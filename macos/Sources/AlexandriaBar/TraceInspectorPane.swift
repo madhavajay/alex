@@ -82,6 +82,7 @@ struct TraceInspectorView: View {
     @State private var reqBody = BodyLoad()
     @State private var respBody = BodyLoad()
     @State private var copiedAll = false
+    @State private var isLoading = false
     @AppStorage("InspectorRawMode") private var rawMode = false
     @AppStorage("InspectorReqHeadersOpen") private var reqHeadersOpen = false
     @AppStorage("InspectorRespHeadersOpen") private var respHeadersOpen = false
@@ -126,18 +127,30 @@ struct TraceInspectorView: View {
             }
         }
         .task(id: traceId) {
-            detail = nil
             loadError = nil
-            reqBody = BodyLoad()
-            respBody = BodyLoad()
-            if reqBodyOpen { loadBody(.request, into: $reqBody) }
-            if respBodyOpen { loadBody(.response, into: $respBody) }
+            isLoading = true
+            if reqBodyOpen {
+                loadBody(.request, into: $reqBody)
+            } else {
+                reqBody = BodyLoad()
+            }
+            if respBodyOpen {
+                loadBody(.response, into: $respBody)
+            } else {
+                respBody = BodyLoad()
+            }
             await loadDetail()
+            isLoading = false
         }
     }
 
     private func loadBody(_ kind: TraceBodyKind, into load: Binding<BodyLoad>) {
-        load.wrappedValue.phase = .loading
+        // Keep previously loaded content visible while the next turn's body
+        // loads so the inspector scroll position survives turn browsing.
+        if case .loaded = load.wrappedValue.phase {
+        } else {
+            load.wrappedValue.phase = .loading
+        }
         let tid = traceId
         Task {
             let phase = await fetchBody(tid, kind: kind)
@@ -156,6 +169,11 @@ struct TraceInspectorView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
+            if isLoading, detail != nil {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.55)
+            }
             Spacer()
             Button(copiedAll ? "Copied" : "Copy All") {
                 copyAll()

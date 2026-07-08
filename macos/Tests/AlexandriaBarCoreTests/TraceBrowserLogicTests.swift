@@ -256,21 +256,31 @@ import Testing
         #expect(!SessionKind.isPingOrTest(sessionId: "real-session", harness: nil))
     }
 
-    @Test func liveSwitchDecision() {
-        #expect(LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 25_000, userAtBottom: true, awayFromBottomMs: 0))
-        #expect(!LiveFollow.shouldSwitch(
-            pinned: true, currentIdleMs: 25_000, userAtBottom: true, awayFromBottomMs: 0))
-        #expect(!LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 10_000, userAtBottom: true, awayFromBottomMs: 0))
-        #expect(!LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 20_000, userAtBottom: true, awayFromBottomMs: 0))
-        #expect(!LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 25_000, userAtBottom: false, awayFromBottomMs: 30_000))
-        #expect(LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 25_000, userAtBottom: false, awayFromBottomMs: 61_000))
-        #expect(!LiveFollow.shouldSwitch(
-            pinned: false, currentIdleMs: 5_000, userAtBottom: false, awayFromBottomMs: 61_000))
+    @Test func newerActivityPill() {
+        #expect(LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: 100,
+            newestId: "b", newestLastTsMs: 200))
+        #expect(!LiveFollow.newerActivity(
+            live: false, selectedId: "a", selectedLastTsMs: 100,
+            newestId: "b", newestLastTsMs: 200))
+        #expect(!LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: 200,
+            newestId: "b", newestLastTsMs: 100))
+        #expect(!LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: 100,
+            newestId: "b", newestLastTsMs: 100))
+        #expect(!LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: 100,
+            newestId: "a", newestLastTsMs: 200))
+        #expect(!LiveFollow.newerActivity(
+            live: true, selectedId: nil, selectedLastTsMs: nil,
+            newestId: "b", newestLastTsMs: 200))
+        #expect(!LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: 100,
+            newestId: nil, newestLastTsMs: nil))
+        #expect(LiveFollow.newerActivity(
+            live: true, selectedId: "a", selectedLastTsMs: nil,
+            newestId: "b", newestLastTsMs: 1))
     }
 
     @Test func sessionsDecoding() throws {

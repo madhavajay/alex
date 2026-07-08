@@ -36,16 +36,7 @@ final class TraceBrowserModel {
         }
     }
 
-    private(set) var userAtBottom = true {
-        didSet {
-            if userAtBottom {
-                scrolledAwayAt = nil
-            } else if scrolledAwayAt == nil {
-                scrolledAwayAt = Date()
-            }
-        }
-    }
-    private var scrolledAwayAt: Date?
+    private(set) var userAtBottom = true
 
     func setUserAtBottom(_ value: Bool) {
         guard userAtBottom != value else { return }
@@ -436,23 +427,20 @@ final class TraceBrowserModel {
     }
 
     private func applyLiveFollow() {
-        guard !findBarVisible else { return }
-        guard let candidate = newestVisibleRow else { return }
-        guard candidate.id != selectedSessionId else { return }
-        guard selectedSessionId != nil else {
-            if !pinned { selectFromFollow(candidate.id) }
-            return
-        }
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let currentLast = selectedSession?.lastTsMs
-        let idleMs = currentLast.map { max(0, now - $0) } ?? Int64.max
-        let awayMs = scrolledAwayAt.map { Int64(-$0.timeIntervalSinceNow * 1000) } ?? 0
-        guard LiveFollow.shouldSwitch(
-            pinned: pinned, currentIdleMs: idleMs,
-            userAtBottom: userAtBottom, awayFromBottomMs: awayMs)
+        guard selectedSessionId == nil, !pinned,
+            let candidate = newestVisibleRow
         else { return }
-        if let currentLast, candidate.lastTsMs <= currentLast { return }
         selectFromFollow(candidate.id)
+    }
+
+    var newerActivityRow: SessionRow? {
+        guard let selected = selectedSession, let newest = newestVisibleRow else { return nil }
+        guard LiveFollow.newerActivity(
+            live: !pinned, selectedId: selected.sessionId,
+            selectedLastTsMs: selected.lastTsMs,
+            newestId: newest.id, newestLastTsMs: newest.lastTsMs)
+        else { return nil }
+        return newest
     }
 
     private func pollTranscript() async {
@@ -1087,21 +1075,39 @@ private struct TranscriptView: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                if !model.userAtBottom, !model.turns.isEmpty {
-                    Button {
-                        model.setUserAtBottom(true)
-                        model.requestScrollToBottom()
-                    } label: {
-                        Label("Jump to latest", systemImage: "arrow.down.to.line")
-                            .font(.system(size: 11, weight: .medium))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(Capsule().fill(.thinMaterial))
-                            .overlay(Capsule().strokeBorder(.quaternary))
+                VStack(spacing: 6) {
+                    if let newer = model.newerActivityRow {
+                        Button {
+                            model.selectFromFollow(newer.id)
+                        } label: {
+                            Label(
+                                "newer activity — \(newer.sessionShort)",
+                                systemImage: "bolt.fill")
+                                .font(.system(size: 11, weight: .medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Capsule().fill(.thinMaterial))
+                                .overlay(Capsule().strokeBorder(.quaternary))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Switch to the session with newer activity")
                     }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 12)
+                    if !model.userAtBottom, !model.turns.isEmpty {
+                        Button {
+                            model.setUserAtBottom(true)
+                            model.requestScrollToBottom()
+                        } label: {
+                            Label("Jump to latest", systemImage: "arrow.down.to.line")
+                                .font(.system(size: 11, weight: .medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Capsule().fill(.thinMaterial))
+                                .overlay(Capsule().strokeBorder(.quaternary))
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
+                .padding(.bottom, 12)
             }
         }
     }

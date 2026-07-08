@@ -1189,6 +1189,7 @@ public enum TranscriptBubbleKind: String, Sendable {
 
 extension NSAttributedString.Key {
     public static let transcriptBubbleKind = NSAttributedString.Key("alexandriaBubbleKind")
+    public static let transcriptBubbleGroup = NSAttributedString.Key("alexandriaBubbleGroup")
     public static let transcriptTurnId = NSAttributedString.Key("alexandriaTurnId")
 }
 
@@ -1465,7 +1466,6 @@ public enum TranscriptRender {
         leftBodyPara.lineHeightMultiple = 1.15
         leftBodyPara.paragraphSpacing = 2
         let rightBodyPara = NSMutableParagraphStyle()
-        rightBodyPara.alignment = .right
         rightBodyPara.firstLineHeadIndent = 88
         rightBodyPara.headIndent = 88
         rightBodyPara.tailIndent = -18
@@ -1616,6 +1616,15 @@ public enum TranscriptRender {
             out.append(NSAttributedString(string: "\n", attributes: separator))
             let turnRange = NSRange(location: turnStart, length: out.length - turnStart)
             out.addAttribute(.transcriptTurnId, value: turn.traceId, range: turnRange)
+            var kindRuns: [NSRange] = []
+            out.enumerateAttribute(.transcriptBubbleKind, in: turnRange) { value, range, _ in
+                if value != nil { kindRuns.append(range) }
+            }
+            for (groupIndex, runRange) in kindRuns.enumerated() {
+                out.addAttribute(
+                    .transcriptBubbleGroup, value: "\(turn.traceId)#\(groupIndex)",
+                    range: runRange)
+            }
             ranges.append(TurnRange(traceId: turn.traceId, range: turnRange))
         }
         return TranscriptDocument(
@@ -1738,12 +1747,13 @@ public struct DarioLogsResponse: Codable, Sendable {
 }
 
 public enum LiveFollow {
-    public static func shouldSwitch(
-        pinned: Bool, currentIdleMs: Int64, userAtBottom: Bool, awayFromBottomMs: Int64
+    public static func newerActivity(
+        live: Bool, selectedId: String?, selectedLastTsMs: Int64?,
+        newestId: String?, newestLastTsMs: Int64?
     ) -> Bool {
-        if pinned { return false }
-        guard currentIdleMs > 20_000 else { return false }
-        if userAtBottom { return true }
-        return awayFromBottomMs >= 60_000
+        guard live, let selectedId, let newestId, newestId != selectedId,
+            let newestLastTsMs
+        else { return false }
+        return newestLastTsMs > (selectedLastTsMs ?? Int64.min)
     }
 }

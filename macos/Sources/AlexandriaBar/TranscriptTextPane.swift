@@ -4,6 +4,7 @@ import AlexandriaBarCore
 
 final class TranscriptTextView: NSTextView {
     var onTurnClick: ((Int) -> Void)?
+    var selectedTurnProvider: (() -> String?)?
 
     override func mouseDown(with event: NSEvent) {
         let downPoint = convert(event.locationInWindow, from: nil)
@@ -16,6 +17,102 @@ final class TranscriptTextView: NSTextView {
         guard index >= 0, index < (textStorage?.length ?? 0) else { return }
         if textStorage?.attribute(.link, at: index, effectiveRange: nil) != nil { return }
         onTurnClick?(index)
+    }
+
+    // Draw one unified rounded bubble per message group, beneath text and
+    // beneath the native selection band (super.drawBackground draws selection).
+    override func drawBackground(in rect: NSRect) {
+        drawBubbles(in: rect)
+        super.drawBackground(in: rect)
+    }
+
+    private func drawBubbles(in dirtyRect: NSRect) {
+        guard let layoutManager = textLayoutManager,
+            let contentManager = layoutManager.textContentManager,
+            let storage = textStorage, storage.length > 0,
+            let context = NSGraphicsContext.current?.cgContext
+        else { return }
+        let viewport = layoutManager.textViewportLayoutController.viewportRange
+            ?? layoutManager.documentRange
+        let start = contentManager.offset(
+            from: contentManager.documentRange.location, to: viewport.location)
+        let end = contentManager.offset(
+            from: contentManager.documentRange.location, to: viewport.endLocation)
+        guard start >= 0, end > start, end <= storage.length else { return }
+        let origin = textContainerOrigin
+        let selectedTurn = selectedTurnProvider?()
+        var drawnGroups = Set<String>()
+        storage.enumerateAttribute(
+            .transcriptBubbleGroup, in: NSRange(location: start, length: end - start)
+        ) { value, partialRange, _ in
+            guard let group = value as? String, drawnGroups.insert(group).inserted else {
+                return
+            }
+            var groupRange = NSRange()
+            guard storage.attribute(
+                .transcriptBubbleGroup, at: partialRange.location,
+                longestEffectiveRange: &groupRange,
+                in: NSRange(location: 0, length: storage.length)) != nil
+            else { return }
+            guard let kindRaw = storage.attribute(
+                .transcriptBubbleKind, at: groupRange.location, effectiveRange: nil) as? String,
+                let kind = TranscriptBubbleKind(rawValue: kindRaw)
+            else { return }
+            let para = storage.attribute(
+                .paragraphStyle, at: groupRange.location, effectiveRange: nil)
+                as? NSParagraphStyle
+            guard let bubble = unifiedRect(
+                for: groupRange, kind: kind, paragraphStyle: para,
+                layoutManager: layoutManager, contentManager: contentManager)
+            else { return }
+            let deviceRect = bubble.offsetBy(dx: origin.x, dy: origin.y)
+            guard deviceRect.intersects(dirtyRect.insetBy(dx: -8, dy: -8)) else { return }
+            let selected = selectedTurn.map { group.hasPrefix($0 + "#") } ?? false
+            BubbleStyle.draw(kind: kind, rect: deviceRect, selected: selected, in: context)
+        }
+    }
+
+    private func unifiedRect(
+        for range: NSRange, kind: TranscriptBubbleKind, paragraphStyle: NSParagraphStyle?,
+        layoutManager: NSTextLayoutManager, contentManager: NSTextContentManager
+    ) -> CGRect? {
+        guard let startLocation = contentManager.location(
+            contentManager.documentRange.location, offsetBy: range.location),
+            let endLocation = contentManager.location(startLocation, offsetBy: range.length),
+            let textRange = NSTextRange(location: startLocation, end: endLocation)
+        else { return nil }
+        layoutManager.ensureLayout(for: textRange)
+        var top: CGFloat?
+        var bottom: CGFloat = 0
+        var maxLineX: CGFloat = 0
+        var containerWidth: CGFloat = 0
+        layoutManager.enumerateTextLayoutFragments(
+            from: textRange.location, options: []
+        ) { fragment in
+            guard fragment.rangeInElement.location.compare(textRange.endLocation)
+                == .orderedAscending
+            else { return false }
+            let frame = fragment.layoutFragmentFrame
+            containerWidth = max(containerWidth, frame.width)
+            for line in fragment.textLineFragments {
+                let bounds = line.typographicBounds
+                if top == nil { top = frame.minY + bounds.minY }
+                bottom = frame.minY + bounds.maxY
+                maxLineX = max(maxLineX, frame.minX + bounds.maxX)
+            }
+            return true
+        }
+        guard let top, containerWidth > 0 else { return nil }
+        let head = paragraphStyle?.headIndent ?? 8
+        let tail = abs(paragraphStyle?.tailIndent ?? -8)
+        let x0 = max(0, head - BubbleStyle.padX)
+        var x1 = containerWidth - max(0, tail - BubbleStyle.padX)
+        if kind == .user {
+            x1 = min(x1, max(maxLineX + BubbleStyle.padX, x0 + 60))
+        }
+        return CGRect(
+            x: x0, y: top - BubbleStyle.padY,
+            width: max(0, x1 - x0), height: bottom - top + BubbleStyle.padY * 2)
     }
 }
 
@@ -31,6 +128,9 @@ struct TranscriptTextPane: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.displaysLinkToolTips = false
         textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
+        textView.selectedTextAttributes = [
+            .backgroundColor: NSColor.selectedTextBackgroundColor
+        ]
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
         textView.textContainerInset = NSSize(width: 8, height: 12)
@@ -38,7 +138,6 @@ struct TranscriptTextPane: NSViewRepresentable {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textLayoutManager?.delegate = context.coordinator
         let scroll = NSScrollView()
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
@@ -55,7 +154,7 @@ struct TranscriptTextPane: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate, @preconcurrency NSTextLayoutManagerDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
             let url = link as? URL ?? (link as? String).flatMap(URL.init(string:))
             guard let url, let traceId = TraceLink.traceId(from: url) else { return false }
@@ -83,6 +182,7 @@ struct TranscriptTextPane: NSViewRepresentable {
                 else { return }
                 model.openInspector(traceId: traceId)
             }
+            textView.selectedTurnProvider = { [weak self] in self?.model?.inspectorTraceId }
             observer = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
                 object: scroll.contentView, queue: .main
@@ -98,63 +198,6 @@ struct TranscriptTextPane: NSViewRepresentable {
         deinit {
             if let observer { NotificationCenter.default.removeObserver(observer) }
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
-        }
-
-        // MARK: - Bubble layout fragments
-
-        func textLayoutManager(
-            _ textLayoutManager: NSTextLayoutManager,
-            textLayoutFragmentFor location: NSTextLocation,
-            in textElement: NSTextElement
-        ) -> NSTextLayoutFragment {
-            guard let paragraph = textElement as? NSTextParagraph else {
-                return NSTextLayoutFragment(
-                    textElement: textElement, range: textElement.elementRange)
-            }
-            let str = paragraph.attributedString
-            guard str.length > 0,
-                let turnId = str.attribute(.transcriptTurnId, at: 0, effectiveRange: nil)
-                    as? String
-            else {
-                return NSTextLayoutFragment(
-                    textElement: textElement, range: textElement.elementRange)
-            }
-            let fragment = BubbleLayoutFragment(
-                textElement: textElement, range: textElement.elementRange)
-            fragment.turnId = turnId
-            fragment.selectedTurnProvider = { [weak self] in self?.model?.inspectorTraceId }
-            if let kindRaw = str.attribute(.transcriptBubbleKind, at: 0, effectiveRange: nil)
-                as? String,
-                let kind = TranscriptBubbleKind(rawValue: kindRaw) {
-                fragment.kind = kind
-                if let para = str.attribute(.paragraphStyle, at: 0, effectiveRange: nil)
-                    as? NSParagraphStyle {
-                    fragment.leftInset = para.headIndent
-                    fragment.rightInset = abs(para.tailIndent)
-                    fragment.isRightAligned = para.alignment == .right
-                }
-                if let storage = textView?.textStorage,
-                    let contentManager = textLayoutManager.textContentManager {
-                    let offset = contentManager.offset(
-                        from: contentManager.documentRange.location, to: location)
-                    fragment.roundedTop = !neighborMatches(
-                        storage, index: offset - 1, kind: kindRaw, turn: turnId)
-                    fragment.roundedBottom = !neighborMatches(
-                        storage, index: offset + str.length, kind: kindRaw, turn: turnId)
-                }
-            }
-            return fragment
-        }
-
-        private func neighborMatches(
-            _ storage: NSTextStorage, index: Int, kind: String, turn: String
-        ) -> Bool {
-            guard index >= 0, index < storage.length else { return false }
-            let neighborKind = storage.attribute(
-                .transcriptBubbleKind, at: index, effectiveRange: nil) as? String
-            let neighborTurn = storage.attribute(
-                .transcriptTurnId, at: index, effectiveRange: nil) as? String
-            return neighborKind == kind && neighborTurn == turn
         }
 
         // MARK: - Find bar

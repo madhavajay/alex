@@ -194,6 +194,17 @@ import Testing
             #expect(atStart == range.traceId)
             #expect(atEnd == range.traceId)
         }
+        var groups: [String] = []
+        built.text.enumerateAttribute(
+            .transcriptBubbleGroup, in: NSRange(location: 0, length: built.text.length)
+        ) { value, range, _ in
+            guard let group = value as? String else { return }
+            groups.append(group)
+            #expect(built.text.attribute(
+                .transcriptBubbleKind, at: range.location, effectiveRange: nil) != nil)
+        }
+        #expect(groups == ["t1#0", "t1#1", "t1#2", "t2#0"])
+        #expect(groups.count == Set(groups).count)
     }
 
     @Test func turnHitTestMapping() throws {
