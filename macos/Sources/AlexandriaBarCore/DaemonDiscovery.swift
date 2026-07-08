@@ -6,7 +6,18 @@ public struct DaemonConfig: Sendable, Equatable {
     public let localKey: String
     public let anthropicUpstream: String
 
-    public var baseURL: URL { URL(string: "http://\(host):\(port)")! }
+    // A daemon bound to 0.0.0.0/:: listens on all interfaces, but those are
+    // not connectable addresses — the app runs on the same host, so connect
+    // over loopback. (This also keeps App Transport Security happy, which
+    // exempts loopback but not 0.0.0.0.)
+    public var connectHost: String {
+        switch host {
+        case "0.0.0.0", "::", "*", "": "127.0.0.1"
+        default: host
+        }
+    }
+
+    public var baseURL: URL { URL(string: "http://\(connectHost):\(port)")! }
     public var darioEnabled: Bool { anthropicUpstream == "dario" }
 
     public init(host: String, port: Int, localKey: String, anthropicUpstream: String = "direct") {
