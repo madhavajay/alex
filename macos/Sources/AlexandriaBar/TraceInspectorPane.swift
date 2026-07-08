@@ -4,12 +4,30 @@ import AlexandriaBarCore
 
 struct SessionInfoCard: View {
     @Bindable var model: TraceBrowserModel
+    @State private var showPrompt = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
                 if let detail = model.firstTraceDetail {
                     facts(detail.trace)
+                    if let prompt = model.sessionSystemPrompt {
+                        Button {
+                            showPrompt = true
+                        } label: {
+                            Label(
+                                "System prompt (\(prompt.count) chars)",
+                                systemImage: "doc.text")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                        .popover(isPresented: $showPrompt) {
+                            SystemPromptView(
+                                prompt: prompt,
+                                modelName: model.selectedSession?.models?.first)
+                        }
+                    }
                     let headers = model.firstRequestHeaders
                     if !headers.isEmpty {
                         Text("First request headers")
@@ -61,14 +79,16 @@ struct TraceInspectorView: View {
 
     @State private var detail: TraceDetailResponse?
     @State private var loadError: String?
-    @State private var reqHeadersOpen = false
-    @State private var respHeadersOpen = false
     @State private var reqBody = BodyLoad()
     @State private var respBody = BodyLoad()
+    @State private var copiedAll = false
     @AppStorage("InspectorRawMode") private var rawMode = false
+    @AppStorage("InspectorReqHeadersOpen") private var reqHeadersOpen = false
+    @AppStorage("InspectorRespHeadersOpen") private var respHeadersOpen = false
+    @AppStorage("InspectorReqBodyOpen") private var reqBodyOpen = false
+    @AppStorage("InspectorRespBodyOpen") private var respBodyOpen = false
 
     struct BodyLoad {
-        var open = false
         var phase = Phase.idle
 
         enum Phase {
@@ -108,11 +128,21 @@ struct TraceInspectorView: View {
         .task(id: traceId) {
             detail = nil
             loadError = nil
-            reqHeadersOpen = false
-            respHeadersOpen = false
             reqBody = BodyLoad()
             respBody = BodyLoad()
+            if reqBodyOpen { loadBody(.request, into: $reqBody) }
+            if respBodyOpen { loadBody(.response, into: $respBody) }
             await loadDetail()
+        }
+    }
+
+    private func loadBody(_ kind: TraceBodyKind, into load: Binding<BodyLoad>) {
+        load.wrappedValue.phase = .loading
+        let tid = traceId
+        Task {
+            let phase = await fetchBody(tid, kind: kind)
+            guard tid == traceId else { return }
+            load.wrappedValue.phase = phase
         }
     }
 
@@ -127,6 +157,13 @@ struct TraceInspectorView: View {
                 .truncationMode(.middle)
                 .textSelection(.enabled)
             Spacer()
+            Button(copiedAll ? "Copied" : "Copy All") {
+                copyAll()
+            }
+            .controlSize(.small)
+            .font(.system(size: 10))
+            .disabled(detail == nil)
+            .help("Copy the whole turn as markdown")
             Button {
                 model.stepInspector(-1)
             } label: {
@@ -165,7 +202,10 @@ struct TraceInspectorView: View {
         let trace = response.trace
         overview(trace)
         if let extras = response.extras, extras.hasAny {
-            section("Extras") {
+            section(
+                "Extras",
+                copyText: TurnExport.extrasLines(extras).joined(separator: "\n")
+            ) {
                 InfoRow(label: "reasoning effort", value: extras.reasoningEffort)
                 InfoRow(label: "thinking budget", value: extras.thinkingBudget.map { "\($0)" })
                 InfoRow(label: "max tokens", value: extras.maxTokens.map { "\($0)" })
@@ -182,13 +222,38 @@ struct TraceInspectorView: View {
             title: "Response headers", json: trace.respHeadersJson,
             isExpanded: $respHeadersOpen, diffAgainstFirst: false)
         Divider()
-        bodyGroup(title: "Request body", kind: .request, load: $reqBody)
-        bodyGroup(title: "Response body", kind: .response, load: $respBody)
+        bodyGroup(
+            title: "Request body", kind: .request, load: $reqBody, isExpanded: $reqBodyOpen)
+        bodyGroup(
+            title: "Response body", kind: .response, load: $respBody, isExpanded: $respBodyOpen)
+    }
+
+    private func copyAll() {
+        guard let response = detail else { return }
+        let tid = traceId
+        Task {
+            let reqContent = try? await model.fetchTraceBody(id: tid, kind: .request)
+            let respContent = try? await model.fetchTraceBody(id: tid, kind: .response)
+            let markdown = TurnExport.markdown(
+                detail: response.trace, extras: response.extras,
+                reqHeaders: TraceHeaders.sortedPairs(response.trace.reqHeadersJson),
+                respHeaders: TraceHeaders.sortedPairs(response.trace.respHeadersJson),
+                reqBody: reqContent?.text, respBody: respContent?.text)
+            guard tid == traceId else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(markdown, forType: .string)
+            copiedAll = true
+            try? await Task.sleep(for: .seconds(1.5))
+            copiedAll = false
+        }
     }
 
     @ViewBuilder
     private func overview(_ trace: TraceDetail) -> some View {
-        section("Overview") {
+        section(
+            "Overview",
+            copyText: TurnExport.overviewLines(trace).joined(separator: "\n")
+        ) {
             if let status = trace.status {
                 InfoRow(
                     label: "status", value: "\(status)",
@@ -247,11 +312,18 @@ struct TraceInspectorView: View {
     }
 
     @ViewBuilder
-    private func section(_ title: String, @ViewBuilder rows: () -> some View) -> some View {
+    private func section(
+        _ title: String, copyText: String? = nil, @ViewBuilder rows: () -> some View
+    ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                if let copyText, !copyText.isEmpty {
+                    CopyIconButton(text: copyText, help: "Copy \(title.lowercased())")
+                }
+            }
             rows()
         }
     }
@@ -267,7 +339,14 @@ struct TraceInspectorView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                HeaderListView(pairs: pairs, delta: diffAgainstFirst ? firstRequestDelta(pairs) : nil)
+                VStack(alignment: .leading, spacing: 4) {
+                    CopyIconButton(
+                        text: TurnExport.headerLines(pairs).joined(separator: "\n"),
+                        help: "Copy \(title.lowercased())", showsLabel: true)
+                    HeaderListView(
+                        pairs: pairs,
+                        delta: diffAgainstFirst ? firstRequestDelta(pairs) : nil)
+                }
             }
         } label: {
             groupLabel("\(title) (\(pairs.count))")
@@ -284,22 +363,16 @@ struct TraceInspectorView: View {
 
     @ViewBuilder
     private func bodyGroup(
-        title: String, kind: TraceBodyKind, load: Binding<BodyLoad>
+        title: String, kind: TraceBodyKind, load: Binding<BodyLoad>, isExpanded: Binding<Bool>
     ) -> some View {
-        DisclosureGroup(isExpanded: load.open) {
+        DisclosureGroup(isExpanded: isExpanded) {
             bodyContent(load.wrappedValue.phase)
         } label: {
             groupLabel(title)
         }
-        .onChange(of: load.wrappedValue.open) { _, open in
+        .onChange(of: isExpanded.wrappedValue) { _, open in
             guard open, case .idle = load.wrappedValue.phase else { return }
-            load.wrappedValue.phase = .loading
-            let tid = traceId
-            Task {
-                let phase = await fetchBody(tid, kind: kind)
-                guard tid == traceId else { return }
-                load.wrappedValue.phase = phase
-            }
+            loadBody(kind, into: load)
         }
     }
 
@@ -374,9 +447,8 @@ struct TraceInspectorView: View {
     }
 
     private func fetchBody(_ id: String, kind: TraceBodyKind) async -> BodyLoad.Phase {
-        guard let client = model.detailClient() else { return .failed("daemon unavailable") }
         do {
-            let content = try await client.traceBody(id: id, kind: kind)
+            let content = try await model.fetchTraceBody(id: id, kind: kind)
             return .loaded(raw: content.text, diskPath: content.diskPath)
         } catch {
             return .failed(error.localizedDescription)
@@ -475,11 +547,72 @@ struct HeaderListView: View {
     }
 }
 
+struct CopyIconButton: View {
+    let text: String
+    var help = "Copy"
+    var showsLabel = false
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task {
+                try? await Task.sleep(for: .seconds(1.5))
+                copied = false
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 9))
+                if showsLabel {
+                    Text(copied ? "Copied" : "Copy")
+                        .font(.system(size: 9))
+                }
+            }
+            .foregroundStyle(copied ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+struct SystemPromptView: View {
+    let prompt: String
+    let modelName: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("System prompt")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("\(prompt.count) chars\(modelName.map { " · \($0)" } ?? "")")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(prompt, forType: .string)
+                }
+                .controlSize(.small)
+            }
+            InspectorTextPane(text: prompt, fontSize: 12)
+                .frame(minHeight: 360)
+        }
+        .padding(12)
+        .frame(width: 560, height: 440)
+    }
+}
+
 struct InspectorTextPane: NSViewRepresentable {
     let text: String
     var highlightJSON = false
+    var fontSize: CGFloat = 10
 
-    private static let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    private var font: NSFont {
+        NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NSTextView(usingTextLayoutManager: true)
@@ -487,7 +620,7 @@ struct InspectorTextPane: NSViewRepresentable {
         textView.isSelectable = true
         textView.isRichText = false
         textView.drawsBackground = false
-        textView.font = Self.font
+        textView.font = font
         textView.textContainerInset = NSSize(width: 6, height: 6)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -505,15 +638,15 @@ struct InspectorTextPane: NSViewRepresentable {
         guard let textView = scroll.documentView as? NSTextView,
             let storage = textView.textStorage
         else { return }
-        let key = "\(highlightJSON)|\(text.count)|\(text.hashValue)"
+        let key = "\(highlightJSON)|\(fontSize)|\(text.count)|\(text.hashValue)"
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key
         if highlightJSON {
-            storage.setAttributedString(JsonHighlight.attributed(text, font: Self.font))
+            storage.setAttributedString(JsonHighlight.attributed(text, font: font))
         } else {
             storage.setAttributedString(NSAttributedString(
                 string: text,
-                attributes: [.font: Self.font, .foregroundColor: NSColor.labelColor]))
+                attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
         }
         textView.scroll(.zero)
     }

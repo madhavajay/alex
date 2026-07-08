@@ -103,7 +103,8 @@ import Testing
         #expect(ProviderInfo.displayName("anthropic") == "Claude")
         #expect(ProviderInfo.loginArg("xai") == "grok")
         #expect(ProviderInfo.pingArg("xai") == "grok")
-        #expect(ProviderInfo.pingArg("gemini") == nil)
+        #expect(ProviderInfo.pingArg("gemini") == "gemini")
+        #expect(ProviderInfo.pingArg("unknown") == nil)
     }
 
     @Test func formatDuration() {

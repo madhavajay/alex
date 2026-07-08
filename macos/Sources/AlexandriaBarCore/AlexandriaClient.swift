@@ -6,7 +6,7 @@ public enum TraceBodyKind: String, Sendable, CaseIterable {
     case response
 }
 
-public struct TraceBodyContent: Sendable {
+public struct TraceBodyContent: Sendable, Equatable {
     public let text: String
     public let diskPath: String?
 

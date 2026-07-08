@@ -190,6 +190,7 @@ public struct TraceExtras: Codable, Sendable {
     public let temperature: Double?
     public let messageCount: Int?
     public let systemChars: Int?
+    public let systemPrompt: String?
 
     public var hasAny: Bool {
         reasoningEffort != nil || thinkingBudget != nil || maxTokens != nil
@@ -203,6 +204,7 @@ public struct TraceExtras: Codable, Sendable {
         case maxTokens = "max_tokens"
         case messageCount = "message_count"
         case systemChars = "system_chars"
+        case systemPrompt = "system_prompt"
     }
 }
 
@@ -932,8 +934,17 @@ public struct OmniQuery: Equatable, Sendable {
         let prefix = key.lowercased() + ":"
         var words = raw.split(whereSeparator: \.isWhitespace).map(String.init)
         words.removeAll { $0.lowercased().hasPrefix(prefix) }
-        if let value, !value.isEmpty { words.append(prefix + value) }
+        if let value, let clean = Self.tokenValue(value) { words.append(prefix + clean) }
         return words.joined(separator: " ")
+    }
+
+    static func tokenValue(_ value: String) -> String? {
+        var clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cut = clean.firstIndex(where: { $0.isWhitespace || $0 == "," }) {
+            clean = String(clean[..<cut])
+        }
+        clean = clean.trimmingCharacters(in: CharacterSet(charactersIn: ","))
+        return clean.isEmpty ? nil : clean
     }
 
     public func matches(_ session: TraceSession) -> Bool {
@@ -1047,6 +1058,12 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
             guard let value, !value.isEmpty, seen.insert(value).inserted else { return }
             out.append(value)
         }
+        func addSplittingList(_ value: String?) {
+            guard let value else { return }
+            for part in value.split(separator: ",") {
+                add(part.trimmingCharacters(in: .whitespaces))
+            }
+        }
         for session in sessions {
             let tags = session.tags ?? [:]
             switch self {
@@ -1054,8 +1071,8 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
                 add(session.harness)
                 add(tags["harness"])
             case .model:
-                (session.models ?? []).forEach { add($0) }
-                add(tags["model"])
+                (session.models ?? []).forEach { addSplittingList($0) }
+                addSplittingList(tags["model"])
             case .task:
                 add(tags["task"])
             case .job:
@@ -1166,6 +1183,172 @@ public struct TurnRange: Equatable, Sendable {
     }
 }
 
+public enum TranscriptBubbleKind: String, Sendable {
+    case user, model, tool, toolResult, error
+}
+
+extension NSAttributedString.Key {
+    public static let transcriptBubbleKind = NSAttributedString.Key("alexandriaBubbleKind")
+    public static let transcriptTurnId = NSAttributedString.Key("alexandriaTurnId")
+}
+
+public enum TurnHitTest {
+    public static func traceId(at index: Int, in ranges: [TurnRange]) -> String? {
+        ranges.first { NSLocationInRange(index, $0.range) }?.traceId
+    }
+}
+
+public struct TraceBodyCache {
+    public let capacity: Int
+    private var store: [String: TraceBodyContent] = [:]
+    private var order: [String] = []
+
+    public init(capacity: Int = 20) {
+        self.capacity = max(1, capacity)
+    }
+
+    public var count: Int { store.count }
+
+    public static func key(id: String, kind: TraceBodyKind) -> String {
+        "\(id)|\(kind.rawValue)"
+    }
+
+    public mutating func value(for key: String) -> TraceBodyContent? {
+        guard let value = store[key] else { return nil }
+        touch(key)
+        return value
+    }
+
+    public mutating func insert(_ value: TraceBodyContent, for key: String) {
+        store[key] = value
+        touch(key)
+        while store.count > capacity, let oldest = order.first {
+            order.removeFirst()
+            store.removeValue(forKey: oldest)
+        }
+    }
+
+    private mutating func touch(_ key: String) {
+        order.removeAll { $0 == key }
+        order.append(key)
+    }
+}
+
+public enum TurnExport {
+    public static func overviewLines(_ trace: TraceDetail) -> [String] {
+        var lines: [String] = []
+        func add(_ label: String, _ value: String?) {
+            guard let value, !value.isEmpty else { return }
+            lines.append("\(label): \(value)")
+        }
+        add("status", trace.status.map { "\($0)" })
+        let endpoint = [trace.method, trace.path].compactMap(\.self).joined(separator: " ")
+        add("endpoint", endpoint.isEmpty ? nil : endpoint)
+        if let requestMs = trace.tsRequestMs {
+            let formatter = ISO8601DateFormatter()
+            add("time", formatter.string(
+                from: Date(timeIntervalSince1970: Double(requestMs) / 1000)))
+            add("duration", TurnHeader.duration(
+                requestMs: requestMs, responseMs: trace.tsResponseMs)
+                ?? trace.latencyMs.map { "\($0)ms" })
+        }
+        switch (trace.requestedModel, trace.routedModel) {
+        case let (.some(requested), .some(routed)) where requested != routed:
+            add("model", "\(requested) → \(routed)")
+        case let (requested, routed):
+            add("model", requested ?? routed)
+        }
+        add("provider", trace.upstreamProvider)
+        if trace.clientFormat != nil || trace.upstreamFormat != nil {
+            let client = trace.clientFormat ?? "?"
+            let upstream = trace.upstreamFormat ?? "?"
+            let translated = trace.clientFormat != nil && trace.upstreamFormat != nil
+                && trace.clientFormat != trace.upstreamFormat
+            add("format", "\(client) → \(upstream)\(translated ? " (translated)" : "")")
+        }
+        add("billing", trace.billingBucket)
+        add("account", trace.accountId)
+        add("session", trace.sessionId)
+        add("run", trace.runId)
+        add("client ip", trace.clientIp)
+        add("key fingerprint", trace.keyFingerprint)
+        if trace.inputTokens != nil || trace.outputTokens != nil {
+            var parts = ["in \(TraceNumberFormat.tokens(trace.inputTokens))"]
+            if let cached = trace.cachedInputTokens, cached > 0 {
+                parts.append("cached \(TraceNumberFormat.tokens(cached))")
+            }
+            parts.append("out \(TraceNumberFormat.tokens(trace.outputTokens))")
+            if let reasoning = trace.reasoningTokens, reasoning > 0 {
+                parts.append("reasoning \(TraceNumberFormat.tokens(reasoning))")
+            }
+            add("tokens", parts.joined(separator: " · "))
+        }
+        if let cost = trace.costUsd, cost > 0 { add("cost", TraceNumberFormat.cost(cost)) }
+        add("error", trace.error)
+        return lines
+    }
+
+    public static func extrasLines(_ extras: TraceExtras?) -> [String] {
+        guard let extras else { return [] }
+        var lines: [String] = []
+        func add(_ label: String, _ value: String?) {
+            guard let value, !value.isEmpty else { return }
+            lines.append("\(label): \(value)")
+        }
+        add("reasoning effort", extras.reasoningEffort)
+        add("thinking budget", extras.thinkingBudget.map { "\($0)" })
+        add("max tokens", extras.maxTokens.map { "\($0)" })
+        add("temperature", extras.temperature.map { "\($0)" })
+        add("messages", extras.messageCount.map { "\($0)" })
+        add("system chars", extras.systemChars.map { "\($0)" })
+        return lines
+    }
+
+    public static func headerLines(_ pairs: [HeaderPair]) -> [String] {
+        pairs.map { "\($0.name): \($0.value)" }
+    }
+
+    public static func markdown(
+        detail: TraceDetail, extras: TraceExtras?,
+        reqHeaders: [HeaderPair], respHeaders: [HeaderPair],
+        reqBody: String?, respBody: String?
+    ) -> String {
+        var out = "# Trace \(detail.id)\n\n## Overview\n"
+        out += overviewLines(detail).map { "- \($0)" }.joined(separator: "\n")
+        let extrasLines = extrasLines(extras)
+        if !extrasLines.isEmpty {
+            out += "\n\n## Extras\n"
+            out += extrasLines.map { "- \($0)" }.joined(separator: "\n")
+        }
+        out += "\n\n## Request headers\n"
+        out += fencedOrMissing(
+            reqHeaders.isEmpty ? nil : headerLines(reqHeaders).joined(separator: "\n"),
+            language: "")
+        out += "\n\n## Response headers\n"
+        out += fencedOrMissing(
+            respHeaders.isEmpty ? nil : headerLines(respHeaders).joined(separator: "\n"),
+            language: "")
+        out += "\n\n## Request body\n"
+        out += bodySection(reqBody)
+        out += "\n\n## Response body\n"
+        out += bodySection(respBody)
+        out += "\n"
+        return out
+    }
+
+    static func bodySection(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "_not available_" }
+        let display = BodyPretty.display(raw)
+        return fencedOrMissing(
+            display.text, language: BodyPretty.isJSON(raw) ? "json" : "")
+    }
+
+    static func fencedOrMissing(_ content: String?, language: String) -> String {
+        guard let content, !content.isEmpty else { return "_not available_" }
+        return "```\(language)\n\(content)\n```"
+    }
+}
+
 public struct TranscriptDocument: @unchecked Sendable {
     public let text: NSAttributedString
     public let turnRanges: [TurnRange]
@@ -1258,21 +1441,42 @@ public enum TranscriptRender {
         formatter.dateFormat = "HH:mm:ss"
         let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
         let separatorFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
-        let bodyFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let toolFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let proseFont = NSFont.systemFont(ofSize: 13)
+        let monoFont = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+        let detailsFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
 
         let separatorPara = NSMutableParagraphStyle()
-        separatorPara.paragraphSpacing = 4
-        let requestPara = NSMutableParagraphStyle()
-        requestPara.firstLineHeadIndent = 8
-        requestPara.headIndent = 8
-        requestPara.tailIndent = -48
-        requestPara.paragraphSpacing = 2
-        let responsePara = NSMutableParagraphStyle()
-        responsePara.firstLineHeadIndent = 48
-        responsePara.headIndent = 48
-        responsePara.tailIndent = -8
-        responsePara.paragraphSpacing = 2
+        separatorPara.paragraphSpacing = 6
+        separatorPara.paragraphSpacingBefore = 12
+        let leftLabelPara = NSMutableParagraphStyle()
+        leftLabelPara.firstLineHeadIndent = 12
+        leftLabelPara.headIndent = 12
+        leftLabelPara.paragraphSpacing = 1
+        leftLabelPara.paragraphSpacingBefore = 3
+        let rightLabelPara = NSMutableParagraphStyle()
+        rightLabelPara.alignment = .right
+        rightLabelPara.tailIndent = -12
+        rightLabelPara.paragraphSpacing = 1
+        rightLabelPara.paragraphSpacingBefore = 3
+        let leftBodyPara = NSMutableParagraphStyle()
+        leftBodyPara.firstLineHeadIndent = 18
+        leftBodyPara.headIndent = 18
+        leftBodyPara.tailIndent = -88
+        leftBodyPara.lineHeightMultiple = 1.15
+        leftBodyPara.paragraphSpacing = 2
+        let rightBodyPara = NSMutableParagraphStyle()
+        rightBodyPara.alignment = .right
+        rightBodyPara.firstLineHeadIndent = 88
+        rightBodyPara.headIndent = 88
+        rightBodyPara.tailIndent = -18
+        rightBodyPara.lineHeightMultiple = 1.15
+        rightBodyPara.paragraphSpacing = 2
+        let rightCardPara = NSMutableParagraphStyle()
+        rightCardPara.firstLineHeadIndent = 88
+        rightCardPara.headIndent = 88
+        rightCardPara.tailIndent = -18
+        rightCardPara.lineHeightMultiple = 1.15
+        rightCardPara.paragraphSpacing = 2
 
         let separator: [NSAttributedString.Key: Any] = [
             .font: separatorFont, .foregroundColor: NSColor.tertiaryLabelColor,
@@ -1285,37 +1489,43 @@ public enum TranscriptRender {
         ]
         let userLabel: [NSAttributedString.Key: Any] = [
             .font: labelFont, .foregroundColor: NSColor.controlAccentColor,
-            .paragraphStyle: requestPara,
+            .paragraphStyle: leftLabelPara,
         ]
         let modelLabel: [NSAttributedString.Key: Any] = [
             .font: labelFont, .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: responsePara,
+            .paragraphStyle: rightLabelPara,
         ]
         let toolLabel: [NSAttributedString.Key: Any] = [
             .font: labelFont, .foregroundColor: NSColor.systemPurple,
-            .paragraphStyle: responsePara,
+            .paragraphStyle: rightCardPara,
         ]
         let user: [NSAttributedString.Key: Any] = [
-            .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: requestPara,
-            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
+            .font: proseFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: leftBodyPara,
+            .transcriptBubbleKind: TranscriptBubbleKind.user.rawValue,
+        ]
+        let toolResult: [NSAttributedString.Key: Any] = [
+            .font: monoFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: leftBodyPara,
+            .transcriptBubbleKind: TranscriptBubbleKind.toolResult.rawValue,
         ]
         let assistant: [NSAttributedString.Key: Any] = [
-            .font: bodyFont, .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: responsePara,
-            .backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.06),
+            .font: proseFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: rightBodyPara,
+            .transcriptBubbleKind: TranscriptBubbleKind.model.rawValue,
         ]
         let tool: [NSAttributedString.Key: Any] = [
-            .font: toolFont, .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: responsePara,
-            .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.06),
+            .font: monoFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: rightCardPara,
+            .transcriptBubbleKind: TranscriptBubbleKind.tool.rawValue,
         ]
         let error: [NSAttributedString.Key: Any] = [
-            .font: bodyFont, .foregroundColor: NSColor.systemRed,
-            .paragraphStyle: responsePara,
+            .font: monoFont, .foregroundColor: NSColor.systemRed,
+            .paragraphStyle: rightCardPara,
+            .transcriptBubbleKind: TranscriptBubbleKind.error.rawValue,
         ]
-        var userKey = user
-        userKey[.foregroundColor] = NSColor.tertiaryLabelColor
+        var toolResultKey = toolResult
+        toolResultKey[.foregroundColor] = NSColor.secondaryLabelColor
         var toolKey = tool
         toolKey[.foregroundColor] = NSColor.secondaryLabelColor
 
@@ -1341,11 +1551,11 @@ public enum TranscriptRender {
                 costUsd: turn.costUsd)
             let isError = (turn.status ?? 0) >= 400
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
-            out.append(NSAttributedString(string: "· \(facts) · ", attributes: sepAttrs))
+            out.append(NSAttributedString(string: "· \(facts) ·", attributes: sepAttrs))
             var detailsAttrs = sepAttrs
-            detailsAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-            out.append(NSAttributedString(string: "Details", attributes: detailsAttrs))
-            out.append(NSAttributedString(string: " ·", attributes: sepAttrs))
+            detailsAttrs[.font] = detailsFont
+            detailsAttrs[.foregroundColor] = NSColor.controlAccentColor
+            out.append(NSAttributedString(string: "   ⓘ Details", attributes: detailsAttrs))
             out.append(NSAttributedString(string: "\n", attributes: sepAttrs))
             if let text = turn.user, !text.isEmpty {
                 let toolBody = TurnHeader.toolResultBody(text)
@@ -1356,15 +1566,18 @@ public enum TranscriptRender {
                     out.append(iconString(icon, attributes: labelAttrs))
                     out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
-                out.append(NSAttributedString(string: "\(label)\n", attributes: labelAttrs))
-                let body = toolBody ?? text
-                if !rawMode, toolBody != nil {
-                    appendNice(
-                        body, to: out, keyAttrs: userKey, valueAttrs: user,
-                        fallbackPrefix: "❯ ")
+                out.append(NSAttributedString(string: label, attributes: labelAttrs))
+                out.append(infoMark(labelAttrs))
+                if let toolBody {
+                    if rawMode {
+                        out.append(NSAttributedString(
+                            string: "\(cap(toolBody))\n", attributes: toolResult))
+                    } else {
+                        appendNice(
+                            toolBody, to: out, keyAttrs: toolResultKey, valueAttrs: toolResult)
+                    }
                 } else {
-                    out.append(NSAttributedString(
-                        string: "❯ \(cap(body))\n", attributes: user))
+                    out.append(NSAttributedString(string: "\(cap(text))\n", attributes: user))
                 }
             }
             let calls = turn.toolCalls ?? []
@@ -1376,8 +1589,9 @@ public enum TranscriptRender {
                     out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
                 out.append(NSAttributedString(
-                    string: "\(TurnHeader.responseLabel(model: turn.model))\n",
+                    string: TurnHeader.responseLabel(model: turn.model),
                     attributes: labelAttrs))
+                out.append(infoMark(labelAttrs))
             }
             if let text = turn.assistant, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
@@ -1393,27 +1607,30 @@ public enum TranscriptRender {
                 } else if let command = call.command {
                     out.append(NSAttributedString(string: "\(cap(command))\n", attributes: tool))
                 } else if !arguments.isEmpty {
-                    appendNice(
-                        arguments, to: out, keyAttrs: toolKey, valueAttrs: tool,
-                        fallbackPrefix: "")
+                    appendNice(arguments, to: out, keyAttrs: toolKey, valueAttrs: tool)
                 }
             }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }
             out.append(NSAttributedString(string: "\n", attributes: separator))
-            ranges.append(TurnRange(
-                traceId: turn.traceId,
-                range: NSRange(location: turnStart, length: out.length - turnStart)))
+            let turnRange = NSRange(location: turnStart, length: out.length - turnStart)
+            out.addAttribute(.transcriptTurnId, value: turn.traceId, range: turnRange)
+            ranges.append(TurnRange(traceId: turn.traceId, range: turnRange))
         }
         return TranscriptDocument(
             text: NSAttributedString(attributedString: out), turnRanges: ranges)
     }
 
+    static func infoMark(_ labelAttrs: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        var attrs = labelAttrs
+        attrs[.foregroundColor] = NSColor.controlAccentColor
+        return NSAttributedString(string: "  ⓘ\n", attributes: attrs)
+    }
+
     static func appendNice(
         _ body: String, to out: NSMutableAttributedString,
-        keyAttrs: [NSAttributedString.Key: Any], valueAttrs: [NSAttributedString.Key: Any],
-        fallbackPrefix: String
+        keyAttrs: [NSAttributedString.Key: Any], valueAttrs: [NSAttributedString.Key: Any]
     ) {
         for block in JsonNice.blocks(body) {
             switch block {
@@ -1424,8 +1641,7 @@ public enum TranscriptRender {
                 out.append(NSAttributedString(string: "\(key):\n", attributes: keyAttrs))
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: valueAttrs))
             case let .text(text):
-                out.append(NSAttributedString(
-                    string: "\(fallbackPrefix)\(cap(text))\n", attributes: valueAttrs))
+                out.append(NSAttributedString(string: "\(cap(text))\n", attributes: valueAttrs))
             }
         }
     }

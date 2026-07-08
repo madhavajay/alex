@@ -209,7 +209,7 @@ import Testing
         let doc = TranscriptRender.document(turns: turns)
         let text = doc.string
         #expect(text.contains("gpt-5.5"))
-        #expect(text.contains("❯ hello"))
+        #expect(text.contains("hello"))
         #expect(text.contains("world"))
         #expect(text.contains("upstream 429"))
         #expect(text.contains("· 429"))

@@ -167,6 +167,110 @@ import Testing
         #expect(!raw.contains("returncode: 0"))
     }
 
+    @Test func bubbleAttributeTagging() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":"hi","assistant":"yo","tool_calls":[{"name":"bash","arguments":"{\"command\":\"ls\"}"}]},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"[tool result] output text","assistant":null}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let built = TranscriptRender.build(turns: turns)
+        var kinds: [String] = []
+        built.text.enumerateAttribute(
+            .transcriptBubbleKind, in: NSRange(location: 0, length: built.text.length)
+        ) { value, _, _ in
+            guard let kind = value as? String else { return }
+            if kinds.last != kind { kinds.append(kind) }
+        }
+        #expect(kinds == [
+            TranscriptBubbleKind.user.rawValue,
+            TranscriptBubbleKind.model.rawValue,
+            TranscriptBubbleKind.tool.rawValue,
+            TranscriptBubbleKind.toolResult.rawValue,
+        ])
+        for range in built.turnRanges {
+            let atStart = built.text.attribute(
+                .transcriptTurnId, at: range.range.location, effectiveRange: nil) as? String
+            let atEnd = built.text.attribute(
+                .transcriptTurnId, at: range.range.upperBound - 1, effectiveRange: nil) as? String
+            #expect(atStart == range.traceId)
+            #expect(atEnd == range.traceId)
+        }
+    }
+
+    @Test func turnHitTestMapping() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"more","assistant":"text"}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let built = TranscriptRender.build(turns: turns)
+        let ranges = built.turnRanges
+        #expect(TurnHitTest.traceId(at: 0, in: ranges) == "t1")
+        #expect(TurnHitTest.traceId(at: ranges[0].range.upperBound - 1, in: ranges) == "t1")
+        #expect(TurnHitTest.traceId(at: ranges[1].range.location, in: ranges) == "t2")
+        #expect(TurnHitTest.traceId(at: built.text.length, in: ranges) == nil)
+        #expect(TurnHitTest.traceId(at: -1, in: ranges) == nil)
+        #expect(TurnHitTest.traceId(at: 5, in: []) == nil)
+    }
+
+    @Test func bodyCacheLRU() {
+        var cache = TraceBodyCache(capacity: 2)
+        let a = TraceBodyContent(text: "a", diskPath: "/a")
+        let b = TraceBodyContent(text: "b", diskPath: nil)
+        let c = TraceBodyContent(text: "c", diskPath: nil)
+        let keyA = TraceBodyCache.key(id: "t1", kind: .request)
+        let keyB = TraceBodyCache.key(id: "t1", kind: .response)
+        let keyC = TraceBodyCache.key(id: "t2", kind: .request)
+        #expect(keyA == "t1|request")
+        #expect(keyA != keyB)
+        cache.insert(a, for: keyA)
+        cache.insert(b, for: keyB)
+        #expect(cache.value(for: keyA) == a)
+        cache.insert(c, for: keyC)
+        #expect(cache.count == 2)
+        #expect(cache.value(for: keyB) == nil)
+        #expect(cache.value(for: keyA) == a)
+        #expect(cache.value(for: keyC) == c)
+        cache.insert(a, for: keyA)
+        #expect(cache.count == 2)
+    }
+
+    @Test func turnExportMarkdown() throws {
+        let json = #"""
+        {"extras":{"max_tokens":8,"message_count":1,"reasoning_effort":null,"system_chars":null,"temperature":null,"thinking_budget":null},"trace":{"account_id":"openai-oauth","billing_bucket":"subscription","client_format":"openai-chat","cost_usd":0.0002,"id":"9829-abc","input_tokens":11,"output_tokens":17,"requested_model":"gpt-5.5","routed_model":"gpt-5.6","session_id":"auto-1","status":200,"ts_request_ms":1783485291841,"ts_response_ms":1783485293618,"upstream_format":"openai-responses","upstream_provider":"openai"}}
+        """#
+        let decoded = try JSONDecoder().decode(TraceDetailResponse.self, from: Data(json.utf8))
+        let md = TurnExport.markdown(
+            detail: decoded.trace, extras: decoded.extras,
+            reqHeaders: [HeaderPair(name: "accept", value: "*/*")],
+            respHeaders: [],
+            reqBody: #"{"a":1}"#, respBody: nil)
+        #expect(md.hasPrefix("# Trace 9829-abc"))
+        #expect(md.contains("## Overview"))
+        #expect(md.contains("- status: 200"))
+        #expect(md.contains("- model: gpt-5.5 → gpt-5.6"))
+        #expect(md.contains("(translated)"))
+        #expect(md.contains("## Extras"))
+        #expect(md.contains("- max tokens: 8"))
+        #expect(md.contains("## Request headers\n```\naccept: */*\n```"))
+        #expect(md.contains("## Response headers\n_not available_"))
+        #expect(md.contains("## Request body\n```json"))
+        #expect(md.contains("\"a\""))
+        #expect(md.contains("## Response body\n_not available_"))
+        let fenceCount = md.components(separatedBy: "```").count - 1
+        #expect(fenceCount == 4)
+    }
+
+    @Test func systemPromptExtraDecoding() throws {
+        let json = #"""
+        {"extras":{"system_prompt":"You are a helpful agent.","max_tokens":null,"message_count":null,"reasoning_effort":null,"system_chars":24,"temperature":null,"thinking_budget":null},"trace":{"id":"x"}}
+        """#
+        let decoded = try JSONDecoder().decode(TraceDetailResponse.self, from: Data(json.utf8))
+        #expect(decoded.extras?.systemPrompt == "You are a helpful agent.")
+        let absent = #"{"extras":{"max_tokens":1},"trace":{"id":"y"}}"#
+        let decodedAbsent = try JSONDecoder().decode(
+            TraceDetailResponse.self, from: Data(absent.utf8))
+        #expect(decodedAbsent.extras?.systemPrompt == nil)
+    }
+
     @Test func turnRangeBookkeeping() throws {
         let json = #"""
         {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"more","assistant":"text"},{"trace_id":"t3","ts_request_ms":4,"ts_response_ms":null,"model":null,"status":429,"user":null,"assistant":null,"error":"boom"}]}
@@ -325,7 +429,7 @@ import Testing
         #expect(text.contains("⬆ pi · user"))
         #expect(text.contains("⬇ m · model"))
         #expect(text.contains("⬆ pi · tool result"))
-        #expect(text.contains("❯ grep output"))
+        #expect(text.contains("grep output"))
         #expect(!text.contains("[tool result]"))
         var foundLinks: [URL] = []
         doc.enumerateAttribute(.link, in: NSRange(location: 0, length: doc.length)) { value, _, _ in

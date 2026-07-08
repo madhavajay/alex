@@ -196,6 +196,55 @@ import Testing
         #expect(TagFilterDimension.task.activeValue(in: OmniQuery.parse("job:j")) == nil)
     }
 
+    @Test func multiModelFilterPipeline() {
+        let multi = makeSession(
+            id: "s-multi", models: ["claude-haiku-4-5", "gpt-5.5"], harness: "codex-cli",
+            runId: nil, lastStatus: 200, lastTsMs: 2000)
+        let other = makeSession(
+            id: "s-grok", models: ["grok-code-fast-1"], harness: "pi/0.1", runId: nil,
+            lastStatus: 500, tags: ["task": "algebra"], lastTsMs: 1000)
+        let sessions = [multi, other]
+        let rowsById = SessionTable.rowsById(sessions)
+        func visible(_ raw: String) -> [String] {
+            SessionTable.visibleRows(
+                sessions: sessions, rowsById: rowsById, showPings: true,
+                query: OmniQuery.parse(raw), serverMatches: nil,
+                sortOrder: SessionTable.defaultSortOrder()
+            ).map(\.id)
+        }
+        #expect(visible("") == ["s-multi", "s-grok"])
+        #expect(visible("model:gpt-5.5") == ["s-multi"])
+        #expect(visible("model:claude-haiku-4-5") == ["s-multi"])
+        #expect(visible("model:GPT-5.5") == ["s-multi"])
+        #expect(visible("model:grok") == ["s-grok"])
+        #expect(visible("model:nonexistent").isEmpty)
+        #expect(visible("harness:pi") == ["s-grok"])
+        #expect(visible("harness:codex") == ["s-multi"])
+        #expect(visible("task:algebra") == ["s-grok"])
+        #expect(visible("status:200") == ["s-multi"])
+        #expect(visible("status:500") == ["s-grok"])
+    }
+
+    @Test func modelDropdownSplitsJoinedValues() {
+        let joinedTag = makeSession(
+            id: "s-tag", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            tags: ["model": "claude-haiku-4-5, gpt-5.5"])
+        #expect(TagFilterDimension.model.values(in: [joinedTag])
+            == ["claude-haiku-4-5", "gpt-5.5"])
+        let multi = makeSession(
+            id: "s-multi", models: ["claude-haiku-4-5", "gpt-5.5"], harness: nil,
+            runId: nil, lastStatus: nil)
+        #expect(TagFilterDimension.model.values(in: [multi])
+            == ["claude-haiku-4-5", "gpt-5.5"])
+        let token = OmniQuery.settingToken(in: "", key: "model", value: "claude-haiku-4-5, gpt-5.5")
+        #expect(token == "model:claude-haiku-4-5")
+        let parsed = OmniQuery.parse(token)
+        #expect(parsed.model == "claude-haiku-4-5")
+        #expect(parsed.freeText.isEmpty)
+        #expect(OmniQuery.settingToken(in: "free", key: "model", value: "  ") == "free")
+        #expect(parsed.matches(multi))
+    }
+
     @Test func pingClassification() {
         #expect(SessionKind.isPingOrTest(sessionId: "auto-1", harness: "alexandria-ping"))
         #expect(SessionKind.isPingOrTest(sessionId: "auto-1", harness: "x/alexandria-ping/1.0"))

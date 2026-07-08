@@ -91,12 +91,27 @@ final class TraceBrowserModel {
         }
     }
 
-    var inspectorHighlightRange: NSRange? {
-        guard let inspectorTraceId else { return nil }
-        return turnRanges.first { $0.traceId == inspectorTraceId }?.range
+    var firstTurnTraceId: String? { turns.first?.traceId }
+
+    var sessionSystemPrompt: String? {
+        guard let prompt = firstTraceDetail?.extras?.systemPrompt, !prompt.isEmpty else {
+            return nil
+        }
+        return prompt
     }
 
-    var firstTurnTraceId: String? { turns.first?.traceId }
+    private var bodyCache = TraceBodyCache(capacity: 20)
+
+    func fetchTraceBody(id: String, kind: TraceBodyKind) async throws -> TraceBodyContent {
+        let key = TraceBodyCache.key(id: id, kind: kind)
+        if let cached = bodyCache.value(for: key) { return cached }
+        guard let client = client() else {
+            throw AlexandriaClient.ClientError.http(0, "daemon unavailable")
+        }
+        let content = try await client.traceBody(id: id, kind: kind)
+        bodyCache.insert(content, for: key)
+        return content
+    }
 
     var firstRequestHeaders: [HeaderPair] {
         TraceHeaders.sortedPairs(firstTraceDetail?.trace.reqHeadersJson)
@@ -613,7 +628,7 @@ struct TraceBrowserView: View {
                 SessionListView(model: model)
                     .frame(
                         minWidth: 280, idealWidth: SplitStore.leftWidth(),
-                        maxWidth: 640, maxHeight: .infinity)
+                        maxWidth: 1200, maxHeight: .infinity)
                     .background(
                         GeometryReader { proxy in
                             Color.clear.onChange(of: proxy.size.width) { _, width in
@@ -621,7 +636,7 @@ struct TraceBrowserView: View {
                             }
                         })
                 TranscriptView(model: model)
-                    .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
                 if let traceId = model.inspectorTraceId {
                     TraceInspectorView(traceId: traceId, model: model)
                         .frame(
@@ -771,7 +786,7 @@ enum SplitStore {
 
     static func leftWidth(defaults: UserDefaults = .standard) -> CGFloat {
         let stored = defaults.double(forKey: leftWidthKey)
-        guard stored >= 280, stored <= 640 else { return 380 }
+        guard stored >= 280, stored <= 1200 else { return 380 }
         return stored
     }
 
@@ -1044,6 +1059,7 @@ private struct SessionCellView: View {
 private struct TranscriptView: View {
     @Bindable var model: TraceBrowserModel
     @AppStorage("SessionInfoExpanded") private var infoExpanded = false
+    @State private var showSystemPrompt = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1146,7 +1162,24 @@ private struct TranscriptView: View {
                     .toggleStyle(.checkbox)
                     .controlSize(.mini)
                     .font(.system(size: 10))
+                    .fixedSize()
                     .help("Show exact wire text without JSON formatting")
+                if model.sessionSystemPrompt != nil {
+                    Button {
+                        showSystemPrompt = true
+                    } label: {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("View system prompt")
+                    .popover(isPresented: $showSystemPrompt) {
+                        SystemPromptView(
+                            prompt: model.sessionSystemPrompt ?? "",
+                            modelName: model.selectedSession?.models?.first)
+                    }
+                }
                 Button {
                     model.requestFind()
                 } label: {
