@@ -28,6 +28,7 @@ pub const OPENAI_CALLBACK_PATH: &str = "/auth/callback";
 pub(crate) const OPENAI_CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const OPENAI_JWT_CLAIM: &str = "https://api.openai.com/auth";
 pub const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+pub const XAI_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 
 pub struct Pkce {
     pub verifier: String,
@@ -433,7 +434,7 @@ pub struct XaiTokens {
 pub async fn xai_device_start(http: &reqwest::Client) -> Result<XaiDeviceStart> {
     let resp = http
         .post(XAI_DEVICE_CODE_URL)
-        .form(&[("client_id", XAI_CLIENT_ID)])
+        .form(&[("client_id", XAI_CLIENT_ID), ("scope", XAI_SCOPES)])
         .send()
         .await?;
     let status = resp.status();
