@@ -11,6 +11,12 @@ struct TranscriptTextPane: NSViewRepresentable {
         textView.isSelectable = true
         textView.isRichText = false
         textView.drawsBackground = false
+        textView.delegate = context.coordinator
+        textView.displaysLinkToolTips = false
+        textView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .cursor: NSCursor.pointingHand,
+        ]
         textView.textContainerInset = NSSize(width: 8, height: 10)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -32,7 +38,14 @@ struct TranscriptTextPane: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            let url = link as? URL ?? (link as? String).flatMap(URL.init(string:))
+            guard let url, let traceId = TraceLink.traceId(from: url) else { return false }
+            model?.openInspector(traceId: traceId)
+            return true
+        }
+
         private weak var scroll: NSScrollView?
         private weak var textView: NSTextView?
         private weak var model: TraceBrowserModel?

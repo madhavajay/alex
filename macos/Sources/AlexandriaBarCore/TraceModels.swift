@@ -76,6 +76,245 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable {
     }
 }
 
+public struct TraceDetailResponse: Codable, Sendable {
+    public let trace: TraceDetail
+    public let extras: TraceExtras?
+}
+
+public struct TraceDetail: Codable, Sendable {
+    public let id: String
+    public let sessionId: String?
+    public let runId: String?
+    public let harness: String?
+    public let method: String?
+    public let path: String?
+    public let status: Int?
+    public let error: String?
+    public let tsRequestMs: Int64?
+    public let tsResponseMs: Int64?
+    public let latencyMs: Int64?
+    public let requestedModel: String?
+    public let routedModel: String?
+    public let clientFormat: String?
+    public let upstreamFormat: String?
+    public let upstreamProvider: String?
+    public let billingBucket: String?
+    public let accountId: String?
+    public let clientIp: String?
+    public let keyFingerprint: String?
+    public let inputTokens: Int64?
+    public let cachedInputTokens: Int64?
+    public let cacheCreationTokens: Int64?
+    public let outputTokens: Int64?
+    public let reasoningTokens: Int64?
+    public let costUsd: Double?
+    public let reqHeadersJson: String?
+    public let respHeadersJson: String?
+    public let reqBodyPath: String?
+    public let upstreamReqBodyPath: String?
+    public let respBodyPath: String?
+    public let tagsJson: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, harness, method, path, status, error
+        case sessionId = "session_id"
+        case runId = "run_id"
+        case tsRequestMs = "ts_request_ms"
+        case tsResponseMs = "ts_response_ms"
+        case latencyMs = "latency_ms"
+        case requestedModel = "requested_model"
+        case routedModel = "routed_model"
+        case clientFormat = "client_format"
+        case upstreamFormat = "upstream_format"
+        case upstreamProvider = "upstream_provider"
+        case billingBucket = "billing_bucket"
+        case accountId = "account_id"
+        case clientIp = "client_ip"
+        case keyFingerprint = "key_fingerprint"
+        case inputTokens = "input_tokens"
+        case cachedInputTokens = "cached_input_tokens"
+        case cacheCreationTokens = "cache_creation_tokens"
+        case outputTokens = "output_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case costUsd = "cost_usd"
+        case reqHeadersJson = "req_headers_json"
+        case respHeadersJson = "resp_headers_json"
+        case reqBodyPath = "req_body_path"
+        case upstreamReqBodyPath = "upstream_req_body_path"
+        case respBodyPath = "resp_body_path"
+        case tagsJson = "tags_json"
+    }
+}
+
+public struct TraceExtras: Codable, Sendable {
+    public let reasoningEffort: String?
+    public let thinkingBudget: Int64?
+    public let maxTokens: Int64?
+    public let temperature: Double?
+    public let messageCount: Int?
+    public let systemChars: Int?
+
+    public var hasAny: Bool {
+        reasoningEffort != nil || thinkingBudget != nil || maxTokens != nil
+            || temperature != nil || messageCount != nil || systemChars != nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case temperature
+        case reasoningEffort = "reasoning_effort"
+        case thinkingBudget = "thinking_budget"
+        case maxTokens = "max_tokens"
+        case messageCount = "message_count"
+        case systemChars = "system_chars"
+    }
+}
+
+public struct HeaderPair: Equatable, Sendable {
+    public let name: String
+    public let value: String
+
+    public init(name: String, value: String) {
+        self.name = name
+        self.value = value
+    }
+}
+
+public enum TraceHeaders {
+    public static func sortedPairs(_ json: String?) -> [HeaderPair] {
+        guard let json, let data = json.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [] }
+        return obj
+            .map { HeaderPair(name: $0.key, value: Self.string($0.value)) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    static func string(_ value: Any) -> String {
+        switch value {
+        case let s as String: s
+        case let n as NSNumber: n.stringValue
+        default: "\(value)"
+        }
+    }
+}
+
+public struct HeaderDelta: Equatable, Sendable {
+    public let added: Set<String>
+    public let removed: Set<String>
+    public let changed: Set<String>
+
+    public init(added: Set<String>, removed: Set<String>, changed: Set<String>) {
+        self.added = added
+        self.removed = removed
+        self.changed = changed
+    }
+
+    public var isEmpty: Bool { added.isEmpty && removed.isEmpty && changed.isEmpty }
+
+    public enum Status: Equatable, Sendable {
+        case same, added, changed
+    }
+
+    public func status(for name: String) -> Status {
+        let key = name.lowercased()
+        if added.contains(key) { return .added }
+        if changed.contains(key) { return .changed }
+        return .same
+    }
+}
+
+public enum HeaderDiff {
+    public static func delta(first: [HeaderPair], other: [HeaderPair]) -> HeaderDelta {
+        let firstMap = Dictionary(
+            first.map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { a, _ in a })
+        let otherMap = Dictionary(
+            other.map { ($0.name.lowercased(), $0.value) }, uniquingKeysWith: { a, _ in a })
+        var added = Set<String>()
+        var changed = Set<String>()
+        for (key, value) in otherMap {
+            guard let firstValue = firstMap[key] else {
+                added.insert(key)
+                continue
+            }
+            if firstValue != value { changed.insert(key) }
+        }
+        let removed = Set(firstMap.keys.filter { otherMap[$0] == nil })
+        return HeaderDelta(added: added, removed: removed, changed: changed)
+    }
+}
+
+public enum TraceLink {
+    public static let scheme = "alexandria"
+    public static let host = "trace"
+
+    public static func url(forTraceId id: String) -> URL? {
+        guard !id.isEmpty else { return nil }
+        var comps = URLComponents()
+        comps.scheme = scheme
+        comps.host = host
+        comps.path = "/" + id
+        return comps.url
+    }
+
+    public static func traceId(from url: URL) -> String? {
+        guard url.scheme == scheme, url.host == host else { return nil }
+        let raw = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
+        let id = raw.removingPercentEncoding ?? raw
+        return id.isEmpty ? nil : id
+    }
+}
+
+public enum TurnHeader {
+    public static func duration(requestMs: Int64, responseMs: Int64?) -> String? {
+        guard let responseMs, responseMs >= requestMs else { return nil }
+        return String(format: "%.1fs", Double(responseMs - requestMs) / 1000.0)
+    }
+
+    public static func facts(
+        turnNumber: Int, time: String, model: String?, status: Int?,
+        requestMs: Int64, responseMs: Int64?,
+        tokensIn: Int64? = nil, tokensOut: Int64? = nil, costUsd: Double? = nil
+    ) -> String {
+        var parts = ["Turn \(turnNumber)", time]
+        if let model {
+            parts.append(status.map { "\(model) → \($0)" } ?? model)
+        } else if let status {
+            parts.append("\(status)")
+        }
+        if let dur = duration(requestMs: requestMs, responseMs: responseMs) {
+            parts.append(dur)
+        }
+        if tokensIn != nil || tokensOut != nil {
+            parts.append(
+                "\(TraceNumberFormat.tokens(tokensIn))→\(TraceNumberFormat.tokens(tokensOut)) tok")
+        }
+        if let costUsd, costUsd > 0 { parts.append(TraceNumberFormat.cost(costUsd)) }
+        return "── " + parts.joined(separator: " · ") + " ──"
+    }
+}
+
+public enum BodyPretty {
+    public static let displayCap = 200_000
+
+    public static func display(_ raw: String, cap: Int = displayCap) -> CappedText {
+        var text = raw
+        if let data = raw.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data),
+            let pretty = try? JSONSerialization.data(
+                withJSONObject: obj,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+            let str = String(data: pretty, encoding: .utf8) {
+            text = str
+        }
+        let full = text.count
+        guard full > cap else {
+            return CappedText(text: text, isTruncated: false, fullCharCount: full)
+        }
+        let capped = String(text.prefix(cap)) + "\n… (+\(full - cap) chars truncated)"
+        return CappedText(text: capped, isTruncated: true, fullCharCount: full)
+    }
+}
+
 public struct TraceSearchResponse: Codable, Sendable {
     public let traces: [TraceSearchRow]
     public let scanned: Int?
@@ -334,6 +573,16 @@ public enum ModelProvider {
         if m.hasPrefix("grok") { return "xai" }
         if m.hasPrefix("gemini") { return "gemini" }
         return nil
+    }
+
+    public static func initial(for provider: String) -> String {
+        switch provider.lowercased() {
+        case "anthropic": "A"
+        case "openai": "O"
+        case "xai": "X"
+        case "gemini": "G"
+        default: provider.first.map { String($0).uppercased() } ?? "?"
+        }
     }
 
     public static func providers(in models: [String]?) -> [String] {
@@ -695,41 +944,70 @@ public enum TranscriptRender {
             + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
     }
 
-    public static func document(turns: [TranscriptTurn]) -> NSAttributedString {
+    public static func document(
+        turns: [TranscriptTurn], firstTurnNumber: Int = 1
+    ) -> NSAttributedString {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         let headerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         let bodyFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
+        let headerPara = NSMutableParagraphStyle()
+        headerPara.paragraphSpacing = 4
+        let userPara = NSMutableParagraphStyle()
+        userPara.firstLineHeadIndent = 48
+        userPara.headIndent = 48
+        userPara.tailIndent = -8
+        userPara.paragraphSpacing = 2
+        let assistantPara = NSMutableParagraphStyle()
+        assistantPara.firstLineHeadIndent = 8
+        assistantPara.headIndent = 8
+        assistantPara.tailIndent = -48
+        assistantPara.paragraphSpacing = 2
+
         let header: [NSAttributedString.Key: Any] = [
             .font: headerFont, .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: headerPara,
         ]
-        let badStatus: [NSAttributedString.Key: Any] = [
+        let badHeader: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .bold),
             .foregroundColor: NSColor.systemRed,
+            .paragraphStyle: headerPara,
         ]
         let user: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: userPara,
+            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
         ]
         let assistant: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: assistantPara,
+            .backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.06),
         ]
         let error: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.systemRed,
+            .paragraphStyle: assistantPara,
         ]
         let out = NSMutableAttributedString()
-        for turn in turns {
-            var parts = [formatter.string(
-                from: Date(timeIntervalSince1970: Double(turn.tsRequestMs) / 1000))]
-            if let model = turn.model { parts.append(model) }
-            parts.append("\(tokens(turn.inputTokens))→\(tokens(turn.outputTokens)) tok")
-            if let usd = turn.costUsd, usd > 0 { parts.append(cost(usd)) }
+        for (index, turn) in turns.enumerated() {
+            let facts = TurnHeader.facts(
+                turnNumber: firstTurnNumber + index,
+                time: formatter.string(
+                    from: Date(timeIntervalSince1970: Double(turn.tsRequestMs) / 1000)),
+                model: turn.model, status: turn.status,
+                requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
+                tokensIn: turn.inputTokens, tokensOut: turn.outputTokens,
+                costUsd: turn.costUsd)
+            let isError = (turn.status ?? 0) >= 400
             out.append(NSAttributedString(
-                string: "── \(parts.joined(separator: " · "))", attributes: header))
-            if let status = turn.status {
-                out.append(NSAttributedString(
-                    string: " · \(status)", attributes: status >= 400 ? badStatus : header))
+                string: facts, attributes: isError ? badHeader : header))
+            if let link = TraceLink.url(forTraceId: turn.traceId) {
+                out.append(NSAttributedString(string: "  ", attributes: header))
+                var linkAttrs = header
+                linkAttrs[.link] = link
+                out.append(NSAttributedString(string: "Details", attributes: linkAttrs))
             }
-            out.append(NSAttributedString(string: " ──\n", attributes: header))
+            out.append(NSAttributedString(string: "\n", attributes: header))
             if let text = turn.user, !text.isEmpty {
                 out.append(NSAttributedString(string: "❯ \(cap(text))\n", attributes: user))
             }

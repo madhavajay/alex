@@ -1,5 +1,21 @@
 import Foundation
 
+public enum TraceBodyKind: String, Sendable, CaseIterable {
+    case request
+    case upstreamRequest = "upstream-request"
+    case response
+}
+
+public struct TraceBodyContent: Sendable {
+    public let text: String
+    public let diskPath: String?
+
+    public init(text: String, diskPath: String?) {
+        self.text = text
+        self.diskPath = diskPath
+    }
+}
+
 public struct AlexandriaClient: Sendable {
     public let config: DaemonConfig
     private let session: URLSession
@@ -186,6 +202,36 @@ public struct AlexandriaClient: Sendable {
                 URLQueryItem(name: "run_id", value: filters.run),
             ],
             as: TraceSearchResponse.self)
+    }
+
+    public func traceDetail(id: String) async throws -> TraceDetailResponse {
+        try await get("traces/\(id)", as: TraceDetailResponse.self)
+    }
+
+    public func traceBody(id: String, kind: TraceBodyKind) async throws -> TraceBodyContent {
+        var req = URLRequest(url: url("traces/\(id)/body/\(kind.rawValue)"))
+        req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
+        let start = ContinuousClock.now
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            BarLog.error(
+                .net,
+                "GET /traces/\(id)/body/\(kind.rawValue) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
+            throw error
+        }
+        let http = resp as? HTTPURLResponse
+        let status = http?.statusCode ?? -1
+        if status >= 400 {
+            BarLog.error(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
+            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+        }
+        BarLog.info(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
+        return TraceBodyContent(
+            text: String(data: data, encoding: .utf8) ?? "",
+            diskPath: http?.value(forHTTPHeaderField: "x-alexandria-body-path"))
     }
 
     public func traceReplyMarkdown(traceId: String) async throws -> String {

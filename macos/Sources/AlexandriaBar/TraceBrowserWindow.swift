@@ -70,6 +70,61 @@ final class TraceBrowserModel {
     private var transcriptTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
 
+    private(set) var inspectorTraceId: String?
+    private(set) var firstTraceDetail: TraceDetailResponse?
+    private var firstDetailKey: String?
+    private var firstDetailTask: Task<Void, Never>?
+
+    var firstTurnTraceId: String? { turns.first?.traceId }
+
+    var firstRequestHeaders: [HeaderPair] {
+        TraceHeaders.sortedPairs(firstTraceDetail?.trace.reqHeadersJson)
+    }
+
+    func openInspector(traceId: String) {
+        inspectorTraceId = traceId
+    }
+
+    func closeInspector() {
+        inspectorTraceId = nil
+    }
+
+    func detailClient() -> AlexandriaClient? { client() }
+
+    func ensureFirstTraceDetail() {
+        guard let sid = selectedSessionId, let first = turns.first else { return }
+        let key = "\(sid)|\(first.traceId)"
+        guard key != firstDetailKey else { return }
+        firstDetailKey = key
+        firstTraceDetail = nil
+        firstDetailTask?.cancel()
+        firstDetailTask = Task { [weak self] in
+            guard let client = self?.client() else { return }
+            guard let detail = try? await client.traceDetail(id: first.traceId) else { return }
+            guard !Task.isCancelled, let self, self.firstDetailKey == key else { return }
+            self.firstTraceDetail = detail
+        }
+    }
+
+    func revealSessionBodies(_ session: TraceSession) {
+        Task {
+            guard let client = client() else { return }
+            var bodyPath: String?
+            if let last = try? await client.traceTranscript(sessionId: session.sessionId).turns.last,
+                let detail = try? await client.traceDetail(id: last.traceId) {
+                bodyPath = detail.trace.reqBodyPath
+                    ?? detail.trace.respBodyPath ?? detail.trace.upstreamReqBodyPath
+            }
+            if let bodyPath {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: bodyPath)])
+            } else {
+                let fallback = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent(".alexandria/bodies")
+                NSWorkspace.shared.activateFileViewerSelecting([fallback])
+            }
+        }
+    }
+
     init(store: SnapshotStore) {
         self.store = store
     }
@@ -132,6 +187,8 @@ final class TraceBrowserModel {
         searchTask = nil
         renderChain?.cancel()
         renderChain = nil
+        firstDetailTask?.cancel()
+        firstDetailTask = nil
     }
 
     func selectFromUser(_ id: String) {
@@ -156,6 +213,11 @@ final class TraceBrowserModel {
     private func resetTurns() {
         turns = []
         turnsFingerprint = ""
+        inspectorTraceId = nil
+        firstTraceDetail = nil
+        firstDetailKey = nil
+        firstDetailTask?.cancel()
+        firstDetailTask = nil
         renderChain?.cancel()
         renderChain = nil
         renderState = TranscriptRender.state(for: [])
@@ -212,15 +274,18 @@ final class TraceBrowserModel {
         renderState = TranscriptRender.state(for: windowed)
         let slice: [TranscriptTurn]
         let isAppend: Bool
+        let firstNumber: Int
         switch plan {
         case .unchanged:
             return
         case .rebuild:
             slice = windowed
             isAppend = false
+            firstNumber = windowStart + 1
         case let .append(from):
             slice = Array(windowed[from...])
             isAppend = true
+            firstNumber = windowStart + from + 1
         }
         let sid = selectedSessionId
         let prev = renderChain
@@ -228,7 +293,7 @@ final class TraceBrowserModel {
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
-                let doc = TranscriptRender.document(turns: slice)
+                let doc = TranscriptRender.document(turns: slice, firstTurnNumber: firstNumber)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
@@ -313,6 +378,7 @@ final class TraceBrowserModel {
                     turns = resp.turns
                 }
                 scheduleRender()
+                ensureFirstTraceDetail()
             }
         } catch is AlexandriaClient.ClientError {
             daemonDown = false
@@ -470,9 +536,22 @@ struct TraceBrowserView: View {
             }
             HSplitView {
                 SessionListView(model: model)
-                    .frame(minWidth: 300, idealWidth: 380, maxWidth: 560, maxHeight: .infinity)
+                    .frame(
+                        minWidth: 280, idealWidth: SplitStore.leftWidth(),
+                        maxWidth: 640, maxHeight: .infinity)
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.onChange(of: proxy.size.width) { _, width in
+                                SplitStore.saveLeftWidth(width)
+                            }
+                        })
                 TranscriptView(model: model)
-                    .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                if let traceId = model.inspectorTraceId {
+                    TraceInspectorView(traceId: traceId, model: model)
+                        .frame(
+                            minWidth: 300, idealWidth: 340, maxWidth: 520, maxHeight: .infinity)
+                }
             }
         }
         .frame(minWidth: 720, minHeight: 400)
@@ -608,6 +687,23 @@ private struct TagChipView: View {
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .background(Capsule().fill(.quaternary.opacity(0.6)))
+    }
+}
+
+enum SplitStore {
+    static let leftWidthKey = "TraceBrowserLeftPaneWidth"
+    nonisolated(unsafe) private static var lastSaved: CGFloat = 0
+
+    static func leftWidth(defaults: UserDefaults = .standard) -> CGFloat {
+        let stored = defaults.double(forKey: leftWidthKey)
+        guard stored >= 280, stored <= 640 else { return 380 }
+        return stored
+    }
+
+    static func saveLeftWidth(_ width: CGFloat, defaults: UserDefaults = .standard) {
+        guard abs(width - lastSaved) > 2 else { return }
+        lastSaved = width
+        defaults.set(Double(width), forKey: leftWidthKey)
     }
 }
 
@@ -820,6 +916,7 @@ private struct SessionListView: View {
         Button("Copy Session ID") { model.copySessionId(session) }
         Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
         Button("Export Session…") { model.exportSession(session) }
+        Button("Reveal Bodies in Finder") { model.revealSessionBodies(session) }
         Divider()
         Button("Delete Session's Traces…", role: .destructive) {
             model.deleteSessionTraces(session)
@@ -846,6 +943,15 @@ private struct SessionCellView: View {
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if row.errors > 0 {
+                Text("✗ \(row.errors)")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.red))
+                    .help("\(row.errors) failed request\(row.errors == 1 ? "" : "s")")
+            }
             if pinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 8))
@@ -862,10 +968,15 @@ private struct SessionCellView: View {
 
 private struct TranscriptView: View {
     @Bindable var model: TraceBrowserModel
+    @AppStorage("SessionInfoExpanded") private var infoExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            if infoExpanded, model.selectedSession != nil {
+                Divider()
+                SessionInfoCard(model: model)
+            }
             Divider()
             if model.hiddenTurnCount > 0 {
                 Button("Load earlier turns (\(model.hiddenTurnCount) more)") {
@@ -932,10 +1043,40 @@ private struct TranscriptView: View {
                 ForEach(chips, id: \.key) { chip in
                     TagChipView(text: chip.label())
                 }
+                if let models = session.models, !models.isEmpty {
+                    Text(models.joined(separator: ", "))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if let cost = session.totalCostUsd, cost > 0 {
+                    Text(TraceFormat.cost(cost))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if let runId = session.runId, !runId.isEmpty {
+                    Text("run \(runId)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 120)
+                }
                 Spacer()
                 Text("\(model.turns.count) turn\(model.turns.count == 1 ? "" : "s")")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                Button {
+                    infoExpanded.toggle()
+                    if infoExpanded { model.ensureFirstTraceDetail() }
+                } label: {
+                    Image(systemName: infoExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(infoExpanded ? "Hide session info" : "Show session info")
             } else {
                 Text("No session selected")
                     .font(.system(size: 11))

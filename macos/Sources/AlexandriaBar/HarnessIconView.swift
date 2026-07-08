@@ -54,7 +54,11 @@ struct ProviderBadgeView: View {
                 Circle().strokeBorder(
                     provider == "xai" ? Color.white.opacity(0.85) : Color.clear,
                     lineWidth: 1))
-            .frame(width: 8, height: 8)
+            .overlay(
+                Text(ModelProvider.initial(for: provider))
+                    .font(.system(size: 6, weight: .bold))
+                    .foregroundStyle(.white))
+            .frame(width: 10, height: 10)
             .help(name)
     }
 
