@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [--service] [--upgrade] [--prefix DIR] [--nosplash]
 
-  (none)     build --release and install the alexandria binary system-wide
+  (none)     build --release and install the alex binary (+ alexandria symlink) system-wide
   --service  also install + load the launchd agent (macOS) so it runs at login
   --upgrade  zero-downtime deploy: build + install, start a NEW daemon on the
              same port (SO_REUSEPORT), wait until it is healthy, then SIGTERM
@@ -19,7 +19,7 @@ traffic flows to the new binary. The old daemon's dario generation drains and
 dies with it; the new daemon spawns its own.
 
 Little Snitch note: approving the installed path once
-(e.g. /usr/local/bin/alexandria) survives upgrades that reuse that path.
+(e.g. /usr/local/bin/alex) survives upgrades that reuse that path.
 EOF
 }
 
@@ -51,7 +51,8 @@ if [ -z "$PREFIX" ]; then
     PREFIX="$HOME/.local/bin"
   fi
 fi
-BIN="$PREFIX/alexandria"
+BIN="$PREFIX/alex"
+ALIAS_BIN="$PREFIX/alexandria"
 
 ANIM_PID=""
 ANIM_LOG=""
@@ -92,10 +93,12 @@ fi
 say "☥ build complete — installing to $PREFIX"
 mkdir -p "$PREFIX" 2>/dev/null || true
 if [ -w "$PREFIX" ]; then
-  install -m 0755 target/release/alexandria "$BIN"
+  install -m 0755 target/release/alex "$BIN"
+  ln -sf "$BIN" "$ALIAS_BIN"
 else
   anim_stop
-  sudo install -m 0755 target/release/alexandria "$BIN"
+  sudo install -m 0755 target/release/alex "$BIN"
+  sudo ln -sf "$BIN" "$ALIAS_BIN"
 fi
 if [ -z "$ANIM_PID" ] && [ "$UPGRADE" = "0" ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${ALEXANDRIA_NO_LIGHT:-0}" != "1" ]; then
   "$BIN" light --loops 1 || true

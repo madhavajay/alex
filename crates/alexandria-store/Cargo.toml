@@ -2,9 +2,12 @@
 name = "alexandria-store"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite trace store, pricing seed, and analytics for alex (Alexandria)"
 
 [dependencies]
-alexandria-core = { path = "../alexandria-core" }
+alexandria-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

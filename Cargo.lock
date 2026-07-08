@@ -30,34 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "alexandria-auth"
-version = "0.1.0"
-dependencies = [
- "alexandria-core",
- "anyhow",
- "base64",
- "chrono",
- "dirs",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "alexandria-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "alexandria-daemon"
+name = "alex"
 version = "0.1.0"
 dependencies = [
  "alexandria-auth",
@@ -83,6 +56,33 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "alexandria-auth"
+version = "0.1.0"
+dependencies = [
+ "alexandria-core",
+ "anyhow",
+ "base64",
+ "chrono",
+ "dirs",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "alexandria-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

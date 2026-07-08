@@ -16,7 +16,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_DOCKER_IMAGE: &str = "node:22-bookworm-slim";
 const CATALOG_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../config/harnesses.json"
+    "/config/harnesses.json"
 ));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

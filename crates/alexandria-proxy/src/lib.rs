@@ -1614,13 +1614,33 @@ fn session_from_metadata(body_json: &Value) -> Option<String> {
     Some(raw.to_string())
 }
 
+const METADATA_HEADERS: &[(&str, &str)] = &[
+    ("x-alexandria-harness", "harness"),
+    ("x-alexandria-task", "task"),
+    ("x-alexandria-model", "model"),
+    ("x-alexandria-job", "job"),
+];
+
 fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
     let values: Vec<&str> = headers
         .get_all("x-alexandria-trace-tag")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .collect();
-    let tags = parse_trace_tags(&values);
+    let mut tags = parse_trace_tags(&values);
+    if let Some(o) = tags.as_object_mut() {
+        for (header, key) in METADATA_HEADERS {
+            if o.contains_key(*key) {
+                continue;
+            }
+            if let Some(v) = headers.get(*header).and_then(|v| v.to_str().ok()) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    o.insert((*key).to_string(), json!(v));
+                }
+            }
+        }
+    }
     if tags.as_object().map(|o| o.is_empty()).unwrap_or(true) {
         return None;
     }

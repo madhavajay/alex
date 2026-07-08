@@ -2,6 +2,9 @@
 name = "alexandria-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core routing, format translation, usage parsing, and pricing logic for alex (Alexandria)"
 
 [dependencies]
 serde = { workspace = true }

@@ -1,17 +1,24 @@
 [package]
-name = "alexandria-daemon"
+name = "alex"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Alexandria: local LLM credential vault, multi-provider routing proxy, and trace capture daemon"
+
+[[bin]]
+name = "alex"
+path = "src/main.rs"
 
 [[bin]]
 name = "alexandria"
 path = "src/main.rs"
 
 [dependencies]
-alexandria-core = { path = "../alexandria-core" }
-alexandria-auth = { path = "../alexandria-auth" }
-alexandria-store = { path = "../alexandria-store" }
-alexandria-proxy = { path = "../alexandria-proxy" }
+alexandria-core = { workspace = true }
+alexandria-auth = { workspace = true }
+alexandria-store = { workspace = true }
+alexandria-proxy = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

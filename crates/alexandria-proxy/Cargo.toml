@@ -2,11 +2,14 @@
 name = "alexandria-proxy"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP routing proxy and admin API for alex (Alexandria)"
 
 [dependencies]
-alexandria-core = { path = "../alexandria-core" }
-alexandria-auth = { path = "../alexandria-auth" }
-alexandria-store = { path = "../alexandria-store" }
+alexandria-core = { workspace = true }
+alexandria-auth = { workspace = true }
+alexandria-store = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

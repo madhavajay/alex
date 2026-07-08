@@ -1509,11 +1509,11 @@ async fn run_pings(
 
 const LAUNCHD_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../config/launchd/com.alexandria.daemon.plist"
+    "/config/launchd/com.alexandria.daemon.plist"
 ));
 const SYSTEMD_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../config/systemd/alexandria.service"
+    "/config/systemd/alexandria.service"
 ));
 
 fn current_uid() -> String {

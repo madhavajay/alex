@@ -38,9 +38,14 @@ public enum DaemonController {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
             override,
+            "\(home)/.local/bin/alex",
+            "/usr/local/bin/alex",
+            "/opt/homebrew/bin/alex",
+            "\(home)/.cargo/bin/alex",
             "\(home)/.local/bin/alexandria",
             "/usr/local/bin/alexandria",
             "/opt/homebrew/bin/alexandria",
+            "\(home)/dev/alexandria/target/release/alex",
             "\(home)/dev/alexandria/target/release/alexandria",
         ]
         return candidates.first { !$0.isEmpty && FileManager.default.isExecutableFile(atPath: $0) }
