@@ -1,5 +1,5 @@
 [package]
-name = "alexandria-core"
+name = "alex-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alexandria_core::Provider;
+use alex_core::Provider;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};

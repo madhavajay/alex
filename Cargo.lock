@@ -33,10 +33,10 @@ dependencies = [
 name = "alex"
 version = "0.1.2"
 dependencies = [
- "alexandria-auth",
- "alexandria-core",
- "alexandria-proxy",
- "alexandria-store",
+ "alex-auth",
+ "alex-core",
+ "alex-proxy",
+ "alex-store",
  "anyhow",
  "axum",
  "base64",
@@ -59,10 +59,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "alexandria-auth"
+name = "alex-auth"
 version = "0.1.2"
 dependencies = [
- "alexandria-core",
+ "alex-core",
  "anyhow",
  "base64",
  "chrono",
@@ -77,7 +77,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "alexandria-core"
+name = "alex-core"
 version = "0.1.2"
 dependencies = [
  "chrono",
@@ -86,12 +86,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "alexandria-proxy"
+name = "alex-proxy"
 version = "0.1.2"
 dependencies = [
- "alexandria-auth",
- "alexandria-core",
- "alexandria-store",
+ "alex-auth",
+ "alex-core",
+ "alex-store",
  "anyhow",
  "axum",
  "base64",
@@ -108,10 +108,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "alexandria-store"
+name = "alex-store"
 version = "0.1.2"
 dependencies = [
- "alexandria-core",
+ "alex-core",
  "anyhow",
  "chrono",
  "flate2",

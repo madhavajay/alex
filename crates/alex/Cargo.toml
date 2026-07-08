@@ -16,10 +16,10 @@ name = "alexandria"
 path = "src/main.rs"
 
 [dependencies]
-alexandria-core = { workspace = true }
-alexandria-auth = { workspace = true }
-alexandria-store = { workspace = true }
-alexandria-proxy = { workspace = true }
+alex-core = { workspace = true }
+alex-auth = { workspace = true }
+alex-store = { workspace = true }
+alex-proxy = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

@@ -61,10 +61,10 @@ cd macos && ./Scripts/run.sh   # build + launch dist/AlexandriaBar.app
 | Crate | What it is |
 |---|---|
 | [`alex`](https://crates.io/crates/alex) | The daemon + CLI (binaries: `alex`, `alexandria`) |
-| [`alexandria-core`](https://crates.io/crates/alexandria-core) | Routing, translation, usage & pricing logic (pure, no I/O) |
-| [`alexandria-auth`](https://crates.io/crates/alexandria-auth) | Credential vault, OAuth/device login flows |
-| [`alexandria-store`](https://crates.io/crates/alexandria-store) | SQLite trace store & analytics |
-| [`alexandria-proxy`](https://crates.io/crates/alexandria-proxy) | axum ingress, admin API, upstream clients |
+| [`alex-core`](https://crates.io/crates/alex-core) | Routing, translation, usage & pricing logic (pure, no I/O) |
+| [`alex-auth`](https://crates.io/crates/alex-auth) | Credential vault, OAuth/device login flows |
+| [`alex-store`](https://crates.io/crates/alex-store) | SQLite trace store & analytics |
+| [`alex-proxy`](https://crates.io/crates/alex-proxy) | axum ingress, admin API, upstream clients |
 
 ## Development
 

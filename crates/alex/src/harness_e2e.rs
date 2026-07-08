@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use alexandria_auth::now_ms;
-use alexandria_core::route_model;
-use alexandria_store::Store;
+use alex_auth::now_ms;
+use alex_core::route_model;
+use alex_store::Store;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 

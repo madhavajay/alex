@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
-use alexandria_auth::now_ms;
+use alex_auth::now_ms;
 
 pub fn colors_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

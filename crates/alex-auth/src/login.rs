@@ -14,7 +14,7 @@ use crate::{
     import_grok, jwt_exp_ms, now_ms, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
     OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
-use alexandria_core::Provider;
+use alex_core::Provider;
 
 pub const PROVIDERS: &[&str] = &["claude", "codex", "grok", "gemini"];
 

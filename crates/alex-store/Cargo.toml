@@ -1,5 +1,5 @@
 [package]
-name = "alexandria-store"
+name = "alex-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 description = "SQLite trace store, pricing seed, and analytics for alex (Alexandria)"
 
 [dependencies]
-alexandria-core = { workspace = true }
+alex-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

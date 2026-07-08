@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alexandria_auth::{now_ms, Account, Vault};
-use alexandria_core::{
+use alex_auth::{now_ms, Account, Vault};
+use alex_core::{
     compute_cost, conversation_root, parse_since, parse_sse_usage, parse_trace_tags, route_model,
     usage_from_json, ClientFormat, Provider, TraceRecord,
 };
-use alexandria_store::{Store, TraceFilter};
+use alex_store::{Store, TraceFilter};
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -58,7 +58,7 @@ pub struct AppState {
     pub started_ms: i64,
     pub base_url: String,
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
-    pub logins: alexandria_auth::sessions::LoginManager,
+    pub logins: alex_auth::sessions::LoginManager,
 }
 
 struct InFlight(Arc<AppState>);
@@ -101,7 +101,7 @@ pub fn build_state(
         started_ms: now_ms(),
         base_url,
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
-        logins: alexandria_auth::sessions::LoginManager::default(),
+        logins: alex_auth::sessions::LoginManager::default(),
     })
 }
 
@@ -151,7 +151,7 @@ async fn admin_auth_import(
         .and_then(|b| b.0["source"].as_str().or(b.0["provider"].as_str()))
         .unwrap_or("all")
         .to_string();
-    match alexandria_auth::import_all(&state.vault, &source).await {
+    match alex_auth::import_all(&state.vault, &source).await {
         Ok(outcomes) => {
             let items: Vec<Value> = outcomes
                 .iter()
@@ -268,7 +268,7 @@ async fn connect_info(
 
 async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut ids = state.store.pricing_models();
-    for (alias, _) in alexandria_core::model_aliases() {
+    for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
     for id in ids.clone() {
@@ -418,7 +418,7 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
             continue;
         };
         let headers: Value = serde_json::from_str(&headers_json).unwrap_or(Value::Null);
-        let mut parsed = alexandria_core::parse_limit_headers(provider, &headers);
+        let mut parsed = alex_core::parse_limit_headers(provider, &headers);
         if let Some(o) = parsed.as_object_mut() {
             o.insert("provider".into(), json!(provider_str));
             o.insert("source".into(), json!("captured response headers"));
@@ -612,7 +612,7 @@ async fn traces_sessions(
 }
 
 fn transcript_turn(row: &Value) -> Value {
-    use alexandria_core::translate;
+    use alex_core::translate;
     let user = read_gz_json(row["req_body_path"].as_str())
         .and_then(|req| {
             translate::last_user_text(row["client_format"].as_str().unwrap_or(""), &req)
@@ -696,7 +696,7 @@ async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -
 }
 
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    use alexandria_core::translate;
+    use alex_core::translate;
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -1167,7 +1167,7 @@ async fn plan_upstream(
     original_body: &[u8],
     trace_id: &str,
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
-    use alexandria_core::translate;
+    use alex_core::translate;
     let client_stream = body_json["stream"].as_bool().unwrap_or(false);
     match provider {
         Provider::Anthropic => {
@@ -1861,7 +1861,7 @@ async fn proxy(
     let is_sse = content_type.starts_with("text/event-stream");
 
     if let Some(target) = plan.respond_as {
-        use alexandria_core::translate;
+        use alex_core::translate;
         let buf = match upstream_resp.bytes().await {
             Ok(b) => b.to_vec(),
             Err(e) => {

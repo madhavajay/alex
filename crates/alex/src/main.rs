@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alexandria_auth::{import_all, now_ms, Vault};
-use alexandria_store::Store;
+use alex_auth::{import_all, now_ms, Vault};
+use alex_store::Store;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rand::Rng;
@@ -349,8 +349,8 @@ fn default_dario_probe_model() -> String {
 }
 
 impl Config {
-    fn ping_models(&self) -> alexandria_proxy::PingModels {
-        alexandria_proxy::PingModels {
+    fn ping_models(&self) -> alex_proxy::PingModels {
+        alex_proxy::PingModels {
             anthropic: self.ping_anthropic_model.clone(),
             openai: self.ping_openai_model.clone(),
             xai: self.ping_xai_model.clone(),
@@ -436,9 +436,9 @@ fn open_vault(config: &Config) -> Result<Vault> {
 
 struct DarioGlue(Arc<dario::DarioSupervisor>);
 
-impl alexandria_proxy::DarioRouter for DarioGlue {
-    fn active(&self) -> Option<alexandria_proxy::DarioActive> {
-        self.0.active().map(|a| alexandria_proxy::DarioActive {
+impl alex_proxy::DarioRouter for DarioGlue {
+    fn active(&self) -> Option<alex_proxy::DarioActive> {
+        self.0.active().map(|a| alex_proxy::DarioActive {
             generation_id: a.generation_id,
             base_url: a.base_url,
             api_key: a.api_key,
@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
             if vault.list().await.is_empty() {
                 eprintln!("warning: no accounts in vault — run `alexandria auth import` first");
             }
-            let mut dario_router: Option<Arc<dyn alexandria_proxy::DarioRouter>> = None;
+            let mut dario_router: Option<Arc<dyn alex_proxy::DarioRouter>> = None;
             let mut supervisor: Option<Arc<dario::DarioSupervisor>> = None;
             if config.dario_enabled() {
                 if config.dario_api_key.is_empty() {
@@ -571,7 +571,7 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|| "-".into())
                         );
                         dario_router = Some(Arc::new(DarioGlue(sup.clone()))
-                            as Arc<dyn alexandria_proxy::DarioRouter>);
+                            as Arc<dyn alex_proxy::DarioRouter>);
                         supervisor = Some(sup);
                     }
                     Err(e) => {
@@ -581,7 +581,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let state = alexandria_proxy::build_state(
+            let state = alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
                 store,
@@ -598,7 +598,7 @@ async fn main() -> Result<()> {
                     interval.tick().await;
                     loop {
                         interval.tick().await;
-                        alexandria_proxy::heartbeat_once(&hb_state, &models).await;
+                        alex_proxy::heartbeat_once(&hb_state, &models).await;
                     }
                 });
                 eprintln!(
@@ -608,7 +608,7 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("heartbeat: disabled (set heartbeat_minutes in config.toml to enable)");
             }
-            let mut app = alexandria_proxy::router(state);
+            let mut app = alex_proxy::router(state);
             if let Some(sup) = supervisor.clone() {
                 app = app.merge(dario_admin_router(sup));
             }
@@ -686,10 +686,10 @@ async fn main() -> Result<()> {
                     }
                     None => anyhow::bail!(
                         "usage: alexandria auth login <provider> — providers: {}",
-                        alexandria_auth::login::PROVIDERS.join(", ")
+                        alex_auth::login::PROVIDERS.join(", ")
                     ),
                 };
-                let id = alexandria_auth::login::login(&vault, &provider).await?;
+                let id = alex_auth::login::login(&vault, &provider).await?;
                 println!("saved account: {id}");
             }
             AuthCommand::List => {
@@ -751,7 +751,7 @@ async fn main() -> Result<()> {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             let state =
-                alexandria_proxy::build_state(
+                alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
                 store,
@@ -759,15 +759,15 @@ async fn main() -> Result<()> {
                 config.base_url(),
             );
             let models = config.ping_models();
-            let providers: Vec<alexandria_core::Provider> = if target == "all" {
+            let providers: Vec<alex_core::Provider> = if target == "all" {
                 let mut seen = Vec::new();
                 for a in state.vault.list().await {
                     if a.status == "active"
                         && matches!(
                             a.provider,
-                            alexandria_core::Provider::Anthropic
-                                | alexandria_core::Provider::Openai
-                                | alexandria_core::Provider::Xai
+                            alex_core::Provider::Anthropic
+                                | alex_core::Provider::Openai
+                                | alex_core::Provider::Xai
                         )
                         && !seen.contains(&a.provider)
                     {
@@ -776,7 +776,7 @@ async fn main() -> Result<()> {
                 }
                 seen
             } else {
-                vec![alexandria_core::Provider::from_str_loose(&target).with_context(
+                vec![alex_core::Provider::from_str_loose(&target).with_context(
                     || format!("unknown target '{target}' (anthropic|openai|grok|all)"),
                 )?]
             };
@@ -854,14 +854,14 @@ async fn main() -> Result<()> {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             let state =
-                alexandria_proxy::build_state(
+                alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
                 store,
                 None,
                 config.base_url(),
             );
-            let snap = alexandria_proxy::limits_snapshot(&state).await;
+            let snap = alex_proxy::limits_snapshot(&state).await;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
             } else {
@@ -884,7 +884,7 @@ async fn main() -> Result<()> {
                 Some(h) => format!("http://{h}:{}", config.port),
                 None => config.base_url(),
             };
-            let (payload, exports) = alexandria_proxy::connect_payload(&base, &config.local_key);
+            let (payload, exports) = alex_proxy::connect_payload(&base, &config.local_key);
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -1356,7 +1356,7 @@ fn print_env(host: &str, port: u16, local_key: &str) {
     eprintln!("export OPENAI_API_KEY={local_key}");
 }
 
-fn account_indicators(a: &alexandria_auth::Account) -> (String, String) {
+fn account_indicators(a: &alex_auth::Account) -> (String, String) {
     let remaining_ms = a.expires_at_ms.map(|exp| exp - now_ms());
     let expired = remaining_ms.map(|r| r < 0).unwrap_or(false);
     let expiring = remaining_ms.map(|r| r >= 0 && r < 30 * 60_000).unwrap_or(false);
@@ -1398,7 +1398,7 @@ fn parse_launchctl_pid(output: &str) -> Option<i64> {
     })
 }
 
-fn ping_done_line(r: &alexandria_proxy::PingResult) -> String {
+fn ping_done_line(r: &alex_proxy::PingResult) -> String {
     let (mark, bar_color) = if r.ok {
         (ui::green("✓"), "42")
     } else {
@@ -1417,13 +1417,13 @@ fn ping_done_line(r: &alexandria_proxy::PingResult) -> String {
 }
 
 async fn run_pings(
-    state: &Arc<alexandria_proxy::AppState>,
-    models: &alexandria_proxy::PingModels,
-    providers: &[alexandria_core::Provider],
-) -> Vec<alexandria_proxy::PingResult> {
+    state: &Arc<alex_proxy::AppState>,
+    models: &alex_proxy::PingModels,
+    providers: &[alex_core::Provider],
+) -> Vec<alex_proxy::PingResult> {
     use std::io::{IsTerminal, Write};
     let n = providers.len();
-    let slots: Arc<std::sync::Mutex<Vec<Option<alexandria_proxy::PingResult>>>> =
+    let slots: Arc<std::sync::Mutex<Vec<Option<alex_proxy::PingResult>>>> =
         Arc::new(std::sync::Mutex::new(vec![None; n]));
     let mut handles = Vec::new();
     for (i, provider) in providers.iter().enumerate() {
@@ -1432,7 +1432,7 @@ async fn run_pings(
         let slots = slots.clone();
         let provider = *provider;
         handles.push(tokio::spawn(async move {
-            let r = alexandria_proxy::ping_provider(&state, provider, &models).await;
+            let r = alex_proxy::ping_provider(&state, provider, &models).await;
             let _ = state.store.insert_heartbeat(
                 now_ms(),
                 r.provider,
@@ -1445,11 +1445,11 @@ async fn run_pings(
             slots.lock().unwrap()[i] = Some(r);
         }));
     }
-    let model_for = |p: alexandria_core::Provider| match p {
-        alexandria_core::Provider::Anthropic => models.anthropic.clone(),
-        alexandria_core::Provider::Openai => models.openai.clone(),
-        alexandria_core::Provider::Xai => models.xai.clone(),
-        alexandria_core::Provider::Gemini => "-".into(),
+    let model_for = |p: alex_core::Provider| match p {
+        alex_core::Provider::Anthropic => models.anthropic.clone(),
+        alex_core::Provider::Openai => models.openai.clone(),
+        alex_core::Provider::Xai => models.xai.clone(),
+        alex_core::Provider::Gemini => "-".into(),
     };
     if std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
@@ -1492,7 +1492,7 @@ async fn run_pings(
     for h in handles {
         let _ = h.await;
     }
-    let results: Vec<alexandria_proxy::PingResult> = slots
+    let results: Vec<alex_proxy::PingResult> = slots
         .lock()
         .unwrap()
         .iter()
@@ -1908,8 +1908,8 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn provider_menu_status(accounts: &[alexandria_auth::Account], provider: &str) -> String {
-    let target = alexandria_core::Provider::from_str_loose(provider);
+fn provider_menu_status(accounts: &[alex_auth::Account], provider: &str) -> String {
+    let target = alex_core::Provider::from_str_loose(provider);
     let account = accounts.iter().find(|a| Some(a.provider) == target);
     match account {
         Some(a) => {
@@ -1934,13 +1934,13 @@ fn provider_menu_status(accounts: &[alexandria_auth::Account], provider: &str) -
     }
 }
 
-fn pick_provider(accounts: &[alexandria_auth::Account]) -> Result<Option<String>> {
+fn pick_provider(accounts: &[alex_auth::Account]) -> Result<Option<String>> {
     use crossterm::cursor::{MoveToColumn, MoveUp};
     use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{Clear, ClearType};
     use std::io::Write;
 
-    let providers = alexandria_auth::login::PROVIDERS;
+    let providers = alex_auth::login::PROVIDERS;
     let statuses: Vec<String> = providers
         .iter()
         .map(|p| provider_menu_status(accounts, p))

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use alexandria_core::{Pricing, TraceRecord};
+use alex_core::{Pricing, TraceRecord};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use flate2::write::GzEncoder;
@@ -708,7 +708,7 @@ mod tests {
             routed_model: Some("claude-haiku-4-5".into()),
             upstream_provider: Some("anthropic".into()),
             run_id: run.map(String::from),
-            usage: alexandria_core::Usage {
+            usage: alex_core::Usage {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 ..Default::default()
