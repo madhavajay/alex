@@ -764,17 +764,16 @@ async fn traces_session_transcript(
 }
 
 fn trace_extras(req: &Value) -> Value {
-    let system_chars = match &req["system"] {
-        Value::String(s) => Some(s.chars().count()),
-        Value::Array(parts) => Some(
-            parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .map(|s| s.chars().count())
-                .sum(),
-        ),
-        _ => req["instructions"].as_str().map(|s| s.chars().count()),
+    let system_text: Option<String> = match &req["system"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let joined: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+            (!joined.is_empty()).then(|| joined.join("\n\n"))
+        }
+        _ => req["instructions"].as_str().map(String::from),
     };
+    let system_chars = system_text.as_ref().map(|s| s.chars().count());
+    let system_prompt = system_text.map(|s| truncate_chars(s, 64_000));
     json!({
         "reasoning_effort": req["reasoning"]["effort"],
         "thinking_budget": req["thinking"]["budget_tokens"],
@@ -782,6 +781,7 @@ fn trace_extras(req: &Value) -> Value {
         "temperature": req["temperature"],
         "message_count": req["messages"].as_array().or(req["input"].as_array()).map(|a| a.len()),
         "system_chars": system_chars,
+        "system_prompt": system_prompt,
     })
 }
 
