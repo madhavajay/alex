@@ -62,6 +62,18 @@ struct PingView: View {
     @Bindable var model: PingModel
     let close: () -> Void
 
+    @State private var copied = false
+
+    private func copyAll() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(model.lines.joined(separator: "\n"), forType: .string)
+        copied = true
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            copied = false
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
@@ -75,19 +87,22 @@ struct PingView: View {
                     Text(code == 0 ? "Ping OK" : "Ping failed").font(.headline)
                 }
                 Spacer()
+                Button { copyAll() } label: {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                }
+                .disabled(model.lines.isEmpty)
+                .help("Copy all output")
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(model.lines.enumerated()), id: \.offset) { _, line in
-                            Text(line)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(model.lines.joined(separator: "\n"))
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .overlay(alignment: .bottom) {
+                            Color.clear.frame(height: 1).id("bottom")
                         }
-                        Color.clear.frame(height: 1).id("bottom")
-                    }
-                    .padding(10)
                 }
                 .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
                 .onChange(of: model.lines.count) {
