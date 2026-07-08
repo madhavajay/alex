@@ -61,6 +61,7 @@ struct Ui {
     table: TableState,
     stable: TableState,
     raw_mode: bool,
+    show_pings: bool,
     transcript: bool,
     tsc_scroll: usize,
     tsc_follow: bool,
@@ -70,6 +71,29 @@ struct Ui {
 
 fn raw_active(sessions_supported: Option<bool>, raw_mode: bool) -> bool {
     raw_mode || sessions_supported == Some(false)
+}
+
+fn session_kind(s: &Value) -> Option<&'static str> {
+    let harness = s.get("harness").and_then(|v| v.as_str()).unwrap_or("");
+    if harness.contains("alexandria-ping") {
+        return Some("ping");
+    }
+    let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if sid.starts_with("tsh-")
+        || sid.starts_with("alexandria-e2e-")
+        || sid.starts_with("smoke-")
+        || sid.starts_with("PING-")
+    {
+        return Some("test");
+    }
+    None
+}
+
+fn visible_sessions<'a>(sessions: &'a [Value], show_pings: bool) -> Vec<&'a Value> {
+    sessions
+        .iter()
+        .filter(|s| show_pings || session_kind(s).is_none())
+        .collect()
 }
 
 pub async fn run(base_url: &str, local_key: &str) -> Result<()> {
@@ -259,6 +283,7 @@ async fn ui_loop(
         table: TableState::default(),
         stable: TableState::default(),
         raw_mode: false,
+        show_pings: false,
         transcript: false,
         tsc_scroll: 0,
         tsc_follow: true,
@@ -337,15 +362,22 @@ async fn ui_loop(
                                         notify.notify_one();
                                     }
                                 }
+                                KeyCode::Char('p') if ui.tab == 0 => {
+                                    ui.show_pings = !ui.show_pings;
+                                }
                                 KeyCode::Enter if ui.tab == 0 => {
                                     let sid = {
                                         let s = shared.lock().unwrap();
                                         if raw_active(s.sessions_supported, ui.raw_mode) {
                                             None
                                         } else {
+                                            let vis = visible_sessions(
+                                                &s.sessions,
+                                                ui.show_pings,
+                                            );
                                             ui.stable
                                                 .selected()
-                                                .and_then(|i| s.sessions.get(i))
+                                                .and_then(|i| vis.get(i).copied())
                                                 .and_then(|v| v.get("session_id"))
                                                 .and_then(|v| v.as_str())
                                                 .map(|v| v.to_string())
@@ -370,7 +402,10 @@ async fn ui_loop(
         if !ui.transcript {
             let sess = ui.tab == 0 && !raw_active(snap.sessions_supported, ui.raw_mode);
             let (st, len) = if sess {
-                (&mut ui.stable, snap.sessions.len())
+                (
+                    &mut ui.stable,
+                    visible_sessions(&snap.sessions, ui.show_pings).len(),
+                )
             } else {
                 (&mut ui.table, snap.traces.len())
             };
@@ -825,17 +860,25 @@ fn session_cells(s: &Value) -> SessionCells {
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
-    let title = if ui.follow {
-        "Sessions · following"
-    } else {
-        "Sessions · paused (f to follow)"
+    let vis = visible_sessions(&snap.sessions, ui.show_pings);
+    let hidden = snap.sessions.len() - vis.len();
+    let title = match (ui.follow, ui.show_pings, hidden) {
+        (true, false, 0) => "Sessions · following".to_string(),
+        (true, false, n) => format!("Sessions · following · {n} pings hidden (p)"),
+        (true, true, _) => "Sessions · following · pings shown (p)".to_string(),
+        (false, false, 0) => "Sessions · paused (f to follow)".to_string(),
+        (false, false, n) => format!("Sessions · paused · {n} pings hidden (p)"),
+        (false, true, _) => "Sessions · paused · pings shown (p)".to_string(),
     };
-    if snap.sessions.is_empty() {
+    let title = title.as_str();
+    if vis.is_empty() {
         let block = themed_block(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
         let msg = if snap.sessions_supported.is_none() {
             "no data yet"
+        } else if hidden > 0 {
+            "only pings/health checks in the last 24h — press p to show them"
         } else {
             "no sessions in the last 24h"
         };
@@ -851,11 +894,23 @@ fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             .map(|h| Cell::from(*h)),
     )
     .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
-    let rows = snap.sessions.iter().map(|s| {
+    let rows = vis.iter().map(|s| {
         let c = session_cells(s);
+        let kind = session_kind(s);
+        let dim = kind.is_some();
+        let id_cell = match kind {
+            Some(k) => Cell::from(format!("{} [{k}]", c.id))
+                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+            None => Cell::from(c.id).style(Style::default().fg(TURQUOISE)),
+        };
+        let time_style = if dim {
+            Style::default().fg(SAND).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(SAND)
+        };
         Row::new(vec![
-            Cell::from(c.time).style(Style::default().fg(SAND)),
-            Cell::from(c.id).style(Style::default().fg(TURQUOISE)),
+            Cell::from(c.time).style(time_style),
+            id_cell,
             Cell::from(c.run).style(Style::default().fg(AMBER)),
             Cell::from(c.models).style(Style::default().fg(LAPIS)),
             Cell::from(c.turns),
@@ -1407,7 +1462,7 @@ fn key_hints(snap: &Snapshot, ui: &Ui) -> &'static str {
         if raw_active(snap.sessions_supported, ui.raw_mode) {
             " q quit · 1-4/←→ tabs · ↑↓ select · f follow · r sessions "
         } else {
-            " q quit · 1-4/←→ tabs · ↑↓ select · Enter transcript · f follow · r raw "
+            " q quit · 1-4/←→ tabs · ↑↓ select · Enter transcript · f follow · p pings · r raw "
         }
     } else {
         " q quit · 1-4/←→ tabs · ↑↓ scroll · f follow · r refresh "
@@ -1540,6 +1595,21 @@ mod tests {
         let w = json!({"resets_at": "2023-11-14T22:13:20Z"});
         assert_eq!(reset_secs(&w, now - 100), Some(100));
         assert_eq!(reset_secs(&json!({}), now), None);
+    }
+
+    #[test]
+    fn session_kind_classifies() {
+        let ping = serde_json::json!({"harness": "alexandria-ping", "session_id": "x"});
+        let test = serde_json::json!({"harness": "curl/8", "session_id": "tsh-W1-99"});
+        let e2e = serde_json::json!({"session_id": "alexandria-e2e-claude-1"});
+        let real = serde_json::json!({"harness": "claude-cli/2.1", "session_id": "abc"});
+        assert_eq!(session_kind(&ping), Some("ping"));
+        assert_eq!(session_kind(&test), Some("test"));
+        assert_eq!(session_kind(&e2e), Some("test"));
+        assert_eq!(session_kind(&real), None);
+        let all = vec![ping, test, real.clone()];
+        assert_eq!(visible_sessions(&all, false).len(), 1);
+        assert_eq!(visible_sessions(&all, true).len(), 3);
     }
 
     #[test]

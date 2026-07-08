@@ -595,6 +595,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_secs(minutes * 60));
+                    interval.tick().await;
                     loop {
                         interval.tick().await;
                         alexandria_proxy::heartbeat_once(&hb_state, &models).await;

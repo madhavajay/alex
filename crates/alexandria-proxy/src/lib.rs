@@ -520,12 +520,53 @@ fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
         .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
 }
 
+const TEXT_SCAN_CAP: usize = 300;
+
+fn trace_matches_text(row: &Value, needle: &str) -> bool {
+    for key in ["req_body_path", "resp_body_path"] {
+        if let Some(path) = row.get(key).and_then(|v| v.as_str()) {
+            if let Some(bytes) = read_gz_file(path) {
+                if String::from_utf8_lossy(&bytes)
+                    .to_lowercase()
+                    .contains(needle)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 async fn traces_search(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    match state.store.search_traces(&filter_from_query(&q)) {
-        Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+    let mut filter = filter_from_query(&q);
+    let text = q
+        .get("text")
+        .or_else(|| q.get("q"))
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty());
+    if text.is_some() {
+        filter.limit = TEXT_SCAN_CAP;
+    }
+    match state.store.search_traces(&filter) {
+        Ok(rows) => match text {
+            Some(needle) => {
+                let scanned = rows.len();
+                let rows = tokio::task::spawn_blocking(move || {
+                    rows.into_iter()
+                        .filter(|r| trace_matches_text(r, &needle))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                axum::Json(json!({"traces": rows, "scanned": scanned, "scan_cap": TEXT_SCAN_CAP}))
+                    .into_response()
+            }
+            None => axum::Json(json!({"traces": rows})).into_response(),
+        },
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
