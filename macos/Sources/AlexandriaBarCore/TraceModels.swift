@@ -99,17 +99,162 @@ public enum SessionKind {
     public static func isPingOrTest(
         sessionId: String, harness: String?, tags: [String: String]? = nil
     ) -> Bool {
-        if let harness, harness.contains("alexandria-ping") { return true }
-        if let kind = tags?["kind"]?.lowercased(),
-            pingKinds.contains(kind) || testKinds.contains(kind) {
-            return true
+        badge(sessionId: sessionId, harness: harness, tags: tags) != nil
+    }
+
+    public static func badge(
+        sessionId: String, harness: String?, tags: [String: String]? = nil
+    ) -> String? {
+        if let harness, harness.contains("alexandria-ping") { return "ping" }
+        if let kind = tags?["kind"]?.lowercased() {
+            if pingKinds.contains(kind) { return "ping" }
+            if testKinds.contains(kind) { return "test" }
         }
         if let phase = tags?["phase"]?.lowercased(), pingPhases.contains(phase) {
-            return true
+            return "ping"
         }
-        return sessionId.hasPrefix("tsh-")
+        if sessionId.hasPrefix("tsh-")
             || sessionId.hasPrefix("alexandria-e2e-")
-            || sessionId.hasPrefix("smoke-")
+            || sessionId.hasPrefix("smoke-") {
+            return "test"
+        }
+        return nil
+    }
+}
+
+public struct SessionRow: Identifiable, Sendable, Equatable {
+    public let id: String
+    public let lastTsMs: Int64
+    public let lastTs: Date
+    public let sessionShort: String
+    public let models: String
+    public let providers: [String]
+    public let harness: String
+    public let harnessRaw: String?
+    public let tags: [String: String]?
+    public let turns: Int
+    public let tokensIn: Int64
+    public let tokensOut: Int64
+    public let cost: Double
+    public let errors: Int
+    public let runId: String
+    public let tagsSummary: String
+    public let kindBadge: String?
+    public let iconAsset: String?
+
+    public var isPingOrTest: Bool { kindBadge != nil }
+
+    public init(session: TraceSession) {
+        id = session.sessionId
+        lastTsMs = session.lastTsMs
+        lastTs = Date(timeIntervalSince1970: Double(session.lastTsMs) / 1000)
+        sessionShort = Self.shortId(session.sessionId)
+        let modelsList = session.models ?? []
+        models = modelsList.joined(separator: ", ")
+        providers = ModelProvider.providers(in: modelsList)
+        harnessRaw = session.harness
+        harness = session.harness ?? ""
+        tags = session.tags
+        turns = session.traceCount
+        tokensIn = session.totalInputTokens ?? 0
+        tokensOut = session.totalOutputTokens ?? 0
+        cost = session.totalCostUsd ?? 0
+        errors = Int(session.errors ?? 0)
+        runId = session.runId ?? ""
+        tagsSummary = (session.tags ?? [:])
+            .filter { !$0.value.isEmpty }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+        kindBadge = SessionKind.badge(
+            sessionId: session.sessionId, harness: session.harness, tags: session.tags)
+        iconAsset = HarnessIcon.assetName(harness: session.harness, tags: session.tags)
+    }
+
+    static func shortId(_ id: String, maxLength: Int = 22) -> String {
+        guard id.count > maxLength else { return id }
+        return "\(id.prefix(10))…\(id.suffix(8))"
+    }
+}
+
+public enum SessionTable {
+    public static func rowsById(_ sessions: [TraceSession]) -> [String: SessionRow] {
+        Dictionary(
+            sessions.map { ($0.sessionId, SessionRow(session: $0)) },
+            uniquingKeysWith: { first, _ in first })
+    }
+
+    public static func defaultSortOrder() -> [KeyPathComparator<SessionRow>] {
+        [KeyPathComparator(\.lastTs, order: .reverse)]
+    }
+
+    public static func visibleRows(
+        sessions: [TraceSession],
+        rowsById: [String: SessionRow],
+        showPings: Bool,
+        query: OmniQuery,
+        serverMatches: Set<String>?,
+        sortOrder: [KeyPathComparator<SessionRow>]
+    ) -> [SessionRow] {
+        var rows: [SessionRow] = []
+        for session in sessions {
+            if !showPings, session.isPingOrTest { continue }
+            guard query.isVisible(session, serverMatches: serverMatches) else { continue }
+            rows.append(rowsById[session.sessionId] ?? SessionRow(session: session))
+        }
+        return rows.sorted(using: sortOrder)
+    }
+}
+
+public struct SessionSelection: Equatable, Sendable {
+    public private(set) var selectedId: String?
+    public private(set) var pinned = false
+    private var lastFollowId: String?
+
+    public init() {}
+
+    public enum Change: Equatable, Sendable {
+        case none
+        case selected(String)
+    }
+
+    @discardableResult
+    public mutating func userSelect(_ id: String) -> Change {
+        lastFollowId = nil
+        pinned = true
+        guard selectedId != id else { return .none }
+        selectedId = id
+        return .selected(id)
+    }
+
+    @discardableResult
+    public mutating func followSelect(_ id: String) -> Change {
+        guard selectedId != id else { return .none }
+        selectedId = id
+        lastFollowId = id
+        return .selected(id)
+    }
+
+    @discardableResult
+    public mutating func bindingSelect(_ id: String?) -> Change {
+        guard let id else { return .none }
+        if id == lastFollowId {
+            lastFollowId = nil
+            return .none
+        }
+        return userSelect(id)
+    }
+
+    @discardableResult
+    public mutating func setLive(_ live: Bool, newestVisibleId: String?) -> Change {
+        pinned = !live
+        guard live, let newestVisibleId else { return .none }
+        return followSelect(newestVisibleId)
+    }
+
+    public mutating func clear() {
+        selectedId = nil
+        lastFollowId = nil
     }
 }
 
@@ -467,6 +612,20 @@ public enum TurnTextCap {
     }
 }
 
+public enum TraceNumberFormat {
+    public static func tokens(_ count: Int64?) -> String {
+        guard let count else { return "–" }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 10_000 { return "\(count / 1000)k" }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1000) }
+        return "\(count)"
+    }
+
+    public static func cost(_ usd: Double) -> String {
+        usd >= 0.01 ? String(format: "$%.2f", usd) : String(format: "$%.4f", usd)
+    }
+}
+
 public enum TranscriptWindow {
     public static let defaultMaxTurns = 200
     public static let defaultMaxChars = 1_500_000
@@ -590,17 +749,9 @@ public enum TranscriptRender {
         return text.prefix(maxChars) + "\n… (+\(text.count - maxChars) chars truncated)"
     }
 
-    static func tokens(_ count: Int64?) -> String {
-        guard let count else { return "–" }
-        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
-        if count >= 10_000 { return "\(count / 1000)k" }
-        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1000) }
-        return "\(count)"
-    }
+    static func tokens(_ count: Int64?) -> String { TraceNumberFormat.tokens(count) }
 
-    static func cost(_ usd: Double) -> String {
-        usd >= 0.01 ? String(format: "$%.2f", usd) : String(format: "$%.4f", usd)
-    }
+    static func cost(_ usd: Double) -> String { TraceNumberFormat.cost(usd) }
 }
 
 public struct DarioAdminStatus: Codable, Sendable {

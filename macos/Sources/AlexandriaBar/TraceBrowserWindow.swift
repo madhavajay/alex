@@ -10,7 +10,7 @@ final class TraceBrowserModel {
 
     private(set) var sessions: [TraceSession] = []
     private(set) var turns: [TranscriptTurn] = []
-    private(set) var visibleSessions: [TraceSession] = []
+    private(set) var visibleRows: [SessionRow] = []
     private(set) var parsedQuery = OmniQuery()
     private(set) var daemonDown = false
     private(set) var searchSessionIds: Set<String>?
@@ -18,9 +18,14 @@ final class TraceBrowserModel {
     private(set) var searchScanned = 0
     private var sessionsFingerprint = ""
     private var turnsFingerprint = ""
+    private var rowsById: [String: SessionRow] = [:]
+    private var selectionState = SessionSelection()
 
-    var selectedSessionId: String?
-    var pinned = false
+    var selectedSessionId: String? { selectionState.selectedId }
+    var pinned: Bool { selectionState.pinned }
+    var sortOrder = SessionTable.defaultSortOrder() {
+        didSet { recomputeVisible() }
+    }
     var showPings = false {
         didSet { recomputeVisible() }
     }
@@ -72,11 +77,14 @@ final class TraceBrowserModel {
     private func recomputeVisible() {
         let query = parsedQuery
         BarLog.measure(.browser, label: "filter sessions=\(sessions.count)") {
-            visibleSessions = sessions.filter { session in
-                if !showPings, session.isPingOrTest { return false }
-                return query.isVisible(session, serverMatches: searchSessionIds)
-            }
+            visibleRows = SessionTable.visibleRows(
+                sessions: sessions, rowsById: rowsById, showPings: showPings,
+                query: query, serverMatches: searchSessionIds, sortOrder: sortOrder)
         }
+    }
+
+    private var newestVisibleRow: SessionRow? {
+        visibleRows.max { $0.lastTsMs < $1.lastTsMs }
     }
 
     var showsTagFilterBar: Bool {
@@ -126,13 +134,20 @@ final class TraceBrowserModel {
         renderChain = nil
     }
 
-    func select(_ session: TraceSession) {
-        guard session.sessionId != selectedSessionId else {
-            pinned = true
-            return
-        }
-        selectedSessionId = session.sessionId
-        pinned = true
+    func selectFromUser(_ id: String) {
+        apply(selectionState.userSelect(id))
+    }
+
+    func selectFromFollow(_ id: String) {
+        apply(selectionState.followSelect(id))
+    }
+
+    func selectFromBinding(_ id: String?) {
+        apply(selectionState.bindingSelect(id))
+    }
+
+    private func apply(_ change: SessionSelection.Change) {
+        guard case .selected = change else { return }
         resetTurns()
         setUserAtBottom(true)
         Task { await pollTranscript() }
@@ -162,14 +177,14 @@ final class TraceBrowserModel {
     }
 
     func moveSelection(_ move: ListNavigation.Move) {
-        let visible = visibleSessions
+        let visible = visibleRows
         let current = selectedSessionId.flatMap { id in
-            visible.firstIndex { $0.sessionId == id }
+            visible.firstIndex { $0.id == id }
         }
         guard let index = ListNavigation.targetIndex(
             selected: current, count: visible.count, move: move)
         else { return }
-        select(visible[index])
+        selectFromUser(visible[index].id)
     }
 
     private func scheduleRender() {
@@ -233,8 +248,7 @@ final class TraceBrowserModel {
     }
 
     func setLive(_ live: Bool) {
-        pinned = !live
-        if live { applyLiveFollow() }
+        apply(selectionState.setLive(live, newestVisibleId: newestVisibleRow?.id))
     }
 
     private func client() -> AlexandriaClient? {
@@ -255,6 +269,7 @@ final class TraceBrowserModel {
                 sessionsFingerprint = fingerprint
                 BarLog.measure(.browser, label: "sessions apply count=\(fetched.count)") {
                     sessions = fetched.sorted { $0.lastTsMs > $1.lastTsMs }
+                    rowsById = SessionTable.rowsById(sessions)
                     recomputeVisible()
                 }
             }
@@ -267,14 +282,10 @@ final class TraceBrowserModel {
     }
 
     private func applyLiveFollow() {
-        guard let candidate = visibleSessions.first else { return }
-        guard candidate.sessionId != selectedSessionId else { return }
+        guard let candidate = newestVisibleRow else { return }
+        guard candidate.id != selectedSessionId else { return }
         guard selectedSessionId != nil else {
-            if !pinned {
-                selectedSessionId = candidate.sessionId
-                resetTurns()
-                setUserAtBottom(true)
-            }
+            if !pinned { selectFromFollow(candidate.id) }
             return
         }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -286,10 +297,7 @@ final class TraceBrowserModel {
             userAtBottom: userAtBottom, awayFromBottomMs: awayMs)
         else { return }
         if let currentLast, candidate.lastTsMs <= currentLast { return }
-        selectedSessionId = candidate.sessionId
-        resetTurns()
-        setUserAtBottom(true)
-        Task { await pollTranscript() }
+        selectFromFollow(candidate.id)
     }
 
     private func pollTranscript() async {
@@ -430,7 +438,7 @@ final class TraceBrowserModel {
                     try await client.deleteTrace(id: turn.traceId)
                 }
                 if selectedSessionId == session.sessionId {
-                    selectedSessionId = nil
+                    selectionState.clear()
                     resetTurns()
                 }
                 await pollSessions()
@@ -603,68 +611,199 @@ private struct TagChipView: View {
     }
 }
 
+private enum SessionColumnStore {
+    static let key = "TraceBrowserColumnCustomization"
+
+    static func load(defaults: UserDefaults = .standard) -> TableColumnCustomization<SessionRow> {
+        guard let data = defaults.data(forKey: key),
+            let decoded = try? JSONDecoder().decode(
+                TableColumnCustomization<SessionRow>.self, from: data)
+        else { return TableColumnCustomization<SessionRow>() }
+        return decoded
+    }
+
+    static func save(
+        _ customization: TableColumnCustomization<SessionRow>,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let data = try? JSONEncoder().encode(customization) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
 private struct SessionListView: View {
     @Bindable var model: TraceBrowserModel
     @FocusState private var listFocused: Bool
+    @State private var customization: TableColumnCustomization<SessionRow>
+
+    init(model: TraceBrowserModel) {
+        self.model = model
+        _customization = State(initialValue: SessionColumnStore.load())
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: selectionBinding) {
-                ForEach(model.visibleSessions) { session in
-                    SessionRowView(
-                        session: session,
-                        pinned: model.pinned && session.sessionId == model.selectedSessionId,
-                        showPingBadge: model.showPings && session.isPingOrTest
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        model.select(session)
-                        listFocused = true
+            ScrollViewReader { proxy in
+                table
+                    .onChange(of: model.selectedSessionId) { _, id in
+                        if let id { proxy.scrollTo(id) }
                     }
-                    .contextMenu { contextMenu(session) }
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 1, leading: 4, bottom: 1, trailing: 4))
-                }
-                if model.visibleSessions.isEmpty {
-                    Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 24)
-                        .listRowSeparator(.hidden)
-                }
             }
-            .listStyle(.plain)
-            .focused($listFocused)
-            .onKeyPress(.home) {
-                model.moveSelection(.home)
-                return .handled
-            }
-            .onKeyPress(.end) {
-                model.moveSelection(.end)
-                return .handled
-            }
-            .onAppear { listFocused = true }
-            if model.searchSessionIds != nil {
-                Divider()
-                Text("\(model.searchMatchCount) matches · scanned \(model.searchScanned)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
+            Divider()
+            footer
+        }
+    }
+
+    private var table: some View {
+        Table(
+            model.visibleRows, selection: selectionBinding, sortOrder: $model.sortOrder,
+            columnCustomization: $customization
+        ) {
+            primaryColumns
+            secondaryColumns
+        }
+        .contextMenu(forSelectionType: SessionRow.ID.self) { ids in
+            if let id = ids.first,
+                let session = model.sessions.first(where: { $0.sessionId == id }) {
+                contextMenu(session)
             }
         }
+        .overlay {
+            if model.visibleRows.isEmpty {
+                Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .focused($listFocused)
+        .onKeyPress(.home) {
+            model.moveSelection(.home)
+            return .handled
+        }
+        .onKeyPress(.end) {
+            model.moveSelection(.end)
+            return .handled
+        }
+        .onAppear { listFocused = true }
+        .onChange(of: customization) { _, updated in
+            SessionColumnStore.save(updated)
+        }
+    }
+
+    @TableColumnBuilder<SessionRow, KeyPathComparator<SessionRow>>
+    private var primaryColumns: some TableColumnContent<SessionRow, KeyPathComparator<SessionRow>> {
+        TableColumn("Session", value: \.sessionShort) { (row: SessionRow) in
+            SessionCellView(
+                row: row,
+                pinned: model.pinned && row.id == model.selectedSessionId,
+                showPingBadge: model.showPings && row.isPingOrTest)
+        }
+        .width(min: 180)
+        .customizationID("session")
+        .disabledCustomizationBehavior(.visibility)
+        TableColumn("Last activity", value: \.lastTs) { (row: SessionRow) in
+            Text(TraceFormat.relative(row.lastTsMs))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .width(min: 60, ideal: 76)
+        .customizationID("lastActivity")
+        TableColumn("Turns", value: \.turns) { (row: SessionRow) in
+            numericCell("\(row.turns)")
+        }
+        .width(min: 36, ideal: 44)
+        .customizationID("turns")
+        TableColumn("Tokens in", value: \.tokensIn) { (row: SessionRow) in
+            numericCell(TraceFormat.tokens(row.tokensIn))
+        }
+        .width(min: 48, ideal: 60)
+        .customizationID("tokensIn")
+        .defaultVisibility(.hidden)
+        TableColumn("Tokens out", value: \.tokensOut) { (row: SessionRow) in
+            numericCell(TraceFormat.tokens(row.tokensOut))
+        }
+        .width(min: 48, ideal: 60)
+        .customizationID("tokensOut")
+        TableColumn("Cost", value: \.cost) { (row: SessionRow) in
+            numericCell(row.cost > 0 ? TraceFormat.cost(row.cost) : "")
+        }
+        .width(min: 48, ideal: 60)
+        .customizationID("cost")
+    }
+
+    @TableColumnBuilder<SessionRow, KeyPathComparator<SessionRow>>
+    private var secondaryColumns: some TableColumnContent<SessionRow, KeyPathComparator<SessionRow>> {
+        TableColumn("Errors", value: \.errors) { (row: SessionRow) in
+            Text(row.errors > 0 ? "\(row.errors)" : "")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .width(min: 40, ideal: 48)
+        .customizationID("errors")
+        .defaultVisibility(.hidden)
+        TableColumn("Model(s)", value: \.models) { (row: SessionRow) in
+            Text(row.models)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .customizationID("models")
+        TableColumn("Harness", value: \.harness) { (row: SessionRow) in
+            Text(row.harness)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .customizationID("harness")
+        .defaultVisibility(.hidden)
+        TableColumn("Run", value: \.runId) { (row: SessionRow) in
+            Text(row.runId)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .customizationID("run")
+        .defaultVisibility(.hidden)
+        TableColumn("Tags", value: \.tagsSummary) { (row: SessionRow) in
+            Text(row.tagsSummary)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .customizationID("tags")
+        .defaultVisibility(.hidden)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if model.searchSessionIds != nil {
+                Text("\(model.searchMatchCount) matches · scanned \(model.searchScanned)")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("Right-click headers to show/hide columns")
+                .foregroundStyle(.tertiary)
+        }
+        .font(.system(size: 10))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+    }
+
+    private func numericCell(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
     private var selectionBinding: Binding<String?> {
         Binding(
             get: { model.selectedSessionId },
             set: { id in
-                guard let id,
-                    let session = model.visibleSessions.first(where: { $0.sessionId == id })
-                else { return }
-                model.select(session)
+                model.selectFromBinding(id)
+                listFocused = true
             })
     }
 
@@ -675,7 +814,7 @@ private struct SessionListView: View {
             if isPinnedRow {
                 model.setLive(true)
             } else {
-                model.select(session)
+                model.selectFromUser(session.sessionId)
             }
         }
         Button("Copy Session ID") { model.copySessionId(session) }
@@ -688,82 +827,36 @@ private struct SessionListView: View {
     }
 }
 
-private struct SessionRowView: View {
-    let session: TraceSession
+private struct SessionCellView: View {
+    let row: SessionRow
     let pinned: Bool
     let showPingBadge: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(TraceFormat.relative(session.lastTsMs))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                if pinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.orange)
-                }
-                Spacer()
-                if let errors = session.errors, errors > 0 {
-                    Text("\(errors) err")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(.red))
-                }
-                if showPingBadge {
-                    Text("[ping]")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            HStack(spacing: 5) {
-                HarnessIconView(harness: session.harness, tags: session.tags, size: 16)
-                Text(session.sessionId)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            HStack(spacing: 8) {
-                let providers = ModelProvider.providers(in: session.models)
-                if !providers.isEmpty {
-                    HStack(spacing: 3) {
-                        ForEach(providers, id: \.self) { provider in
-                            ProviderBadgeView(provider: provider)
-                        }
+        HStack(spacing: 5) {
+            HarnessIconView(harness: row.harnessRaw, tags: row.tags, size: 16)
+            if !row.providers.isEmpty {
+                HStack(spacing: 3) {
+                    ForEach(row.providers, id: \.self) { provider in
+                        ProviderBadgeView(provider: provider)
                     }
                 }
-                Text((session.models ?? []).joined(separator: ", "))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
             }
-            let chips = SessionTagChips.chips(
-                tags: session.tags, harness: session.harness, models: session.models)
-            if !chips.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(chips, id: \.key) { chip in
-                        TagChipView(text: chip.label())
-                    }
-                    Spacer()
-                }
+            Text(row.sessionShort)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if pinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.orange)
             }
-            HStack(spacing: 8) {
-                Text("\(session.traceCount) turn\(session.traceCount == 1 ? "" : "s")")
-                Text("\(TraceFormat.tokens(session.totalInputTokens))→\(TraceFormat.tokens(session.totalOutputTokens)) tok")
-                if let cost = session.totalCostUsd, cost > 0 {
-                    Text(TraceFormat.cost(cost))
-                }
-                Spacer()
+            if showPingBadge, let badge = row.kindBadge {
+                Text("[\(badge)]")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
             }
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
     }
 }
 
@@ -873,17 +966,9 @@ enum TraceFormat {
         timeFormatter.string(from: Date(timeIntervalSince1970: Double(tsMs) / 1000))
     }
 
-    static func tokens(_ count: Int64?) -> String {
-        guard let count else { return "–" }
-        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
-        if count >= 10_000 { return "\(count / 1000)k" }
-        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1000) }
-        return "\(count)"
-    }
+    static func tokens(_ count: Int64?) -> String { TraceNumberFormat.tokens(count) }
 
-    static func cost(_ usd: Double) -> String {
-        usd >= 0.01 ? String(format: "$%.2f", usd) : String(format: "$%.4f", usd)
-    }
+    static func cost(_ usd: Double) -> String { TraceNumberFormat.cost(usd) }
 }
 
 @MainActor
