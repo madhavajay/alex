@@ -235,3 +235,22 @@ alexandria keys revoke rk-1a2b3c4d
 ```
 
 Then correlate as usual: `GET {base}/traces/runs/cove-job-42`.
+
+## Retention
+
+The daemon prunes trace bodies + captured headers after
+`trace_body_retention_days` (config.toml, default 30) — export any runs you care
+about before then (`alexandria traces export --run-id ... --bodies`). Trace rows
+(token counts, costs, status) are kept forever by default; set
+`trace_row_retention_days` to also delete rows.
+
+Inspect and prune manually:
+
+```
+GET {base}/admin/storage
+POST {base}/admin/storage/prune
+{"older_than": "30d", "bodies_only": true, "dry_run": true}
+
+alexandria traces du
+alexandria traces prune --older-than 30d [--rows] [--dry-run] [--json]
+```

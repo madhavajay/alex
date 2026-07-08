@@ -212,6 +212,23 @@ impl Default for TraceFilter {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PruneReport {
+    pub bodies_deleted: u64,
+    pub bytes_freed: u64,
+    pub rows_affected: u64,
+    pub rows_deleted: u64,
+    pub dirs_removed: u64,
+}
+
+fn date_dir_name(name: &str) -> bool {
+    name.len() == 10
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     pub data_dir: PathBuf,
@@ -777,9 +794,150 @@ impl Store {
         Ok(changed > 0)
     }
 
+    pub fn prune(&self, older_than_ms: i64, bodies_only: bool, dry_run: bool) -> Result<PruneReport> {
+        let mut report = PruneReport::default();
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, req_body_path, upstream_req_body_path, resp_body_path
+                 FROM traces WHERE ts_request_ms < ?1
+                   AND (req_body_path IS NOT NULL OR upstream_req_body_path IS NOT NULL
+                        OR resp_body_path IS NOT NULL OR req_headers_json IS NOT NULL
+                        OR resp_headers_json IS NOT NULL)",
+            )?;
+            let rows = stmt
+                .query_map(params![older_than_ms], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        for (id, req, upstream, resp) in rows {
+            for path in [req, upstream, resp].into_iter().flatten() {
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                report.bytes_freed += meta.len();
+                report.bodies_deleted += 1;
+                if !dry_run {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("deleting body file {path}"))?;
+                }
+            }
+            if !dry_run {
+                let conn = self.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE traces SET req_body_path = NULL, upstream_req_body_path = NULL,
+                            resp_body_path = NULL, req_headers_json = NULL, resp_headers_json = NULL
+                     WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            report.rows_affected += 1;
+        }
+        if !bodies_only {
+            let conn = self.conn.lock().unwrap();
+            if dry_run {
+                report.rows_deleted = conn.query_row(
+                    "SELECT COUNT(*) FROM traces WHERE ts_request_ms < ?1",
+                    params![older_than_ms],
+                    |r| r.get::<_, i64>(0),
+                )? as u64;
+            } else {
+                report.rows_deleted = conn.execute(
+                    "DELETE FROM traces WHERE ts_request_ms < ?1",
+                    params![older_than_ms],
+                )? as u64;
+                if report.rows_deleted > 0 {
+                    if let Err(e) = conn.execute_batch("VACUUM") {
+                        tracing::warn!("prune: VACUUM skipped: {e}");
+                    }
+                }
+            }
+        }
+        if !dry_run {
+            let bodies = self.data_dir.join("bodies");
+            if let Ok(entries) = std::fs::read_dir(&bodies) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !path.is_dir() || !date_dir_name(&name) {
+                        continue;
+                    }
+                    let empty = std::fs::read_dir(&path)
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(false);
+                    if empty && std::fs::remove_dir(&path).is_ok() {
+                        report.dirs_removed += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn disk_usage(&self) -> Result<Value> {
+        let mut sqlite_bytes = 0u64;
+        for suffix in ["", "-wal", "-shm"] {
+            let path = self.data_dir.join(format!("alexandria.sqlite3{suffix}"));
+            if let Ok(m) = std::fs::metadata(&path) {
+                sqlite_bytes += m.len();
+            }
+        }
+        let mut bodies_bytes = 0u64;
+        let mut days: Vec<Value> = vec![];
+        if let Ok(entries) = std::fs::read_dir(self.data_dir.join("bodies")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !entry.path().is_dir() || !date_dir_name(&name) {
+                    continue;
+                }
+                let (mut files, mut bytes) = (0u64, 0u64);
+                if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                    for f in inner.flatten() {
+                        if let Ok(m) = f.metadata() {
+                            if m.is_file() {
+                                files += 1;
+                                bytes += m.len();
+                            }
+                        }
+                    }
+                }
+                bodies_bytes += bytes;
+                days.push(json!({"date": name, "files": files, "bytes": bytes}));
+            }
+        }
+        days.sort_by(|a, b| b["date"].as_str().cmp(&a["date"].as_str()));
+        let conn = self.conn.lock().unwrap();
+        let (trace_rows, oldest_ts_ms, newest_ts_ms) = conn.query_row(
+            "SELECT COUNT(*), MIN(ts_request_ms), MAX(ts_request_ms) FROM traces",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        Ok(json!({
+            "sqlite_bytes": sqlite_bytes,
+            "bodies_bytes": bodies_bytes,
+            "days": days,
+            "trace_rows": trace_rows,
+            "oldest_ts_ms": oldest_ts_ms,
+            "newest_ts_ms": newest_ts_ms,
+        }))
+    }
+
     pub fn write_body(&self, trace_id: &str, kind: &str, bytes: &[u8]) -> Result<String> {
         let date = Utc::now().format("%Y-%m-%d").to_string();
-        let dir = self.data_dir.join("bodies").join(&date);
+        self.write_body_dated(&date, trace_id, kind, bytes)
+    }
+
+    fn write_body_dated(&self, date: &str, trace_id: &str, kind: &str, bytes: &[u8]) -> Result<String> {
+        let dir = self.data_dir.join("bodies").join(date);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{trace_id}.{kind}.gz"));
         let file = std::fs::File::create(&path)?;
@@ -1014,6 +1172,115 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(store.get_trace("a").unwrap().is_none());
         assert!(store.delete_trace("a").is_err());
+    }
+
+    fn seed_dated_trace(store: &Store, id: &str, ts: i64, date: &str) {
+        let mut t = trace(id, ts, None);
+        t.req_body_path = Some(
+            store
+                .write_body_dated(date, id, "request.json", b"{\"model\":\"x\"}")
+                .unwrap(),
+        );
+        t.resp_body_path = Some(
+            store
+                .write_body_dated(date, id, "response.body", b"response bytes here")
+                .unwrap(),
+        );
+        t.req_headers_json = Some(r#"{"authorization":"[redacted]"}"#.into());
+        t.resp_headers_json = Some(r#"{"content-type":"application/json"}"#.into());
+        store.insert_trace(&t).unwrap();
+    }
+
+    #[test]
+    fn date_dir_name_shape() {
+        assert!(date_dir_name("2024-01-31"));
+        assert!(!date_dir_name("2024-1-31"));
+        assert!(!date_dir_name("20240131"));
+        assert!(!date_dir_name("accounts"));
+        assert!(!date_dir_name("2024-01-31x"));
+    }
+
+    #[test]
+    fn prune_bodies_dry_run_then_real() {
+        let store = Store::open(tmpdir("prune-bodies")).unwrap();
+        seed_dated_trace(&store, "a", 1000, "2024-01-01");
+        seed_dated_trace(&store, "b", 2000, "2024-01-02");
+        seed_dated_trace(&store, "c", 10_000, "2024-01-03");
+        let scratch = store.data_dir.join("bodies").join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let dry = store.prune(5000, true, true).unwrap();
+        assert_eq!(dry.bodies_deleted, 4);
+        assert!(dry.bytes_freed > 0);
+        assert_eq!(dry.rows_affected, 2);
+        assert_eq!(dry.rows_deleted, 0);
+        assert_eq!(dry.dirs_removed, 0);
+        let before = store.get_trace("a").unwrap().unwrap();
+        assert!(before["req_body_path"].is_string());
+        assert!(store.data_dir.join("bodies").join("2024-01-01").exists());
+        let real = store.prune(5000, true, false).unwrap();
+        assert_eq!(real.bodies_deleted, dry.bodies_deleted);
+        assert_eq!(real.bytes_freed, dry.bytes_freed);
+        assert_eq!(real.rows_affected, dry.rows_affected);
+        assert_eq!(real.rows_deleted, 0);
+        assert_eq!(real.dirs_removed, 2);
+        assert!(!store.data_dir.join("bodies").join("2024-01-01").exists());
+        assert!(!store.data_dir.join("bodies").join("2024-01-02").exists());
+        assert!(store.data_dir.join("bodies").join("2024-01-03").exists());
+        assert!(scratch.exists());
+        assert_eq!(store.search_traces(&TraceFilter::default()).unwrap().len(), 3);
+        let pruned = store.get_trace("a").unwrap().unwrap();
+        for key in [
+            "req_body_path",
+            "upstream_req_body_path",
+            "resp_body_path",
+            "req_headers_json",
+            "resp_headers_json",
+        ] {
+            assert_eq!(pruned[key], Value::Null, "{key} not nulled");
+        }
+        let kept = store.get_trace("c").unwrap().unwrap();
+        assert!(kept["req_body_path"].is_string());
+        assert!(kept["req_headers_json"].is_string());
+        assert_eq!(store.prune(5000, true, false).unwrap(), PruneReport::default());
+    }
+
+    #[test]
+    fn prune_rows_deletes_and_du_reflects() {
+        let store = Store::open(tmpdir("prune-rows")).unwrap();
+        seed_dated_trace(&store, "a", 1000, "2024-01-01");
+        seed_dated_trace(&store, "b", 2000, "2024-01-02");
+        seed_dated_trace(&store, "c", 10_000, "2024-01-03");
+        let before = store.disk_usage().unwrap();
+        assert_eq!(before["trace_rows"], 3);
+        assert_eq!(before["oldest_ts_ms"], 1000);
+        assert_eq!(before["newest_ts_ms"], 10_000);
+        assert_eq!(before["days"].as_array().unwrap().len(), 3);
+        assert_eq!(before["days"][0]["date"], "2024-01-03");
+        assert_eq!(before["days"][0]["files"], 2);
+        assert!(before["bodies_bytes"].as_u64().unwrap() > 0);
+        assert!(before["sqlite_bytes"].as_u64().unwrap() > 0);
+        let dry = store.prune(5000, false, true).unwrap();
+        assert_eq!(dry.rows_deleted, 2);
+        assert_eq!(dry.rows_affected, 2);
+        assert_eq!(store.disk_usage().unwrap()["trace_rows"], 3);
+        let real = store.prune(5000, false, false).unwrap();
+        assert_eq!(real.bodies_deleted, 4);
+        assert_eq!(real.rows_affected, 2);
+        assert_eq!(real.rows_deleted, 2);
+        assert_eq!(real.dirs_removed, 2);
+        assert_eq!(real.bytes_freed, dry.bytes_freed);
+        let after = store.disk_usage().unwrap();
+        assert_eq!(after["trace_rows"], 1);
+        assert_eq!(after["oldest_ts_ms"], 10_000);
+        assert_eq!(after["newest_ts_ms"], 10_000);
+        assert_eq!(after["days"].as_array().unwrap().len(), 1);
+        assert_eq!(after["days"][0]["date"], "2024-01-03");
+        assert_eq!(
+            after["bodies_bytes"].as_u64().unwrap(),
+            before["bodies_bytes"].as_u64().unwrap() - real.bytes_freed
+        );
+        assert!(store.get_trace("a").unwrap().is_none());
+        assert!(store.get_trace("c").unwrap().is_some());
     }
 
     #[test]

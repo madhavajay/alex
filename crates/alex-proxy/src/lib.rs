@@ -149,6 +149,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/run-keys/{id}",
             axum::routing::delete(admin_run_keys_revoke),
         )
+        .route("/admin/storage", get(admin_storage))
+        .route("/admin/storage/prune", post(admin_storage_prune))
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/health", get(admin_health))
@@ -471,6 +473,58 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
     match &state.dario {
         Some(d) => axum::Json(d.status()).into_response(),
         None => error_response(StatusCode::NOT_FOUND, "dario mode is not enabled"),
+    }
+}
+
+async fn admin_storage(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.disk_usage() {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_storage_prune(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let now = now_ms();
+    let cutoff = match &body["older_than_ms"] {
+        Value::Null => match body["older_than"].as_str() {
+            Some(s) => match parse_since(s, now) {
+                Some(ms) => ms,
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid 'older_than' '{s}' (use 45s, 30m, 24h, 7d, or RFC3339)"),
+                    )
+                }
+            },
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "missing 'older_than_ms' or 'older_than'",
+                )
+            }
+        },
+        v => match v.as_i64() {
+            Some(ms) => ms,
+            None => {
+                return error_response(StatusCode::BAD_REQUEST, "'older_than_ms' must be an integer")
+            }
+        },
+    };
+    if cutoff > now {
+        return error_response(StatusCode::BAD_REQUEST, "cutoff is in the future");
+    }
+    let bodies_only = body["bodies_only"].as_bool().unwrap_or(true);
+    let dry_run = body["dry_run"].as_bool().unwrap_or(false);
+    let store = state.store.clone();
+    let report =
+        tokio::task::spawn_blocking(move || store.prune(cutoff, bodies_only, dry_run)).await;
+    match report {
+        Ok(Ok(r)) => axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 

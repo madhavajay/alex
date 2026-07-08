@@ -182,6 +182,21 @@ fn human_secs(secs: i64) -> String {
     }
 }
 
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 pub fn human_ago(ts_ms: i64) -> String {
     let elapsed = now_ms() - ts_ms;
     if elapsed < 1000 {
@@ -334,6 +349,17 @@ mod tests {
         assert_eq!(fill_count(&gauge(100.0, 24)), 24);
         assert_eq!(fill_count(&gauge(150.0, 24)), 24);
         assert_eq!(gauge(0.0, 10).chars().filter(|c| *c == '░').count(), 10);
+    }
+
+    #[test]
+    fn human_bytes_cases() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024 * 1024), "2.0 TB");
     }
 
     #[test]

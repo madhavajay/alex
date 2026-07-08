@@ -250,6 +250,28 @@ enum TracesCommand {
         #[arg(long)]
         run_id: String,
     },
+    /// Delete old trace bodies + headers, and rows with --rows (offline)
+    Prune {
+        /// Cutoff: relative (45s, 30m, 24h, 30d) or RFC3339
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Only remove bodies/headers, keep rows (the default)
+        #[arg(long, conflicts_with = "rows")]
+        bodies_only: bool,
+        /// Also delete trace rows older than the cutoff
+        #[arg(long)]
+        rows: bool,
+        /// Report what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show sqlite + body file disk usage (offline)
+    Du {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -345,10 +367,18 @@ struct Config {
     dario_probe_failures: u32,
     #[serde(default = "default_dario_probe_model")]
     dario_probe_model: String,
+    #[serde(default = "default_trace_body_retention_days")]
+    trace_body_retention_days: u64,
+    #[serde(default)]
+    trace_row_retention_days: u64,
 }
 
 fn default_heartbeat_minutes() -> u64 {
     15
+}
+
+fn default_trace_body_retention_days() -> u64 {
+    30
 }
 
 fn default_ping_anthropic() -> String {
@@ -461,6 +491,8 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         dario_probe_seconds: default_dario_probe_seconds(),
         dario_probe_failures: default_dario_probe_failures(),
         dario_probe_model: default_dario_probe_model(),
+        trace_body_retention_days: default_trace_body_retention_days(),
+        trace_row_retention_days: 0,
     };
     std::fs::write(&path, toml::to_string_pretty(&config)?)?;
     #[cfg(unix)]
@@ -707,6 +739,60 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("heartbeat: disabled (set heartbeat_minutes in config.toml to enable)");
             }
+            let body_days = config.trace_body_retention_days;
+            let row_days = config.trace_row_retention_days;
+            if body_days > 0 || row_days > 0 {
+                let prune_state = state.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        let store = prune_state.store.clone();
+                        let reports = tokio::task::spawn_blocking(move || {
+                            let now = now_ms();
+                            let day_ms = 86_400_000i64;
+                            let mut out = Vec::new();
+                            if body_days > 0 {
+                                out.push((
+                                    "bodies",
+                                    store.prune(now - body_days as i64 * day_ms, true, false),
+                                ));
+                            }
+                            if row_days > 0 {
+                                out.push((
+                                    "rows",
+                                    store.prune(now - row_days as i64 * day_ms, false, false),
+                                ));
+                            }
+                            out
+                        })
+                        .await
+                        .unwrap_or_default();
+                        for (scope, report) in reports {
+                            match report {
+                                Ok(r) => tracing::info!("retention prune ({scope}): {r:?}"),
+                                Err(e) => {
+                                    tracing::warn!("retention prune ({scope}) failed: {e}")
+                                }
+                            }
+                        }
+                    }
+                });
+                let describe = |days: u64| {
+                    if days > 0 {
+                        format!("{days}d")
+                    } else {
+                        "keep forever".into()
+                    }
+                };
+                eprintln!(
+                    "retention: bodies {} / rows {} (daily check)",
+                    describe(body_days),
+                    describe(row_days)
+                );
+            }
             let mut app = alex_proxy::router(state);
             if let Some(sup) = supervisor.clone() {
                 app = app.merge(dario_admin_router(sup));
@@ -841,6 +927,18 @@ async fn main() -> Result<()> {
             }
             Some(TracesCommand::Path { run_id }) => {
                 traces_path_cmd(&config, &run_id)?;
+            }
+            Some(TracesCommand::Prune {
+                older_than,
+                bodies_only: _,
+                rows,
+                dry_run,
+                json,
+            }) => {
+                traces_prune_cmd(&config, &older_than, rows, dry_run, json)?;
+            }
+            Some(TracesCommand::Du { json }) => {
+                traces_du_cmd(&config, json)?;
             }
         },
         Command::Env => {
@@ -1220,6 +1318,100 @@ fn traces_path_cmd(config: &Config, run_id: &str) -> Result<()> {
         if let Some(p) = artifact["path"].as_str() {
             println!("{p}");
         }
+    }
+    Ok(())
+}
+
+fn traces_prune_cmd(
+    config: &Config,
+    older_than: &str,
+    rows: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let now = now_ms();
+    let cutoff = alex_core::parse_since(older_than, now).with_context(|| {
+        format!("invalid --older-than '{older_than}' (use 45s, 30m, 24h, 30d, or RFC3339)")
+    })?;
+    anyhow::ensure!(cutoff <= now, "--older-than '{older_than}' resolves to the future");
+    let store = Store::open(config.data_dir.clone())?;
+    let report = store.prune(cutoff, !rows, dry_run)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let title = if dry_run { "prune (dry run)" } else { "prune" };
+    println!("{}", ui::section(title));
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    println!(
+        "{verb} {} body files ({})",
+        ui::bold(&report.bodies_deleted.to_string()),
+        ui::amber(&ui::human_bytes(report.bytes_freed))
+    );
+    println!(
+        "{} {} rows of body paths + headers",
+        if dry_run { "would strip" } else { "stripped" },
+        ui::bold(&report.rows_affected.to_string())
+    );
+    if rows {
+        println!(
+            "{verb} {} trace rows",
+            ui::bold(&report.rows_deleted.to_string())
+        );
+    }
+    if report.dirs_removed > 0 {
+        println!("removed {} empty date dirs", report.dirs_removed);
+    }
+    if dry_run {
+        println!("{}", ui::dim("no changes made — rerun without --dry-run"));
+    }
+    Ok(())
+}
+
+fn traces_du_cmd(config: &Config, json: bool) -> Result<()> {
+    let store = Store::open(config.data_dir.clone())?;
+    let du = store.disk_usage()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&du)?);
+        return Ok(());
+    }
+    println!("{}", ui::section("storage"));
+    let sqlite = du["sqlite_bytes"].as_u64().unwrap_or(0);
+    let bodies = du["bodies_bytes"].as_u64().unwrap_or(0);
+    println!(
+        "sqlite {}  bodies {}  total {}",
+        ui::amber(&ui::human_bytes(sqlite)),
+        ui::amber(&ui::human_bytes(bodies)),
+        ui::bold(&ui::human_bytes(sqlite + bodies))
+    );
+    let rows = du["trace_rows"].as_i64().unwrap_or(0);
+    let span = match (du["oldest_ts_ms"].as_i64(), du["newest_ts_ms"].as_i64()) {
+        (Some(oldest), Some(newest)) if rows > 0 => format!(
+            " ({} → {})",
+            ui::human_ago(oldest),
+            ui::human_ago(newest)
+        ),
+        _ => String::new(),
+    };
+    println!("{} trace rows{span}", ui::bold(&rows.to_string()));
+    let days = du["days"].as_array().cloned().unwrap_or_default();
+    if days.is_empty() {
+        println!("{}", ui::dim("no body files"));
+        return Ok(());
+    }
+    println!(
+        "{} {} {}",
+        ui::pad_right(&ui::column_header("date"), 12),
+        ui::pad_left(&ui::column_header("files"), 7),
+        ui::pad_left(&ui::column_header("size"), 10)
+    );
+    for d in &days {
+        println!(
+            "{} {} {}",
+            ui::pad_right(&ui::sand(d["date"].as_str().unwrap_or("-")), 12),
+            ui::pad_left(&d["files"].as_u64().unwrap_or(0).to_string(), 7),
+            ui::pad_left(&ui::human_bytes(d["bytes"].as_u64().unwrap_or(0)), 10)
+        );
     }
     Ok(())
 }
@@ -2641,6 +2833,8 @@ mod tests {
             dario_probe_seconds: 90,
             dario_probe_failures: 2,
             dario_probe_model: "claude-haiku-4-5".into(),
+            trace_body_retention_days: default_trace_body_retention_days(),
+            trace_row_retention_days: 0,
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();
