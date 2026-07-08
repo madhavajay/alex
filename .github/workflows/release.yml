@@ -12,6 +12,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     if: "!startsWith(github.event.head_commit.message, 'release:')"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     permissions:
       contents: write
     steps:
@@ -137,3 +139,41 @@ jobs:
               gh release upload "$tag" "$asset_dir"/* --clobber
             fi
           fi
+
+  windows-asset:
+    needs: publish
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI binaries from crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.publish.outputs.version }}"
+          root="$RUNNER_TEMP/alex-cli-install"
+          asset="alex-cli-${version}-windows-x86_64.zip"
+
+          for attempt in {1..12}; do
+            if cargo install alex --version "$version" --root "$root" --force --bins; then
+              break
+            fi
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "cargo install alex ${version} failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            echo "alex ${version} is not installable from crates.io yet; retrying in 15s..."
+            sleep 15
+          done
+
+          mkdir -p dist
+          7z a "dist/$asset" "$root/bin/alex.exe" "$root/bin/alexandria.exe"
+          sha256sum "dist/$asset" > "dist/$asset.sha256"
+      - name: Upload to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${{ needs.publish.outputs.version }}" dist/* --clobber -R "${{ github.repository }}"
