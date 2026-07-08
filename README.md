@@ -66,11 +66,17 @@ The upstream is chosen purely by the model name, so e.g. an **OpenAI Chat** requ
 Point the Gemini CLI at the proxy and let it run on, say, `gpt-5.5` — requests arrive as Gemini, get rewritten to OpenAI/Codex upstream, and responses convert back to Gemini shape:
 
 ```bash
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4100   # no /v1 — the SDK appends /v1beta
-export GEMINI_API_KEY=<local_key>                     # from ~/.alexandria/config.toml
-export GEMINI_API_KEY_AUTH_MECHANISM=bearer
+eval "$(alex env)"   # sets GOOGLE_GEMINI_BASE_URL, GEMINI_API_KEY, bearer mechanism, GOOGLE_GENAI_USE_GCA=false
 gemini --model gpt-5.5 --prompt 'Reply with only PONG'
 ```
+
+One-time: the Gemini CLI must use API-key auth, not its Google login. Set it in `~/.gemini/settings.json`:
+
+```json
+{ "security": { "auth": { "selectedType": "gemini-api-key" } } }
+```
+
+(or pick "Use API key" once in the CLI's `/auth` menu). Then `alex env` points it at the proxy — `GOOGLE_GEMINI_BASE_URL` has no `/v1`, since the SDK appends `/v1beta` itself, and `GEMINI_API_KEY_AUTH_MECHANISM=bearer` sends the key as `Authorization: Bearer`. Temp tokens from `POST /admin/run-keys` carry the same env block in their `exports` field, so a tagged run can drive the Gemini CLI too.
 
 Direct curl (non-streaming and streaming):
 

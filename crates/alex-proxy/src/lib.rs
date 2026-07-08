@@ -246,7 +246,12 @@ pub fn connect_payload(base_url: &str, local_key: &str) -> (Value, String) {
     let base = base_url.trim_end_matches('/').to_string();
     let v1 = format!("{base}/v1");
     let exports = format!(
-        "export ANTHROPIC_BASE_URL={base}\nexport ANTHROPIC_API_KEY={local_key}\nexport OPENAI_BASE_URL={v1}\nexport OPENAI_API_KEY={local_key}\nexport XAI_API_KEY={local_key}\nexport GROK_MODELS_BASE_URL={v1}\n"
+        "export ANTHROPIC_BASE_URL={base}\nexport ANTHROPIC_API_KEY={local_key}\n\
+         export OPENAI_BASE_URL={v1}\nexport OPENAI_API_KEY={local_key}\n\
+         export XAI_API_KEY={local_key}\nexport GROK_MODELS_BASE_URL={v1}\n\
+         export GOOGLE_GEMINI_BASE_URL={base}\nexport GOOGLE_GENAI_API_VERSION=v1beta\n\
+         export GEMINI_API_KEY={local_key}\nexport GEMINI_API_KEY_AUTH_MECHANISM=bearer\n\
+         export GOOGLE_GENAI_USE_GCA=false\n"
     );
     let payload = json!({
         "service": "alexandria",
@@ -255,6 +260,13 @@ pub fn connect_payload(base_url: &str, local_key: &str) -> (Value, String) {
         "anthropic": {"base_url": base, "env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": local_key}},
         "openai": {"base_url": v1, "env": {"OPENAI_BASE_URL": v1, "OPENAI_API_KEY": local_key}},
         "xai": {"base_url": v1, "env": {"XAI_API_KEY": local_key, "GROK_MODELS_BASE_URL": v1}},
+        "gemini": {"base_url": base, "env": {
+            "GOOGLE_GEMINI_BASE_URL": base,
+            "GOOGLE_GENAI_API_VERSION": "v1beta",
+            "GEMINI_API_KEY": local_key,
+            "GEMINI_API_KEY_AUTH_MECHANISM": "bearer",
+            "GOOGLE_GENAI_USE_GCA": "false",
+        }},
         "exports": exports,
     });
     (payload, exports)
@@ -2052,17 +2064,21 @@ async fn admin_run_keys_create(
         created_ms,
         Some(expires_ms),
     ) {
-        Ok(()) => (
-            StatusCode::CREATED,
-            axum::Json(json!({
-                "id": id,
-                "key": key,
-                "run_id": run_id,
-                "tags": tags.map(Value::Object).unwrap_or_else(|| json!({})),
-                "expires_ms": expires_ms,
-            })),
-        )
-            .into_response(),
+        Ok(()) => {
+            let (_, exports) = connect_payload(&state.base_url, &key);
+            (
+                StatusCode::CREATED,
+                axum::Json(json!({
+                    "id": id,
+                    "key": key,
+                    "run_id": run_id,
+                    "tags": tags.map(Value::Object).unwrap_or_else(|| json!({})),
+                    "expires_ms": expires_ms,
+                    "exports": exports,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
