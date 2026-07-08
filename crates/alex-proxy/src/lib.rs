@@ -26,6 +26,7 @@ const GROK_CLIENT_VERSION: &str = "0.2.77";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 
 #[derive(Debug, Clone)]
 pub struct DarioActive {
@@ -1741,12 +1742,12 @@ async fn plan_upstream(
             })
         }
         Provider::Gemini => {
+            // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
                 .vault
-                .account_for(provider, true)
+                .account_for(provider, false)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-            let project = ensure_gemini_project(state, &account).await?;
             let (gemini_req, respond_as) = match format {
                 ClientFormat::GeminiGenerate => {
                     let mut g = body_json.clone();
@@ -1778,18 +1779,35 @@ async fn plan_upstream(
             } else {
                 "generateContent"
             };
-            let envelope = json!({
-                "model": routed_model,
-                "project": project,
-                "request": gemini_req,
-            });
-            let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| original_body.to_vec());
-            let mut url = format!(
-                "{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
-            );
-            if client_stream {
-                url.push_str("?alt=sse");
-            }
+            let (url, body) = if account.kind == "api_key" {
+                // AI Studio: plain request, model in the path, x-goog-api-key header.
+                let mut url = format!(
+                    "{GEMINI_API_BASE}/v1beta/models/{routed_model}:{method}"
+                );
+                if client_stream {
+                    url.push_str("?alt=sse");
+                }
+                let body =
+                    serde_json::to_vec(&gemini_req).unwrap_or_else(|_| original_body.to_vec());
+                (url, body)
+            } else {
+                // Code Assist (OAuth): wrapped envelope + project.
+                let project = ensure_gemini_project(state, &account).await?;
+                let mut url = format!(
+                    "{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
+                );
+                if client_stream {
+                    url.push_str("?alt=sse");
+                }
+                let envelope = json!({
+                    "model": routed_model,
+                    "project": project,
+                    "request": gemini_req,
+                });
+                let body =
+                    serde_json::to_vec(&envelope).unwrap_or_else(|_| original_body.to_vec());
+                (url, body)
+            };
             Ok(UpstreamPlan {
                 url,
                 account,
@@ -2070,6 +2088,17 @@ fn upstream_headers(
             );
             h.insert("user-agent", HeaderValue::from_static("xai-grok-workspace"));
             h.insert("accept", HeaderValue::from_static("text/event-stream"));
+        }
+        (Provider::Gemini, "api_key") => {
+            let key = account.api_key.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "gemini api_key account has no key".to_string(),
+            ))?;
+            h.insert(
+                "x-goog-api-key",
+                HeaderValue::from_str(key)
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
         }
         (Provider::Gemini, _) => {
             let token = account.access_token.as_deref().ok_or((

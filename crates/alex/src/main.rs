@@ -173,6 +173,11 @@ enum AuthCommand {
     },
     /// Run an OAuth login flow from the terminal (claude|codex|grok|gemini); no arg opens a picker
     Login { provider: Option<String> },
+    /// Register a Google AI Studio API key for Gemini (from aistudio.google.com/apikey)
+    GeminiKey {
+        /// The API key; omit to read from the GEMINI_API_KEY env var
+        key: Option<String>,
+    },
     /// List vault accounts
     List,
 }
@@ -907,6 +912,35 @@ async fn main() -> Result<()> {
                 };
                 let id = alex_auth::login::login(&vault, &provider).await?;
                 println!("saved account: {id}");
+            }
+            AuthCommand::GeminiKey { key } => {
+                let key = key
+                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                    .filter(|k| !k.trim().is_empty())
+                    .context(
+                        "provide the key: `alexandria auth gemini-key <KEY>` (get one at https://aistudio.google.com/apikey)",
+                    )?;
+                let vault = open_vault(&config)?;
+                let account = alex_auth::Account {
+                    id: "gemini-api-key".into(),
+                    provider: alex_core::Provider::Gemini,
+                    kind: "api_key".into(),
+                    label: Some("gemini (AI Studio key)".into()),
+                    access_token: None,
+                    refresh_token: None,
+                    id_token: None,
+                    api_key: Some(key.trim().to_string()),
+                    expires_at_ms: None,
+                    last_refresh_ms: None,
+                    account_meta: serde_json::Value::Null,
+                    cooldown_until_ms: None,
+                    status: "active".into(),
+                };
+                vault.upsert(account).await?;
+                println!(
+                    "{} saved gemini-api-key — gemini-* models now route to AI Studio",
+                    ui::green(ui::dot())
+                );
             }
             AuthCommand::List => {
                 let vault = open_vault(&config)?;
