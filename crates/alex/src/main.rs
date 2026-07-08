@@ -1647,6 +1647,15 @@ fn print_env(host: &str, port: u16, local_key: &str) {
     eprintln!("{}", ui::dim("# openai-format harnesses (codex, pi, …)"));
     eprintln!("export OPENAI_BASE_URL=http://{host}:{port}/v1");
     eprintln!("export OPENAI_API_KEY={local_key}");
+    eprintln!("{}", ui::dim("# xai/grok harnesses"));
+    eprintln!("export XAI_API_KEY={local_key}");
+    eprintln!("export GROK_MODELS_BASE_URL=http://{host}:{port}/v1");
+    eprintln!("{}", ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)"));
+    eprintln!("export GOOGLE_GEMINI_BASE_URL=http://{host}:{port}");
+    eprintln!("export GOOGLE_GENAI_API_VERSION=v1beta");
+    eprintln!("export GEMINI_API_KEY={local_key}");
+    eprintln!("export GEMINI_API_KEY_AUTH_MECHANISM=bearer");
+    eprintln!("export GOOGLE_GENAI_USE_GCA=false");
 }
 
 fn account_indicators(a: &alex_auth::Account) -> (String, String) {
@@ -2505,6 +2514,11 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     println!("{}", ui::dim("# openai-format harnesses (codex, pi, …)"));
     println!("export OPENAI_BASE_URL={base}/v1");
     println!("export OPENAI_API_KEY={}", config.local_key);
+    println!("{}", ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)"));
+    println!("export GOOGLE_GEMINI_BASE_URL={base}");
+    println!("export GEMINI_API_KEY={}", config.local_key);
+    println!("export GEMINI_API_KEY_AUTH_MECHANISM=bearer");
+    println!("export GOOGLE_GENAI_USE_GCA=false");
 
     println!();
     println!("{}", ui::section("accounts"));
