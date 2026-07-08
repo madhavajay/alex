@@ -636,10 +636,7 @@ impl DarioSupervisor {
                     generation = e["generation_id"].as_str().unwrap_or("-"),
                     "reaping orphaned dario child from dead daemon"
                 );
-                let _ = std::process::Command::new("kill")
-                    .arg("-TERM")
-                    .arg(child.to_string())
-                    .output();
+                terminate_pid(child as i32);
             }
         }
         if let Ok(data) = serde_json::to_string(&kept) {
@@ -1093,13 +1090,36 @@ fn generation_id(version: &str, port: u16) -> String {
     format!("gen-{version}-{port}")
 }
 
+#[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
     unsafe { libc_kill(pid, 0) == 0 }
 }
 
+#[cfg(unix)]
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: i32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
+}
+
+fn terminate_pid(pid: i32) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .output();
+    #[cfg(not(unix))]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .output();
 }
 
 fn alloc_port() -> Result<u16> {
@@ -1109,9 +1129,15 @@ fn alloc_port() -> Result<u16> {
 }
 
 async fn send_sigterm(pid: u32) {
+    #[cfg(unix)]
     let _ = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
+        .status()
+        .await;
+    #[cfg(not(unix))]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
         .status()
         .await;
 }
