@@ -280,13 +280,29 @@ jobs:
             -T /usr/bin/codesign -T /usr/bin/security >/dev/null
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null 2>&1 || true
 
+          identity_list="$(security find-identity -p codesigning -v "$keychain" || true)"
+          codesign_identity=""
+          if [[ "${APPLE_SIGNING_IDENTITY:-}" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+            codesign_identity="$APPLE_SIGNING_IDENTITY"
+          elif [[ -n "${APPLE_TEAM_ID:-}" ]]; then
+            codesign_identity="$(awk -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($0, team) { print $2; exit }' <<<"$identity_list")"
+          fi
+          if [[ -z "$codesign_identity" ]]; then
+            codesign_identity="$(awk '/Developer ID Application/ { print $2; exit }' <<<"$identity_list")"
+          fi
+          if [[ -z "$codesign_identity" ]]; then
+            echo "no Developer ID Application identity found after import:" >&2
+            printf '%s\n' "$identity_list" >&2
+            exit 1
+          fi
+
           for bin in \
             "$RUNNER_TEMP/alex-cli-aarch64/bin/alex" \
             "$RUNNER_TEMP/alex-cli-aarch64/bin/alexandria" \
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alex" \
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alexandria"
           do
-            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+            codesign --force --options runtime --timestamp --sign "$codesign_identity" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
 
