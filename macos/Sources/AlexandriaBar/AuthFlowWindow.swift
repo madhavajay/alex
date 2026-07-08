@@ -18,6 +18,7 @@ final class AuthFlowModel {
     private(set) var stage: Stage = .starting
     private(set) var session: LoginSession?
     var pasteInput = ""
+    var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
     private var pollTask: Task<Void, Never>?
 
     init(provider: String, store: SnapshotStore) {
@@ -57,6 +58,7 @@ final class AuthFlowModel {
             stage = .done(session.accountId ?? "")
             pollTask?.cancel()
             Task { await store.refresh() }
+            onAuthenticated?(provider)
         case "failed":
             stage = .failed(session.error ?? "login failed")
             pollTask?.cancel()
@@ -270,13 +272,17 @@ final class AuthWindowController {
     private var windows: [String: NSWindow] = [:]
     private var models: [String: AuthFlowModel] = [:]
 
-    func show(provider: String, store: SnapshotStore) {
+    func show(
+        provider: String, store: SnapshotStore,
+        onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
+    ) {
         if let window = windows[provider] {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
         let model = AuthFlowModel(provider: provider, store: store)
+        model.onAuthenticated = onAuthenticated
         models[provider] = model
         let view = AuthFlowView(model: model) { [weak self] in
             self?.closeWindow(provider: provider)

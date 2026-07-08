@@ -12,6 +12,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var darioWindow: DarioWindowController?
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
+    private let geminiKeyWindow = GeminiKeyWindowController()
 
     init(store: SnapshotStore) {
         self.store = store
@@ -216,8 +217,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         sub.addItem(.separator())
         action("Re-auth \(name)…", symbol: "key") { [weak self] in
-            guard let self else { return }
-            self.authWindows.show(provider: account.provider, store: self.store)
+            self?.openAuth(provider: account.provider)
         }
         action("Re-auth in Terminal…", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
@@ -232,11 +232,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self?.runPing(target: ping, name: name)
             }
         }
+        if account.provider == "gemini" {
+            action("Set AI Studio API Key…", symbol: "key.horizontal") { [weak self] in
+                self?.setGeminiKey()
+            }
+        }
         if account.provider == "openai" {
             sub.addItem(.separator())
             action("Start 5h Window Now…", symbol: "hourglass.bottomhalf.filled") { [weak self] in
                 self?.confirmStartCodexWindow()
             }
+        }
+        sub.addItem(.separator())
+        action("Remove Account", symbol: "trash") { [weak self] in
+            self?.removeAccount(account)
         }
         return sub
     }
@@ -313,8 +322,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     action: #selector(runHandler(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = MenuHandler { [weak self] in
-                    guard let self else { return }
-                    self.authWindows.show(provider: provider, store: self.store)
+                    self?.openAuth(provider: provider)
                 }
                 sub.addItem(item)
             }
@@ -370,6 +378,46 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func runPing(target: String, name: String) {
         pingWindow.show(target: target, title: name, store: store)
+    }
+
+    private func openAuth(provider: String) {
+        authWindows.show(provider: provider, store: store) { [weak self] provider in
+            self?.pingAfterAuth(provider: provider)
+        }
+    }
+
+    private func pingAfterAuth(provider: String) {
+        guard let ping = ProviderInfo.pingArg(provider) else { return }
+        runPing(target: ping, name: ProviderInfo.displayName(provider))
+    }
+
+    private func setGeminiKey() {
+        guard store.config != nil else { return }
+        geminiKeyWindow.show(store: store) { [weak self] in
+            self?.pingAfterAuth(provider: "gemini")
+        }
+    }
+
+    private func removeAccount(_ account: Account) {
+        let name = ProviderInfo.displayName(account.provider)
+        let alert = NSAlert()
+        alert.messageText = "Remove \(name) account (\(account.id))?"
+        alert.informativeText = "Alexandria will stop using and pinging it."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let config = store.config else { return }
+        let client = AlexandriaClient(config: config)
+        Task { [weak self] in
+            do {
+                try await client.removeAccount(id: account.id)
+                await self?.store.refresh()
+                self?.notify(title: "\(name) account removed", body: account.id)
+            } catch {
+                self?.notify(title: "Failed to remove account", body: error.localizedDescription)
+            }
+        }
     }
 
     private func importCredentials() {

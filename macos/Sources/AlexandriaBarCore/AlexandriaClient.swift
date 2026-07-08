@@ -242,4 +242,13 @@ public struct AlexandriaClient: Sendable {
     public func deleteTrace(id: String) async throws {
         _ = try await request("traces/\(id)", method: "DELETE")
     }
+
+    public func removeAccount(id: String) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        _ = try await request("admin/accounts/\(encoded)", method: "DELETE")
+    }
+
+    public func setGeminiKey(_ key: String) async throws {
+        _ = try await request("admin/auth/gemini-key", method: "POST", body: ["key": key])
+    }
 }
