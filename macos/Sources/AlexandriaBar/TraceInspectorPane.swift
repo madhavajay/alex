@@ -65,6 +65,7 @@ struct TraceInspectorView: View {
     @State private var respHeadersOpen = false
     @State private var reqBody = BodyLoad()
     @State private var respBody = BodyLoad()
+    @AppStorage("InspectorRawMode") private var rawMode = false
 
     struct BodyLoad {
         var open = false
@@ -73,7 +74,7 @@ struct TraceInspectorView: View {
         enum Phase {
             case idle
             case loading
-            case loaded(display: String, truncated: Bool, raw: String, diskPath: String?)
+            case loaded(raw: String, diskPath: String?)
             case failed(String)
         }
     }
@@ -126,6 +127,26 @@ struct TraceInspectorView: View {
                 .truncationMode(.middle)
                 .textSelection(.enabled)
             Spacer()
+            Button {
+                model.stepInspector(-1)
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!model.canStepInspector(-1))
+            .help("Previous turn")
+            Button {
+                model.stepInspector(1)
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!model.canStepInspector(1))
+            .help("Next turn")
             Button {
                 model.closeInspector()
             } label: {
@@ -298,7 +319,9 @@ struct TraceInspectorView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
-        case let .loaded(display, truncated, raw, diskPath):
+        case let .loaded(raw, diskPath):
+            let capped = rawMode ? BodyPretty.capped(raw) : BodyPretty.display(raw)
+            let highlight = !rawMode && BodyPretty.isJSON(raw)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Button("Copy") {
@@ -311,7 +334,11 @@ struct TraceInspectorView: View {
                             [URL(fileURLWithPath: diskPath)])
                     }
                     .disabled(diskPath == nil)
-                    if truncated {
+                    Toggle("Raw", isOn: $rawMode)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10))
+                        .help("Show as-fetched text without pretty-printing or highlighting")
+                    if capped.isTruncated {
                         Text("truncated to \(BodyPretty.displayCap / 1000)KB")
                             .font(.system(size: 9))
                             .foregroundStyle(.orange)
@@ -319,7 +346,7 @@ struct TraceInspectorView: View {
                     Spacer()
                 }
                 .controlSize(.small)
-                InspectorTextPane(text: display)
+                InspectorTextPane(text: capped.text, highlightJSON: highlight)
                     .frame(height: 220)
             }
         }
@@ -350,10 +377,7 @@ struct TraceInspectorView: View {
         guard let client = model.detailClient() else { return .failed("daemon unavailable") }
         do {
             let content = try await client.traceBody(id: id, kind: kind)
-            let capped = BodyPretty.display(content.text)
-            return .loaded(
-                display: capped.text, truncated: capped.isTruncated,
-                raw: content.text, diskPath: content.diskPath)
+            return .loaded(raw: content.text, diskPath: content.diskPath)
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -453,6 +477,9 @@ struct HeaderListView: View {
 
 struct InspectorTextPane: NSViewRepresentable {
     let text: String
+    var highlightJSON = false
+
+    private static let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
 
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NSTextView(usingTextLayoutManager: true)
@@ -460,7 +487,7 @@ struct InspectorTextPane: NSViewRepresentable {
         textView.isSelectable = true
         textView.isRichText = false
         textView.drawsBackground = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        textView.font = Self.font
         textView.textContainerInset = NSSize(width: 6, height: 6)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -475,11 +502,26 @@ struct InspectorTextPane: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let textView = scroll.documentView as? NSTextView else { return }
-        if textView.string != text {
-            textView.string = text
-            textView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-            textView.scroll(.zero)
+        guard let textView = scroll.documentView as? NSTextView,
+            let storage = textView.textStorage
+        else { return }
+        let key = "\(highlightJSON)|\(text.count)|\(text.hashValue)"
+        guard context.coordinator.lastKey != key else { return }
+        context.coordinator.lastKey = key
+        if highlightJSON {
+            storage.setAttributedString(JsonHighlight.attributed(text, font: Self.font))
+        } else {
+            storage.setAttributedString(NSAttributedString(
+                string: text,
+                attributes: [.font: Self.font, .foregroundColor: NSColor.labelColor]))
         }
+        textView.scroll(.zero)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    @MainActor
+    final class Coordinator {
+        var lastKey: String?
     }
 }

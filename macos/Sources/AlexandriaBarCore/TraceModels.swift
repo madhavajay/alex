@@ -89,6 +89,13 @@ public struct ToolCall: Codable, Sendable, Equatable {
 
     public var argumentSummary: String { Self.summary(arguments ?? "") }
 
+    public var command: String? {
+        guard let arguments, let data = arguments.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["command"] as? String
+    }
+
     public static func summary(_ arguments: String) -> String {
         let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -347,7 +354,8 @@ public enum BodyPretty {
 
     public static func display(_ raw: String, cap: Int = displayCap) -> CappedText {
         var text = raw
-        if let data = raw.data(using: .utf8),
+        if isJSON(raw),
+            let data = raw.data(using: .utf8),
             let obj = try? JSONSerialization.jsonObject(with: data),
             let pretty = try? JSONSerialization.data(
                 withJSONObject: obj,
@@ -355,12 +363,188 @@ public enum BodyPretty {
             let str = String(data: pretty, encoding: .utf8) {
             text = str
         }
+        return capped(text, cap: cap)
+    }
+
+    public static func capped(_ text: String, cap: Int = displayCap) -> CappedText {
         let full = text.count
         guard full > cap else {
             return CappedText(text: text, isTruncated: false, fullCharCount: full)
         }
-        let capped = String(text.prefix(cap)) + "\n… (+\(full - cap) chars truncated)"
-        return CappedText(text: capped, isTruncated: true, fullCharCount: full)
+        let out = String(text.prefix(cap)) + "\n… (+\(full - cap) chars truncated)"
+        return CappedText(text: out, isTruncated: true, fullCharCount: full)
+    }
+
+    public static func isJSON(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return false }
+        guard let data = trimmed.data(using: .utf8) else { return false }
+        return (try? JSONSerialization.jsonObject(with: data)) != nil
+    }
+}
+
+public enum JsonHighlight {
+    public struct Colors: @unchecked Sendable {
+        public let key: NSColor
+        public let string: NSColor
+        public let number: NSColor
+        public let keyword: NSColor
+        public let punctuation: NSColor
+
+        public init(
+            key: NSColor, string: NSColor, number: NSColor,
+            keyword: NSColor, punctuation: NSColor
+        ) {
+            self.key = key
+            self.string = string
+            self.number = number
+            self.keyword = keyword
+            self.punctuation = punctuation
+        }
+
+        public static let standard = Colors(
+            key: .systemBlue, string: .systemOrange, number: .systemPurple,
+            keyword: .systemTeal, punctuation: .secondaryLabelColor)
+    }
+
+    public enum Kind: Equatable, Sendable {
+        case key, string, number, keyword
+    }
+
+    public static func attributed(
+        _ text: String, font: NSFont, colors: Colors = .standard,
+        cap: Int = BodyPretty.displayCap
+    ) -> NSAttributedString {
+        let input = text.count > cap ? String(text.prefix(cap)) : text
+        let out = NSMutableAttributedString(
+            string: input,
+            attributes: [.font: font, .foregroundColor: colors.punctuation])
+        for (range, kind) in spans(input) {
+            let color: NSColor = switch kind {
+            case .key: colors.key
+            case .string: colors.string
+            case .number: colors.number
+            case .keyword: colors.keyword
+            }
+            out.addAttribute(
+                .foregroundColor, value: color,
+                range: NSRange(location: range.lowerBound, length: range.count))
+        }
+        return out
+    }
+
+    public static func spans(_ text: String) -> [(range: Range<Int>, kind: Kind)] {
+        let units = Array(text.utf16)
+        var spans: [(Range<Int>, Kind)] = []
+        var i = 0
+        let quote: UInt16 = 34
+        let backslash: UInt16 = 92
+        func isWhitespace(_ u: UInt16) -> Bool { u == 32 || u == 10 || u == 9 || u == 13 }
+        func matches(_ word: [UInt16], at index: Int) -> Bool {
+            guard index + word.count <= units.count else { return false }
+            for (offset, u) in word.enumerated() where units[index + offset] != u {
+                return false
+            }
+            return true
+        }
+        let trueWord = Array("true".utf16)
+        let falseWord = Array("false".utf16)
+        let nullWord = Array("null".utf16)
+        while i < units.count {
+            let u = units[i]
+            if u == quote {
+                let start = i
+                i += 1
+                while i < units.count {
+                    if units[i] == backslash {
+                        i += 2
+                        continue
+                    }
+                    if units[i] == quote {
+                        i += 1
+                        break
+                    }
+                    i += 1
+                }
+                var j = i
+                while j < units.count, isWhitespace(units[j]) { j += 1 }
+                let isKey = j < units.count && units[j] == 58
+                spans.append((start..<min(i, units.count), isKey ? .key : .string))
+            } else if (u >= 48 && u <= 57) || u == 45 {
+                let start = i
+                i += 1
+                while i < units.count {
+                    let n = units[i]
+                    let isNumberUnit = (n >= 48 && n <= 57) || n == 46 || n == 101
+                        || n == 69 || n == 43 || n == 45
+                    guard isNumberUnit else { break }
+                    i += 1
+                }
+                spans.append((start..<i, .number))
+            } else if matches(trueWord, at: i) {
+                spans.append((i..<i + 4, .keyword))
+                i += 4
+            } else if matches(falseWord, at: i) {
+                spans.append((i..<i + 5, .keyword))
+                i += 5
+            } else if matches(nullWord, at: i) {
+                spans.append((i..<i + 4, .keyword))
+                i += 4
+            } else {
+                i += 1
+            }
+        }
+        return spans
+    }
+}
+
+public enum NiceBlock: Equatable, Sendable {
+    case row(key: String, value: String)
+    case block(key: String, text: String)
+    case text(String)
+}
+
+public enum JsonNice {
+    public static let longStringThreshold = 120
+
+    public static func blocks(_ text: String) -> [NiceBlock] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{"),
+            let data = trimmed.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            !obj.isEmpty
+        else { return [.text(text)] }
+        var rows: [NiceBlock] = []
+        var blocks: [NiceBlock] = []
+        for (key, value) in obj.sorted(by: { $0.key < $1.key }) {
+            if let str = value as? String {
+                if str.count > longStringThreshold || str.contains("\n") {
+                    blocks.append(.block(key: key, text: str))
+                } else {
+                    rows.append(.row(key: key, value: str))
+                }
+                continue
+            }
+            rows.append(.row(key: key, value: scalarText(value)))
+        }
+        return rows + blocks
+    }
+
+    static func scalarText(_ value: Any) -> String {
+        if value is NSNull { return "null" }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return number.boolValue ? "true" : "false"
+            }
+            return number.stringValue
+        }
+        if JSONSerialization.isValidJSONObject(value),
+            let data = try? JSONSerialization.data(
+                withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes]),
+            let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        return "\(value)"
     }
 }
 
@@ -972,18 +1156,43 @@ public enum TranscriptWindow {
     }
 }
 
+public struct TurnRange: Equatable, Sendable {
+    public let traceId: String
+    public let range: NSRange
+
+    public init(traceId: String, range: NSRange) {
+        self.traceId = traceId
+        self.range = range
+    }
+}
+
+public struct TranscriptDocument: @unchecked Sendable {
+    public let text: NSAttributedString
+    public let turnRanges: [TurnRange]
+
+    public init(text: NSAttributedString, turnRanges: [TurnRange]) {
+        self.text = text
+        self.turnRanges = turnRanges
+    }
+}
+
 public enum TranscriptRender {
     public struct State: Equatable, Sendable {
         public let count: Int
         public let firstId: String?
         public let lastId: String?
         public let lastSignature: String
+        public let rawMode: Bool
 
-        public init(count: Int, firstId: String?, lastId: String?, lastSignature: String) {
+        public init(
+            count: Int, firstId: String?, lastId: String?, lastSignature: String,
+            rawMode: Bool = false
+        ) {
             self.count = count
             self.firstId = firstId
             self.lastId = lastId
             self.lastSignature = lastSignature
+            self.rawMode = rawMode
         }
     }
 
@@ -995,14 +1204,17 @@ public enum TranscriptRender {
 
     public static let maxTurnChars = 100_000
 
-    public static func state(for turns: [TranscriptTurn]) -> State {
+    public static func state(for turns: [TranscriptTurn], rawMode: Bool = false) -> State {
         State(
             count: turns.count, firstId: turns.first?.traceId, lastId: turns.last?.traceId,
-            lastSignature: turns.last.map(signature) ?? "")
+            lastSignature: turns.last.map(signature) ?? "", rawMode: rawMode)
     }
 
-    public static func plan(previous: State?, turns: [TranscriptTurn]) -> Plan {
+    public static func plan(
+        previous: State?, turns: [TranscriptTurn], rawMode: Bool = false
+    ) -> Plan {
         guard let previous else { return .rebuild }
+        if previous.rawMode != rawMode { return .rebuild }
         if previous.count == 0 { return turns.isEmpty ? .unchanged : .rebuild }
         if turns.count < previous.count { return .rebuild }
         if turns.first?.traceId != previous.firstId { return .rebuild }
@@ -1014,6 +1226,14 @@ public enum TranscriptRender {
         return turns.count == previous.count ? .unchanged : .append(from: previous.count)
     }
 
+    public static func shifted(_ ranges: [TurnRange], by offset: Int) -> [TurnRange] {
+        ranges.map {
+            TurnRange(
+                traceId: $0.traceId,
+                range: NSRange(location: $0.range.location + offset, length: $0.range.length))
+        }
+    }
+
     static func signature(_ turn: TranscriptTurn) -> String {
         "\(turn.tsResponseMs ?? -1)|\(turn.status ?? -1)|\(turn.user?.count ?? -1)"
             + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
@@ -1022,8 +1242,18 @@ public enum TranscriptRender {
 
     public static func document(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none
+        icons: TranscriptIcons = .none, rawMode: Bool = false
     ) -> NSAttributedString {
+        build(
+            turns: turns, firstTurnNumber: firstTurnNumber, harnessName: harnessName,
+            icons: icons, rawMode: rawMode
+        ).text
+    }
+
+    public static func build(
+        turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
+        icons: TranscriptIcons = .none, rawMode: Bool = false
+    ) -> TranscriptDocument {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
@@ -1084,8 +1314,24 @@ public enum TranscriptRender {
             .font: bodyFont, .foregroundColor: NSColor.systemRed,
             .paragraphStyle: responsePara,
         ]
+        var userKey = user
+        userKey[.foregroundColor] = NSColor.tertiaryLabelColor
+        var toolKey = tool
+        toolKey[.foregroundColor] = NSColor.secondaryLabelColor
+
+        func linked(
+            _ attrs: [NSAttributedString.Key: Any], _ traceId: String
+        ) -> [NSAttributedString.Key: Any] {
+            guard let url = TraceLink.url(forTraceId: traceId) else { return attrs }
+            var out = attrs
+            out[.link] = url
+            return out
+        }
+
         let out = NSMutableAttributedString()
+        var ranges: [TurnRange] = []
         for (index, turn) in turns.enumerated() {
+            let turnStart = out.length
             let facts = TurnHeader.separatorFacts(
                 turnNumber: firstTurnNumber + index,
                 time: formatter.string(
@@ -1094,54 +1340,94 @@ public enum TranscriptRender {
                 requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
                 costUsd: turn.costUsd)
             let isError = (turn.status ?? 0) >= 400
-            let sepAttrs = isError ? badSeparator : separator
+            let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) · ", attributes: sepAttrs))
-            if let link = TraceLink.url(forTraceId: turn.traceId) {
-                var linkAttrs = sepAttrs
-                linkAttrs[.link] = link
-                out.append(NSAttributedString(string: "Details", attributes: linkAttrs))
-                out.append(NSAttributedString(string: " ·", attributes: sepAttrs))
-            }
+            var detailsAttrs = sepAttrs
+            detailsAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            out.append(NSAttributedString(string: "Details", attributes: detailsAttrs))
+            out.append(NSAttributedString(string: " ·", attributes: sepAttrs))
             out.append(NSAttributedString(string: "\n", attributes: sepAttrs))
             if let text = turn.user, !text.isEmpty {
                 let toolBody = TurnHeader.toolResultBody(text)
                 let label = TurnHeader.requestLabel(
                     harness: harnessName, isToolResult: toolBody != nil)
+                let labelAttrs = linked(userLabel, turn.traceId)
                 if let icon = icons.harness {
-                    out.append(iconString(icon, attributes: userLabel))
-                    out.append(NSAttributedString(string: " ", attributes: userLabel))
+                    out.append(iconString(icon, attributes: labelAttrs))
+                    out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
-                out.append(NSAttributedString(string: "\(label)\n", attributes: userLabel))
-                out.append(NSAttributedString(
-                    string: "❯ \(cap(toolBody ?? text))\n", attributes: user))
+                out.append(NSAttributedString(string: "\(label)\n", attributes: labelAttrs))
+                let body = toolBody ?? text
+                if !rawMode, toolBody != nil {
+                    appendNice(
+                        body, to: out, keyAttrs: userKey, valueAttrs: user,
+                        fallbackPrefix: "❯ ")
+                } else {
+                    out.append(NSAttributedString(
+                        string: "❯ \(cap(body))\n", attributes: user))
+                }
             }
             let calls = turn.toolCalls ?? []
             let hasModelText = turn.assistant?.isEmpty == false
             if hasModelText || !calls.isEmpty {
+                let labelAttrs = linked(modelLabel, turn.traceId)
                 if let icon = providerIcon(for: turn.model, icons: icons) {
-                    out.append(iconString(icon, attributes: modelLabel))
-                    out.append(NSAttributedString(string: " ", attributes: modelLabel))
+                    out.append(iconString(icon, attributes: labelAttrs))
+                    out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
                 out.append(NSAttributedString(
                     string: "\(TurnHeader.responseLabel(model: turn.model))\n",
-                    attributes: modelLabel))
+                    attributes: labelAttrs))
             }
             if let text = turn.assistant, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
             }
             for call in calls {
                 out.append(NSAttributedString(string: "⚙ \(call.name)\n", attributes: toolLabel))
-                let summary = call.argumentSummary
-                if !summary.isEmpty {
-                    out.append(NSAttributedString(string: "\(cap(summary))\n", attributes: tool))
+                let arguments = call.arguments ?? ""
+                if rawMode {
+                    if !arguments.isEmpty {
+                        out.append(NSAttributedString(
+                            string: "\(cap(arguments))\n", attributes: tool))
+                    }
+                } else if let command = call.command {
+                    out.append(NSAttributedString(string: "\(cap(command))\n", attributes: tool))
+                } else if !arguments.isEmpty {
+                    appendNice(
+                        arguments, to: out, keyAttrs: toolKey, valueAttrs: tool,
+                        fallbackPrefix: "")
                 }
             }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }
             out.append(NSAttributedString(string: "\n", attributes: separator))
+            ranges.append(TurnRange(
+                traceId: turn.traceId,
+                range: NSRange(location: turnStart, length: out.length - turnStart)))
         }
-        return NSAttributedString(attributedString: out)
+        return TranscriptDocument(
+            text: NSAttributedString(attributedString: out), turnRanges: ranges)
+    }
+
+    static func appendNice(
+        _ body: String, to out: NSMutableAttributedString,
+        keyAttrs: [NSAttributedString.Key: Any], valueAttrs: [NSAttributedString.Key: Any],
+        fallbackPrefix: String
+    ) {
+        for block in JsonNice.blocks(body) {
+            switch block {
+            case let .row(key, value):
+                out.append(NSAttributedString(string: "\(key): ", attributes: keyAttrs))
+                out.append(NSAttributedString(string: "\(cap(value))\n", attributes: valueAttrs))
+            case let .block(key, text):
+                out.append(NSAttributedString(string: "\(key):\n", attributes: keyAttrs))
+                out.append(NSAttributedString(string: "\(cap(text))\n", attributes: valueAttrs))
+            case let .text(text):
+                out.append(NSAttributedString(
+                    string: "\(fallbackPrefix)\(cap(text))\n", attributes: valueAttrs))
+            }
+        }
     }
 
     static func providerIcon(for model: String?, icons: TranscriptIcons) -> NSImage? {

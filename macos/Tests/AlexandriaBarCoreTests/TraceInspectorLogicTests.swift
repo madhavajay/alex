@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import AlexandriaBarCore
@@ -75,8 +76,116 @@ import Testing
         #expect(text.contains("ls -l /app"))
         #expect(!text.contains("intent"))
         #expect(text.contains("⚙ str_replace"))
-        #expect(text.contains("\"path\""))
+        #expect(text.contains("old: x"))
+        #expect(text.contains("path: /a"))
         #expect(text.contains("⬇ gpt-5.5 · model"))
+        let raw = TranscriptRender.document(turns: turns, rawMode: true).string
+        #expect(raw.contains(#"{"command":"ls -l /app","intent":"look"}"#))
+        #expect(raw.contains(#"{"path":"/a","old":"x"}"#))
+    }
+
+    @Test func jsonHighlightSpans() {
+        let json = #"{"a": "b", "n": -1.5, "t": true, "f": false, "x": null}"#
+        let tokens = JsonHighlight.spans(json).map { span -> (String, JsonHighlight.Kind) in
+            let units = Array(json.utf16)[span.range]
+            return (String(utf16CodeUnits: Array(units), count: units.count), span.kind)
+        }
+        #expect(tokens.map(\.0) == [
+            "\"a\"", "\"b\"", "\"n\"", "-1.5", "\"t\"", "true", "\"f\"", "false", "\"x\"", "null",
+        ])
+        #expect(tokens.map(\.1) == [
+            .key, .string, .key, .number, .key, .keyword, .key, .keyword, .key, .keyword,
+        ])
+        let escaped = JsonHighlight.spans(#"{"k": "a\"b"}"#)
+        #expect(escaped.count == 2)
+        #expect(escaped[1].kind == .string)
+    }
+
+    @Test func jsonHighlightAttributes() {
+        let pretty = "{\n  \"name\" : \"bash\",\n  \"count\" : 3\n}"
+        let attributed = JsonHighlight.attributed(
+            pretty, font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular))
+        let ns = pretty as NSString
+        let colors = JsonHighlight.Colors.standard
+        let keyAt = ns.range(of: "\"name\"").location
+        let stringAt = ns.range(of: "\"bash\"").location
+        let numberAt = ns.range(of: "3", options: .backwards).location
+        let braceAt = 0
+        func color(_ at: Int) -> NSColor? {
+            attributed.attribute(.foregroundColor, at: at, effectiveRange: nil) as? NSColor
+        }
+        #expect(color(keyAt) == colors.key)
+        #expect(color(stringAt) == colors.string)
+        #expect(color(numberAt) == colors.number)
+        #expect(color(braceAt) == colors.punctuation)
+    }
+
+    @Test func jsonNiceBlocks() {
+        let bashResult = #"{"returncode":0,"output":"total 12\n-rw-r--r-- 1"}"#
+        #expect(JsonNice.blocks(bashResult) == [
+            .row(key: "returncode", value: "0"),
+            .block(key: "output", text: "total 12\n-rw-r--r-- 1"),
+        ])
+        let long = String(repeating: "x", count: 121)
+        #expect(JsonNice.blocks(#"{"s":"\#(long)"}"#) == [.block(key: "s", text: long)])
+        let exactly = String(repeating: "x", count: 120)
+        #expect(JsonNice.blocks(#"{"s":"\#(exactly)"}"#) == [.row(key: "s", value: exactly)])
+        #expect(JsonNice.blocks("plain text") == [.text("plain text")])
+        #expect(JsonNice.blocks("[1,2]") == [.text("[1,2]")])
+        #expect(JsonNice.blocks("{}") == [.text("{}")])
+        #expect(JsonNice.blocks(#"{"b":true,"n":null,"o":{"k":1}}"#) == [
+            .row(key: "b", value: "true"),
+            .row(key: "n", value: "null"),
+            .row(key: "o", value: #"{"k":1}"#),
+        ])
+    }
+
+    @Test func rawModeInRenderSignature() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"hi","assistant":"yo"}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let nice = TranscriptRender.state(for: turns, rawMode: false)
+        #expect(TranscriptRender.plan(previous: nice, turns: turns, rawMode: false) == .unchanged)
+        #expect(TranscriptRender.plan(previous: nice, turns: turns, rawMode: true) == .rebuild)
+        let raw = TranscriptRender.state(for: turns, rawMode: true)
+        #expect(TranscriptRender.plan(previous: raw, turns: turns, rawMode: true) == .unchanged)
+        #expect(TranscriptRender.plan(previous: raw, turns: turns, rawMode: false) == .rebuild)
+    }
+
+    @Test func toolResultNiceVersusRaw() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"[tool result] {\"returncode\":0,\"output\":\"line1\\nline2\"}","assistant":null}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let nice = TranscriptRender.document(turns: turns).string
+        #expect(nice.contains("returncode: 0"))
+        #expect(nice.contains("output:\nline1\nline2"))
+        #expect(!nice.contains(#"\n"#))
+        let raw = TranscriptRender.document(turns: turns, rawMode: true).string
+        #expect(raw.contains(#"{"returncode":0,"output":"line1\nline2"}"#))
+        #expect(!raw.contains("returncode: 0"))
+    }
+
+    @Test func turnRangeBookkeeping() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"more","assistant":"text"},{"trace_id":"t3","ts_request_ms":4,"ts_response_ms":null,"model":null,"status":429,"user":null,"assistant":null,"error":"boom"}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let built = TranscriptRender.build(turns: turns)
+        #expect(built.turnRanges.map(\.traceId) == ["t1", "t2", "t3"])
+        #expect(built.turnRanges[0].range.location == 0)
+        #expect(built.turnRanges[1].range.location == built.turnRanges[0].range.upperBound)
+        #expect(built.turnRanges[2].range.location == built.turnRanges[1].range.upperBound)
+        #expect(built.turnRanges[2].range.upperBound == built.text.length)
+        let slice = (built.text.string as NSString).substring(with: built.turnRanges[1].range)
+        #expect(slice.contains("turn 2"))
+        #expect(slice.contains("more"))
+        #expect(!slice.contains("turn 3"))
+        let shifted = TranscriptRender.shifted(built.turnRanges, by: 100)
+        #expect(shifted[0].range.location == 100)
+        #expect(shifted[2].range.length == built.turnRanges[2].range.length)
+        #expect(shifted.map(\.traceId) == ["t1", "t2", "t3"])
     }
 
     @Test func toolResultBodyStripping() {
@@ -220,7 +329,8 @@ import Testing
         #expect(!text.contains("[tool result]"))
         var foundLinks: [URL] = []
         doc.enumerateAttribute(.link, in: NSRange(location: 0, length: doc.length)) { value, _, _ in
-            if let url = value as? URL { foundLinks.append(url) }
+            guard let url = value as? URL else { return }
+            if foundLinks.last != url { foundLinks.append(url) }
         }
         #expect(foundLinks.map(\.absoluteString)
             == ["alexandria://trace/t1", "alexandria://trace/t2"])

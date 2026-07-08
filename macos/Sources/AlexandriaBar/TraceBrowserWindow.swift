@@ -75,6 +75,27 @@ final class TraceBrowserModel {
     private var firstDetailKey: String?
     private var firstDetailTask: Task<Void, Never>?
 
+    private(set) var turnRanges: [TurnRange] = []
+    private var renderedLength = 0
+    private(set) var scrollToRangeCommand: (version: Int, range: NSRange)?
+    private var scrollToRangeVersion = 0
+    private(set) var findCommand = 0
+    private(set) var findBarVisible = false
+
+    var transcriptRawMode = UserDefaults.standard.bool(forKey: "TranscriptRawMode") {
+        didSet {
+            guard oldValue != transcriptRawMode else { return }
+            UserDefaults.standard.set(transcriptRawMode, forKey: "TranscriptRawMode")
+            renderState = nil
+            scheduleRender()
+        }
+    }
+
+    var inspectorHighlightRange: NSRange? {
+        guard let inspectorTraceId else { return nil }
+        return turnRanges.first { $0.traceId == inspectorTraceId }?.range
+    }
+
     var firstTurnTraceId: String? { turns.first?.traceId }
 
     var firstRequestHeaders: [HeaderPair] {
@@ -87,6 +108,37 @@ final class TraceBrowserModel {
 
     func closeInspector() {
         inspectorTraceId = nil
+    }
+
+    func requestFind() {
+        findCommand += 1
+    }
+
+    func setFindBarVisible(_ visible: Bool) {
+        guard findBarVisible != visible else { return }
+        findBarVisible = visible
+    }
+
+    private func inspectorTurnIndex() -> Int? {
+        guard let inspectorTraceId else { return nil }
+        return turns.firstIndex { $0.traceId == inspectorTraceId }
+    }
+
+    func canStepInspector(_ offset: Int) -> Bool {
+        guard let index = inspectorTurnIndex() else { return false }
+        return turns.indices.contains(index + offset)
+    }
+
+    func stepInspector(_ offset: Int) {
+        guard let index = inspectorTurnIndex(),
+            turns.indices.contains(index + offset)
+        else { return }
+        let target = turns[index + offset]
+        openInspector(traceId: target.traceId)
+        if let range = turnRanges.first(where: { $0.traceId == target.traceId })?.range {
+            scrollToRangeVersion += 1
+            scrollToRangeCommand = (scrollToRangeVersion, range)
+        }
     }
 
     func detailClient() -> AlexandriaClient? { client() }
@@ -220,10 +272,12 @@ final class TraceBrowserModel {
         firstDetailTask = nil
         renderChain?.cancel()
         renderChain = nil
-        renderState = TranscriptRender.state(for: [])
+        renderState = TranscriptRender.state(for: [], rawMode: transcriptRawMode)
         windowStart = 0
         windowMaxTurns = TranscriptWindow.defaultMaxTurns
         hiddenTurnCount = 0
+        turnRanges = []
+        renderedLength = 0
         renderVersion += 1
         renderOp = (renderVersion, .set(NSAttributedString()))
     }
@@ -253,7 +307,8 @@ final class TraceBrowserModel {
         let all = turns
         windowStart = min(windowStart, all.count)
         var windowed = Array(all[windowStart...])
-        var plan = TranscriptRender.plan(previous: renderState, turns: windowed)
+        let rawMode = transcriptRawMode
+        var plan = TranscriptRender.plan(previous: renderState, turns: windowed, rawMode: rawMode)
         if case .append = plan, windowed.count > windowMaxTurns + 100 {
             windowMaxTurns = TranscriptWindow.defaultMaxTurns
             plan = .rebuild
@@ -271,7 +326,7 @@ final class TraceBrowserModel {
         }
         hiddenTurnCount = windowStart
         guard plan != .unchanged else { return }
-        renderState = TranscriptRender.state(for: windowed)
+        renderState = TranscriptRender.state(for: windowed, rawMode: rawMode)
         let slice: [TranscriptTurn]
         let isAppend: Bool
         let firstNumber: Int
@@ -302,16 +357,16 @@ final class TraceBrowserModel {
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
-                let doc = TranscriptRender.document(
+                let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
-                    icons: icons)
+                    icons: icons, rawMode: rawMode)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
                 return BuiltDocument(doc: doc, ms: ms)
             }.value
             let (doc, ms) = (built.doc, built.ms)
-            let label = "render build turns=\(slice.count) append=\(isAppend) len=\(doc.length) \(ms)ms"
+            let label = "render build turns=\(slice.count) append=\(isAppend) len=\(doc.text.length) \(ms)ms"
             if Double(ms) >= BarLog.slowThresholdMs {
                 BarLog.warn(.browser, "SLOW \(label)")
             } else {
@@ -319,7 +374,15 @@ final class TraceBrowserModel {
             }
             guard let self, !Task.isCancelled, self.selectedSessionId == sid else { return }
             self.renderVersion += 1
-            self.renderOp = (self.renderVersion, isAppend ? .append(doc) : .set(doc))
+            if isAppend {
+                self.turnRanges += TranscriptRender.shifted(doc.turnRanges, by: self.renderedLength)
+                self.renderedLength += doc.text.length
+                self.renderOp = (self.renderVersion, .append(doc.text))
+            } else {
+                self.turnRanges = doc.turnRanges
+                self.renderedLength = doc.text.length
+                self.renderOp = (self.renderVersion, .set(doc.text))
+            }
         }
     }
 
@@ -358,6 +421,7 @@ final class TraceBrowserModel {
     }
 
     private func applyLiveFollow() {
+        guard !findBarVisible else { return }
         guard let candidate = newestVisibleRow else { return }
         guard candidate.id != selectedSessionId else { return }
         guard selectedSessionId != nil else {
@@ -527,7 +591,7 @@ final class TraceBrowserModel {
 }
 
 private struct BuiltDocument: @unchecked Sendable {
-    let doc: NSAttributedString
+    let doc: TranscriptDocument
     let ms: Int
 }
 
@@ -1078,6 +1142,20 @@ private struct TranscriptView: View {
                 Text("\(model.turns.count) turn\(model.turns.count == 1 ? "" : "s")")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                Toggle("Raw", isOn: $model.transcriptRawMode)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.mini)
+                    .font(.system(size: 10))
+                    .help("Show exact wire text without JSON formatting")
+                Button {
+                    model.requestFind()
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Find in transcript (⌘F)")
                 Button {
                     infoExpanded.toggle()
                     if infoExpanded { model.ensureFirstTraceDetail() }
