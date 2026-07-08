@@ -13,6 +13,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
     private let geminiKeyWindow = GeminiKeyWindowController()
+    private let updaterController = UpdaterController()
 
     init(store: SnapshotStore) {
         self.store = store
@@ -353,6 +354,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Settings…", symbol: "gearshape") { [weak self] in
             self?.openPreferences()
         }
+        let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(runHandler(_:)), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+        updateItem.isEnabled = updaterController.canCheckForUpdates
+        updateItem.representedObject = MenuHandler { [weak self] in
+            self?.updaterController.checkForUpdates()
+        }
+        menu.addItem(updateItem)
         if LaunchAtLogin.available {
             let item = NSMenuItem(title: "Launch at Login", action: #selector(runHandler(_:)), keyEquivalent: "")
             item.target = self

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 mod dario;
 mod harness_e2e;
 mod light;
+mod selfupdate;
 mod tui;
 mod ui;
 
@@ -84,6 +85,24 @@ enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// Check for and install a newer alex release
+    Update {
+        /// Only check and report; never install
+        #[arg(long)]
+        check: bool,
+        /// Install without prompting
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Do not restart a running daemon after updating
+        #[arg(long)]
+        no_restart: bool,
+        /// Machine-readable output for --check
+        #[arg(long)]
+        json: bool,
+        /// Proceed even when the install looks brew- or cargo-managed
+        #[arg(long)]
+        force: bool,
     },
     /// Play the Pharos of Alexandria in your terminal (truecolor blocks)
     Light {
@@ -376,6 +395,8 @@ struct Config {
     trace_body_retention_days: u64,
     #[serde(default)]
     trace_row_retention_days: u64,
+    #[serde(default = "default_update_check_hours")]
+    update_check_hours: u64,
 }
 
 fn default_heartbeat_minutes() -> u64 {
@@ -384,6 +405,10 @@ fn default_heartbeat_minutes() -> u64 {
 
 fn default_trace_body_retention_days() -> u64 {
     30
+}
+
+fn default_update_check_hours() -> u64 {
+    24
 }
 
 fn default_ping_anthropic() -> String {
@@ -498,6 +523,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         dario_probe_model: default_dario_probe_model(),
         trace_body_retention_days: default_trace_body_retention_days(),
         trace_row_retention_days: 0,
+        update_check_hours: default_update_check_hours(),
     };
     std::fs::write(&path, toml::to_string_pretty(&config)?)?;
     #[cfg(unix)]
@@ -564,7 +590,9 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> ax
         if presented.as_deref() != Some(key.as_str()) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({"error": "admin routes require x-api-key: <local_key>"})),
+                axum::Json(
+                    serde_json::json!({"error": "admin routes require x-api-key: <local_key>"}),
+                ),
             )
                 .into_response();
         }
@@ -658,7 +686,9 @@ async fn main() -> Result<()> {
         Some(c) => c,
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-                anyhow::bail!("no subcommand given and stdout is not a terminal — try `alexandria --help`");
+                anyhow::bail!(
+                    "no subcommand given and stdout is not a terminal — try `alexandria --help`"
+                );
             }
             Command::Tui
         }
@@ -737,14 +767,13 @@ async fn main() -> Result<()> {
                                 .map(|a| a.generation_id)
                                 .unwrap_or_else(|| "-".into())
                         );
-                        dario_router = Some(Arc::new(DarioGlue(sup.clone()))
-                            as Arc<dyn alex_proxy::DarioRouter>);
+                        dario_router =
+                            Some(Arc::new(DarioGlue(sup.clone()))
+                                as Arc<dyn alex_proxy::DarioRouter>);
                         supervisor = Some(sup);
                     }
                     Err(e) => {
-                        eprintln!(
-                            "dario: failed to start ({e}); using direct anthropic upstream"
-                        );
+                        eprintln!("dario: failed to start ({e}); using direct anthropic upstream");
                     }
                 }
             }
@@ -755,6 +784,30 @@ async fn main() -> Result<()> {
                 dario_router,
                 format!("http://{host}:{port}"),
             );
+            if config.update_check_hours > 0 {
+                let update_status = state.update_status.clone();
+                let hours = config.update_check_hours;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    loop {
+                        match selfupdate::daemon_update_status_value().await {
+                            Ok(status) => {
+                                *update_status.write().await = Some(status);
+                            }
+                            Err(e) => tracing::debug!("update check failed: {e}"),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(hours * 3600)).await;
+                    }
+                });
+                eprintln!(
+                    "update checks: every {}h (set update_check_hours = 0 to disable)",
+                    config.update_check_hours
+                );
+            } else {
+                eprintln!(
+                    "update checks: disabled (set update_check_hours in config.toml to enable)"
+                );
+            }
             if config.heartbeat_minutes > 0 {
                 let hb_state = state.clone();
                 let models = config.ping_models();
@@ -844,32 +897,33 @@ async fn main() -> Result<()> {
             socket.set_reuseaddr(true)?;
             #[cfg(unix)]
             socket.set_reuseport(true)?;
-            socket.bind(addr).with_context(|| format!("binding {addr}"))?;
+            socket
+                .bind(addr)
+                .with_context(|| format!("binding {addr}"))?;
             let listener = socket.listen(1024)?;
             print_banner(&host, port, &config.local_key);
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-                .with_graceful_shutdown(async {
-                    #[cfg(unix)]
-                    {
-                        let mut term = tokio::signal::unix::signal(
-                            tokio::signal::unix::SignalKind::terminate(),
-                        )
-                        .expect("sigterm handler");
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {}
-                            _ = term.recv() => {}
-                        }
+            .with_graceful_shutdown(async {
+                #[cfg(unix)]
+                {
+                    let mut term =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("sigterm handler");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
                     }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = tokio::signal::ctrl_c().await;
-                    }
-                    eprintln!("\ndraining in-flight connections, then shutting down");
-                })
-                .await?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                eprintln!("\ndraining in-flight connections, then shutting down");
+            })
+            .await?;
             if let Some(sup) = supervisor {
                 sup.shutdown().await;
             }
@@ -1012,8 +1066,7 @@ async fn main() -> Result<()> {
         Command::Ping { target } => {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
-            let state =
-                alex_proxy::build_state(
+            let state = alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
                 store,
@@ -1039,9 +1092,11 @@ async fn main() -> Result<()> {
                 }
                 seen
             } else {
-                vec![alex_core::Provider::from_str_loose(&target).with_context(
-                    || format!("unknown target '{target}' (anthropic|openai|grok|all)"),
-                )?]
+                vec![
+                    alex_core::Provider::from_str_loose(&target).with_context(|| {
+                        format!("unknown target '{target}' (anthropic|openai|grok|all)")
+                    })?,
+                ]
             };
             if providers.is_empty() {
                 println!("no pingable accounts — run `alexandria auth import`");
@@ -1116,8 +1171,7 @@ async fn main() -> Result<()> {
         Command::Limits { json } => {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
-            let state =
-                alex_proxy::build_state(
+            let state = alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
                 store,
@@ -1161,27 +1215,39 @@ async fn main() -> Result<()> {
                 println!("{}", service_state_label(&detect_service_state()));
             }
         },
+        Command::Update {
+            check,
+            yes,
+            no_restart,
+            json,
+            force,
+        } => {
+            selfupdate::run_update(&config, check, yes, no_restart, json, force).await?;
+        }
         Command::Dario { command } => {
             let http = reqwest::Client::new();
             let base = config.base_url();
             let is_status = matches!(command, DarioCommand::Status);
             let key = config.local_key.as_str();
             let result = match command {
-                DarioCommand::Status => http
-                    .get(format!("{base}/admin/dario"))
-                    .header("x-api-key", key)
-                    .send()
-                    .await,
-                DarioCommand::Restart => http
-                    .post(format!("{base}/admin/dario/restart"))
-                    .header("x-api-key", key)
-                    .send()
-                    .await,
-                DarioCommand::Update => http
-                    .post(format!("{base}/admin/dario/update"))
-                    .header("x-api-key", key)
-                    .send()
-                    .await,
+                DarioCommand::Status => {
+                    http.get(format!("{base}/admin/dario"))
+                        .header("x-api-key", key)
+                        .send()
+                        .await
+                }
+                DarioCommand::Restart => {
+                    http.post(format!("{base}/admin/dario/restart"))
+                        .header("x-api-key", key)
+                        .send()
+                        .await
+                }
+                DarioCommand::Update => {
+                    http.post(format!("{base}/admin/dario/update"))
+                        .header("x-api-key", key)
+                        .send()
+                        .await
+                }
             };
             let resp = result.with_context(|| {
                 format!("could not reach the alexandria daemon at {base} — is it running?")
@@ -1246,7 +1312,11 @@ fn render_traces_table(rows: &[serde_json::Value]) {
     );
     for r in rows {
         let ts = r["ts_request_ms"].as_i64().unwrap_or(0);
-        let when = if ts > 0 { ui::human_ago(ts) } else { "-".into() };
+        let when = if ts > 0 {
+            ui::human_ago(ts)
+        } else {
+            "-".into()
+        };
         let streamed = r["streamed"]
             .as_bool()
             .or_else(|| r["streamed"].as_i64().map(|v| v != 0))
@@ -1301,7 +1371,11 @@ fn render_traces_table(rows: &[serde_json::Value]) {
     }
 }
 
-async fn daemon_get(config: &Config, path: &str, params: &[(&str, String)]) -> Result<reqwest::Response> {
+async fn daemon_get(
+    config: &Config,
+    path: &str,
+    params: &[(&str, String)],
+) -> Result<reqwest::Response> {
     let base = config.base_url();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1407,7 +1481,10 @@ fn traces_prune_cmd(
     let cutoff = alex_core::parse_since(older_than, now).with_context(|| {
         format!("invalid --older-than '{older_than}' (use 45s, 30m, 24h, 30d, or RFC3339)")
     })?;
-    anyhow::ensure!(cutoff <= now, "--older-than '{older_than}' resolves to the future");
+    anyhow::ensure!(
+        cutoff <= now,
+        "--older-than '{older_than}' resolves to the future"
+    );
     let store = Store::open(config.data_dir.clone())?;
     let report = store.prune(cutoff, !rows, dry_run)?;
     if json {
@@ -1460,11 +1537,9 @@ fn traces_du_cmd(config: &Config, json: bool) -> Result<()> {
     );
     let rows = du["trace_rows"].as_i64().unwrap_or(0);
     let span = match (du["oldest_ts_ms"].as_i64(), du["newest_ts_ms"].as_i64()) {
-        (Some(oldest), Some(newest)) if rows > 0 => format!(
-            " ({} → {})",
-            ui::human_ago(oldest),
-            ui::human_ago(newest)
-        ),
+        (Some(oldest), Some(newest)) if rows > 0 => {
+            format!(" ({} → {})", ui::human_ago(oldest), ui::human_ago(newest))
+        }
         _ => String::new(),
     };
     println!("{} trace rows{span}", ui::bold(&rows.to_string()));
@@ -1546,7 +1621,11 @@ async fn keys_mint_cmd(
     if let Some(r) = &run_id {
         body["run_id"] = serde_json::json!(r);
     }
-    if tag_values.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+    if tag_values
+        .as_object()
+        .map(|o| !o.is_empty())
+        .unwrap_or(false)
+    {
         body["tags"] = tag_values;
     }
     if let Some(l) = &label {
@@ -1555,7 +1634,10 @@ async fn keys_mint_cmd(
     let (status, resp) =
         daemon_send(config, reqwest::Method::POST, "/admin/run-keys", Some(body)).await?;
     if !status.is_success() {
-        anyhow::bail!("daemon returned {status}: {}", ui::truncate(&resp.to_string(), 300));
+        anyhow::bail!(
+            "daemon returned {status}: {}",
+            ui::truncate(&resp.to_string(), 300)
+        );
     }
     let key = resp["key"].as_str().unwrap_or("-").to_string();
     println!("{}", ui::section("run key minted"));
@@ -1585,7 +1667,11 @@ async fn keys_mint_cmd(
 }
 
 async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
-    let params: Vec<(&str, String)> = if all { vec![("all", "1".into())] } else { vec![] };
+    let params: Vec<(&str, String)> = if all {
+        vec![("all", "1".into())]
+    } else {
+        vec![]
+    };
     let resp = daemon_get(config, "/admin/run-keys", &params).await?;
     let body: serde_json::Value = resp.json().await?;
     let rows = body["run_keys"].as_array().cloned().unwrap_or_default();
@@ -1638,10 +1724,7 @@ async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
                 18
             ),
             ui::pad_right(&ui::sand(&ui::truncate(&tags, 26)), 26),
-            ui::pad_left(
-                &r["use_count"].as_i64().unwrap_or(0).to_string(),
-                5
-            ),
+            ui::pad_left(&r["use_count"].as_i64().unwrap_or(0).to_string(), 5),
             ui::pad_right(&expires, 10),
             ui::dim(r["label"].as_str().unwrap_or(""))
         );
@@ -1661,7 +1744,10 @@ async fn keys_revoke_cmd(config: &Config, id: &str) -> Result<()> {
         anyhow::bail!("unknown run key '{id}'");
     }
     if !status.is_success() {
-        anyhow::bail!("daemon returned {status}: {}", ui::truncate(&resp.to_string(), 300));
+        anyhow::bail!(
+            "daemon returned {status}: {}",
+            ui::truncate(&resp.to_string(), 300)
+        );
     }
     println!("{} revoked {}", ui::gold(ui::ankh()), ui::amber(id));
     Ok(())
@@ -1702,7 +1788,9 @@ fn fmt_reset(v: &serde_json::Value) -> String {
 fn print_limits(snap: &serde_json::Value) {
     let providers = snap["providers"].as_array().cloned().unwrap_or_default();
     if providers.is_empty() {
-        println!("no limit data yet — send some traffic through the proxy (or run `alexandria ping`)");
+        println!(
+            "no limit data yet — send some traffic through the proxy (or run `alexandria ping`)"
+        );
         return;
     }
     println!("{}", ui::section("subscription limits"));
@@ -1907,7 +1995,10 @@ fn print_banner(host: &str, port: u16, local_key: &str) {
 }
 
 fn print_env(host: &str, port: u16, local_key: &str) {
-    eprintln!("{}", ui::dim("# anthropic-format harnesses (claude-code, …)"));
+    eprintln!(
+        "{}",
+        ui::dim("# anthropic-format harnesses (claude-code, …)")
+    );
     eprintln!("export ANTHROPIC_BASE_URL=http://{host}:{port}");
     eprintln!("export ANTHROPIC_API_KEY={local_key}");
     eprintln!("{}", ui::dim("# openai-format harnesses (codex, pi, …)"));
@@ -1916,7 +2007,10 @@ fn print_env(host: &str, port: u16, local_key: &str) {
     eprintln!("{}", ui::dim("# xai/grok harnesses"));
     eprintln!("export XAI_API_KEY={local_key}");
     eprintln!("export GROK_MODELS_BASE_URL=http://{host}:{port}/v1");
-    eprintln!("{}", ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)"));
+    eprintln!(
+        "{}",
+        ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)")
+    );
     eprintln!("export GOOGLE_GEMINI_BASE_URL=http://{host}:{port}");
     eprintln!("export GOOGLE_GENAI_API_VERSION=v1beta");
     eprintln!("export GEMINI_API_KEY={local_key}");
@@ -1927,7 +2021,9 @@ fn print_env(host: &str, port: u16, local_key: &str) {
 fn account_indicators(a: &alex_auth::Account) -> (String, String) {
     let remaining_ms = a.expires_at_ms.map(|exp| exp - now_ms());
     let expired = remaining_ms.map(|r| r < 0).unwrap_or(false);
-    let expiring = remaining_ms.map(|r| r >= 0 && r < 30 * 60_000).unwrap_or(false);
+    let expiring = remaining_ms
+        .map(|r| r >= 0 && r < 30 * 60_000)
+        .unwrap_or(false);
     let cooldown = a.cooldown_until_ms.map(|c| c > now_ms()).unwrap_or(false);
     let active = a.status == "active" && !cooldown;
     let dot = if expired || !active {
@@ -1949,10 +2045,16 @@ fn account_indicators(a: &alex_auth::Account) -> (String, String) {
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 enum ServiceState {
-    LaunchdLoaded { pid: Option<i64> },
+    LaunchdLoaded {
+        pid: Option<i64>,
+    },
     LaunchdNotLoaded,
     LaunchdNotInstalled,
-    Systemd { enabled: bool, active: bool, unit_present: bool },
+    Systemd {
+        enabled: bool,
+        active: bool,
+        unit_present: bool,
+    },
     SystemdMissing,
     Unsupported,
 }
@@ -2060,13 +2162,8 @@ async fn run_pings(
     for h in handles {
         let _ = h.await;
     }
-    let results: Vec<alex_proxy::PingResult> = slots
-        .lock()
-        .unwrap()
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
+    let results: Vec<alex_proxy::PingResult> =
+        slots.lock().unwrap().iter().flatten().cloned().collect();
     if !std::io::stdout().is_terminal() {
         for r in &results {
             println!("{}", ping_done_line(r));
@@ -2251,7 +2348,9 @@ fn service_state_label(state: &ServiceState) -> String {
         ServiceState::Systemd {
             unit_present: true, ..
         } => "systemd: installed but disabled → systemctl --user enable --now alexandria".into(),
-        ServiceState::Systemd { .. } => "systemd: not installed → alexandria service install".into(),
+        ServiceState::Systemd { .. } => {
+            "systemd: not installed → alexandria service install".into()
+        }
         ServiceState::SystemdMissing => "systemd: systemctl not found".into(),
         ServiceState::Unsupported => "service management: unsupported OS".into(),
     }
@@ -2312,7 +2411,9 @@ fn detect_service_state_linux() -> ServiceState {
         Err(_) => ServiceState::SystemdMissing,
         Ok(enabled_out) => {
             let enabled = enabled_out.status.success();
-            let active = run("is-active").map(|o| o.status.success()).unwrap_or(false);
+            let active = run("is-active")
+                .map(|o| o.status.success())
+                .unwrap_or(false);
             let unit_present = dirs::home_dir()
                 .map(|h| h.join(".config/systemd/user/alexandria.service").exists())
                 .unwrap_or(false);
@@ -2400,10 +2501,7 @@ async fn daemon_background(
     if healthy(client.clone(), base.clone()).await {
         println!(
             "{}",
-            ui::gold(&format!(
-                "{} daemon already running at {base}",
-                ui::ankh()
-            ))
+            ui::gold(&format!("{} daemon already running at {base}", ui::ankh()))
         );
         return Ok(());
     }
@@ -2539,7 +2637,12 @@ fn pick_provider(accounts: &[alex_auth::Account]) -> Result<Option<String>> {
             } else {
                 (*p).to_string()
             };
-            write!(out, " {marker} {} {}\r\n", ui::pad_right(&name, 8), statuses[i])?;
+            write!(
+                out,
+                " {marker} {} {}\r\n",
+                ui::pad_right(&name, 8),
+                statuses[i]
+            )?;
         }
         out.flush()?;
         drawn = true;
@@ -2681,7 +2784,11 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     } else {
         let mut first = true;
         for p in &binaries {
-            let label = if first { ui::sand("binary") } else { String::new() };
+            let label = if first {
+                ui::sand("binary")
+            } else {
+                String::new()
+            };
             first = false;
             let this = current_exe.is_some() && p.canonicalize().ok() == current_exe;
             let suffix = if this {
@@ -2774,13 +2881,19 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         ui::bold(&ui::lapis(&format!("{base}/v1")))
     );
     println!();
-    println!("{}", ui::dim("# anthropic-format harnesses (claude-code, …)"));
+    println!(
+        "{}",
+        ui::dim("# anthropic-format harnesses (claude-code, …)")
+    );
     println!("export ANTHROPIC_BASE_URL={base}");
     println!("export ANTHROPIC_API_KEY={}", config.local_key);
     println!("{}", ui::dim("# openai-format harnesses (codex, pi, …)"));
     println!("export OPENAI_BASE_URL={base}/v1");
     println!("export OPENAI_API_KEY={}", config.local_key);
-    println!("{}", ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)"));
+    println!(
+        "{}",
+        ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)")
+    );
     println!("export GOOGLE_GEMINI_BASE_URL={base}");
     println!("export GEMINI_API_KEY={}", config.local_key);
     println!("export GEMINI_API_KEY_AUTH_MECHANISM=bearer");
@@ -2860,7 +2973,8 @@ mod tests {
 
     #[test]
     fn launchctl_pid_parsing() {
-        let out = "com.alexandria.daemon = {\n\tactive count = 1\n\tpid = 96513\n\tstate = running\n}";
+        let out =
+            "com.alexandria.daemon = {\n\tactive count = 1\n\tpid = 96513\n\tstate = running\n}";
         assert_eq!(parse_launchctl_pid(out), Some(96513));
         assert_eq!(parse_launchctl_pid("state = running"), None);
         assert_eq!(parse_launchctl_pid(""), None);
@@ -2909,6 +3023,7 @@ mod tests {
             dario_probe_model: "claude-haiku-4-5".into(),
             trace_body_retention_days: default_trace_body_retention_days(),
             trace_row_retention_days: 0,
+            update_check_hours: default_update_check_hours(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();
@@ -2928,14 +3043,10 @@ mod tests {
             service_state_label(&ServiceState::LaunchdLoaded { pid: None }),
             "launchd: installed + loaded"
         );
-        assert!(
-            service_state_label(&ServiceState::LaunchdNotLoaded)
-                .contains("alexandria service install")
-        );
-        assert!(
-            service_state_label(&ServiceState::LaunchdNotInstalled)
-                .contains("alexandria service install")
-        );
+        assert!(service_state_label(&ServiceState::LaunchdNotLoaded)
+            .contains("alexandria service install"));
+        assert!(service_state_label(&ServiceState::LaunchdNotInstalled)
+            .contains("alexandria service install"));
         assert_eq!(
             service_state_label(&ServiceState::Systemd {
                 enabled: true,
@@ -3005,7 +3116,10 @@ mod tests {
             None
         );
         assert_eq!(parse_dario_update_notice("not json"), None);
-        assert_eq!(parse_dario_update_notice(r#"{"update_available":true}"#), None);
+        assert_eq!(
+            parse_dario_update_notice(r#"{"update_available":true}"#),
+            None
+        );
         assert_eq!(
             parse_dario_update_notice(r#"{"latest":"5","update_available":true}"#),
             Some("dario 5 available (running unknown) — alexandria dario update".into())

@@ -63,6 +63,7 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
+    pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +115,7 @@ pub fn build_state(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
+        update_status: Arc::new(tokio::sync::RwLock::new(None)),
     })
 }
 
@@ -160,6 +162,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/health", get(admin_health))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
+        .route("/admin/update", get(admin_update))
         .route("/admin/dario", get(admin_dario))
         .route("/admin/auth/import", post(admin_auth_import))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
@@ -540,6 +543,23 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
 
 async fn admin_limits(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(limits_snapshot(&state).await).into_response()
+}
+
+async fn admin_update(State(state): State<Arc<AppState>>) -> Response {
+    let stored = state.update_status.read().await.clone();
+    let mut body = json!({
+        "current": env!("CARGO_PKG_VERSION"),
+        "latest": null,
+        "update_available": false,
+        "checked_at_ms": null,
+    });
+    if let Some(Value::Object(fields)) = stored {
+        if let Some(obj) = body.as_object_mut() {
+            obj.extend(fields);
+            obj.insert("current".into(), json!(env!("CARGO_PKG_VERSION")));
+        }
+    }
+    axum::Json(body).into_response()
 }
 
 async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {

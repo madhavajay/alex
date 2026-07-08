@@ -15,6 +15,8 @@ Environment can be provided via .env or exported variables:
   APPLE_ID                         Apple ID for notarization
   APPLE_PASSWORD                   app-specific password for notarization
   APPLE_TEAM_ID                    Apple developer team ID
+  SPARKLE_FEED_URL                 Sparkle appcast URL
+  SPARKLE_PUBLIC_ED_KEY            Sparkle EdDSA public key
 
 Defaults:
   BUNDLE_ID=com.madhavajay.alexandria-macos
