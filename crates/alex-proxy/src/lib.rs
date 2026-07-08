@@ -124,6 +124,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/responses", post(openai_responses))
         .route("/chat/completions", post(openai_chat))
         .route("/responses", post(openai_responses))
+        .route("/v1beta/models/{model_action}", post(gemini_generate))
         .route("/traces/search", get(traces_search))
         .route("/traces/export.ndjson", get(traces_export))
         .route("/traces/sessions", get(traces_sessions))
@@ -133,6 +134,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
+        .route("/traces/{id}/body/{kind}", get(trace_body))
         .route("/traces/runs/{run_id}", get(traces_run_summary))
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
         .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
@@ -712,6 +714,49 @@ async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -
     }
 }
 
+async fn trace_body(
+    State(state): State<Arc<AppState>>,
+    Path((id, kind)): Path<(String, String)>,
+) -> Response {
+    let row = match state.store.get_trace(&id) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let column = match kind.as_str() {
+        "request" => "req_body_path",
+        "upstream-request" => "upstream_req_body_path",
+        "response" => "resp_body_path",
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "kind must be request|upstream-request|response",
+            )
+        }
+    };
+    match read_gz_text(row[column].as_str()) {
+        Some(text) => {
+            let ct = if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
+                "application/json; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", ct)
+                .header("x-alexandria-body-path", row[column].as_str().unwrap_or(""))
+                .body(Body::from(text))
+                .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+        }
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &format!("no {kind} body stored for trace '{id}'"),
+        ),
+    }
+}
+
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     use alex_core::translate;
     let row = match state.store.get_trace(&id) {
@@ -1101,6 +1146,53 @@ async fn openai_responses(
     .await
 }
 
+async fn gemini_generate(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (model, method) = model_action
+        .split_once(':')
+        .unwrap_or((model_action.as_str(), "generateContent"));
+    let stream = method == "streamGenerateContent";
+    if method != "generateContent" && !stream {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("unsupported gemini method '{method}' (expected generateContent or streamGenerateContent)"),
+        );
+    }
+    if model.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing model in path");
+    }
+    let mut v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}"))
+        }
+    };
+    v["model"] = json!(model);
+    if stream {
+        v["stream"] = json!(true);
+    }
+    let body = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+    let path = if stream {
+        "/v1beta/models/:streamGenerateContent"
+    } else {
+        "/v1beta/models/:generateContent"
+    };
+    proxy(
+        state,
+        ClientFormat::GeminiGenerate,
+        path,
+        headers,
+        body,
+        Some(peer),
+    )
+    .await
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -1111,6 +1203,9 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 
 fn client_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_string());
+    }
+    if let Some(v) = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
     }
     headers
@@ -1143,6 +1238,7 @@ enum RespondAs {
     Anthropic,
     OpenaiChat,
     OpenaiResponses,
+    Gemini,
 }
 
 struct UpstreamPlan {
@@ -1197,6 +1293,10 @@ async fn plan_upstream(
                 ClientFormat::OpenaiResponses => Some((
                     translate::openai_responses_to_anthropic(body_json),
                     RespondAs::OpenaiResponses,
+                )),
+                ClientFormat::GeminiGenerate => Some((
+                    translate::gemini_to_anthropic(body_json),
+                    RespondAs::Gemini,
                 )),
             };
             let dario_active = state.dario.as_ref().and_then(|d| d.active());
@@ -1333,6 +1433,31 @@ async fn plan_upstream(
                         upstream_format: "openai-responses",
                         destream: false,
                         respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::GeminiGenerate => {
+                    let pivot = translate::gemini_to_anthropic(body_json);
+                    let mut converted = translate::anthropic_to_openai_responses(&pivot);
+                    converted["model"] = json!(routed_model);
+                    let url = if oauth {
+                        translate::normalize_codex_request(&mut converted);
+                        format!("{CODEX_BASE}/responses")
+                    } else {
+                        converted["stream"] = json!(false);
+                        format!("{OPENAI_BASE}/v1/responses")
+                    };
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url,
+                        account,
+                        body,
+                        upstream_format: "openai-responses",
+                        destream: false,
+                        respond_as: Some(RespondAs::Gemini),
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
@@ -2143,6 +2268,13 @@ async fn proxy(
                 &upstream_final,
                 &requested_model,
             ),
+            (RespondAs::Gemini, "anthropic") => {
+                translate::anthropic_response_to_gemini(&upstream_final, &requested_model)
+            }
+            (RespondAs::Gemini, _) => translate::anthropic_response_to_gemini(
+                &translate::responses_final_to_anthropic(&upstream_final, &requested_model),
+                &requested_model,
+            ),
             (RespondAs::Anthropic, "anthropic") | (RespondAs::OpenaiResponses, _) => {
                 upstream_final.clone()
             }
@@ -2158,6 +2290,7 @@ async fn proxy(
                 RespondAs::Anthropic => translate::synth_anthropic_sse(&out),
                 RespondAs::OpenaiChat => translate::synth_openai_chat_sse(&out),
                 RespondAs::OpenaiResponses => translate::synth_openai_responses_sse(&out),
+                RespondAs::Gemini => translate::synth_gemini_sse(&out),
             };
             ("text/event-stream", sse.into_bytes())
         } else {
