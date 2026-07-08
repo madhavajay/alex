@@ -159,15 +159,24 @@ async fn read_token_response(resp: reqwest::Response) -> Result<TokenResponse> {
     serde_json::from_str(&text).context("bad token exchange response")
 }
 
+pub fn browser_open_command(url: &str) -> Option<(&'static str, Vec<String>)> {
+    if cfg!(target_os = "macos") {
+        Some(("open", vec![url.to_string()]))
+    } else if cfg!(target_os = "windows") {
+        Some((
+            "cmd",
+            vec!["/C".into(), "start".into(), String::new(), url.to_string()],
+        ))
+    } else if cfg!(target_os = "linux") {
+        Some(("xdg-open", vec![url.to_string()]))
+    } else {
+        None
+    }
+}
+
 fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(target_os = "linux")]
-    let opener = "xdg-open";
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let opener = "";
-    if !opener.is_empty() {
-        let _ = std::process::Command::new(opener).arg(url).spawn();
+    if let Some((program, args)) = browser_open_command(url) {
+        let _ = std::process::Command::new(program).args(args).spawn();
     }
 }
 
@@ -668,6 +677,31 @@ mod tests {
         let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({})).unwrap());
         assert_eq!(chatgpt_account_id(&format!("h.{empty}.s")), None);
+    }
+
+    #[test]
+    fn browser_command_per_platform() {
+        let cmd = browser_open_command("https://example.com/auth?x=1");
+        if cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")) {
+            let (program, args) = cmd.expect("major platforms have a browser opener");
+            let expected = if cfg!(target_os = "macos") {
+                "open"
+            } else if cfg!(target_os = "windows") {
+                "cmd"
+            } else {
+                "xdg-open"
+            };
+            assert_eq!(program, expected);
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("https://example.com/auth?x=1")
+            );
+            if cfg!(target_os = "windows") {
+                assert_eq!(args[..3], ["/C", "start", ""]);
+            }
+        } else {
+            assert!(cmd.is_none());
+        }
     }
 
     #[test]

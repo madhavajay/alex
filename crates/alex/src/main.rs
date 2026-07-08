@@ -2566,6 +2566,54 @@ mod tests {
     }
 
     #[test]
+    fn home_dir_is_platform_native() {
+        let home = alexandria_home();
+        assert!(home.ends_with(".alexandria"));
+        assert!(home.is_absolute());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_service_unsupported() {
+        assert!(matches!(detect_service_state(), ServiceState::Unsupported));
+        assert!(service_install().is_err());
+        assert!(!service_managed(&ServiceState::Unsupported));
+    }
+
+    #[test]
+    fn unsupported_service_state_has_readable_label() {
+        let label = service_state_label(&ServiceState::Unsupported);
+        assert!(label.contains("unsupported"), "got: {label}");
+    }
+
+    #[test]
+    fn config_toml_roundtrip_with_native_paths() {
+        let config = Config {
+            host: "127.0.0.1".into(),
+            port: 4100,
+            data_dir: alexandria_home(),
+            local_key: "alx-test".into(),
+            heartbeat_minutes: default_heartbeat_minutes(),
+            ping_anthropic_model: default_ping_anthropic(),
+            ping_openai_model: default_ping_openai(),
+            ping_xai_model: default_ping_xai(),
+            anthropic_upstream: "direct".into(),
+            dario_api_key: String::new(),
+            dario_update_check_minutes: 60,
+            dario_version: None,
+            dario_probe_seconds: 90,
+            dario_probe_failures: 2,
+            dario_probe_model: "claude-haiku-4-5".into(),
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.port, config.port);
+        assert_eq!(reloaded.local_key, config.local_key);
+        assert_eq!(reloaded.data_dir, config.data_dir);
+        assert!(reloaded.data_dir.is_absolute());
+    }
+
+    #[test]
     fn service_state_labels() {
         assert_eq!(
             service_state_label(&ServiceState::LaunchdLoaded { pid: Some(7) }),
