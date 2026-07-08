@@ -152,40 +152,49 @@ else
   fi
 fi
 
-if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+IDENTITY_LIST="$(security find-identity -p codesigning -v || true)"
+
+if [[ "${APPLE_SIGNING_IDENTITY:-}" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+  CODESIGN_IDENTITY="$APPLE_SIGNING_IDENTITY"
+else
+  CODESIGN_IDENTITY=""
+  RESOLVED_SIGNING_IDENTITY=""
+
   if [[ -n "${APPLE_TEAM_ID:-}" ]]; then
-    APPLE_SIGNING_IDENTITY="$(security find-identity -p codesigning -v | awk -F\" -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($2, team) { print $2; exit }')"
-  else
-    mapfile -t developer_id_identities < <(security find-identity -p codesigning -v | awk -F\" '/Developer ID Application/ { print $2 }')
-    if [[ "${#developer_id_identities[@]}" -eq 1 ]]; then
-      APPLE_SIGNING_IDENTITY="${developer_id_identities[0]}"
-    elif [[ "${#developer_id_identities[@]}" -gt 1 ]]; then
-      echo "Multiple Developer ID Application identities found. Set APPLE_SIGNING_IDENTITY explicitly:" >&2
-      printf '  %s\n' "${developer_id_identities[@]}" >&2
+    identity_line="$(printf '%s\n' "$IDENTITY_LIST" | awk -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($0, team) { print; exit }')"
+    if [[ -n "$identity_line" ]]; then
+      CODESIGN_IDENTITY="$(awk '{ print $2 }' <<<"$identity_line")"
+      RESOLVED_SIGNING_IDENTITY="$(awk -F\" '{ print $2 }' <<<"$identity_line")"
+    fi
+  fi
+
+  if [[ -z "$CODESIGN_IDENTITY" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    identity_line="$(printf '%s\n' "$IDENTITY_LIST" | awk -v identity="$APPLE_SIGNING_IDENTITY" '/Developer ID Application/ && index($0, identity) { print; exit }')"
+    if [[ -n "$identity_line" ]]; then
+      CODESIGN_IDENTITY="$(awk '{ print $2 }' <<<"$identity_line")"
+      RESOLVED_SIGNING_IDENTITY="$(awk -F\" '{ print $2 }' <<<"$identity_line")"
+    fi
+  fi
+
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    mapfile -t developer_id_lines < <(printf '%s\n' "$IDENTITY_LIST" | awk '/Developer ID Application/ { print }')
+    if [[ "${#developer_id_lines[@]}" -eq 1 ]]; then
+      CODESIGN_IDENTITY="$(awk '{ print $2 }' <<<"${developer_id_lines[0]}")"
+      RESOLVED_SIGNING_IDENTITY="$(awk -F\" '{ print $2 }' <<<"${developer_id_lines[0]}")"
+    elif [[ "${#developer_id_lines[@]}" -gt 1 ]]; then
+      echo "Multiple Developer ID Application identities found. Set APPLE_TEAM_ID or APPLE_SIGNING_IDENTITY explicitly." >&2
       exit 1
     fi
   fi
-fi
 
-if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  echo "APPLE_SIGNING_IDENTITY is not set and no Developer ID Application identity was found." >&2
-  echo "Run: security find-identity -v -p codesigning" >&2
-  exit 1
-fi
-
-if ! security find-identity -p codesigning -v | grep -Fq "$APPLE_SIGNING_IDENTITY"; then
-  echo "Signing identity is not available in the keychain: $APPLE_SIGNING_IDENTITY" >&2
-  exit 1
-fi
-
-if [[ "$APPLE_SIGNING_IDENTITY" =~ ^[A-Fa-f0-9]{40}$ ]]; then
-  CODESIGN_IDENTITY="$APPLE_SIGNING_IDENTITY"
-else
-  CODESIGN_IDENTITY="$(security find-identity -p codesigning -v | awk -v identity="$APPLE_SIGNING_IDENTITY" 'index($0, "\"" identity "\"") { print $2; exit }')"
+  if [[ -n "${RESOLVED_SIGNING_IDENTITY:-}" ]]; then
+    APPLE_SIGNING_IDENTITY="$RESOLVED_SIGNING_IDENTITY"
+  fi
 fi
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
-  echo "Unable to resolve signing identity hash for: $APPLE_SIGNING_IDENTITY" >&2
+  echo "Unable to resolve a Developer ID Application signing identity after certificate import." >&2
+  echo "Check APPLE_TEAM_ID, APPLE_SIGNING_IDENTITY, and SIGNING_CERTIFICATE_P12_DATA." >&2
   exit 1
 fi
 
