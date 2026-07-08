@@ -11,23 +11,53 @@ import Testing
         #expect(TurnHeader.duration(requestMs: 0, responseMs: 12_449) == "12.4s")
     }
 
-    @Test func turnHeaderFacts() {
-        let full = TurnHeader.facts(
-            turnNumber: 3, time: "12:00:01", model: "gpt-5.5", status: 200,
-            requestMs: 1000, responseMs: 2800, tokensIn: 11, tokensOut: 17, costUsd: 0.02)
-        #expect(full == "── Turn 3 · 12:00:01 · gpt-5.5 → 200 · 1.8s · 11→17 tok · $0.02 ──")
-        let pending = TurnHeader.facts(
-            turnNumber: 1, time: "09:00:00", model: "grok-code-fast-1", status: nil,
-            requestMs: 5000, responseMs: nil)
-        #expect(pending == "── Turn 1 · 09:00:00 · grok-code-fast-1 ──")
-        let noModel = TurnHeader.facts(
-            turnNumber: 2, time: "09:00:01", model: nil, status: 429,
-            requestMs: 0, responseMs: nil)
-        #expect(noModel == "── Turn 2 · 09:00:01 · 429 ──")
-        let zeroCost = TurnHeader.facts(
-            turnNumber: 4, time: "10:10:10", model: "m", status: 200,
-            requestMs: 0, responseMs: 100, tokensIn: nil, tokensOut: 5, costUsd: 0)
-        #expect(zeroCost == "── Turn 4 · 10:10:10 · m → 200 · 0.1s · –→5 tok ──")
+    @Test func turnSeparatorFacts() {
+        let full = TurnHeader.separatorFacts(
+            turnNumber: 3, time: "12:31:04", status: 200,
+            requestMs: 1000, responseMs: 2800, costUsd: 0.02)
+        #expect(full == "turn 3 · 12:31:04 · 200 · 1.8s · $0.02")
+        let pending = TurnHeader.separatorFacts(
+            turnNumber: 1, time: "09:00:00", status: nil, requestMs: 5000, responseMs: nil)
+        #expect(pending == "turn 1 · 09:00:00")
+        let failed = TurnHeader.separatorFacts(
+            turnNumber: 2, time: "09:00:01", status: 429, requestMs: 0, responseMs: nil)
+        #expect(failed == "turn 2 · 09:00:01 · 429")
+        let zeroCost = TurnHeader.separatorFacts(
+            turnNumber: 4, time: "10:10:10", status: 200,
+            requestMs: 0, responseMs: 100, costUsd: 0)
+        #expect(zeroCost == "turn 4 · 10:10:10 · 200 · 0.1s")
+    }
+
+    @Test func bubbleLabels() {
+        #expect(TurnHeader.requestLabel(harness: "pi") == "⬆ pi · user")
+        #expect(TurnHeader.requestLabel(harness: "claude-code", isToolResult: false)
+            == "⬆ claude-code · user")
+        #expect(TurnHeader.requestLabel(harness: "codex", isToolResult: true)
+            == "⬆ codex · tool result")
+        #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "⬇ gpt-5.5 · assistant")
+        #expect(TurnHeader.responseLabel(model: nil) == "⬇ assistant")
+    }
+
+    @Test func toolResultBodyStripping() {
+        #expect(TurnHeader.toolResultBody("[tool result] file contents here")
+            == "file contents here")
+        #expect(TurnHeader.toolResultBody("[tool result]\nline1\nline2") == "line1\nline2")
+        #expect(TurnHeader.toolResultBody("[tool result]") == "")
+        #expect(TurnHeader.toolResultBody("plain user message") == nil)
+        #expect(TurnHeader.toolResultBody(" [tool result] not at start") == nil)
+    }
+
+    @Test func harnessDisplayName() {
+        #expect(HarnessName.display(harness: nil, tags: ["harness": "pi"]) == "pi")
+        #expect(HarnessName.display(harness: "ureq/2.12.1", tags: ["harness": "custom-rig"])
+            == "custom-rig")
+        #expect(HarnessName.display(harness: "claude-cli/1.0 (darwin)", tags: nil)
+            == "claude-code")
+        #expect(HarnessName.display(harness: "codex_exec/0.4", tags: [:]) == "codex")
+        #expect(HarnessName.display(harness: "ureq/2.12.1", tags: nil) == "ureq")
+        #expect(HarnessName.display(harness: "curl/8.7.1", tags: ["harness": ""]) == "curl")
+        #expect(HarnessName.display(harness: nil, tags: nil) == "harness")
+        #expect(HarnessName.display(harness: "", tags: nil) == "harness")
     }
 
     @Test func traceLinkRoundtrip() {
@@ -134,13 +164,19 @@ import Testing
 
     @Test func documentTurnNumbersAndLinks() {
         let json = #"""
-        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2800,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":3000,"ts_response_ms":null,"model":"m","status":null,"user":"next","assistant":null}]}
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2800,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":3000,"ts_response_ms":null,"model":"m","status":null,"user":"[tool result] grep output","assistant":null}]}
         """#
         let turns = try! JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
-        let doc = TranscriptRender.document(turns: turns, firstTurnNumber: 42)
-        #expect(doc.string.contains("Turn 42"))
-        #expect(doc.string.contains("Turn 43"))
-        #expect(doc.string.contains("Details"))
+        let doc = TranscriptRender.document(turns: turns, firstTurnNumber: 42, harnessName: "pi")
+        let text = doc.string
+        #expect(text.contains("turn 42"))
+        #expect(text.contains("turn 43"))
+        #expect(text.contains("Details"))
+        #expect(text.contains("⬆ pi · user"))
+        #expect(text.contains("⬇ m · assistant"))
+        #expect(text.contains("⬆ pi · tool result"))
+        #expect(text.contains("❯ grep output"))
+        #expect(!text.contains("[tool result]"))
         var foundLinks: [URL] = []
         doc.enumerateAttribute(.link, in: NSRange(location: 0, length: doc.length)) { value, _, _ in
             if let url = value as? URL { foundLinks.append(url) }

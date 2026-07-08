@@ -288,12 +288,15 @@ final class TraceBrowserModel {
             firstNumber = windowStart + from + 1
         }
         let sid = selectedSessionId
+        let session = selectedSession
+        let harnessName = HarnessName.display(harness: session?.harness, tags: session?.tags)
         let prev = renderChain
         renderChain = Task { [weak self] in
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
-                let doc = TranscriptRender.document(turns: slice, firstTurnNumber: firstNumber)
+                let doc = TranscriptRender.document(
+                    turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)

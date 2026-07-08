@@ -265,31 +265,38 @@ public enum TraceLink {
 }
 
 public enum TurnHeader {
+    public static let toolResultPrefix = "[tool result]"
+
     public static func duration(requestMs: Int64, responseMs: Int64?) -> String? {
         guard let responseMs, responseMs >= requestMs else { return nil }
         return String(format: "%.1fs", Double(responseMs - requestMs) / 1000.0)
     }
 
-    public static func facts(
-        turnNumber: Int, time: String, model: String?, status: Int?,
-        requestMs: Int64, responseMs: Int64?,
-        tokensIn: Int64? = nil, tokensOut: Int64? = nil, costUsd: Double? = nil
+    public static func separatorFacts(
+        turnNumber: Int, time: String, status: Int?,
+        requestMs: Int64, responseMs: Int64?, costUsd: Double? = nil
     ) -> String {
-        var parts = ["Turn \(turnNumber)", time]
-        if let model {
-            parts.append(status.map { "\(model) → \($0)" } ?? model)
-        } else if let status {
-            parts.append("\(status)")
-        }
+        var parts = ["turn \(turnNumber)", time]
+        if let status { parts.append("\(status)") }
         if let dur = duration(requestMs: requestMs, responseMs: responseMs) {
             parts.append(dur)
         }
-        if tokensIn != nil || tokensOut != nil {
-            parts.append(
-                "\(TraceNumberFormat.tokens(tokensIn))→\(TraceNumberFormat.tokens(tokensOut)) tok")
-        }
         if let costUsd, costUsd > 0 { parts.append(TraceNumberFormat.cost(costUsd)) }
-        return "── " + parts.joined(separator: " · ") + " ──"
+        return parts.joined(separator: " · ")
+    }
+
+    public static func requestLabel(harness: String, isToolResult: Bool = false) -> String {
+        "⬆ \(harness) · \(isToolResult ? "tool result" : "user")"
+    }
+
+    public static func responseLabel(model: String?) -> String {
+        model.map { "⬇ \($0) · assistant" } ?? "⬇ assistant"
+    }
+
+    public static func toolResultBody(_ text: String) -> String? {
+        guard text.hasPrefix(toolResultPrefix) else { return nil }
+        return String(text.dropFirst(toolResultPrefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -541,23 +548,49 @@ public enum HarnessIcon {
     ]
 
     public static func assetName(harness: String?, tags: [String: String]?) -> String? {
+        canonicalKey(harness: harness, tags: tags).flatMap { files[$0] }
+    }
+
+    public static func canonicalKey(harness: String?, tags: [String: String]?) -> String? {
         if let tag = tags?["harness"] {
             let key = tag.lowercased().trimmingCharacters(in: .whitespaces)
-            if let file = resolve(key) ?? resolve(key.replacingOccurrences(of: "_", with: "-")) {
-                return file
+            if let canonical = canonical(key)
+                ?? canonical(key.replacingOccurrences(of: "_", with: "-")) {
+                return canonical
             }
         }
+        guard let token = userAgentToken(harness) else { return nil }
+        if let canonical = userAgentAliases[token] { return canonical }
+        return canonical(token)
+    }
+
+    public static func userAgentToken(_ harness: String?) -> String? {
         guard let harness else { return nil }
         let head = harness.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? harness
         guard let token = head.split(separator: "/").first.map({ String($0).lowercased() }),
             !token.isEmpty
         else { return nil }
-        if let canonical = userAgentAliases[token] { return files[canonical] }
-        return resolve(token)
+        return token
+    }
+
+    static func canonical(_ key: String) -> String? {
+        if files[key] != nil { return key }
+        return aliases[key]
     }
 
     static func resolve(_ key: String) -> String? {
-        files[key] ?? aliases[key].flatMap { files[$0] }
+        canonical(key).flatMap { files[$0] }
+    }
+}
+
+public enum HarnessName {
+    public static func display(harness: String?, tags: [String: String]?) -> String {
+        if let tag = tags?["harness"]?.trimmingCharacters(in: .whitespaces), !tag.isEmpty {
+            return tag
+        }
+        if let key = HarnessIcon.canonicalKey(harness: harness, tags: tags) { return key }
+        if let token = HarnessIcon.userAgentToken(harness) { return token }
+        return "harness"
     }
 }
 
@@ -945,15 +978,16 @@ public enum TranscriptRender {
     }
 
     public static func document(
-        turns: [TranscriptTurn], firstTurnNumber: Int = 1
+        turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness"
     ) -> NSAttributedString {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        let headerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        let separatorFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
         let bodyFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 
-        let headerPara = NSMutableParagraphStyle()
-        headerPara.paragraphSpacing = 4
+        let separatorPara = NSMutableParagraphStyle()
+        separatorPara.paragraphSpacing = 4
         let userPara = NSMutableParagraphStyle()
         userPara.firstLineHeadIndent = 48
         userPara.headIndent = 48
@@ -965,14 +999,22 @@ public enum TranscriptRender {
         assistantPara.tailIndent = -48
         assistantPara.paragraphSpacing = 2
 
-        let header: [NSAttributedString.Key: Any] = [
-            .font: headerFont, .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: headerPara,
+        let separator: [NSAttributedString.Key: Any] = [
+            .font: separatorFont, .foregroundColor: NSColor.tertiaryLabelColor,
+            .paragraphStyle: separatorPara,
         ]
-        let badHeader: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .bold),
+        let badSeparator: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .bold),
             .foregroundColor: NSColor.systemRed,
-            .paragraphStyle: headerPara,
+            .paragraphStyle: separatorPara,
+        ]
+        let userLabel: [NSAttributedString.Key: Any] = [
+            .font: labelFont, .foregroundColor: NSColor.controlAccentColor,
+            .paragraphStyle: userPara,
+        ]
+        let assistantLabel: [NSAttributedString.Key: Any] = [
+            .font: labelFont, .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: assistantPara,
         ]
         let user: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
@@ -990,34 +1032,41 @@ public enum TranscriptRender {
         ]
         let out = NSMutableAttributedString()
         for (index, turn) in turns.enumerated() {
-            let facts = TurnHeader.facts(
+            let facts = TurnHeader.separatorFacts(
                 turnNumber: firstTurnNumber + index,
                 time: formatter.string(
                     from: Date(timeIntervalSince1970: Double(turn.tsRequestMs) / 1000)),
-                model: turn.model, status: turn.status,
+                status: turn.status,
                 requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
-                tokensIn: turn.inputTokens, tokensOut: turn.outputTokens,
                 costUsd: turn.costUsd)
             let isError = (turn.status ?? 0) >= 400
-            out.append(NSAttributedString(
-                string: facts, attributes: isError ? badHeader : header))
+            let sepAttrs = isError ? badSeparator : separator
+            out.append(NSAttributedString(string: "· \(facts) · ", attributes: sepAttrs))
             if let link = TraceLink.url(forTraceId: turn.traceId) {
-                out.append(NSAttributedString(string: "  ", attributes: header))
-                var linkAttrs = header
+                var linkAttrs = sepAttrs
                 linkAttrs[.link] = link
                 out.append(NSAttributedString(string: "Details", attributes: linkAttrs))
+                out.append(NSAttributedString(string: " ·", attributes: sepAttrs))
             }
-            out.append(NSAttributedString(string: "\n", attributes: header))
+            out.append(NSAttributedString(string: "\n", attributes: sepAttrs))
             if let text = turn.user, !text.isEmpty {
-                out.append(NSAttributedString(string: "❯ \(cap(text))\n", attributes: user))
+                let toolBody = TurnHeader.toolResultBody(text)
+                let label = TurnHeader.requestLabel(
+                    harness: harnessName, isToolResult: toolBody != nil)
+                out.append(NSAttributedString(string: "\(label)\n", attributes: userLabel))
+                out.append(NSAttributedString(
+                    string: "❯ \(cap(toolBody ?? text))\n", attributes: user))
             }
             if let text = turn.assistant, !text.isEmpty {
+                out.append(NSAttributedString(
+                    string: "\(TurnHeader.responseLabel(model: turn.model))\n",
+                    attributes: assistantLabel))
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
             }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }
-            out.append(NSAttributedString(string: "\n", attributes: header))
+            out.append(NSAttributedString(string: "\n", attributes: separator))
         }
         return NSAttributedString(attributedString: out)
     }
