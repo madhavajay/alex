@@ -9,6 +9,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private var prefsController: PreferencesWindowController?
     private let authWindows = AuthWindowController()
+    private let pingWindow = PingWindowController()
 
     init(store: SnapshotStore) {
         self.store = store
@@ -18,6 +19,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateIcon()
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateIcon()
+            }
+        }
     }
 
     func snapshotDidChange() {
@@ -32,9 +40,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         let daemonUp = store.daemonUp || store.lastRefresh == nil
-        button.image = IconRenderer.statusIcon(
-            severity: store.worstSeverity, daemonUp: daemonUp)
-        button.imagePosition = .imageOnly
+        let severity = store.worstSeverity
+        button.image = IconRenderer.statusIcon(severity: severity, daemonUp: daemonUp)
+
+        let dotColor: NSColor? = if !daemonUp {
+            .systemRed
+        } else if severity == .critical {
+            .systemRed
+        } else if severity == .warning {
+            .systemOrange
+        } else {
+            nil
+        }
+        if IconRenderer.style == "logo", let dotColor {
+            button.imagePosition = .imageLeading
+            button.attributedTitle = NSAttributedString(string: "●", attributes: [
+                .foregroundColor: dotColor,
+                .font: NSFont.systemFont(ofSize: 8),
+                .baselineOffset: 3,
+            ])
+        } else {
+            button.imagePosition = .imageOnly
+            button.attributedTitle = NSAttributedString(string: "")
+        }
     }
 
     private func rebuildMenu() {
@@ -250,6 +278,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         update.target = self
         update.representedObject = MenuHandler { [weak self] in self?.darioAction(update: true) }
         sub.addItem(update)
+        sub.addItem(.separator())
+        let about = NSMenuItem(title: "What is Dario?", action: #selector(runHandler(_:)), keyEquivalent: "")
+        about.target = self
+        about.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil)
+        about.representedObject = MenuHandler {
+            NSWorkspace.shared.open(URL(string: "https://github.com/askalf/dario")!)
+        }
+        sub.addItem(about)
         item.submenu = sub
         menu.addItem(item)
         menu.addItem(.separator())
@@ -328,15 +364,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func runPing(target: String, name: String) {
-        notify(title: "Pinging \(name)…", body: "Running alexandria ping \(target)")
-        Task { [weak self] in
-            let result = await DaemonController.ping(target)
-            await self?.store.refresh()
-            let tail = result.combined.split(separator: "\n").suffix(4).joined(separator: "\n")
-            self?.notify(
-                title: result.ok ? "Ping OK: \(name)" : "Ping FAILED: \(name)",
-                body: String(tail.prefix(300)))
-        }
+        pingWindow.show(target: target, title: name, store: store)
     }
 
     private func importCredentials() {

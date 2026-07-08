@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use alexandria_auth::{now_ms, Account, Vault};
 use alexandria_core::{
-    compute_cost, parse_since, parse_sse_usage, parse_trace_tags, route_model, usage_from_json,
-    ClientFormat, Provider, TraceRecord,
+    compute_cost, conversation_root, parse_since, parse_sse_usage, parse_trace_tags, route_model,
+    usage_from_json, ClientFormat, Provider, TraceRecord,
 };
 use alexandria_store::{Store, TraceFilter};
 use axum::body::{Body, Bytes};
@@ -117,6 +117,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(openai_responses))
         .route("/traces/search", get(traces_search))
         .route("/traces/export.ndjson", get(traces_export))
+        .route("/traces/sessions", get(traces_sessions))
+        .route(
+            "/traces/sessions/{session_id}/transcript",
+            get(traces_session_transcript),
+        )
+        .route("/traces/{id}", get(trace_get).delete(trace_delete))
+        .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/runs/{run_id}", get(traces_run_summary))
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
         .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
@@ -474,6 +481,14 @@ fn wants_bodies(q: &HashMap<String, String>) -> bool {
     q.get("bodies").map(|v| v == "1" || v == "true").unwrap_or(false)
 }
 
+fn read_gz_file(path: &str) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut buf).ok()?;
+    Some(buf)
+}
+
 fn inline_row_bodies(row: &mut Value) {
     use base64::Engine;
     for (path_key, out_key) in [
@@ -481,17 +496,9 @@ fn inline_row_bodies(row: &mut Value) {
         ("upstream_req_body_path", "upstream_req_body_b64"),
         ("resp_body_path", "resp_body_b64"),
     ] {
-        let Some(path) = row[path_key].as_str().map(String::from) else {
+        let Some(buf) = row[path_key].as_str().and_then(read_gz_file) else {
             continue;
         };
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut buf = Vec::new();
-        if std::io::Read::read_to_end(&mut decoder, &mut buf).is_err() {
-            continue;
-        }
         row[out_key] = json!(base64::engine::general_purpose::STANDARD.encode(&buf));
     }
 }
@@ -529,6 +536,168 @@ async fn traces_export(
 ) -> Response {
     match state.store.search_traces(&filter_from_query(&q)) {
         Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        s
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+fn read_gz_json(path: Option<&str>) -> Option<Value> {
+    let buf = path.and_then(read_gz_file)?;
+    serde_json::from_slice(&buf).ok()
+}
+
+fn read_gz_text(path: Option<&str>) -> Option<String> {
+    let buf = path.and_then(read_gz_file)?;
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+async fn traces_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let since = q.get("since").and_then(|s| parse_since(s, now_ms()));
+    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0);
+    match state.store.sessions(since, limit) {
+        Ok(rows) => axum::Json(json!({"sessions": rows})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn transcript_turn(row: &Value) -> Value {
+    use alexandria_core::translate;
+    let user = read_gz_json(row["req_body_path"].as_str())
+        .and_then(|req| {
+            translate::last_user_text(row["client_format"].as_str().unwrap_or(""), &req)
+        })
+        .map(|s| truncate_chars(s, 8000));
+    let assistant = read_gz_text(row["resp_body_path"].as_str())
+        .and_then(|text| {
+            let fmt = row["upstream_format"]
+                .as_str()
+                .or(row["client_format"].as_str())
+                .unwrap_or("");
+            translate::assistant_reply_text(fmt, &text)
+        })
+        .map(|s| truncate_chars(s, 8000));
+    json!({
+        "trace_id": row["id"],
+        "ts_request_ms": row["ts_request_ms"],
+        "ts_response_ms": row["ts_response_ms"],
+        "model": row["routed_model"],
+        "status": row["status"],
+        "input_tokens": row["input_tokens"],
+        "output_tokens": row["output_tokens"],
+        "cost_usd": row["cost_usd"],
+        "error": row["error"],
+        "user": user,
+        "assistant": assistant,
+    })
+}
+
+async fn traces_session_transcript(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let since = q
+        .get("since_ms")
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
+    let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(500);
+    let rows = match state.store.session_traces(&session_id, since) {
+        Ok(rows) => rows,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let turns: Vec<Value> = rows.iter().take(limit).map(transcript_turn).collect();
+    axum::Json(json!({"session_id": session_id, "turns": turns})).into_response()
+}
+
+fn trace_extras(req: &Value) -> Value {
+    let system_chars = match &req["system"] {
+        Value::String(s) => Some(s.chars().count()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .map(|s| s.chars().count())
+                .sum(),
+        ),
+        _ => req["instructions"].as_str().map(|s| s.chars().count()),
+    };
+    json!({
+        "reasoning_effort": req["reasoning"]["effort"],
+        "thinking_budget": req["thinking"]["budget_tokens"],
+        "max_tokens": req["max_tokens"].as_i64().or(req["max_output_tokens"].as_i64()),
+        "temperature": req["temperature"],
+        "message_count": req["messages"].as_array().or(req["input"].as_array()).map(|a| a.len()),
+        "system_chars": system_chars,
+    })
+}
+
+async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.store.get_trace(&id) {
+        Ok(Some(row)) => {
+            let extras = read_gz_json(row["req_body_path"].as_str())
+                .map(|req| trace_extras(&req))
+                .unwrap_or_else(|| json!({}));
+            axum::Json(json!({"trace": row, "extras": extras})).into_response()
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    use alexandria_core::translate;
+    let row = match state.store.get_trace(&id) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let fmt = row["upstream_format"]
+        .as_str()
+        .or(row["client_format"].as_str())
+        .unwrap_or("");
+    let reply = read_gz_text(row["resp_body_path"].as_str())
+        .and_then(|text| translate::assistant_reply_text(fmt, &text));
+    match reply {
+        Some(md) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/markdown; charset=utf-8")
+            .body(Body::from(md))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &format!("no assistant reply available for trace '{id}'"),
+        ),
+    }
+}
+
+async fn trace_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.store.get_trace(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+    match state.store.delete_trace(&id) {
+        Ok(paths) => {
+            let removed = paths
+                .iter()
+                .filter(|p| std::fs::remove_file(p).is_ok())
+                .count();
+            axum::Json(json!({"deleted": true, "files_removed": removed})).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1150,6 +1319,79 @@ async fn plan_upstream(
 }
 
 #[cfg(test)]
+mod trace_api_tests {
+    use super::{session_from_metadata, trace_extras, transcript_turn, truncate_chars};
+    use serde_json::json;
+
+    #[test]
+    fn metadata_session_variants() {
+        let claude = json!({"metadata": {"user_id":
+            "{\"device_id\":\"d1\",\"session_id\":\"ses_inner\"}"}});
+        assert_eq!(session_from_metadata(&claude), Some("ses_inner".into()));
+        let plain = json!({"metadata": {"user_id": "user-123"}});
+        assert_eq!(session_from_metadata(&plain), Some("user-123".into()));
+        let json_no_session = json!({"metadata": {"user_id": "{\"device_id\":\"d1\"}"}});
+        assert_eq!(
+            session_from_metadata(&json_no_session),
+            Some("{\"device_id\":\"d1\"}".into())
+        );
+        assert_eq!(session_from_metadata(&json!({})), None);
+    }
+
+    #[test]
+    fn extras_per_format() {
+        let anthropic = json!({
+            "system": [{"type": "text", "text": "abcd"}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "temperature": 0.5,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        });
+        let e = trace_extras(&anthropic);
+        assert_eq!(e["thinking_budget"], 4096);
+        assert_eq!(e["max_tokens"], 100);
+        assert_eq!(e["temperature"], 0.5);
+        assert_eq!(e["message_count"], 1);
+        assert_eq!(e["system_chars"], 4);
+        assert_eq!(e["reasoning_effort"], serde_json::Value::Null);
+        let responses = json!({
+            "instructions": "abc",
+            "input": [{"type": "message"}, {"type": "message"}],
+            "max_output_tokens": 200,
+            "reasoning": {"effort": "high"},
+        });
+        let e = trace_extras(&responses);
+        assert_eq!(e["reasoning_effort"], "high");
+        assert_eq!(e["max_tokens"], 200);
+        assert_eq!(e["message_count"], 2);
+        assert_eq!(e["system_chars"], 3);
+        assert_eq!(e["thinking_budget"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        assert_eq!(truncate_chars("abc".into(), 8000), "abc");
+        assert_eq!(truncate_chars("héllo".repeat(2000), 8000).chars().count(), 8000);
+    }
+
+    #[test]
+    fn transcript_turn_missing_bodies_are_null() {
+        let row = json!({
+            "id": "t1", "ts_request_ms": 1, "ts_response_ms": 2,
+            "routed_model": "m", "status": 200,
+            "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01, "error": null,
+            "req_body_path": "/nonexistent/x.gz", "resp_body_path": null,
+            "client_format": "anthropic", "upstream_format": "anthropic",
+        });
+        let turn = transcript_turn(&row);
+        assert_eq!(turn["trace_id"], "t1");
+        assert_eq!(turn["user"], serde_json::Value::Null);
+        assert_eq!(turn["assistant"], serde_json::Value::Null);
+        assert_eq!(turn["model"], "m");
+    }
+}
+
+#[cfg(test)]
 mod usage_tests {
     use super::{key_fingerprint, usage_backoff_ms};
 
@@ -1321,6 +1563,16 @@ fn key_fingerprint(key: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn session_from_metadata(body_json: &Value) -> Option<String> {
+    let raw = body_json["metadata"]["user_id"].as_str()?;
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        if let Some(inner) = v["session_id"].as_str() {
+            return Some(inner.to_string());
+        }
+    }
+    Some(raw.to_string())
+}
+
 fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
     let values: Vec<&str> = headers
         .get_all("x-alexandria-trace-tag")
@@ -1386,7 +1638,23 @@ async fn proxy(
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .or_else(|| body_json["metadata"]["user_id"].as_str().map(String::from));
+        .or_else(|| {
+            headers
+                .get("session_id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .or_else(|| session_from_metadata(&body_json))
+        .or_else(|| {
+            conversation_root(format, &body_json).map(|root| {
+                let ua = headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ip = peer.map(|p| p.ip().to_string()).unwrap_or_default();
+                format!("auto-{}", key_fingerprint(&format!("{root}{ua}{ip}")))
+            })
+        });
 
     let requested_model = body_json["model"].as_str().unwrap_or("").to_string();
     if requested_model.is_empty() {

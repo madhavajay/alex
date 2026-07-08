@@ -58,11 +58,21 @@ enum TerminalLauncher {
         }
     }
 
+    static var ghosttyIsRunning: Bool {
+        !NSRunningApplication.runningApplications(
+            withBundleIdentifier: TerminalApp.ghostty.bundleId
+        ).isEmpty
+    }
+
     private static func launchGhostty(_ command: String) {
         guard let url = TerminalApp.ghostty.appURL else { return launchTerminal(command) }
+        // Ghostty has no macOS IPC to open a command window in a running
+        // instance, and `open -n` spawns a second instance that restores
+        // every saved window. Only launch Ghostty cold; otherwise use Terminal.
+        guard !ghosttyIsRunning else { return launchTerminal(command) }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        proc.arguments = ["-na", url.path, "--args", "-e", loginShell, "-lc", holdOpen(command)]
+        proc.arguments = ["-a", url.path, "--args", "-e", loginShell, "-lc", holdOpen(command)]
         try? proc.run()
     }
 

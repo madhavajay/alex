@@ -29,11 +29,25 @@ enum DarioView {
 }
 
 #[derive(Clone, Default)]
+enum TranscriptView {
+    #[default]
+    Empty,
+    Unsupported,
+    Ready {
+        id: String,
+        turns: Vec<Value>,
+    },
+}
+
+#[derive(Clone, Default)]
 struct Snapshot {
     up: bool,
     ever: bool,
     version: String,
     traces: Vec<Value>,
+    sessions: Vec<Value>,
+    sessions_supported: Option<bool>,
+    transcript: TranscriptView,
     limits: Vec<Value>,
     accounts: Vec<Value>,
     dario: DarioView,
@@ -45,6 +59,17 @@ struct Ui {
     tab: usize,
     follow: bool,
     table: TableState,
+    stable: TableState,
+    raw_mode: bool,
+    transcript: bool,
+    tsc_scroll: usize,
+    tsc_follow: bool,
+    tsc_view_h: usize,
+    watching: Arc<Mutex<Option<String>>>,
+}
+
+fn raw_active(sessions_supported: Option<bool>, raw_mode: bool) -> bool {
+    raw_mode || sessions_supported == Some(false)
 }
 
 pub async fn run(base_url: &str, local_key: &str) -> Result<()> {
@@ -58,17 +83,64 @@ pub async fn run(base_url: &str, local_key: &str) -> Result<()> {
         .build()?;
     let shared = Arc::new(Mutex::new(Snapshot::default()));
     let notify = Arc::new(Notify::new());
+    let watching = Arc::new(Mutex::new(None::<String>));
+    let tnotify = Arc::new(Notify::new());
     let poller = tokio::spawn(poll_loop(
-        client,
+        client.clone(),
         base_url.to_string(),
         shared.clone(),
         notify.clone(),
     ));
+    let tpoller = tokio::spawn(transcript_poll_loop(
+        client,
+        base_url.to_string(),
+        shared.clone(),
+        watching.clone(),
+        tnotify.clone(),
+    ));
     let terminal = ratatui::init();
-    let res = ui_loop(terminal, shared, notify, base_url).await;
+    let res = ui_loop(terminal, shared, notify, tnotify, watching, base_url).await;
     ratatui::restore();
     poller.abort();
+    tpoller.abort();
     res
+}
+
+async fn transcript_poll_loop(
+    client: reqwest::Client,
+    base: String,
+    shared: Arc<Mutex<Snapshot>>,
+    watching: Arc<Mutex<Option<String>>>,
+    notify: Arc<Notify>,
+) {
+    loop {
+        let id = watching.lock().unwrap().clone();
+        if let Some(id) = id {
+            let url = format!("{base}/traces/sessions/{id}/transcript?limit=500");
+            if let Some((code, v)) = get_json(&client, &url).await {
+                let still = watching.lock().unwrap().as_deref() == Some(id.as_str());
+                if still {
+                    let mut s = shared.lock().unwrap();
+                    match code {
+                        200 => {
+                            let turns = v
+                                .get("turns")
+                                .and_then(|t| t.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            s.transcript = TranscriptView::Ready { id, turns };
+                        }
+                        404 => s.transcript = TranscriptView::Unsupported,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = notify.notified() => {}
+        }
+    }
 }
 
 async fn poll_loop(
@@ -108,12 +180,14 @@ async fn poll_once(client: &reqwest::Client, base: &str, shared: &Arc<Mutex<Snap
         .unwrap_or("")
         .to_string();
     let u_traces = format!("{base}/admin/traces?limit=100");
+    let u_sessions = format!("{base}/traces/sessions?since=24h&limit=200");
     let u_limits = format!("{base}/admin/limits");
     let u_accounts = format!("{base}/admin/health");
     let u_dario = format!("{base}/admin/dario");
     let u_analytics = format!("{base}/admin/analytics?since_minutes=60");
-    let (traces, limits, accounts, dario, analytics) = tokio::join!(
+    let (traces, sessions, limits, accounts, dario, analytics) = tokio::join!(
         get_json(client, &u_traces),
+        get_json(client, &u_sessions),
         get_json(client, &u_limits),
         get_json(client, &u_accounts),
         get_json(client, &u_dario),
@@ -132,6 +206,20 @@ async fn poll_once(client: &reqwest::Client, base: &str, shared: &Arc<Mutex<Snap
             .unwrap_or_default();
         list.sort_by_key(|t| -t.get("ts_request_ms").and_then(|v| v.as_i64()).unwrap_or(0));
         s.traces = list;
+    }
+    match sessions {
+        Some((200, v)) => {
+            let mut list = v
+                .get("sessions")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            list.sort_by_key(|x| -x.get("last_ts_ms").and_then(|v| v.as_i64()).unwrap_or(0));
+            s.sessions = list;
+            s.sessions_supported = Some(true);
+        }
+        Some((404, _)) => s.sessions_supported = Some(false),
+        _ => {}
     }
     if let Some((200, v)) = limits {
         s.limits = v
@@ -161,12 +249,21 @@ async fn ui_loop(
     mut terminal: DefaultTerminal,
     shared: Arc<Mutex<Snapshot>>,
     notify: Arc<Notify>,
+    tnotify: Arc<Notify>,
+    watching: Arc<Mutex<Option<String>>>,
     base: &str,
 ) -> Result<()> {
     let mut ui = Ui {
         tab: 0,
         follow: true,
         table: TableState::default(),
+        stable: TableState::default(),
+        raw_mode: false,
+        transcript: false,
+        tsc_scroll: 0,
+        tsc_follow: true,
+        tsc_view_h: 10,
+        watching,
     };
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -176,48 +273,116 @@ async fn ui_loop(
             ev = events.next() => {
                 if let Some(Ok(Event::Key(k))) = ev {
                     if k.kind == KeyEventKind::Press {
-                        match k.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                                return Ok(())
+                        if k.code == KeyCode::Char('c')
+                            && k.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return Ok(());
+                        }
+                        if ui.transcript {
+                            let page = ui.tsc_view_h.saturating_sub(1).max(1);
+                            match k.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    ui.transcript = false;
+                                    *ui.watching.lock().unwrap() = None;
+                                    shared.lock().unwrap().transcript = TranscriptView::Empty;
+                                }
+                                KeyCode::Up => {
+                                    ui.tsc_follow = false;
+                                    ui.tsc_scroll = ui.tsc_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    ui.tsc_follow = false;
+                                    ui.tsc_scroll = ui.tsc_scroll.saturating_add(1);
+                                }
+                                KeyCode::PageUp => {
+                                    ui.tsc_follow = false;
+                                    ui.tsc_scroll = ui.tsc_scroll.saturating_sub(page);
+                                }
+                                KeyCode::PageDown => {
+                                    ui.tsc_follow = false;
+                                    ui.tsc_scroll = ui.tsc_scroll.saturating_add(page);
+                                }
+                                KeyCode::End => ui.tsc_scroll = usize::MAX,
+                                KeyCode::Char('f') => ui.tsc_follow = true,
+                                _ => {}
                             }
-                            KeyCode::Char('1') => ui.tab = 0,
-                            KeyCode::Char('2') => ui.tab = 1,
-                            KeyCode::Char('3') => ui.tab = 2,
-                            KeyCode::Char('4') => ui.tab = 3,
-                            KeyCode::Left => ui.tab = (ui.tab + 3) % 4,
-                            KeyCode::Right => ui.tab = (ui.tab + 1) % 4,
-                            KeyCode::Up => {
-                                ui.follow = false;
-                                let i = ui.table.selected().unwrap_or(0);
-                                ui.table.select(Some(i.saturating_sub(1)));
+                        } else {
+                            match k.code {
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                KeyCode::Char('1') => ui.tab = 0,
+                                KeyCode::Char('2') => ui.tab = 1,
+                                KeyCode::Char('3') => ui.tab = 2,
+                                KeyCode::Char('4') => ui.tab = 3,
+                                KeyCode::Left => ui.tab = (ui.tab + 3) % 4,
+                                KeyCode::Right => ui.tab = (ui.tab + 1) % 4,
+                                KeyCode::Up | KeyCode::Down => {
+                                    ui.follow = false;
+                                    let supported = shared.lock().unwrap().sessions_supported;
+                                    let sess =
+                                        ui.tab == 0 && !raw_active(supported, ui.raw_mode);
+                                    let st = if sess { &mut ui.stable } else { &mut ui.table };
+                                    if k.code == KeyCode::Up {
+                                        let i = st.selected().unwrap_or(0);
+                                        st.select(Some(i.saturating_sub(1)));
+                                    } else {
+                                        let i = st.selected().map(|i| i + 1).unwrap_or(0);
+                                        st.select(Some(i));
+                                    }
+                                }
+                                KeyCode::Char('f') => ui.follow = true,
+                                KeyCode::Char('r') => {
+                                    if ui.tab == 0 {
+                                        ui.raw_mode = !ui.raw_mode;
+                                    } else {
+                                        notify.notify_one();
+                                    }
+                                }
+                                KeyCode::Enter if ui.tab == 0 => {
+                                    let sid = {
+                                        let s = shared.lock().unwrap();
+                                        if raw_active(s.sessions_supported, ui.raw_mode) {
+                                            None
+                                        } else {
+                                            ui.stable
+                                                .selected()
+                                                .and_then(|i| s.sessions.get(i))
+                                                .and_then(|v| v.get("session_id"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|v| v.to_string())
+                                        }
+                                    };
+                                    if let Some(sid) = sid {
+                                        *ui.watching.lock().unwrap() = Some(sid);
+                                        ui.transcript = true;
+                                        ui.tsc_follow = true;
+                                        ui.tsc_scroll = 0;
+                                        tnotify.notify_one();
+                                    }
+                                }
+                                _ => {}
                             }
-                            KeyCode::Down => {
-                                ui.follow = false;
-                                let i = ui.table.selected().map(|i| i + 1).unwrap_or(0);
-                                ui.table.select(Some(i));
-                            }
-                            KeyCode::Char('f') => ui.follow = true,
-                            KeyCode::Char('r') => notify.notify_one(),
-                            _ => {}
                         }
                     }
                 }
             }
         }
         let snap = shared.lock().unwrap().clone();
-        let len = snap.traces.len();
-        if ui.follow {
-            ui.table.select(if len == 0 { None } else { Some(0) });
-        } else {
-            match ui.table.selected() {
-                Some(i) if len == 0 => {
-                    let _ = i;
-                    ui.table.select(None);
+        if !ui.transcript {
+            let sess = ui.tab == 0 && !raw_active(snap.sessions_supported, ui.raw_mode);
+            let (st, len) = if sess {
+                (&mut ui.stable, snap.sessions.len())
+            } else {
+                (&mut ui.table, snap.traces.len())
+            };
+            if ui.follow {
+                st.select(if len == 0 { None } else { Some(0) });
+            } else {
+                match st.selected() {
+                    Some(_) if len == 0 => st.select(None),
+                    Some(i) if i >= len => st.select(Some(len - 1)),
+                    None if len > 0 => st.select(Some(0)),
+                    _ => {}
                 }
-                Some(i) if i >= len => ui.table.select(Some(len - 1)),
-                None if len > 0 => ui.table.select(Some(0)),
-                _ => {}
             }
         }
         terminal.draw(|f| draw(f, &snap, &mut ui, base))?;
@@ -234,13 +399,23 @@ fn draw(f: &mut Frame, snap: &Snapshot, ui: &mut Ui, base: &str) {
     .split(f.area());
     draw_status(f, chunks[0], snap, base);
     draw_tabs(f, chunks[1], ui.tab);
-    match ui.tab {
-        0 => draw_traces(f, chunks[2], snap, ui),
-        1 => draw_limits(f, chunks[2], snap),
-        2 => draw_accounts(f, chunks[2], snap),
-        _ => draw_dario(f, chunks[2], snap),
+    if ui.transcript {
+        draw_transcript(f, chunks[2], snap, ui);
+    } else {
+        match ui.tab {
+            0 => {
+                if raw_active(snap.sessions_supported, ui.raw_mode) {
+                    draw_traces(f, chunks[2], snap, ui);
+                } else {
+                    draw_sessions(f, chunks[2], snap, ui);
+                }
+            }
+            1 => draw_limits(f, chunks[2], snap),
+            2 => draw_accounts(f, chunks[2], snap),
+            _ => draw_dario(f, chunks[2], snap),
+        }
     }
-    draw_bottom(f, chunks[3], snap);
+    draw_bottom(f, chunks[3], snap, ui);
 }
 
 fn themed_block(title: &str) -> Block<'_> {
@@ -305,7 +480,7 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, tab: usize) {
-    let titles = ["Traces", "Limits", "Accounts", "Dario"]
+    let titles = ["Sessions", "Limits", "Accounts", "Dario"]
         .iter()
         .enumerate()
         .map(|(i, t)| {
@@ -366,11 +541,24 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-fn trace_cells(t: &Value) -> TraceCells {
-    let ts = jint(t, "ts_request_ms").unwrap_or(0);
-    let time = chrono::DateTime::from_timestamp_millis(ts)
+fn fmt_time_ms(ts: Option<i64>) -> String {
+    ts.and_then(chrono::DateTime::from_timestamp_millis)
         .map(|d| d.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "--:--:--".into());
+        .unwrap_or_else(|| "--:--:--".into())
+}
+
+fn fmt_count(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn trace_cells(t: &Value) -> TraceCells {
+    let time = fmt_time_ms(jint(t, "ts_request_ms").filter(|ts| *ts > 0));
     let model = t
         .get("routed_model")
         .and_then(|v| v.as_str())
@@ -421,6 +609,19 @@ fn status_color(class: u8) -> Color {
 }
 
 fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
+    let area = if snap.sessions_supported == Some(false) && !ui.raw_mode {
+        let c = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " sessions endpoint unavailable — daemon update required · showing raw traces",
+                Style::default().fg(SAND).add_modifier(Modifier::DIM),
+            )),
+            c[0],
+        );
+        c[1]
+    } else {
+        area
+    };
     let sel = ui.table.selected().filter(|i| *i < snap.traces.len());
     let (tarea, darea) = if sel.is_some() && area.height > 16 {
         let c = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).split(area);
@@ -455,9 +656,9 @@ fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
         ])
     });
     let title = if ui.follow {
-        "Traces · following".to_string()
+        "Raw traces · following".to_string()
     } else {
-        "Traces · paused (f to follow)".to_string()
+        "Raw traces · paused (f to follow)".to_string()
     };
     let table = Table::new(
         rows,

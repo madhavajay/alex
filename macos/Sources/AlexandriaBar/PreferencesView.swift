@@ -8,6 +8,7 @@ struct PreferencesView: View {
     @AppStorage("notifyEnabled") private var notifyEnabled = true
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
+    @AppStorage("menuIconStyle") private var menuIconStyle = "logo"
 
     var body: some View {
         Form {
@@ -17,6 +18,12 @@ struct PreferencesView: View {
                     Text("1 minute").tag(60.0)
                     Text("5 minutes").tag(300.0)
                     Text("15 minutes").tag(900.0)
+                }
+            }
+            Section("Menu Bar") {
+                Picker("Icon", selection: $menuIconStyle) {
+                    Text("Alexandria logo").tag("logo")
+                    Text("Hieroglyph (𓂀)").tag("glyph")
                 }
             }
             Section("Alerts") {
@@ -34,6 +41,11 @@ struct PreferencesView: View {
                     ForEach(TerminalLauncher.installedApps, id: \.rawValue) { app in
                         Text(app.displayName).tag(app.rawValue)
                     }
+                }
+                if TerminalLauncher.resolved == .ghostty {
+                    Text("Ghostty can't accept commands while already running — Terminal is used instead in that case.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
                 }
             }
             Section("Daemon") {
@@ -67,7 +79,9 @@ final class PreferencesWindowController {
             win.center()
             window = win
         }
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        if let window {
+            DockIconManager.shared.track(window)
+            window.makeKeyAndOrderFront(nil)
+        }
     }
 }

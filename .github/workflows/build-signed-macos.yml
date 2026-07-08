@@ -1,0 +1,52 @@
+name: Build Signed macOS App
+
+on:
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: "Submit the DMG to Apple notarization"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build-signed-macos:
+    name: Build signed DMG
+    runs-on: macos-15
+    env:
+      BUNDLE_ID: com.madhavajay.alexandria-macos
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build signed DMG
+        run: |
+          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
+          if [[ "${{ inputs.notarize }}" == "true" ]]; then
+            ./build-signed.sh --clean --notarize
+          else
+            ./build-signed.sh --clean --skip-notarize
+          fi
+
+      - name: Check Gatekeeper
+        if: ${{ inputs.notarize }}
+        run: ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: alexandria-macos-dmg
+          path: macos/dist/*.dmg

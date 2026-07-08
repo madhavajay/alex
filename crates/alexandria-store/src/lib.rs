@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 const SCHEMA: &str = r#"
@@ -350,6 +350,107 @@ impl Store {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn sessions(&self, since_ms: Option<i64>, limit: usize) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT session_id, MAX(run_id), MIN(ts_request_ms), MAX(ts_request_ms), COUNT(*),
+                    GROUP_CONCAT(DISTINCT routed_model), MAX(harness),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cost_usd),0.0),
+                    COALESCE(SUM(CASE WHEN error IS NOT NULL OR status >= 400 THEN 1 ELSE 0 END),0),
+                    (SELECT t2.status FROM traces t2 WHERE t2.session_id = traces.session_id
+                     ORDER BY t2.ts_request_ms DESC LIMIT 1),
+                    GROUP_CONCAT(tags_json, char(31))
+             FROM traces WHERE session_id IS NOT NULL",
+        );
+        let mut args: Vec<String> = vec![];
+        if let Some(since) = since_ms {
+            sql.push_str(" AND ts_request_ms >= ?");
+            args.push(since.to_string());
+        }
+        sql.push_str(" GROUP BY session_id ORDER BY MAX(ts_request_ms) DESC LIMIT ?");
+        let limit = if limit == 0 {
+            DEFAULT_SEARCH_LIMIT
+        } else {
+            limit.min(1000)
+        };
+        args.push(limit.to_string());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            let models: Vec<String> = r
+                .get::<_, Option<String>>(5)?
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+            let mut tags = serde_json::Map::new();
+            if let Some(raw) = r.get::<_, Option<String>>(12)? {
+                for piece in raw.split('\u{1f}') {
+                    if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(piece) {
+                        tags.extend(o);
+                    }
+                }
+            }
+            Ok(json!({
+                "session_id": r.get::<_, String>(0)?,
+                "run_id": r.get::<_, Option<String>>(1)?,
+                "first_ts_ms": r.get::<_, Option<i64>>(2)?,
+                "last_ts_ms": r.get::<_, Option<i64>>(3)?,
+                "trace_count": r.get::<_, i64>(4)?,
+                "models": models,
+                "harness": r.get::<_, Option<String>>(6)?,
+                "total_input_tokens": r.get::<_, i64>(7)?,
+                "total_output_tokens": r.get::<_, i64>(8)?,
+                "total_cost_usd": r.get::<_, f64>(9)?,
+                "errors": r.get::<_, i64>(10)?,
+                "last_status": r.get::<_, Option<i64>>(11)?,
+                "tags": tags,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn session_traces(&self, session_id: &str, since_ms: Option<i64>) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = format!("SELECT {TRACE_COLS} FROM traces WHERE session_id = ?");
+        let mut args = vec![session_id.to_string()];
+        if let Some(since) = since_ms {
+            sql.push_str(" AND ts_request_ms >= ?");
+            args.push(since.to_string());
+        }
+        sql.push_str(" ORDER BY ts_request_ms ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn get_trace(&self, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                &format!("SELECT {TRACE_COLS} FROM traces WHERE id = ?1"),
+                params![id],
+                trace_row_json,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn delete_trace(&self, id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let paths: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT req_body_path, upstream_req_body_path, resp_body_path
+                 FROM traces WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((req, upstream, resp)) = paths else {
+            anyhow::bail!("trace not found: {id}");
+        };
+        conn.execute("DELETE FROM traces WHERE id = ?1", params![id])?;
+        Ok([req, upstream, resp].into_iter().flatten().collect())
     }
 
     pub fn run_summary(&self, run_id: &str) -> Result<Value> {
@@ -714,6 +815,100 @@ mod tests {
             })
             .unwrap();
         assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn sessions_aggregate_and_order() {
+        let store = Store::open(tmpdir("sessions")).unwrap();
+        let mut a = trace("a", 1000, Some("run-1"));
+        a.session_id = Some("ses_1".into());
+        a.tags = Some(r#"{"suite":"swebench"}"#.into());
+        a.harness = Some("codex".into());
+        let mut b = trace("b", 2000, None);
+        b.session_id = Some("ses_1".into());
+        b.status = Some(500);
+        b.error = Some("boom".into());
+        b.routed_model = Some("gpt-5.5".into());
+        b.tags = Some(r#"{"case":"x1"}"#.into());
+        let mut c = trace("c", 5000, None);
+        c.session_id = Some("ses_2".into());
+        let d = trace("d", 9000, None);
+        for t in [&a, &b, &c, &d] {
+            store.insert_trace(t).unwrap();
+        }
+        let sessions = store.sessions(None, 0).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["session_id"], "ses_2");
+        let s1 = &sessions[1];
+        assert_eq!(s1["session_id"], "ses_1");
+        assert_eq!(s1["run_id"], "run-1");
+        assert_eq!(s1["first_ts_ms"], 1000);
+        assert_eq!(s1["last_ts_ms"], 2000);
+        assert_eq!(s1["trace_count"], 2);
+        assert_eq!(s1["harness"], "codex");
+        assert_eq!(s1["total_input_tokens"], 20);
+        assert_eq!(s1["total_output_tokens"], 10);
+        assert_eq!(s1["errors"], 1);
+        assert_eq!(s1["last_status"], 500);
+        assert_eq!(s1["tags"]["suite"], "swebench");
+        assert_eq!(s1["tags"]["case"], "x1");
+        let models: Vec<String> = s1["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert!(models.contains(&"claude-haiku-4-5".to_string()));
+        assert!(models.contains(&"gpt-5.5".to_string()));
+        let recent = store.sessions(Some(3000), 0).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["session_id"], "ses_2");
+        let limited = store.sessions(None, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn session_traces_ascending() {
+        let store = Store::open(tmpdir("session-traces")).unwrap();
+        for (id, ts) in [("a", 3000i64), ("b", 1000), ("c", 2000)] {
+            let mut t = trace(id, ts, None);
+            t.session_id = Some("ses_1".into());
+            t.upstream_format = Some("anthropic".into());
+            t.req_body_path = Some(format!("/bodies/{id}.request.json.gz"));
+            store.insert_trace(&t).unwrap();
+        }
+        let rows = store.session_traces("ses_1", None).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["id"], "b");
+        assert_eq!(rows[2]["id"], "a");
+        assert_eq!(rows[0]["upstream_format"], "anthropic");
+        assert_eq!(rows[0]["client_format"], Value::Null);
+        assert_eq!(rows[0]["req_body_path"], "/bodies/b.request.json.gz");
+        let windowed = store.session_traces("ses_1", Some(1500)).unwrap();
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed[0]["id"], "c");
+        assert!(store.session_traces("nope", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_and_delete_trace() {
+        let store = Store::open(tmpdir("delete")).unwrap();
+        let mut t = trace("a", 1000, None);
+        t.req_body_path = Some(
+            store
+                .write_body("a", "request.json", b"{\"model\":\"x\"}")
+                .unwrap(),
+        );
+        t.resp_body_path = Some("/nonexistent/a.response.body.gz".into());
+        store.insert_trace(&t).unwrap();
+        let row = store.get_trace("a").unwrap().unwrap();
+        assert_eq!(row["id"], "a");
+        assert_eq!(row["resp_body_path"], "/nonexistent/a.response.body.gz");
+        assert!(store.get_trace("missing").unwrap().is_none());
+        let paths = store.delete_trace("a").unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(store.get_trace("a").unwrap().is_none());
+        assert!(store.delete_trace("a").is_err());
     }
 
     #[test]

@@ -289,13 +289,13 @@ final class AuthWindowController {
         window.center()
         windows[provider] = window
         model.begin()
-        NSApp.activate(ignoringOtherApps: true)
+        DockIconManager.shared.track(window)
         window.makeKeyAndOrderFront(nil)
     }
 
     private func closeWindow(provider: String) {
         models[provider]?.cancel()
-        windows[provider]?.orderOut(nil)
+        windows[provider]?.close()
         windows[provider] = nil
         models[provider] = nil
     }

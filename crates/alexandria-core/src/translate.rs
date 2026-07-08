@@ -6,7 +6,7 @@ fn put(o: &mut Map<String, Value>, k: &str, v: &Value) {
     }
 }
 
-fn txt(c: &Value) -> String {
+pub(crate) fn txt(c: &Value) -> String {
     match c {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
@@ -748,6 +748,157 @@ pub fn synth_anthropic_sse(anthropic_resp: &Value) -> String {
     out
 }
 
+fn tool_result_snip(text: &str) -> String {
+    let head: String = text.chars().take(200).collect();
+    format!("[tool result] {head}")
+}
+
+pub fn last_user_text(format_str: &str, req: &Value) -> Option<String> {
+    match format_str {
+        "anthropic" => {
+            for m in req["messages"].as_array().into_iter().flatten().rev() {
+                if m["role"] != "user" {
+                    continue;
+                }
+                match &m["content"] {
+                    Value::String(s) if !s.is_empty() => return Some(s.clone()),
+                    Value::Array(blocks) => {
+                        let text = blocks
+                            .iter()
+                            .filter(|b| b["type"] == "text")
+                            .filter_map(|b| b["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                        if let Some(tr) = blocks.iter().find(|b| b["type"] == "tool_result") {
+                            return Some(tool_result_snip(&txt(&tr["content"])));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        "openai-chat" => {
+            for m in req["messages"].as_array().into_iter().flatten().rev() {
+                match m["role"].as_str() {
+                    Some("user") => {
+                        let t = txt(&m["content"]);
+                        if !t.is_empty() {
+                            return Some(t);
+                        }
+                    }
+                    Some("tool") => return Some(tool_result_snip(&txt(&m["content"]))),
+                    _ => {}
+                }
+            }
+            None
+        }
+        "openai-responses" => {
+            if let Some(s) = req["input"].as_str() {
+                return (!s.is_empty()).then(|| s.to_string());
+            }
+            for it in req["input"].as_array().into_iter().flatten().rev() {
+                match it["type"].as_str().unwrap_or("message") {
+                    "message" if it["role"] == "user" => {
+                        let t = match &it["content"] {
+                            Value::String(s) => s.clone(),
+                            Value::Array(parts) => parts
+                                .iter()
+                                .filter(|p| p["type"] == "input_text")
+                                .filter_map(|p| p["text"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            _ => String::new(),
+                        };
+                        if !t.is_empty() {
+                            return Some(t);
+                        }
+                    }
+                    "function_call_output" => {
+                        return Some(tool_result_snip(&txt(&it["output"])))
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_message_text(msg: &Value) -> Option<String> {
+    let parts: Vec<&str> = msg["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(""))
+}
+
+fn responses_output_text(resp: &Value) -> Option<String> {
+    let mut out = String::new();
+    for it in resp["output"].as_array().into_iter().flatten() {
+        if it["type"] != "message" {
+            continue;
+        }
+        for p in it["content"].as_array().into_iter().flatten() {
+            if p["type"] == "output_text" {
+                out.push_str(p["text"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn openai_chat_sse_text(sse: &str) -> Option<String> {
+    let mut out = String::new();
+    for v in sse_datas(sse) {
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            out.push_str(c);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+pub fn assistant_reply_text(upstream_format: &str, resp_text: &str) -> Option<String> {
+    let trimmed = resp_text.trim_start();
+    let is_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    match upstream_format {
+        "anthropic" => {
+            let msg = if is_sse {
+                parse_anthropic_sse_to_message(resp_text)?
+            } else {
+                serde_json::from_str(resp_text).ok()?
+            };
+            anthropic_message_text(&msg)
+        }
+        "openai-chat" => {
+            if is_sse {
+                openai_chat_sse_text(resp_text)
+            } else {
+                let v: Value = serde_json::from_str(resp_text).ok()?;
+                v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .map(String::from)
+            }
+        }
+        "openai-responses" => {
+            let resp = if is_sse {
+                parse_responses_sse_final(resp_text)?
+            } else {
+                serde_json::from_str(resp_text).ok()?
+            };
+            responses_output_text(&resp)
+        }
+        _ => None,
+    }
+}
+
 pub fn normalize_codex_request(req: &mut Value) {
     let Some(o) = req.as_object_mut() else { return };
     o.insert("store".to_string(), json!(false));
@@ -1171,5 +1322,141 @@ mod tests {
         normalize_codex_request(&mut req);
         assert_eq!(req["tool_choice"], "auto");
         assert_eq!(req["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn last_user_text_anthropic() {
+        let req = json!({"messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "part1"},
+                {"type": "text", "text": "part2"},
+            ]},
+        ]});
+        assert_eq!(last_user_text("anthropic", &req), Some("part1\npart2".into()));
+        let long = "x".repeat(500);
+        let tool = json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": long}]},
+            ]},
+        ]});
+        let got = last_user_text("anthropic", &tool).unwrap();
+        assert!(got.starts_with("[tool result] xxx"));
+        assert_eq!(got.chars().count(), "[tool result] ".chars().count() + 200);
+        assert_eq!(last_user_text("anthropic", &json!({"messages": []})), None);
+    }
+
+    #[test]
+    fn last_user_text_openai_chat() {
+        let req = json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": [{"type": "text", "text": "again"}]},
+        ]});
+        assert_eq!(last_user_text("openai-chat", &req), Some("again".into()));
+        let tool = json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": null},
+            {"role": "tool", "tool_call_id": "c1", "content": "result body"},
+        ]});
+        assert_eq!(
+            last_user_text("openai-chat", &tool),
+            Some("[tool result] result body".into())
+        );
+        assert_eq!(last_user_text("openai-chat", &json!({})), None);
+    }
+
+    #[test]
+    fn last_user_text_openai_responses() {
+        let req = json!({"input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "one"}]},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "r"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "two"}]},
+        ]});
+        assert_eq!(last_user_text("openai-responses", &req), Some("two".into()));
+        let tool = json!({"input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "tool says hi"},
+        ]});
+        assert_eq!(
+            last_user_text("openai-responses", &tool),
+            Some("[tool result] tool says hi".into())
+        );
+        assert_eq!(
+            last_user_text("openai-responses", &json!({"input": "raw"})),
+            Some("raw".into())
+        );
+        assert_eq!(last_user_text("mystery", &json!({})), None);
+    }
+
+    #[test]
+    fn assistant_reply_anthropic_plain_and_sse() {
+        let plain = json!({
+            "id": "msg_01", "type": "message", "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+            "stop_reason": "end_turn",
+        });
+        assert_eq!(
+            assistant_reply_text("anthropic", &plain.to_string()),
+            Some("hello world".into())
+        );
+        let sse = synth_anthropic_sse(&anthropic_resp());
+        assert_eq!(
+            assistant_reply_text("anthropic", &sse),
+            Some("hi there".into())
+        );
+        assert_eq!(assistant_reply_text("anthropic", "not json"), None);
+    }
+
+    #[test]
+    fn assistant_reply_openai_chat_plain_and_sse() {
+        let plain = json!({"choices": [{"message": {"role": "assistant", "content": "chat reply"}}]});
+        assert_eq!(
+            assistant_reply_text("openai-chat", &plain.to_string()),
+            Some("chat reply".into())
+        );
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"str\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"eamed\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(
+            assistant_reply_text("openai-chat", sse),
+            Some("streamed".into())
+        );
+        assert_eq!(assistant_reply_text("openai-chat", "data: {}\n\n"), None);
+    }
+
+    #[test]
+    fn assistant_reply_openai_responses_plain_and_sse() {
+        assert_eq!(
+            assistant_reply_text("openai-responses", &responses_resp().to_string()),
+            Some("hello".into())
+        );
+        let sse = synth_openai_responses_sse(&responses_resp());
+        assert_eq!(
+            assistant_reply_text("openai-responses", &sse),
+            Some("hello".into())
+        );
+        assert_eq!(
+            assistant_reply_text("openai-responses", "data: {\"type\":\"ping\"}\n\n"),
+            None
+        );
     }
 }

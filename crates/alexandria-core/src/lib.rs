@@ -359,16 +359,68 @@ pub struct TraceRecord {
 pub fn parse_trace_tags(values: &[&str]) -> Value {
     let mut map = serde_json::Map::new();
     for v in values {
-        let Some((k, val)) = v.split_once('=') else {
-            continue;
-        };
-        let k = k.trim();
-        if k.is_empty() {
-            continue;
+        for piece in v.split(',') {
+            let Some((k, val)) = piece.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            if k.is_empty() {
+                continue;
+            }
+            map.insert(k.to_string(), Value::String(val.trim().to_string()));
         }
-        map.insert(k.to_string(), Value::String(val.trim().to_string()));
     }
     Value::Object(map)
+}
+
+pub fn conversation_root(format: ClientFormat, body: &Value) -> Option<String> {
+    let (system, user) = match format {
+        ClientFormat::AnthropicMessages => {
+            let system = translate::txt(&body["system"]);
+            let user = body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|m| m["role"] == "user")
+                .map(|m| translate::txt(&m["content"]))
+                .unwrap_or_default();
+            (system, user)
+        }
+        ClientFormat::OpenaiChat => {
+            let msgs = body["messages"].as_array();
+            let find = |roles: &[&str]| {
+                msgs.into_iter()
+                    .flatten()
+                    .find(|m| roles.contains(&m["role"].as_str().unwrap_or("")))
+                    .map(|m| translate::txt(&m["content"]))
+                    .unwrap_or_default()
+            };
+            (find(&["system", "developer"]), find(&["user"]))
+        }
+        ClientFormat::OpenaiResponses => {
+            let system = body["instructions"].as_str().unwrap_or("").to_string();
+            let user = match &body["input"] {
+                Value::String(s) => s.clone(),
+                Value::Array(items) => items
+                    .iter()
+                    .find(|it| {
+                        it["role"] == "user"
+                            && it["type"].as_str().unwrap_or("message") == "message"
+                    })
+                    .map(|it| translate::txt(&it["content"]))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            (system, user)
+        }
+    };
+    let system = system.trim();
+    let user = user.trim();
+    if system.is_empty() && user.is_empty() {
+        None
+    } else {
+        Some(format!("{system}\n{user}"))
+    }
 }
 
 pub fn parse_since(s: &str, now_ms: i64) -> Option<i64> {
@@ -494,6 +546,94 @@ mod tests {
         assert_eq!(parse_trace_tags(&[]), serde_json::json!({}));
         let padded = parse_trace_tags(&[" k = v "]);
         assert_eq!(padded["k"], "v");
+    }
+
+    #[test]
+    fn parses_coalesced_trace_tags() {
+        let v = parse_trace_tags(&["harness=codex,task=smoke,model=gpt-5.5"]);
+        assert_eq!(v["harness"], "codex");
+        assert_eq!(v["task"], "smoke");
+        assert_eq!(v["model"], "gpt-5.5");
+        assert_eq!(v.as_object().unwrap().len(), 3);
+        let mixed = parse_trace_tags(&["a=1, b = 2 ,junk,=x", "c=3"]);
+        assert_eq!(mixed["a"], "1");
+        assert_eq!(mixed["b"], "2");
+        assert_eq!(mixed["c"], "3");
+        assert_eq!(mixed.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn conversation_root_anthropic() {
+        let body = serde_json::json!({
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        });
+        assert_eq!(
+            conversation_root(ClientFormat::AnthropicMessages, &body),
+            Some("sys\nhi".to_string())
+        );
+        let plain = serde_json::json!({
+            "system": "s",
+            "messages": [{"role": "user", "content": "u"}],
+        });
+        assert_eq!(
+            conversation_root(ClientFormat::AnthropicMessages, &plain),
+            Some("s\nu".to_string())
+        );
+        assert_eq!(
+            conversation_root(ClientFormat::AnthropicMessages, &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn conversation_root_openai_chat() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "developer", "content": "dev"},
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+            ],
+        });
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiChat, &body),
+            Some("dev\nq".to_string())
+        );
+        let user_only = serde_json::json!({"messages": [{"role": "user", "content": "solo"}]});
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiChat, &user_only),
+            Some("\nsolo".to_string())
+        );
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiChat, &serde_json::json!({"messages": []})),
+            None
+        );
+    }
+
+    #[test]
+    fn conversation_root_openai_responses() {
+        let body = serde_json::json!({
+            "instructions": "inst",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "first"}]},
+            ],
+        });
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiResponses, &body),
+            Some("inst\nfirst".to_string())
+        );
+        let string_input = serde_json::json!({"input": "plain"});
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiResponses, &string_input),
+            Some("\nplain".to_string())
+        );
+        assert_eq!(
+            conversation_root(ClientFormat::OpenaiResponses, &serde_json::json!({"input": []})),
+            None
+        );
     }
 
     #[test]

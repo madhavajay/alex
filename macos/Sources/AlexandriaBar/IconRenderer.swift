@@ -16,7 +16,28 @@ enum IconRenderer {
 
     private static var cache: [String: NSImage] = [:]
 
+    static var style: String {
+        UserDefaults.standard.string(forKey: "menuIconStyle") ?? "logo"
+    }
+
+    static let logoImage: NSImage? = {
+        guard let url = Bundle.main.urlForImageResource("icon")
+            ?? Bundle.main.resourceURL.map({ $0.appendingPathComponent("icon.png") }),
+            let image = NSImage(contentsOf: url)
+        else { return nil }
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = false
+        return image
+    }()
+
     static func statusIcon(severity: StoreAlert.Severity?, daemonUp: Bool) -> NSImage {
+        if style == "logo", let logo = logoImage {
+            return logo
+        }
+        return glyphIcon(severity: severity, daemonUp: daemonUp)
+    }
+
+    static func glyphIcon(severity: StoreAlert.Severity?, daemonUp: Bool) -> NSImage {
         let color: NSColor?
         switch (daemonUp, severity) {
         case (false, _): color = .systemRed
