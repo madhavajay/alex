@@ -2,3 +2,4 @@
 *.mp4
 macos/dist/
 macos/.build/
+__pycache__/
