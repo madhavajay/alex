@@ -183,8 +183,8 @@ ensure_daemon() {
     log "daemon: using running instance at $BASE"
     return 0
   fi
-  log "daemon: none at $BASE - starting ./alexandria daemon (cargo may compile; waiting up to 60s)"
-  "$ROOT/alexandria" daemon --host "$HOST" --port "$PORT" >"$TMP/daemon.log" 2>&1 &
+  log "daemon: none at $BASE - starting ./alex daemon (cargo may compile; waiting up to 60s)"
+  "$ROOT/alex" daemon --host "$HOST" --port "$PORT" >"$TMP/daemon.log" 2>&1 &
   DAEMON_PID=$!
   local i=0
   while [ "$i" -lt 60 ]; do
@@ -531,7 +531,7 @@ run_harness_cell() {
   t0=$(now_ms)
   out="$TMP/cell.$id.harness.out"
   rc=0
-  "$ROOT/alexandria" harness run "$h" --model "$model" --json --timeout-secs "$HARNESS_TIMEOUT" \
+  "$ROOT/alex" harness run "$h" --model "$model" --json --timeout-secs "$HARNESS_TIMEOUT" \
     >"$out" 2>"$TMP/cell.$id.harness.err" || rc=$?
   t1=$(now_ms)
   if [ "$rc" -ne 0 ]; then

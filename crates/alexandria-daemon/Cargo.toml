@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Alexandria: local LLM credential vault, multi-provider routing proxy, and trace capture daemon"
+readme = "../../README.md"
 
 [[bin]]
 name = "alex"
