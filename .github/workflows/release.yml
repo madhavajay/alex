@@ -88,3 +88,52 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -f "v${version}"
           git push origin "v${version}" || true
+
+      - name: Build CLI binary from crates.io
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          root="$RUNNER_TEMP/alex-cli-install"
+          artifact_dir="$PWD/dist/release-assets"
+          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+
+          rm -rf "$root" "$artifact_dir"
+          mkdir -p "$artifact_dir"
+
+          for attempt in {1..12}; do
+            if cargo install alex --version "$version" --root "$root" --force --bins; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "cargo install alex ${version} failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+
+            echo "alex ${version} is not installable from crates.io yet; retrying in 15s..."
+            sleep 15
+          done
+
+          tar -C "$root/bin" -czf "$artifact_dir/$asset" alex alexandria
+          shasum -a 256 "$artifact_dir/$asset" > "$artifact_dir/$asset.sha256"
+
+      - name: Publish CLI binary to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          tag="v${version}"
+          asset_dir="dist/release-assets"
+          notes="Release assets for Alexandria ${version}."
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset_dir"/* --clobber
+          else
+            if ! gh release create "$tag" "$asset_dir"/* \
+              --target "$(git rev-parse HEAD)" \
+              --title "Alexandria ${tag}" \
+              --notes "$notes"; then
+              gh release upload "$tag" "$asset_dir"/* --clobber
+            fi
+          fi

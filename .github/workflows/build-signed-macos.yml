@@ -8,9 +8,14 @@ on:
         required: true
         default: true
         type: boolean
+      publish_release:
+        description: "Attach the notarized DMG to a GitHub Release"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-signed-macos:
@@ -69,6 +74,44 @@ jobs:
       - name: Check Gatekeeper
         if: ${{ inputs.notarize }}
         run: ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Prepare release metadata
+        id: release
+        if: ${{ inputs.notarize && inputs.publish_release }}
+        run: |
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          tag="v${version}"
+          dmg="$(ls -t macos/dist/*.dmg | head -1)"
+
+          if [[ -z "$version" || -z "$dmg" ]]; then
+            echo "Unable to resolve release version or DMG path." >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "dmg=$dmg"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish DMG to GitHub Release
+        if: ${{ inputs.notarize && inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          DMG_PATH: ${{ steps.release.outputs.dmg }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber
+          else
+            if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "Alexandria ${RELEASE_TAG}" \
+              --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
+              gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber
+            fi
+          fi
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
