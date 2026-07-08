@@ -53,9 +53,17 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
           for crate in alex-core alex-auth alex-store alex-proxy alex; do
-            echo "::group::publish ${crate}"
-            cargo publish -p "$crate" --allow-dirty
+            echo "::group::publish ${crate} ${version}"
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              -A "alex-release-workflow" \
+              "https://crates.io/api/v1/crates/${crate}/${version}")
+            if [ "$status" = "200" ]; then
+              echo "${crate} ${version} already published; skipping"
+            else
+              cargo publish -p "$crate" --allow-dirty
+            fi
             echo "::endgroup::"
           done
 
