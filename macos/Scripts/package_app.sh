@@ -68,6 +68,10 @@ if [[ "$IDENTITY" != "-" ]]; then
   codesign_args+=(--options runtime --timestamp)
 fi
 
+while IFS= read -r -d '' bundled_file; do
+  xattr -d com.apple.quarantine "$bundled_file" 2>/dev/null || true
+done < <(find "$APP" -type f -print0)
+
 codesign "${codesign_args[@]}" "$APP/Contents/MacOS/$APP_NAME"
 codesign "${codesign_args[@]}" "$APP"
 echo "built $APP (signed: $IDENTITY)"

@@ -8,6 +8,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
     private var prefsController: PreferencesWindowController?
+    private var traceBrowser: TraceBrowserWindowController?
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
 
@@ -332,6 +333,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Refresh Now", symbol: "arrow.clockwise") { [weak self] in
             Task { await self?.store.refresh() }
         }
+        addAction("Trace Browser…", symbol: "list.bullet.rectangle") { [weak self] in
+            self?.openTraceBrowser()
+        }
         addAction("Open TUI in Terminal", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
             TerminalLauncher.launch(command: "\(bin) tui")
@@ -398,6 +402,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func notify(title: String, body: String) {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
+    }
+
+    private func openTraceBrowser() {
+        if traceBrowser == nil {
+            traceBrowser = TraceBrowserWindowController(store: store)
+        }
+        traceBrowser?.show()
     }
 
     private func openPreferences() {

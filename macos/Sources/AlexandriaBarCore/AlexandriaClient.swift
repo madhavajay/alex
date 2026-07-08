@@ -21,10 +21,19 @@ public struct AlexandriaClient: Sendable {
         }
     }
 
+    private func url(_ path: String, query: [URLQueryItem] = []) -> URL {
+        var comps = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false)!
+        comps.path = "/" + path
+        let items = query.filter { $0.value?.isEmpty == false }
+        if !items.isEmpty { comps.queryItems = items }
+        return comps.url ?? config.baseURL.appendingPathComponent(path)
+    }
+
     private func request(
-        _ path: String, method: String = "GET", body: [String: String]? = nil
+        _ path: String, query: [URLQueryItem] = [], method: String = "GET",
+        body: [String: String]? = nil
     ) async throws -> Data {
-        var req = URLRequest(url: config.baseURL.appendingPathComponent(path))
+        var req = URLRequest(url: url(path, query: query))
         req.httpMethod = method
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
         if let body {
@@ -38,8 +47,10 @@ public struct AlexandriaClient: Sendable {
         return data
     }
 
-    private func get<T: Decodable>(_ path: String, as type: T.Type) async throws -> T {
-        try JSONDecoder().decode(T.self, from: try await request(path))
+    private func get<T: Decodable>(
+        _ path: String, query: [URLQueryItem] = [], as type: T.Type
+    ) async throws -> T {
+        try JSONDecoder().decode(T.self, from: try await request(path, query: query))
     }
 
     public func health() async throws -> DaemonHealth {
@@ -59,7 +70,10 @@ public struct AlexandriaClient: Sendable {
     }
 
     public func analytics(sinceMinutes: Int = 60) async throws -> Analytics {
-        try await get("admin/analytics?since_minutes=\(sinceMinutes)", as: Analytics.self)
+        try await get(
+            "admin/analytics",
+            query: [URLQueryItem(name: "since_minutes", value: "\(sinceMinutes)")],
+            as: Analytics.self)
     }
 
     public func dario() async throws -> DarioStatus? {
@@ -99,5 +113,48 @@ public struct AlexandriaClient: Sendable {
         let data = try await request(
             "admin/auth/import", method: "POST", body: ["source": source])
         return try JSONDecoder().decode(ImportOutcomes.self, from: data).outcomes
+    }
+
+    public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
+        try await get(
+            "traces/sessions",
+            query: [
+                URLQueryItem(name: "since", value: since),
+                URLQueryItem(name: "limit", value: "\(limit)"),
+            ],
+            as: TraceSessionsResponse.self
+        ).sessions
+    }
+
+    public func traceTranscript(sessionId: String, limit: Int = 500) async throws -> TranscriptResponse {
+        try await get(
+            "traces/sessions/\(sessionId)/transcript",
+            query: [URLQueryItem(name: "limit", value: "\(limit)")],
+            as: TranscriptResponse.self)
+    }
+
+    public func searchTraces(text: String, since: String = "24h", filters: OmniQuery = OmniQuery()) async throws -> TraceSearchResponse {
+        try await get(
+            "traces/search",
+            query: [
+                URLQueryItem(name: "text", value: text),
+                URLQueryItem(name: "since", value: since),
+                URLQueryItem(name: "model", value: filters.model),
+                URLQueryItem(name: "provider", value: filters.provider),
+                URLQueryItem(name: "harness", value: filters.harness),
+                URLQueryItem(name: "status", value: filters.status),
+                URLQueryItem(name: "session", value: filters.session),
+                URLQueryItem(name: "run_id", value: filters.run),
+            ],
+            as: TraceSearchResponse.self)
+    }
+
+    public func traceReplyMarkdown(traceId: String) async throws -> String {
+        let data = try await request("traces/\(traceId)/reply.md")
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    public func deleteTrace(id: String) async throws {
+        _ = try await request("traces/\(id)", method: "DELETE")
     }
 }
