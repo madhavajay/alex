@@ -336,6 +336,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Trace Browser…", symbol: "list.bullet.rectangle") { [weak self] in
             self?.openTraceBrowser()
         }
+        addAction("Reveal Log File", symbol: "doc.text.magnifyingglass") {
+            NSWorkspace.shared.activateFileViewerSelecting([BarLog.fileURL])
+        }
         addAction("Open TUI in Terminal", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
             TerminalLauncher.launch(command: "\(bin) tui")

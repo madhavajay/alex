@@ -298,6 +298,51 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
     }
 }
 
+public enum TraceFingerprint {
+    public static func sessions(_ sessions: [TraceSession]) -> String {
+        let newest = sessions.max { $0.lastTsMs < $1.lastTsMs }
+        let totalTraces = sessions.reduce(0) { $0 + $1.traceCount }
+        return "\(sessions.count)|\(newest?.sessionId ?? "")|\(newest?.lastTsMs ?? 0)|\(totalTraces)"
+    }
+
+    public static func turns(_ turns: [TranscriptTurn]) -> String {
+        let last = turns.last
+        return "\(turns.count)|\(last?.traceId ?? "")|\(last?.tsRequestMs ?? 0)"
+            + "|\(last?.tsResponseMs ?? -1)|\(last?.status ?? -1)"
+    }
+}
+
+public struct CappedText: Equatable, Sendable {
+    public let text: String
+    public let isTruncated: Bool
+    public let fullCharCount: Int
+
+    public init(text: String, isTruncated: Bool, fullCharCount: Int) {
+        self.text = text
+        self.isTruncated = isTruncated
+        self.fullCharCount = fullCharCount
+    }
+}
+
+public enum TurnTextCap {
+    public static let maxChars = 4000
+    public static let maxLines = 60
+
+    public static func cap(
+        _ text: String, maxChars: Int = maxChars, maxLines: Int = maxLines
+    ) -> CappedText {
+        let fullCount = text.count
+        var out = fullCount > maxChars ? String(text.prefix(maxChars)) : text
+        var truncated = fullCount > maxChars
+        let lines = out.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.count > maxLines {
+            out = lines.prefix(maxLines).joined(separator: "\n")
+            truncated = true
+        }
+        return CappedText(text: out, isTruncated: truncated, fullCharCount: fullCount)
+    }
+}
+
 public enum LiveFollow {
     public static func shouldSwitch(
         pinned: Bool, currentIdleMs: Int64, userAtBottom: Bool, awayFromBottomMs: Int64

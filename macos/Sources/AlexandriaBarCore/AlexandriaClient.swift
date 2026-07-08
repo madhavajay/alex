@@ -40,17 +40,41 @@ public struct AlexandriaClient: Sendable {
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.httpBody = try JSONEncoder().encode(body)
         }
-        let (data, resp) = try await session.data(for: req)
-        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
-            throw ClientError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        let start = ContinuousClock.now
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            BarLog.error(.net, "\(method) /\(path) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
+            throw error
         }
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        if status >= 400 {
+            BarLog.error(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
+            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+        }
+        BarLog.info(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
         return data
     }
 
-    private func get<T: Decodable>(
+    private static func ms(since start: ContinuousClock.Instant) -> Int {
+        let elapsed = start.duration(to: .now)
+        return Int(elapsed.components.seconds * 1000)
+            + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    private func get<T: Decodable & Sendable>(
         _ path: String, query: [URLQueryItem] = [], as type: T.Type
     ) async throws -> T {
-        try JSONDecoder().decode(T.self, from: try await request(path, query: query))
+        let data = try await request(path, query: query)
+        do {
+            return try await Task.detached { try JSONDecoder().decode(T.self, from: data) }.value
+        } catch {
+            let snippet = String(data: data, encoding: .utf8).map { String($0.prefix(200)) } ?? "<non-utf8>"
+            BarLog.error(.net, "decode \(T.self) failed for /\(path): \(error) body=\(snippet)")
+            throw error
+        }
     }
 
     public func health() async throws -> DaemonHealth {

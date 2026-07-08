@@ -261,15 +261,89 @@ import Testing
         #expect(resp.traces[1].sessionId == nil)
     }
 
+    @Test func logLineFormatting() {
+        let ts = Date(timeIntervalSince1970: 1_700_000_000)
+        let line = BarLog.formatLine(
+            timestamp: ts, level: .warn, category: .net, message: "GET /health 200 12ms")
+        #expect(line == "2023-11-14T22:13:20.000Z WARN [net] GET /health 200 12ms")
+        let multiline = BarLog.formatLine(
+            timestamp: ts, level: .error, category: .browser, message: "a\nb\r\nc")
+        #expect(multiline == "2023-11-14T22:13:20.000Z ERROR [browser] a\\nb\\nc")
+        let info = BarLog.formatLine(timestamp: ts, level: .info, category: .ui, message: "x")
+        #expect(info.hasSuffix("INFO [ui] x"))
+    }
+
+    @Test func logRotationDecision() {
+        #expect(!BarLog.shouldRotate(fileBytes: 0))
+        #expect(!BarLog.shouldRotate(fileBytes: BarLog.maxFileBytes))
+        #expect(BarLog.shouldRotate(fileBytes: BarLog.maxFileBytes + 1))
+        #expect(BarLog.shouldRotate(fileBytes: 10, limit: 9))
+        #expect(!BarLog.shouldRotate(fileBytes: 9, limit: 9))
+    }
+
+    @Test func turnTextCappingChars() {
+        let exact = String(repeating: "a", count: 4000)
+        let atLimit = TurnTextCap.cap(exact)
+        #expect(!atLimit.isTruncated)
+        #expect(atLimit.text == exact)
+        #expect(atLimit.fullCharCount == 4000)
+        let over = TurnTextCap.cap(exact + "b")
+        #expect(over.isTruncated)
+        #expect(over.text.count == 4000)
+        #expect(over.fullCharCount == 4001)
+        let empty = TurnTextCap.cap("")
+        #expect(!empty.isTruncated)
+        #expect(empty.fullCharCount == 0)
+    }
+
+    @Test func turnTextCappingLines() {
+        let sixty = Array(repeating: "line", count: 60).joined(separator: "\n")
+        let atLimit = TurnTextCap.cap(sixty)
+        #expect(!atLimit.isTruncated)
+        #expect(atLimit.text == sixty)
+        let over = TurnTextCap.cap(sixty + "\nline61")
+        #expect(over.isTruncated)
+        #expect(over.text == sixty)
+        let short = TurnTextCap.cap("one\ntwo", maxChars: 100, maxLines: 2)
+        #expect(!short.isTruncated)
+        let both = TurnTextCap.cap(String(repeating: "x\n", count: 5000))
+        #expect(both.isTruncated)
+        #expect(both.text.count <= 4000)
+        #expect(both.text.split(separator: "\n", omittingEmptySubsequences: false).count <= 60)
+    }
+
+    @Test func sessionsFingerprintSkip() {
+        let a = makeSession(id: "s1", models: nil, harness: nil, runId: nil, lastStatus: nil, lastTsMs: 100)
+        let b = makeSession(id: "s2", models: nil, harness: nil, runId: nil, lastStatus: nil, lastTsMs: 200)
+        #expect(TraceFingerprint.sessions([a, b]) == TraceFingerprint.sessions([a, b]))
+        #expect(TraceFingerprint.sessions([a, b]) != TraceFingerprint.sessions([a]))
+        #expect(TraceFingerprint.sessions([]) != TraceFingerprint.sessions([a]))
+        let bNewer = makeSession(
+            id: "s2", models: nil, harness: nil, runId: nil, lastStatus: nil, lastTsMs: 300)
+        #expect(TraceFingerprint.sessions([a, b]) != TraceFingerprint.sessions([a, bNewer]))
+    }
+
+    @Test func turnsFingerprintSkip() throws {
+        let json = #"""
+        {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"status":200,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
+        """#
+        let turns = try decode(json, as: TranscriptResponse.self).turns
+        #expect(TraceFingerprint.turns(turns) == TraceFingerprint.turns(turns))
+        #expect(TraceFingerprint.turns(turns) != TraceFingerprint.turns(Array(turns.prefix(1))))
+        #expect(TraceFingerprint.turns([]) != TraceFingerprint.turns(turns))
+        #expect(TraceFingerprint.turns([]) == TraceFingerprint.turns([]))
+        #expect(TraceFingerprint.turns([turns[0]]) != TraceFingerprint.turns([turns[1]]))
+    }
+
     private func makeSession(
         id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?,
-        tags: [String: String]? = nil
+        tags: [String: String]? = nil, lastTsMs: Int64 = 0
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
             "run_id": runId as Any,
             "first_ts_ms": 0,
-            "last_ts_ms": 0,
+            "last_ts_ms": lastTsMs,
             "trace_count": 1,
             "models": models as Any,
             "harness": harness as Any,

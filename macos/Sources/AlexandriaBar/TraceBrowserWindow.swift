@@ -10,19 +10,29 @@ final class TraceBrowserModel {
 
     private(set) var sessions: [TraceSession] = []
     private(set) var turns: [TranscriptTurn] = []
+    private(set) var visibleSessions: [TraceSession] = []
+    private(set) var parsedQuery = OmniQuery()
     private(set) var daemonDown = false
     private(set) var searchSessionIds: Set<String>?
     private(set) var searchMatchCount = 0
     private(set) var searchScanned = 0
+    private var sessionsFingerprint = ""
+    private var turnsFingerprint = ""
 
     var selectedSessionId: String?
     var pinned = false
-    var showPings = false
+    var expandedTurns: Set<String> = []
+    var showPings = false {
+        didSet { recomputeVisible() }
+    }
     var queryText = "" {
-        didSet { queryChanged() }
+        didSet {
+            parsedQuery = OmniQuery.parse(queryText)
+            queryChanged()
+        }
     }
 
-    var userAtBottom = true {
+    private(set) var userAtBottom = true {
         didSet {
             if userAtBottom {
                 scrolledAwayAt = nil
@@ -33,6 +43,11 @@ final class TraceBrowserModel {
     }
     private var scrolledAwayAt: Date?
 
+    func setUserAtBottom(_ value: Bool) {
+        guard userAtBottom != value else { return }
+        userAtBottom = value
+    }
+
     private var sessionsTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
@@ -41,13 +56,13 @@ final class TraceBrowserModel {
         self.store = store
     }
 
-    var parsedQuery: OmniQuery { OmniQuery.parse(queryText) }
-
-    var visibleSessions: [TraceSession] {
+    private func recomputeVisible() {
         let query = parsedQuery
-        return sessions.filter { session in
-            if !showPings, session.isPingOrTest { return false }
-            return query.isVisible(session, serverMatches: searchSessionIds)
+        BarLog.measure(.browser, label: "filter sessions=\(sessions.count)") {
+            visibleSessions = sessions.filter { session in
+                if !showPings, session.isPingOrTest { return false }
+                return query.isVisible(session, serverMatches: searchSessionIds)
+            }
         }
     }
 
@@ -103,9 +118,14 @@ final class TraceBrowserModel {
         }
         selectedSessionId = session.sessionId
         pinned = true
-        turns = []
-        userAtBottom = true
+        resetTurns()
+        setUserAtBottom(true)
         Task { await pollTranscript() }
+    }
+
+    private func resetTurns() {
+        turns = []
+        turnsFingerprint = ""
     }
 
     func setLive(_ live: Bool) {
@@ -125,8 +145,15 @@ final class TraceBrowserModel {
         }
         do {
             let fetched = try await client.traceSessions(since: "24h", limit: 200)
-            sessions = fetched.sorted { $0.lastTsMs > $1.lastTsMs }
             daemonDown = false
+            let fingerprint = TraceFingerprint.sessions(fetched)
+            if fingerprint != sessionsFingerprint {
+                sessionsFingerprint = fingerprint
+                BarLog.measure(.browser, label: "sessions apply count=\(fetched.count)") {
+                    sessions = fetched.sorted { $0.lastTsMs > $1.lastTsMs }
+                    recomputeVisible()
+                }
+            }
             applyLiveFollow()
         } catch is AlexandriaClient.ClientError {
             daemonDown = false
@@ -141,8 +168,8 @@ final class TraceBrowserModel {
         guard selectedSessionId != nil else {
             if !pinned {
                 selectedSessionId = candidate.sessionId
-                turns = []
-                userAtBottom = true
+                resetTurns()
+                setUserAtBottom(true)
             }
             return
         }
@@ -156,8 +183,8 @@ final class TraceBrowserModel {
         else { return }
         if let currentLast, candidate.lastTsMs <= currentLast { return }
         selectedSessionId = candidate.sessionId
-        turns = []
-        userAtBottom = true
+        resetTurns()
+        setUserAtBottom(true)
         Task { await pollTranscript() }
     }
 
@@ -165,8 +192,15 @@ final class TraceBrowserModel {
         guard let sid = selectedSessionId, let client = client() else { return }
         do {
             let resp = try await client.traceTranscript(sessionId: sid, limit: 500)
-            if resp.sessionId == selectedSessionId { turns = resp.turns }
             daemonDown = false
+            guard resp.sessionId == selectedSessionId else { return }
+            let fingerprint = TraceFingerprint.turns(resp.turns)
+            if fingerprint != turnsFingerprint {
+                turnsFingerprint = fingerprint
+                BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
+                    turns = resp.turns
+                }
+            }
         } catch is AlexandriaClient.ClientError {
             daemonDown = false
         } catch {
@@ -179,8 +213,10 @@ final class TraceBrowserModel {
         let query = parsedQuery
         guard !query.freeText.isEmpty else {
             searchSessionIds = nil
+            recomputeVisible()
             return
         }
+        recomputeVisible()
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
@@ -190,17 +226,30 @@ final class TraceBrowserModel {
 
     private func runSearch(_ query: OmniQuery) async {
         guard let client = client() else { return }
+        let start = ContinuousClock.now
         do {
             let resp = try await client.searchTraces(text: query.freeText, filters: query)
             guard parsedQuery == query else { return }
             searchSessionIds = Set(resp.traces.compactMap(\.sessionId))
             searchMatchCount = resp.traces.count
             searchScanned = resp.scanned ?? 0
+            let elapsed = start.duration(to: .now)
+            BarLog.info(.browser, "search \"\(query.freeText)\" matches=\(resp.traces.count) scanned=\(resp.scanned ?? 0) in \(elapsed.components.seconds * 1000 + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000))ms")
         } catch {
             guard parsedQuery == query else { return }
             searchSessionIds = []
             searchMatchCount = 0
             searchScanned = 0
+            BarLog.warn(.browser, "search \"\(query.freeText)\" failed: \(error.localizedDescription)")
+        }
+        recomputeVisible()
+    }
+
+    func toggleExpanded(_ traceId: String) {
+        if expandedTurns.contains(traceId) {
+            expandedTurns.remove(traceId)
+        } else {
+            expandedTurns.insert(traceId)
         }
     }
 
@@ -285,7 +334,7 @@ final class TraceBrowserModel {
                 }
                 if selectedSessionId == session.sessionId {
                     selectedSessionId = nil
-                    turns = []
+                    resetTurns()
                 }
                 await pollSessions()
             } catch {
@@ -595,7 +644,12 @@ private struct TranscriptView: View {
                 ZStack(alignment: .bottom) {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(model.turns) { TurnView(turn: $0) }
+                            ForEach(model.turns) { turn in
+                                TurnView(
+                                    turn: turn,
+                                    expanded: model.expandedTurns.contains(turn.traceId),
+                                    onToggleExpand: { model.toggleExpanded(turn.traceId) })
+                            }
                             if model.turns.isEmpty {
                                 Text(model.selectedSessionId == nil
                                     ? "Select a session"
@@ -608,14 +662,14 @@ private struct TranscriptView: View {
                             Color.clear
                                 .frame(height: 1)
                                 .id("bottom")
-                                .onAppear { model.userAtBottom = true }
-                                .onDisappear { model.userAtBottom = false }
+                                .onAppear { model.setUserAtBottom(true) }
+                                .onDisappear { model.setUserAtBottom(false) }
                         }
                         .padding(12)
                     }
                     if !model.userAtBottom, !model.turns.isEmpty {
                         Button {
-                            model.userAtBottom = true
+                            model.setUserAtBottom(true)
                             proxy.scrollTo("bottom", anchor: .bottom)
                         } label: {
                             Label("Jump to latest", systemImage: "arrow.down.to.line")
@@ -686,16 +740,21 @@ private struct TranscriptView: View {
 
 private struct TurnView: View {
     let turn: TranscriptTurn
+    let expanded: Bool
+    let onToggleExpand: () -> Void
 
     var body: some View {
+        let user = capped(turn.user)
+        let assistant = capped(turn.assistant)
+        let error = capped(turn.error)
         VStack(alignment: .leading, spacing: 6) {
             headerLine
-            if let user = turn.user, !user.isEmpty {
+            if let user, !user.text.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5)
                         .fill(Color.accentColor.opacity(0.7))
                         .frame(width: 3)
-                    Text(user)
+                    Text(user.text)
                         .font(.system(size: 12, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -706,22 +765,41 @@ private struct TurnView: View {
                         .fill(Color.accentColor.opacity(0.07)))
                 .fixedSize(horizontal: false, vertical: true)
             }
-            if let assistant = turn.assistant, !assistant.isEmpty {
-                Text(assistant)
+            if let assistant, !assistant.text.isEmpty {
+                Text(assistant.text)
                     .font(.system(size: 12))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let error = turn.error, !error.isEmpty {
-                Text(error)
+            if let error, !error.text.isEmpty {
+                Text(error.text)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let title = expanderTitle(user: user, assistant: assistant, error: error) {
+                Button(title, action: onToggleExpand)
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+            }
         }
+    }
+
+    private func capped(_ text: String?) -> CappedText? {
+        guard let text else { return nil }
+        if expanded { return CappedText(text: text, isTruncated: false, fullCharCount: text.count) }
+        return TurnTextCap.cap(text)
+    }
+
+    private func expanderTitle(user: CappedText?, assistant: CappedText?, error: CappedText?) -> String? {
+        if expanded { return "Show less" }
+        let parts = [user, assistant, error].compactMap { $0 }
+        guard parts.contains(where: \.isTruncated) else { return nil }
+        let total = parts.reduce(0) { $0 + $1.fullCharCount }
+        return "Show full (\(total) chars)"
     }
 
     private var headerLine: some View {
@@ -754,10 +832,15 @@ enum TraceFormat {
         return "\(Format.duration(delta)) ago"
     }
 
-    static func time(_ tsMs: Int64) -> String {
+    @MainActor private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: Date(timeIntervalSince1970: Double(tsMs) / 1000))
+        return formatter
+    }()
+
+    @MainActor
+    static func time(_ tsMs: Int64) -> String {
+        timeFormatter.string(from: Date(timeIntervalSince1970: Double(tsMs) / 1000))
     }
 
     static func tokens(_ count: Int64?) -> String {
@@ -799,6 +882,7 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
             win.setFrameAutosaveName("AlexandriaTraceBrowser")
             window = win
         }
+        BarLog.info(.ui, "trace browser opened")
         model?.start()
         if let window {
             DockIconManager.shared.track(window)
@@ -808,6 +892,7 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        BarLog.info(.ui, "trace browser closed")
         model?.stop()
     }
 }
