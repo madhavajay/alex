@@ -1163,8 +1163,10 @@ public enum TranscriptWindow {
         var index = turns.count
         while index > 0, count < maxTurns {
             let turn = turns[index - 1]
-            chars += (turn.user?.count ?? 0) + (turn.assistant?.count ?? 0)
-                + (turn.error?.count ?? 0) + 64
+            let userChars: Int = turn.user?.count ?? 0
+            let assistantChars: Int = turn.assistant?.count ?? 0
+            let errorChars: Int = turn.error?.count ?? 0
+            chars += userChars + assistantChars + errorChars + 64
             if count > 0, chars > maxChars { break }
             index -= 1
             count += 1
