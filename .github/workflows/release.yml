@@ -3,6 +3,11 @@ name: Release to crates.io
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'macos/**'
+      - '.github/workflows/build-signed-macos.yml'
 
 concurrency:
   group: release

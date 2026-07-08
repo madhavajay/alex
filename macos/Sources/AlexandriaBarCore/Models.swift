@@ -261,7 +261,7 @@ public enum ProviderInfo {
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai": provider
+        case "anthropic", "openai", "gemini": provider
         case "xai": "grok"
         default: nil
         }
