@@ -109,8 +109,39 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Mint, list, and revoke ephemeral run keys (requires a running daemon)
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
     /// Live dashboard: traces, limits, accounts, dario generations
     Tui,
+}
+
+#[derive(Subcommand)]
+enum KeysCommand {
+    /// Mint a run key bound to run metadata; the key is printed exactly once
+    Mint {
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Tag as k=v; repeatable
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+        /// Lifetime: seconds or relative (45s, 30m, 24h, 7d); capped at 7d
+        #[arg(long, default_value = "24h")]
+        ttl: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List run keys (active only by default)
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a run key by id (or unique id prefix)
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -929,6 +960,22 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Keys { command } => match command {
+            KeysCommand::Mint {
+                run_id,
+                tag,
+                ttl,
+                label,
+            } => {
+                keys_mint_cmd(&config, run_id, &tag, &ttl, label).await?;
+            }
+            KeysCommand::List { all, json } => {
+                keys_list_cmd(&config, all, json).await?;
+            }
+            KeysCommand::Revoke { id } => {
+                keys_revoke_cmd(&config, &id).await?;
+            }
+        },
         Command::Tui => {
             tui::run(&config.base_url(), &config.local_key).await?;
         }
@@ -1105,6 +1152,183 @@ fn traces_path_cmd(config: &Config, run_id: &str) -> Result<()> {
             println!("{p}");
         }
     }
+    Ok(())
+}
+
+fn parse_ttl_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return (n > 0).then_some(n);
+    }
+    let unit = s.chars().last()?;
+    let n: i64 = s[..s.len() - unit.len_utf8()].parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    match unit {
+        's' => Some(n),
+        'm' => Some(n * 60),
+        'h' => Some(n * 3_600),
+        'd' => Some(n * 86_400),
+        _ => None,
+    }
+}
+
+async fn daemon_send(
+    config: &Config,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+    let base = config.base_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut req = client.request(method, format!("{base}{path}"));
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.with_context(|| {
+        format!("could not reach the alexandria daemon at {base} — is it running?")
+    })?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+async fn keys_mint_cmd(
+    config: &Config,
+    run_id: Option<String>,
+    tags: &[String],
+    ttl: &str,
+    label: Option<String>,
+) -> Result<()> {
+    let ttl_seconds = parse_ttl_seconds(ttl)
+        .with_context(|| format!("invalid --ttl '{ttl}' (use seconds or 45s, 30m, 24h, 7d)"))?;
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let tag_values = alex_core::parse_trace_tags(&tag_refs);
+    let mut body = serde_json::json!({"ttl_seconds": ttl_seconds});
+    if let Some(r) = &run_id {
+        body["run_id"] = serde_json::json!(r);
+    }
+    if tag_values.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        body["tags"] = tag_values;
+    }
+    if let Some(l) = &label {
+        body["label"] = serde_json::json!(l);
+    }
+    let (status, resp) =
+        daemon_send(config, reqwest::Method::POST, "/admin/run-keys", Some(body)).await?;
+    if !status.is_success() {
+        anyhow::bail!("daemon returned {status}: {}", ui::truncate(&resp.to_string(), 300));
+    }
+    let key = resp["key"].as_str().unwrap_or("-").to_string();
+    println!("{}", ui::section("run key minted"));
+    println!(
+        "{} {}   {} {}   {} {}",
+        ui::column_header("id"),
+        ui::amber(resp["id"].as_str().unwrap_or("-")),
+        ui::column_header("run"),
+        resp["run_id"].as_str().unwrap_or("-"),
+        ui::column_header("expires"),
+        resp["expires_ms"]
+            .as_i64()
+            .map(|e| format!("in {}", ui::human_ms(e - now_ms())))
+            .unwrap_or_else(|| "-".into())
+    );
+    println!();
+    println!("{}", ui::bold(&ui::gold(&key)));
+    println!();
+    println!(
+        "{}",
+        ui::dim("shown once — inject into the harness env (any of):")
+    );
+    println!("export ANTHROPIC_API_KEY={key}");
+    println!("export OPENAI_API_KEY={key}");
+    println!("export XAI_API_KEY={key}");
+    Ok(())
+}
+
+async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
+    let params: Vec<(&str, String)> = if all { vec![("all", "1".into())] } else { vec![] };
+    let resp = daemon_get(config, "/admin/run-keys", &params).await?;
+    let body: serde_json::Value = resp.json().await?;
+    let rows = body["run_keys"].as_array().cloned().unwrap_or_default();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "no run keys{} — mint one with `alexandria keys mint`",
+            if all { "" } else { " (try --all)" }
+        );
+        return Ok(());
+    }
+    println!("{}", ui::section("run keys"));
+    println!(
+        "{} {} {} {} {} {}",
+        ui::pad_right(&ui::column_header("id"), 12),
+        ui::pad_right(&ui::column_header("run"), 18),
+        ui::pad_right(&ui::column_header("tags"), 26),
+        ui::pad_left(&ui::column_header("uses"), 5),
+        ui::pad_right(&ui::column_header("expires"), 10),
+        ui::column_header("label")
+    );
+    for r in &rows {
+        let tags = r["tags"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into());
+        let expires = if r["revoked"].as_bool().unwrap_or(false) {
+            ui::red("revoked")
+        } else {
+            match r["expires_ms"].as_i64() {
+                Some(e) if e <= now_ms() => ui::dim("expired"),
+                Some(e) => format!("in {}", ui::human_ms(e - now_ms())),
+                None => "never".into(),
+            }
+        };
+        println!(
+            "{} {} {} {} {} {}",
+            ui::pad_right(&ui::amber(r["id"].as_str().unwrap_or("-")), 12),
+            ui::pad_right(
+                &ui::turquoise(&ui::truncate(r["run_id"].as_str().unwrap_or("-"), 18)),
+                18
+            ),
+            ui::pad_right(&ui::sand(&ui::truncate(&tags, 26)), 26),
+            ui::pad_left(
+                &r["use_count"].as_i64().unwrap_or(0).to_string(),
+                5
+            ),
+            ui::pad_right(&expires, 10),
+            ui::dim(r["label"].as_str().unwrap_or(""))
+        );
+    }
+    Ok(())
+}
+
+async fn keys_revoke_cmd(config: &Config, id: &str) -> Result<()> {
+    let (status, resp) = daemon_send(
+        config,
+        reqwest::Method::DELETE,
+        &format!("/admin/run-keys/{id}"),
+        None,
+    )
+    .await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("unknown run key '{id}'");
+    }
+    if !status.is_success() {
+        anyhow::bail!("daemon returned {status}: {}", ui::truncate(&resp.to_string(), 300));
+    }
+    println!("{} revoked {}", ui::gold(ui::ankh()), ui::amber(id));
     Ok(())
 }
 

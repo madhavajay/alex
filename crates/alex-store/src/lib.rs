@@ -65,7 +65,44 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   message    TEXT
 );
 CREATE INDEX IF NOT EXISTS heartbeats_ts ON heartbeats(ts_ms);
+
+CREATE TABLE IF NOT EXISTS run_keys (
+  id TEXT PRIMARY KEY,
+  key_hash TEXT UNIQUE NOT NULL,
+  run_id TEXT,
+  tags_json TEXT,
+  label TEXT,
+  created_ms INTEGER NOT NULL,
+  expires_ms INTEGER,
+  revoked INTEGER DEFAULT 0,
+  use_count INTEGER DEFAULT 0,
+  last_used_ms INTEGER
+);
 "#;
+
+const RUN_KEY_COLS: &str =
+    "id, key_hash, run_id, tags_json, label, created_ms, expires_ms, revoked, use_count, last_used_ms";
+
+fn run_key_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let key_hash = r.get::<_, String>(1)?;
+    let tags = r
+        .get::<_, Option<String>>(3)?
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    Ok(json!({
+        "id": r.get::<_, String>(0)?,
+        "key_fingerprint": key_hash.chars().take(16).collect::<String>(),
+        "run_id": r.get::<_, Option<String>>(2)?,
+        "tags": tags,
+        "label": r.get::<_, Option<String>>(4)?,
+        "created_ms": r.get::<_, i64>(5)?,
+        "expires_ms": r.get::<_, Option<i64>>(6)?,
+        "revoked": r.get::<_, i64>(7)? != 0,
+        "use_count": r.get::<_, i64>(8)?,
+        "last_used_ms": r.get::<_, Option<i64>>(9)?,
+    }))
+}
 
 const TRACE_COLS: &str = "id, ts_request_ms, ts_response_ms, harness, client_format, upstream_provider,
      requested_model, routed_model, status, streamed,
@@ -672,6 +709,74 @@ impl Store {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_run_key(
+        &self,
+        id: &str,
+        key_hash: &str,
+        run_id: Option<&str>,
+        tags_json: Option<&str>,
+        label: Option<&str>,
+        created_ms: i64,
+        expires_ms: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO run_keys (id, key_hash, run_id, tags_json, label, created_ms, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, key_hash, run_id, tags_json, label, created_ms, expires_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_run_key(&self, key_hash: &str, now_ms: i64) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {RUN_KEY_COLS} FROM run_keys
+                     WHERE key_hash = ?1 AND revoked = 0
+                       AND (expires_ms IS NULL OR expires_ms > ?2)"
+                ),
+                params![key_hash, now_ms],
+                run_key_row_json,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn touch_run_key(&self, key_hash: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE run_keys SET use_count = use_count + 1, last_used_ms = ?2 WHERE key_hash = ?1",
+            params![key_hash, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_run_keys(&self, include_inactive: bool) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = format!("SELECT {RUN_KEY_COLS} FROM run_keys");
+        let mut args: Vec<String> = vec![];
+        if !include_inactive {
+            sql.push_str(" WHERE revoked = 0 AND (expires_ms IS NULL OR expires_ms > ?1)");
+            args.push(Utc::now().timestamp_millis().to_string());
+        }
+        sql.push_str(" ORDER BY created_ms DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), run_key_row_json)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn revoke_run_key(&self, id_or_prefix: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE run_keys SET revoked = 1 WHERE id = ?1 OR id LIKE ?1 || '%'",
+            params![id_or_prefix],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn write_body(&self, trace_id: &str, kind: &str, bytes: &[u8]) -> Result<String> {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let dir = self.data_dir.join("bodies").join(&date);
@@ -952,6 +1057,83 @@ mod tests {
         store.insert_trace(&trace("b", 2000, Some("run-1"))).unwrap();
         let s = store.run_summary("run-1").unwrap();
         assert_eq!(s["trace_count"], 2);
+    }
+
+    #[test]
+    fn run_keys_lifecycle() {
+        let store = Store::open(tmpdir("run-keys")).unwrap();
+        store
+            .insert_run_key(
+                "rk-aaaa1111",
+                "aaaa1111bbbb2222cccc",
+                Some("run-1"),
+                Some(r#"{"task":"demo"}"#),
+                Some("demo job"),
+                1000,
+                Some(10_000),
+            )
+            .unwrap();
+        store
+            .insert_run_key("rk-dddd4444", "dddd4444eeee5555ffff", None, None, None, 2000, None)
+            .unwrap();
+        let k = store
+            .lookup_run_key("aaaa1111bbbb2222cccc", 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(k["id"], "rk-aaaa1111");
+        assert_eq!(k["run_id"], "run-1");
+        assert_eq!(k["tags"]["task"], "demo");
+        assert_eq!(k["label"], "demo job");
+        assert_eq!(k["key_fingerprint"], "aaaa1111bbbb2222");
+        assert_eq!(k["revoked"], false);
+        assert!(store
+            .lookup_run_key("aaaa1111bbbb2222cccc", 10_000)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .lookup_run_key("dddd4444eeee5555ffff", 10_000)
+            .unwrap()
+            .is_some());
+        assert!(store.lookup_run_key("unknown-hash", 5000).unwrap().is_none());
+        store.touch_run_key("aaaa1111bbbb2222cccc", 3000).unwrap();
+        store.touch_run_key("aaaa1111bbbb2222cccc", 4000).unwrap();
+        let all = store.list_run_keys(true).unwrap();
+        assert_eq!(all.len(), 2);
+        let touched = all.iter().find(|r| r["id"] == "rk-aaaa1111").unwrap();
+        assert_eq!(touched["use_count"], 2);
+        assert_eq!(touched["last_used_ms"], 4000);
+        assert_eq!(touched["tags"], json!({"task": "demo"}));
+        assert!(store.revoke_run_key("rk-aaaa").unwrap());
+        assert!(!store.revoke_run_key("rk-zzzz").unwrap());
+        assert!(store
+            .lookup_run_key("aaaa1111bbbb2222cccc", 5000)
+            .unwrap()
+            .is_none());
+        let active = store.list_run_keys(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["id"], "rk-dddd4444");
+        assert!(store
+            .insert_run_key("rk-ffff6666", "aaaa1111bbbb2222cccc", None, None, None, 1, None)
+            .is_err());
+    }
+
+    #[test]
+    fn run_keys_table_added_to_existing_db() {
+        let dir = tmpdir("run-keys-migrate");
+        let db_path = dir.join("alexandria.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE traces (id TEXT PRIMARY KEY, ts_request_ms INTEGER NOT NULL,
+                   session_id TEXT, routed_model TEXT);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir).unwrap();
+        store
+            .insert_run_key("rk-11112222", "hash-x", None, None, None, 1000, None)
+            .unwrap();
+        assert_eq!(store.list_run_keys(true).unwrap().len(), 1);
     }
 
     #[test]

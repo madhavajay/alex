@@ -59,6 +59,14 @@ pub struct AppState {
     pub base_url: String,
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub logins: alex_auth::sessions::LoginManager,
+    pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedRunKey {
+    pub run_id: Option<String>,
+    pub tags_json: Option<String>,
+    pub expires_ms: Option<i64>,
 }
 
 struct InFlight(Arc<AppState>);
@@ -102,6 +110,7 @@ pub fn build_state(
         base_url,
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         logins: alex_auth::sessions::LoginManager::default(),
+        run_keys: std::sync::RwLock::new(HashMap::new()),
     })
 }
 
@@ -128,6 +137,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
         .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
         .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
+        .route(
+            "/admin/run-keys",
+            get(admin_run_keys_list).post(admin_run_keys_create),
+        )
+        .route(
+            "/admin/run-keys/{id}",
+            axum::routing::delete(admin_run_keys_revoke),
+        )
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/health", get(admin_health))
@@ -1433,6 +1450,49 @@ mod trace_api_tests {
 }
 
 #[cfg(test)]
+mod run_key_tests {
+    use super::{generate_run_key, key_fingerprint, key_hash_hex, merge_run_key_tags};
+
+    #[test]
+    fn merge_header_tags_win_per_key() {
+        let merged = merge_run_key_tags(
+            Some(r#"{"task":"demo","suite":"swebench"}"#),
+            Some(r#"{"task":"override","case":"x1"}"#),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["task"], "override");
+        assert_eq!(v["suite"], "swebench");
+        assert_eq!(v["case"], "x1");
+    }
+
+    #[test]
+    fn merge_handles_missing_sides() {
+        assert_eq!(merge_run_key_tags(None, None), None);
+        assert_eq!(
+            merge_run_key_tags(Some(r#"{"a":"1"}"#), None).unwrap(),
+            r#"{"a":"1"}"#
+        );
+        assert_eq!(
+            merge_run_key_tags(None, Some(r#"{"b":"2"}"#)).unwrap(),
+            r#"{"b":"2"}"#
+        );
+        assert_eq!(merge_run_key_tags(Some("not json"), None), None);
+    }
+
+    #[test]
+    fn run_key_shape_and_fingerprint() {
+        let key = generate_run_key();
+        assert!(key.starts_with("alxk-"));
+        assert_eq!(key.len(), 5 + 64);
+        assert_ne!(key, generate_run_key());
+        let hash = key_hash_hex(&key);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash[..16], key_fingerprint(&key));
+    }
+}
+
+#[cfg(test)]
 mod usage_tests {
     use super::{key_fingerprint, usage_backoff_ms};
 
@@ -1604,6 +1664,143 @@ fn key_fingerprint(key: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+const RUN_KEY_PREFIX: &str = "alxk-";
+const RUN_KEY_DEFAULT_TTL_S: i64 = 86_400;
+const RUN_KEY_MAX_TTL_S: i64 = 604_800;
+
+pub fn generate_run_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!(
+        "{RUN_KEY_PREFIX}{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+fn key_hash_hex(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn merge_run_key_tags(key_tags: Option<&str>, header_tags: Option<&str>) -> Option<String> {
+    let parse = |s: Option<&str>| {
+        s.and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+    };
+    let mut merged = parse(key_tags);
+    merged.extend(parse(header_tags));
+    if merged.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&Value::Object(merged)).ok()
+    }
+}
+
+fn run_key_entry(state: &AppState, key_hash: &str) -> Option<CachedRunKey> {
+    let now = now_ms();
+    let cached = state.run_keys.read().unwrap().get(key_hash).cloned();
+    if let Some(entry) = cached {
+        if entry.expires_ms.map(|e| e > now).unwrap_or(true) {
+            return Some(entry);
+        }
+        state.run_keys.write().unwrap().remove(key_hash);
+        return None;
+    }
+    let row = state.store.lookup_run_key(key_hash, now).ok().flatten()?;
+    let entry = CachedRunKey {
+        run_id: row["run_id"].as_str().map(String::from),
+        tags_json: row["tags"]
+            .as_object()
+            .filter(|o| !o.is_empty())
+            .and_then(|o| serde_json::to_string(o).ok()),
+        expires_ms: row["expires_ms"].as_i64(),
+    };
+    state
+        .run_keys
+        .write()
+        .unwrap()
+        .insert(key_hash.to_string(), entry.clone());
+    Some(entry)
+}
+
+async fn admin_run_keys_create(
+    State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let tags = match &body["tags"] {
+        Value::Null => None,
+        Value::Object(o) => Some(o.clone()),
+        _ => return error_response(StatusCode::BAD_REQUEST, "'tags' must be an object"),
+    };
+    let ttl_seconds = body["ttl_seconds"].as_i64().unwrap_or(RUN_KEY_DEFAULT_TTL_S);
+    if ttl_seconds <= 0 {
+        return error_response(StatusCode::BAD_REQUEST, "'ttl_seconds' must be positive");
+    }
+    let ttl_seconds = ttl_seconds.min(RUN_KEY_MAX_TTL_S);
+    let run_id = body["run_id"].as_str().map(String::from);
+    let label = body["label"].as_str().map(String::from);
+    let key = generate_run_key();
+    let key_hash = key_hash_hex(&key);
+    let id = format!("rk-{}", &key_hash[..8]);
+    let created_ms = now_ms();
+    let expires_ms = created_ms + ttl_seconds * 1000;
+    let tags_json = tags
+        .as_ref()
+        .filter(|o| !o.is_empty())
+        .and_then(|o| serde_json::to_string(o).ok());
+    match state.store.insert_run_key(
+        &id,
+        &key_hash,
+        run_id.as_deref(),
+        tags_json.as_deref(),
+        label.as_deref(),
+        created_ms,
+        Some(expires_ms),
+    ) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            axum::Json(json!({
+                "id": id,
+                "key": key,
+                "run_id": run_id,
+                "tags": tags.map(Value::Object).unwrap_or_else(|| json!({})),
+                "expires_ms": expires_ms,
+            })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_run_keys_list(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let all = q.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
+    match state.store.list_run_keys(all) {
+        Ok(rows) => axum::Json(json!({"run_keys": rows})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_run_keys_revoke(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.revoke_run_key(&id) {
+        Ok(true) => {
+            state.run_keys.write().unwrap().clear();
+            axum::Json(json!({"revoked": true})).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown run key '{id}'")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 fn session_from_metadata(body_json: &Value) -> Option<String> {
     let raw = body_json["metadata"]["user_id"].as_str()?;
     if let Ok(v) = serde_json::from_str::<Value>(raw) {
@@ -1655,9 +1852,34 @@ async fn proxy(
     body: Bytes,
     peer: Option<std::net::SocketAddr>,
 ) -> Response {
+    let mut run_key: Option<CachedRunKey> = None;
     let client_fingerprint = match client_key(&headers) {
         Some(k) if k == state.local_key => key_fingerprint(&k),
-        _ => {
+        Some(k) => {
+            let key_hash = key_hash_hex(&k);
+            match run_key_entry(&state, &key_hash) {
+                Some(entry) => {
+                    if let Err(e) = state.store.touch_run_key(&key_hash, now_ms()) {
+                        tracing::warn!("failed to touch run key: {e}");
+                    }
+                    run_key = Some(entry);
+                    key_hash.chars().take(16).collect()
+                }
+                None if k.starts_with(RUN_KEY_PREFIX) => {
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "run key expired or revoked",
+                    )
+                }
+                None => {
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "bad or missing local key (x-api-key / Authorization: Bearer)",
+                    )
+                }
+            }
+        }
+        None => {
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 "bad or missing local key (x-api-key / Authorization: Bearer)",
@@ -1681,8 +1903,12 @@ async fn proxy(
         run_id: headers
             .get("x-alexandria-run-id")
             .and_then(|v| v.to_str().ok())
-            .map(String::from),
-        tags: trace_tags_json(&headers),
+            .map(String::from)
+            .or_else(|| run_key.as_ref().and_then(|k| k.run_id.clone())),
+        tags: merge_run_key_tags(
+            run_key.as_ref().and_then(|k| k.tags_json.as_deref()),
+            trace_tags_json(&headers).as_deref(),
+        ),
         client_ip: peer.map(|p| p.ip().to_string()),
         key_fingerprint: Some(client_fingerprint),
         ..Default::default()

@@ -97,6 +97,7 @@ dependencies = [
  "base64",
  "flate2",
  "futures-util",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

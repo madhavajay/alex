@@ -188,3 +188,50 @@ CLI equivalents: `alexandria ping|traces|limits|dario|auth|harness|env`.
 6. Delete: per-job proxy spawn, Dario management, port scanning, in-repo converters.
 7. Regression gate: `./test.sh all` in the alexandria repo (wire matrix W1–W12,
    harness matrix H1–H6 incl. claude×gpt-5.5 and codex×opus-4.8, dario chaos tier).
+
+## Run keys (harness-agnostic attribution)
+
+Ephemeral API keys pre-bound to run metadata. The API key is the one header every
+harness reliably carries, so a harness that knows nothing about Alexandria (no custom
+headers, no session ids) still produces perfectly attributed traces: mint a key bound
+to a run, inject it as the harness's provider API key, and every request it makes is
+tagged with that run_id + tags automatically.
+
+Mint (the `key` is returned exactly once; only its sha256 is stored):
+
+```
+POST {base}/admin/run-keys
+{"run_id": "cove-job-42", "tags": {"suite": "swebench", "case": "astropy-1"},
+ "ttl_seconds": 86400, "label": "nightly swebench"}
+-> 201 {"id": "rk-1a2b3c4d", "key": "alxk-…64hex…", "run_id": "cove-job-42",
+        "tags": {...}, "expires_ms": ...}
+```
+
+Inject into the job container instead of the local key — all three env slots accept it:
+
+```
+ANTHROPIC_API_KEY=alxk-…   OPENAI_API_KEY=alxk-…   XAI_API_KEY=alxk-…
+```
+
+Semantics:
+
+- Traces authenticated with the key default to its `run_id` and `tags`; an explicit
+  `X-Alexandria-Run-Id` header still wins, and header tags override key tags per-key
+  (key tags not named by a header survive the merge).
+- `ttl_seconds` defaults to 86400 (24h), capped at 604800 (7d). Expired or revoked
+  keys get `401 {"message": "run key expired or revoked"}` — distinct from the
+  generic bad-key 401, so cove can classify it.
+- Revoke to kill a runaway job mid-run: `DELETE {base}/admin/run-keys/{id}` -> `{"revoked": true}`.
+- `GET {base}/admin/run-keys?all=1` lists keys (id, run_id, tags, label, use_count,
+  expires_ms, revoked, key_fingerprint — never the key itself). `key_fingerprint`
+  matches the `key_fingerprint` column on traces, so keys correlate to traffic.
+
+CLI equivalents:
+
+```
+alexandria keys mint --run-id cove-job-42 --tag suite=swebench --tag case=astropy-1 --ttl 24h
+alexandria keys list [--all] [--json]
+alexandria keys revoke rk-1a2b3c4d
+```
+
+Then correlate as usual: `GET {base}/traces/runs/cove-job-42`.
