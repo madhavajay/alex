@@ -770,7 +770,25 @@ fn trace_extras(req: &Value) -> Value {
             let joined: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
             (!joined.is_empty()).then(|| joined.join("\n\n"))
         }
-        _ => req["instructions"].as_str().map(String::from),
+        _ => req["instructions"].as_str().map(String::from).or_else(|| {
+            let joined: Vec<String> = req["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| matches!(m["role"].as_str(), Some("system") | Some("developer")))
+                .map(|m| match &m["content"] {
+                    Value::String(s) => s.clone(),
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!joined.is_empty()).then(|| joined.join("\n\n"))
+        }),
     };
     let system_chars = system_text.as_ref().map(|s| s.chars().count());
     let system_prompt = system_text.map(|s| truncate_chars(s, 64_000));
