@@ -34,8 +34,49 @@ import Testing
             == "⬆ claude-code · user")
         #expect(TurnHeader.requestLabel(harness: "codex", isToolResult: true)
             == "⬆ codex · tool result")
-        #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "⬇ gpt-5.5 · assistant")
-        #expect(TurnHeader.responseLabel(model: nil) == "⬇ assistant")
+        #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "⬇ gpt-5.5 · model")
+        #expect(TurnHeader.responseLabel(model: nil) == "⬇ model")
+    }
+
+    @Test func toolCallDecoding() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":null,"assistant":"ok","tool_calls":[{"name":"bash","arguments":"{\"command\":\"ls -l\"}"},{"name":"read_file","arguments":null}]},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"hi","assistant":"yo"}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        #expect(turns[0].toolCalls?.count == 2)
+        #expect(turns[0].toolCalls?[0] == ToolCall(name: "bash", arguments: #"{"command":"ls -l"}"#))
+        #expect(turns[0].toolCalls?[1] == ToolCall(name: "read_file", arguments: nil))
+        #expect(turns[1].toolCalls == nil)
+    }
+
+    @Test func toolCallArgumentSummary() {
+        #expect(ToolCall.summary(#"{"command":"ls -l /app"}"#) == "ls -l /app")
+        #expect(ToolCall.summary(
+            #"{"command":"sed -n '1,10p' f","intent":"read","timeout":10000}"#)
+            == "sed -n '1,10p' f")
+        let multi = ToolCall.summary(#"{"path":"/a","limit":5}"#)
+        #expect(multi.contains("\n"))
+        #expect(multi.contains("\"path\""))
+        #expect(multi.contains("\"limit\""))
+        #expect(ToolCall.summary("not json {") == "not json {")
+        #expect(ToolCall.summary("") == "")
+        #expect(ToolCall.summary("  \n ") == "")
+        #expect(ToolCall.summary(#"{"command":123}"#).contains("\"command\""))
+        #expect(ToolCall(name: "bash", arguments: nil).argumentSummary == "")
+    }
+
+    @Test func documentRendersToolCalls() {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":null,"assistant":null,"tool_calls":[{"name":"bash","arguments":"{\"command\":\"ls -l /app\",\"intent\":\"look\"}"},{"name":"str_replace","arguments":"{\"path\":\"/a\",\"old\":\"x\"}"}]}]}
+        """#
+        let turns = try! JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let text = TranscriptRender.document(turns: turns).string
+        #expect(text.contains("⚙ bash"))
+        #expect(text.contains("ls -l /app"))
+        #expect(!text.contains("intent"))
+        #expect(text.contains("⚙ str_replace"))
+        #expect(text.contains("\"path\""))
+        #expect(text.contains("⬇ gpt-5.5 · model"))
     }
 
     @Test func toolResultBodyStripping() {
@@ -173,7 +214,7 @@ import Testing
         #expect(text.contains("turn 43"))
         #expect(text.contains("Details"))
         #expect(text.contains("⬆ pi · user"))
-        #expect(text.contains("⬇ m · assistant"))
+        #expect(text.contains("⬇ m · model"))
         #expect(text.contains("⬆ pi · tool result"))
         #expect(text.contains("❯ grep output"))
         #expect(!text.contains("[tool result]"))

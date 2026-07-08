@@ -62,6 +62,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable {
     public let error: String?
     public let user: String?
     public let assistant: String?
+    public let toolCalls: [ToolCall]?
 
     public var id: String { traceId }
 
@@ -73,6 +74,35 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable {
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
         case costUsd = "cost_usd"
+        case toolCalls = "tool_calls"
+    }
+}
+
+public struct ToolCall: Codable, Sendable, Equatable {
+    public let name: String
+    public let arguments: String?
+
+    public init(name: String, arguments: String?) {
+        self.name = name
+        self.arguments = arguments
+    }
+
+    public var argumentSummary: String { Self.summary(arguments ?? "") }
+
+    public static func summary(_ arguments: String) -> String {
+        let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        guard let data = trimmed.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return trimmed }
+        if let command = obj["command"] as? String { return command }
+        if let pretty = try? JSONSerialization.data(
+            withJSONObject: obj,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+            let text = String(data: pretty, encoding: .utf8) {
+            return text
+        }
+        return trimmed
     }
 }
 
@@ -290,7 +320,7 @@ public enum TurnHeader {
     }
 
     public static func responseLabel(model: String?) -> String {
-        model.map { "⬇ \($0) · assistant" } ?? "⬇ assistant"
+        model.map { "⬇ \($0) · model" } ?? "⬇ model"
     }
 
     public static func toolResultBody(_ text: String) -> String? {
@@ -298,6 +328,18 @@ public enum TurnHeader {
         return String(text.dropFirst(toolResultPrefix.count))
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
+}
+
+public struct TranscriptIcons: @unchecked Sendable {
+    public let harness: NSImage?
+    public let providers: [String: NSImage]
+
+    public init(harness: NSImage? = nil, providers: [String: NSImage] = [:]) {
+        self.harness = harness
+        self.providers = providers
+    }
+
+    public static let none = TranscriptIcons()
 }
 
 public enum BodyPretty {
@@ -975,29 +1017,32 @@ public enum TranscriptRender {
     static func signature(_ turn: TranscriptTurn) -> String {
         "\(turn.tsResponseMs ?? -1)|\(turn.status ?? -1)|\(turn.user?.count ?? -1)"
             + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
+            + "|\(turn.toolCalls?.count ?? -1)"
     }
 
     public static func document(
-        turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness"
+        turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
+        icons: TranscriptIcons = .none
     ) -> NSAttributedString {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
         let separatorFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
         let bodyFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let toolFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
 
         let separatorPara = NSMutableParagraphStyle()
         separatorPara.paragraphSpacing = 4
-        let userPara = NSMutableParagraphStyle()
-        userPara.firstLineHeadIndent = 48
-        userPara.headIndent = 48
-        userPara.tailIndent = -8
-        userPara.paragraphSpacing = 2
-        let assistantPara = NSMutableParagraphStyle()
-        assistantPara.firstLineHeadIndent = 8
-        assistantPara.headIndent = 8
-        assistantPara.tailIndent = -48
-        assistantPara.paragraphSpacing = 2
+        let requestPara = NSMutableParagraphStyle()
+        requestPara.firstLineHeadIndent = 8
+        requestPara.headIndent = 8
+        requestPara.tailIndent = -48
+        requestPara.paragraphSpacing = 2
+        let responsePara = NSMutableParagraphStyle()
+        responsePara.firstLineHeadIndent = 48
+        responsePara.headIndent = 48
+        responsePara.tailIndent = -8
+        responsePara.paragraphSpacing = 2
 
         let separator: [NSAttributedString.Key: Any] = [
             .font: separatorFont, .foregroundColor: NSColor.tertiaryLabelColor,
@@ -1010,25 +1055,34 @@ public enum TranscriptRender {
         ]
         let userLabel: [NSAttributedString.Key: Any] = [
             .font: labelFont, .foregroundColor: NSColor.controlAccentColor,
-            .paragraphStyle: userPara,
+            .paragraphStyle: requestPara,
         ]
-        let assistantLabel: [NSAttributedString.Key: Any] = [
+        let modelLabel: [NSAttributedString.Key: Any] = [
             .font: labelFont, .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: assistantPara,
+            .paragraphStyle: responsePara,
+        ]
+        let toolLabel: [NSAttributedString.Key: Any] = [
+            .font: labelFont, .foregroundColor: NSColor.systemPurple,
+            .paragraphStyle: responsePara,
         ]
         let user: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: userPara,
+            .paragraphStyle: requestPara,
             .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
         ]
         let assistant: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: assistantPara,
+            .paragraphStyle: responsePara,
             .backgroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.06),
+        ]
+        let tool: [NSAttributedString.Key: Any] = [
+            .font: toolFont, .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: responsePara,
+            .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.06),
         ]
         let error: [NSAttributedString.Key: Any] = [
             .font: bodyFont, .foregroundColor: NSColor.systemRed,
-            .paragraphStyle: assistantPara,
+            .paragraphStyle: responsePara,
         ]
         let out = NSMutableAttributedString()
         for (index, turn) in turns.enumerated() {
@@ -1053,15 +1107,34 @@ public enum TranscriptRender {
                 let toolBody = TurnHeader.toolResultBody(text)
                 let label = TurnHeader.requestLabel(
                     harness: harnessName, isToolResult: toolBody != nil)
+                if let icon = icons.harness {
+                    out.append(iconString(icon, attributes: userLabel))
+                    out.append(NSAttributedString(string: " ", attributes: userLabel))
+                }
                 out.append(NSAttributedString(string: "\(label)\n", attributes: userLabel))
                 out.append(NSAttributedString(
                     string: "❯ \(cap(toolBody ?? text))\n", attributes: user))
             }
-            if let text = turn.assistant, !text.isEmpty {
+            let calls = turn.toolCalls ?? []
+            let hasModelText = turn.assistant?.isEmpty == false
+            if hasModelText || !calls.isEmpty {
+                if let icon = providerIcon(for: turn.model, icons: icons) {
+                    out.append(iconString(icon, attributes: modelLabel))
+                    out.append(NSAttributedString(string: " ", attributes: modelLabel))
+                }
                 out.append(NSAttributedString(
                     string: "\(TurnHeader.responseLabel(model: turn.model))\n",
-                    attributes: assistantLabel))
+                    attributes: modelLabel))
+            }
+            if let text = turn.assistant, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
+            }
+            for call in calls {
+                out.append(NSAttributedString(string: "⚙ \(call.name)\n", attributes: toolLabel))
+                let summary = call.argumentSummary
+                if !summary.isEmpty {
+                    out.append(NSAttributedString(string: "\(cap(summary))\n", attributes: tool))
+                }
             }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
@@ -1069,6 +1142,24 @@ public enum TranscriptRender {
             out.append(NSAttributedString(string: "\n", attributes: separator))
         }
         return NSAttributedString(attributedString: out)
+    }
+
+    static func providerIcon(for model: String?, icons: TranscriptIcons) -> NSImage? {
+        guard let provider = model.flatMap(ModelProvider.provider(forModel:)) else { return nil }
+        return icons.providers[provider]
+    }
+
+    static func iconString(
+        _ image: NSImage, attributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        let attachment = NSTextAttachment()
+        attachment.image = image
+        attachment.bounds = CGRect(x: 0, y: -3, width: 13, height: 13)
+        let out = NSMutableAttributedString(attachment: attachment)
+        var attrs = attributes
+        attrs.removeValue(forKey: .attachment)
+        out.addAttributes(attrs, range: NSRange(location: 0, length: out.length))
+        return out
     }
 
     static func cap(_ text: String, maxChars: Int = maxTurnChars) -> String {

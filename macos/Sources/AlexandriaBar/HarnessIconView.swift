@@ -27,6 +27,53 @@ enum HarnessIconLoader {
     }
 }
 
+@MainActor
+enum ProviderChipRenderer {
+    private static var cache: [String: NSImage] = [:]
+
+    static func image(for provider: String) -> NSImage {
+        if let cached = cache[provider] { return cached }
+        let image = draw(provider)
+        cache[provider] = image
+        return image
+    }
+
+    private static func draw(_ provider: String) -> NSImage {
+        let fill = color(provider)
+        let initial = ModelProvider.initial(for: provider)
+        return NSImage(size: NSSize(width: 13, height: 13), flipped: false) { rect in
+            fill.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            if provider == "xai" {
+                NSColor.white.withAlphaComponent(0.85).setStroke()
+                let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+                ring.lineWidth = 1
+                ring.stroke()
+            }
+            let text = NSAttributedString(
+                string: initial,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 7.5, weight: .bold),
+                    .foregroundColor: NSColor.white,
+                ])
+            let size = text.size()
+            text.draw(at: NSPoint(
+                x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+            return true
+        }
+    }
+
+    private static func color(_ provider: String) -> NSColor {
+        switch provider {
+        case "anthropic": NSColor(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255, alpha: 1)
+        case "openai": NSColor(red: 0x10 / 255, green: 0xA3 / 255, blue: 0x7F / 255, alpha: 1)
+        case "xai": .black
+        case "gemini": NSColor(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255, alpha: 1)
+        default: .gray
+        }
+    }
+}
+
 struct HarnessIconView: View {
     let harness: String?
     let tags: [String: String]?

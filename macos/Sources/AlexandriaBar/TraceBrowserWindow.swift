@@ -290,13 +290,21 @@ final class TraceBrowserModel {
         let sid = selectedSessionId
         let session = selectedSession
         let harnessName = HarnessName.display(harness: session?.harness, tags: session?.tags)
+        let providerNames = Set(
+            slice.compactMap { $0.model.flatMap(ModelProvider.provider(forModel:)) })
+        let icons = TranscriptIcons(
+            harness: HarnessIconLoader.image(harness: session?.harness, tags: session?.tags),
+            providers: Dictionary(uniqueKeysWithValues: providerNames.map {
+                ($0, ProviderChipRenderer.image(for: $0))
+            }))
         let prev = renderChain
         renderChain = Task { [weak self] in
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
                 let doc = TranscriptRender.document(
-                    turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName)
+                    turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
+                    icons: icons)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
