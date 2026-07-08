@@ -47,7 +47,7 @@ Re-auth a subscription any time with `alex auth login claude|codex|grok`, watch 
 ## macOS menu bar app
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/logo.png" width="220" alt="Alexandria logo" />
+  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/docs/images/mac-menu.png" width="440" alt="AlexandriaBar menu: subscription limit gauges, account status, dario, and actions" />
 </p>
 
 `macos/` contains **AlexandriaBar**, a Swift menu bar app that shows daemon health, subscription limit gauges, and account status — with in-app re-auth (device codes, paste flows), ping checks, and notifications when a subscription needs attention.
