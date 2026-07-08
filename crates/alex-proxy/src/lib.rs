@@ -651,15 +651,30 @@ fn transcript_turn(row: &Value) -> Value {
             translate::last_user_text(row["client_format"].as_str().unwrap_or(""), &req)
         })
         .map(|s| truncate_chars(s, 8000));
-    let assistant = read_gz_text(row["resp_body_path"].as_str())
-        .and_then(|text| {
-            let fmt = row["upstream_format"]
-                .as_str()
-                .or(row["client_format"].as_str())
-                .unwrap_or("");
-            translate::assistant_reply_text(fmt, &text)
-        })
+    let resp_text = read_gz_text(row["resp_body_path"].as_str());
+    let fmt = row["upstream_format"]
+        .as_str()
+        .or(row["client_format"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let assistant = resp_text
+        .as_deref()
+        .and_then(|text| translate::assistant_reply_text(&fmt, text))
         .map(|s| truncate_chars(s, 8000));
+    let tool_calls: Vec<Value> = resp_text
+        .as_deref()
+        .map(|text| translate::assistant_tool_calls(&fmt, text))
+        .unwrap_or_default()
+        .into_iter()
+        .take(24)
+        .map(|mut c| {
+            if let Some(a) = c["arguments"].as_str() {
+                let t = truncate_chars(a.to_string(), 600);
+                c["arguments"] = json!(t);
+            }
+            c
+        })
+        .collect();
     json!({
         "trace_id": row["id"],
         "ts_request_ms": row["ts_request_ms"],
@@ -672,6 +687,7 @@ fn transcript_turn(row: &Value) -> Value {
         "error": row["error"],
         "user": user,
         "assistant": assistant,
+        "tool_calls": tool_calls,
     })
 }
 

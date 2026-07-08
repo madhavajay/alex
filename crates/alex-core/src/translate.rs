@@ -887,6 +887,97 @@ fn openai_chat_sse_text(sse: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+fn tool_call_json(name: &Value, args: &Value) -> Value {
+    let arguments = match args {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    json!({"name": name, "arguments": arguments})
+}
+
+pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value> {
+    let trimmed = resp_text.trim_start();
+    let is_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    match upstream_format {
+        "anthropic" => {
+            let msg = if is_sse {
+                parse_anthropic_sse_to_message(resp_text)
+            } else {
+                serde_json::from_str(resp_text).ok()
+            };
+            msg.map(|m| {
+                m["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == "tool_use")
+                    .map(|b| tool_call_json(&b["name"], &b["input"]))
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+        "openai-chat" => {
+            if is_sse {
+                let mut calls: Vec<(String, String)> = Vec::new();
+                for v in sse_datas(resp_text) {
+                    for tc in v["choices"][0]["delta"]["tool_calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        while calls.len() <= idx {
+                            calls.push((String::new(), String::new()));
+                        }
+                        if let Some(n) = tc["function"]["name"].as_str() {
+                            calls[idx].0.push_str(n);
+                        }
+                        if let Some(a) = tc["function"]["arguments"].as_str() {
+                            calls[idx].1.push_str(a);
+                        }
+                    }
+                }
+                calls
+                    .into_iter()
+                    .filter(|(n, _)| !n.is_empty())
+                    .map(|(n, a)| json!({"name": n, "arguments": a}))
+                    .collect()
+            } else {
+                serde_json::from_str::<Value>(resp_text)
+                    .ok()
+                    .map(|v| {
+                        v["choices"][0]["message"]["tool_calls"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|tc| tool_call_json(&tc["function"]["name"], &tc["function"]["arguments"]))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        }
+        "openai-responses" => {
+            let resp = if is_sse {
+                parse_responses_sse_final(resp_text)
+            } else {
+                serde_json::from_str(resp_text).ok()
+            };
+            resp.map(|r| {
+                r["output"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|it| it["type"] == "function_call")
+                    .map(|it| tool_call_json(&it["name"], &it["arguments"]))
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub fn assistant_reply_text(upstream_format: &str, resp_text: &str) -> Option<String> {
     let trimmed = resp_text.trim_start();
     let is_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
