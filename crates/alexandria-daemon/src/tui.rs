@@ -760,6 +760,305 @@ fn detail_lines(t: &Value) -> Vec<Line<'static>> {
     lines
 }
 
+struct SessionCells {
+    time: String,
+    id: String,
+    run: String,
+    models: String,
+    turns: String,
+    tokens: String,
+    cost: String,
+    errors: String,
+}
+
+fn models_short(v: Option<&Value>) -> String {
+    let joined = match v {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    if joined.is_empty() {
+        "-".into()
+    } else {
+        truncate(&joined, 24)
+    }
+}
+
+fn session_cells(s: &Value) -> SessionCells {
+    let tin = jint(s, "total_input_tokens");
+    let tout = jint(s, "total_output_tokens");
+    let tokens = if tin.is_none() && tout.is_none() {
+        "-".into()
+    } else {
+        format!(
+            "{}→{}",
+            tin.map(fmt_count).unwrap_or_else(|| "-".into()),
+            tout.map(fmt_count).unwrap_or_else(|| "-".into()),
+        )
+    };
+    SessionCells {
+        time: fmt_time_ms(jint(s, "last_ts_ms")),
+        id: truncate(&jstr(s, "session_id"), 24),
+        run: s
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .filter(|r| !r.is_empty())
+            .map(|r| truncate(r, 12))
+            .unwrap_or_default(),
+        models: models_short(s.get("models")),
+        turns: jint(s, "trace_count")
+            .map(|n| format!("{n} turns"))
+            .unwrap_or_else(|| "-".into()),
+        tokens,
+        cost: jf64(s, "total_cost_usd")
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "-".into()),
+        errors: match jint(s, "errors") {
+            Some(e) if e > 0 => format!("{e} err"),
+            _ => String::new(),
+        },
+    }
+}
+
+fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
+    let title = if ui.follow {
+        "Sessions · following"
+    } else {
+        "Sessions · paused (f to follow)"
+    };
+    if snap.sessions.is_empty() {
+        let block = themed_block(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let msg = if snap.sessions_supported.is_none() {
+            "no data yet"
+        } else {
+            "no sessions in the last 24h"
+        };
+        let p = Paragraph::new(msg)
+            .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+            .alignment(Alignment::Center);
+        f.render_widget(p, inner);
+        return;
+    }
+    let header = Row::new(
+        ["time", "session", "run", "models", "turns", "tokens in→out", "cost", "err"]
+            .iter()
+            .map(|h| Cell::from(*h)),
+    )
+    .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
+    let rows = snap.sessions.iter().map(|s| {
+        let c = session_cells(s);
+        Row::new(vec![
+            Cell::from(c.time).style(Style::default().fg(SAND)),
+            Cell::from(c.id).style(Style::default().fg(TURQUOISE)),
+            Cell::from(c.run).style(Style::default().fg(AMBER)),
+            Cell::from(c.models).style(Style::default().fg(LAPIS)),
+            Cell::from(c.turns),
+            Cell::from(c.tokens),
+            Cell::from(c.cost).style(Style::default().fg(SAND)),
+            Cell::from(c.errors)
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(26),
+            Constraint::Length(12),
+            Constraint::Min(14),
+            Constraint::Length(9),
+            Constraint::Length(15),
+            Constraint::Length(10),
+            Constraint::Min(6),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(Style::default().bg(Color::Indexed(236)).fg(GOLD))
+    .block(themed_block(title));
+    f.render_stateful_widget(table, area, &mut ui.stable);
+}
+
+const TURN_TEXT_CAP: usize = 40;
+
+fn turn_header_text(t: &Value) -> String {
+    let tin = jint(t, "input_tokens")
+        .map(fmt_count)
+        .unwrap_or_else(|| "-".into());
+    let tout = jint(t, "output_tokens")
+        .map(fmt_count)
+        .unwrap_or_else(|| "-".into());
+    let cost = jf64(t, "cost_usd")
+        .map(|c| format!("${c:.4}"))
+        .unwrap_or_else(|| "-".into());
+    let status = jint(t, "status")
+        .filter(|s| *s > 0)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".into());
+    format!(
+        "── {} · {} · {tin}→{tout} tok · {cost} · {status} ──",
+        fmt_time_ms(jint(t, "ts_request_ms")),
+        jstr(t, "model"),
+    )
+}
+
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut out = Vec::new();
+    for raw in s.split('\n') {
+        let mut cur = String::new();
+        let mut len = 0usize;
+        for word in raw.split_whitespace() {
+            let wlen = word.chars().count();
+            if len > 0 && len + 1 + wlen <= width {
+                cur.push(' ');
+                cur.push_str(word);
+                len += 1 + wlen;
+                continue;
+            }
+            if len > 0 {
+                out.push(std::mem::take(&mut cur));
+                len = 0;
+            }
+            if wlen <= width {
+                cur.push_str(word);
+                len = wlen;
+            } else {
+                let chars: Vec<char> = word.chars().collect();
+                for chunk in chars.chunks(width) {
+                    if len > 0 {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur = chunk.iter().collect();
+                    len = chunk.len();
+                }
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
+fn cap_lines(lines: Vec<String>, max: usize) -> (Vec<String>, usize) {
+    if lines.len() <= max {
+        (lines, 0)
+    } else {
+        let hidden = lines.len() - max;
+        (lines.into_iter().take(max).collect(), hidden)
+    }
+}
+
+fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
+    let w = width.max(8);
+    let dim = Style::default().fg(SAND).add_modifier(Modifier::DIM);
+    let mut out = Vec::new();
+    for t in turns {
+        out.push(Line::from(Span::styled(turn_header_text(t), dim)));
+        if let Some(u) = t.get("user").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let (lines, hidden) = cap_lines(wrap_text(u, w.saturating_sub(2)), TURN_TEXT_CAP);
+            for (i, l) in lines.into_iter().enumerate() {
+                let prefix = if i == 0 { "❯ " } else { "  " };
+                out.push(Line::from(Span::styled(
+                    format!("{prefix}{l}"),
+                    Style::default().fg(SAND),
+                )));
+            }
+            if hidden > 0 {
+                out.push(Line::from(Span::styled(format!("  … (+{hidden} lines)"), dim)));
+            }
+        }
+        if let Some(a) = t
+            .get("assistant")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let (lines, hidden) = cap_lines(wrap_text(a, w), TURN_TEXT_CAP);
+            for l in lines {
+                out.push(Line::from(Span::raw(l)));
+            }
+            if hidden > 0 {
+                out.push(Line::from(Span::styled(format!("… (+{hidden} lines)"), dim)));
+            }
+        }
+        if let Some(e) = t.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            for l in wrap_text(&format!("✗ {e}"), w) {
+                out.push(Line::from(Span::styled(l, Style::default().fg(Color::Red))));
+            }
+        }
+        out.push(Line::default());
+    }
+    out
+}
+
+fn centered_msg(f: &mut Frame, area: Rect, block: Block, msg: &str) {
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let p = Paragraph::new(msg.to_string())
+        .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+fn draw_transcript(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
+    match &snap.transcript {
+        TranscriptView::Ready { id, turns } => {
+            let cost: f64 = turns.iter().filter_map(|t| jf64(t, "cost_usd")).sum();
+            let follow = if ui.tsc_follow {
+                "following"
+            } else {
+                "paused (f to follow)"
+            };
+            let title = format!(
+                "☥ session {} — {} turns · ${cost:.4} · {follow}",
+                truncate(id, 24),
+                turns.len(),
+            );
+            let block = themed_block(&title);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            if turns.is_empty() {
+                let p = Paragraph::new("no turns yet")
+                    .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+                    .alignment(Alignment::Center);
+                f.render_widget(p, inner);
+                return;
+            }
+            let lines = transcript_lines(turns, inner.width.saturating_sub(1) as usize);
+            let view_h = inner.height as usize;
+            ui.tsc_view_h = view_h;
+            let max_scroll = lines.len().saturating_sub(view_h);
+            if ui.tsc_follow || ui.tsc_scroll > max_scroll {
+                ui.tsc_scroll = max_scroll;
+            }
+            let visible: Vec<Line> = lines
+                .into_iter()
+                .skip(ui.tsc_scroll)
+                .take(view_h)
+                .collect();
+            f.render_widget(Paragraph::new(visible), inner);
+        }
+        TranscriptView::Unsupported => {
+            centered_msg(
+                f,
+                area,
+                themed_block("☥ transcript"),
+                "daemon update required — transcript endpoint unavailable",
+            );
+        }
+        TranscriptView::Empty => {
+            let id = ui.watching.lock().unwrap().clone().unwrap_or_default();
+            let title = format!("☥ session {}", truncate(&id, 24));
+            centered_msg(f, area, themed_block(&title), "loading transcript…");
+        }
+    }
+}
+
 fn gauge_color(pct: f64) -> Color {
     if pct >= 80.0 {
         Color::Red
@@ -1101,14 +1400,28 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
     }
 }
 
-fn draw_bottom(f: &mut Frame, area: Rect, snap: &Snapshot) {
+fn key_hints(snap: &Snapshot, ui: &Ui) -> &'static str {
+    if ui.transcript {
+        " Esc back · ↑↓ PgUp/PgDn scroll · f follow · End bottom "
+    } else if ui.tab == 0 {
+        if raw_active(snap.sessions_supported, ui.raw_mode) {
+            " q quit · 1-4/←→ tabs · ↑↓ select · f follow · r sessions "
+        } else {
+            " q quit · 1-4/←→ tabs · ↑↓ select · Enter transcript · f follow · r raw "
+        }
+    } else {
+        " q quit · 1-4/←→ tabs · ↑↓ scroll · f follow · r refresh "
+    }
+}
+
+fn draw_bottom(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &Ui) {
     let totals = snap.analytics.get("totals").cloned().unwrap_or(Value::Null);
     let req = jint(&totals, "requests").unwrap_or(0);
     let cost = jf64(&totals, "cost_usd").unwrap_or(0.0);
     let errors = jint(&totals, "errors").unwrap_or(0);
     let line = Line::from(vec![
         Span::styled(
-            " q quit · 1-4/←→ tabs · ↑↓ scroll · f follow · r refresh ",
+            key_hints(snap, ui),
             Style::default().fg(SAND).add_modifier(Modifier::DIM),
         ),
         Span::styled("│ ", Style::default().fg(AMBER)),
@@ -1227,6 +1540,125 @@ mod tests {
         let w = json!({"resets_at": "2023-11-14T22:13:20Z"});
         assert_eq!(reset_secs(&w, now - 100), Some(100));
         assert_eq!(reset_secs(&json!({}), now), None);
+    }
+
+    #[test]
+    fn session_cells_full() {
+        let s = json!({
+            "session_id": "sess-0123456789abcdef0123456789",
+            "run_id": "run-42",
+            "first_ts_ms": 1_699_999_000_000i64,
+            "last_ts_ms": 1_700_000_000_000i64,
+            "trace_count": 7,
+            "models": ["grok-4", "claude-x"],
+            "total_input_tokens": 45_000,
+            "total_output_tokens": 320,
+            "total_cost_usd": 0.5,
+            "errors": 2
+        });
+        let c = session_cells(&s);
+        assert_eq!(c.id.chars().count(), 24);
+        assert!(c.id.ends_with('…'));
+        assert_eq!(c.run, "run-42");
+        assert_eq!(c.models, "grok-4,claude-x");
+        assert_eq!(c.turns, "7 turns");
+        assert_eq!(c.tokens, "45.0k→320");
+        assert_eq!(c.cost, "$0.5000");
+        assert_eq!(c.errors, "2 err");
+        assert_ne!(c.time, "--:--:--");
+    }
+
+    #[test]
+    fn session_cells_missing_fields() {
+        let c = session_cells(&json!({}));
+        assert_eq!(c.time, "--:--:--");
+        assert_eq!(c.id, "-");
+        assert!(c.run.is_empty());
+        assert_eq!(c.models, "-");
+        assert_eq!(c.turns, "-");
+        assert_eq!(c.tokens, "-");
+        assert_eq!(c.cost, "-");
+        assert!(c.errors.is_empty());
+    }
+
+    #[test]
+    fn models_short_variants() {
+        assert_eq!(models_short(Some(&json!(["a", "b"]))), "a,b");
+        assert_eq!(models_short(Some(&json!("a, b"))), "a, b");
+        assert_eq!(models_short(None), "-");
+        assert_eq!(models_short(Some(&json!(42))), "-");
+        let long = models_short(Some(&json!("very-long-model-name-that-overflows-here")));
+        assert!(long.ends_with('…'));
+        assert!(long.chars().count() <= 24);
+    }
+
+    #[test]
+    fn turn_header_full() {
+        let t = json!({
+            "ts_request_ms": 1_700_000_000_000i64,
+            "model": "grok-4",
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "cost_usd": 0.01234,
+            "status": 200
+        });
+        let h = turn_header_text(&t);
+        assert!(h.starts_with("── "));
+        assert!(h.ends_with(" ──"));
+        assert!(h.contains("grok-4"));
+        assert!(h.contains("120→45 tok"));
+        assert!(h.contains("$0.0123"));
+        assert!(h.contains("· 200 ──"));
+    }
+
+    #[test]
+    fn turn_header_missing_fields() {
+        let h = turn_header_text(&json!({}));
+        assert!(h.contains("--:--:--"));
+        assert!(h.contains("-→- tok"));
+        assert!(h.contains("· - · - ──"));
+    }
+
+    #[test]
+    fn wrap_text_basics() {
+        assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
+        assert_eq!(wrap_text("hello world again", 11), vec!["hello world", "again"]);
+        assert_eq!(wrap_text("a\n\nb", 10), vec!["a", "", "b"]);
+        let long = "x".repeat(25);
+        assert_eq!(
+            wrap_text(&long, 10),
+            vec!["x".repeat(10), "x".repeat(10), "x".repeat(5)]
+        );
+        for l in wrap_text("many words that should wrap nicely at the boundary", 12) {
+            assert!(l.chars().count() <= 12);
+        }
+    }
+
+    #[test]
+    fn cap_lines_tail() {
+        let lines: Vec<String> = (0..50).map(|i| i.to_string()).collect();
+        let (kept, hidden) = cap_lines(lines, 40);
+        assert_eq!(kept.len(), 40);
+        assert_eq!(hidden, 10);
+        let (kept, hidden) = cap_lines(vec!["a".into()], 40);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn fmt_count_scales() {
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(9_999), "9999");
+        assert_eq!(fmt_count(45_000), "45.0k");
+        assert_eq!(fmt_count(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn raw_active_fallback() {
+        assert!(!raw_active(None, false));
+        assert!(!raw_active(Some(true), false));
+        assert!(raw_active(Some(false), false));
+        assert!(raw_active(Some(true), true));
     }
 
     #[test]
