@@ -1,0 +1,3 @@
+[submodule "repos/dario"]
+	path = repos/dario
+	url = git@github.com:askalf/dario.git

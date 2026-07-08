@@ -1,0 +1,1824 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use alexandria_auth::{now_ms, Account, Vault};
+use alexandria_core::{
+    compute_cost, parse_since, parse_sse_usage, parse_trace_tags, route_model, usage_from_json,
+    ClientFormat, Provider, TraceRecord,
+};
+use alexandria_store::{Store, TraceFilter};
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
+
+const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+const OPENAI_BASE: &str = "https://api.openai.com";
+const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+const XAI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+const GROK_CLIENT_VERSION: &str = "0.2.77";
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+#[derive(Debug, Clone)]
+pub struct DarioActive {
+    pub generation_id: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+pub trait DarioRouter: Send + Sync {
+    fn active(&self) -> Option<DarioActive>;
+    fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>>;
+    fn status(&self) -> Value;
+    fn suspect(&self, generation_id: &str);
+}
+
+fn suspect_dario(state: &AppState, account: &Account) {
+    if account.kind != "dario" {
+        return;
+    }
+    if let (Some(dario), Some(gen)) = (&state.dario, account.id.strip_prefix("dario:")) {
+        dario.suspect(gen);
+    }
+}
+
+pub struct AppState {
+    pub local_key: String,
+    pub vault: Arc<Vault>,
+    pub store: Arc<Store>,
+    pub http: reqwest::Client,
+    pub dario: Option<Arc<dyn DarioRouter>>,
+    pub in_flight: std::sync::atomic::AtomicI64,
+    pub started_ms: i64,
+    pub base_url: String,
+    pub anthropic_usage: std::sync::Mutex<UsageCache>,
+    pub logins: alexandria_auth::sessions::LoginManager,
+}
+
+struct InFlight(Arc<AppState>);
+
+impl InFlight {
+    fn new(state: &Arc<AppState>) -> Self {
+        state
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(state.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn build_state(
+    local_key: String,
+    vault: Arc<Vault>,
+    store: Arc<Store>,
+    dario: Option<Arc<dyn DarioRouter>>,
+    base_url: String,
+) -> Arc<AppState> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .expect("reqwest client");
+    Arc::new(AppState {
+        local_key,
+        vault,
+        store,
+        http,
+        dario,
+        in_flight: std::sync::atomic::AtomicI64::new(0),
+        started_ms: now_ms(),
+        base_url,
+        anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
+        logins: alexandria_auth::sessions::LoginManager::default(),
+    })
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/connect", get(connect_info))
+        .route("/v1/models", get(models))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/chat/completions", post(openai_chat))
+        .route("/v1/responses", post(openai_responses))
+        .route("/chat/completions", post(openai_chat))
+        .route("/responses", post(openai_responses))
+        .route("/traces/search", get(traces_search))
+        .route("/traces/export.ndjson", get(traces_export))
+        .route("/traces/runs/{run_id}", get(traces_run_summary))
+        .route("/traces/runs/{run_id}/events", get(traces_run_events))
+        .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
+        .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
+        .route("/admin/traces", get(admin_traces))
+        .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/health", get(admin_health))
+        .route("/admin/analytics", get(admin_analytics))
+        .route("/admin/limits", get(admin_limits))
+        .route("/admin/dario", get(admin_dario))
+        .route("/admin/auth/import", post(admin_auth_import))
+        .route("/admin/auth/login/start", post(admin_auth_login_start))
+        .route("/admin/auth/login/complete", post(admin_auth_login_complete))
+        .route("/admin/auth/login/{id}", get(admin_auth_login_status))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(state)
+}
+
+async fn admin_auth_import(
+    State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<Value>>,
+) -> Response {
+    let source = body
+        .as_ref()
+        .and_then(|b| b.0["source"].as_str().or(b.0["provider"].as_str()))
+        .unwrap_or("all")
+        .to_string();
+    match alexandria_auth::import_all(&state.vault, &source).await {
+        Ok(outcomes) => {
+            let items: Vec<Value> = outcomes
+                .iter()
+                .map(|o| {
+                    json!({
+                        "source": o.source,
+                        "imported": o.imported,
+                        "note": o.note,
+                    })
+                })
+                .collect();
+            axum::Json(json!({"outcomes": items})).into_response()
+        }
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_auth_login_start(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(provider) = body.0["provider"].as_str() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
+    };
+    match state.logins.start(state.vault.clone(), provider).await {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_auth_login_complete(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let (Some(id), Some(input)) = (body.0["login_id"].as_str(), body.0["input"].as_str()) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'login_id' or 'input'");
+    };
+    match state.logins.complete(state.vault.clone(), id, input).await {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_auth_login_status(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.logins.status(&id).await {
+        Some(snapshot) => axum::Json(snapshot).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "unknown or expired login session"),
+    }
+}
+
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    axum::Json(json!({
+        "status": "ok",
+        "service": "alexandria",
+        "version": env!("CARGO_PKG_VERSION"),
+        "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        "uptime_s": (now_ms() - state.started_ms) / 1000,
+        "dario": state.dario.is_some(),
+    }))
+}
+
+fn rewrite_host(base_url: &str, host: &str) -> String {
+    let port = base_url.rsplit(':').next().unwrap_or("4100");
+    format!("http://{host}:{port}")
+}
+
+pub fn connect_payload(base_url: &str, local_key: &str) -> (Value, String) {
+    let base = base_url.trim_end_matches('/').to_string();
+    let v1 = format!("{base}/v1");
+    let exports = format!(
+        "export ANTHROPIC_BASE_URL={base}\nexport ANTHROPIC_API_KEY={local_key}\nexport OPENAI_BASE_URL={v1}\nexport OPENAI_API_KEY={local_key}\nexport XAI_API_KEY={local_key}\nexport GROK_MODELS_BASE_URL={v1}\n"
+    );
+    let payload = json!({
+        "service": "alexandria",
+        "base_url": base,
+        "api_key": local_key,
+        "anthropic": {"base_url": base, "env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": local_key}},
+        "openai": {"base_url": v1, "env": {"OPENAI_BASE_URL": v1, "OPENAI_API_KEY": local_key}},
+        "xai": {"base_url": v1, "env": {"XAI_API_KEY": local_key, "GROK_MODELS_BASE_URL": v1}},
+        "exports": exports,
+    });
+    (payload, exports)
+}
+
+async fn connect_info(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "connection info is only served to loopback clients",
+        );
+    }
+    let base = match q.get("host").map(String::as_str) {
+        Some("docker") => rewrite_host(&state.base_url, "host.docker.internal"),
+        Some(host) if !host.is_empty() => rewrite_host(&state.base_url, host),
+        _ => state.base_url.clone(),
+    };
+    let (payload, exports) = connect_payload(&base, &state.local_key);
+    if q.get("format").map(|f| f == "env").unwrap_or(false) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body(Body::from(exports))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
+    axum::Json(payload).into_response()
+}
+
+async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut ids = state.store.pricing_models();
+    for (alias, _) in alexandria_core::model_aliases() {
+        ids.push((*alias).to_string());
+    }
+    for id in ids.clone() {
+        ids.push(format!("alexandria/{id}"));
+    }
+    let data: Vec<Value> = ids
+        .into_iter()
+        .map(|m| json!({"id": m, "object": "model", "owned_by": "alexandria"}))
+        .collect();
+    axum::Json(json!({"object": "list", "data": data}))
+}
+
+async fn admin_analytics(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let minutes: i64 = q
+        .get("since_minutes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    match state.store.analytics(now_ms() - minutes * 60_000) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+const USAGE_CACHE_TTL_MS: i64 = 300_000;
+const USAGE_BACKOFF_BASE_MS: i64 = 60_000;
+const USAGE_BACKOFF_MAX_MS: i64 = 3_600_000;
+
+#[derive(Default)]
+pub struct UsageCache {
+    fetched_at_ms: i64,
+    entry: Option<Value>,
+    cooldown_until_ms: i64,
+    failures: u32,
+}
+
+fn usage_backoff_ms(failures: u32, retry_after_ms: Option<i64>) -> i64 {
+    let exp = USAGE_BACKOFF_BASE_MS
+        .saturating_mul(1i64 << failures.saturating_sub(1).min(6))
+        .min(USAGE_BACKOFF_MAX_MS);
+    exp.max(retry_after_ms.unwrap_or(0))
+}
+
+async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state.vault.account_for(Provider::Anthropic, true).await.ok()?;
+    if account.kind != "oauth" {
+        return None;
+    }
+    let token = account.access_token.as_deref()?.to_string();
+    {
+        let cache = state.anthropic_usage.lock().unwrap();
+        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
+            return cache.entry.clone();
+        }
+        if now_ms() < cache.cooldown_until_ms {
+            return cache.entry.clone();
+        }
+    }
+    let result = state
+        .http
+        .get(format!("{ANTHROPIC_BASE}/api/oauth/usage"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
+        .header("accept", "application/json")
+        .header("user-agent", "claude-cli/2.1.202 (external, cli)")
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            let raw: Value = resp.json().await.unwrap_or(Value::Null);
+            let mut windows = Vec::new();
+            for (name, key) in [
+                ("5h", "five_hour"),
+                ("7d", "seven_day"),
+                ("7d opus", "seven_day_opus"),
+                ("7d sonnet", "seven_day_sonnet"),
+            ] {
+                let w = &raw[key];
+                if w.is_object() {
+                    windows.push(json!({
+                        "window": name,
+                        "used_pct": w["utilization"],
+                        "resets_at": w["resets_at"],
+                    }));
+                }
+            }
+            let entry = json!({
+                "provider": "anthropic",
+                "source": "oauth usage endpoint",
+                "plan": account.label,
+                "windows": windows,
+                "extra_usage": raw["extra_usage"],
+            });
+            let mut cache = state.anthropic_usage.lock().unwrap();
+            cache.fetched_at_ms = now_ms();
+            cache.cooldown_until_ms = 0;
+            cache.failures = 0;
+            cache.entry = Some(entry.clone());
+            Some(entry)
+        }
+        Ok(resp) => {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|s| s.clamp(30, 3600) * 1000);
+            let mut cache = state.anthropic_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, retry_after);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            tracing::debug!(
+                status = resp.status().as_u16(),
+                failures = cache.failures,
+                cooldown_ms = cooldown,
+                "anthropic usage endpoint unavailable; backing off"
+            );
+            cache.entry.clone()
+        }
+        Err(_) => {
+            let mut cache = state.anthropic_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, None);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            cache.entry.clone()
+        }
+    }
+}
+
+pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
+    let mut providers: Vec<Value> = Vec::new();
+    if let Some(entry) = anthropic_usage_entry(state).await {
+        providers.push(entry);
+    }
+    for (provider_str, ts_ms, headers_json) in
+        state.store.latest_provider_headers().unwrap_or_default()
+    {
+        if providers
+            .iter()
+            .any(|p| p["provider"].as_str() == Some(&provider_str))
+        {
+            continue;
+        }
+        let Some(provider) = Provider::from_str_loose(&provider_str) else {
+            continue;
+        };
+        let headers: Value = serde_json::from_str(&headers_json).unwrap_or(Value::Null);
+        let mut parsed = alexandria_core::parse_limit_headers(provider, &headers);
+        if let Some(o) = parsed.as_object_mut() {
+            o.insert("provider".into(), json!(provider_str));
+            o.insert("source".into(), json!("captured response headers"));
+            o.insert("observed_at_ms".into(), json!(ts_ms));
+            providers.push(parsed);
+        }
+    }
+    providers.sort_by_key(|p| p["provider"].as_str().unwrap_or("").to_string());
+    json!({"providers": providers})
+}
+
+async fn admin_limits(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(limits_snapshot(&state).await).into_response()
+}
+
+async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
+    match &state.dario {
+        Some(d) => axum::Json(d.status()).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "dario mode is not enabled"),
+    }
+}
+
+async fn admin_traces(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    match state.store.list_traces(
+        limit,
+        q.get("session").map(|s| s.as_str()),
+        q.get("model").map(|s| s.as_str()),
+    ) {
+        Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
+    let now = now_ms();
+    TraceFilter {
+        since_ms: q.get("since").and_then(|s| parse_since(s, now)),
+        until_ms: q.get("until").and_then(|s| parse_since(s, now)),
+        run_id: q.get("run_id").cloned(),
+        session: q.get("session").cloned(),
+        model: q.get("model").cloned(),
+        provider: q.get("provider").cloned(),
+        path: q.get("path").cloned(),
+        harness: q.get("harness").cloned(),
+        status: q.get("status").and_then(|s| s.parse().ok()),
+        errors_only: q
+            .get("errors")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false),
+        key_fingerprint: q.get("key_fingerprint").cloned(),
+        limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
+    }
+}
+
+fn wants_bodies(q: &HashMap<String, String>) -> bool {
+    q.get("bodies").map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
+fn inline_row_bodies(row: &mut Value) {
+    use base64::Engine;
+    for (path_key, out_key) in [
+        ("req_body_path", "req_body_b64"),
+        ("upstream_req_body_path", "upstream_req_body_b64"),
+        ("resp_body_path", "resp_body_b64"),
+    ] {
+        let Some(path) = row[path_key].as_str().map(String::from) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut buf = Vec::new();
+        if std::io::Read::read_to_end(&mut decoder, &mut buf).is_err() {
+            continue;
+        }
+        row[out_key] = json!(base64::engine::general_purpose::STANDARD.encode(&buf));
+    }
+}
+
+fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
+    rows.sort_by_key(|r| r["ts_request_ms"].as_i64().unwrap_or(0));
+    let mut out = String::new();
+    for mut row in rows {
+        if inline_bodies {
+            inline_row_bodies(&mut row);
+        }
+        out.push_str(&serde_json::to_string(&row).unwrap_or_default());
+        out.push('\n');
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(out))
+        .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+async fn traces_search(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    match state.store.search_traces(&filter_from_query(&q)) {
+        Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn traces_export(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    match state.store.search_traces(&filter_from_query(&q)) {
+        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn traces_run_summary(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match state.store.run_summary(&run_id) {
+        Ok(v) if v["trace_count"].as_i64().unwrap_or(0) == 0 => error_response(
+            StatusCode::NOT_FOUND,
+            &format!("no traces for run '{run_id}'"),
+        ),
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn traces_run_events(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let filter = TraceFilter {
+        run_id: Some(run_id),
+        limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(1000),
+        ..Default::default()
+    };
+    match state.store.search_traces(&filter) {
+        Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn traces_run_export(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let filter = TraceFilter {
+        run_id: Some(run_id),
+        limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(5000),
+        ..Default::default()
+    };
+    match state.store.search_traces(&filter) {
+        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn traces_run_artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match state.store.run_artifacts(&run_id) {
+        Ok(artifacts) => axum::Json(json!({
+            "run_id": run_id,
+            "data_dir": state.store.data_dir.to_string_lossy(),
+            "artifacts": artifacts,
+        }))
+        .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let accounts: Vec<Value> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "provider": a.provider.as_str(),
+                "kind": a.kind,
+                "label": a.label,
+                "status": a.status,
+                "expires_at_ms": a.expires_at_ms,
+                "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
+            })
+        })
+        .collect();
+    axum::Json(json!({"accounts": accounts}))
+}
+
+async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
+    let heartbeats = state.store.last_heartbeats().unwrap_or_default();
+    let accounts: Vec<Value> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .map(|a| {
+            let last = heartbeats
+                .iter()
+                .find(|h| h["provider"].as_str() == Some(a.provider.as_str()))
+                .cloned();
+            json!({
+                "id": a.id,
+                "provider": a.provider.as_str(),
+                "kind": a.kind,
+                "status": a.status,
+                "token_expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
+                "last_heartbeat": last,
+            })
+        })
+        .collect();
+    axum::Json(json!({"accounts": accounts})).into_response()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PingResult {
+    pub provider: &'static str,
+    pub account_id: Option<String>,
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub latency_ms: i64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PingModels {
+    pub anthropic: String,
+    pub openai: String,
+    pub xai: String,
+}
+
+pub async fn ping_provider(
+    state: &Arc<AppState>,
+    provider: Provider,
+    models: &PingModels,
+) -> PingResult {
+    let start = now_ms();
+    let prompt = "Health check: what time is it? If you cannot know, just reply: creds ok";
+    let (format, path, body) = match provider {
+        Provider::Anthropic => (
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            json!({
+                "model": models.anthropic,
+                "max_tokens": 64,
+                "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+        ),
+        Provider::Openai => (
+            ClientFormat::OpenaiResponses,
+            "/v1/responses",
+            json!({
+                "model": models.openai,
+                "stream": true,
+                "store": false,
+                "instructions": "You are a helpful assistant.",
+                "input": [{"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": prompt}]}],
+            }),
+        ),
+        Provider::Xai => (
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            json!({
+                "model": models.xai,
+                "stream": false,
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+        ),
+        other => {
+            return PingResult {
+                provider: other.as_str(),
+                account_id: None,
+                ok: false,
+                status: None,
+                latency_ms: 0,
+                message: "upstream not supported yet".into(),
+            }
+        }
+    };
+    let account_id = state
+        .vault
+        .account_for(provider, true)
+        .await
+        .ok()
+        .map(|a| a.id);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(&state.local_key).expect("key header"),
+    );
+    headers.insert("user-agent", HeaderValue::from_static("alexandria-ping"));
+    let resp = proxy(
+        state.clone(),
+        format,
+        path,
+        headers,
+        Bytes::from(serde_json::to_vec(&body).expect("ping body")),
+        None,
+    )
+    .await;
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let message = extract_reply(&text).unwrap_or_else(|| snippet(&text));
+    PingResult {
+        provider: provider.as_str(),
+        account_id,
+        ok: (200..300).contains(&status),
+        status: Some(status),
+        latency_ms: now_ms() - start,
+        message,
+    }
+}
+
+fn extract_reply(text: &str) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        if let Some(t) = v["content"][0]["text"].as_str() {
+            return Some(t.to_string());
+        }
+        if let Some(t) = v["choices"][0]["message"]["content"].as_str() {
+            return Some(t.to_string());
+        }
+        if let Some(t) = v["error"]["message"].as_str() {
+            return Some(t.to_string());
+        }
+        if let Some(t) = v["detail"].as_str() {
+            return Some(t.to_string());
+        }
+    }
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if v["type"].as_str() == Some("response.output_text.done") {
+            if let Some(t) = v["text"].as_str() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn snippet(text: &str) -> String {
+    let t: String = text.chars().take(200).collect();
+    t.replace('\n', " ")
+}
+
+pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<PingResult> {
+    let providers: Vec<Provider> = {
+        let mut seen = Vec::new();
+        for a in state.vault.list().await {
+            if a.status == "active"
+                && matches!(
+                    a.provider,
+                    Provider::Anthropic | Provider::Openai | Provider::Xai
+                )
+                && !seen.contains(&a.provider)
+            {
+                seen.push(a.provider);
+            }
+        }
+        seen
+    };
+    let mut results = Vec::new();
+    for provider in providers {
+        let r = ping_provider(state, provider, models).await;
+        if let Err(e) = state.store.insert_heartbeat(
+            now_ms(),
+            r.provider,
+            r.account_id.as_deref(),
+            r.ok,
+            r.status.map(|s| s as i64),
+            r.latency_ms,
+            &r.message,
+        ) {
+            tracing::warn!("failed to record heartbeat: {e}");
+        }
+        tracing::info!(
+            provider = r.provider,
+            ok = r.ok,
+            status = r.status,
+            latency_ms = r.latency_ms,
+            reply = %r.message,
+            "heartbeat"
+        );
+        results.push(r);
+    }
+    results
+}
+
+async fn anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy(
+        state,
+        ClientFormat::AnthropicMessages,
+        "/v1/messages",
+        headers,
+        body,
+        Some(peer),
+    )
+    .await
+}
+
+async fn openai_chat(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy(
+        state,
+        ClientFormat::OpenaiChat,
+        "/v1/chat/completions",
+        headers,
+        body,
+        Some(peer),
+    )
+    .await
+}
+
+async fn openai_responses(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy(
+        state,
+        ClientFormat::OpenaiResponses,
+        "/v1/responses",
+        headers,
+        body,
+        Some(peer),
+    )
+    .await
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        axum::Json(json!({"error": {"type": "alexandria", "message": message}})),
+    )
+        .into_response()
+}
+
+fn client_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_string());
+    }
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(String::from)
+}
+
+fn redacted_headers(headers: &HeaderMap) -> String {
+    let map: HashMap<String, String> = headers
+        .iter()
+        .map(|(k, v)| {
+            let key = k.as_str().to_lowercase();
+            let val = if ["authorization", "x-api-key", "cookie", "chatgpt-account-id"]
+                .contains(&key.as_str())
+            {
+                "<redacted>".to_string()
+            } else {
+                v.to_str().unwrap_or("<binary>").to_string()
+            };
+            (key, val)
+        })
+        .collect();
+    serde_json::to_string(&map).unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RespondAs {
+    Anthropic,
+    OpenaiChat,
+    OpenaiResponses,
+}
+
+struct UpstreamPlan {
+    url: String,
+    account: Account,
+    body: Vec<u8>,
+    upstream_format: &'static str,
+    destream: bool,
+    respond_as: Option<RespondAs>,
+    client_stream: bool,
+    extra_headers: Vec<(String, String)>,
+    dario_guard: Option<Box<dyn std::any::Any + Send>>,
+}
+
+fn dario_account(active: &DarioActive) -> Account {
+    Account {
+        id: format!("dario:{}", active.generation_id),
+        provider: Provider::Anthropic,
+        kind: "dario".into(),
+        label: Some("dario generational proxy".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(active.api_key.clone()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: Value::Null,
+        cooldown_until_ms: None,
+        status: "active".into(),
+    }
+}
+
+async fn plan_upstream(
+    state: &AppState,
+    format: ClientFormat,
+    provider: Provider,
+    routed_model: &str,
+    body_json: &mut Value,
+    original_body: &[u8],
+    trace_id: &str,
+) -> Result<UpstreamPlan, (StatusCode, String)> {
+    use alexandria_core::translate;
+    let client_stream = body_json["stream"].as_bool().unwrap_or(false);
+    match provider {
+        Provider::Anthropic => {
+            let converted = match format {
+                ClientFormat::AnthropicMessages => None,
+                ClientFormat::OpenaiChat => Some((
+                    translate::openai_chat_to_anthropic(body_json),
+                    RespondAs::OpenaiChat,
+                )),
+                ClientFormat::OpenaiResponses => Some((
+                    translate::openai_responses_to_anthropic(body_json),
+                    RespondAs::OpenaiResponses,
+                )),
+            };
+            let dario_active = state.dario.as_ref().and_then(|d| d.active());
+            let (base, account, dario_guard) = match (&state.dario, dario_active) {
+                (Some(dario), Some(active)) => (
+                    active.base_url.trim_end_matches('/').to_string(),
+                    dario_account(&active),
+                    dario.begin(&active.generation_id),
+                ),
+                _ => {
+                    let account = state
+                        .vault
+                        .account_for(provider, true)
+                        .await
+                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    (ANTHROPIC_BASE.to_string(), account, None)
+                }
+            };
+            let (body, respond_as) = match converted {
+                None => {
+                    body_json["model"] = json!(routed_model);
+                    (
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec()),
+                        None,
+                    )
+                }
+                Some((mut converted, respond_as)) => {
+                    converted["model"] = json!(routed_model);
+                    converted["stream"] = json!(false);
+                    (
+                        serde_json::to_vec(&converted).unwrap_or_else(|_| original_body.to_vec()),
+                        Some(respond_as),
+                    )
+                }
+            };
+            Ok(UpstreamPlan {
+                url: format!("{base}/v1/messages"),
+                account,
+                body,
+                upstream_format: "anthropic",
+                destream: false,
+                respond_as,
+                client_stream,
+                extra_headers: vec![],
+                dario_guard,
+            })
+        }
+        Provider::Openai => {
+            let prefer_oauth = format != ClientFormat::OpenaiChat;
+            let account = state
+                .vault
+                .account_for(provider, prefer_oauth)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let oauth = account.kind == "oauth";
+            match format {
+                ClientFormat::OpenaiChat if !oauth => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{OPENAI_BASE}/v1/chat/completions"),
+                        account,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::OpenaiChat => {
+                    let pivot = translate::openai_chat_to_anthropic(body_json);
+                    let mut converted = translate::anthropic_to_openai_responses(&pivot);
+                    converted["model"] = json!(routed_model);
+                    translate::normalize_codex_request(&mut converted);
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{CODEX_BASE}/responses"),
+                        account,
+                        body,
+                        upstream_format: "openai-responses",
+                        destream: false,
+                        respond_as: Some(RespondAs::OpenaiChat),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::OpenaiResponses => {
+                    body_json["model"] = json!(routed_model);
+                    let mut destream = false;
+                    let url = if oauth {
+                        if body_json["stream"].as_bool() != Some(true) {
+                            destream = true;
+                        }
+                        translate::normalize_codex_request(body_json);
+                        format!("{CODEX_BASE}/responses")
+                    } else {
+                        format!("{OPENAI_BASE}/v1/responses")
+                    };
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url,
+                        account,
+                        body,
+                        upstream_format: "openai-responses",
+                        destream,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::AnthropicMessages => {
+                    let mut converted = translate::anthropic_to_openai_responses(body_json);
+                    converted["model"] = json!(routed_model);
+                    let url = if oauth {
+                        translate::normalize_codex_request(&mut converted);
+                        format!("{CODEX_BASE}/responses")
+                    } else {
+                        converted["stream"] = json!(false);
+                        format!("{OPENAI_BASE}/v1/responses")
+                    };
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url,
+                        account,
+                        body,
+                        upstream_format: "openai-responses",
+                        destream: false,
+                        respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+            }
+        }
+        Provider::Xai => {
+            if format != ClientFormat::OpenaiChat {
+                return Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "the xai/grok upstream speaks OpenAI chat completions; POST to /v1/chat/completions".to_string(),
+                ));
+            }
+            let account = state
+                .vault
+                .account_for(provider, true)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            body_json["model"] = json!(routed_model);
+            let body = serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+            Ok(UpstreamPlan {
+                url: format!("{XAI_BASE}/chat/completions"),
+                account,
+                body,
+                upstream_format: "openai-chat",
+                destream: false,
+                respond_as: None,
+                client_stream,
+                extra_headers: vec![
+                    ("x-grok-model-override".into(), routed_model.to_string()),
+                    ("x-grok-conv-id".into(), trace_id.to_string()),
+                ],
+                dario_guard: None,
+            })
+        }
+        other => Err((
+            StatusCode::NOT_IMPLEMENTED,
+            format!("upstream provider {} not supported yet", other.as_str()),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{key_fingerprint, usage_backoff_ms};
+
+    #[test]
+    fn fingerprint_is_first_8_sha256_bytes_hex() {
+        assert_eq!(key_fingerprint("abc"), "ba7816bf8f01cfea");
+        assert_eq!(key_fingerprint("abc").len(), 16);
+        assert_ne!(key_fingerprint("abc"), key_fingerprint("abd"));
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(usage_backoff_ms(1, None), 60_000);
+        assert_eq!(usage_backoff_ms(2, None), 120_000);
+        assert_eq!(usage_backoff_ms(3, None), 240_000);
+        assert_eq!(usage_backoff_ms(10, None), 3_600_000);
+    }
+
+    #[test]
+    fn retry_after_wins_when_larger() {
+        assert_eq!(usage_backoff_ms(1, Some(600_000)), 600_000);
+        assert_eq!(usage_backoff_ms(5, Some(1_000)), 960_000);
+    }
+}
+
+fn upstream_headers(
+    account: &Account,
+    client_headers: &HeaderMap,
+) -> Result<reqwest::header::HeaderMap, (StatusCode, String)> {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert("content-type", HeaderValue::from_static("application/json"));
+    h.insert("accept", HeaderValue::from_static("*/*"));
+    h.insert("accept-encoding", HeaderValue::from_static("identity"));
+    if let Some(ua) = client_headers.get("user-agent") {
+        h.insert("user-agent", ua.clone());
+    }
+    match (account.provider, account.kind.as_str()) {
+        (Provider::Anthropic, "oauth") => {
+            let token = account.access_token.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "anthropic oauth account has no access token".to_string(),
+            ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+            let mut beta = ANTHROPIC_OAUTH_BETA.to_string();
+            if let Some(client_beta) = client_headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+            {
+                if !client_beta.contains(ANTHROPIC_OAUTH_BETA) {
+                    beta = format!("{ANTHROPIC_OAUTH_BETA},{client_beta}");
+                } else {
+                    beta = client_beta.to_string();
+                }
+            }
+            h.insert(
+                "anthropic-beta",
+                HeaderValue::from_str(&beta)
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+            insert_anthropic_version(&mut h, client_headers);
+        }
+        (Provider::Anthropic, _) => {
+            let key = account
+                .api_key
+                .as_deref()
+                .or(account.access_token.as_deref())
+                .ok_or((
+                    StatusCode::BAD_GATEWAY,
+                    "anthropic account has no api key".to_string(),
+                ))?;
+            h.insert(
+                "x-api-key",
+                HeaderValue::from_str(key).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+            if let Some(client_beta) = client_headers.get("anthropic-beta") {
+                h.insert("anthropic-beta", client_beta.clone());
+            }
+            insert_anthropic_version(&mut h, client_headers);
+        }
+        (Provider::Openai, "oauth") => {
+            let token = account.access_token.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "openai oauth account has no access token".to_string(),
+            ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+            if let Some(acct) = account.chatgpt_account_id() {
+                h.insert(
+                    "chatgpt-account-id",
+                    HeaderValue::from_str(&acct)
+                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+                );
+            }
+            h.insert(
+                "openai-beta",
+                HeaderValue::from_static("responses=experimental"),
+            );
+            h.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+            let session = client_headers
+                .get("session_id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            h.insert(
+                "session_id",
+                HeaderValue::from_str(&session)
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+        }
+        (Provider::Openai, _) => {
+            let key = account.api_key.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "openai account has no api key".to_string(),
+            ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+        }
+        (Provider::Xai, _) => {
+            let token = account
+                .access_token
+                .as_deref()
+                .or(account.api_key.as_deref())
+                .ok_or((
+                    StatusCode::BAD_GATEWAY,
+                    "xai account has no access token".to_string(),
+                ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+            h.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
+            h.insert(
+                "x-grok-client-version",
+                HeaderValue::from_static(GROK_CLIENT_VERSION),
+            );
+            h.insert("user-agent", HeaderValue::from_static("xai-grok-workspace"));
+            h.insert("accept", HeaderValue::from_static("text/event-stream"));
+        }
+        _ => {}
+    }
+    Ok(h)
+}
+
+fn insert_anthropic_version(h: &mut reqwest::header::HeaderMap, client_headers: &HeaderMap) {
+    match client_headers.get("anthropic-version") {
+        Some(v) => {
+            h.insert("anthropic-version", v.clone());
+        }
+        None => {
+            h.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        }
+    }
+}
+
+fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all("x-alexandria-trace-tag")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let tags = parse_trace_tags(&values);
+    if tags.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    serde_json::to_string(&tags).ok()
+}
+
+async fn proxy(
+    state: Arc<AppState>,
+    format: ClientFormat,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+    peer: Option<std::net::SocketAddr>,
+) -> Response {
+    let client_fingerprint = match client_key(&headers) {
+        Some(k) if k == state.local_key => key_fingerprint(&k),
+        _ => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "bad or missing local key (x-api-key / Authorization: Bearer)",
+            )
+        }
+    };
+
+    let in_flight = InFlight::new(&state);
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let mut trace = TraceRecord {
+        id: trace_id.clone(),
+        ts_request_ms: now_ms(),
+        method: Some("POST".into()),
+        path: Some(path.into()),
+        client_format: Some(format.as_str().into()),
+        harness: headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from),
+        req_headers_json: Some(redacted_headers(&headers)),
+        run_id: headers
+            .get("x-alexandria-run-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from),
+        tags: trace_tags_json(&headers),
+        client_ip: peer.map(|p| p.ip().to_string()),
+        key_fingerprint: Some(client_fingerprint),
+        ..Default::default()
+    };
+
+    let mut body_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("body is not JSON: {e}"))
+        }
+    };
+
+    trace.session_id = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| body_json["metadata"]["user_id"].as_str().map(String::from));
+
+    let requested_model = body_json["model"].as_str().unwrap_or("").to_string();
+    if requested_model.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'model' in request body");
+    }
+    let (routed_provider, routed_model) = route_model(&requested_model);
+    let provider = routed_provider.unwrap_or_else(|| format.default_provider());
+    trace.requested_model = Some(requested_model.clone());
+    trace.routed_model = Some(routed_model.clone());
+    trace.upstream_provider = Some(provider.as_str().into());
+    trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
+
+    let mut plan = match plan_upstream(
+        &state,
+        format,
+        provider,
+        &routed_model,
+        &mut body_json,
+        &body,
+        &trace_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err((status, msg)) => {
+            trace.status = Some(status.as_u16() as i64);
+            trace.error = Some(msg.clone());
+            finalize_trace(&state, trace, &body, None, None);
+            return error_response(status, &msg);
+        }
+    };
+    trace.upstream_format = Some(plan.upstream_format.into());
+    trace.account_id = Some(plan.account.id.clone());
+    trace.billing_bucket = Some(
+        if plan.account.kind == "oauth" || plan.account.kind == "dario" {
+            "subscription"
+        } else {
+            "api"
+        }
+        .into(),
+    );
+
+    tracing::info!(
+        trace_id,
+        model = %routed_model,
+        provider = provider.as_str(),
+        account = %plan.account.id,
+        url = %plan.url,
+        "proxying request"
+    );
+
+    let mut account = plan.account.clone();
+    let mut upstream_resp = None;
+    for attempt in 0..2 {
+        let mut up_headers = match upstream_headers(&account, &headers) {
+            Ok(h) => h,
+            Err((status, msg)) => {
+                trace.status = Some(status.as_u16() as i64);
+                trace.error = Some(msg.clone());
+                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                return error_response(status, &msg);
+            }
+        };
+        for (k, v) in &plan.extra_headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                up_headers.insert(name, value);
+            }
+        }
+        let resp = match state
+            .http
+            .post(&plan.url)
+            .headers(up_headers)
+            .body(plan.body.clone())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("upstream request failed: {e}");
+                suspect_dario(&state, &account);
+                trace.status = Some(502);
+                trace.error = Some(msg.clone());
+                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                return error_response(StatusCode::BAD_GATEWAY, &msg);
+            }
+        };
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && account.kind != "dario" {
+            let retry_after_s = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(60)
+                .clamp(1, 3600);
+            tracing::warn!(
+                account = %account.id,
+                retry_after_s,
+                "upstream returned 429; cooling account down"
+            );
+            if let Err(e) = state
+                .vault
+                .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
+                .await
+            {
+                tracing::warn!("failed to mark cooldown: {e}");
+            }
+        }
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && account.kind == "oauth"
+            && attempt == 0
+        {
+            tracing::warn!(
+                account = %account.id,
+                "upstream returned 401 for oauth account; forcing token refresh and retrying"
+            );
+            match state.vault.refresh(&account.id, true).await {
+                Ok(fresh) => {
+                    account = fresh;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("forced refresh failed: {e}");
+                }
+            }
+        }
+        upstream_resp = Some(resp);
+        break;
+    }
+    let upstream_resp = upstream_resp.expect("upstream response after retry loop");
+
+    let status = upstream_resp.status();
+    trace.status = Some(status.as_u16() as i64);
+    let resp_headers = upstream_resp.headers().clone();
+    let content_type = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    trace.resp_headers_json = Some(redacted_headers(&resp_headers));
+    let is_sse = content_type.starts_with("text/event-stream");
+
+    if let Some(target) = plan.respond_as {
+        use alexandria_core::translate;
+        let buf = match upstream_resp.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                let msg = format!("upstream body read failed: {e}");
+                suspect_dario(&state, &account);
+                trace.status = Some(502);
+                trace.error = Some(msg.clone());
+                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                return error_response(StatusCode::BAD_GATEWAY, &msg);
+            }
+        };
+        drop(plan.dario_guard.take());
+        trace.ts_response_ms = Some(now_ms());
+        fill_usage_and_cost(&state, &mut trace, &buf, is_sse);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if !status.is_success() {
+            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            return Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .header("x-alexandria-trace-id", &trace_id)
+                .body(Body::from(buf))
+                .unwrap_or_else(|e| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                });
+        }
+        let trimmed = text.trim_start();
+        let looks_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+        let upstream_final = if plan.upstream_format == "anthropic" {
+            if is_sse || looks_sse {
+                translate::parse_anthropic_sse_to_message(&text)
+            } else {
+                serde_json::from_str(&text).ok()
+            }
+        } else if is_sse || looks_sse {
+            translate::parse_responses_sse_final(&text)
+        } else {
+            serde_json::from_str(&text).ok()
+        };
+        let Some(upstream_final) = upstream_final else {
+            let msg = "could not reassemble upstream response for translation";
+            trace.error = Some(msg.to_string());
+            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            return error_response(StatusCode::BAD_GATEWAY, msg);
+        };
+        let out = match (target, plan.upstream_format) {
+            (RespondAs::OpenaiChat, "anthropic") => {
+                translate::anthropic_response_to_openai_chat(&upstream_final, &requested_model)
+            }
+            (RespondAs::OpenaiResponses, "anthropic") => translate::anthropic_response_to_openai_responses(
+                &upstream_final,
+                &requested_model,
+            ),
+            (RespondAs::Anthropic, "anthropic") | (RespondAs::OpenaiResponses, _) => {
+                upstream_final.clone()
+            }
+            (RespondAs::Anthropic, _) => {
+                translate::responses_final_to_anthropic(&upstream_final, &requested_model)
+            }
+            (RespondAs::OpenaiChat, _) => {
+                translate::responses_final_to_openai_chat(&upstream_final, &requested_model)
+            }
+        };
+        let (out_ct, out_body) = if plan.client_stream {
+            let sse = match target {
+                RespondAs::Anthropic => translate::synth_anthropic_sse(&out),
+                RespondAs::OpenaiChat => translate::synth_openai_chat_sse(&out),
+                RespondAs::OpenaiResponses => translate::synth_openai_responses_sse(&out),
+            };
+            ("text/event-stream", sse.into_bytes())
+        } else {
+            (
+                "application/json",
+                serde_json::to_vec(&out).unwrap_or_default(),
+            )
+        };
+        finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", out_ct)
+            .header("x-alexandria-trace-id", &trace_id)
+            .body(Body::from(out_body))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
+
+    if plan.destream {
+        let buf = match upstream_resp.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                let msg = format!("upstream body read failed: {e}");
+                trace.status = Some(502);
+                trace.error = Some(msg.clone());
+                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                return error_response(StatusCode::BAD_GATEWAY, &msg);
+            }
+        };
+        trace.ts_response_ms = Some(now_ms());
+        fill_usage_and_cost(&state, &mut trace, &buf, is_sse);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let (out_status, out_body) = if status.is_success() {
+            match extract_final_response(&text) {
+                Some(v) => (StatusCode::OK, serde_json::to_vec(&v).unwrap_or_default()),
+                None => {
+                    let msg = "upstream stream ended without a response.completed event";
+                    trace.error = Some(msg.to_string());
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_vec(
+                            &json!({"error": {"type": "alexandria", "message": msg}}),
+                        )
+                        .unwrap_or_default(),
+                    )
+                }
+            }
+        } else {
+            (status, buf.clone())
+        };
+        finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+        return Response::builder()
+            .status(out_status)
+            .header("content-type", "application/json")
+            .header("x-alexandria-trace-id", &trace_id)
+            .body(Body::from(out_body))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let mut upstream_stream = upstream_resp.bytes_stream();
+    let state2 = state.clone();
+    let client_body = body.clone();
+    let upstream_body = plan.body.clone();
+    let dario_guard = plan.dario_guard.take();
+    tokio::spawn(async move {
+        let _dario_guard = dario_guard;
+        let _in_flight = in_flight;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream_error: Option<String> = None;
+        while let Some(chunk) = upstream_stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    buf.extend_from_slice(&b);
+                    let _ = tx.send(Ok(b)).await;
+                }
+                Err(e) => {
+                    stream_error = Some(format!("upstream stream error: {e}"));
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )))
+                        .await;
+                    break;
+                }
+            }
+        }
+        drop(tx);
+        trace.ts_response_ms = Some(now_ms());
+        if trace.error.is_none() {
+            trace.error = stream_error;
+        }
+        if trace.error.is_some() {
+            if let (Some(dario), Some(gen)) = (
+                &state2.dario,
+                trace
+                    .account_id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("dario:")),
+            ) {
+                dario.suspect(gen);
+            }
+        }
+
+        fill_usage_and_cost(&state2, &mut trace, &buf, is_sse);
+        finalize_trace(
+            &state2,
+            trace,
+            &client_body,
+            Some(&upstream_body),
+            Some(&buf),
+        );
+    });
+
+    let mut response = Response::builder().status(status);
+    for (k, v) in resp_headers.iter() {
+        let key = k.as_str().to_lowercase();
+        if [
+            "transfer-encoding",
+            "connection",
+            "content-encoding",
+            "content-length",
+        ]
+        .contains(&key.as_str())
+        {
+            continue;
+        }
+        response = response.header(k, v);
+    }
+    response = response.header("x-alexandria-trace-id", &trace_id);
+    response
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is_sse: bool) {
+    let text = String::from_utf8_lossy(buf);
+    let trimmed = text.trim_start();
+    let looks_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    trace.usage = if is_sse || looks_sse {
+        parse_sse_usage(&text)
+    } else {
+        serde_json::from_str::<Value>(&text)
+            .map(|v| usage_from_json(&v))
+            .unwrap_or_default()
+    };
+    if !trace.usage.is_empty() {
+        if let Some(pricing) = trace
+            .routed_model
+            .as_deref()
+            .and_then(|m| state.store.pricing_for(m))
+        {
+            let input_includes_cached = trace
+                .upstream_format
+                .as_deref()
+                .map(|f| f.starts_with("openai"))
+                .unwrap_or(false);
+            trace.cost_usd = Some(compute_cost(&trace.usage, &pricing, input_includes_cached));
+        }
+    }
+}
+
+fn extract_final_response(text: &str) -> Option<Value> {
+    let mut last: Option<Value> = None;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if matches!(
+            v["type"].as_str(),
+            Some("response.completed") | Some("response.incomplete") | Some("response.failed")
+        ) && v["response"].is_object()
+        {
+            last = Some(v["response"].clone());
+        }
+    }
+    last
+}
+
+fn finalize_trace(
+    state: &AppState,
+    mut trace: TraceRecord,
+    client_body: &[u8],
+    upstream_body: Option<&[u8]>,
+    resp_body: Option<&[u8]>,
+) {
+    let store = &state.store;
+    match store.write_body(&trace.id, "request.json", client_body) {
+        Ok(p) => trace.req_body_path = Some(p),
+        Err(e) => tracing::warn!("failed to write request body: {e}"),
+    }
+    if let Some(up) = upstream_body {
+        if up != client_body {
+            match store.write_body(&trace.id, "upstream-request.json", up) {
+                Ok(p) => trace.upstream_req_body_path = Some(p),
+                Err(e) => tracing::warn!("failed to write upstream request body: {e}"),
+            }
+        }
+    }
+    if let Some(resp) = resp_body {
+        match store.write_body(&trace.id, "response.body", resp) {
+            Ok(p) => trace.resp_body_path = Some(p),
+            Err(e) => tracing::warn!("failed to write response body: {e}"),
+        }
+    }
+    if let Err(e) = store.insert_trace(&trace) {
+        tracing::error!("failed to insert trace {}: {e}", trace.id);
+    } else {
+        tracing::info!(
+            trace_id = %trace.id,
+            status = trace.status,
+            input = trace.usage.input_tokens,
+            output = trace.usage.output_tokens,
+            cost = trace.cost_usd,
+            "trace recorded"
+        );
+    }
+}

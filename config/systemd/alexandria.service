@@ -1,0 +1,19 @@
+[Unit]
+Description=Alexandria LLM proxy daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/alexandria daemon
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info,alexandria=debug
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=%h/.alexandria %h/.npm
+PrivateTmp=true
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target

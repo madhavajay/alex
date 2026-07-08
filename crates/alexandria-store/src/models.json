@@ -1,0 +1,156 @@
+[
+  {
+    "model": "claude-opus-4-8",
+    "input_per_m": 5.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 6.25,
+    "output_per_m": 25.0
+  },
+  {
+    "model": "claude-sonnet-5",
+    "input_per_m": 3.0,
+    "cached_input_per_m": 0.3,
+    "cache_creation_per_m": 3.75,
+    "output_per_m": 15.0
+  },
+  {
+    "model": "gpt-5.5-codex",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-5.5",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "grok-code-fast-1",
+    "input_per_m": 0.2,
+    "cached_input_per_m": 0.02,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 1.5
+  },
+  {
+    "model": "grok-4",
+    "input_per_m": 3.0,
+    "cached_input_per_m": 0.75,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 15.0
+  },
+  {
+    "model": "claude-opus-4-5",
+    "input_per_m": 5.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 6.25,
+    "output_per_m": 25.0
+  },
+  {
+    "model": "claude-opus-4-1",
+    "input_per_m": 15.0,
+    "cached_input_per_m": 1.5,
+    "cache_creation_per_m": 18.75,
+    "output_per_m": 75.0
+  },
+  {
+    "model": "claude-opus-4",
+    "input_per_m": 15.0,
+    "cached_input_per_m": 1.5,
+    "cache_creation_per_m": 18.75,
+    "output_per_m": 75.0
+  },
+  {
+    "model": "claude-sonnet-4-5",
+    "input_per_m": 3.0,
+    "cached_input_per_m": 0.3,
+    "cache_creation_per_m": 3.75,
+    "output_per_m": 15.0
+  },
+  {
+    "model": "claude-sonnet-4",
+    "input_per_m": 3.0,
+    "cached_input_per_m": 0.3,
+    "cache_creation_per_m": 3.75,
+    "output_per_m": 15.0
+  },
+  {
+    "model": "claude-haiku-4-5",
+    "input_per_m": 1.0,
+    "cached_input_per_m": 0.1,
+    "cache_creation_per_m": 1.25,
+    "output_per_m": 5.0
+  },
+  {
+    "model": "claude-3-5-haiku",
+    "input_per_m": 0.8,
+    "cached_input_per_m": 0.08,
+    "cache_creation_per_m": 1.0,
+    "output_per_m": 4.0
+  },
+  {
+    "model": "gpt-5.1-codex",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-5.1",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-5-codex",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-5-mini",
+    "input_per_m": 0.25,
+    "cached_input_per_m": 0.025,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 2.0
+  },
+  {
+    "model": "gpt-5",
+    "input_per_m": 1.25,
+    "cached_input_per_m": 0.125,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-4o",
+    "input_per_m": 2.5,
+    "cached_input_per_m": 1.25,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 10.0
+  },
+  {
+    "model": "gpt-4.1",
+    "input_per_m": 2.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 8.0
+  },
+  {
+    "model": "o3",
+    "input_per_m": 2.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 8.0
+  },
+  {
+    "model": "o4-mini",
+    "input_per_m": 1.1,
+    "cached_input_per_m": 0.275,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 4.4
+  }
+]
