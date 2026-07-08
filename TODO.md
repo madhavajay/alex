@@ -236,7 +236,14 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
       rate-limit response headers).
 - [x] Rolling-window analytics (`GET /admin/analytics?since_minutes=` — per-model
       requests/tokens/cost/errors/latency + billing-bucket split).
-- [ ] Live trace stream (SSE) + `alexandria tui` live view (ratatui).
+- [x] `alexandria tui` live view (ratatui): sessions tab (grouped, ping-filtered),
+      Enter → live transcript follow, limits gauges, accounts, dario tabs.
+      (Polling-based; a push SSE trace stream remains a possible optimization.)
+- [x] Shipped beyond plan: run keys (`/admin/run-keys`, `alex keys`) for
+      harness-agnostic run attribution; metadata headers (harness/task/model/job/
+      phase/kind) → tags; sessions + transcript API with tool_calls; body-text
+      search; `/traces/{id}/body/{kind}`; AlexandriaBar macOS app (menu bar +
+      Trace Browser + Dario window); `GET /admin/storage` retention (§ M8+).
 - [x] Query CLI: `alexandria traces --session … --model …`.
 
 ### M6 — Dario runtime + generational supervisor (see §10)
