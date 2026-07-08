@@ -327,6 +327,10 @@ struct Config {
     ping_openai_model: String,
     #[serde(default = "default_ping_xai")]
     ping_xai_model: String,
+    #[serde(default = "default_ping_gemini")]
+    ping_gemini_model: String,
+    #[serde(default)]
+    gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
     anthropic_upstream: String,
     #[serde(default)]
@@ -359,6 +363,10 @@ fn default_ping_xai() -> String {
     "grok-code-fast-1".into()
 }
 
+fn default_ping_gemini() -> String {
+    "gemini-2.5-flash".into()
+}
+
 fn default_anthropic_upstream() -> String {
     "direct".into()
 }
@@ -385,6 +393,7 @@ impl Config {
             anthropic: self.ping_anthropic_model.clone(),
             openai: self.ping_openai_model.clone(),
             xai: self.ping_xai_model.clone(),
+            gemini: self.ping_gemini_model.clone(),
         }
     }
 
@@ -439,6 +448,8 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         port: 4100,
         data_dir: home.clone(),
         local_key: random_key("alx"),
+        ping_gemini_model: default_ping_gemini(),
+        gemini_project: String::new(),
         heartbeat_minutes: default_heartbeat_minutes(),
         ping_anthropic_model: default_ping_anthropic(),
         ping_openai_model: default_ping_openai(),
@@ -622,6 +633,15 @@ async fn main() -> Result<()> {
             let vault = Arc::new(open_vault(&config)?);
             if vault.list().await.is_empty() {
                 eprintln!("warning: no accounts in vault — run `alexandria auth import` first");
+            }
+            if !config.gemini_project.is_empty() {
+                let _ = vault
+                    .set_account_meta(
+                        "gemini-oauth",
+                        "project_id",
+                        serde_json::json!(config.gemini_project),
+                    )
+                    .await;
             }
             let mut dario_router: Option<Arc<dyn alex_proxy::DarioRouter>> = None;
             let mut supervisor: Option<Arc<dario::DarioSupervisor>> = None;
@@ -847,6 +867,7 @@ async fn main() -> Result<()> {
                             alex_core::Provider::Anthropic
                                 | alex_core::Provider::Openai
                                 | alex_core::Provider::Xai
+                                | alex_core::Provider::Gemini
                         )
                         && !seen.contains(&a.provider)
                     {
@@ -1721,7 +1742,7 @@ async fn run_pings(
         alex_core::Provider::Anthropic => models.anthropic.clone(),
         alex_core::Provider::Openai => models.openai.clone(),
         alex_core::Provider::Xai => models.xai.clone(),
-        alex_core::Provider::Gemini => "-".into(),
+        alex_core::Provider::Gemini => models.gemini.clone(),
     };
     if std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
@@ -2597,6 +2618,8 @@ mod tests {
             ping_anthropic_model: default_ping_anthropic(),
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
+            ping_gemini_model: default_ping_gemini(),
+            gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_api_key: String::new(),
             dario_update_check_minutes: 60,

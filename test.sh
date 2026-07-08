@@ -262,6 +262,10 @@ build_body() {
       printf '{"model":"%s","stream":%s,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}' \
         "$model" "$s" "$PROMPT"
       ;;
+    gemini)
+      printf '{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":%s}}' \
+        "$PROMPT" "$maxtok"
+      ;;
   esac
 }
 
@@ -280,7 +284,8 @@ W9|openai-chat|/v1/chat/completions|grok-code-fast-1|xai|openai-|subscription|xa
 W10|anthropic|/v1/messages|claude-opus-4-8|anthropic|anthropic|subscription|anthropic|0|0|claude-opus-4-8|1
 W11a|openai-chat|/v1/chat/completions|alexandria/gpt-5.5|openai|openai-|subscription|openai|0|0|gpt-5.5|0
 W11b|anthropic|/v1/messages|opus-4.8|anthropic|anthropic|subscription|anthropic|0|0|claude-opus-4-8|0
-W12|gemini|-|gemini-pro|gemini|-|-|gemini|0|0|-|0
+W12|gemini|/v1beta/models/gpt-5.5:generateContent|gpt-5.5|openai|openai-|subscription|openai|0|1|gpt-5.5|0
+W13|gemini|/v1beta/models/gpt-5.5:streamGenerateContent?alt=sse|gpt-5.5|openai|openai-|subscription|openai|1|1|gpt-5.5|0
 EOF
 }
 
@@ -478,10 +483,6 @@ select_wire() {
     if [ -z "$id" ]; then continue; fi
     in_only "$id" || continue
     if [ -n "$PROVIDER_FILTER" ] && [ "$needs" != "$PROVIDER_FILTER" ]; then continue; fi
-    if [ "$id" = "W12" ]; then
-      write_result W12 SKIP 0 "gemini generateContent path undecided (TODO section 8.5)"
-      continue
-    fi
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$id" "$fmt" "$ep" "$model" "$provider" "$fprefix" "$bucket" "$needs" \
       "$stream" "$cross" "$routed" "$dflag" >> "$TMP/wire.cells"

@@ -24,6 +24,8 @@ const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const XAI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION: &str = "0.2.77";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
+const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 
 #[derive(Debug, Clone)]
 pub struct DarioActive {
@@ -927,6 +929,7 @@ pub struct PingModels {
     pub anthropic: String,
     pub openai: String,
     pub xai: String,
+    pub gemini: String,
 }
 
 pub async fn ping_provider(
@@ -968,16 +971,15 @@ pub async fn ping_provider(
                 "messages": [{"role": "user", "content": prompt}],
             }),
         ),
-        other => {
-            return PingResult {
-                provider: other.as_str(),
-                account_id: None,
-                ok: false,
-                status: None,
-                latency_ms: 0,
-                message: "upstream not supported yet".into(),
-            }
-        }
+        Provider::Gemini => (
+            ClientFormat::GeminiGenerate,
+            "/v1beta/models/:generateContent",
+            json!({
+                "model": models.gemini,
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 64},
+            }),
+        ),
     };
     let account_id = state
         .vault
@@ -1059,7 +1061,7 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
             if a.status == "active"
                 && matches!(
                     a.provider,
-                    Provider::Anthropic | Provider::Openai | Provider::Xai
+                    Provider::Anthropic | Provider::Openai | Provider::Xai | Provider::Gemini
                 )
                 && !seen.contains(&a.provider)
             {
@@ -1269,6 +1271,101 @@ fn dario_account(active: &DarioActive) -> Account {
         cooldown_until_ms: None,
         status: "active".into(),
     }
+}
+
+async fn ensure_gemini_project(
+    state: &AppState,
+    account: &Account,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(p) = account.account_meta.get("project_id").and_then(|v| v.as_str()) {
+        if !p.is_empty() {
+            return Ok(p.to_string());
+        }
+    }
+    if let Ok(env_p) = std::env::var("GOOGLE_CLOUD_PROJECT") {
+        if !env_p.is_empty() {
+            let _ = state
+                .vault
+                .set_account_meta(&account.id, "project_id", json!(env_p))
+                .await;
+            return Ok(env_p);
+        }
+    }
+    let token = account
+        .access_token
+        .as_deref()
+        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "gemini account has no access token".into()))?;
+    let load_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
+    let load_body = json!({
+        "cloudaicompanionProject": null,
+        "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"},
+    });
+    let resp = state
+        .http
+        .post(&load_url)
+        .header("authorization", format!("Bearer {token}"))
+        .json(&load_body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("loadCodeAssist failed: {e}")))?;
+    let load: Value = resp.json().await.unwrap_or(Value::Null);
+    let extract = |v: &Value| -> Option<String> {
+        for key in ["cloudaicompanionProject", "projectId", "project"] {
+            match &v[key] {
+                Value::String(s) if !s.is_empty() => return Some(s.clone()),
+                obj if obj["id"].is_string() => {
+                    return obj["id"].as_str().map(String::from)
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    if let Some(p) = extract(&load) {
+        let _ = state
+            .vault
+            .set_account_meta(&account.id, "project_id", json!(p))
+            .await;
+        return Ok(p);
+    }
+    let tier = load["allowedTiers"]
+        .as_array()
+        .and_then(|tiers| tiers.iter().find(|t| t["isDefault"] == json!(true)))
+        .and_then(|t| t["id"].as_str())
+        .unwrap_or("free-tier")
+        .to_string();
+    let onboard_url =
+        format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
+    let onboard_body = json!({
+        "tierId": tier,
+        "cloudaicompanionProject": load["cloudaicompanionProject"],
+        "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"},
+    });
+    for _ in 0..5 {
+        let resp = state
+            .http
+            .post(&onboard_url)
+            .header("authorization", format!("Bearer {token}"))
+            .json(&onboard_body)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("onboardUser failed: {e}")))?;
+        let lro: Value = resp.json().await.unwrap_or(Value::Null);
+        if lro["done"] == json!(true) {
+            if let Some(p) = extract(&lro["response"]) {
+                let _ = state
+                    .vault
+                    .set_account_meta(&account.id, "project_id", json!(p))
+                    .await;
+                return Ok(p);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "gemini Code Assist onboarding did not return a project id (set GOOGLE_CLOUD_PROJECT to override)".into(),
+    ))
 }
 
 async fn plan_upstream(
@@ -1494,10 +1591,68 @@ async fn plan_upstream(
                 dario_guard: None,
             })
         }
-        other => Err((
-            StatusCode::NOT_IMPLEMENTED,
-            format!("upstream provider {} not supported yet", other.as_str()),
-        )),
+        Provider::Gemini => {
+            let account = state
+                .vault
+                .account_for(provider, true)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let project = ensure_gemini_project(state, &account).await?;
+            let (gemini_req, respond_as) = match format {
+                ClientFormat::GeminiGenerate => {
+                    let mut g = body_json.clone();
+                    if let Some(o) = g.as_object_mut() {
+                        o.remove("model");
+                        o.remove("stream");
+                    }
+                    (g, None)
+                }
+                ClientFormat::AnthropicMessages => (
+                    translate::anthropic_to_gemini_request(body_json),
+                    Some(RespondAs::Anthropic),
+                ),
+                ClientFormat::OpenaiChat => (
+                    translate::anthropic_to_gemini_request(&translate::openai_chat_to_anthropic(
+                        body_json,
+                    )),
+                    Some(RespondAs::OpenaiChat),
+                ),
+                ClientFormat::OpenaiResponses => (
+                    translate::anthropic_to_gemini_request(
+                        &translate::openai_responses_to_anthropic(body_json),
+                    ),
+                    Some(RespondAs::OpenaiResponses),
+                ),
+            };
+            let method = if client_stream {
+                "streamGenerateContent"
+            } else {
+                "generateContent"
+            };
+            let envelope = json!({
+                "model": routed_model,
+                "project": project,
+                "request": gemini_req,
+            });
+            let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| original_body.to_vec());
+            let mut url = format!(
+                "{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
+            );
+            if client_stream {
+                url.push_str("?alt=sse");
+            }
+            Ok(UpstreamPlan {
+                url,
+                account,
+                body,
+                upstream_format: "gemini",
+                destream: false,
+                respond_as: respond_as.or(Some(RespondAs::Gemini)),
+                client_stream,
+                extra_headers: vec![],
+                dario_guard: None,
+            })
+        }
     }
 }
 
@@ -1766,6 +1921,17 @@ fn upstream_headers(
             );
             h.insert("user-agent", HeaderValue::from_static("xai-grok-workspace"));
             h.insert("accept", HeaderValue::from_static("text/event-stream"));
+        }
+        (Provider::Gemini, _) => {
+            let token = account.access_token.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "gemini account has no access token".to_string(),
+            ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
         }
         _ => {}
     }
@@ -2249,6 +2415,8 @@ async fn proxy(
             } else {
                 serde_json::from_str(&text).ok()
             }
+        } else if plan.upstream_format == "gemini" {
+            translate::parse_gemini_upstream_final(&text)
         } else if is_sse || looks_sse {
             translate::parse_responses_sse_final(&text)
         } else {
@@ -2261,6 +2429,20 @@ async fn proxy(
             return error_response(StatusCode::BAD_GATEWAY, msg);
         };
         let out = match (target, plan.upstream_format) {
+            (RespondAs::Gemini, "gemini") => upstream_final.clone(),
+            (RespondAs::Anthropic, "gemini") => {
+                translate::gemini_response_to_anthropic(&upstream_final, &requested_model)
+            }
+            (RespondAs::OpenaiChat, "gemini") => translate::anthropic_response_to_openai_chat(
+                &translate::gemini_response_to_anthropic(&upstream_final, &requested_model),
+                &requested_model,
+            ),
+            (RespondAs::OpenaiResponses, "gemini") => {
+                translate::anthropic_response_to_openai_responses(
+                    &translate::gemini_response_to_anthropic(&upstream_final, &requested_model),
+                    &requested_model,
+                )
+            }
             (RespondAs::OpenaiChat, "anthropic") => {
                 translate::anthropic_response_to_openai_chat(&upstream_final, &requested_model)
             }

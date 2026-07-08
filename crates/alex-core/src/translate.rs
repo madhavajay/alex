@@ -825,6 +825,28 @@ pub fn last_user_text(format_str: &str, req: &Value) -> Option<String> {
             }
             None
         }
+        "gemini" => {
+            for c in req["contents"].as_array().into_iter().flatten().rev() {
+                if c["role"].as_str().unwrap_or("user") != "user" {
+                    continue;
+                }
+                let text = gemini_parts_text(&c["parts"]);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+                if let Some(fr) = c["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["functionResponse"].is_object())
+                {
+                    return Some(tool_result_snip(
+                        &fr["functionResponse"]["response"].to_string(),
+                    ));
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -895,8 +917,416 @@ pub fn assistant_reply_text(upstream_format: &str, resp_text: &str) -> Option<St
             };
             responses_output_text(&resp)
         }
+        "gemini" => {
+            if is_sse {
+                let mut out = String::new();
+                for v in sse_datas(resp_text) {
+                    out.push_str(&gemini_parts_text(&v["candidates"][0]["content"]["parts"]));
+                }
+                (!out.is_empty()).then_some(out)
+            } else {
+                let v: Value = serde_json::from_str(resp_text).ok()?;
+                let text = gemini_parts_text(&v["candidates"][0]["content"]["parts"]);
+                (!text.is_empty()).then_some(text)
+            }
+        }
         _ => None,
     }
+}
+
+pub(crate) fn gemini_parts_text(parts: &Value) -> String {
+    parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn gemini_to_anthropic(req: &Value) -> Value {
+    let mut msgs = Vec::new();
+    let mut call_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut call_counter = 0usize;
+    for content in req["contents"].as_array().into_iter().flatten() {
+        let role = content["role"].as_str().unwrap_or("user");
+        let mut blocks = Vec::new();
+        for part in content["parts"].as_array().into_iter().flatten() {
+            if let Some(t) = part["text"].as_str() {
+                if !t.is_empty() {
+                    blocks.push(json!({"type": "text", "text": t}));
+                }
+            } else if part["functionCall"].is_object() {
+                call_counter += 1;
+                let name = part["functionCall"]["name"].as_str().unwrap_or("");
+                let id = format!("toolu_gemini_{call_counter}");
+                call_ids.insert(name.to_string(), id.clone());
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": if part["functionCall"]["args"].is_object() {
+                        part["functionCall"]["args"].clone()
+                    } else {
+                        json!({})
+                    },
+                }));
+            } else if part["functionResponse"].is_object() {
+                let name = part["functionResponse"]["name"].as_str().unwrap_or("");
+                let id = call_ids
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("toolu_gemini_{name}"));
+                let payload = &part["functionResponse"]["response"];
+                let text = match payload {
+                    Value::String(s) => s.clone(),
+                    v if v.is_null() => String::new(),
+                    v => v.to_string(),
+                };
+                blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": [{"type": "text", "text": text}],
+                }));
+            }
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        let a_role = if role == "model" { "assistant" } else { "user" };
+        msgs.push(json!({"role": a_role, "content": blocks}));
+    }
+    let mut o = Map::new();
+    put(&mut o, "model", &req["model"]);
+    let system = gemini_parts_text(&req["systemInstruction"]["parts"]);
+    if !system.trim().is_empty() {
+        o.insert("system".to_string(), Value::String(system));
+    }
+    o.insert("messages".to_string(), Value::Array(msgs));
+    let tools: Vec<Value> = req["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|t| t["functionDeclarations"].as_array().cloned().unwrap_or_default())
+        .map(|fd| {
+            let mut tool = Map::new();
+            put(&mut tool, "name", &fd["name"]);
+            put(&mut tool, "description", &fd["description"]);
+            if fd["parameters"].is_object() {
+                tool.insert("input_schema".to_string(), fd["parameters"].clone());
+            } else {
+                tool.insert("input_schema".to_string(), json!({"type": "object"}));
+            }
+            Value::Object(tool)
+        })
+        .collect();
+    if !tools.is_empty() {
+        o.insert("tools".to_string(), Value::Array(tools));
+    }
+    match req["toolConfig"]["functionCallingConfig"]["mode"].as_str() {
+        Some("ANY") => {
+            o.insert("tool_choice".to_string(), json!({"type": "any"}));
+        }
+        Some("AUTO") => {
+            o.insert("tool_choice".to_string(), json!({"type": "auto"}));
+        }
+        _ => {}
+    }
+    let g = &req["generationConfig"];
+    let max = g["maxOutputTokens"].as_i64().unwrap_or(8192);
+    o.insert("max_tokens".to_string(), json!(max));
+    put(&mut o, "temperature", &g["temperature"]);
+    put(&mut o, "top_p", &g["topP"]);
+    if let Some(stops) = g["stopSequences"].as_array() {
+        if !stops.is_empty() {
+            o.insert("stop_sequences".to_string(), Value::Array(stops.clone()));
+        }
+    }
+    Value::Object(o)
+}
+
+fn stop_to_gemini_finish(stop: Option<&str>) -> &'static str {
+    match stop {
+        Some("max_tokens") => "MAX_TOKENS",
+        _ => "STOP",
+    }
+}
+
+pub fn anthropic_response_to_gemini(resp: &Value, model: &str) -> Value {
+    let mut parts = Vec::new();
+    for b in resp["content"].as_array().into_iter().flatten() {
+        match b["type"].as_str() {
+            Some("text") => {
+                parts.push(json!({"text": b["text"].as_str().unwrap_or("")}));
+            }
+            Some("tool_use") => {
+                parts.push(json!({
+                    "functionCall": {"name": b["name"], "args": b["input"].clone()},
+                }));
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        parts.push(json!({"text": ""}));
+    }
+    let u = &resp["usage"];
+    let pt = u["input_tokens"].as_i64().unwrap_or(0)
+        + u["cache_read_input_tokens"].as_i64().unwrap_or(0);
+    let ct = u["output_tokens"].as_i64().unwrap_or(0);
+    json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": parts},
+            "finishReason": stop_to_gemini_finish(resp["stop_reason"].as_str()),
+            "index": 0,
+        }],
+        "usageMetadata": {
+            "promptTokenCount": pt,
+            "candidatesTokenCount": ct,
+            "totalTokenCount": pt + ct,
+            "cachedContentTokenCount": u["cache_read_input_tokens"].as_i64().unwrap_or(0),
+        },
+        "modelVersion": model,
+    })
+}
+
+pub fn anthropic_to_gemini_request(req: &Value) -> Value {
+    let mut contents = Vec::new();
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for m in req["messages"].as_array().into_iter().flatten() {
+        let role = if m["role"] == "assistant" { "model" } else { "user" };
+        let mut parts = Vec::new();
+        match &m["content"] {
+            Value::String(s) => {
+                if !s.is_empty() {
+                    parts.push(json!({"text": s}));
+                }
+            }
+            Value::Array(blocks) => {
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("text") => {
+                            parts.push(json!({"text": b["text"].as_str().unwrap_or("")}));
+                        }
+                        Some("tool_use") => {
+                            let id = b["id"].as_str().unwrap_or("").to_string();
+                            let name = b["name"].as_str().unwrap_or("").to_string();
+                            tool_names.insert(id, name.clone());
+                            parts.push(json!({
+                                "functionCall": {"name": name, "args": b["input"].clone()},
+                            }));
+                        }
+                        Some("tool_result") => {
+                            let id = b["tool_use_id"].as_str().unwrap_or("");
+                            let name = tool_names
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| id.to_string());
+                            parts.push(json!({
+                                "functionResponse": {
+                                    "name": name,
+                                    "response": {"result": txt(&b["content"])},
+                                },
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !parts.is_empty() {
+            contents.push(json!({"role": role, "parts": parts}));
+        }
+    }
+    let mut o = Map::new();
+    o.insert("contents".to_string(), Value::Array(contents));
+    let system = txt(&req["system"]);
+    if !system.is_empty() {
+        o.insert(
+            "systemInstruction".to_string(),
+            json!({"parts": [{"text": system}]}),
+        );
+    }
+    let decls: Vec<Value> = req["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            json!({
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": if t["input_schema"].is_object() {
+                    t["input_schema"].clone()
+                } else {
+                    json!({"type": "object"})
+                },
+            })
+        })
+        .collect();
+    if !decls.is_empty() {
+        o.insert(
+            "tools".to_string(),
+            json!([{"functionDeclarations": decls}]),
+        );
+    }
+    let mut g = Map::new();
+    put(&mut g, "temperature", &req["temperature"]);
+    put(&mut g, "topP", &req["top_p"]);
+    put(&mut g, "maxOutputTokens", &req["max_tokens"]);
+    if let Some(stops) = req["stop_sequences"].as_array() {
+        if !stops.is_empty() {
+            g.insert("stopSequences".to_string(), Value::Array(stops.clone()));
+        }
+    }
+    if !g.is_empty() {
+        o.insert("generationConfig".to_string(), Value::Object(g));
+    }
+    Value::Object(o)
+}
+
+pub fn gemini_response_to_anthropic(resp: &Value, model: &str) -> Value {
+    let mut content = Vec::new();
+    let mut saw_tool = false;
+    let mut call_counter = 0usize;
+    for part in resp["candidates"][0]["content"]["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(t) = part["text"].as_str() {
+            if !t.is_empty() {
+                content.push(json!({"type": "text", "text": t}));
+            }
+        } else if part["functionCall"].is_object() {
+            saw_tool = true;
+            call_counter += 1;
+            content.push(json!({
+                "type": "tool_use",
+                "id": format!("toolu_gemini_{call_counter}"),
+                "name": part["functionCall"]["name"],
+                "input": if part["functionCall"]["args"].is_object() {
+                    part["functionCall"]["args"].clone()
+                } else {
+                    json!({})
+                },
+            }));
+        }
+    }
+    let finish = resp["candidates"][0]["finishReason"].as_str();
+    let stop_reason = if saw_tool {
+        "tool_use"
+    } else if finish == Some("MAX_TOKENS") {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+    let u = &resp["usageMetadata"];
+    json!({
+        "id": format!("msg_gemini_{}", resp["responseId"].as_str().unwrap_or("0")),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": u["promptTokenCount"].as_i64().unwrap_or(0),
+            "output_tokens": u["candidatesTokenCount"].as_i64().unwrap_or(0)
+                + u["thoughtsTokenCount"].as_i64().unwrap_or(0),
+            "cache_read_input_tokens": u["cachedContentTokenCount"].as_i64().unwrap_or(0),
+        },
+    })
+}
+
+pub fn parse_gemini_upstream_final(text: &str) -> Option<Value> {
+    let unwrap = |v: Value| -> Value {
+        if v["response"].is_object() {
+            v["response"].clone()
+        } else {
+            v
+        }
+    };
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with("data:") || trimmed.starts_with("event:")) {
+        return serde_json::from_str::<Value>(text).ok().map(unwrap);
+    }
+    let mut texts = String::new();
+    let mut calls: Vec<Value> = Vec::new();
+    let mut finish = Value::Null;
+    let mut usage = Value::Null;
+    let mut model_version = Value::Null;
+    let mut saw_any = false;
+    for frame in sse_datas(text) {
+        let v = unwrap(frame);
+        if !v["candidates"].is_array() && !v["usageMetadata"].is_object() {
+            continue;
+        }
+        saw_any = true;
+        for part in v["candidates"][0]["content"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(t) = part["text"].as_str() {
+                texts.push_str(t);
+            } else if part["functionCall"].is_object() {
+                calls.push(part.clone());
+            }
+        }
+        if v["candidates"][0]["finishReason"].is_string() {
+            finish = v["candidates"][0]["finishReason"].clone();
+        }
+        if v["usageMetadata"].is_object() {
+            usage = v["usageMetadata"].clone();
+        }
+        if v["modelVersion"].is_string() {
+            model_version = v["modelVersion"].clone();
+        }
+    }
+    if !saw_any {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !texts.is_empty() {
+        parts.push(json!({"text": texts}));
+    }
+    parts.extend(calls);
+    Some(json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": parts},
+            "finishReason": if finish.is_null() { json!("STOP") } else { finish },
+            "index": 0,
+        }],
+        "usageMetadata": usage,
+        "modelVersion": model_version,
+    }))
+}
+
+pub fn synth_gemini_sse(resp: &Value) -> String {
+    let text = gemini_parts_text(&resp["candidates"][0]["content"]["parts"]);
+    let mut frames = Vec::new();
+    if !text.is_empty() {
+        let content_frame = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": text}]},
+                "index": 0,
+            }],
+            "modelVersion": resp["modelVersion"],
+        });
+        frames.push(format!("data: {content_frame}\n\n"));
+    }
+    let mut fin = resp.clone();
+    if !text.is_empty() {
+        if let Some(parts) = fin["candidates"][0]["content"]["parts"].as_array_mut() {
+            parts.retain(|p| p["text"].as_str().is_none());
+            if parts.is_empty() {
+                parts.push(json!({"text": ""}));
+            }
+        }
+    }
+    frames.push(format!("data: {fin}\n\n"));
+    frames.concat()
 }
 
 pub fn normalize_codex_request(req: &mut Value) {
@@ -928,6 +1358,219 @@ pub fn normalize_codex_request(req: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn gemini_req() -> Value {
+        json!({
+            "model": "gpt-5.5",
+            "systemInstruction": {"parts": [{"text": "be terse"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "what is the weather in SF?"}]},
+                {"role": "model", "parts": [
+                    {"text": "checking"},
+                    {"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_weather", "response": {"temp": 18}}}
+                ]}
+            ],
+            "tools": [{"functionDeclarations": [{
+                "name": "get_weather",
+                "description": "look up weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+            "generationConfig": {
+                "temperature": 0.5,
+                "topP": 0.9,
+                "maxOutputTokens": 1024,
+                "stopSequences": ["END"]
+            }
+        })
+    }
+
+    #[test]
+    fn gemini_to_anthropic_full() {
+        let a = gemini_to_anthropic(&gemini_req());
+        assert_eq!(a["model"], "gpt-5.5");
+        assert_eq!(a["system"], "be terse");
+        assert_eq!(a["max_tokens"], 1024);
+        assert_eq!(a["temperature"], 0.5);
+        assert_eq!(a["top_p"], 0.9);
+        assert_eq!(a["stop_sequences"][0], "END");
+        assert_eq!(a["tool_choice"]["type"], "auto");
+        assert_eq!(a["tools"][0]["name"], "get_weather");
+        assert_eq!(a["tools"][0]["input_schema"]["type"], "object");
+        let msgs = a["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], "what is the weather in SF?");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][1]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][1]["name"], "get_weather");
+        assert_eq!(msgs[1]["content"][1]["input"]["city"], "SF");
+        let call_id = msgs[1]["content"][1]["id"].as_str().unwrap();
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], call_id);
+        assert!(msgs[2]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("18"));
+    }
+
+    #[test]
+    fn gemini_to_anthropic_defaults() {
+        let a = gemini_to_anthropic(&json!({
+            "contents": [{"parts": [{"text": "hi"}]}]
+        }));
+        assert_eq!(a["max_tokens"], 8192);
+        assert_eq!(a["messages"][0]["role"], "user");
+        assert!(a.get("system").is_none());
+        assert!(a.get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_resp_to_gemini_text_and_tools() {
+        let resp = json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "text", "text": "PONG"},
+                {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "SF"}}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 4}
+        });
+        let g = anthropic_response_to_gemini(&resp, "gpt-5.5");
+        assert_eq!(g["candidates"][0]["content"]["role"], "model");
+        assert_eq!(g["candidates"][0]["content"]["parts"][0]["text"], "PONG");
+        assert_eq!(
+            g["candidates"][0]["content"]["parts"][1]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(g["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(g["usageMetadata"]["promptTokenCount"], 14);
+        assert_eq!(g["usageMetadata"]["candidatesTokenCount"], 3);
+        assert_eq!(g["usageMetadata"]["cachedContentTokenCount"], 4);
+        assert_eq!(g["modelVersion"], "gpt-5.5");
+
+        let max = json!({"content": [], "stop_reason": "max_tokens", "usage": {}});
+        let g2 = anthropic_response_to_gemini(&max, "m");
+        assert_eq!(g2["candidates"][0]["finishReason"], "MAX_TOKENS");
+    }
+
+    #[test]
+    fn gemini_sse_synth_round_trip() {
+        let resp = anthropic_response_to_gemini(
+            &json!({
+                "content": [{"type": "text", "text": "PONG"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1}
+            }),
+            "gpt-5.5",
+        );
+        let sse = synth_gemini_sse(&resp);
+        assert!(sse.starts_with("data: "));
+        assert!(!sse.contains("[DONE]"));
+        let frames: Vec<Value> = sse_datas(&sse).collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0]["candidates"][0]["content"]["parts"][0]["text"],
+            "PONG"
+        );
+        assert_eq!(frames[1]["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(frames[1]["usageMetadata"]["promptTokenCount"], 5);
+        assert_eq!(
+            assistant_reply_text("gemini", &sse).as_deref(),
+            Some("PONG")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_gemini_request_round_trip() {
+        let a = json!({
+            "model": "gemini-2.5-flash",
+            "system": "be terse",
+            "max_tokens": 256,
+            "temperature": 0.3,
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "get_weather", "input": {"city": "SF"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": [{"type": "text", "text": "18C"}]}
+                ]}
+            ],
+            "tools": [{"name": "get_weather", "description": "w", "input_schema": {"type": "object"}}]
+        });
+        let g = anthropic_to_gemini_request(&a);
+        assert_eq!(g["systemInstruction"]["parts"][0]["text"], "be terse");
+        assert_eq!(g["generationConfig"]["maxOutputTokens"], 256);
+        assert_eq!(g["generationConfig"]["temperature"], 0.3);
+        assert_eq!(g["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+        let c = g["contents"].as_array().unwrap();
+        assert_eq!(c[0]["role"], "user");
+        assert_eq!(c[0]["parts"][0]["text"], "weather?");
+        assert_eq!(c[1]["role"], "model");
+        assert_eq!(c[1]["parts"][0]["functionCall"]["name"], "get_weather");
+        assert_eq!(c[2]["parts"][0]["functionResponse"]["name"], "get_weather");
+        assert_eq!(c[2]["parts"][0]["functionResponse"]["response"]["result"], "18C");
+    }
+
+    #[test]
+    fn gemini_response_to_anthropic_basic() {
+        let g = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "PONG"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "thoughtsTokenCount": 3}
+        });
+        let a = gemini_response_to_anthropic(&g, "gemini-2.5-flash");
+        assert_eq!(a["role"], "assistant");
+        assert_eq!(a["content"][0]["text"], "PONG");
+        assert_eq!(a["stop_reason"], "end_turn");
+        assert_eq!(a["usage"]["input_tokens"], 10);
+        assert_eq!(a["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn gemini_upstream_final_unwraps_envelope_and_sse() {
+        // non-stream, wrapped in code-assist "response" envelope
+        let wrapped = json!({
+            "response": {
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+            }
+        });
+        let final_v = parse_gemini_upstream_final(&wrapped.to_string()).unwrap();
+        assert_eq!(final_v["candidates"][0]["content"]["parts"][0]["text"], "hi");
+        assert_eq!(final_v["usageMetadata"]["promptTokenCount"], 1);
+
+        // streaming SSE with response-wrapped frames
+        let sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"PO\"}]}}]}}\n\n\
+                   data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"NG\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}}\n\n";
+        let final_sse = parse_gemini_upstream_final(sse).unwrap();
+        assert_eq!(final_sse["candidates"][0]["content"]["parts"][0]["text"], "PONG");
+        assert_eq!(final_sse["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(final_sse["usageMetadata"]["candidatesTokenCount"], 1);
+    }
+
+    #[test]
+    fn gemini_last_user_and_reply_text() {
+        assert_eq!(
+            last_user_text("gemini", &gemini_req()).as_deref(),
+            Some("[tool result] {\"temp\":18}")
+        );
+        let plain = json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hello"}]}}]
+        });
+        assert_eq!(
+            assistant_reply_text("gemini", &plain.to_string()).as_deref(),
+            Some("hello")
+        );
+    }
+
     use super::*;
 
     #[test]

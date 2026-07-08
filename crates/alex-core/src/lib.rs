@@ -38,6 +38,7 @@ pub enum ClientFormat {
     AnthropicMessages,
     OpenaiChat,
     OpenaiResponses,
+    GeminiGenerate,
 }
 
 impl ClientFormat {
@@ -46,6 +47,7 @@ impl ClientFormat {
             ClientFormat::AnthropicMessages => "anthropic",
             ClientFormat::OpenaiChat => "openai-chat",
             ClientFormat::OpenaiResponses => "openai-responses",
+            ClientFormat::GeminiGenerate => "gemini",
         }
     }
 
@@ -53,6 +55,7 @@ impl ClientFormat {
         match self {
             ClientFormat::AnthropicMessages => Provider::Anthropic,
             ClientFormat::OpenaiChat | ClientFormat::OpenaiResponses => Provider::Openai,
+            ClientFormat::GeminiGenerate => Provider::Gemini,
         }
     }
 }
@@ -259,21 +262,32 @@ fn path_i64(v: &Value, path: &[&str]) -> Option<i64> {
 
 pub fn usage_from_obj(o: &Value) -> Usage {
     Usage {
-        input_tokens: path_i64(o, &["input_tokens"]).or_else(|| path_i64(o, &["prompt_tokens"])),
+        input_tokens: path_i64(o, &["input_tokens"])
+            .or_else(|| path_i64(o, &["prompt_tokens"]))
+            .or_else(|| path_i64(o, &["promptTokenCount"])),
         cached_input_tokens: path_i64(o, &["cache_read_input_tokens"])
             .or_else(|| path_i64(o, &["prompt_tokens_details", "cached_tokens"]))
-            .or_else(|| path_i64(o, &["input_tokens_details", "cached_tokens"])),
+            .or_else(|| path_i64(o, &["input_tokens_details", "cached_tokens"]))
+            .or_else(|| path_i64(o, &["cachedContentTokenCount"])),
         cache_creation_tokens: path_i64(o, &["cache_creation_input_tokens"]),
         output_tokens: path_i64(o, &["output_tokens"])
-            .or_else(|| path_i64(o, &["completion_tokens"])),
+            .or_else(|| path_i64(o, &["completion_tokens"]))
+            .or_else(|| path_i64(o, &["candidatesTokenCount"])),
         reasoning_tokens: path_i64(o, &["completion_tokens_details", "reasoning_tokens"])
-            .or_else(|| path_i64(o, &["output_tokens_details", "reasoning_tokens"])),
+            .or_else(|| path_i64(o, &["output_tokens_details", "reasoning_tokens"]))
+            .or_else(|| path_i64(o, &["thoughtsTokenCount"])),
     }
 }
 
 pub fn usage_from_json(v: &Value) -> Usage {
     let mut usage = Usage::default();
-    for loc in [&v["usage"], &v["message"]["usage"], &v["response"]["usage"]] {
+    for loc in [
+        &v["usage"],
+        &v["message"]["usage"],
+        &v["response"]["usage"],
+        &v["usageMetadata"],
+        &v["response"]["usageMetadata"],
+    ] {
         if loc.is_object() {
             usage.merge(usage_from_obj(loc));
         }
@@ -411,6 +425,17 @@ pub fn conversation_root(format: ClientFormat, body: &Value) -> Option<String> {
                     .unwrap_or_default(),
                 _ => String::new(),
             };
+            (system, user)
+        }
+        ClientFormat::GeminiGenerate => {
+            let system = translate::gemini_parts_text(&body["systemInstruction"]["parts"]);
+            let user = body["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|c| c["role"].as_str().unwrap_or("user") == "user")
+                .map(|c| translate::gemini_parts_text(&c["parts"]))
+                .unwrap_or_default();
             (system, user)
         }
     };

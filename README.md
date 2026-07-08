@@ -16,7 +16,7 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 ## Features
 
 - **Credential vault** — imports OAuth tokens from Claude Code, Codex, grok, and gemini CLIs; stores them in `~/.alexandria/accounts/` (0600); refreshes them itself (Anthropic, OpenAI, xAI)
-- **One endpoint, every provider** — `/v1/messages`, `/v1/chat/completions`, `/v1/responses` with cross-format translation and model routing (`claude-*` → Anthropic, `gpt-*` → Codex, `grok-*` → xAI)
+- **One endpoint, every provider** — `/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/v1beta/models/{model}:generateContent` with cross-format translation and model routing (`claude-*` → Anthropic, `gpt-*` → Codex, `grok-*` → xAI, `gemini-*` → Gemini)
 - **Login flows built in** — `alex auth login claude|codex|grok` (PKCE paste, loopback, and xAI device-code flows); also exposed over HTTP so GUIs can drive re-auth
 - **Trace capture & sessions** — every request/response stored with tokens, cost, latency; group runs with `x-session-id`, tag with `x-alexandria-*` headers, search body text, stitch transcripts
 - **Trace Browser & TUI** — a two-pane live trace browser in the menu bar app, `alex tui` in the terminal, `alex traces --json` for scripts
@@ -47,6 +47,44 @@ eval "$(alex env)"        # point ANTHROPIC_/OPENAI_/XAI_ env at the proxy
 ```
 
 Re-auth a subscription any time with `alex auth login claude|codex|grok`, watch live traffic with `alex tui`, and check window utilization with `alex limits`.
+
+## Format translation
+
+Alexandria speaks four API dialects on the way **in** and routes to whichever provider owns the **model** you name — translating the request, the response, and the streaming events in between. Point any client's SDK at the proxy and use any model; the wire format is converted for you (all conversions pivot through the Anthropic Messages shape internally).
+
+| Client sends (ingress) | Endpoint | → can drive any upstream |
+|---|---|---|
+| Anthropic Messages | `POST /v1/messages` | Anthropic · Codex · Gemini |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Anthropic · Codex · Gemini · xAI |
+| OpenAI Responses | `POST /v1/responses` | Anthropic · Codex · Gemini |
+| Gemini generateContent | `POST /v1beta/models/{model}:generateContent` | Anthropic · Codex · Gemini |
+
+The upstream is chosen purely by the model name, so e.g. an **OpenAI Chat** request naming `claude-opus-4-8` is translated to Anthropic and back; a **Gemini** request naming `gpt-5.5` is translated to Codex and returned as Gemini `candidates`. Streaming works across the matrix — SSE events are re-synthesized in the client's dialect.
+
+### Serving the Gemini CLI with a different model
+
+Point the Gemini CLI at the proxy and let it run on, say, `gpt-5.5` — requests arrive as Gemini, get rewritten to OpenAI/Codex upstream, and responses convert back to Gemini shape:
+
+```bash
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4100   # no /v1 — the SDK appends /v1beta
+export GEMINI_API_KEY=<local_key>                     # from ~/.alexandria/config.toml
+export GEMINI_API_KEY_AUTH_MECHANISM=bearer
+gemini --model gpt-5.5 --prompt 'Reply with only PONG'
+```
+
+Direct curl (non-streaming and streaming):
+
+```bash
+curl -H 'Authorization: Bearer <local_key>' -H 'Content-Type: application/json' \
+  -X POST 'http://127.0.0.1:4100/v1beta/models/gpt-5.5:generateContent' \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Reply with only PONG"}]}]}'
+
+curl -N -H 'Authorization: Bearer <local_key>' -H 'Content-Type: application/json' \
+  -X POST 'http://127.0.0.1:4100/v1beta/models/gpt-5.5:streamGenerateContent?alt=sse' \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Reply with only PONG"}]}]}'
+```
+
+To use your **Gemini subscription** as an upstream instead (name a `gemini-*` model), alexandria authenticates via the gemini-cli OAuth token it imported and Google's Code Assist API. Individual accounts are onboarded automatically; **Workspace/Enterprise accounts must supply a GCP project** with the Code Assist API enabled — set `gemini_project = "your-gcp-project"` in `~/.alexandria/config.toml` (or `GOOGLE_CLOUD_PROJECT`).
 
 ## Sessions & trace tagging
 
