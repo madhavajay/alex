@@ -108,6 +108,21 @@ public struct AlexandriaClient: Sendable {
         }
     }
 
+    public func darioDetail() async throws -> DarioAdminStatus? {
+        do {
+            return try await get("admin/dario", as: DarioAdminStatus.self)
+        } catch ClientError.http(404, _) {
+            return nil
+        }
+    }
+
+    public func darioLogs(generationId: String, lines: Int = 300) async throws -> DarioLogsResponse {
+        try await get(
+            "admin/dario/logs/\(generationId)",
+            query: [URLQueryItem(name: "lines", value: "\(lines)")],
+            as: DarioLogsResponse.self)
+    }
+
     public func darioRestart() async throws {
         _ = try await request("admin/dario/restart", method: "POST")
     }

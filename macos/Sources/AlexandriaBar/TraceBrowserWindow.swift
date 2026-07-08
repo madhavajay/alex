@@ -21,7 +21,6 @@ final class TraceBrowserModel {
 
     var selectedSessionId: String?
     var pinned = false
-    var expandedTurns: Set<String> = []
     var showPings = false {
         didSet { recomputeVisible() }
     }
@@ -47,6 +46,20 @@ final class TraceBrowserModel {
         guard userAtBottom != value else { return }
         userAtBottom = value
     }
+
+    enum TranscriptRenderOp {
+        case set(NSAttributedString)
+        case append(NSAttributedString)
+    }
+
+    private(set) var renderOp: (version: Int, op: TranscriptRenderOp)?
+    private(set) var scrollCommand = 0
+    private(set) var hiddenTurnCount = 0
+    private var renderVersion = 0
+    private var renderState: TranscriptRender.State?
+    private var renderChain: Task<Void, Never>?
+    private var windowStart = 0
+    private var windowMaxTurns = TranscriptWindow.defaultMaxTurns
 
     private var sessionsTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
@@ -109,6 +122,8 @@ final class TraceBrowserModel {
         transcriptTask = nil
         searchTask?.cancel()
         searchTask = nil
+        renderChain?.cancel()
+        renderChain = nil
     }
 
     func select(_ session: TraceSession) {
@@ -126,6 +141,95 @@ final class TraceBrowserModel {
     private func resetTurns() {
         turns = []
         turnsFingerprint = ""
+        renderChain?.cancel()
+        renderChain = nil
+        renderState = TranscriptRender.state(for: [])
+        windowStart = 0
+        windowMaxTurns = TranscriptWindow.defaultMaxTurns
+        hiddenTurnCount = 0
+        renderVersion += 1
+        renderOp = (renderVersion, .set(NSAttributedString()))
+    }
+
+    func loadEarlierTurns() {
+        windowMaxTurns += TranscriptWindow.defaultMaxTurns
+        renderState = nil
+        scheduleRender()
+    }
+
+    func requestScrollToBottom() {
+        scrollCommand += 1
+    }
+
+    func moveSelection(_ move: ListNavigation.Move) {
+        let visible = visibleSessions
+        let current = selectedSessionId.flatMap { id in
+            visible.firstIndex { $0.sessionId == id }
+        }
+        guard let index = ListNavigation.targetIndex(
+            selected: current, count: visible.count, move: move)
+        else { return }
+        select(visible[index])
+    }
+
+    private func scheduleRender() {
+        let all = turns
+        windowStart = min(windowStart, all.count)
+        var windowed = Array(all[windowStart...])
+        var plan = TranscriptRender.plan(previous: renderState, turns: windowed)
+        if case .append = plan, windowed.count > windowMaxTurns + 100 {
+            windowMaxTurns = TranscriptWindow.defaultMaxTurns
+            plan = .rebuild
+        }
+        if plan == .rebuild {
+            let budget = TranscriptWindow.defaultMaxChars
+                * max(1, windowMaxTurns / TranscriptWindow.defaultMaxTurns)
+            windowStart = TranscriptWindow.startIndex(
+                turns: all, maxTurns: windowMaxTurns, maxChars: budget)
+            windowed = Array(all[windowStart...])
+            if windowStart > 0 {
+                BarLog.info(
+                    .browser, "transcript windowed: showing \(windowed.count)/\(all.count) turns")
+            }
+        }
+        hiddenTurnCount = windowStart
+        guard plan != .unchanged else { return }
+        renderState = TranscriptRender.state(for: windowed)
+        let slice: [TranscriptTurn]
+        let isAppend: Bool
+        switch plan {
+        case .unchanged:
+            return
+        case .rebuild:
+            slice = windowed
+            isAppend = false
+        case let .append(from):
+            slice = Array(windowed[from...])
+            isAppend = true
+        }
+        let sid = selectedSessionId
+        let prev = renderChain
+        renderChain = Task { [weak self] in
+            await prev?.value
+            let built = await Task.detached { () -> BuiltDocument in
+                let start = ContinuousClock.now
+                let doc = TranscriptRender.document(turns: slice)
+                let elapsed = start.duration(to: .now)
+                let ms = Int(elapsed.components.seconds * 1000)
+                    + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
+                return BuiltDocument(doc: doc, ms: ms)
+            }.value
+            let (doc, ms) = (built.doc, built.ms)
+            let label = "render build turns=\(slice.count) append=\(isAppend) len=\(doc.length) \(ms)ms"
+            if Double(ms) >= BarLog.slowThresholdMs {
+                BarLog.warn(.browser, "SLOW \(label)")
+            } else {
+                BarLog.info(.browser, label)
+            }
+            guard let self, !Task.isCancelled, self.selectedSessionId == sid else { return }
+            self.renderVersion += 1
+            self.renderOp = (self.renderVersion, isAppend ? .append(doc) : .set(doc))
+        }
     }
 
     func setLive(_ live: Bool) {
@@ -200,6 +304,7 @@ final class TraceBrowserModel {
                 BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
                     turns = resp.turns
                 }
+                scheduleRender()
             }
         } catch is AlexandriaClient.ClientError {
             daemonDown = false
@@ -243,14 +348,6 @@ final class TraceBrowserModel {
             BarLog.warn(.browser, "search \"\(query.freeText)\" failed: \(error.localizedDescription)")
         }
         recomputeVisible()
-    }
-
-    func toggleExpanded(_ traceId: String) {
-        if expandedTurns.contains(traceId) {
-            expandedTurns.remove(traceId)
-        } else {
-            expandedTurns.insert(traceId)
-        }
     }
 
     func copySessionId(_ session: TraceSession) {
@@ -342,6 +439,11 @@ final class TraceBrowserModel {
             }
         }
     }
+}
+
+private struct BuiltDocument: @unchecked Sendable {
+    let doc: NSAttributedString
+    let ms: Int
 }
 
 struct TraceBrowserView: View {
@@ -503,31 +605,46 @@ private struct TagChipView: View {
 
 private struct SessionListView: View {
     @Bindable var model: TraceBrowserModel
+    @FocusState private var listFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(model.visibleSessions) { session in
-                        SessionRowView(
-                            session: session,
-                            selected: session.sessionId == model.selectedSessionId,
-                            pinned: model.pinned && session.sessionId == model.selectedSessionId,
-                            showPingBadge: model.showPings && session.isPingOrTest
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.select(session) }
-                        .contextMenu { contextMenu(session) }
+            List(selection: selectionBinding) {
+                ForEach(model.visibleSessions) { session in
+                    SessionRowView(
+                        session: session,
+                        pinned: model.pinned && session.sessionId == model.selectedSessionId,
+                        showPingBadge: model.showPings && session.isPingOrTest
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        model.select(session)
+                        listFocused = true
                     }
-                    if model.visibleSessions.isEmpty {
-                        Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 24)
-                    }
+                    .contextMenu { contextMenu(session) }
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 4, bottom: 1, trailing: 4))
                 }
-                .padding(6)
+                if model.visibleSessions.isEmpty {
+                    Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 24)
+                        .listRowSeparator(.hidden)
+                }
             }
+            .listStyle(.plain)
+            .focused($listFocused)
+            .onKeyPress(.home) {
+                model.moveSelection(.home)
+                return .handled
+            }
+            .onKeyPress(.end) {
+                model.moveSelection(.end)
+                return .handled
+            }
+            .onAppear { listFocused = true }
             if model.searchSessionIds != nil {
                 Divider()
                 Text("\(model.searchMatchCount) matches · scanned \(model.searchScanned)")
@@ -538,6 +655,17 @@ private struct SessionListView: View {
                     .padding(.vertical, 4)
             }
         }
+    }
+
+    private var selectionBinding: Binding<String?> {
+        Binding(
+            get: { model.selectedSessionId },
+            set: { id in
+                guard let id,
+                    let session = model.visibleSessions.first(where: { $0.sessionId == id })
+                else { return }
+                model.select(session)
+            })
     }
 
     @ViewBuilder
@@ -562,7 +690,6 @@ private struct SessionListView: View {
 
 private struct SessionRowView: View {
     let session: TraceSession
-    let selected: Bool
     let pinned: Bool
     let showPingBadge: Bool
 
@@ -592,11 +719,22 @@ private struct SessionRowView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            Text(session.sessionId)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 5) {
+                HarnessIconView(harness: session.harness, tags: session.tags, size: 16)
+                Text(session.sessionId)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
             HStack(spacing: 8) {
+                let providers = ModelProvider.providers(in: session.models)
+                if !providers.isEmpty {
+                    HStack(spacing: 3) {
+                        ForEach(providers, id: \.self) { provider in
+                            ProviderBadgeView(provider: provider)
+                        }
+                    }
+                }
                 Text((session.models ?? []).joined(separator: ", "))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
@@ -626,10 +764,6 @@ private struct SessionRowView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(selected ? Color.accentColor.opacity(0.18) : Color.clear)
-        )
     }
 }
 
@@ -640,56 +774,38 @@ private struct TranscriptView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollViewReader { proxy in
-                ZStack(alignment: .bottom) {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(model.turns) { turn in
-                                TurnView(
-                                    turn: turn,
-                                    expanded: model.expandedTurns.contains(turn.traceId),
-                                    onToggleExpand: { model.toggleExpanded(turn.traceId) })
-                            }
-                            if model.turns.isEmpty {
-                                Text(model.selectedSessionId == nil
-                                    ? "Select a session"
-                                    : "No turns yet")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.top, 24)
-                                    .frame(maxWidth: .infinity)
-                            }
-                            Color.clear
-                                .frame(height: 1)
-                                .id("bottom")
-                                .onAppear { model.setUserAtBottom(true) }
-                                .onDisappear { model.setUserAtBottom(false) }
-                        }
-                        .padding(12)
-                    }
-                    if !model.userAtBottom, !model.turns.isEmpty {
-                        Button {
-                            model.setUserAtBottom(true)
-                            proxy.scrollTo("bottom", anchor: .bottom)
-                        } label: {
-                            Label("Jump to latest", systemImage: "arrow.down.to.line")
-                                .font(.system(size: 11, weight: .medium))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Capsule().fill(.thinMaterial))
-                                .overlay(Capsule().strokeBorder(.quaternary))
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.bottom, 12)
-                    }
+            if model.hiddenTurnCount > 0 {
+                Button("Load earlier turns (\(model.hiddenTurnCount) more)") {
+                    model.loadEarlierTurns()
                 }
-                .onChange(of: model.turns.count) {
-                    if model.userAtBottom {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
+                .buttonStyle(.link)
+                .font(.system(size: 11))
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
+                Divider()
+            }
+            ZStack(alignment: .bottom) {
+                TranscriptTextPane(model: model)
+                if model.turns.isEmpty {
+                    Text(model.selectedSessionId == nil ? "Select a session" : "No turns yet")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .onChange(of: model.selectedSessionId) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
+                if !model.userAtBottom, !model.turns.isEmpty {
+                    Button {
+                        model.setUserAtBottom(true)
+                        model.requestScrollToBottom()
+                    } label: {
+                        Label("Jump to latest", systemImage: "arrow.down.to.line")
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(.thinMaterial))
+                            .overlay(Capsule().strokeBorder(.quaternary))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 12)
                 }
             }
         }
@@ -698,6 +814,7 @@ private struct TranscriptView: View {
     private var header: some View {
         HStack(spacing: 8) {
             if let session = model.selectedSession {
+                HarnessIconView(harness: session.harness, tags: session.tags, size: 18)
                 if model.pinned {
                     Button {
                         model.setLive(true)
@@ -735,93 +852,6 @@ private struct TranscriptView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-    }
-}
-
-private struct TurnView: View {
-    let turn: TranscriptTurn
-    let expanded: Bool
-    let onToggleExpand: () -> Void
-
-    var body: some View {
-        let user = capped(turn.user)
-        let assistant = capped(turn.assistant)
-        let error = capped(turn.error)
-        VStack(alignment: .leading, spacing: 6) {
-            headerLine
-            if let user, !user.text.isEmpty {
-                HStack(alignment: .top, spacing: 8) {
-                    RoundedRectangle(cornerRadius: 1.5)
-                        .fill(Color.accentColor.opacity(0.7))
-                        .frame(width: 3)
-                    Text(user.text)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.accentColor.opacity(0.07)))
-                .fixedSize(horizontal: false, vertical: true)
-            }
-            if let assistant, !assistant.text.isEmpty {
-                Text(assistant.text)
-                    .font(.system(size: 12))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let error, !error.text.isEmpty {
-                Text(error.text)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let title = expanderTitle(user: user, assistant: assistant, error: error) {
-                Button(title, action: onToggleExpand)
-                    .buttonStyle(.link)
-                    .font(.system(size: 11))
-            }
-        }
-    }
-
-    private func capped(_ text: String?) -> CappedText? {
-        guard let text else { return nil }
-        if expanded { return CappedText(text: text, isTruncated: false, fullCharCount: text.count) }
-        return TurnTextCap.cap(text)
-    }
-
-    private func expanderTitle(user: CappedText?, assistant: CappedText?, error: CappedText?) -> String? {
-        if expanded { return "Show less" }
-        let parts = [user, assistant, error].compactMap { $0 }
-        guard parts.contains(where: \.isTruncated) else { return nil }
-        let total = parts.reduce(0) { $0 + $1.fullCharCount }
-        return "Show full (\(total) chars)"
-    }
-
-    private var headerLine: some View {
-        HStack(spacing: 0) {
-            Text(headerText)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-            if let status = turn.status {
-                Text(" · \(status)")
-                    .font(.system(size: 10, weight: status >= 400 ? .bold : .regular, design: .monospaced))
-                    .foregroundStyle(status >= 400 ? .red : .secondary)
-            }
-            Spacer()
-        }
-    }
-
-    private var headerText: String {
-        var parts = [TraceFormat.time(turn.tsRequestMs)]
-        if let model = turn.model { parts.append(model) }
-        parts.append("\(TraceFormat.tokens(turn.inputTokens))→\(TraceFormat.tokens(turn.outputTokens)) tok")
-        if let cost = turn.costUsd, cost > 0 { parts.append(TraceFormat.cost(cost)) }
-        return parts.joined(separator: " · ")
     }
 }
 

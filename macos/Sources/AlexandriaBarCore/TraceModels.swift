@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 public struct TraceSessionsResponse: Codable, Sendable {
@@ -22,7 +23,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public var id: String { sessionId }
 
     public var isPingOrTest: Bool {
-        SessionKind.isPingOrTest(sessionId: sessionId, harness: harness)
+        SessionKind.isPingOrTest(sessionId: sessionId, harness: harness, tags: tags)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -91,11 +92,134 @@ public struct TraceSearchRow: Codable, Sendable {
 }
 
 public enum SessionKind {
-    public static func isPingOrTest(sessionId: String, harness: String?) -> Bool {
+    static let pingKinds: Set<String> = ["ping", "health", "preflight", "heartbeat"]
+    static let pingPhases: Set<String> = ["preflight", "health", "ping"]
+    static let testKinds: Set<String> = ["test", "smoke"]
+
+    public static func isPingOrTest(
+        sessionId: String, harness: String?, tags: [String: String]? = nil
+    ) -> Bool {
         if let harness, harness.contains("alexandria-ping") { return true }
+        if let kind = tags?["kind"]?.lowercased(),
+            pingKinds.contains(kind) || testKinds.contains(kind) {
+            return true
+        }
+        if let phase = tags?["phase"]?.lowercased(), pingPhases.contains(phase) {
+            return true
+        }
         return sessionId.hasPrefix("tsh-")
             || sessionId.hasPrefix("alexandria-e2e-")
             || sessionId.hasPrefix("smoke-")
+    }
+}
+
+public enum HarnessIcon {
+    static let files: [String: String] = [
+        "pi": "pi.svg",
+        "codex": "codex.png",
+        "claude-code": "claude-code.png",
+        "grok-build": "grok-build.png",
+        "opencode": "opencode.png",
+        "qwen-code": "qwen-code.png",
+        "gemini-cli": "gemini-cli.png",
+        "mini-swe-agent": "mini-swe-agent.png",
+        "kimi-code": "kimi-code.jpg",
+        "goose": "goose.jpg",
+        "hermes": "hermes.png",
+        "droid-cli": "droid-cli.svg",
+        "cursor-cli": "cursor-cli.png",
+        "amp-code": "amp-code.svg",
+        "opensage-adk": "opensage-adk.png",
+        "stirrup": "stirrup.ico",
+    ]
+
+    static let aliases: [String: String] = [
+        "claude": "claude-code",
+        "grok": "grok-build",
+        "qwen": "qwen-code",
+        "gemini": "gemini-cli",
+        "mini": "mini-swe-agent",
+        "kimi": "kimi-code",
+        "droid": "droid-cli",
+        "cursor": "cursor-cli",
+        "amp": "amp-code",
+        "opensage": "opensage-adk",
+    ]
+
+    static let userAgentAliases: [String: String] = [
+        "claude-cli": "claude-code",
+        "codex-tui": "codex",
+        "codex_exec": "codex",
+        "grok-shell": "grok-build",
+        "qwencode": "qwen-code",
+        "factory-cli": "droid-cli",
+        "kimi-code-cli": "kimi-code",
+    ]
+
+    public static func assetName(harness: String?, tags: [String: String]?) -> String? {
+        if let tag = tags?["harness"] {
+            let key = tag.lowercased().trimmingCharacters(in: .whitespaces)
+            if let file = resolve(key) ?? resolve(key.replacingOccurrences(of: "_", with: "-")) {
+                return file
+            }
+        }
+        guard let harness else { return nil }
+        let head = harness.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? harness
+        guard let token = head.split(separator: "/").first.map({ String($0).lowercased() }),
+            !token.isEmpty
+        else { return nil }
+        if let canonical = userAgentAliases[token] { return files[canonical] }
+        return resolve(token)
+    }
+
+    static func resolve(_ key: String) -> String? {
+        files[key] ?? aliases[key].flatMap { files[$0] }
+    }
+}
+
+public enum ModelProvider {
+    public static func provider(forModel model: String) -> String? {
+        let m = model.lowercased()
+        if m.hasPrefix("claude") { return "anthropic" }
+        if m.hasPrefix("gpt") { return "openai" }
+        if m.hasPrefix("o"), m.count > 1,
+            m[m.index(after: m.startIndex)].isNumber {
+            return "openai"
+        }
+        if m.hasPrefix("grok") { return "xai" }
+        if m.hasPrefix("gemini") { return "gemini" }
+        return nil
+    }
+
+    public static func providers(in models: [String]?) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for model in models ?? [] {
+            guard let provider = provider(forModel: model), seen.insert(provider).inserted
+            else { continue }
+            out.append(provider)
+        }
+        return out
+    }
+}
+
+public enum ListNavigation {
+    public enum Move: Sendable {
+        case up, down, home, end
+    }
+
+    public static func targetIndex(selected: Int?, count: Int, move: Move) -> Int? {
+        guard count > 0 else { return nil }
+        switch move {
+        case .home: return 0
+        case .end: return count - 1
+        case .up:
+            guard let selected else { return 0 }
+            return max(0, selected - 1)
+        case .down:
+            guard let selected else { return 0 }
+            return min(count - 1, selected + 1)
+        }
     }
 }
 
@@ -340,6 +464,205 @@ public enum TurnTextCap {
             truncated = true
         }
         return CappedText(text: out, isTruncated: truncated, fullCharCount: fullCount)
+    }
+}
+
+public enum TranscriptWindow {
+    public static let defaultMaxTurns = 200
+    public static let defaultMaxChars = 1_500_000
+
+    public static func startIndex(
+        turns: [TranscriptTurn], maxTurns: Int, maxChars: Int = defaultMaxChars
+    ) -> Int {
+        var chars = 0
+        var count = 0
+        var index = turns.count
+        while index > 0, count < maxTurns {
+            let turn = turns[index - 1]
+            chars += (turn.user?.count ?? 0) + (turn.assistant?.count ?? 0)
+                + (turn.error?.count ?? 0) + 64
+            if count > 0, chars > maxChars { break }
+            index -= 1
+            count += 1
+        }
+        return index
+    }
+}
+
+public enum TranscriptRender {
+    public struct State: Equatable, Sendable {
+        public let count: Int
+        public let firstId: String?
+        public let lastId: String?
+        public let lastSignature: String
+
+        public init(count: Int, firstId: String?, lastId: String?, lastSignature: String) {
+            self.count = count
+            self.firstId = firstId
+            self.lastId = lastId
+            self.lastSignature = lastSignature
+        }
+    }
+
+    public enum Plan: Equatable, Sendable {
+        case unchanged
+        case rebuild
+        case append(from: Int)
+    }
+
+    public static let maxTurnChars = 100_000
+
+    public static func state(for turns: [TranscriptTurn]) -> State {
+        State(
+            count: turns.count, firstId: turns.first?.traceId, lastId: turns.last?.traceId,
+            lastSignature: turns.last.map(signature) ?? "")
+    }
+
+    public static func plan(previous: State?, turns: [TranscriptTurn]) -> Plan {
+        guard let previous else { return .rebuild }
+        if previous.count == 0 { return turns.isEmpty ? .unchanged : .rebuild }
+        if turns.count < previous.count { return .rebuild }
+        if turns.first?.traceId != previous.firstId { return .rebuild }
+        let overlapLast = turns[previous.count - 1]
+        if overlapLast.traceId != previous.lastId
+            || signature(overlapLast) != previous.lastSignature {
+            return .rebuild
+        }
+        return turns.count == previous.count ? .unchanged : .append(from: previous.count)
+    }
+
+    static func signature(_ turn: TranscriptTurn) -> String {
+        "\(turn.tsResponseMs ?? -1)|\(turn.status ?? -1)|\(turn.user?.count ?? -1)"
+            + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
+    }
+
+    public static func document(turns: [TranscriptTurn]) -> NSAttributedString {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let headerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        let bodyFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let header: [NSAttributedString.Key: Any] = [
+            .font: headerFont, .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let badStatus: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor.systemRed,
+        ]
+        let user: [NSAttributedString.Key: Any] = [
+            .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let assistant: [NSAttributedString.Key: Any] = [
+            .font: bodyFont, .foregroundColor: NSColor.labelColor,
+        ]
+        let error: [NSAttributedString.Key: Any] = [
+            .font: bodyFont, .foregroundColor: NSColor.systemRed,
+        ]
+        let out = NSMutableAttributedString()
+        for turn in turns {
+            var parts = [formatter.string(
+                from: Date(timeIntervalSince1970: Double(turn.tsRequestMs) / 1000))]
+            if let model = turn.model { parts.append(model) }
+            parts.append("\(tokens(turn.inputTokens))→\(tokens(turn.outputTokens)) tok")
+            if let usd = turn.costUsd, usd > 0 { parts.append(cost(usd)) }
+            out.append(NSAttributedString(
+                string: "── \(parts.joined(separator: " · "))", attributes: header))
+            if let status = turn.status {
+                out.append(NSAttributedString(
+                    string: " · \(status)", attributes: status >= 400 ? badStatus : header))
+            }
+            out.append(NSAttributedString(string: " ──\n", attributes: header))
+            if let text = turn.user, !text.isEmpty {
+                out.append(NSAttributedString(string: "❯ \(cap(text))\n", attributes: user))
+            }
+            if let text = turn.assistant, !text.isEmpty {
+                out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
+            }
+            if let text = turn.error, !text.isEmpty {
+                out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
+            }
+            out.append(NSAttributedString(string: "\n", attributes: header))
+        }
+        return NSAttributedString(attributedString: out)
+    }
+
+    static func cap(_ text: String, maxChars: Int = maxTurnChars) -> String {
+        guard text.count > maxChars else { return text }
+        return text.prefix(maxChars) + "\n… (+\(text.count - maxChars) chars truncated)"
+    }
+
+    static func tokens(_ count: Int64?) -> String {
+        guard let count else { return "–" }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 10_000 { return "\(count / 1000)k" }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1000) }
+        return "\(count)"
+    }
+
+    static func cost(_ usd: Double) -> String {
+        usd >= 0.01 ? String(format: "$%.2f", usd) : String(format: "$%.4f", usd)
+    }
+}
+
+public struct DarioAdminStatus: Codable, Sendable {
+    public let activeGenerationId: String?
+    public let generations: [DarioGenerationDetail]
+
+    enum CodingKeys: String, CodingKey {
+        case generations
+        case activeGenerationId = "active_generation_id"
+    }
+}
+
+public struct DarioGenerationDetail: Codable, Sendable, Identifiable {
+    public let id: String
+    public let version: String
+    public let port: Int?
+    public let pid: Int?
+    public let state: String?
+    public let phase: String
+    public let inFlight: Int?
+    public let consecutiveFailures: Int?
+    public let lastProbe: DarioProbeDetail?
+    public let startedAt: Int64?
+    public let promotedAt: Int64?
+    public let stdoutLog: String?
+    public let stderrLog: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, version, port, pid, state, phase
+        case inFlight = "in_flight"
+        case consecutiveFailures = "consecutive_failures"
+        case lastProbe = "last_probe"
+        case startedAt = "started_at"
+        case promotedAt = "promoted_at"
+        case stdoutLog = "stdout_log"
+        case stderrLog = "stderr_log"
+    }
+}
+
+public struct DarioProbeDetail: Codable, Sendable {
+    public let ok: Bool
+    public let status: Int?
+    public let latencyMs: Int64?
+    public let error: String?
+    public let atMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, status, error
+        case latencyMs = "latency_ms"
+        case atMs = "at_ms"
+    }
+}
+
+public struct DarioLogsResponse: Codable, Sendable {
+    public let generationId: String
+    public let stdout: String
+    public let stderr: String
+    public let lines: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case stdout, stderr, lines
+        case generationId = "generation_id"
     }
 }
 

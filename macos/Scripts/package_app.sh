@@ -28,6 +28,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 
+RES_BUNDLE=".build/$CONFIGURATION/${APP_NAME}_${APP_NAME}.bundle"
+if [[ -d "$RES_BUNDLE" ]]; then
+  cp -R "$RES_BUNDLE" "$APP/Contents/Resources/"
+fi
+
 ICON_SRC="Resources/icon.png"
 if [[ -f "$ICON_SRC" ]]; then
   ICONSET="$DIST/AppIcon.iconset"

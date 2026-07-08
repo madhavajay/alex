@@ -9,6 +9,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private var prefsController: PreferencesWindowController?
     private var traceBrowser: TraceBrowserWindowController?
+    private var darioWindow: DarioWindowController?
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
 
@@ -336,6 +337,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Trace Browser…", symbol: "list.bullet.rectangle") { [weak self] in
             self?.openTraceBrowser()
         }
+        addAction("Dario…", symbol: "server.rack") { [weak self] in
+            self?.openDario()
+        }
         addAction("Reveal Log File", symbol: "doc.text.magnifyingglass") {
             NSWorkspace.shared.activateFileViewerSelecting([BarLog.fileURL])
         }
@@ -412,6 +416,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
         traceBrowser?.show()
+    }
+
+    private func openDario() {
+        if darioWindow == nil {
+            darioWindow = DarioWindowController(store: store)
+        }
+        darioWindow?.show()
     }
 
     private func openPreferences() {

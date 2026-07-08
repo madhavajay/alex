@@ -8,7 +8,8 @@ let package = Package(
         .target(name: "AlexandriaBarCore"),
         .executableTarget(
             name: "AlexandriaBar",
-            dependencies: ["AlexandriaBarCore"]
+            dependencies: ["AlexandriaBarCore"],
+            resources: [.copy("Resources/logos")]
         ),
         .testTarget(
             name: "AlexandriaBarCoreTests",
