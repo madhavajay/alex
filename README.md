@@ -17,12 +17,16 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 
 - **Credential vault** — imports OAuth tokens from Claude Code, Codex, grok, and gemini CLIs; stores them in `~/.alexandria/accounts/` (0600); refreshes them itself (Anthropic, OpenAI, xAI)
 - **One endpoint, every provider** — `/v1/messages`, `/v1/chat/completions`, `/v1/responses` with cross-format translation and model routing (`claude-*` → Anthropic, `gpt-*` → Codex, `grok-*` → xAI)
-- **Login flows built in** — `alex auth login claude|codex|grok` (PKCE paste, loopback, and xAI device-code flows); also exposed over HTTP for GUIs
-- **Trace capture** — every request/response stored with tokens, cost, latency, and session correlation; browse via `alex traces`, `alex tui`, or the trace API
+- **Login flows built in** — `alex auth login claude|codex|grok` (PKCE paste, loopback, and xAI device-code flows); also exposed over HTTP so GUIs can drive re-auth
+- **Trace capture & sessions** — every request/response stored with tokens, cost, latency; group runs with `x-session-id`, tag with `x-alexandria-*` headers, search body text, stitch transcripts
+- **Trace Browser & TUI** — a two-pane live trace browser in the menu bar app, `alex tui` in the terminal, `alex traces --json` for scripts
 - **Limits & health** — subscription plan windows (5h/7d) with utilization and reset times, per-provider heartbeats, `alex ping`, `alex status`
-- **Dario mode** — optional generational supervisor for the `@askalf/dario` Anthropic upstream with zero-downtime rolling restarts
-- **macOS menu bar app** — live gauges, re-auth windows, ping checks, and alerts in `macos/` (AlexandriaBar)
+- **Cost analytics** — per-model requests/tokens/cost with subscription-vs-API billing buckets (`/admin/analytics`)
+- **Dario mode** — optional generational supervisor for the `@askalf/dario` Anthropic upstream with health probes, npm auto-update, and rolling restarts
+- **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
+- **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
 - **Zero-downtime upgrades** — `./install.sh --upgrade` blue-greens the daemon on a shared port (SO_REUSEPORT)
+- **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
 
 ## Install
 
@@ -44,6 +48,44 @@ eval "$(alex env)"        # point ANTHROPIC_/OPENAI_/XAI_ env at the proxy
 
 Re-auth a subscription any time with `alex auth login claude|codex|grok`, watch live traffic with `alex tui`, and check window utilization with `alex limits`.
 
+## Sessions & trace tagging
+
+Generate client credentials for the proxy, then tag requests so every trace from a run lands in one named session:
+
+```bash
+eval "$(alex env)"        # exports ANTHROPIC_/OPENAI_/XAI_ vars pointing at the proxy
+alex credentials --json   # same thing as JSON (alias: creds); --host host.docker.internal for containers
+
+SESSION="experiment-42"
+curl -s "$OPENAI_BASE_URL/chat/completions" \
+  -H "authorization: Bearer $OPENAI_API_KEY" \
+  -H "x-session-id: $SESSION" \
+  -H "x-alexandria-task: sparql-university" \
+  -H "x-alexandria-job: cove-sparql-1" \
+  -H "x-alexandria-trace-tag: attempt=1" \
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Every response carries an `x-alexandria-trace-id`. Typed headers (`x-alexandria-harness|task|model|job`) and free-form `x-alexandria-trace-tag: key=value` tags are captured with each trace. Collect a session back out:
+
+```bash
+alex traces --session "$SESSION" --json                 # CLI
+curl -H "x-api-key: <local_key>" \
+  "http://127.0.0.1:4100/admin/traces?session=$SESSION" # HTTP
+curl -H "x-api-key: <local_key>" \
+  "http://127.0.0.1:4100/traces/sessions/$SESSION/transcript"  # stitched transcript
+curl -H "x-api-key: <local_key>" \
+  "http://127.0.0.1:4100/traces/search?text=professor&session=$SESSION"  # body-text search
+```
+
+## Trace Browser
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/docs/images/browser.png" width="720" alt="Trace Browser: session list with tags and cost, live transcript pane, omni search with typed filters" />
+</p>
+
+The menu bar app's Trace Browser gives the same data a UI: two-pane sessions + live transcript, an omni bar combining free text with `model:`, `harness:`, `task:`, `job:`, `tag:key=value`, `status:`, `run:` and `session:` filters, live/pin modes, and per-turn token/cost breakdowns.
+
 ## macOS menu bar app
 
 <p align="center">
@@ -55,6 +97,14 @@ Re-auth a subscription any time with `alex auth login claude|codex|grok`, watch 
 ```bash
 cd macos && ./Scripts/run.sh   # build + launch dist/AlexandriaBar.app
 ```
+
+### Re-auth helpers
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/docs/images/reauth.png" width="420" alt="Re-authenticate Codex: open the authorization page, approve in the browser, finishes automatically" />
+</p>
+
+When a subscription expires you get a notification and a one-click fix. Each provider gets the flow that suits it: **Codex** opens the browser and finishes automatically via the localhost callback (above), **Grok** shows an xAI device code you can enter from any device, and **Claude** takes the pasted `code#state`. The same flows are served by the daemon (`POST /admin/auth/login/start`, poll `GET /admin/auth/login/<id>`), so any UI can drive them — the terminal equivalent is `alex auth login <provider>`.
 
 ## Crates
 
