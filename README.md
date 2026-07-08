@@ -76,4 +76,4 @@ cd macos && swift test    # menu bar app tests
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
