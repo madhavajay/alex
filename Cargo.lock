@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "alex"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alex-auth",
  "alex-core",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "alex-auth"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alex-core",
  "anyhow",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "alex-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "chrono",
  "serde",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "alex-proxy"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alex-auth",
  "alex-core",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "alex-store"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alex-core",
  "anyhow",
