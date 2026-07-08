@@ -78,6 +78,19 @@ fn session_kind(s: &Value) -> Option<&'static str> {
     if harness.contains("alexandria-ping") {
         return Some("ping");
     }
+    match s["tags"]["kind"].as_str() {
+        Some("ping") | Some("health") | Some("preflight") | Some("heartbeat") => {
+            return Some("ping")
+        }
+        Some("test") | Some("smoke") => return Some("test"),
+        _ => {}
+    }
+    if matches!(
+        s["tags"]["phase"].as_str(),
+        Some("preflight") | Some("health") | Some("ping")
+    ) {
+        return Some("ping");
+    }
     let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
     if sid.starts_with("tsh-")
         || sid.starts_with("alexandria-e2e-")

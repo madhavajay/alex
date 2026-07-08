@@ -321,6 +321,7 @@ impl DarioSupervisor {
             respawn_next_at: AtomicI64::new(0),
         });
         let _ = supervisor.weak_self.set(Arc::downgrade(&supervisor));
+        supervisor.reap_orphans();
         let version = match &supervisor.settings.version_pin {
             Some(pin) => pin.clone(),
             None => supervisor.npm_latest().await?,
@@ -584,6 +585,68 @@ impl DarioSupervisor {
             .ok_or_else(|| anyhow!("npm registry response missing version"))
     }
 
+    fn pids_path(&self) -> PathBuf {
+        self.settings.install_root.join("child-pids.json")
+    }
+
+    fn record_child(&self, gen_id: &str, child_pid: u32, port: u16) {
+        let path = self.pids_path();
+        let mut entries: Vec<Value> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        entries.retain(|e| e["child_pid"].as_u64() != Some(child_pid as u64));
+        entries.push(json!({
+            "daemon_pid": std::process::id(),
+            "child_pid": child_pid,
+            "port": port,
+            "generation_id": gen_id,
+            "started_ms": now_ms(),
+        }));
+        if let Ok(data) = serde_json::to_string(&entries) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
+    fn reap_orphans(&self) {
+        let path = self.pids_path();
+        let Some(entries) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+        else {
+            return;
+        };
+        let self_pid = std::process::id() as u64;
+        let mut kept = Vec::new();
+        for e in entries {
+            let daemon = e["daemon_pid"].as_u64().unwrap_or(0);
+            let child = e["child_pid"].as_u64().unwrap_or(0);
+            if child == 0 {
+                continue;
+            }
+            let daemon_alive = daemon == self_pid || (daemon > 0 && process_alive(daemon as i32));
+            let child_alive = process_alive(child as i32);
+            if daemon_alive && child_alive {
+                kept.push(e);
+                continue;
+            }
+            if child_alive {
+                tracing::info!(
+                    child,
+                    generation = e["generation_id"].as_str().unwrap_or("-"),
+                    "reaping orphaned dario child from dead daemon"
+                );
+                let _ = std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(child.to_string())
+                    .output();
+            }
+        }
+        if let Ok(data) = serde_json::to_string(&kept) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
     fn spawn_generation(&self, version: &str, bin: &Path) -> Result<Arc<Generation>> {
         let port = alloc_port()?;
         let id = generation_id(version, port);
@@ -604,6 +667,9 @@ impl DarioSupervisor {
             .spawn()
             .with_context(|| format!("spawning {bin:?}"))?;
         let pid = child.id().unwrap_or(0);
+        if pid > 0 {
+            self.record_child(&id, pid, port);
+        }
         let gen = Arc::new(Generation::new(
             id,
             version.to_string(),
@@ -1025,6 +1091,15 @@ fn reap_action(
 
 fn generation_id(version: &str, port: u16) -> String {
     format!("gen-{version}-{port}")
+}
+
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc_kill(pid, 0) == 0 }
+}
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn alloc_port() -> Result<u16> {

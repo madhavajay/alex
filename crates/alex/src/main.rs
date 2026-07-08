@@ -492,9 +492,56 @@ impl alex_proxy::DarioRouter for DarioGlue {
 }
 
 fn dario_admin_router(sup: Arc<dario::DarioSupervisor>) -> axum::Router {
-    use axum::extract::State;
+    use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
-    use axum::routing::post;
+    use axum::routing::{get, post};
+
+    fn tail_lines(path: &str, lines: usize) -> String {
+        std::fs::read_to_string(path)
+            .map(|s| {
+                let all: Vec<&str> = s.lines().collect();
+                let start = all.len().saturating_sub(lines);
+                all[start..].join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    async fn logs(
+        State(sup): State<Arc<dario::DarioSupervisor>>,
+        AxPath(gen_id): AxPath<String>,
+        Query(q): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lines = q
+            .get("lines")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200usize)
+            .min(2000);
+        let status = sup.status();
+        let found = status["generations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|g| g["id"].as_str() == Some(gen_id.as_str()))
+            .cloned();
+        match found {
+            Some(g) => {
+                let out = g["stdout_log"].as_str().map(|p| tail_lines(p, lines));
+                let err = g["stderr_log"].as_str().map(|p| tail_lines(p, lines));
+                axum::Json(serde_json::json!({
+                    "generation_id": gen_id,
+                    "stdout": out,
+                    "stderr": err,
+                    "lines": lines,
+                }))
+                .into_response()
+            }
+            None => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": {"message": "unknown generation"}})),
+            )
+                .into_response(),
+        }
+    }
 
     async fn restart(State(sup): State<Arc<dario::DarioSupervisor>>) -> axum::response::Response {
         match sup.restart().await {
@@ -521,6 +568,7 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>) -> axum::Router {
     axum::Router::new()
         .route("/admin/dario/restart", post(restart))
         .route("/admin/dario/update", post(update))
+        .route("/admin/dario/logs/{generation_id}", get(logs))
         .with_state(sup)
 }
 

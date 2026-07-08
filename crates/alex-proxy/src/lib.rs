@@ -1816,6 +1816,8 @@ const METADATA_HEADERS: &[(&str, &str)] = &[
     ("x-alexandria-task", "task"),
     ("x-alexandria-model", "model"),
     ("x-alexandria-job", "job"),
+    ("x-alexandria-phase", "phase"),
+    ("x-alexandria-kind", "kind"),
 ];
 
 fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
