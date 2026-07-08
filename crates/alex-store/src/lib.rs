@@ -69,6 +69,7 @@ CREATE INDEX IF NOT EXISTS heartbeats_ts ON heartbeats(ts_ms);
 CREATE TABLE IF NOT EXISTS run_keys (
   id TEXT PRIMARY KEY,
   key_hash TEXT UNIQUE NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'run',
   run_id TEXT,
   tags_json TEXT,
   label TEXT,
@@ -81,7 +82,7 @@ CREATE TABLE IF NOT EXISTS run_keys (
 "#;
 
 const RUN_KEY_COLS: &str =
-    "id, key_hash, run_id, tags_json, label, created_ms, expires_ms, revoked, use_count, last_used_ms";
+    "id, key_hash, run_id, tags_json, label, created_ms, expires_ms, revoked, use_count, last_used_ms, kind";
 
 fn run_key_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let key_hash = r.get::<_, String>(1)?;
@@ -101,6 +102,7 @@ fn run_key_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "revoked": r.get::<_, i64>(7)? != 0,
         "use_count": r.get::<_, i64>(8)?,
         "last_used_ms": r.get::<_, Option<i64>>(9)?,
+        "kind": r.get::<_, String>(10)?,
     }))
 }
 
@@ -177,6 +179,15 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_run_keys(conn: &Connection) -> Result<()> {
+    if let Err(e) = conn.execute_batch("ALTER TABLE run_keys ADD COLUMN kind TEXT NOT NULL DEFAULT 'run'") {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct TraceFilter {
     pub since_ms: Option<i64>,
@@ -243,6 +254,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
         migrate_traces(&conn)?;
+        migrate_run_keys(&conn)?;
         seed_pricing(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -748,6 +760,7 @@ impl Store {
         &self,
         id: &str,
         key_hash: &str,
+        kind: &str,
         run_id: Option<&str>,
         tags_json: Option<&str>,
         label: Option<&str>,
@@ -756,9 +769,9 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO run_keys (id, key_hash, run_id, tags_json, label, created_ms, expires_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, key_hash, run_id, tags_json, label, created_ms, expires_ms],
+            "INSERT INTO run_keys (id, key_hash, kind, run_id, tags_json, label, created_ms, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, key_hash, kind, run_id, tags_json, label, created_ms, expires_ms],
         )?;
         Ok(())
     }
@@ -1350,6 +1363,7 @@ mod tests {
             .insert_run_key(
                 "rk-aaaa1111",
                 "aaaa1111bbbb2222cccc",
+                "run",
                 Some("run-1"),
                 Some(r#"{"task":"demo"}"#),
                 Some("demo job"),
@@ -1358,7 +1372,7 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_run_key("rk-dddd4444", "dddd4444eeee5555ffff", None, None, None, 2000, None)
+            .insert_run_key("rk-dddd4444", "dddd4444eeee5555ffff", "run", None, None, None, 2000, None)
             .unwrap();
         let k = store
             .lookup_run_key("aaaa1111bbbb2222cccc", 5000)
@@ -1387,6 +1401,7 @@ mod tests {
         assert_eq!(touched["use_count"], 2);
         assert_eq!(touched["last_used_ms"], 4000);
         assert_eq!(touched["tags"], json!({"task": "demo"}));
+        assert_eq!(touched["kind"], "run");
         assert!(store.revoke_run_key("rk-aaaa").unwrap());
         assert!(!store.revoke_run_key("rk-zzzz").unwrap());
         assert!(store
@@ -1397,8 +1412,42 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0]["id"], "rk-dddd4444");
         assert!(store
-            .insert_run_key("rk-ffff6666", "aaaa1111bbbb2222cccc", None, None, None, 1, None)
+            .insert_run_key("rk-ffff6666", "aaaa1111bbbb2222cccc", "run", None, None, None, 1, None)
             .is_err());
+    }
+
+    #[test]
+    fn harness_run_keys_never_expire_and_revoke() {
+        let store = Store::open(tmpdir("run-keys-harness")).unwrap();
+        store
+            .insert_run_key(
+                "rk-harness1",
+                "hhhh1111bbbb2222cccc",
+                "harness",
+                None,
+                Some(r#"{"harness":"pi"}"#),
+                Some("pi"),
+                1000,
+                None,
+            )
+            .unwrap();
+        let k = store
+            .lookup_run_key("hhhh1111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(k["kind"], "harness");
+        assert_eq!(k["label"], "pi");
+        assert_eq!(k["expires_ms"], Value::Null);
+        assert_eq!(k["tags"], json!({"harness": "pi"}));
+        let active = store.list_run_keys(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["id"], "rk-harness1");
+        assert!(store.revoke_run_key("rk-harness1").unwrap());
+        assert!(store
+            .lookup_run_key("hhhh1111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_none());
+        assert!(store.list_run_keys(false).unwrap().is_empty());
     }
 
     #[test]
@@ -1415,7 +1464,7 @@ mod tests {
         }
         let store = Store::open(dir).unwrap();
         store
-            .insert_run_key("rk-11112222", "hash-x", None, None, None, 1000, None)
+            .insert_run_key("rk-11112222", "hash-x", "run", None, None, None, 1000, None)
             .unwrap();
         assert_eq!(store.list_run_keys(true).unwrap().len(), 1);
     }

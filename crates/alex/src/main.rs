@@ -9,6 +9,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 mod dario;
+mod harness_connect;
 mod harness_e2e;
 mod light;
 mod selfupdate;
@@ -61,6 +62,22 @@ enum Command {
     },
     /// Print env exports for pointing harnesses at the daemon
     Env,
+    /// Connect an installed AI harness to this daemon (pi)
+    Connect {
+        /// Harness name; omit to show detection status
+        harness: Option<String>,
+        /// Override the harness config dir (default: ~/.pi/agent for pi)
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a harness's alexandria config and revoke its keys
+    Disconnect {
+        harness: String,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
     /// Fire a tiny test prompt through each provider to verify credentials
     Ping {
         #[arg(default_value = "all")]
@@ -1063,6 +1080,19 @@ async fn main() -> Result<()> {
         Command::Env => {
             print_env(&config.host, config.port, &config.local_key);
         }
+        Command::Connect {
+            harness,
+            config_dir,
+            json,
+        } => {
+            harness_connect::connect_cmd(&config, harness, config_dir, json).await?;
+        }
+        Command::Disconnect {
+            harness,
+            config_dir,
+        } => {
+            harness_connect::disconnect_cmd(&config, harness, config_dir).await?;
+        }
         Command::Ping { target } => {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
@@ -1382,6 +1412,7 @@ async fn daemon_get(
         .build()?;
     let resp = client
         .get(format!("{base}{path}"))
+        .header("x-api-key", &config.local_key)
         .query(params)
         .send()
         .await
@@ -1595,6 +1626,7 @@ async fn daemon_send(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let mut req = client.request(method, format!("{base}{path}"));
+    req = req.header("x-api-key", &config.local_key);
     if let Some(b) = body {
         req = req.json(&b);
     }

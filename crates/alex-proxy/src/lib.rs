@@ -2269,18 +2269,28 @@ async fn admin_run_keys_create(
         Value::Object(o) => Some(o.clone()),
         _ => return error_response(StatusCode::BAD_REQUEST, "'tags' must be an object"),
     };
-    let ttl_seconds = body["ttl_seconds"].as_i64().unwrap_or(RUN_KEY_DEFAULT_TTL_S);
-    if ttl_seconds <= 0 {
-        return error_response(StatusCode::BAD_REQUEST, "'ttl_seconds' must be positive");
+    let kind = body["kind"].as_str().unwrap_or("run");
+    if kind != "run" && kind != "harness" {
+        return error_response(StatusCode::BAD_REQUEST, "'kind' must be 'run' or 'harness'");
     }
-    let ttl_seconds = ttl_seconds.min(RUN_KEY_MAX_TTL_S);
     let run_id = body["run_id"].as_str().map(String::from);
     let label = body["label"].as_str().map(String::from);
+    if kind == "harness" && label.as_deref().unwrap_or("").trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "'label' is required for harness keys");
+    }
+    let created_ms = now_ms();
+    let expires_ms = if kind == "harness" {
+        None
+    } else {
+        let ttl_seconds = body["ttl_seconds"].as_i64().unwrap_or(RUN_KEY_DEFAULT_TTL_S);
+        if ttl_seconds <= 0 {
+            return error_response(StatusCode::BAD_REQUEST, "'ttl_seconds' must be positive");
+        }
+        Some(created_ms + ttl_seconds.min(RUN_KEY_MAX_TTL_S) * 1000)
+    };
     let key = generate_run_key();
     let key_hash = key_hash_hex(&key);
     let id = format!("rk-{}", &key_hash[..8]);
-    let created_ms = now_ms();
-    let expires_ms = created_ms + ttl_seconds * 1000;
     let tags_json = tags
         .as_ref()
         .filter(|o| !o.is_empty())
@@ -2288,11 +2298,12 @@ async fn admin_run_keys_create(
     match state.store.insert_run_key(
         &id,
         &key_hash,
+        kind,
         run_id.as_deref(),
         tags_json.as_deref(),
         label.as_deref(),
         created_ms,
-        Some(expires_ms),
+        expires_ms,
     ) {
         Ok(()) => {
             let (_, exports) = connect_payload(&state.base_url, &key);
@@ -2301,7 +2312,9 @@ async fn admin_run_keys_create(
                 axum::Json(json!({
                     "id": id,
                     "key": key,
+                    "kind": kind,
                     "run_id": run_id,
+                    "label": label,
                     "tags": tags.map(Value::Object).unwrap_or_else(|| json!({})),
                     "expires_ms": expires_ms,
                     "exports": exports,
@@ -2350,6 +2363,7 @@ fn session_from_metadata(body_json: &Value) -> Option<String> {
 
 const METADATA_HEADERS: &[(&str, &str)] = &[
     ("x-alexandria-harness", "harness"),
+    ("x-alexandria-harness-version", "harness_version"),
     ("x-alexandria-task", "task"),
     ("x-alexandria-model", "model"),
     ("x-alexandria-job", "job"),
@@ -2938,5 +2952,114 @@ fn finalize_trace(
             cost = trace.cost_usd,
             "trace recorded"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_state(name: &str) -> Arc<AppState> {
+        let dir = tmpdir(name);
+        let store = Arc::new(Store::open(dir.join("store")).unwrap());
+        let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
+        build_state(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+        )
+    }
+
+    async fn response_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn harness_run_key_mints_lists_validates_and_revokes() {
+        let state = test_state("harness-run-key");
+        let (_status, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({
+                    "kind": "harness",
+                    "label": "pi",
+                    "ttl_seconds": 1,
+                    "tags": {"harness": "pi"},
+                }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(_status, StatusCode::CREATED);
+        assert_eq!(created["kind"], "harness");
+        assert_eq!(created["label"], "pi");
+        assert_eq!(created["expires_ms"], Value::Null);
+        let id = created["id"].as_str().unwrap().to_string();
+        let key = created["key"].as_str().unwrap();
+        let hash = key_hash_hex(key);
+
+        let entry = run_key_entry(&state, &hash).unwrap();
+        assert_eq!(entry.expires_ms, None);
+        assert_eq!(entry.tags_json.as_deref(), Some(r#"{"harness":"pi"}"#));
+
+        let (_status, listed) = response_json(
+            admin_run_keys_list(State(state.clone()), Query(HashMap::new())).await,
+        )
+        .await;
+        assert_eq!(_status, StatusCode::OK);
+        let rows = listed["run_keys"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["kind"], "harness");
+        assert_eq!(rows[0]["label"], "pi");
+        assert_eq!(rows[0]["expires_ms"], Value::Null);
+
+        let (_status, revoked) =
+            response_json(admin_run_keys_revoke(State(state.clone()), Path(id)).await).await;
+        assert_eq!(_status, StatusCode::OK);
+        assert_eq!(revoked["revoked"], true);
+        assert!(run_key_entry(&state, &hash).is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_run_key_requires_label() {
+        let state = test_state("harness-run-key-label");
+        let (status, body) = response_json(
+            admin_run_keys_create(
+                State(state),
+                Some(axum::Json(json!({
+                    "kind": "harness",
+                    "tags": {"harness": "pi"},
+                }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("label"));
     }
 }
