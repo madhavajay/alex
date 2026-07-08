@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "alex"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alexandria-auth",
  "alexandria-core",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alexandria-core",
  "anyhow",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-proxy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alexandria-auth",
  "alexandria-core",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alexandria-core",
  "anyhow",
