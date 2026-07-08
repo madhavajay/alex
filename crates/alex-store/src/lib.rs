@@ -509,26 +509,39 @@ impl Store {
 
     pub fn run_summary(&self, run_id: &str) -> Result<Value> {
         let conn = self.conn.lock().unwrap();
-        let (trace_count, first_ts_ms, last_ts_ms, total_input, total_output, total_cost, errors) =
-            conn.query_row(
-                "SELECT COUNT(*), MIN(ts_request_ms), MAX(ts_request_ms),
-                        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(cost_usd),0.0),
-                        COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),0)
-                 FROM traces WHERE run_id = ?1",
-                params![run_id],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<i64>>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
-                        r.get::<_, f64>(5)?,
-                        r.get::<_, i64>(6)?,
-                    ))
-                },
-            )?;
+        #[allow(clippy::type_complexity)]
+        let (
+            trace_count,
+            first_ts_ms,
+            last_ts_ms,
+            last_response_ms,
+            pending,
+            total_input,
+            total_output,
+            total_cost,
+            errors,
+        ) = conn.query_row(
+            "SELECT COUNT(*), MIN(ts_request_ms), MAX(ts_request_ms), MAX(ts_response_ms),
+                    COALESCE(SUM(CASE WHEN ts_response_ms IS NULL THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cost_usd),0.0),
+                    COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),0)
+             FROM traces WHERE run_id = ?1",
+            params![run_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, f64>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
         let mut status_counts = serde_json::Map::new();
         let mut stmt = conn.prepare(
             "SELECT status, COUNT(*) FROM traces WHERE run_id = ?1 GROUP BY status",
@@ -567,6 +580,10 @@ impl Store {
             "trace_count": trace_count,
             "first_ts_ms": first_ts_ms,
             "last_ts_ms": last_ts_ms,
+            "last_request_ms": last_ts_ms,
+            "last_response_ms": last_response_ms,
+            "last_activity_ms": last_response_ms.max(last_ts_ms),
+            "pending": pending,
             "status_counts": status_counts,
             "models": models,
             "providers": providers,
