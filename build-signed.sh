@@ -69,6 +69,7 @@ DMG_PATH="$DIST_DIR/$DMG_NAME"
 TRAP_P12=""
 TEMP_KEYCHAIN=""
 DMG_STAGE=""
+ORIGINAL_DEFAULT_KEYCHAIN=""
 cleanup() {
   if [[ -n "$DMG_STAGE" && -d "$DMG_STAGE" ]]; then
     rm -rf "$DMG_STAGE" || true
@@ -77,6 +78,9 @@ cleanup() {
     rm -f "$TRAP_P12" || true
   fi
   if [[ -n "$TEMP_KEYCHAIN" && -f "$TEMP_KEYCHAIN" ]]; then
+    if [[ -n "$ORIGINAL_DEFAULT_KEYCHAIN" ]]; then
+      security default-keychain -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+    fi
     security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true
   fi
 }
@@ -97,9 +101,11 @@ prepare_import_keychain() {
   if [[ -n "${GITHUB_ACTIONS:-}" || -n "${CI:-}" ]]; then
     KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-$(uuidgen)}"
     TEMP_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/alexandria-signing.keychain-db"
+    ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain | tr -d '"')"
     security create-keychain -p "$KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN"
     security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN"
     security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN"
+    security default-keychain -s "$TEMP_KEYCHAIN"
     existing_keychains="$(security list-keychains -d user | tr -d '"')"
     # shellcheck disable=SC2086
     security list-keychains -d user -s "$TEMP_KEYCHAIN" $existing_keychains
@@ -172,6 +178,17 @@ if ! security find-identity -p codesigning -v | grep -Fq "$APPLE_SIGNING_IDENTIT
   exit 1
 fi
 
+if [[ "$APPLE_SIGNING_IDENTITY" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+  CODESIGN_IDENTITY="$APPLE_SIGNING_IDENTITY"
+else
+  CODESIGN_IDENTITY="$(security find-identity -p codesigning -v | awk -v identity="$APPLE_SIGNING_IDENTITY" 'index($0, "\"" identity "\"") { print $2; exit }')"
+fi
+
+if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
+  echo "Unable to resolve signing identity hash for: $APPLE_SIGNING_IDENTITY" >&2
+  exit 1
+fi
+
 echo "Using signing identity: $APPLE_SIGNING_IDENTITY"
 echo "Using bundle identifier: $BUNDLE_ID"
 
@@ -183,7 +200,7 @@ fi
 
 echo "Building signed app bundle..."
 CONFIGURATION=release \
-IDENTITY="$APPLE_SIGNING_IDENTITY" \
+IDENTITY="$CODESIGN_IDENTITY" \
 BUNDLE_ID="$BUNDLE_ID" \
 VERSION="$VERSION" \
 ./macos/Scripts/package_app.sh
@@ -250,7 +267,7 @@ hdiutil create -volname "Alexandria" -srcfolder "$DMG_STAGE" -ov -format UDZO "$
 hdiutil verify "$DMG_PATH" >/dev/null
 
 echo "Signing DMG..."
-codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
+codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG_PATH"
 codesign --verify --verbose=2 "$DMG_PATH"
 
 if [[ "$SHOULD_NOTARIZE" == "true" ]]; then
