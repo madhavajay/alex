@@ -11,7 +11,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: "!startsWith(github.event.head_commit.message, 'release:')"
+    if: "!startsWith(github.event.head_commit.message, 'release: v')"
     outputs:
       version: ${{ steps.version.outputs.version }}
     permissions:
