@@ -47,10 +47,24 @@ final class TraceBrowserModel {
         let query = parsedQuery
         return sessions.filter { session in
             if !showPings, session.isPingOrTest { return false }
-            guard query.matches(session) else { return false }
-            if let ids = searchSessionIds, !ids.contains(session.sessionId) { return false }
-            return true
+            return query.isVisible(session, serverMatches: searchSessionIds)
         }
+    }
+
+    var showsTagFilterBar: Bool {
+        sessions.contains { $0.tags?.isEmpty == false }
+    }
+
+    func filterValues(_ dimension: TagFilterDimension) -> [String] {
+        dimension.values(in: sessions)
+    }
+
+    func activeFilter(_ dimension: TagFilterDimension) -> String? {
+        dimension.activeValue(in: parsedQuery)
+    }
+
+    func setFilter(_ dimension: TagFilterDimension, _ value: String?) {
+        queryText = OmniQuery.settingToken(in: queryText, key: dimension.rawValue, value: value)
     }
 
     var selectedSession: TraceSession? {
@@ -287,6 +301,9 @@ struct TraceBrowserView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
+            if model.showsTagFilterBar {
+                TagFilterBar(model: model)
+            }
             Divider()
             if model.daemonDown {
                 banner
@@ -308,7 +325,7 @@ struct TraceBrowserView: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                 TextField(
-                    "Search — free text + model: provider: harness: status: run: session:",
+                    "Search — free text + model: harness: task: job: tag:key=value status: run: session:",
                     text: $model.queryText
                 )
                 .textFieldStyle(.plain)
@@ -351,6 +368,87 @@ struct TraceBrowserView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.orange.opacity(0.12))
+    }
+}
+
+private struct TagFilterBar: View {
+    @Bindable var model: TraceBrowserModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(TagFilterDimension.allCases, id: \.rawValue) { dimension in
+                menu(for: dimension)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 7)
+    }
+
+    @ViewBuilder
+    private func menu(for dimension: TagFilterDimension) -> some View {
+        let values = model.filterValues(dimension)
+        let active = model.activeFilter(dimension)
+        Menu {
+            Button {
+                model.setFilter(dimension, nil)
+            } label: {
+                menuItemLabel("All", checked: active == nil)
+            }
+            Divider()
+            ForEach(values, id: \.self) { value in
+                Button {
+                    model.setFilter(dimension, value)
+                } label: {
+                    menuItemLabel(value, checked: active == value)
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(active.map { "\(dimension.rawValue): \($0)" } ?? dimension.title)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 6, weight: .semibold))
+            }
+            .font(.system(size: 10, weight: active == nil ? .regular : .semibold))
+            .foregroundStyle(active == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(
+                    active == nil ? AnyShapeStyle(.quaternary.opacity(0.5))
+                        : AnyShapeStyle(Color.accentColor.opacity(0.15))))
+            .frame(maxWidth: 220)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(values.isEmpty && active == nil)
+    }
+
+    @ViewBuilder
+    private func menuItemLabel(_ text: String, checked: Bool) -> some View {
+        if checked {
+            Label(text, systemImage: "checkmark")
+        } else {
+            Text(text)
+        }
+    }
+}
+
+private struct TagChipView: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(.quaternary.opacity(0.6)))
     }
 }
 
@@ -456,6 +554,16 @@ private struct SessionRowView: View {
                     .lineLimit(1)
                 Spacer()
             }
+            let chips = SessionTagChips.chips(
+                tags: session.tags, harness: session.harness, models: session.models)
+            if !chips.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(chips, id: \.key) { chip in
+                        TagChipView(text: chip.label())
+                    }
+                    Spacer()
+                }
+            }
             HStack(spacing: 8) {
                 Text("\(session.traceCount) turn\(session.traceCount == 1 ? "" : "s")")
                 Text("\(TraceFormat.tokens(session.totalInputTokens))→\(TraceFormat.tokens(session.totalOutputTokens)) tok")
@@ -555,6 +663,11 @@ private struct TranscriptView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
+                let chips = SessionTagChips.chips(
+                    tags: session.tags, harness: session.harness, models: session.models)
+                ForEach(chips, id: \.key) { chip in
+                    TagChipView(text: chip.label())
+                }
                 Spacer()
                 Text("\(model.turns.count) turn\(model.turns.count == 1 ? "" : "s")")
                     .font(.system(size: 10))

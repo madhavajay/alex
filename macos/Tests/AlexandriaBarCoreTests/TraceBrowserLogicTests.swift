@@ -57,6 +57,145 @@ import Testing
         #expect(!OmniQuery.parse("model:grok status:500").matches(session))
     }
 
+    @Test func omniQueryTagTokens() {
+        let q = OmniQuery.parse("sparql task:sparql-university job:job-42 tag:harness=codex")
+        #expect(q.freeText == "sparql")
+        #expect(q.task == "sparql-university")
+        #expect(q.job == "job-42")
+        #expect(q.tag == "harness=codex")
+        #expect(q.hasTokenFilters)
+        let bare = OmniQuery.parse("tag:codex")
+        #expect(bare.tag == "codex")
+        #expect(bare.freeText.isEmpty)
+        let upper = OmniQuery.parse("TASK:X JOB:y TAG:k=v")
+        #expect(upper.task == "X")
+        #expect(upper.job == "y")
+        #expect(upper.tag == "k=v")
+    }
+
+    @Test func omniQueryTagMatching() {
+        let session = makeSession(
+            id: "sess-1", models: ["gpt-5.5"], harness: "codex-cli", runId: nil, lastStatus: 200,
+            tags: [
+                "task": "sparql-university", "job": "job-42",
+                "harness": "codex", "model": "gpt-5.5-mini",
+            ])
+        #expect(OmniQuery.parse("task:sparql").matches(session))
+        #expect(OmniQuery.parse("task:SPARQL-UNI").matches(session))
+        #expect(!OmniQuery.parse("task:other").matches(session))
+        #expect(OmniQuery.parse("job:42").matches(session))
+        #expect(!OmniQuery.parse("job:43").matches(session))
+        #expect(OmniQuery.parse("harness:codex-cli").matches(session))
+        #expect(OmniQuery.parse("harness:codex").matches(session))
+        #expect(OmniQuery.parse("model:gpt-5.5").matches(session))
+        #expect(OmniQuery.parse("model:mini").matches(session))
+        #expect(!OmniQuery.parse("model:grok").matches(session))
+        #expect(OmniQuery.parse("tag:task=sparql").matches(session))
+        #expect(OmniQuery.parse("tag:TASK=Sparql").matches(session))
+        #expect(!OmniQuery.parse("tag:task=other").matches(session))
+        #expect(!OmniQuery.parse("tag:missing=x").matches(session))
+        #expect(OmniQuery.parse("tag:job-42").matches(session))
+        #expect(!OmniQuery.parse("tag:nowhere").matches(session))
+        #expect(OmniQuery.parse("tag:job=").matches(session))
+    }
+
+    @Test func harnessTagFallbackWithoutField() {
+        let tagOnly = makeSession(
+            id: "sess-2", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            tags: ["harness": "codex", "model": "gpt-5.5"])
+        #expect(OmniQuery.parse("harness:codex").matches(tagOnly))
+        #expect(!OmniQuery.parse("harness:claude").matches(tagOnly))
+        #expect(OmniQuery.parse("model:gpt").matches(tagOnly))
+        let untagged = makeSession(
+            id: "sess-3", models: nil, harness: nil, runId: nil, lastStatus: nil)
+        #expect(!OmniQuery.parse("harness:codex").matches(untagged))
+        #expect(!OmniQuery.parse("task:x").matches(untagged))
+        #expect(!OmniQuery.parse("tag:x").matches(untagged))
+    }
+
+    @Test func freeTextMatchesTagValues() {
+        let tagged = makeSession(
+            id: "sess-4", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            tags: ["task": "sparql-university"])
+        let untagged = makeSession(
+            id: "sess-5", models: nil, harness: nil, runId: nil, lastStatus: nil)
+        let q = OmniQuery.parse("sparql")
+        #expect(q.freeTextMatchesTags(tagged))
+        #expect(!q.freeTextMatchesTags(untagged))
+        #expect(q.isVisible(tagged, serverMatches: nil))
+        #expect(!q.isVisible(untagged, serverMatches: nil))
+        #expect(q.isVisible(untagged, serverMatches: ["sess-5"]))
+        #expect(!q.isVisible(untagged, serverMatches: ["other"]))
+        #expect(q.isVisible(tagged, serverMatches: []))
+        let empty = OmniQuery.parse("")
+        #expect(empty.isVisible(untagged, serverMatches: nil))
+        let tokenMiss = OmniQuery.parse("sparql task:other")
+        #expect(!tokenMiss.isVisible(tagged, serverMatches: nil))
+    }
+
+    @Test func chipSelection() {
+        let chips = SessionTagChips.chips(
+            tags: [
+                "alpha": "1", "task": "sparql-university", "job": "job-42", "beta": "2",
+            ],
+            harness: nil, models: nil)
+        #expect(chips.map(\.key) == ["task", "job", "alpha"])
+        #expect(chips[0].label() == "task=sparql-university")
+        #expect(chips[1].label() == "job=job-42")
+    }
+
+    @Test func chipDedupAndEdgeCases() {
+        #expect(SessionTagChips.chips(tags: nil, harness: nil, models: nil).isEmpty)
+        #expect(SessionTagChips.chips(tags: [:], harness: "codex", models: nil).isEmpty)
+        let deduped = SessionTagChips.chips(
+            tags: ["model": "gpt-5.5", "harness": "codex", "task": "t1"],
+            harness: "codex", models: ["gpt-5.5"])
+        #expect(deduped.map(\.key) == ["task"])
+        let kept = SessionTagChips.chips(
+            tags: ["model": "gpt-5.5-mini", "harness": "codex"],
+            harness: "codex-cli", models: ["gpt-5.5"])
+        #expect(kept.map(\.key) == ["harness", "model"])
+        let emptyValue = SessionTagChips.chips(
+            tags: ["task": "", "job": "j1"], harness: nil, models: nil)
+        #expect(emptyValue.map(\.key) == ["job"])
+    }
+
+    @Test func chipLabelTruncation() {
+        let chip = TagChip(key: "task", value: "a-very-long-task-name-indeed")
+        #expect(chip.label() == "task=a-very-long-task-n…")
+        #expect(chip.label(maxValueLength: 100) == "task=a-very-long-task-name-indeed")
+        #expect(TagChip(key: "job", value: "exactly-eighteen-c").label() == "job=exactly-eighteen-c")
+    }
+
+    @Test func settingTokenComposition() {
+        #expect(OmniQuery.settingToken(in: "", key: "task", value: "t1") == "task:t1")
+        #expect(OmniQuery.settingToken(in: "sparql", key: "job", value: "j1") == "sparql job:j1")
+        #expect(
+            OmniQuery.settingToken(in: "sparql task:old job:j1", key: "task", value: "new")
+                == "sparql job:j1 task:new")
+        #expect(OmniQuery.settingToken(in: "sparql task:old", key: "task", value: nil) == "sparql")
+        #expect(OmniQuery.settingToken(in: "TASK:old free", key: "task", value: "t2") == "free task:t2")
+        #expect(OmniQuery.settingToken(in: "model:a", key: "model", value: nil) == "")
+    }
+
+    @Test func filterDimensionValues() {
+        let sessions = [
+            makeSession(
+                id: "s1", models: ["gpt-5.5"], harness: "codex-cli", runId: nil, lastStatus: nil,
+                tags: ["harness": "codex", "task": "sparql-university", "job": "job-42"]),
+            makeSession(
+                id: "s2", models: ["grok-code-fast-1"], harness: "codex-cli", runId: nil,
+                lastStatus: nil, tags: ["model": "gpt-5.5", "task": "algebra"]),
+            makeSession(id: "s3", models: nil, harness: nil, runId: nil, lastStatus: nil),
+        ]
+        #expect(TagFilterDimension.harness.values(in: sessions) == ["codex", "codex-cli"])
+        #expect(TagFilterDimension.task.values(in: sessions) == ["algebra", "sparql-university"])
+        #expect(TagFilterDimension.job.values(in: sessions) == ["job-42"])
+        #expect(TagFilterDimension.model.values(in: sessions) == ["gpt-5.5", "grok-code-fast-1"])
+        #expect(TagFilterDimension.harness.activeValue(in: OmniQuery.parse("harness:codex")) == "codex")
+        #expect(TagFilterDimension.task.activeValue(in: OmniQuery.parse("job:j")) == nil)
+    }
+
     @Test func pingClassification() {
         #expect(SessionKind.isPingOrTest(sessionId: "auto-1", harness: "alexandria-ping"))
         #expect(SessionKind.isPingOrTest(sessionId: "auto-1", harness: "x/alexandria-ping/1.0"))
@@ -123,7 +262,8 @@ import Testing
     }
 
     private func makeSession(
-        id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?
+        id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?,
+        tags: [String: String]? = nil
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
@@ -134,6 +274,7 @@ import Testing
             "models": models as Any,
             "harness": harness as Any,
             "last_status": lastStatus as Any,
+            "tags": tags as Any,
         ]
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(TraceSession.self, from: data)

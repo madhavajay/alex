@@ -107,6 +107,9 @@ public struct OmniQuery: Equatable, Sendable {
     public var status: String?
     public var run: String?
     public var session: String?
+    public var task: String?
+    public var job: String?
+    public var tag: String?
 
     public init() {}
 
@@ -117,6 +120,7 @@ public struct OmniQuery: Equatable, Sendable {
     public var hasTokenFilters: Bool {
         model != nil || provider != nil || harness != nil
             || status != nil || run != nil || session != nil
+            || task != nil || job != nil || tag != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -134,6 +138,9 @@ public struct OmniQuery: Equatable, Sendable {
                     case "status": query.status = value; continue
                     case "run": query.run = value; continue
                     case "session": query.session = value; continue
+                    case "task": query.task = value; continue
+                    case "job": query.job = value; continue
+                    case "tag": query.tag = value; continue
                     default: break
                     }
                 }
@@ -144,17 +151,35 @@ public struct OmniQuery: Equatable, Sendable {
         return query
     }
 
+    public static func settingToken(in raw: String, key: String, value: String?) -> String {
+        let prefix = key.lowercased() + ":"
+        var words = raw.split(whereSeparator: \.isWhitespace).map(String.init)
+        words.removeAll { $0.lowercased().hasPrefix(prefix) }
+        if let value, !value.isEmpty { words.append(prefix + value) }
+        return words.joined(separator: " ")
+    }
+
     public func matches(_ session: TraceSession) -> Bool {
+        let tags = session.tags ?? [:]
         if let model {
             let models = session.models ?? []
-            guard models.contains(where: { $0.localizedCaseInsensitiveContains(model) }) else {
-                return false
-            }
+            let inModels = models.contains { $0.localizedCaseInsensitiveContains(model) }
+            let inTag = tags["model"]?.localizedCaseInsensitiveContains(model) == true
+            guard inModels || inTag else { return false }
         }
         if let harness {
-            guard session.harness?.localizedCaseInsensitiveContains(harness) == true else {
-                return false
-            }
+            let inField = session.harness?.localizedCaseInsensitiveContains(harness) == true
+            let inTag = tags["harness"]?.localizedCaseInsensitiveContains(harness) == true
+            guard inField || inTag else { return false }
+        }
+        if let task {
+            guard tags["task"]?.localizedCaseInsensitiveContains(task) == true else { return false }
+        }
+        if let job {
+            guard tags["job"]?.localizedCaseInsensitiveContains(job) == true else { return false }
+        }
+        if let tag {
+            guard Self.tagTokenMatches(tag, tags: tags) else { return false }
         }
         if let sid = self.session {
             guard session.sessionId.localizedCaseInsensitiveContains(sid) else { return false }
@@ -166,6 +191,110 @@ public struct OmniQuery: Equatable, Sendable {
             guard let last = session.lastStatus, String(last) == status else { return false }
         }
         return true
+    }
+
+    public func freeTextMatchesTags(_ session: TraceSession) -> Bool {
+        guard !freeText.isEmpty, let tags = session.tags else { return false }
+        return tags.values.contains { $0.localizedCaseInsensitiveContains(freeText) }
+    }
+
+    public func isVisible(_ session: TraceSession, serverMatches: Set<String>?) -> Bool {
+        guard matches(session) else { return false }
+        if freeText.isEmpty { return true }
+        if freeTextMatchesTags(session) { return true }
+        return serverMatches?.contains(session.sessionId) == true
+    }
+
+    static func tagTokenMatches(_ token: String, tags: [String: String]) -> Bool {
+        if let eq = token.firstIndex(of: "="), eq != token.startIndex {
+            let key = token[..<eq].lowercased()
+            let value = String(token[token.index(after: eq)...])
+            return tags.contains { pair in
+                guard pair.key.lowercased() == key else { return false }
+                return value.isEmpty || pair.value.localizedCaseInsensitiveContains(value)
+            }
+        }
+        return tags.values.contains { $0.localizedCaseInsensitiveContains(token) }
+    }
+}
+
+public struct TagChip: Equatable, Sendable {
+    public let key: String
+    public let value: String
+
+    public init(key: String, value: String) {
+        self.key = key
+        self.value = value
+    }
+
+    public func label(maxValueLength: Int = 18) -> String {
+        let shown = value.count > maxValueLength
+            ? value.prefix(maxValueLength) + "…"
+            : value[...]
+        return "\(key)=\(shown)"
+    }
+}
+
+public enum SessionTagChips {
+    public static func chips(
+        tags: [String: String]?, harness: String?, models: [String]?, limit: Int = 3
+    ) -> [TagChip] {
+        guard let tags else { return [] }
+        var pool = tags.filter { !$0.value.isEmpty }
+        if let model = pool["model"], (models ?? []).contains(model) {
+            pool.removeValue(forKey: "model")
+        }
+        if let tagHarness = pool["harness"], tagHarness == harness {
+            pool.removeValue(forKey: "harness")
+        }
+        var ordered: [TagChip] = []
+        for key in ["task", "job"] {
+            if let value = pool.removeValue(forKey: key) {
+                ordered.append(TagChip(key: key, value: value))
+            }
+        }
+        ordered += pool.sorted { $0.key < $1.key }.map { TagChip(key: $0.key, value: $0.value) }
+        return Array(ordered.prefix(limit))
+    }
+}
+
+public enum TagFilterDimension: String, CaseIterable, Sendable {
+    case harness, task, job, model
+
+    public var title: String { rawValue.capitalized }
+
+    public func values(in sessions: [TraceSession]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        func add(_ value: String?) {
+            guard let value, !value.isEmpty, seen.insert(value).inserted else { return }
+            out.append(value)
+        }
+        for session in sessions {
+            let tags = session.tags ?? [:]
+            switch self {
+            case .harness:
+                add(session.harness)
+                add(tags["harness"])
+            case .model:
+                (session.models ?? []).forEach { add($0) }
+                add(tags["model"])
+            case .task:
+                add(tags["task"])
+            case .job:
+                add(tags["job"])
+            }
+        }
+        return out.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    public func activeValue(in query: OmniQuery) -> String? {
+        switch self {
+        case .harness: query.harness
+        case .task: query.task
+        case .job: query.job
+        case .model: query.model
+        }
     }
 }
 
