@@ -534,10 +534,37 @@ impl alex_proxy::DarioRouter for DarioGlue {
     }
 }
 
-fn dario_admin_router(sup: Arc<dario::DarioSupervisor>) -> axum::Router {
+fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
+
+    async fn require_local_key(
+        State(key): State<String>,
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let presented = req
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .map(str::to_string)
+            });
+        if presented.as_deref() != Some(key.as_str()) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "admin routes require x-api-key: <local_key>"})),
+            )
+                .into_response();
+        }
+        next.run(req).await
+    }
 
     fn tail_lines(path: &str, lines: usize) -> String {
         std::fs::read_to_string(path)
@@ -612,6 +639,10 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>) -> axum::Router {
         .route("/admin/dario/restart", post(restart))
         .route("/admin/dario/update", post(update))
         .route("/admin/dario/logs/{generation_id}", get(logs))
+        .route_layer(axum::middleware::from_fn_with_state(
+            local_key,
+            require_local_key,
+        ))
         .with_state(sup)
 }
 
@@ -795,7 +826,7 @@ async fn main() -> Result<()> {
             }
             let mut app = alex_proxy::router(state);
             if let Some(sup) = supervisor.clone() {
-                app = app.merge(dario_admin_router(sup));
+                app = app.merge(dario_admin_router(sup, config.local_key.clone()));
             }
             let addr: std::net::SocketAddr = format!("{host}:{port}")
                 .parse()
@@ -1100,14 +1131,23 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             let base = config.base_url();
             let is_status = matches!(command, DarioCommand::Status);
+            let key = config.local_key.as_str();
             let result = match command {
-                DarioCommand::Status => http.get(format!("{base}/admin/dario")).send().await,
-                DarioCommand::Restart => {
-                    http.post(format!("{base}/admin/dario/restart")).send().await
-                }
-                DarioCommand::Update => {
-                    http.post(format!("{base}/admin/dario/update")).send().await
-                }
+                DarioCommand::Status => http
+                    .get(format!("{base}/admin/dario"))
+                    .header("x-api-key", key)
+                    .send()
+                    .await,
+                DarioCommand::Restart => http
+                    .post(format!("{base}/admin/dario/restart"))
+                    .header("x-api-key", key)
+                    .send()
+                    .await,
+                DarioCommand::Update => http
+                    .post(format!("{base}/admin/dario/update"))
+                    .header("x-api-key", key)
+                    .send()
+                    .await,
             };
             let resp = result.with_context(|| {
                 format!("could not reach the alexandria daemon at {base} — is it running?")

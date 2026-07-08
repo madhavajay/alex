@@ -116,7 +116,53 @@ pub fn build_state(
     })
 }
 
+async fn require_local_key(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ok = client_key(req.headers())
+        .map(|k| k == state.local_key)
+        .unwrap_or(false);
+    if !ok {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin routes require x-api-key: <local_key>",
+        );
+    }
+    next.run(req).await
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    // Control-plane routes: gated by the local key so a LAN/0.0.0.0 bind
+    // doesn't expose them. Run keys are NOT accepted here — a worker's run
+    // key must not be able to mint or revoke run keys.
+    let admin = Router::new()
+        .route(
+            "/admin/run-keys",
+            get(admin_run_keys_list).post(admin_run_keys_create),
+        )
+        .route(
+            "/admin/run-keys/{id}",
+            axum::routing::delete(admin_run_keys_revoke),
+        )
+        .route("/admin/storage", get(admin_storage))
+        .route("/admin/storage/prune", post(admin_storage_prune))
+        .route("/admin/traces", get(admin_traces))
+        .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/health", get(admin_health))
+        .route("/admin/analytics", get(admin_analytics))
+        .route("/admin/limits", get(admin_limits))
+        .route("/admin/dario", get(admin_dario))
+        .route("/admin/auth/import", post(admin_auth_import))
+        .route("/admin/auth/login/start", post(admin_auth_login_start))
+        .route("/admin/auth/login/complete", post(admin_auth_login_complete))
+        .route("/admin/auth/login/{id}", get(admin_auth_login_status))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_local_key,
+        ));
+
     Router::new()
         .route("/health", get(health))
         .route("/connect", get(connect_info))
@@ -141,26 +187,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
         .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
         .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
-        .route(
-            "/admin/run-keys",
-            get(admin_run_keys_list).post(admin_run_keys_create),
-        )
-        .route(
-            "/admin/run-keys/{id}",
-            axum::routing::delete(admin_run_keys_revoke),
-        )
-        .route("/admin/storage", get(admin_storage))
-        .route("/admin/storage/prune", post(admin_storage_prune))
-        .route("/admin/traces", get(admin_traces))
-        .route("/admin/accounts", get(admin_accounts))
-        .route("/admin/health", get(admin_health))
-        .route("/admin/analytics", get(admin_analytics))
-        .route("/admin/limits", get(admin_limits))
-        .route("/admin/dario", get(admin_dario))
-        .route("/admin/auth/import", post(admin_auth_import))
-        .route("/admin/auth/login/start", post(admin_auth_login_start))
-        .route("/admin/auth/login/complete", post(admin_auth_login_complete))
-        .route("/admin/auth/login/{id}", get(admin_auth_login_status))
+        .merge(admin)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
