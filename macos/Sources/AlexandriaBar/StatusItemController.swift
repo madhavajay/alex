@@ -215,11 +215,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 : "Heartbeat FAILED \(age) ago")
         }
         sub.addItem(.separator())
-        if account.provider != "gemini" {
-            action("Re-auth \(name)…", symbol: "key") { [weak self] in
-                guard let self else { return }
-                self.authWindows.show(provider: account.provider, store: self.store)
-            }
+        action("Re-auth \(name)…", symbol: "key") { [weak self] in
+            guard let self else { return }
+            self.authWindows.show(provider: account.provider, store: self.store)
         }
         action("Re-auth in Terminal…", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
@@ -316,11 +314,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 item.target = self
                 item.representedObject = MenuHandler { [weak self] in
                     guard let self else { return }
-                    if provider == "gemini" {
-                        self.importCredentials()
-                    } else {
-                        self.authWindows.show(provider: provider, store: self.store)
-                    }
+                    self.authWindows.show(provider: provider, store: self.store)
                 }
                 sub.addItem(item)
             }

@@ -29,6 +29,9 @@ pub(crate) const OPENAI_CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const OPENAI_JWT_CLAIM: &str = "https://api.openai.com/auth";
 pub const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
 pub const XAI_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+pub const GEMINI_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const GEMINI_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile openid";
+pub const GEMINI_CALLBACK_PATH: &str = "/oauth2callback";
 
 pub struct Pkce {
     pub verifier: String,
@@ -224,6 +227,14 @@ pub(crate) async fn wait_for_openai_callback(
     listener: &TcpListener,
     expected_state: &str,
 ) -> Result<String> {
+    wait_for_loopback_callback(listener, expected_state, OPENAI_CALLBACK_PATH).await
+}
+
+pub(crate) async fn wait_for_loopback_callback(
+    listener: &TcpListener,
+    expected_state: &str,
+    expected_path: &str,
+) -> Result<String> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let mut buf = vec![0u8; 8192];
@@ -238,7 +249,7 @@ pub(crate) async fn wait_for_openai_callback(
             .await;
             continue;
         };
-        if callback_path(target) != OPENAI_CALLBACK_PATH {
+        if callback_path(target) != expected_path {
             respond(
                 &mut stream,
                 "404 Not Found",
@@ -291,9 +302,7 @@ pub async fn login(vault: &Vault, provider: &str) -> Result<String> {
         "claude" | "anthropic" => login_claude(vault).await,
         "codex" | "openai" | "chatgpt" => login_codex(vault).await,
         "grok" | "xai" => login_grok(vault).await,
-        "gemini" => bail!(
-            "gemini login not supported yet - use the gemini CLI login then `alexandria auth import gemini`"
-        ),
+        "gemini" | "google" => login_gemini(vault).await,
         other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
     }
 }
@@ -405,6 +414,89 @@ async fn login_codex(vault: &Vault) -> Result<String> {
     open_browser(&url);
     let code = wait_for_openai_callback(&listener, &state).await?;
     codex_exchange(vault, &pkce.verifier, &code).await
+}
+
+pub fn gemini_authorize_url(challenge: &str, state: &str, redirect_uri: &str) -> String {
+    let mut url = reqwest::Url::parse(GEMINI_AUTHORIZE_URL).unwrap();
+    url.query_pairs_mut()
+        .append_pair("client_id", crate::GEMINI_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", GEMINI_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent");
+    url.to_string()
+}
+
+pub async fn gemini_exchange(
+    vault: &Vault,
+    verifier: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<String> {
+    let resp = reqwest::Client::new()
+        .post(crate::GOOGLE_TOKEN_URL)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", crate::GEMINI_CLIENT_ID),
+            ("client_secret", &crate::gemini_client_secret()),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await?;
+    let tokens = read_token_response(resp).await?;
+    let email = tokens
+        .id_token
+        .as_deref()
+        .and_then(jwt_payload)
+        .and_then(|p| p.get("email").and_then(|v| v.as_str().map(String::from)));
+    let label = match &email {
+        Some(e) => format!("gemini ({e})"),
+        None => "gemini (oauth login)".into(),
+    };
+    let account = Account {
+        id: "gemini-oauth".into(),
+        provider: Provider::Gemini,
+        kind: "oauth".into(),
+        label: Some(label),
+        access_token: Some(tokens.access_token.clone()),
+        refresh_token: tokens.refresh_token,
+        id_token: tokens.id_token,
+        api_key: None,
+        expires_at_ms: tokens.expires_in.map(|s| now_ms() + s * 1000),
+        last_refresh_ms: Some(now_ms()),
+        account_meta: json!({"email": email}),
+        cooldown_until_ms: None,
+        status: "active".into(),
+    };
+    vault.upsert(account).await?;
+    Ok("gemini-oauth".into())
+}
+
+pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding a loopback port for the oauth callback")?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+async fn login_gemini(vault: &Vault) -> Result<String> {
+    let (listener, port) = bind_loopback().await?;
+    let redirect_uri = format!("http://localhost:{port}{GEMINI_CALLBACK_PATH}");
+    let pkce = generate_pkce();
+    let state = random_state();
+    let url = gemini_authorize_url(&pkce.challenge, &state, &redirect_uri);
+    println!("open this url and pick a Google account:\n\n  {url}\n");
+    println!("waiting for the browser callback on {redirect_uri} ...");
+    open_browser(&url);
+    let code = wait_for_loopback_callback(&listener, &state, GEMINI_CALLBACK_PATH).await?;
+    gemini_exchange(vault, &pkce.verifier, &redirect_uri, &code).await
 }
 
 #[derive(Debug, Clone, Deserialize)]

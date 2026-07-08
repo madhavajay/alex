@@ -2033,7 +2033,6 @@ fn upstream_headers(
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
         }
-        _ => {}
     }
     Ok(h)
 }

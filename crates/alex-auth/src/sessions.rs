@@ -10,7 +10,7 @@ use crate::login::{
     openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
     xai_upsert_from_tokens, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_REDIRECT_URI,
 };
-use crate::{import_all, now_ms, Vault};
+use crate::{now_ms, Vault};
 
 const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
 
@@ -80,7 +80,7 @@ impl LoginManager {
             "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id))),
             "codex" | "openai" | "chatgpt" => self.start_codex(&id, vault.clone()).await?,
             "grok" | "xai" => self.start_grok(&id, vault.clone()).await?,
-            "gemini" => Arc::new(Mutex::new(self.start_import(&id, "gemini", vault.clone()).await)),
+            "gemini" | "google" => self.start_gemini(&id, vault.clone()).await?,
             other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
         };
         let snapshot = shared.lock().await.snapshot();
@@ -186,6 +186,58 @@ impl LoginManager {
         Ok(shared)
     }
 
+    async fn start_gemini(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+        let (listener, port) = crate::login::bind_loopback().await?;
+        let redirect_uri = format!("http://localhost:{port}{}", crate::login::GEMINI_CALLBACK_PATH);
+        let pkce = generate_pkce();
+        let state = random_id();
+        let url = crate::login::gemini_authorize_url(&pkce.challenge, &state, &redirect_uri);
+        let session = LoginSession {
+            id: id.to_string(),
+            provider: "gemini".into(),
+            mode: "loopback",
+            authorize_url: Some(url),
+            user_code: None,
+            verification_uri: Some(redirect_uri.clone()),
+            verification_uri_complete: None,
+            created_ms: now_ms(),
+            expires_at_ms: now_ms() + SESSION_TTL_MS,
+            verifier: None,
+            phase: LoginPhase::Pending,
+        };
+        let shared = Arc::new(Mutex::new(session));
+        let worker = shared.clone();
+        let verifier = pkce.verifier;
+        tokio::spawn(async move {
+            let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
+            let phase = match tokio::time::timeout(
+                deadline,
+                crate::login::wait_for_loopback_callback(
+                    &listener,
+                    &state,
+                    crate::login::GEMINI_CALLBACK_PATH,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(code)) => {
+                    match crate::login::gemini_exchange(&vault, &verifier, &redirect_uri, &code)
+                        .await
+                    {
+                        Ok(account_id) => LoginPhase::Done { account_id },
+                        Err(e) => LoginPhase::Failed { error: e.to_string() },
+                    }
+                }
+                Ok(Err(e)) => LoginPhase::Failed { error: e.to_string() },
+                Err(_) => LoginPhase::Failed {
+                    error: "timed out waiting for the browser callback".into(),
+                },
+            };
+            worker.lock().await.phase = phase;
+        });
+        Ok(shared)
+    }
+
     async fn start_grok(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
         let http = reqwest::Client::new();
         let start = xai_device_start(&http).await?;
@@ -235,43 +287,6 @@ impl LoginManager {
             worker.lock().await.phase = phase;
         });
         Ok(shared)
-    }
-
-    async fn start_import(&self, id: &str, source: &str, vault: Arc<Vault>) -> LoginSession {
-        let phase = match import_all(&vault, source).await {
-            Ok(outcomes) => {
-                let imported: Vec<String> =
-                    outcomes.iter().flat_map(|o| o.imported.clone()).collect();
-                if imported.is_empty() {
-                    let note = outcomes
-                        .iter()
-                        .filter_map(|o| o.note.clone())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    LoginPhase::Failed {
-                        error: format!("nothing imported ({note})"),
-                    }
-                } else {
-                    LoginPhase::Done {
-                        account_id: imported.join(", "),
-                    }
-                }
-            }
-            Err(e) => LoginPhase::Failed { error: e.to_string() },
-        };
-        LoginSession {
-            id: id.to_string(),
-            provider: source.to_string(),
-            mode: "import",
-            authorize_url: None,
-            user_code: None,
-            verification_uri: None,
-            verification_uri_complete: None,
-            created_ms: now_ms(),
-            expires_at_ms: now_ms() + SESSION_TTL_MS,
-            verifier: None,
-            phase,
-        }
     }
 
     async fn prune(&self) {
@@ -333,12 +348,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_import_reports_outcome() {
+    async fn gemini_starts_loopback_oauth() {
         let (dir, vault) = temp_vault("gemini");
         let mgr = LoginManager::default();
         let snap = mgr.start(vault, "gemini").await.unwrap();
-        assert_eq!(snap["mode"], "import");
-        assert!(snap["state"] == "done" || snap["state"] == "failed");
+        assert_eq!(snap["mode"], "loopback");
+        assert_eq!(snap["state"], "pending");
+        let url = snap["authorize_url"].as_str().unwrap();
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth"));
+        assert!(url.contains("code_challenge"));
+        assert!(url.contains("access_type=offline"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
