@@ -135,10 +135,11 @@ async fn require_local_key(
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    // Control-plane routes: gated by the local key so a LAN/0.0.0.0 bind
-    // doesn't expose them. Run keys are NOT accepted here — a worker's run
-    // key must not be able to mint or revoke run keys.
-    let admin = Router::new()
+    // Control-plane + report routes: gated by the local key (sent as
+    // `x-api-key: <key>` or `Authorization: Bearer <key>`) so a LAN/0.0.0.0
+    // bind doesn't expose them. Run keys are NOT accepted here — a worker's
+    // run key must not mint/revoke run keys or read the trace store.
+    let gated = Router::new()
         .route(
             "/admin/run-keys",
             get(admin_run_keys_list).post(admin_run_keys_create),
@@ -151,6 +152,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/storage/prune", post(admin_storage_prune))
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
+        .route(
+            "/admin/accounts/{id}",
+            axum::routing::delete(admin_account_remove),
+        )
+        .route("/admin/auth/gemini-key", post(admin_auth_gemini_key))
         .route("/admin/health", get(admin_health))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
@@ -159,6 +165,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/auth/login/start", post(admin_auth_login_start))
         .route("/admin/auth/login/complete", post(admin_auth_login_complete))
         .route("/admin/auth/login/{id}", get(admin_auth_login_status))
+        .route("/traces/search", get(traces_search))
+        .route("/traces/export.ndjson", get(traces_export))
+        .route("/traces/sessions", get(traces_sessions))
+        .route(
+            "/traces/sessions/{session_id}/transcript",
+            get(traces_session_transcript),
+        )
+        .route("/traces/{id}", get(trace_get).delete(trace_delete))
+        .route("/traces/{id}/reply.md", get(trace_reply_md))
+        .route("/traces/{id}/body/{kind}", get(trace_body))
+        .route("/traces/runs/{run_id}", get(traces_run_summary))
+        .route("/traces/runs/{run_id}/events", get(traces_run_events))
+        .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
+        .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_local_key,
@@ -174,21 +194,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(openai_chat))
         .route("/responses", post(openai_responses))
         .route("/v1beta/models/{model_action}", post(gemini_generate))
-        .route("/traces/search", get(traces_search))
-        .route("/traces/export.ndjson", get(traces_export))
-        .route("/traces/sessions", get(traces_sessions))
-        .route(
-            "/traces/sessions/{session_id}/transcript",
-            get(traces_session_transcript),
-        )
-        .route("/traces/{id}", get(trace_get).delete(trace_delete))
-        .route("/traces/{id}/reply.md", get(trace_reply_md))
-        .route("/traces/{id}/body/{kind}", get(trace_body))
-        .route("/traces/runs/{run_id}", get(traces_run_summary))
-        .route("/traces/runs/{run_id}/events", get(traces_run_events))
-        .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
-        .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
-        .merge(admin)
+        .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -217,6 +223,45 @@ async fn admin_auth_import(
             axum::Json(json!({"outcomes": items})).into_response()
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_account_remove(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.vault.remove(&id).await {
+        Ok(true) => axum::Json(json!({"removed": id})).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_auth_gemini_key(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(key) = body.0["key"].as_str().map(str::trim).filter(|k| !k.is_empty()) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'key'");
+    };
+    let account = Account {
+        id: "gemini-api-key".into(),
+        provider: Provider::Gemini,
+        kind: "api_key".into(),
+        label: Some("gemini (AI Studio key)".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(key.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: Value::Null,
+        cooldown_until_ms: None,
+        status: "active".into(),
+    };
+    match state.vault.upsert(account).await {
+        Ok(()) => axum::Json(json!({"saved": "gemini-api-key"})).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 

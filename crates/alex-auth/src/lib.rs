@@ -161,6 +161,15 @@ impl Vault {
         Ok(())
     }
 
+    pub async fn remove(&self, id: &str) -> Result<bool> {
+        let existed = self.accounts.write().await.remove(id).is_some();
+        let path = self.dir.join(format!("{id}.json"));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(existed)
+    }
+
     pub async fn account_for(&self, provider: Provider, prefer_oauth: bool) -> Result<Account> {
         let now = now_ms();
         let candidates: Vec<Account> = {
