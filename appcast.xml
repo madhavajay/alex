@@ -1,0 +1,15 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>AlexandriaBar</title>
+        <item>
+            <title>0.1.18</title>
+            <pubDate>Wed, 08 Jul 2026 23:51:21 +0000</pubDate>
+            <sparkle:version>0.1.18</sparkle:version>
+            <sparkle:shortVersionString>0.1.18</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.18/AlexandriaBar-0.1.18.dmg" length="5254754" type="application/octet-stream" sparkle:edSignature="62bIcUcTJqwWqJyXaMdTl6m9JlM2ey9kgMwgam9JGqr/70o8t8vTynCF8outF7br7u9gPthi9wdmggMPuSjIAA=="/>
+        </item>
+    </channel>
+</rss>
