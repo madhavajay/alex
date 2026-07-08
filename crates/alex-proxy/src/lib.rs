@@ -1428,6 +1428,28 @@ async fn ensure_gemini_project(
             .await;
         return Ok(p);
     }
+    if let Some(free) = load["ineligibleTiers"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["tierId"] == json!("free-tier")))
+    {
+        let reason = free["reasonCode"].as_str().unwrap_or("");
+        let msg = free["reasonMessage"].as_str().unwrap_or("");
+        let hint = if let Some(url) = free["validationUrl"].as_str() {
+            format!(
+                "gemini account needs verification before the free Code Assist tier works — \
+                 open {url} to verify, then retry (or sign in with another personal Google \
+                 account, or set gemini_project to a GCP project)"
+            )
+        } else if reason == "DASHER_USER" {
+            "this is a Google Workspace account, which cannot use the free Code Assist tier — \
+             set gemini_project to a GCP project (Code Assist API enabled), or sign in with a \
+             personal Google account"
+                .to_string()
+        } else {
+            format!("gemini account is not eligible for the free Code Assist tier: {msg}")
+        };
+        return Err((StatusCode::BAD_GATEWAY, hint));
+    }
     let tier = load["allowedTiers"]
         .as_array()
         .and_then(|tiers| tiers.iter().find(|t| t["isDefault"] == json!(true)))
