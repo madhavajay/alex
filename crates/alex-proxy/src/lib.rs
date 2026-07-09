@@ -2163,33 +2163,58 @@ async fn plan_upstream(
             }
         }
         Provider::Xai => {
-            if format != ClientFormat::OpenaiChat {
-                return Err((
-                    StatusCode::NOT_IMPLEMENTED,
-                    "the xai/grok upstream speaks OpenAI chat completions; POST to /v1/chat/completions".to_string(),
-                ));
-            }
             let account = state
                 .vault
                 .account_for(provider, true)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-            body_json["model"] = json!(routed_model);
-            let body = serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
-            Ok(UpstreamPlan {
-                url: format!("{XAI_BASE}/chat/completions"),
-                account,
-                body,
-                upstream_format: "openai-chat",
-                destream: false,
-                respond_as: None,
-                client_stream,
-                extra_headers: vec![
-                    ("x-grok-model-override".into(), routed_model.to_string()),
-                    ("x-grok-conv-id".into(), trace_id.to_string()),
-                ],
-                dario_guard: None,
-            })
+            let extra_headers = vec![
+                ("x-grok-model-override".into(), routed_model.to_string()),
+                ("x-grok-conv-id".into(), trace_id.to_string()),
+            ];
+            match format {
+                ClientFormat::OpenaiChat => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{XAI_BASE}/chat/completions"),
+                        account,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers,
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::AnthropicMessages => {
+                    // pivot (anthropic) → chat completions for xAI/Grok upstream
+                    let mut converted = translate::anthropic_to_openai_chat(body_json);
+                    converted["model"] = json!(routed_model);
+                    // buffer full upstream body then re-synth client dialect
+                    converted["stream"] = json!(false);
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{XAI_BASE}/chat/completions"),
+                        account,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers,
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "the xai/grok upstream speaks OpenAI chat completions; POST to /v1/chat/completions or /v1/messages"
+                        .to_string(),
+                )),
+            }
         }
         Provider::Gemini => {
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
@@ -3076,6 +3101,12 @@ async fn proxy(
             }
         } else if plan.upstream_format == "gemini" {
             translate::parse_gemini_upstream_final(&text)
+        } else if plan.upstream_format == "openai-chat" {
+            if is_sse || looks_sse {
+                translate::parse_openai_chat_sse_final(&text)
+            } else {
+                serde_json::from_str(&text).ok()
+            }
         } else if is_sse || looks_sse {
             translate::parse_responses_sse_final(&text)
         } else {
@@ -3112,6 +3143,23 @@ async fn proxy(
             (RespondAs::Gemini, "anthropic") => {
                 translate::anthropic_response_to_gemini(&upstream_final, &requested_model)
             }
+            (RespondAs::Anthropic, "openai-chat") => {
+                translate::openai_chat_response_to_anthropic(&upstream_final, &requested_model)
+            }
+            (RespondAs::OpenaiChat, "openai-chat") => upstream_final.clone(),
+            (RespondAs::OpenaiResponses, "openai-chat") => {
+                translate::anthropic_response_to_openai_responses(
+                    &translate::openai_chat_response_to_anthropic(
+                        &upstream_final,
+                        &requested_model,
+                    ),
+                    &requested_model,
+                )
+            }
+            (RespondAs::Gemini, "openai-chat") => translate::anthropic_response_to_gemini(
+                &translate::openai_chat_response_to_anthropic(&upstream_final, &requested_model),
+                &requested_model,
+            ),
             (RespondAs::Gemini, _) => translate::anthropic_response_to_gemini(
                 &translate::responses_final_to_anthropic(&upstream_final, &requested_model),
                 &requested_model,

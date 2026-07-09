@@ -263,11 +263,170 @@ pub fn anthropic_to_openai_responses(req: &Value) -> Value {
     Value::Object(o)
 }
 
+/// Anthropic Messages request → OpenAI chat completions (pivot → chat).
+/// Drops `thinking` / budget fields (no chat equivalent).
+pub fn anthropic_to_openai_chat(req: &Value) -> Value {
+    let mut msgs = Vec::new();
+    let system = match &req["system"] {
+        Value::String(s) => s.clone(),
+        Value::Array(_) => txt(&req["system"]),
+        _ => String::new(),
+    };
+    if !system.is_empty() {
+        msgs.push(json!({"role": "system", "content": system}));
+    }
+    for m in req["messages"].as_array().into_iter().flatten() {
+        let role = m["role"].as_str().unwrap_or("user");
+        if role == "system" || role == "developer" {
+            let text = txt(&m["content"]);
+            if !text.is_empty() {
+                msgs.push(json!({"role": "system", "content": text}));
+            }
+            continue;
+        }
+        match &m["content"] {
+            Value::String(s) => msgs.push(json!({"role": role, "content": s})),
+            Value::Array(blocks) => {
+                if role == "assistant" {
+                    let mut texts = Vec::new();
+                    let mut calls = Vec::new();
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                texts.push(b["text"].as_str().unwrap_or("").to_string());
+                            }
+                            Some("tool_use") => calls.push(json!({
+                                "id": b["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": b["name"],
+                                    "arguments": b["input"].to_string(),
+                                },
+                            })),
+                            _ => {}
+                        }
+                    }
+                    let content = if texts.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(texts.join(""))
+                    };
+                    let mut msg = json!({"role": "assistant", "content": content});
+                    if !calls.is_empty() {
+                        msg["tool_calls"] = Value::Array(calls);
+                    }
+                    msgs.push(msg);
+                } else {
+                    // user (or other): text stays as user; tool_result → role:tool
+                    let mut text_parts = Vec::new();
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                if let Some(t) = b["text"].as_str() {
+                                    if !t.is_empty() {
+                                        text_parts.push(t.to_string());
+                                    }
+                                }
+                            }
+                            Some("tool_result") => {
+                                msgs.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": b["tool_use_id"],
+                                    "content": txt(&b["content"]),
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !text_parts.is_empty() {
+                        msgs.push(json!({
+                            "role": "user",
+                            "content": text_parts.join("\n"),
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut o = Map::new();
+    put(&mut o, "model", &req["model"]);
+    o.insert("messages".to_string(), Value::Array(msgs));
+    if let Some(ts) = req["tools"].as_array() {
+        let tools: Vec<Value> = ts
+            .iter()
+            .map(|t| {
+                let mut f = Map::new();
+                put(&mut f, "name", &t["name"]);
+                put(&mut f, "description", &t["description"]);
+                f.insert(
+                    "parameters".to_string(),
+                    if t["input_schema"].is_object() {
+                        t["input_schema"].clone()
+                    } else {
+                        json!({"type": "object"})
+                    },
+                );
+                json!({"type": "function", "function": Value::Object(f)})
+            })
+            .collect();
+        if !tools.is_empty() {
+            o.insert("tools".to_string(), Value::Array(tools));
+        }
+    }
+    match &req["tool_choice"] {
+        Value::Object(tc) => match tc.get("type").and_then(|v| v.as_str()) {
+            Some("auto") => {
+                o.insert("tool_choice".to_string(), json!("auto"));
+            }
+            Some("any") => {
+                o.insert("tool_choice".to_string(), json!("required"));
+            }
+            Some("none") => {
+                o.insert("tool_choice".to_string(), json!("none"));
+            }
+            Some("tool") => {
+                o.insert(
+                    "tool_choice".to_string(),
+                    json!({
+                        "type": "function",
+                        "function": {"name": tc.get("name").cloned().unwrap_or(json!(""))},
+                    }),
+                );
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    if let Some(mt) = req["max_tokens"].as_i64() {
+        o.insert("max_tokens".to_string(), json!(mt));
+    }
+    put(&mut o, "temperature", &req["temperature"]);
+    put(&mut o, "top_p", &req["top_p"]);
+    match &req["stop_sequences"] {
+        Value::Array(a) if !a.is_empty() => {
+            o.insert("stop".to_string(), Value::Array(a.clone()));
+        }
+        _ => {}
+    }
+    put(&mut o, "stream", &req["stream"]);
+    // thinking / budget_tokens intentionally dropped — no chat equivalent
+    Value::Object(o)
+}
+
 fn stop_to_finish(stop: Option<&str>) -> &'static str {
     match stop {
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
         _ => "stop",
+    }
+}
+
+fn finish_to_stop(finish: Option<&str>) -> &'static str {
+    match finish {
+        Some("length") => "max_tokens",
+        Some("tool_calls") => "tool_use",
+        _ => "end_turn",
     }
 }
 
@@ -314,6 +473,49 @@ pub fn anthropic_response_to_openai_chat(resp: &Value, model: &str) -> Value {
             "prompt_tokens_details": {
                 "cached_tokens": u["cache_read_input_tokens"].as_i64().unwrap_or(0),
             },
+        },
+    })
+}
+
+/// OpenAI chat completion response → Anthropic Messages shape (chat → pivot).
+pub fn openai_chat_response_to_anthropic(resp: &Value, model: &str) -> Value {
+    let msg = &resp["choices"][0]["message"];
+    let mut content = Vec::new();
+    if let Some(t) = msg["content"].as_str() {
+        if !t.is_empty() {
+            content.push(json!({"type": "text", "text": t}));
+        }
+    }
+    for tc in msg["tool_calls"].as_array().into_iter().flatten() {
+        content.push(json!({
+            "type": "tool_use",
+            "id": tc["id"],
+            "name": tc["function"]["name"],
+            "input": parse_args(tc["function"]["arguments"].as_str().unwrap_or("{}")),
+        }));
+    }
+    let u = &resp["usage"];
+    let pt = u["prompt_tokens"].as_i64().unwrap_or(0);
+    let ct = u["completion_tokens"].as_i64().unwrap_or(0);
+    let cached = u["prompt_tokens_details"]["cached_tokens"]
+        .as_i64()
+        .unwrap_or(0);
+    let id = resp["id"].as_str().unwrap_or("");
+    let msg_id = id
+        .strip_prefix("chatcmpl-")
+        .unwrap_or(id);
+    json!({
+        "id": if msg_id.is_empty() { "msg_chat".to_string() } else { format!("msg_{msg_id}") },
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": finish_to_stop(resp["choices"][0]["finish_reason"].as_str()),
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": pt,
+            "output_tokens": ct,
+            "cache_read_input_tokens": cached,
         },
     })
 }
@@ -573,6 +775,120 @@ pub fn parse_responses_sse_final(sse: &str) -> Option<Value> {
         resp["output"] = Value::Array(items);
     }
     Some(resp)
+}
+
+/// Reassemble OpenAI chat.completion.chunk SSE into a final chat.completion object.
+pub fn parse_openai_chat_sse_final(sse: &str) -> Option<Value> {
+    let mut id = String::new();
+    let mut model = String::new();
+    let mut content = String::new();
+    let mut tool_calls: Vec<(String, String, String)> = Vec::new(); // id, name, args
+    let mut finish_reason = Value::Null;
+    let mut usage = Value::Null;
+    let mut saw_chunk = false;
+    for v in sse_datas(sse) {
+        if v["object"] == "chat.completion" && v["choices"][0]["message"].is_object() {
+            // non-chunk full object in a data: line
+            return Some(v);
+        }
+        if !v["choices"].is_array() && v.get("usage").is_none() {
+            continue;
+        }
+        saw_chunk = true;
+        if let Some(s) = v["id"].as_str() {
+            if !s.is_empty() {
+                id = s.to_string();
+            }
+        }
+        if let Some(s) = v["model"].as_str() {
+            if !s.is_empty() {
+                model = s.to_string();
+            }
+        }
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            usage = u.clone();
+        }
+        let choice = &v["choices"][0];
+        if !choice["finish_reason"].is_null() {
+            finish_reason = choice["finish_reason"].clone();
+        }
+        let delta = &choice["delta"];
+        if let Some(c) = delta["content"].as_str() {
+            content.push_str(c);
+        }
+        for tc in delta["tool_calls"].as_array().into_iter().flatten() {
+            let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+            while tool_calls.len() <= idx {
+                tool_calls.push((String::new(), String::new(), String::new()));
+            }
+            if let Some(tc_id) = tc["id"].as_str() {
+                tool_calls[idx].0.push_str(tc_id);
+            }
+            if let Some(n) = tc["function"]["name"].as_str() {
+                tool_calls[idx].1.push_str(n);
+            }
+            if let Some(a) = tc["function"]["arguments"].as_str() {
+                tool_calls[idx].2.push_str(a);
+            }
+        }
+        // some providers put the full message on the last chunk instead of delta
+        if let Some(m) = choice.get("message") {
+            if let Some(c) = m["content"].as_str() {
+                if content.is_empty() {
+                    content.push_str(c);
+                }
+            }
+            if tool_calls.is_empty() {
+                for tc in m["tool_calls"].as_array().into_iter().flatten() {
+                    tool_calls.push((
+                        tc["id"].as_str().unwrap_or("").to_string(),
+                        tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                        tc["function"]["arguments"].as_str().unwrap_or("").to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    if !saw_chunk {
+        return None;
+    }
+    let content_val = if content.is_empty() {
+        Value::Null
+    } else {
+        Value::String(content)
+    };
+    let mut msg = json!({"role": "assistant", "content": content_val});
+    if !tool_calls.is_empty() {
+        let tcs: Vec<Value> = tool_calls
+            .into_iter()
+            .filter(|(i, n, _)| !i.is_empty() || !n.is_empty())
+            .map(|(i, n, a)| {
+                json!({
+                    "id": i,
+                    "type": "function",
+                    "function": {"name": n, "arguments": a},
+                })
+            })
+            .collect();
+        if !tcs.is_empty() {
+            msg["tool_calls"] = Value::Array(tcs);
+        }
+    }
+    let mut out = json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": 0,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": msg,
+            "finish_reason": finish_reason,
+        }],
+    });
+    if usage.is_object() {
+        out["usage"] = usage;
+    }
+    Some(out)
 }
 
 pub fn synth_openai_chat_sse(chat_resp: &Value) -> String {
@@ -1804,6 +2120,109 @@ mod tests {
         assert_eq!(out["stream"], true);
     }
 
+    #[test]
+    fn anthropic_to_chat_basic() {
+        let req = json!({
+            "model": "grok-4",
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": "hi"},
+            ],
+            "max_tokens": 512,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "stop_sequences": ["END"],
+            "stream": true,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        });
+        let out = anthropic_to_openai_chat(&req);
+        assert_eq!(out["model"], "grok-4");
+        assert_eq!(out["messages"][0], json!({"role": "system", "content": "be brief"}));
+        assert_eq!(out["messages"][1], json!({"role": "user", "content": "hi"}));
+        assert_eq!(out["max_tokens"], 512);
+        assert_eq!(out["temperature"], 0.5);
+        assert_eq!(out["top_p"], 0.9);
+        assert_eq!(out["stop"], json!(["END"]));
+        assert_eq!(out["stream"], true);
+        assert!(out.get("thinking").is_none());
+        assert!(out.get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_chat_tools_round_trip() {
+        let req = json!({
+            "model": "grok-4",
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "SF"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1",
+                     "content": [{"type": "text", "text": "sunny"}]},
+                ]},
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "d",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "max_tokens": 256,
+        });
+        let out = anthropic_to_openai_chat(&req);
+        assert_eq!(out["messages"][0]["role"], "system");
+        assert_eq!(out["messages"][0]["content"], "sys");
+        assert_eq!(out["messages"][1]["content"], "weather?");
+        let asst = &out["messages"][2];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["content"], "checking");
+        assert_eq!(asst["tool_calls"][0]["id"], "call_1");
+        assert_eq!(asst["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(asst["tool_calls"][0]["function"]["arguments"], "{\"city\":\"SF\"}");
+        let tool = &out["messages"][3];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "call_1");
+        assert_eq!(tool["content"], "sunny");
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {"city": {"type": "string"}}})
+        );
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "function": {"name": "get_weather"}})
+        );
+        assert_eq!(out["max_tokens"], 256);
+
+        // round-trip through openai_chat_to_anthropic preserves tool shape
+        let back = openai_chat_to_anthropic(&out);
+        assert_eq!(back["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(back["messages"][1]["content"][1]["id"], "call_1");
+        assert_eq!(back["messages"][1]["content"][1]["input"], json!({"city": "SF"}));
+        assert_eq!(back["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(back["messages"][2]["content"][0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_to_chat_tool_choice_variants() {
+        let auto = anthropic_to_openai_chat(&json!({
+            "messages": [], "tool_choice": {"type": "auto"}
+        }));
+        assert_eq!(auto["tool_choice"], "auto");
+        let any = anthropic_to_openai_chat(&json!({
+            "messages": [], "tool_choice": {"type": "any"}
+        }));
+        assert_eq!(any["tool_choice"], "required");
+        let none = anthropic_to_openai_chat(&json!({
+            "messages": [], "tool_choice": {"type": "none"}
+        }));
+        assert_eq!(none["tool_choice"], "none");
+    }
+
     fn anthropic_resp() -> Value {
         json!({
             "id": "msg_01",
@@ -1834,6 +2253,76 @@ mod tests {
         assert_eq!(out["usage"]["completion_tokens"], 5);
         assert_eq!(out["usage"]["total_tokens"], 15);
         assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+    }
+
+    #[test]
+    fn chat_resp_to_anthropic() {
+        let chat = json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "model": "grok-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hi there",
+                    "tool_calls": [{
+                        "id": "t1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"a\":1}"}
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 3},
+            },
+        });
+        let out = openai_chat_response_to_anthropic(&chat, "grok-4");
+        assert_eq!(out["id"], "msg_abc");
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["role"], "assistant");
+        assert_eq!(out["model"], "grok-4");
+        assert_eq!(out["content"][0], json!({"type": "text", "text": "hi there"}));
+        assert_eq!(out["content"][1]["type"], "tool_use");
+        assert_eq!(out["content"][1]["id"], "t1");
+        assert_eq!(out["content"][1]["name"], "f");
+        assert_eq!(out["content"][1]["input"], json!({"a": 1}));
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["output_tokens"], 5);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 3);
+
+        let stop = json!({
+            "id": "chatcmpl-x",
+            "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        });
+        assert_eq!(
+            openai_chat_response_to_anthropic(&stop, "m")["stop_reason"],
+            "end_turn"
+        );
+        let len = json!({
+            "id": "chatcmpl-y",
+            "choices": [{"message": {"role": "assistant", "content": "cut"}, "finish_reason": "length"}],
+            "usage": {},
+        });
+        assert_eq!(
+            openai_chat_response_to_anthropic(&len, "m")["stop_reason"],
+            "max_tokens"
+        );
+
+        // inverse of anthropic_response_to_openai_chat
+        let round = openai_chat_response_to_anthropic(
+            &anthropic_response_to_openai_chat(&anthropic_resp(), "m"),
+            "m",
+        );
+        assert_eq!(round["content"][0]["text"], "hi there");
+        assert_eq!(round["content"][1]["input"], json!({"a": 1}));
+        assert_eq!(round["stop_reason"], "tool_use");
     }
 
     #[test]
@@ -1975,6 +2464,79 @@ mod tests {
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(last["usage"]["total_tokens"], 15);
         assert!(sse.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn chat_sse_parse_and_anthropic_resynth() {
+        // chat SSE deltas → final chat → anthropic → anthropic SSE
+        let chat = json!({
+            "id": "chatcmpl-xyz",
+            "object": "chat.completion",
+            "model": "grok-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "tool_calls": [{
+                        "id": "t1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"a\":1}"}
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 4,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            },
+        });
+        let sse = synth_openai_chat_sse(&chat);
+        let parsed = parse_openai_chat_sse_final(&sse).unwrap();
+        assert_eq!(parsed["id"], "chatcmpl-xyz");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "hello");
+        assert_eq!(
+            parsed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"a\":1}"
+        );
+        assert_eq!(parsed["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(parsed["usage"]["prompt_tokens"], 8);
+
+        let anth = openai_chat_response_to_anthropic(&parsed, "grok-4");
+        assert_eq!(anth["content"][0]["text"], "hello");
+        assert_eq!(anth["content"][1]["input"], json!({"a": 1}));
+        assert_eq!(anth["stop_reason"], "tool_use");
+        assert_eq!(anth["usage"]["input_tokens"], 8);
+        assert_eq!(anth["usage"]["cache_read_input_tokens"], 2);
+
+        let anth_sse = synth_anthropic_sse(&anth);
+        assert!(anth_sse.starts_with("event: message_start\n"));
+        assert!(anth_sse.contains("event: content_block_delta\n"));
+        assert!(anth_sse.contains("event: message_stop\n"));
+        let reassembled = parse_anthropic_sse_to_message(&anth_sse).unwrap();
+        assert_eq!(reassembled["content"][0]["text"], "hello");
+        assert_eq!(reassembled["content"][1]["input"], json!({"a": 1}));
+        assert_eq!(reassembled["stop_reason"], "tool_use");
+        assert_eq!(reassembled["usage"]["output_tokens"], 4);
+
+        // text-only streaming deltas
+        let text_sse = concat!(
+            "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"PO\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"NG\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let t = parse_openai_chat_sse_final(text_sse).unwrap();
+        assert_eq!(t["choices"][0]["message"]["content"], "PONG");
+        assert_eq!(t["choices"][0]["finish_reason"], "stop");
+        assert_eq!(t["usage"]["prompt_tokens"], 3);
+        let a = openai_chat_response_to_anthropic(&t, "m");
+        assert_eq!(a["content"][0]["text"], "PONG");
+        assert_eq!(a["stop_reason"], "end_turn");
+        assert!(parse_openai_chat_sse_final("data: {\"type\":\"ping\"}\n\n").is_none());
     }
 
     #[test]
