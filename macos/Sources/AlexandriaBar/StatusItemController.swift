@@ -127,9 +127,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (sender.representedObject as? MenuHandler)?.run()
     }
 
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    }
+
     private func buildHeader() {
         if store.daemonUp, let health = store.health {
-            var line = "Alexandria v\(health.version) · up \(Format.duration(health.uptimeS))"
+            var line = "Alexandria app v\(appVersion) · daemon v\(health.version)"
+            line += " · up \(Format.duration(health.uptimeS))"
             if health.inFlight > 0 { line += " · \(health.inFlight) in flight" }
             addInfo(line)
         } else if store.lastRefresh == nil {
