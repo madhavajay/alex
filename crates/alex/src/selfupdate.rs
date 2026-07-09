@@ -24,7 +24,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Channel::Brew => "brew",
             Channel::Cargo => "cargo",
@@ -221,6 +221,85 @@ pub async fn daemon_update_status_value() -> Result<serde_json::Value> {
         "notes_url": update.notes_url,
         "checked_at_ms": now_ms(),
     }))
+}
+
+pub(crate) enum DaemonUpdateApplyError {
+    Conflict(serde_json::Value),
+    Failed(anyhow::Error),
+}
+
+fn managed_reason(channel: Channel) -> Option<&'static str> {
+    match channel {
+        Channel::Brew => Some("alex is managed by Homebrew - run `brew upgrade alex`"),
+        Channel::Cargo => Some("alex is managed by Cargo - run `cargo install alex --force`"),
+        Channel::Standalone => None,
+    }
+}
+
+fn update_body(update: &UpdateCheck, applying: bool) -> serde_json::Value {
+    json!({
+        "applying": applying,
+        "current": update.current,
+        "latest": update.latest,
+        "update_available": update.update_available,
+        "notes_url": update.notes_url,
+    })
+}
+
+pub(crate) async fn daemon_apply_update(
+    config: Config,
+) -> std::result::Result<serde_json::Value, DaemonUpdateApplyError> {
+    let exe = std::env::current_exe()
+        .context("resolving current executable")
+        .and_then(|p| p.canonicalize().context("canonicalizing current executable"))
+        .map_err(DaemonUpdateApplyError::Failed)?;
+    let home = dirs::home_dir()
+        .context("no home directory")
+        .map_err(DaemonUpdateApplyError::Failed)?;
+    let channel = install_channel(&exe, &home);
+    let update = check(channel)
+        .await
+        .map_err(DaemonUpdateApplyError::Failed)?;
+
+    if !update.update_available {
+        return Ok(update_body(&update, false));
+    }
+    if let Some(reason) = managed_reason(channel) {
+        let mut body = update_body(&update, false);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("reason".into(), json!(reason));
+        }
+        return Err(DaemonUpdateApplyError::Conflict(body));
+    }
+
+    #[cfg(unix)]
+    {
+        let task_update = update.clone();
+        let task_exe = exe.clone();
+        tokio::spawn(async move {
+            let result = async {
+                install_unix(&task_exe, &task_update).await?;
+                restart_daemon(&config, &task_exe).await
+            }
+            .await;
+            if let Err(e) = result {
+                tracing::error!("daemon self-update failed: {e:#}");
+            }
+        });
+        Ok(update_body(&update, true))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut body = update_body(&update, false);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "reason".into(),
+                json!("self-update is not available for this platform"),
+            );
+        }
+        Err(DaemonUpdateApplyError::Conflict(body))
+    }
 }
 
 pub async fn run_update(

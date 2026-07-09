@@ -37,9 +37,11 @@ public struct AlexandriaClient: Sendable {
 
     public enum ClientError: Error, LocalizedError {
         case http(Int, String)
+        case daemonUpdateRejected(String)
         public var errorDescription: String? {
             switch self {
             case let .http(code, body): "HTTP \(code): \(body.prefix(200))"
+            case let .daemonUpdateRejected(reason): reason
             }
         }
     }
@@ -160,6 +162,37 @@ public struct AlexandriaClient: Sendable {
 
     public func darioUpdate() async throws {
         _ = try await request("admin/dario/update", method: "POST")
+    }
+
+    public func daemonUpdateStatus() async throws -> DaemonUpdateStatus {
+        try await get("admin/update", as: DaemonUpdateStatus.self)
+    }
+
+    public func daemonUpdateApply() async throws -> DaemonUpdateApplyResponse {
+        do {
+            let data = try await request("admin/update", method: "POST")
+            return try JSONDecoder().decode(DaemonUpdateApplyResponse.self, from: data)
+        } catch ClientError.http(409, let body) {
+            throw ClientError.daemonUpdateRejected(Self.updateRejectionReason(from: body))
+        }
+    }
+
+    private static func updateRejectionReason(from body: String) -> String {
+        let data = Data(body.utf8)
+        if let decoded = try? JSONDecoder().decode(DaemonUpdateApplyResponse.self, from: data),
+           let reason = decoded.reason, !reason.isEmpty {
+            return reason
+        }
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let reason = obj["reason"] as? String, !reason.isEmpty {
+                return reason
+            }
+            if let error = obj["error"] as? [String: Any],
+               let message = error["message"] as? String, !message.isEmpty {
+                return message
+            }
+        }
+        return String(body.prefix(200))
     }
 
     public func darioPromptCacheClear(key: String) async throws {

@@ -14,6 +14,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let pingWindow = PingWindowController()
     private let geminiKeyWindow = GeminiKeyWindowController()
     private let updaterController = UpdaterController()
+    private var daemonUpdateApplying = false
+    private var daemonUpdateTarget: String?
+    private var daemonUpdateMessage: String?
 
     init(store: SnapshotStore) {
         self.store = store
@@ -33,6 +36,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     func snapshotDidChange() {
+        reconcileDaemonUpdateState()
         updateIcon()
     }
 
@@ -423,6 +427,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Settings…", symbol: "gearshape") { [weak self] in
             self?.openPreferences()
         }
+        buildDaemonUpdateAction()
         let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(runHandler(_:)), keyEquivalent: "")
         updateItem.target = self
         updateItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
@@ -442,6 +447,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit AlexandriaBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
+    }
+
+    private func buildDaemonUpdateAction() {
+        if daemonUpdateApplying {
+            let target = daemonUpdateTarget ?? store.daemonUpdate?.latest ?? "latest"
+            addInfo("Updating daemon to \(target)…")
+            return
+        }
+        if let update = store.daemonUpdate, update.updateAvailable, let latest = update.latest {
+            addAction("Update daemon to \(latest)…", symbol: "arrow.down.circle") { [weak self] in
+                self?.applyDaemonUpdate(latest: latest)
+            }
+        }
+        if let message = daemonUpdateMessage {
+            addInfo(String(message.prefix(70)))
+        }
     }
 
     private func startDaemon() {
@@ -525,6 +546,62 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self?.notify(title: "Dario action failed", body: error.localizedDescription)
             }
         }
+    }
+
+    private func applyDaemonUpdate(latest: String) {
+        guard let config = store.config else { return }
+        let client = AlexandriaClient(config: config)
+        daemonUpdateApplying = true
+        daemonUpdateTarget = latest
+        daemonUpdateMessage = nil
+        rebuildMenu()
+        Task { [weak self] in
+            do {
+                let response = try await client.daemonUpdateApply()
+                if response.applying {
+                    self?.notify(title: "Daemon update started", body: "Updating to \(response.latest ?? latest)")
+                } else {
+                    self?.daemonUpdateApplying = false
+                    self?.daemonUpdateTarget = nil
+                    self?.notify(title: "Daemon already up to date", body: response.current ?? "")
+                }
+                await self?.store.refresh()
+            } catch AlexandriaClient.ClientError.daemonUpdateRejected(let reason) {
+                self?.daemonUpdateApplying = false
+                self?.daemonUpdateTarget = nil
+                self?.daemonUpdateMessage = reason
+                self?.rebuildMenu()
+                self?.notify(title: "Daemon update unavailable", body: reason)
+            } catch {
+                self?.daemonUpdateApplying = false
+                self?.daemonUpdateTarget = nil
+                self?.daemonUpdateMessage = error.localizedDescription
+                self?.rebuildMenu()
+                self?.notify(title: "Daemon update failed", body: error.localizedDescription)
+            }
+        }
+    }
+
+    private func reconcileDaemonUpdateState() {
+        if store.daemonUpdate?.updateAvailable == false {
+            daemonUpdateMessage = nil
+        }
+        guard daemonUpdateApplying, let target = daemonUpdateTarget else { return }
+        let healthMatches = store.health.map { versionsMatch($0.version, target) } ?? false
+        let statusMatches = store.daemonUpdate.map {
+            versionsMatch($0.current, target) && !$0.updateAvailable
+        } ?? false
+        if healthMatches || statusMatches {
+            daemonUpdateApplying = false
+            daemonUpdateTarget = nil
+            daemonUpdateMessage = nil
+            notify(title: "Daemon updated", body: "Alexandria \(target)")
+        }
+    }
+
+    private func versionsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+            == rhs.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
     }
 
     private func notify(title: String, body: String) {

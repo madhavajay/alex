@@ -85,6 +85,28 @@ import Testing
         #expect(dario.generations[0].lastProbe?.ok == true)
     }
 
+    @Test func daemonUpdateStatus() throws {
+        let json = #"""
+        {"current":"0.1.0","latest":"0.2.0","update_available":true,"notes_url":"https://example.test/notes","checked_at_ms":1783477427269}
+        """#
+        let update = try decode(json, as: DaemonUpdateStatus.self)
+        #expect(update.current == "0.1.0")
+        #expect(update.latest == "0.2.0")
+        #expect(update.updateAvailable)
+        #expect(update.notesUrl == "https://example.test/notes")
+        #expect(update.checkedAtMs == 1783477427269)
+    }
+
+    @Test func daemonUpdateApplyResponse() throws {
+        let json = #"""
+        {"applying":false,"current":"0.1.0","latest":"0.2.0","update_available":true,"reason":"alex is managed by Homebrew - run `brew upgrade alex`"}
+        """#
+        let update = try decode(json, as: DaemonUpdateApplyResponse.self)
+        #expect(!update.applying)
+        #expect(update.updateAvailable == true)
+        #expect(update.reason == "alex is managed by Homebrew - run `brew upgrade alex`")
+    }
+
     @Test func harnesses() throws {
         let json = #"""
         {"harnesses":[

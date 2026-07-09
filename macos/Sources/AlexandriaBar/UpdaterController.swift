@@ -14,6 +14,10 @@ final class UpdaterController {
             startingUpdater: true,
             updaterDelegate: nil,
             userDriverDelegate: nil)
+        if let updater = updaterController?.updater {
+            updater.automaticallyChecksForUpdates = true
+            updater.automaticallyDownloadsUpdates = true
+        }
     }
 
     var isAvailable: Bool {

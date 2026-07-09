@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +45,19 @@ pub trait DarioRouter: Send + Sync {
     fn suspect(&self, generation_id: &str);
 }
 
+pub type UpdateApplyFuture =
+    Pin<Box<dyn Future<Output = Result<Value, UpdateApplyError>> + Send + 'static>>;
+
+#[derive(Debug)]
+pub enum UpdateApplyError {
+    Conflict(Value),
+    Failed(String),
+}
+
+pub trait DaemonUpdater: Send + Sync {
+    fn apply(&self) -> UpdateApplyFuture;
+}
+
 fn suspect_dario(state: &AppState, account: &Account) {
     if account.kind != "dario" {
         return;
@@ -65,6 +80,7 @@ pub struct AppState {
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
+    pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +133,14 @@ pub fn build_state(
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
+        daemon_updater: std::sync::RwLock::new(None),
     })
+}
+
+pub fn set_daemon_updater(state: &Arc<AppState>, updater: Arc<dyn DaemonUpdater>) {
+    if let Ok(mut slot) = state.daemon_updater.write() {
+        *slot = Some(updater);
+    }
 }
 
 async fn require_local_key(
@@ -163,7 +186,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/health", get(admin_health))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
-        .route("/admin/update", get(admin_update))
+        .route("/admin/update", get(admin_update).post(admin_update_apply))
         .route("/admin/dario", get(admin_dario))
         .route("/admin/dario/prompt-caches", get(admin_dario_prompt_caches))
         .route(
@@ -566,6 +589,33 @@ async fn admin_update(State(state): State<Arc<AppState>>) -> Response {
         }
     }
     axum::Json(body).into_response()
+}
+
+async fn admin_update_apply(State(state): State<Arc<AppState>>) -> Response {
+    let updater = state
+        .daemon_updater
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(updater) = updater else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "daemon updater is not configured");
+    };
+    match updater.apply().await {
+        Ok(body) => {
+            let status = if body["applying"].as_bool() == Some(true) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            (status, axum::Json(body)).into_response()
+        }
+        Err(UpdateApplyError::Conflict(body)) => {
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
+        Err(UpdateApplyError::Failed(message)) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &message)
+        }
+    }
 }
 
 async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
@@ -3204,6 +3254,79 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
+    }
+
+    struct FakeUpdater {
+        result: Result<Value, UpdateApplyError>,
+    }
+
+    impl DaemonUpdater for FakeUpdater {
+        fn apply(&self) -> UpdateApplyFuture {
+            let result = match &self.result {
+                Ok(body) => Ok(body.clone()),
+                Err(UpdateApplyError::Conflict(body)) => {
+                    Err(UpdateApplyError::Conflict(body.clone()))
+                }
+                Err(UpdateApplyError::Failed(message)) => {
+                    Err(UpdateApplyError::Failed(message.clone()))
+                }
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_update_apply_response_shapes() {
+        let state = test_state("admin-update-apply");
+        set_daemon_updater(
+            &state,
+            Arc::new(FakeUpdater {
+                result: Ok(json!({
+                    "applying": true,
+                    "current": "0.1.0",
+                    "latest": "0.2.0",
+                    "update_available": true,
+                })),
+            }),
+        );
+        let (status, body) = response_json(admin_update_apply(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["applying"], true);
+        assert_eq!(body["latest"], "0.2.0");
+
+        set_daemon_updater(
+            &state,
+            Arc::new(FakeUpdater {
+                result: Ok(json!({
+                    "applying": false,
+                    "current": "0.2.0",
+                    "latest": "0.2.0",
+                    "update_available": false,
+                })),
+            }),
+        );
+        let (status, body) = response_json(admin_update_apply(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["update_available"], false);
+
+        set_daemon_updater(
+            &state,
+            Arc::new(FakeUpdater {
+                result: Err(UpdateApplyError::Conflict(json!({
+                    "applying": false,
+                    "current": "0.1.0",
+                    "latest": "0.2.0",
+                    "update_available": true,
+                    "reason": "alex is managed by Homebrew - run `brew upgrade alex`",
+                }))),
+            }),
+        );
+        let (status, body) = response_json(admin_update_apply(State(state)).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["reason"],
+            "alex is managed by Homebrew - run `brew upgrade alex`"
+        );
     }
 
     #[tokio::test]

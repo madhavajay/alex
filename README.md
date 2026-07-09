@@ -25,12 +25,15 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **Dario mode** — optional generational supervisor for the `@askalf/dario` Anthropic upstream with health probes, npm auto-update, and rolling restarts
 - **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
 - **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
-- **Zero-downtime upgrades** — `./install.sh --upgrade` blue-greens the daemon on a shared port (SO_REUSEPORT)
+- **Self-updating, zero downtime** — `alex update` fetches the release manifest, sha256-verifies the binary, swaps it atomically, and blue-greens the daemon on a shared port (SO_REUSEPORT) so in-flight traffic never drops; the menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item that rides the same blue-green handover
 - **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
 
 ## Install
 
 ```bash
+brew install madhavajay/alex/alex               # CLI + daemon
+brew install --cask madhavajay/alex/alexandria  # macOS menu bar app
+# or:
 cargo install alex        # installs the `alex` and `alexandria` binaries
 # or from a checkout:
 ./install.sh              # release build → /usr/local/bin/alex (+ alexandria symlink)

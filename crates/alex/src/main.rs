@@ -419,6 +419,28 @@ struct Config {
     harness_overrides: BTreeMap<String, HarnessOverride>,
 }
 
+#[derive(Clone)]
+struct SelfUpdateApplier {
+    config: Config,
+}
+
+impl alex_proxy::DaemonUpdater for SelfUpdateApplier {
+    fn apply(&self) -> alex_proxy::UpdateApplyFuture {
+        let config = self.config.clone();
+        Box::pin(async move {
+            match selfupdate::daemon_apply_update(config).await {
+                Ok(body) => Ok(body),
+                Err(selfupdate::DaemonUpdateApplyError::Conflict(body)) => {
+                    Err(alex_proxy::UpdateApplyError::Conflict(body))
+                }
+                Err(selfupdate::DaemonUpdateApplyError::Failed(e)) => {
+                    Err(alex_proxy::UpdateApplyError::Failed(e.to_string()))
+                }
+            }
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct HarnessOverride {
     #[serde(default)]
@@ -1065,6 +1087,12 @@ async fn main() -> Result<()> {
                 store,
                 dario_router,
                 format!("http://{host}:{port}"),
+            );
+            alex_proxy::set_daemon_updater(
+                &state,
+                Arc::new(SelfUpdateApplier {
+                    config: config.clone(),
+                }),
             );
             if config.update_check_hours > 0 {
                 let update_status = state.update_status.clone();
