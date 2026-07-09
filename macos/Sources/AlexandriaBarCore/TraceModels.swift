@@ -1348,6 +1348,16 @@ public enum TurnHitTest {
     }
 }
 
+public enum TraceInspectorSelection {
+    public static func target(currentTraceId: String?, in traceIds: [String]) -> String? {
+        guard !traceIds.isEmpty else { return nil }
+        if let currentTraceId, traceIds.contains(currentTraceId) {
+            return currentTraceId
+        }
+        return traceIds.last
+    }
+}
+
 public struct TraceBodyCache {
     public let capacity: Int
     private var store: [String: TraceBodyContent] = [:]

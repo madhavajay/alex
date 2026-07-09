@@ -222,6 +222,14 @@ import Testing
         #expect(TurnHitTest.traceId(at: 5, in: []) == nil)
     }
 
+    @Test func inspectorSelectionRetargetsToCurrentOrLastTurn() {
+        let ids = ["t1", "t2", "t3"]
+        #expect(TraceInspectorSelection.target(currentTraceId: "t2", in: ids) == "t2")
+        #expect(TraceInspectorSelection.target(currentTraceId: "missing", in: ids) == "t3")
+        #expect(TraceInspectorSelection.target(currentTraceId: nil, in: ids) == "t3")
+        #expect(TraceInspectorSelection.target(currentTraceId: "t2", in: []) == nil)
+    }
+
     @Test func bodyCacheLRU() {
         var cache = TraceBodyCache(capacity: 2)
         let a = TraceBodyContent(text: "a", diskPath: "/a")

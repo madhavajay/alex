@@ -62,6 +62,7 @@ final class TraceBrowserModel {
     private var transcriptTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
 
+    private(set) var detailsVisible = false
     private(set) var inspectorTraceId: String?
     private(set) var firstTraceDetail: TraceDetailResponse?
     private var firstDetailKey: String?
@@ -111,10 +112,25 @@ final class TraceBrowserModel {
 
     func openInspector(traceId: String) {
         inspectorTraceId = traceId
+        detailsVisible = true
     }
 
     func closeInspector() {
+        detailsVisible = false
         inspectorTraceId = nil
+    }
+
+    func setDetailsVisible(_ visible: Bool) {
+        guard detailsVisible != visible else {
+            if visible { retargetInspector() }
+            return
+        }
+        detailsVisible = visible
+        if visible {
+            retargetInspector()
+        } else {
+            inspectorTraceId = nil
+        }
     }
 
     func requestFind() {
@@ -129,6 +145,12 @@ final class TraceBrowserModel {
     private func inspectorTurnIndex() -> Int? {
         guard let inspectorTraceId else { return nil }
         return turns.firstIndex { $0.traceId == inspectorTraceId }
+    }
+
+    private func retargetInspector() {
+        guard detailsVisible else { return }
+        inspectorTraceId = TraceInspectorSelection.target(
+            currentTraceId: inspectorTraceId, in: turns.map(\.traceId))
     }
 
     func canStepInspector(_ offset: Int) -> Bool {
@@ -281,7 +303,9 @@ final class TraceBrowserModel {
         allTurns = []
         turns = []
         turnsFingerprint = ""
-        inspectorTraceId = nil
+        if !detailsVisible {
+            inspectorTraceId = nil
+        }
         firstTraceDetail = nil
         firstDetailKey = nil
         firstDetailTask?.cancel()
@@ -494,6 +518,7 @@ final class TraceBrowserModel {
 
     private func applyTurnFilter() {
         let filtered = parsedQuery.effort == nil ? allTurns : allTurns.filter(parsedQuery.matches)
+        defer { retargetInspector() }
         guard filtered != turns else { return }
         turns = filtered
         renderState = nil
@@ -619,6 +644,7 @@ private struct BuiltDocument: @unchecked Sendable {
 
 struct TraceBrowserView: View {
     @Bindable var model: TraceBrowserModel
+    @AppStorage("TraceBrowserDetailsOn") private var persistedDetailsOn = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -644,14 +670,39 @@ struct TraceBrowserView: View {
                         })
                 TranscriptView(model: model)
                     .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-                if let traceId = model.inspectorTraceId {
-                    TraceInspectorView(traceId: traceId, model: model)
-                        .frame(
-                            minWidth: 300, idealWidth: 340, maxWidth: 520, maxHeight: .infinity)
+                if model.detailsVisible {
+                    if let traceId = model.inspectorTraceId {
+                        TraceInspectorView(traceId: traceId, model: model)
+                            .frame(
+                                minWidth: 300, idealWidth: 340, maxWidth: 520,
+                                maxHeight: .infinity)
+                    } else {
+                        TraceInspectorPlaceholderView(model: model)
+                            .frame(
+                                minWidth: 300, idealWidth: 340, maxWidth: 520,
+                                maxHeight: .infinity)
+                    }
                 }
             }
         }
         .frame(minWidth: 720, minHeight: 400)
+        .onAppear {
+            model.setDetailsVisible(persistedDetailsOn)
+        }
+        .onChange(of: persistedDetailsOn) { _, value in
+            model.setDetailsVisible(value)
+        }
+        .onChange(of: model.detailsVisible) { _, value in
+            if persistedDetailsOn != value {
+                persistedDetailsOn = value
+            }
+        }
+    }
+
+    private var detailsBinding: Binding<Bool> {
+        Binding(
+            get: { model.detailsVisible },
+            set: { model.setDetailsVisible($0) })
     }
 
     private var toolbar: some View {
@@ -687,6 +738,10 @@ struct TraceBrowserView: View {
             .controlSize(.small)
             Toggle("Show pings", isOn: $model.showPings)
                 .controlSize(.small)
+            Toggle("Details", isOn: detailsBinding)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("Show turn details")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -703,6 +758,35 @@ struct TraceBrowserView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.orange.opacity(0.12))
+    }
+}
+
+private struct TraceInspectorPlaceholderView: View {
+    @Bindable var model: TraceBrowserModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("Turn Details")
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Button {
+                    model.closeInspector()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close details")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            Divider()
+            Text(model.selectedSessionId == nil ? "Select a session" : "No turn selected")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 }
 
