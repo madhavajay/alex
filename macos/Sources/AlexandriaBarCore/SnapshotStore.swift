@@ -34,6 +34,8 @@ public final class SnapshotStore {
     public private(set) var limits: [ProviderLimits] = []
     public private(set) var analytics: Analytics?
     public private(set) var dario: DarioStatus?
+    public private(set) var harnesses: [Harness] = []
+    public private(set) var harnessesSupported: Bool?
     public private(set) var alerts: [StoreAlert] = []
     public private(set) var lastRefresh: Date?
     public private(set) var lastError: String?
@@ -90,6 +92,8 @@ public final class SnapshotStore {
         guard let cfg = DaemonDiscovery.load() else {
             config = nil
             daemonUp = false
+            harnesses = []
+            harnessesSupported = nil
             lastError = "no config at ~/.alexandria/config.toml"
             return
         }
@@ -104,6 +108,8 @@ public final class SnapshotStore {
         } catch {
             daemonUp = false
             health = nil
+            harnesses = []
+            harnessesSupported = nil
             lastError = error.localizedDescription
             return
         }
@@ -113,6 +119,7 @@ public final class SnapshotStore {
         async let limitsR = try? client.limits()
         async let analyticsR = try? client.analytics(sinceMinutes: 60)
         async let darioR = try? client.dario()
+        async let harnessesR = client.harnesses()
 
         accounts = await accountsR ?? []
         healthAccounts = await healthR ?? []
@@ -120,6 +127,18 @@ public final class SnapshotStore {
         limits = await limitsR ?? []
         analytics = await analyticsR
         dario = await darioR ?? nil
+        do {
+            if let fetched = try await harnessesR {
+                harnesses = fetched
+                harnessesSupported = true
+            } else {
+                harnesses = []
+                harnessesSupported = false
+            }
+        } catch {
+            harnesses = []
+            harnessesSupported = nil
+        }
         detectWindowResets(old: oldLimits, new: limits)
         scheduleBoundaryRefresh()
     }

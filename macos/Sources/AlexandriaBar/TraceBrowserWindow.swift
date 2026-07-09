@@ -183,8 +183,16 @@ final class TraceBrowserModel {
         }
     }
 
-    init(store: SnapshotStore) {
+    init(store: SnapshotStore, initialHarness: String? = nil) {
         self.store = store
+        if let initialHarness {
+            queryText = "harness:\(initialHarness)"
+            parsedQuery = OmniQuery.parse(queryText)
+        }
+    }
+
+    func setHarnessFilter(_ harness: String) {
+        queryText = OmniQuery.settingToken(in: queryText, key: "harness", value: harness)
     }
 
     private func recomputeVisible() {
@@ -1251,9 +1259,9 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show() {
+    func show(harness: String? = nil) {
         if window == nil {
-            let model = TraceBrowserModel(store: store)
+            let model = TraceBrowserModel(store: store, initialHarness: harness)
             self.model = model
             let host = NSHostingController(rootView: TraceBrowserView(model: model))
             let win = NSWindow(contentViewController: host)
@@ -1265,6 +1273,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
             win.center()
             win.setFrameAutosaveName("AlexandriaTraceBrowser")
             window = win
+        } else if let harness {
+            model?.setHarnessFilter(harness)
         }
         BarLog.info(.ui, "trace browser opened")
         model?.start()

@@ -30,6 +30,11 @@ public struct AlexandriaClient: Sendable {
         self.session = URLSession(configuration: cfg)
     }
 
+    init(config: DaemonConfig, session: URLSession) {
+        self.config = config
+        self.session = session
+    }
+
     public enum ClientError: Error, LocalizedError {
         case http(Int, String)
         public var errorDescription: String? {
@@ -49,14 +54,14 @@ public struct AlexandriaClient: Sendable {
 
     private func request(
         _ path: String, query: [URLQueryItem] = [], method: String = "GET",
-        body: [String: String]? = nil
+        body: Data? = nil
     ) async throws -> Data {
         var req = URLRequest(url: url(path, query: query))
         req.httpMethod = method
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
         if let body {
             req.setValue("application/json", forHTTPHeaderField: "content-type")
-            req.httpBody = try JSONEncoder().encode(body)
+            req.httpBody = body
         }
         let start = ContinuousClock.now
         let data: Data
@@ -74,6 +79,14 @@ public struct AlexandriaClient: Sendable {
         }
         BarLog.info(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
         return data
+    }
+
+    private func body<T: Encodable>(_ value: T) throws -> Data {
+        try JSONEncoder().encode(value)
+    }
+
+    private func encodedPathComponent(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
     }
 
     private static func ms(since start: ContinuousClock.Instant) -> Int {
@@ -155,7 +168,7 @@ public struct AlexandriaClient: Sendable {
 
     public func authLoginStart(provider: String) async throws -> LoginSession {
         let data = try await request(
-            "admin/auth/login/start", method: "POST", body: ["provider": provider])
+            "admin/auth/login/start", method: "POST", body: body(["provider": provider]))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 
@@ -166,14 +179,42 @@ public struct AlexandriaClient: Sendable {
     public func authLoginComplete(id: String, input: String) async throws -> LoginSession {
         let data = try await request(
             "admin/auth/login/complete", method: "POST",
-            body: ["login_id": id, "input": input])
+            body: body(["login_id": id, "input": input]))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 
     public func authImport(source: String = "all") async throws -> [ImportOutcome] {
         let data = try await request(
-            "admin/auth/import", method: "POST", body: ["source": source])
+            "admin/auth/import", method: "POST", body: body(["source": source]))
         return try JSONDecoder().decode(ImportOutcomes.self, from: data).outcomes
+    }
+
+    public func harnesses() async throws -> [Harness]? {
+        do {
+            return try await get("admin/harnesses", as: HarnessesResponse.self).harnesses
+        } catch ClientError.http(404, _) {
+            return nil
+        }
+    }
+
+    public func connectHarness(_ name: String) async throws -> HarnessConnectResponse {
+        let encoded = encodedPathComponent(name)
+        let data = try await request("admin/harnesses/\(encoded)/connect", method: "POST")
+        return try JSONDecoder().decode(HarnessConnectResponse.self, from: data)
+    }
+
+    public func disconnectHarness(_ name: String) async throws -> HarnessDisconnectResponse {
+        let encoded = encodedPathComponent(name)
+        let data = try await request("admin/harnesses/\(encoded)/disconnect", method: "POST")
+        return try JSONDecoder().decode(HarnessDisconnectResponse.self, from: data)
+    }
+
+    public func setHarnessOverride(_ name: String, binary: String?, configDir: String?) async throws -> Harness {
+        let encoded = encodedPathComponent(name)
+        let data = try await request(
+            "admin/harnesses/\(encoded)/override", method: "PUT",
+            body: body(HarnessOverride(binary: binary, configDir: configDir)))
+        return try JSONDecoder().decode(Harness.self, from: data)
     }
 
     public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
@@ -255,6 +296,6 @@ public struct AlexandriaClient: Sendable {
     }
 
     public func setGeminiKey(_ key: String) async throws {
-        _ = try await request("admin/auth/gemini-key", method: "POST", body: ["key": key])
+        _ = try await request("admin/auth/gemini-key", method: "POST", body: body(["key": key]))
     }
 }

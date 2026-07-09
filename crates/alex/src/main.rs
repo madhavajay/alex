@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -414,6 +415,16 @@ struct Config {
     trace_row_retention_days: u64,
     #[serde(default = "default_update_check_hours")]
     update_check_hours: u64,
+    #[serde(default)]
+    harness_overrides: BTreeMap<String, HarnessOverride>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub(crate) struct HarnessOverride {
+    #[serde(default)]
+    binary: Option<PathBuf>,
+    #[serde(default)]
+    config_dir: Option<PathBuf>,
 }
 
 fn default_heartbeat_minutes() -> u64 {
@@ -504,6 +515,9 @@ fn save_config(config: &Config) -> Result<()> {
 }
 
 fn alexandria_home() -> PathBuf {
+    if let Some(path) = std::env::var_os("ALEXANDRIA_HOME") {
+        return PathBuf::from(path);
+    }
     dirs::home_dir().expect("no home dir").join(".alexandria")
 }
 
@@ -541,6 +555,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         trace_body_retention_days: default_trace_body_retention_days(),
         trace_row_retention_days: 0,
         update_check_hours: default_update_check_hours(),
+        harness_overrides: BTreeMap::new(),
     };
     std::fs::write(&path, toml::to_string_pretty(&config)?)?;
     #[cfg(unix)]
@@ -694,6 +709,254 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> ax
             require_local_key,
         ))
         .with_state(sup)
+}
+
+fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> axum::Router {
+    use axum::extract::{Path as AxPath, State};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post, put};
+
+    #[derive(Deserialize)]
+    struct HarnessOverrideBody {
+        binary: Option<PathBuf>,
+        config_dir: Option<PathBuf>,
+    }
+
+    async fn require_local_key(
+        State(key): State<String>,
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let presented = req
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .map(str::to_string)
+            });
+        if presented.as_deref() != Some(key.as_str()) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(
+                    serde_json::json!({"error": "admin routes require x-api-key: <local_key>"}),
+                ),
+            )
+                .into_response();
+        }
+        next.run(req).await
+    }
+
+    fn error(status: axum::http::StatusCode, message: impl Into<String>) -> axum::response::Response {
+        (status, axum::Json(serde_json::json!({"error": message.into()}))).into_response()
+    }
+
+    fn key_hash_hex(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn revoke_pi_keys(state: &alex_proxy::AppState) -> Result<usize> {
+        let rows = state.store.list_run_keys(true)?;
+        let ids: Vec<String> = rows
+            .iter()
+            .filter(|row| row["kind"].as_str() == Some("harness"))
+            .filter(|row| row["label"].as_str() == Some("pi"))
+            .filter(|row| !row["revoked"].as_bool().unwrap_or(false))
+            .filter_map(|row| row["id"].as_str().map(String::from))
+            .collect();
+        let mut revoked = 0usize;
+        for id in ids {
+            if state.store.revoke_run_key(&id)? {
+                revoked += 1;
+            }
+        }
+        if revoked > 0 {
+            state.run_keys.write().unwrap().clear();
+        }
+        Ok(revoked)
+    }
+
+    fn mint_pi_key(state: &alex_proxy::AppState) -> Result<(String, String)> {
+        let key = alex_proxy::generate_run_key();
+        let key_hash = key_hash_hex(&key);
+        let id = format!("rk-{}", &key_hash[..8]);
+        let tags_json = serde_json::json!({"harness": "pi"}).to_string();
+        state.store.insert_run_key(
+            &id,
+            &key_hash,
+            "harness",
+            None,
+            Some(&tags_json),
+            Some("pi"),
+            now_ms(),
+            None,
+        )?;
+        Ok((id, key))
+    }
+
+    fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
+        let mut ids = state.store.pricing_models();
+        for (alias, _) in alex_core::model_aliases() {
+            ids.push((*alias).to_string());
+        }
+        let filtered = harness_connect::filter_model_ids(ids);
+        if filtered.is_empty() {
+            vec![
+                "claude-opus-4-8".into(),
+                "claude-sonnet-5".into(),
+                "claude-haiku-4-5".into(),
+                "gpt-5.5".into(),
+                "grok-code-fast-1".into(),
+                "gemini-2.5-flash".into(),
+            ]
+        } else {
+            filtered
+        }
+    }
+
+    async fn list() -> axum::response::Response {
+        match load_or_create_config() {
+            Ok((config, _)) => match harness_connect::harness_statuses(&config, None, true).await {
+                Ok(harnesses) => axum::Json(serde_json::json!({"harnesses": harnesses})).into_response(),
+                Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            },
+            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    async fn connect(
+        State(state): State<Arc<alex_proxy::AppState>>,
+        AxPath(name): AxPath<String>,
+    ) -> axum::response::Response {
+        if name != "pi" {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("harness '{name}' does not support connect"),
+            );
+        }
+        let (config, _) = match load_or_create_config() {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let spec = harness_connect::pi_spec();
+        let status = match harness_connect::harness_status(&config, spec, None, true).await {
+            Ok(status) => status,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        if !status.installed {
+            return error(axum::http::StatusCode::BAD_REQUEST, "pi is not installed");
+        }
+        let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
+        if !config_dir.is_dir() {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("pi config dir does not exist at {}", config_dir.display()),
+            );
+        }
+        if let Err(e) = revoke_pi_keys(&state) {
+            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+        let (key_id, key) = match mint_pi_key(&state) {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let models = state_models(&state);
+        match harness_connect::write_pi_connection(
+            config_dir,
+            state.base_url.clone(),
+            key_id,
+            key,
+            models,
+            status.version,
+        ) {
+            Ok(summary) => axum::Json(serde_json::json!({
+                "key_id": summary.key_id,
+                "models": summary.models.len(),
+            }))
+            .into_response(),
+            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    async fn disconnect(
+        State(state): State<Arc<alex_proxy::AppState>>,
+        AxPath(name): AxPath<String>,
+    ) -> axum::response::Response {
+        if name != "pi" {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("harness '{name}' does not support disconnect"),
+            );
+        }
+        let (config, _) = match load_or_create_config() {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let config_dir = harness_connect::resolve_config_dir(&config, harness_connect::pi_spec(), None);
+        let was_connected = match harness_connect::disconnect_pi_config(&config_dir) {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        match revoke_pi_keys(&state) {
+            Ok(revoked) => axum::Json(serde_json::json!({
+                "revoked": revoked,
+                "was_connected": was_connected,
+            }))
+            .into_response(),
+            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    async fn put_override(
+        AxPath(name): AxPath<String>,
+        axum::Json(body): axum::Json<HarnessOverrideBody>,
+    ) -> axum::response::Response {
+        let Some(spec) = harness_connect::spec_by_name(&name) else {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("unknown harness '{name}'"),
+            );
+        };
+        let (mut config, _) = match load_or_create_config() {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        if body.binary.is_none() && body.config_dir.is_none() {
+            config.harness_overrides.remove(&name);
+        } else {
+            config.harness_overrides.insert(
+                name,
+                HarnessOverride {
+                    binary: body.binary,
+                    config_dir: body.config_dir,
+                },
+            );
+        }
+        if let Err(e) = save_config(&config) {
+            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+        match harness_connect::harness_status(&config, spec, None, true).await {
+            Ok(status) => axum::Json(status).into_response(),
+            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    axum::Router::new()
+        .route("/admin/harnesses", get(list))
+        .route("/admin/harnesses/{name}/connect", post(connect))
+        .route("/admin/harnesses/{name}/disconnect", post(disconnect))
+        .route("/admin/harnesses/{name}/override", put(put_override))
+        .route_layer(axum::middleware::from_fn_with_state(
+            local_key,
+            require_local_key,
+        ))
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -901,7 +1164,8 @@ async fn main() -> Result<()> {
                     describe(row_days)
                 );
             }
-            let mut app = alex_proxy::router(state);
+            let mut app = alex_proxy::router(state.clone());
+            app = app.merge(harness_admin_router(state.clone(), config.local_key.clone()));
             if let Some(sup) = supervisor.clone() {
                 app = app.merge(dario_admin_router(sup, config.local_key.clone()));
             }
@@ -3004,6 +3268,98 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::{Method, StatusCode};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_config(home: PathBuf) -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            port: 4100,
+            data_dir: home,
+            local_key: "alx-local".into(),
+            heartbeat_minutes: default_heartbeat_minutes(),
+            ping_anthropic_model: default_ping_anthropic(),
+            ping_openai_model: default_ping_openai(),
+            ping_xai_model: default_ping_xai(),
+            ping_gemini_model: default_ping_gemini(),
+            gemini_project: String::new(),
+            anthropic_upstream: "direct".into(),
+            dario_api_key: String::new(),
+            dario_update_check_minutes: 60,
+            dario_version: None,
+            dario_probe_seconds: 90,
+            dario_probe_failures: 2,
+            dario_probe_model: "claude-haiku-4-5".into(),
+            trace_body_retention_days: default_trace_body_retention_days(),
+            trace_row_retention_days: 0,
+            update_check_hours: default_update_check_hours(),
+            harness_overrides: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_executable(dir: &PathBuf, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn test_state(name: &str) -> Arc<alex_proxy::AppState> {
+        let dir = tmpdir(name);
+        let store = Arc::new(Store::open(dir.join("store")).unwrap());
+        let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
+        alex_proxy::build_state(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+        )
+    }
+
+    async fn router_json(
+        app: axum::Router,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let mut request = client
+            .request(method, format!("http://{addr}{path}"))
+            .header("x-api-key", "alx-local");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let value = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        server.abort();
+        (status, value)
+    }
 
     #[test]
     fn launchctl_pid_parsing() {
@@ -3016,6 +3372,8 @@ mod tests {
 
     #[test]
     fn home_dir_is_platform_native() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
         let home = alexandria_home();
         assert!(home.ends_with(".alexandria"));
         assert!(home.is_absolute());
@@ -3037,6 +3395,8 @@ mod tests {
 
     #[test]
     fn config_toml_roundtrip_with_native_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
         let config = Config {
             host: "127.0.0.1".into(),
             port: 4100,
@@ -3058,6 +3418,7 @@ mod tests {
             trace_body_retention_days: default_trace_body_retention_days(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
+            harness_overrides: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();
@@ -3065,6 +3426,150 @@ mod tests {
         assert_eq!(reloaded.local_key, config.local_key);
         assert_eq!(reloaded.data_dir, config.data_dir);
         assert!(reloaded.data_dir.is_absolute());
+    }
+
+    #[test]
+    fn config_old_toml_defaults_harness_overrides() {
+        let config = test_config(tmpdir("old-config"));
+        let text = toml::to_string_pretty(&config).unwrap();
+        let old_text = text
+            .lines()
+            .filter(|line| !line.starts_with("harness_overrides"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reloaded: Config = toml::from_str(&old_text).unwrap();
+        assert!(reloaded.harness_overrides.is_empty());
+    }
+
+    #[test]
+    fn save_load_preserves_harness_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("config-home");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.harness_overrides.insert(
+            "pi".into(),
+            HarnessOverride {
+                binary: Some(home.join("bin").join("pi")),
+                config_dir: Some(home.join("pi-agent")),
+            },
+        );
+        save_config(&config).unwrap();
+        let (loaded, fresh) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert!(!fresh);
+        let override_ = loaded.harness_overrides.get("pi").unwrap();
+        assert_eq!(override_.binary.as_ref().unwrap(), &home.join("bin").join("pi"));
+        assert_eq!(override_.config_dir.as_ref().unwrap(), &home.join("pi-agent"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_lists_and_rejects_non_pi_connect() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-list");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        save_config(&test_config(home.clone())).unwrap();
+        let app = harness_admin_router(test_state("router-list-state"), "alx-local".into());
+
+        let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let harnesses = body["harnesses"].as_array().unwrap();
+        assert_eq!(harnesses.len(), 6);
+        assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
+        assert!(harnesses.iter().all(|h| h.get("name").is_some()));
+        assert!(harnesses.iter().all(|h| h.get("override").is_some()));
+
+        let (status, body) = router_json(
+            app,
+            Method::POST,
+            "/admin/harnesses/claude/connect",
+            None,
+        )
+        .await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("does not support connect"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_put_override_persists_and_clears() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-override");
+        let bin_dir = tmpdir("router-override-bin");
+        let binary = fake_executable(&bin_dir, "claude", "echo claude 1.0.0");
+        let config_dir = home.join("claude-config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        save_config(&test_config(home.clone())).unwrap();
+        let app = harness_admin_router(test_state("router-override-state"), "alx-local".into());
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::PUT,
+            "/admin/harnesses/claude/override",
+            Some(serde_json::json!({
+                "binary": binary,
+                "config_dir": config_dir,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "claude");
+        assert_eq!(body["installed"], true);
+        let (loaded, _) = load_or_create_config().unwrap();
+        assert!(loaded.harness_overrides.contains_key("claude"));
+
+        let (status, body) = router_json(
+            app,
+            Method::PUT,
+            "/admin/harnesses/claude/override",
+            Some(serde_json::json!({"binary": null, "config_dir": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["override"]["binary"], serde_json::Value::Null);
+        let (loaded, _) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert!(!loaded.harness_overrides.contains_key("claude"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_connect_pi_writes_models_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-connect");
+        let bin_dir = tmpdir("router-connect-bin");
+        let binary = fake_executable(&bin_dir, "pi", "echo pi 0.80.0");
+        let config_dir = home.join("pi-agent");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.harness_overrides.insert(
+            "pi".into(),
+            HarnessOverride {
+                binary: Some(binary),
+                config_dir: Some(config_dir.clone()),
+            },
+        );
+        save_config(&config).unwrap();
+        let state = test_state("router-connect-state");
+        let app = harness_admin_router(state.clone(), "alx-local".into());
+
+        let (status, body) =
+            router_json(app, Method::POST, "/admin/harnesses/pi/connect", None).await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
+        assert!(body["models"].as_u64().unwrap() > 0);
+        let models_path = config_dir.join("models.json");
+        let models: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(models_path).unwrap()).unwrap();
+        assert!(models["providers"]["alexandria"].is_object());
+        let keys = state.store.list_run_keys(false).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kind"], "harness");
+        assert_eq!(keys[0]["label"], "pi");
     }
 
     #[test]

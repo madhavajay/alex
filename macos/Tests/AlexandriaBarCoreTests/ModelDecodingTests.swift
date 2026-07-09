@@ -85,6 +85,37 @@ import Testing
         #expect(dario.generations[0].lastProbe?.ok == true)
     }
 
+    @Test func harnesses() throws {
+        let json = #"""
+        {"harnesses":[
+          {"name":"pi","installed":true,"binary":"/opt/alex/pi","version":"0.80.3","version_warning":null,"config_dir":"/Users/x/.pi/agent","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":null,"config_dir":null},"daemon_reachable":true,"extra":"ignored"},
+          {"name":"codex","installed":false,"binary":null,"version":null,"version_warning":"install codex >= 1.2","config_dir":null,"config_dir_exists":false,"connected":false,"supports_connect":true,"override":{"binary":"/tmp/codex","config_dir":null},"daemon_reachable":true}
+        ],"extra":"ignored"}
+        """#
+        let harnesses = try decode(json, as: HarnessesResponse.self).harnesses
+        #expect(harnesses.count == 2)
+        #expect(harnesses[0].name == "pi")
+        #expect(harnesses[0].versionWarning == nil)
+        #expect(harnesses[0].override?.binary == nil)
+        #expect(harnesses[0].connected)
+        #expect(harnesses[1].versionWarning == "install codex >= 1.2")
+        #expect(harnesses[1].override?.binary == "/tmp/codex")
+        #expect(!harnesses[1].configDirExists)
+    }
+
+    @Test func harnessCatalogRows() {
+        let rows = HarnessCatalog.rows([
+            Harness(
+                name: "codex", installed: true, binary: "/bin/codex", version: "1.0",
+                versionWarning: nil, configDir: nil, configDirExists: false,
+                connected: false, supportsConnect: true, override: nil, daemonReachable: true),
+        ])
+        #expect(Array(rows.map(\.name).prefix(6)) == ["pi", "claude", "codex", "gemini", "grok", "opencode"])
+        #expect(rows[2].installed)
+        #expect(!rows[0].installed)
+        #expect(HarnessCatalog.displayName("opencode") == "OpenCode")
+    }
+
     @Test func configToml() {
         let toml = """
         # Alexandria config

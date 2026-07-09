@@ -1,15 +1,16 @@
 use std::collections::HashSet;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(windows)]
-use std::ffi::OsString;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{ui, Config};
+use crate::{ui, Config, HarnessOverride};
 
 const PROVIDER_NAME: &str = "alexandria";
 const PI_MIN_VERSION: Version = Version {
@@ -26,11 +27,58 @@ const FALLBACK_MODELS: &[&str] = &[
     "gemini-2.5-flash",
 ];
 
-struct HarnessDef {
-    name: &'static str,
+pub(crate) struct HarnessSpec {
+    pub(crate) name: &'static str,
+    pub(crate) binary: &'static str,
+    pub(crate) config_dir: fn(&Path) -> PathBuf,
+    pub(crate) version_args: &'static [&'static str],
+    pub(crate) supports_connect: bool,
 }
 
-const HARNESSES: &[HarnessDef] = &[HarnessDef { name: "pi" }];
+pub(crate) const HARNESSES: &[HarnessSpec] = &[
+    HarnessSpec {
+        name: "pi",
+        binary: "pi",
+        config_dir: pi_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: true,
+    },
+    HarnessSpec {
+        name: "claude",
+        binary: "claude",
+        config_dir: claude_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "codex",
+        binary: "codex",
+        config_dir: codex_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "gemini",
+        binary: "gemini",
+        config_dir: gemini_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "grok",
+        binary: "grok",
+        config_dir: grok_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "opencode",
+        binary: "opencode",
+        config_dir: opencode_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Version {
@@ -46,23 +94,53 @@ pub(crate) struct VersionCheck {
 }
 
 #[derive(Debug, Serialize)]
-struct HarnessStatus {
-    harness: &'static str,
-    installed: bool,
-    binary: Option<String>,
+pub(crate) struct HarnessStatus {
+    pub(crate) name: &'static str,
+    pub(crate) installed: bool,
+    pub(crate) binary: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) version_warning: Option<String>,
+    pub(crate) config_dir: String,
+    pub(crate) config_dir_exists: bool,
+    pub(crate) connected: bool,
+    pub(crate) supports_connect: bool,
+    #[serde(rename = "override")]
+    pub(crate) override_: HarnessOverrideJson,
+    pub(crate) daemon_reachable: bool,
+}
+
+#[derive(Debug)]
+struct HarnessDetection {
+    binary: Option<PathBuf>,
     version: Option<String>,
     version_warning: Option<String>,
-    config_dir: String,
-    config_dir_exists: bool,
-    connected: bool,
-    daemon_reachable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct HarnessOverrideJson {
+    pub(crate) binary: Option<String>,
+    pub(crate) config_dir: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PiConnectSummary {
+    pub(crate) key_id: String,
+    pub(crate) models: Vec<String>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) version: Option<String>,
+}
+
+#[derive(Debug)]
+struct VersionOutput {
+    version: Option<String>,
+    warning: Option<String>,
 }
 
 #[derive(Debug)]
 struct PiDetection {
     binary: Option<PathBuf>,
     version_raw: Option<String>,
-    version: VersionCheck,
+    version_check: VersionCheck,
 }
 
 pub(crate) async fn connect_cmd(
@@ -104,7 +182,7 @@ pub(crate) async fn disconnect_cmd(
 }
 
 async fn connect_status(config: &Config, config_dir: Option<PathBuf>, json_out: bool) -> Result<()> {
-    let statuses = vec![pi_status(config, config_dir).await?];
+    let statuses = harness_statuses(config, config_dir, daemon_health(config).await).await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&statuses)?);
         return Ok(());
@@ -126,7 +204,7 @@ async fn connect_status(config: &Config, config_dir: Option<PathBuf>, json_out: 
         let daemon = if status.daemon_reachable { "up" } else { "down" };
         println!(
             "{} {} {} {} {} {}",
-            ui::pad_right(status.harness, 10),
+            ui::pad_right(status.name, 10),
             ui::pad_right(installed, 10),
             ui::pad_right(status.version.as_deref().unwrap_or("-"), 14),
             ui::pad_right(config_exists, 8),
@@ -143,38 +221,66 @@ async fn connect_status(config: &Config, config_dir: Option<PathBuf>, json_out: 
     Ok(())
 }
 
-async fn pi_status(config: &Config, config_dir: Option<PathBuf>) -> Result<HarnessStatus> {
-    let detection = detect_pi();
-    let config_dir = config_dir.unwrap_or_else(default_pi_config_dir);
+pub(crate) async fn harness_statuses(
+    config: &Config,
+    pi_config_dir: Option<PathBuf>,
+    daemon_reachable: bool,
+) -> Result<Vec<HarnessStatus>> {
+    let mut statuses = Vec::new();
+    for spec in HARNESSES {
+        let explicit_config_dir = if spec.name == "pi" {
+            pi_config_dir.clone()
+        } else {
+            None
+        };
+        statuses.push(harness_status(config, spec, explicit_config_dir, daemon_reachable).await?);
+    }
+    Ok(statuses)
+}
+
+pub(crate) async fn harness_status(
+    config: &Config,
+    spec: &'static HarnessSpec,
+    explicit_config_dir: Option<PathBuf>,
+    daemon_reachable: bool,
+) -> Result<HarnessStatus> {
+    let detection = detect_harness(config, spec).await;
+    let config_dir = resolve_config_dir(config, spec, explicit_config_dir);
     let config_dir_exists = config_dir.is_dir();
-    let connected = models_json_connected(&config_dir.join("models.json")).unwrap_or(false);
-    let daemon_reachable = daemon_health(config).await;
+    let connected = if spec.name == "pi" {
+        models_json_connected(&config_dir.join("models.json")).unwrap_or(false)
+    } else {
+        false
+    };
+    let override_ = override_json(config.harness_overrides.get(spec.name));
     Ok(HarnessStatus {
-        harness: "pi",
+        name: spec.name,
         installed: detection.binary.is_some(),
         binary: detection
             .binary
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
-        version: detection.version_raw,
-        version_warning: detection.version.warning,
+        version: detection.version,
+        version_warning: detection.version_warning,
         config_dir: config_dir.to_string_lossy().to_string(),
         config_dir_exists,
         connected,
+        supports_connect: spec.supports_connect,
+        override_,
         daemon_reachable,
     })
 }
 
 async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool) -> Result<()> {
-    let detection = detect_pi();
+    let detection = detect_pi(config).await;
     if detection.binary.is_none() {
         bail!("pi is not installed or not on PATH; install it with `npm install -g @earendil-works/pi-coding-agent`");
     }
-    if let Some(warning) = &detection.version.warning {
+    if let Some(warning) = &detection.version_check.warning {
         eprintln!("{}", ui::amber(warning));
     }
 
-    let config_dir = config_dir.unwrap_or_else(default_pi_config_dir);
+    let config_dir = resolve_config_dir(config, pi_spec(), config_dir);
     if !config_dir.is_dir() {
         bail!(
             "pi config dir does not exist at {}; run pi once first (it creates ~/.pi/agent), or pass --config-dir",
@@ -197,24 +303,30 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
     let models = fetch_models(config, &client)
         .await
         .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
-    let models_path = config_dir.join("models.json");
-    upsert_pi_provider(&models_path, &normalized_base_url(config), &minted.key, &models)?;
+    let summary = write_pi_connection(
+        config_dir,
+        normalized_base_url(config),
+        minted.id,
+        minted.key,
+        models,
+        detection.version_raw,
+    )?;
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "harness": "pi",
-                "version": detection.version_raw,
-                "config_path": models_path,
-                "models": models,
-                "key_id": minted.id,
+                "version": summary.version,
+                "config_path": summary.config_path,
+                "models": summary.models,
+                "key_id": summary.key_id,
             }))?
         );
     } else {
         println!("{}", ui::section("pi connected"));
-        println!("key id: {}", ui::amber(&minted.id));
-        println!("models: {}", models.len());
+        println!("key id: {}", ui::amber(&summary.key_id));
+        println!("models: {}", summary.models.len());
         println!();
         println!("pi --provider alexandria --model claude-opus-4-8");
         println!("or pick via /model inside pi — changes hot-reload");
@@ -223,9 +335,9 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
 }
 
 async fn disconnect_pi(config: &Config, config_dir: Option<PathBuf>) -> Result<()> {
-    let config_dir = config_dir.unwrap_or_else(default_pi_config_dir);
-    let models_path = config_dir.join("models.json");
-    if !remove_pi_provider(&models_path)? {
+    let config_dir = resolve_config_dir(config, pi_spec(), config_dir);
+    let was_connected = disconnect_pi_config(&config_dir)?;
+    if !was_connected {
         println!("pi not connected");
         return Ok(());
     }
@@ -252,6 +364,28 @@ async fn disconnect_pi(config: &Config, config_dir: Option<PathBuf>) -> Result<(
     }
     println!("disconnected pi; revoked {revoked} harness key(s)");
     Ok(())
+}
+
+pub(crate) fn write_pi_connection(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    models: Vec<String>,
+    version: Option<String>,
+) -> Result<PiConnectSummary> {
+    let models_path = config_dir.join("models.json");
+    upsert_pi_provider(&models_path, &base_url, &api_key, &models)?;
+    Ok(PiConnectSummary {
+        key_id,
+        models,
+        config_path: models_path,
+        version,
+    })
+}
+
+pub(crate) fn disconnect_pi_config(config_dir: &Path) -> Result<bool> {
+    remove_pi_provider(&config_dir.join("models.json"))
 }
 
 #[derive(Debug)]
@@ -412,18 +546,74 @@ fn normalized_base_url(config: &Config) -> String {
     format!("http://{host}:{}", config.port)
 }
 
-fn default_pi_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pi")
-        .join("agent")
+pub(crate) fn pi_spec() -> &'static HarnessSpec {
+    HARNESSES
+        .iter()
+        .find(|spec| spec.name == "pi")
+        .expect("pi harness spec")
 }
 
-fn detect_pi() -> PiDetection {
-    let binary = find_on_path("pi");
-    let version_raw = binary.as_ref().and_then(|path| pi_version(path));
-    let version = if binary.is_some() {
-        check_version(version_raw.as_deref())
+pub(crate) fn spec_by_name(name: &str) -> Option<&'static HarnessSpec> {
+    HARNESSES.iter().find(|spec| spec.name == name)
+}
+
+pub(crate) fn resolve_config_dir(
+    config: &Config,
+    spec: &HarnessSpec,
+    explicit: Option<PathBuf>,
+) -> PathBuf {
+    explicit
+        .or_else(|| {
+            config
+                .harness_overrides
+                .get(spec.name)
+                .and_then(|override_| override_.config_dir.clone())
+        })
+        .unwrap_or_else(|| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            (spec.config_dir)(&home)
+        })
+}
+
+fn pi_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent")
+}
+
+fn claude_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".claude")
+}
+
+fn codex_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".codex")
+}
+
+fn gemini_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".gemini")
+}
+
+fn grok_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".grok")
+}
+
+fn opencode_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".config").join("opencode")
+}
+
+fn override_json(override_: Option<&HarnessOverride>) -> HarnessOverrideJson {
+    HarnessOverrideJson {
+        binary: override_
+            .and_then(|o| o.binary.as_ref())
+            .map(|p| p.to_string_lossy().to_string()),
+        config_dir: override_
+            .and_then(|o| o.config_dir.as_ref())
+            .map(|p| p.to_string_lossy().to_string()),
+    }
+}
+
+async fn detect_pi(config: &Config) -> PiDetection {
+    let detection = detect_harness(config, pi_spec()).await;
+    let version_check = if detection.binary.is_some() {
+        check_version(detection.version.as_deref())
     } else {
         VersionCheck {
             parsed: None,
@@ -431,17 +621,55 @@ fn detect_pi() -> PiDetection {
         }
     };
     PiDetection {
-        binary,
-        version_raw,
-        version,
+        binary: detection.binary,
+        version_raw: detection.version,
+        version_check,
     }
 }
 
-fn find_on_path(bin: &str) -> Option<PathBuf> {
+async fn detect_harness(config: &Config, spec: &HarnessSpec) -> HarnessDetection {
+    detect_harness_with_timeout(config, spec, Duration::from_secs(5)).await
+}
+
+async fn detect_harness_with_timeout(
+    config: &Config,
+    spec: &HarnessSpec,
+    timeout: Duration,
+) -> HarnessDetection {
+    let override_binary = config
+        .harness_overrides
+        .get(spec.name)
+        .and_then(|override_| override_.binary.clone());
+    let binary = match override_binary {
+        Some(path) if is_executable_file(&path) => Some(path),
+        Some(_) => None,
+        None => find_on_path(spec.binary),
+    };
+    let Some(binary_path) = binary.clone() else {
+        return HarnessDetection {
+            binary: None,
+            version: None,
+            version_warning: None,
+        };
+    };
+    let version = command_version(&binary_path, spec.version_args, timeout).await;
+    let mut version_warning = version.warning.clone();
+    if spec.name == "pi" {
+        let check = check_version(version.version.as_deref());
+        version_warning = version_warning.or(check.warning);
+    }
+    HarnessDetection {
+        binary: Some(binary_path),
+        version: version.version,
+        version_warning,
+    }
+}
+
+pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         for candidate in executable_candidates(&dir, bin) {
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -465,15 +693,59 @@ fn executable_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
     }
 }
 
-fn pi_version(binary: &Path) -> Option<String> {
-    let out = Command::new(binary).arg("--version").output().ok()?;
-    let raw = if out.stdout.is_empty() {
-        String::from_utf8_lossy(&out.stderr).to_string()
-    } else {
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
-    let raw = raw.trim().to_string();
-    (!raw.is_empty()).then_some(raw)
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> VersionOutput {
+    let binary = binary.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            let out = Command::new(binary).args(args).output().ok()?;
+            let raw = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            };
+            version_token(&raw)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(version)) => VersionOutput {
+            version,
+            warning: None,
+        },
+        Ok(Err(e)) => VersionOutput {
+            version: None,
+            warning: Some(format!("version check failed: {e}")),
+        },
+        Err(_) => VersionOutput {
+            version: None,
+            warning: Some("version check timed out".into()),
+        },
+    }
+}
+
+fn version_token(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .find(|part| part.chars().any(|c| c.is_ascii_digit()))
+        .map(|part| part.trim().to_string())
 }
 
 pub(crate) fn check_version(raw: Option<&str>) -> VersionCheck {
@@ -498,8 +770,13 @@ pub(crate) fn check_version(raw: Option<&str>) -> VersionCheck {
 fn parse_version(raw: &str) -> Option<Version> {
     let token = raw
         .split_whitespace()
-        .find(|part| part.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))?;
-    let mut parts = token.split('.');
+        .find(|part| part.chars().any(|c| c.is_ascii_digit()))?;
+    let start = token.find(|c: char| c.is_ascii_digit())?;
+    let numeric: String = token[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = numeric.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts
@@ -669,6 +946,7 @@ pub(crate) fn reasoning_enabled(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -685,6 +963,102 @@ mod tests {
 
     fn model_ids() -> Vec<String> {
         vec!["claude-opus-4-8".into(), "gpt-5.5".into()]
+    }
+
+    fn test_config() -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            port: 4100,
+            data_dir: tmpdir("data"),
+            local_key: "alx-test".into(),
+            heartbeat_minutes: crate::default_heartbeat_minutes(),
+            ping_anthropic_model: crate::default_ping_anthropic(),
+            ping_openai_model: crate::default_ping_openai(),
+            ping_xai_model: crate::default_ping_xai(),
+            ping_gemini_model: crate::default_ping_gemini(),
+            gemini_project: String::new(),
+            anthropic_upstream: crate::default_anthropic_upstream(),
+            dario_api_key: String::new(),
+            dario_update_check_minutes: crate::default_dario_update_minutes(),
+            dario_version: None,
+            dario_probe_seconds: crate::default_dario_probe_seconds(),
+            dario_probe_failures: crate::default_dario_probe_failures(),
+            dario_probe_model: crate::default_dario_probe_model(),
+            trace_body_retention_days: crate::default_trace_body_retention_days(),
+            trace_row_retention_days: 0,
+            update_check_hours: crate::default_update_check_hours(),
+            harness_overrides: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_detection_uses_overrides() {
+        let dir = tmpdir("override-detect");
+        let config_dir = dir.join("claude-config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let binary = fake_executable(&dir, "claude-fake", "echo claude-code 1.2.3");
+        let mut config = test_config();
+        config.harness_overrides.insert(
+            "claude".into(),
+            HarnessOverride {
+                binary: Some(binary.clone()),
+                config_dir: Some(config_dir.clone()),
+            },
+        );
+
+        let status = harness_status(&config, spec_by_name("claude").unwrap(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(status.name, "claude");
+        assert!(status.installed);
+        assert_eq!(status.binary.as_deref(), Some(binary.to_str().unwrap()));
+        assert_eq!(status.version.as_deref(), Some("1.2.3"));
+        assert_eq!(status.config_dir, config_dir.to_string_lossy());
+        assert!(status.config_dir_exists);
+        assert!(!status.connected);
+        assert!(!status.supports_connect);
+        assert_eq!(
+            status.override_.config_dir.as_deref(),
+            Some(config_dir.to_str().unwrap())
+        );
+
+        let statuses = harness_statuses(&config, None, true).await.unwrap();
+        assert_eq!(statuses.len(), 6);
+        assert!(statuses.iter().any(|s| s.name == "opencode"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_detection_timeout_keeps_installed_true() {
+        let dir = tmpdir("timeout");
+        let binary = fake_executable(&dir, "codex-slow", "sleep 2\necho codex 9.9.9");
+        let mut config = test_config();
+        config.harness_overrides.insert(
+            "codex".into(),
+            HarnessOverride {
+                binary: Some(binary),
+                config_dir: None,
+            },
+        );
+        let detection = detect_harness_with_timeout(
+            &config,
+            spec_by_name("codex").unwrap(),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(detection.binary.is_some());
+        assert!(detection.version.is_none());
+        assert_eq!(detection.version_warning.as_deref(), Some("version check timed out"));
     }
 
     #[test]

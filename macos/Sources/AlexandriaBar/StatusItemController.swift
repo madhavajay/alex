@@ -76,6 +76,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if store.daemonUp {
             buildLimits()
             buildAccounts()
+            buildHarnesses()
             buildDario()
             buildAnalytics()
         }
@@ -301,6 +302,74 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
     }
 
+    private func buildHarnesses() {
+        guard store.harnessesSupported == true else { return }
+        let installed = HarnessCatalog.rows(store.harnesses).filter(\.installed)
+        guard !installed.isEmpty else { return }
+        let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for harness in installed {
+            let harnessItem = NSMenuItem(
+                title: HarnessCatalog.displayName(harness.name), action: nil, keyEquivalent: "")
+            harnessItem.image = harnessDotImage(harness)
+            harnessItem.submenu = harnessSubmenu(harness)
+            sub.addItem(harnessItem)
+        }
+        item.submenu = sub
+        menu.addItem(item)
+        menu.addItem(.separator())
+    }
+
+    private func harnessDotImage(_ harness: Harness) -> NSImage? {
+        NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: [
+                harness.connected ? .systemGreen : .secondaryLabelColor,
+            ]))
+    }
+
+    private func harnessSubmenu(_ harness: Harness) -> NSMenu {
+        let sub = NSMenu()
+        let name = HarnessCatalog.displayName(harness.name)
+
+        func info(_ title: String) {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            sub.addItem(item)
+        }
+        func action(_ title: String, symbol: String? = nil, handler: @escaping @MainActor () -> Void) {
+            let item = NSMenuItem(title: title, action: #selector(runHandler(_:)), keyEquivalent: "")
+            item.target = self
+            if let symbol {
+                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            }
+            item.representedObject = MenuHandler(handler)
+            sub.addItem(item)
+        }
+
+        info(harness.version.map { "\(name) · v\($0)" } ?? name)
+        if let configDir = harness.configDir, !configDir.isEmpty {
+            info(configDir)
+        }
+        sub.addItem(.separator())
+        if harness.supportsConnect, !harness.connected {
+            action("Install", symbol: "arrow.down.circle") { [weak self] in
+                self?.connectHarness(harness)
+            }
+        }
+        action("Configure…", symbol: "gearshape") { [weak self] in
+            self?.openPreferences(section: .harnesses)
+        }
+        if harness.connected {
+            action("Uninstall", symbol: "trash") { [weak self] in
+                self?.confirmDisconnectHarness(harness)
+            }
+        }
+        action("View in Trace Browser", symbol: "list.bullet.rectangle") { [weak self] in
+            self?.openTraceBrowser(harness: harness.name)
+        }
+        return sub
+    }
+
     private func buildAnalytics() {
         guard let analytics = store.analytics, analytics.totals.requests > 0 else { return }
         let t = analytics.totals
@@ -462,11 +531,56 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
     }
 
-    private func openTraceBrowser() {
+    private func connectHarness(_ harness: Harness) {
+        guard let config = store.config else { return }
+        let client = AlexandriaClient(config: config)
+        let name = HarnessCatalog.displayName(harness.name)
+        Task { [weak self] in
+            do {
+                let result = try await client.connectHarness(harness.name)
+                await self?.store.refresh()
+                self?.notify(title: "\(name) installed", body: "\(result.models) models connected")
+            } catch {
+                self?.notify(title: "\(name) install failed", body: error.localizedDescription)
+            }
+        }
+    }
+
+    private func confirmDisconnectHarness(_ harness: Harness) {
+        let name = HarnessCatalog.displayName(harness.name)
+        let alert = NSAlert()
+        alert.messageText = "Uninstall \(name)?"
+        alert.informativeText = "Alexandria will disconnect this harness and revoke its local route key."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Uninstall")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        disconnectHarness(harness)
+    }
+
+    private func disconnectHarness(_ harness: Harness) {
+        guard let config = store.config else { return }
+        let client = AlexandriaClient(config: config)
+        let name = HarnessCatalog.displayName(harness.name)
+        Task { [weak self] in
+            do {
+                let result = try await client.disconnectHarness(harness.name)
+                await self?.store.refresh()
+                self?.notify(
+                    title: "\(name) uninstalled",
+                    body: result.wasConnected ? "\(result.revoked) route key(s) revoked" : "Already disconnected")
+            } catch {
+                self?.notify(title: "\(name) uninstall failed", body: error.localizedDescription)
+            }
+        }
+    }
+
+    private func openTraceBrowser(harness: String? = nil) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show()
+        traceBrowser?.show(harness: harness)
     }
 
     private func openDario() {
@@ -476,11 +590,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         darioWindow?.show()
     }
 
-    private func openPreferences() {
+    private func openPreferences(section: PreferencesSection = .general) {
         if prefsController == nil {
-            prefsController = PreferencesWindowController()
+            prefsController = PreferencesWindowController(store: store)
         }
-        prefsController?.show()
+        prefsController?.show(section: section)
     }
 }
 
