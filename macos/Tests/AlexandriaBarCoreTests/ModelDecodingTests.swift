@@ -125,6 +125,61 @@ import Testing
         #expect(!harnesses[1].configDirExists)
     }
 
+    @Test func harnessRefreshConfigResponse() throws {
+        let json = #"""
+        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100"}
+        """#
+        let response = try decode(json, as: HarnessConfigWriteResponse.self)
+        #expect(response.refreshed == true)
+        #expect(response.modelsTotal == 28)
+        #expect(response.models == 28)
+        #expect(response.added == ["alex/claude-fable-5"])
+        #expect(response.removed.isEmpty)
+        #expect(response.unchanged == 27)
+        #expect(response.key == "reused")
+        #expect(response.path.hasSuffix("models.json"))
+        #expect(response.baseUrl == "http://127.0.0.1:4100")
+    }
+
+    @Test func harnessConnectConfigWriteResponse() throws {
+        let json = #"""
+        {"path":"/tmp/pi/models.json","models_total":12,"added":["alex/a","alex/b"],"removed":["alex/z"],"unchanged":10,"key":"minted","base_url":"http://127.0.0.1:4100","key_id":"rk-abc"}
+        """#
+        let response = try decode(json, as: HarnessConfigWriteResponse.self)
+        #expect(response.refreshed == nil)
+        #expect(response.modelsTotal == 12)
+        #expect(response.key == "minted")
+        #expect(response.keyId == "rk-abc")
+        #expect(response.added.count == 2)
+        #expect(response.removed == ["alex/z"])
+    }
+
+    @Test func harnessPlanResponse() throws {
+        let json = #"""
+        {"plan":[
+          {"path":"/Users/x/.pi/agent/models.json","action":"create","detail":"add provider 'alexandria' with 28 models"},
+          {"path":"run-keys","action":"create","detail":"mint harness key"}
+        ]}
+        """#
+        let response = try decode(json, as: HarnessPlanResponse.self)
+        #expect(response.plan.count == 2)
+        #expect(response.plan[0].action == "create")
+        #expect(response.plan[0].path.hasSuffix("models.json"))
+        #expect(response.plan[1].detail == "mint harness key")
+    }
+
+    @Test func harnessDisconnectResponse() throws {
+        let json = #"""
+        {"path":"/Users/x/.pi/agent/models.json","models_total":0,"added":[],"removed":["alex/a"],"unchanged":0,"key":"revoked","base_url":"http://127.0.0.1:4100","revoked":1,"was_connected":true}
+        """#
+        let response = try decode(json, as: HarnessDisconnectResponse.self)
+        #expect(response.wasConnected)
+        #expect(response.revoked == 1)
+        #expect(response.key == "revoked")
+        #expect(response.removed == ["alex/a"])
+        #expect(response.path.hasSuffix("models.json"))
+    }
+
     @Test func harnessCatalogRows() {
         let rows = HarnessCatalog.rows([
             Harness(
@@ -136,6 +191,30 @@ import Testing
         #expect(rows[2].installed)
         #expect(!rows[0].installed)
         #expect(HarnessCatalog.displayName("opencode") == "OpenCode")
+    }
+
+    @Test func harnessRefreshTargetsFiltersConnectedSupport() {
+        let harnesses = [
+            Harness(
+                name: "pi", installed: true, binary: "/bin/pi", version: "1",
+                versionWarning: nil, configDir: "/tmp/pi", configDirExists: true,
+                connected: true, supportsConnect: true, override: nil, daemonReachable: true),
+            Harness(
+                name: "codex", installed: true, binary: "/bin/codex", version: "1",
+                versionWarning: nil, configDir: nil, configDirExists: false,
+                connected: false, supportsConnect: true, override: nil, daemonReachable: true),
+            Harness(
+                name: "claude", installed: true, binary: "/bin/claude", version: "1",
+                versionWarning: nil, configDir: nil, configDirExists: true,
+                connected: true, supportsConnect: false, override: nil, daemonReachable: true),
+            Harness(
+                name: "future", installed: true, binary: "/bin/future", version: "1",
+                versionWarning: nil, configDir: "/tmp/f", configDirExists: true,
+                connected: true, supportsConnect: true, override: nil, daemonReachable: true),
+        ]
+        let targets = HarnessCatalog.refreshTargets(harnesses)
+        #expect(targets.map(\.name) == ["pi", "future"])
+        #expect(HarnessCatalog.refreshTargets([]).isEmpty)
     }
 
     @Test func configToml() {

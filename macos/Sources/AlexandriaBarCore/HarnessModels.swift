@@ -77,23 +77,116 @@ public struct HarnessOverride: Codable, Sendable, Equatable {
     }
 }
 
-public struct HarnessConnectResponse: Codable, Sendable, Equatable {
-    public let keyId: String
-    public let models: Int
+public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
+    public let refreshed: Bool?
+    public let path: String
+    public let modelsTotal: Int
+    public let added: [String]
+    public let removed: [String]
+    public let unchanged: Int
+    /// `"reused"` or `"minted"`.
+    public let key: String
+    public let baseUrl: String
+    public let keyId: String?
+
+    public init(
+        refreshed: Bool? = nil,
+        path: String,
+        modelsTotal: Int,
+        added: [String],
+        removed: [String],
+        unchanged: Int,
+        key: String,
+        baseUrl: String,
+        keyId: String? = nil
+    ) {
+        self.refreshed = refreshed
+        self.path = path
+        self.modelsTotal = modelsTotal
+        self.added = added
+        self.removed = removed
+        self.unchanged = unchanged
+        self.key = key
+        self.baseUrl = baseUrl
+        self.keyId = keyId
+    }
 
     enum CodingKeys: String, CodingKey {
-        case models
+        case refreshed, path, added, removed, unchanged, key
+        case modelsTotal = "models_total"
+        case baseUrl = "base_url"
         case keyId = "key_id"
     }
+
+    /// Prefer this for connect notifications that previously used `models`.
+    public var models: Int { modelsTotal }
 }
 
+/// Alias kept for call-site clarity.
+public typealias HarnessConnectResponse = HarnessConfigWriteResponse
+public typealias HarnessRefreshConfigResponse = HarnessConfigWriteResponse
+
 public struct HarnessDisconnectResponse: Codable, Sendable, Equatable {
+    public let path: String
+    public let modelsTotal: Int
+    public let added: [String]
+    public let removed: [String]
+    public let unchanged: Int
+    /// `"revoked"` or `"none"`.
+    public let key: String
+    public let baseUrl: String
     public let revoked: Int
     public let wasConnected: Bool
 
+    public init(
+        path: String,
+        modelsTotal: Int = 0,
+        added: [String] = [],
+        removed: [String] = [],
+        unchanged: Int = 0,
+        key: String = "none",
+        baseUrl: String = "",
+        revoked: Int,
+        wasConnected: Bool
+    ) {
+        self.path = path
+        self.modelsTotal = modelsTotal
+        self.added = added
+        self.removed = removed
+        self.unchanged = unchanged
+        self.key = key
+        self.baseUrl = baseUrl
+        self.revoked = revoked
+        self.wasConnected = wasConnected
+    }
+
     enum CodingKeys: String, CodingKey {
-        case revoked
+        case path, added, removed, unchanged, key, revoked
+        case modelsTotal = "models_total"
+        case baseUrl = "base_url"
         case wasConnected = "was_connected"
+    }
+}
+
+public struct HarnessPlanStep: Codable, Sendable, Equatable, Identifiable {
+    public let path: String
+    public let action: String
+    public let detail: String
+
+    public var id: String { "\(action)|\(path)|\(detail)" }
+
+    public init(path: String, action: String, detail: String) {
+        self.path = path
+        self.action = action
+        self.detail = detail
+    }
+}
+
+public struct HarnessPlanResponse: Codable, Sendable, Equatable {
+    public let plan: [HarnessPlanStep]
+
+    public init(plan: [HarnessPlanStep]) {
+        self.plan = plan
     }
 }
 
@@ -119,5 +212,11 @@ public enum HarnessCatalog {
             .filter { !names.contains($0.name) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         return out
+    }
+
+    /// Harnesses that can receive `refresh-config` (connected + supports connect).
+    /// Order follows `rows(_:)`; not hard-coded to a name list beyond display ordering.
+    public static func refreshTargets(_ harnesses: [Harness]) -> [Harness] {
+        rows(harnesses).filter { $0.supportsConnect && $0.connected }
     }
 }

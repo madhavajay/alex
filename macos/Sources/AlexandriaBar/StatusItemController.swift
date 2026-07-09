@@ -13,6 +13,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
     private let geminiKeyWindow = GeminiKeyWindowController()
+    private let harnessActionWindow = HarnessActionWindowController()
     private let updaterController = UpdaterController()
     private var daemonUpdateApplying = false
     private var daemonUpdateTarget: String?
@@ -324,6 +325,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             harnessItem.submenu = harnessSubmenu(harness)
             sub.addItem(harnessItem)
         }
+        sub.addItem(.separator())
+        let updateAll = NSMenuItem(
+            title: "Update All Harnesses",
+            action: #selector(runHandler(_:)),
+            keyEquivalent: "")
+        updateAll.target = self
+        updateAll.image = NSImage(
+            systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)
+        updateAll.representedObject = MenuHandler { [weak self] in
+            guard let self else { return }
+            self.harnessActionWindow.showUpdateAll(store: self.store)
+        }
+        sub.addItem(updateAll)
         item.submenu = sub
         menu.addItem(item)
         menu.addItem(.separator())
@@ -361,16 +375,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         sub.addItem(.separator())
         if harness.supportsConnect, !harness.connected {
-            action("Install", symbol: "arrow.down.circle") { [weak self] in
-                self?.connectHarness(harness)
+            action(HarnessActionKind.connect.label, symbol: "arrow.down.circle") { [weak self] in
+                guard let self else { return }
+                self.harnessActionWindow.show(store: self.store, harness: harness, kind: .connect)
             }
         }
         action("Configure…", symbol: "gearshape") { [weak self] in
             self?.openPreferences(section: .harnesses)
         }
         if harness.connected {
-            action("Uninstall", symbol: "trash") { [weak self] in
-                self?.confirmDisconnectHarness(harness)
+            action(HarnessActionKind.refresh.label, symbol: "arrow.triangle.2.circlepath") {
+                [weak self] in
+                guard let self else { return }
+                self.harnessActionWindow.show(store: self.store, harness: harness, kind: .refresh)
+            }
+            action(HarnessActionKind.disconnect.label, symbol: "trash") { [weak self] in
+                guard let self else { return }
+                self.harnessActionWindow.show(store: self.store, harness: harness, kind: .disconnect)
             }
         }
         action("View in Trace Browser", symbol: "list.bullet.rectangle") { [weak self] in
@@ -611,51 +632,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func notify(title: String, body: String) {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
-    }
-
-    private func connectHarness(_ harness: Harness) {
-        guard let config = store.config else { return }
-        let client = AlexandriaClient(config: config)
-        let name = HarnessCatalog.displayName(harness.name)
-        Task { [weak self] in
-            do {
-                let result = try await client.connectHarness(harness.name)
-                await self?.store.refresh()
-                self?.notify(title: "\(name) installed", body: "\(result.models) models connected")
-            } catch {
-                self?.notify(title: "\(name) install failed", body: error.localizedDescription)
-            }
-        }
-    }
-
-    private func confirmDisconnectHarness(_ harness: Harness) {
-        let name = HarnessCatalog.displayName(harness.name)
-        let alert = NSAlert()
-        alert.messageText = "Uninstall \(name)?"
-        alert.informativeText = "Alexandria will disconnect this harness and revoke its local route key."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Uninstall")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        disconnectHarness(harness)
-    }
-
-    private func disconnectHarness(_ harness: Harness) {
-        guard let config = store.config else { return }
-        let client = AlexandriaClient(config: config)
-        let name = HarnessCatalog.displayName(harness.name)
-        Task { [weak self] in
-            do {
-                let result = try await client.disconnectHarness(harness.name)
-                await self?.store.refresh()
-                self?.notify(
-                    title: "\(name) uninstalled",
-                    body: result.wasConnected ? "\(result.revoked) route key(s) revoked" : "Already disconnected")
-            } catch {
-                self?.notify(title: "\(name) uninstall failed", body: error.localizedDescription)
-            }
-        }
     }
 
     private func openTraceBrowser(harness: String? = nil) {

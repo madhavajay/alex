@@ -101,6 +101,11 @@ struct PreferencesView: View {
 
 private struct HarnessesPreferencesSection: View {
     let store: SnapshotStore
+    @State private var updateAllModel: MultiHarnessRefreshSheetModel?
+
+    private var refreshTargets: [Harness] {
+        HarnessCatalog.refreshTargets(store.harnesses)
+    }
 
     var body: some View {
         Section("Harnesses") {
@@ -125,25 +130,65 @@ private struct HarnessesPreferencesSection: View {
                     await store.refresh()
                 }
             } else {
+                if !refreshTargets.isEmpty {
+                    HStack {
+                        Text(
+                            "\(refreshTargets.count) connected harness\(refreshTargets.count == 1 ? "" : "es") can update"
+                        )
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Update All Harnesses") {
+                            let model = MultiHarnessRefreshSheetModel(store: store)
+                            updateAllModel = model
+                            model.start()
+                        }
+                        .controlSize(.small)
+                    }
+                }
                 ForEach(HarnessCatalog.rows(store.harnesses)) { harness in
                     HarnessRowView(harness: harness, store: store)
                 }
             }
         }
+        .sheet(item: $updateAllModel) { sheet in
+            MultiHarnessRefreshSheetHost(sheet: sheet) {
+                updateAllModel = nil
+            }
+        }
     }
 }
 
-private enum HarnessRowAction {
-    case connect
-    case disconnect
+private struct MultiHarnessRefreshSheetHost: View {
+    let sheet: MultiHarnessRefreshSheetModel
+    let onClose: () -> Void
+
+    var body: some View {
+        // Observe the inner model so sequential updates re-render.
+        MultiHarnessRefreshRootProxy(model: sheet.model, onClose: onClose)
+    }
+}
+
+private struct MultiHarnessRefreshRootProxy: View {
+    @Bindable var model: MultiHarnessRefreshModel
+    let onClose: () -> Void
+
+    var body: some View {
+        MultiHarnessRefreshResultView(
+            items: model.items,
+            finished: model.finished,
+            totalsLine: model.totalsLine,
+            onClose: onClose
+        )
+    }
 }
 
 private struct HarnessRowView: View {
     let harness: Harness
     let store: SnapshotStore
-    @State private var action: HarnessRowAction?
     @State private var error: String?
     @State private var showOverride = false
+    @State private var actionModel: HarnessActionSheetModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -172,13 +217,20 @@ private struct HarnessRowView: View {
                 }
                 Spacer()
                 if harness.supportsConnect {
+                    if harness.connected {
+                        Button(HarnessActionKind.refresh.label) {
+                            beginAction(.refresh)
+                        }
+                        .controlSize(.small)
+                        .disabled(actionModel != nil)
+                    }
                     actionButton
                 }
                 Button("Override…") {
                     showOverride = true
                 }
                 .controlSize(.small)
-                .disabled(action != nil)
+                .disabled(actionModel != nil)
             }
             if let error {
                 Text(error)
@@ -189,6 +241,11 @@ private struct HarnessRowView: View {
         .font(.system(size: 12))
         .sheet(isPresented: $showOverride) {
             HarnessOverrideSheet(harness: harness, store: store)
+        }
+        .sheet(item: $actionModel) { model in
+            HarnessActionSheetHost(model: model) {
+                actionModel = nil
+            }
         }
     }
 
@@ -203,38 +260,41 @@ private struct HarnessRowView: View {
 
     @ViewBuilder
     private var actionButton: some View {
-        if action != nil {
+        if actionModel != nil {
             ProgressView()
                 .controlSize(.small)
-                .frame(width: 82, alignment: .center)
         } else {
-            Button(harness.connected ? "Disconnect" : "Connect") {
-                run(harness.connected ? .disconnect : .connect)
+            Button(
+                harness.connected
+                    ? HarnessActionKind.disconnect.label : HarnessActionKind.connect.label
+            ) {
+                beginAction(harness.connected ? .disconnect : .connect)
             }
             .controlSize(.small)
-            .frame(width: 82)
         }
     }
 
-    private func run(_ next: HarnessRowAction) {
-        guard let config = store.config else { return }
+    private func beginAction(_ kind: HarnessActionKind) {
         error = nil
-        action = next
-        let client = AlexandriaClient(config: config)
-        Task {
-            do {
-                switch next {
-                case .connect:
-                    _ = try await client.connectHarness(harness.name)
-                case .disconnect:
-                    _ = try await client.disconnectHarness(harness.name)
-                }
-                await store.refresh()
-            } catch {
-                self.error = error.localizedDescription
-            }
-            action = nil
-        }
+        let model = HarnessActionSheetModel(store: store, harness: harness, kind: kind)
+        actionModel = model
+        model.start()
+    }
+}
+
+private struct HarnessActionSheetHost: View {
+    @Bindable var model: HarnessActionSheetModel
+    let onClose: () -> Void
+
+    var body: some View {
+        HarnessActionResultView(
+            kind: model.kind,
+            harnessDisplayName: model.displayName,
+            phase: model.phase,
+            onApprove: { model.approve() },
+            onCancel: onClose,
+            onClose: onClose
+        )
     }
 }
 

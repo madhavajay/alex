@@ -734,7 +734,7 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> ax
 }
 
 fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> axum::Router {
-    use axum::extract::{Path as AxPath, State};
+    use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
     use axum::routing::{get, post, put};
 
@@ -742,6 +742,30 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
     struct HarnessOverrideBody {
         binary: Option<PathBuf>,
         config_dir: Option<PathBuf>,
+    }
+
+    fn parse_dry_run(q: &std::collections::HashMap<String, String>) -> bool {
+        q.get("dry_run")
+            .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    }
+
+    fn list_active_pi_keys(state: &alex_proxy::AppState) -> Result<Vec<(String, String)>> {
+        let rows = state.store.list_run_keys(true)?;
+        Ok(rows
+            .iter()
+            .filter(|row| row["kind"].as_str() == Some("harness"))
+            .filter(|row| row["label"].as_str() == Some("pi"))
+            .filter(|row| !row["revoked"].as_bool().unwrap_or(false))
+            .filter_map(|row| {
+                let id = row["id"].as_str()?.to_string();
+                let fp = row["key_fingerprint"]
+                    .as_str()
+                    .unwrap_or(id.as_str())
+                    .to_string();
+                Some((id, fp))
+            })
+            .collect())
     }
 
     async fn require_local_key(
@@ -855,6 +879,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
     async fn connect(
         State(state): State<Arc<alex_proxy::AppState>>,
         AxPath(name): AxPath<String>,
+        Query(q): Query<std::collections::HashMap<String, String>>,
     ) -> axum::response::Response {
         if name != "pi" {
             return error(
@@ -862,6 +887,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 format!("harness '{name}' does not support connect"),
             );
         }
+        let dry_run = parse_dry_run(&q);
         let (config, _) = match load_or_create_config() {
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -881,6 +907,21 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 format!("pi config dir does not exist at {}", config_dir.display()),
             );
         }
+        let models = state_models(&state);
+        if dry_run {
+            let keys = match list_active_pi_keys(&state) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            };
+            return axum::Json(harness_connect::plan_connect(
+                &config_dir,
+                models.len(),
+                &keys,
+            ))
+            .into_response();
+        }
         if let Err(e) = revoke_pi_keys(&state) {
             return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
@@ -888,7 +929,6 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let models = state_models(&state);
         match harness_connect::write_pi_connection(
             config_dir,
             state.base_url.clone(),
@@ -897,11 +937,10 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             models,
             status.version,
         ) {
-            Ok(summary) => axum::Json(serde_json::json!({
-                "key_id": summary.key_id,
-                "models": summary.models.len(),
-            }))
-            .into_response(),
+            Ok(summary) => {
+                axum::Json(harness_connect::config_write_json(&summary, "minted", None))
+                    .into_response()
+            }
             Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         }
     }
@@ -909,6 +948,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
     async fn disconnect(
         State(state): State<Arc<alex_proxy::AppState>>,
         AxPath(name): AxPath<String>,
+        Query(q): Query<std::collections::HashMap<String, String>>,
     ) -> axum::response::Response {
         if name != "pi" {
             return error(
@@ -916,20 +956,97 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 format!("harness '{name}' does not support disconnect"),
             );
         }
+        let dry_run = parse_dry_run(&q);
         let (config, _) = match load_or_create_config() {
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let config_dir = harness_connect::resolve_config_dir(&config, harness_connect::pi_spec(), None);
+        let config_dir =
+            harness_connect::resolve_config_dir(&config, harness_connect::pi_spec(), None);
+        if dry_run {
+            let keys = match list_active_pi_keys(&state) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            };
+            return axum::Json(harness_connect::plan_disconnect(&config_dir, &keys)).into_response();
+        }
+        let models_path = config_dir.join("models.json");
+        let previous_models = harness_connect::read_pi_model_ids(&config_dir);
         let was_connected = match harness_connect::disconnect_pi_config(&config_dir) {
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         match revoke_pi_keys(&state) {
-            Ok(revoked) => axum::Json(serde_json::json!({
-                "revoked": revoked,
-                "was_connected": was_connected,
-            }))
+            Ok(revoked) => axum::Json(harness_connect::disconnect_summary_json(
+                &models_path,
+                if was_connected {
+                    previous_models
+                } else {
+                    Vec::new()
+                },
+                &state.base_url,
+                revoked,
+                was_connected,
+            ))
+            .into_response(),
+            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    async fn refresh_config(
+        State(state): State<Arc<alex_proxy::AppState>>,
+        AxPath(name): AxPath<String>,
+    ) -> axum::response::Response {
+        let Some(spec) = harness_connect::spec_by_name(&name) else {
+            return error(
+                axum::http::StatusCode::NOT_FOUND,
+                format!("unknown harness '{name}'"),
+            );
+        };
+        if !spec.supports_connect || name != "pi" {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("harness '{name}' does not support connect"),
+            );
+        }
+        let (config, _) = match load_or_create_config() {
+            Ok(v) => v,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
+        if !config_dir.is_dir() {
+            return error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("pi config dir does not exist at {}", config_dir.display()),
+            );
+        }
+        let existing_key = harness_connect::read_pi_api_key(&config_dir);
+        let (key_status, key_id, api_key) = if let Some(key) = existing_key {
+            ("reused", String::new(), key)
+        } else {
+            match mint_pi_key(&state) {
+                Ok((id, key)) => ("minted", id, key),
+                Err(e) => {
+                    return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            }
+        };
+        let models = state_models(&state);
+        match harness_connect::write_pi_connection(
+            config_dir,
+            state.base_url.clone(),
+            key_id,
+            api_key,
+            models,
+            None,
+        ) {
+            Ok(summary) => axum::Json(harness_connect::config_write_json(
+                &summary,
+                key_status,
+                Some(true),
+            ))
             .into_response(),
             Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         }
@@ -973,6 +1090,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         .route("/admin/harnesses", get(list))
         .route("/admin/harnesses/{name}/connect", post(connect))
         .route("/admin/harnesses/{name}/disconnect", post(disconnect))
+        .route("/admin/harnesses/{name}/refresh-config", post(refresh_config))
         .route("/admin/harnesses/{name}/override", put(put_override))
         .route_layer(axum::middleware::from_fn_with_state(
             local_key,
@@ -3584,20 +3702,137 @@ mod tests {
         let state = test_state("router-connect-state");
         let app = harness_admin_router(state.clone(), "alx-local".into());
 
+        let models_path = config_dir.join("models.json");
+        assert!(!models_path.exists());
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/pi/connect?dry_run=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let plan = body["plan"].as_array().unwrap();
+        assert!(!plan.is_empty());
+        assert!(plan.iter().any(|s| s["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("add provider 'alexandria'")));
+        assert!(plan
+            .iter()
+            .any(|s| s["detail"].as_str() == Some("mint harness key")));
+        assert!(!models_path.exists());
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
+
         let (status, body) =
-            router_json(app, Method::POST, "/admin/harnesses/pi/connect", None).await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+            router_json(app.clone(), Method::POST, "/admin/harnesses/pi/connect", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
-        assert!(body["models"].as_u64().unwrap() > 0);
-        let models_path = config_dir.join("models.json");
+        assert_eq!(body["key"], "minted");
+        assert!(body["models_total"].as_u64().unwrap() > 0);
+        assert!(body["path"].as_str().unwrap().ends_with("models.json"));
+        assert!(body["base_url"].as_str().is_some());
+        assert!(body["added"].as_array().unwrap().len() > 0);
+        assert_eq!(body["removed"].as_array().unwrap().len(), 0);
         let models: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(models_path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
         assert!(models["providers"]["alexandria"].is_object());
+        let written_ids: Vec<&str> = models["providers"]["alexandria"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(written_ids.iter().all(|id| id.starts_with("alex/")));
+        assert!(written_ids.iter().any(|id| *id == "alex/claude-fable-5" || id.ends_with("claude-opus-4-8")));
+        let saved_key = models["providers"]["alexandria"]["apiKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before_disconnect = std::fs::read_to_string(&models_path).unwrap();
         let keys = state.store.list_run_keys(false).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0]["kind"], "harness");
         assert_eq!(keys[0]["label"], "pi");
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/pi/disconnect?dry_run=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let dplan = body["plan"].as_array().unwrap();
+        assert!(dplan.iter().any(|s| s["detail"].as_str() == Some("remove provider block")));
+        assert!(dplan.iter().any(|s| s["detail"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("revoke harness key")));
+        assert_eq!(std::fs::read_to_string(&models_path).unwrap(), before_disconnect);
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/pi/refresh-config",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["refreshed"], true);
+        assert_eq!(body["key"], "reused");
+        assert!(body["models_total"].as_u64().unwrap() > 0);
+        assert_eq!(body["added"].as_array().unwrap().len(), 0);
+        assert_eq!(body["removed"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body["unchanged"].as_u64().unwrap(),
+            body["models_total"].as_u64().unwrap()
+        );
+        let refreshed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        assert_eq!(
+            refreshed["providers"]["alexandria"]["apiKey"].as_str().unwrap(),
+            saved_key
+        );
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/pi/disconnect",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["was_connected"], true);
+        assert_eq!(body["revoked"], 1);
+        assert!(body["path"].as_str().unwrap().ends_with("models.json"));
+        assert!(body["removed"].as_array().unwrap().len() > 0);
+        assert_eq!(body["key"], "revoked");
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/nope/refresh-config",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("unknown harness"));
+
+        let (status, body) = router_json(
+            app,
+            Method::POST,
+            "/admin/harnesses/claude/refresh-config",
+            None,
+        )
+        .await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("does not support connect"));
     }
 
     #[test]

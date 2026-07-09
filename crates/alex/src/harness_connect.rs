@@ -128,6 +128,10 @@ pub(crate) struct PiConnectSummary {
     pub(crate) models: Vec<String>,
     pub(crate) config_path: PathBuf,
     pub(crate) version: Option<String>,
+    pub(crate) base_url: String,
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
+    pub(crate) unchanged: usize,
 }
 
 #[derive(Debug)]
@@ -374,14 +378,187 @@ pub(crate) fn write_pi_connection(
     models: Vec<String>,
     version: Option<String>,
 ) -> Result<PiConnectSummary> {
+    let models = short_alex_model_ids(models);
     let models_path = config_dir.join("models.json");
+    let before = read_pi_model_ids(&config_dir);
     upsert_pi_provider(&models_path, &base_url, &api_key, &models)?;
+    let (added, removed, unchanged) = model_id_diff(&before, &models);
     Ok(PiConnectSummary {
         key_id,
         models,
         config_path: models_path,
         version,
+        base_url,
+        added,
+        removed,
+        unchanged,
     })
+}
+
+/// Prefix bare catalog ids as `alex/<model>` for pi models.json.
+/// Bare ids still route via PASSTHROUGH stripping; existing bare configs keep working.
+pub(crate) fn short_alex_model_ids(models: Vec<String>) -> Vec<String> {
+    models
+        .into_iter()
+        .map(|id| {
+            if id.starts_with("alex/") {
+                id
+            } else if let Some(rest) = id.strip_prefix("alexandria/") {
+                format!("alex/{rest}")
+            } else if let Some(rest) = id.strip_prefix("cove/") {
+                format!("alex/{rest}")
+            } else {
+                format!("alex/{id}")
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn read_pi_api_key(config_dir: &Path) -> Option<String> {
+    read_pi_provider(config_dir)?["apiKey"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+pub(crate) fn read_pi_model_ids(config_dir: &Path) -> Vec<String> {
+    let Some(provider) = read_pi_provider(config_dir) else {
+        return Vec::new();
+    };
+    provider["models"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["id"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_pi_provider(config_dir: &Path) -> Option<Value> {
+    let path = config_dir.join("models.json");
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value["providers"][PROVIDER_NAME].as_object().map(|o| Value::Object(o.clone()))
+}
+
+pub(crate) fn model_id_diff(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>, usize) {
+    let before_set: HashSet<&str> = before.iter().map(String::as_str).collect();
+    let after_set: HashSet<&str> = after.iter().map(String::as_str).collect();
+    let mut added: Vec<String> = after_set
+        .difference(&before_set)
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut removed: Vec<String> = before_set
+        .difference(&after_set)
+        .map(|s| (*s).to_string())
+        .collect();
+    added.sort();
+    removed.sort();
+    let unchanged = before_set.intersection(&after_set).count();
+    (added, removed, unchanged)
+}
+
+pub(crate) fn config_write_json(
+    summary: &PiConnectSummary,
+    key_status: &str,
+    refreshed: Option<bool>,
+) -> Value {
+    let mut body = json!({
+        "path": summary.config_path.display().to_string(),
+        "models_total": summary.models.len(),
+        "added": summary.added,
+        "removed": summary.removed,
+        "unchanged": summary.unchanged,
+        "key": key_status,
+        "base_url": summary.base_url,
+    });
+    if let Some(refreshed) = refreshed {
+        body["refreshed"] = json!(refreshed);
+    }
+    if !summary.key_id.is_empty() {
+        body["key_id"] = json!(summary.key_id);
+    }
+    body
+}
+
+pub(crate) fn disconnect_summary_json(
+    models_path: &Path,
+    previous_models: Vec<String>,
+    base_url: &str,
+    revoked: usize,
+    was_connected: bool,
+) -> Value {
+    json!({
+        "path": models_path.display().to_string(),
+        "models_total": 0,
+        "added": [],
+        "removed": previous_models,
+        "unchanged": 0,
+        "key": if revoked > 0 { "revoked" } else { "none" },
+        "base_url": base_url,
+        "revoked": revoked,
+        "was_connected": was_connected,
+    })
+}
+
+/// Plan step for dry-run connect/disconnect. `keys` is `(id, fingerprint)`.
+pub(crate) fn plan_connect(config_dir: &Path, model_count: usize, keys: &[(String, String)]) -> Value {
+    let models_path = config_dir.join("models.json");
+    let mut plan = Vec::new();
+    let connected = models_json_connected(&models_path).unwrap_or(false);
+    let file_exists = models_path.exists();
+    let action = if !file_exists {
+        "create"
+    } else {
+        "modify"
+    };
+    let detail = if connected {
+        format!("update provider 'alexandria' with {model_count} models")
+    } else {
+        format!("add provider 'alexandria' with {model_count} models")
+    };
+    plan.push(json!({
+        "path": models_path.display().to_string(),
+        "action": action,
+        "detail": detail,
+    }));
+    for (id, fp) in keys {
+        plan.push(json!({
+            "path": id,
+            "action": "delete",
+            "detail": format!("revoke harness key {fp}"),
+        }));
+    }
+    plan.push(json!({
+        "path": "run-keys",
+        "action": "create",
+        "detail": "mint harness key",
+    }));
+    json!({"plan": plan})
+}
+
+pub(crate) fn plan_disconnect(config_dir: &Path, keys: &[(String, String)]) -> Value {
+    let models_path = config_dir.join("models.json");
+    let mut plan = Vec::new();
+    if models_json_connected(&models_path).unwrap_or(false) {
+        plan.push(json!({
+            "path": models_path.display().to_string(),
+            "action": "modify",
+            "detail": "remove provider block",
+        }));
+    }
+    for (id, fp) in keys {
+        plan.push(json!({
+            "path": id,
+            "action": "delete",
+            "detail": format!("revoke harness key {fp}"),
+        }));
+    }
+    json!({"plan": plan})
 }
 
 pub(crate) fn disconnect_pi_config(config_dir: &Path) -> Result<bool> {
@@ -934,13 +1111,18 @@ fn allowed_model_prefix(id: &str) -> bool {
 
 pub(crate) fn reasoning_enabled(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
-    id.contains("opus")
-        || id.contains("sonnet")
-        || id.contains("gpt-5")
-        || id.starts_with("o3")
-        || id.starts_with("o4")
-        || id.contains("grok")
-        || (id.starts_with("gemini-") && id.contains("pro"))
+    let bare = id
+        .rsplit_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(id.as_str());
+    bare.contains("opus")
+        || bare.contains("sonnet")
+        || bare.contains("fable")
+        || bare.contains("gpt-5")
+        || bare.starts_with("o3")
+        || bare.starts_with("o4")
+        || bare.contains("grok")
+        || (bare.starts_with("gemini-") && bare.contains("pro"))
 }
 
 #[cfg(test)]
@@ -963,6 +1145,34 @@ mod tests {
 
     fn model_ids() -> Vec<String> {
         vec!["claude-opus-4-8".into(), "gpt-5.5".into()]
+    }
+
+    #[test]
+    fn short_alex_model_ids_prefixes_bare_and_normalizes_long_forms() {
+        assert_eq!(
+            short_alex_model_ids(vec![
+                "claude-opus-4-8".into(),
+                "alex/gpt-5.5".into(),
+                "alexandria/grok-4.5".into(),
+                "cove/claude-fable-5".into(),
+            ]),
+            vec![
+                "alex/claude-opus-4-8",
+                "alex/gpt-5.5",
+                "alex/grok-4.5",
+                "alex/claude-fable-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_id_diff_reports_added_removed_unchanged() {
+        let before = vec!["alex/a".into(), "alex/b".into(), "alex/c".into()];
+        let after = vec!["alex/b".into(), "alex/c".into(), "alex/d".into()];
+        let (added, removed, unchanged) = model_id_diff(&before, &after);
+        assert_eq!(added, vec!["alex/d"]);
+        assert_eq!(removed, vec!["alex/a"]);
+        assert_eq!(unchanged, 2);
     }
 
     fn test_config() -> Config {

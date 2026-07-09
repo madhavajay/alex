@@ -230,16 +230,40 @@ public struct AlexandriaClient: Sendable {
         }
     }
 
-    public func connectHarness(_ name: String) async throws -> HarnessConnectResponse {
+    public func connectHarness(_ name: String) async throws -> HarnessConfigWriteResponse {
         let encoded = encodedPathComponent(name)
         let data = try await request("admin/harnesses/\(encoded)/connect", method: "POST")
-        return try JSONDecoder().decode(HarnessConnectResponse.self, from: data)
+        return try JSONDecoder().decode(HarnessConfigWriteResponse.self, from: data)
+    }
+
+    public func connectHarnessPlan(_ name: String) async throws -> HarnessPlanResponse {
+        let encoded = encodedPathComponent(name)
+        let data = try await request(
+            "admin/harnesses/\(encoded)/connect",
+            query: [URLQueryItem(name: "dry_run", value: "true")],
+            method: "POST")
+        return try JSONDecoder().decode(HarnessPlanResponse.self, from: data)
     }
 
     public func disconnectHarness(_ name: String) async throws -> HarnessDisconnectResponse {
         let encoded = encodedPathComponent(name)
         let data = try await request("admin/harnesses/\(encoded)/disconnect", method: "POST")
         return try JSONDecoder().decode(HarnessDisconnectResponse.self, from: data)
+    }
+
+    public func disconnectHarnessPlan(_ name: String) async throws -> HarnessPlanResponse {
+        let encoded = encodedPathComponent(name)
+        let data = try await request(
+            "admin/harnesses/\(encoded)/disconnect",
+            query: [URLQueryItem(name: "dry_run", value: "true")],
+            method: "POST")
+        return try JSONDecoder().decode(HarnessPlanResponse.self, from: data)
+    }
+
+    public func refreshHarnessConfig(_ name: String) async throws -> HarnessConfigWriteResponse {
+        let encoded = encodedPathComponent(name)
+        let data = try await request("admin/harnesses/\(encoded)/refresh-config", method: "POST")
+        return try JSONDecoder().decode(HarnessConfigWriteResponse.self, from: data)
     }
 
     public func setHarnessOverride(_ name: String, binary: String?, configDir: String?) async throws -> Harness {

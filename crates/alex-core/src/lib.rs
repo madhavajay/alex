@@ -85,7 +85,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("xai/", Provider::Xai),
 ];
 
-const PASSTHROUGH: &[&str] = &["cove/", "alexandria/"];
+const PASSTHROUGH: &[&str] = &["cove/", "alexandria/", "alex/"];
 
 const ALIASES: &[(&str, &str)] = &[
     ("opus-4.8", "claude-opus-4-8"),
@@ -517,6 +517,18 @@ mod tests {
         assert_eq!(
             route_model("alexandria/gpt-5.5"),
             (Some(Provider::Openai), "gpt-5.5".to_string())
+        );
+        assert_eq!(
+            route_model("alex/gpt-5.5"),
+            (Some(Provider::Openai), "gpt-5.5".to_string())
+        );
+        assert_eq!(
+            route_model("alex/claude-fable-5"),
+            (Some(Provider::Anthropic), "claude-fable-5".to_string())
+        );
+        assert_eq!(
+            route_model("alex/grok-4.5"),
+            (Some(Provider::Xai), "grok-4.5".to_string())
         );
         assert_eq!(
             route_model("cove/claude-opus-4-8"),

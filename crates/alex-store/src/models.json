@@ -1,5 +1,12 @@
 [
   {
+    "model": "claude-fable-5",
+    "input_per_m": 10.0,
+    "cached_input_per_m": 1.0,
+    "cache_creation_per_m": 12.5,
+    "output_per_m": 50.0
+  },
+  {
     "model": "claude-opus-4-8",
     "input_per_m": 5.0,
     "cached_input_per_m": 0.5,
@@ -7,7 +14,28 @@
     "output_per_m": 25.0
   },
   {
+    "model": "claude-opus-4-7",
+    "input_per_m": 5.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 6.25,
+    "output_per_m": 25.0
+  },
+  {
+    "model": "claude-opus-4-6",
+    "input_per_m": 5.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 6.25,
+    "output_per_m": 25.0
+  },
+  {
     "model": "claude-sonnet-5",
+    "input_per_m": 3.0,
+    "cached_input_per_m": 0.3,
+    "cache_creation_per_m": 3.75,
+    "output_per_m": 15.0
+  },
+  {
+    "model": "claude-sonnet-4-6",
     "input_per_m": 3.0,
     "cached_input_per_m": 0.3,
     "cache_creation_per_m": 3.75,
@@ -26,6 +54,13 @@
     "cached_input_per_m": 0.125,
     "cache_creation_per_m": 0.0,
     "output_per_m": 10.0
+  },
+  {
+    "model": "grok-4.5",
+    "input_per_m": 2.0,
+    "cached_input_per_m": 0.5,
+    "cache_creation_per_m": 0.0,
+    "output_per_m": 6.0
   },
   {
     "model": "grok-code-fast-1",
