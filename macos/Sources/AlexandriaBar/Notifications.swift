@@ -13,7 +13,9 @@ final class AlertNotifier {
 
     func requestAuthorization() {
         guard enabled, UserDefaults.standard.object(forKey: "notifyEnabled") as? Bool ?? true else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) {
+            @Sendable _, _ in
+        }
     }
 
     func sync(alerts: [StoreAlert]) {
