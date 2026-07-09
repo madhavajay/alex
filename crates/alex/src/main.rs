@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alex_auth::{import_all, now_ms, Vault};
+use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
 use alex_store::Store;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -207,9 +207,23 @@ enum AuthCommand {
     Import {
         #[arg(default_value = "all")]
         source: String,
+        #[arg(long, default_value = "default")]
+        name: String,
+        #[arg(long)]
+        force: bool,
     },
     /// Run an OAuth login flow from the terminal (claude|codex|grok|gemini); no arg opens a picker
-    Login { provider: Option<String> },
+    Login {
+        provider: Option<String>,
+        #[arg(long, default_value = "default")]
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Pause an account so selection skips it
+    Pause { provider: String, name: String },
+    /// Resume a paused account
+    Resume { provider: String, name: String },
     /// Register a Google AI Studio API key for Gemini (from aistudio.google.com/apikey)
     GeminiKey {
         /// The API key; omit to read from the GEMINI_API_KEY env var
@@ -417,6 +431,8 @@ struct Config {
     update_check_hours: u64,
     #[serde(default)]
     harness_overrides: BTreeMap<String, HarnessOverride>,
+    #[serde(default)]
+    account_policy: BTreeMap<String, AccountPolicy>,
 }
 
 #[derive(Clone)]
@@ -578,6 +594,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         trace_row_retention_days: 0,
         update_check_hours: default_update_check_hours(),
         harness_overrides: BTreeMap::new(),
+        account_policy: BTreeMap::new(),
     };
     std::fs::write(&path, toml::to_string_pretty(&config)?)?;
     #[cfg(unix)]
@@ -590,7 +607,37 @@ fn load_or_create_config() -> Result<(Config, bool)> {
 }
 
 fn open_vault(config: &Config) -> Result<Vault> {
-    Vault::open(config.data_dir.join("accounts"))
+    let vault = Vault::open(config.data_dir.join("accounts"))?;
+    let mut policies = Vec::new();
+    for (k, v) in &config.account_policy {
+        let p = match k.as_str() {
+            "claude" | "anthropic" => alex_core::Provider::Anthropic,
+            "codex" | "openai" | "chatgpt" => alex_core::Provider::Openai,
+            "grok" | "xai" => alex_core::Provider::Xai,
+            "gemini" | "google" => alex_core::Provider::Gemini,
+            _ => continue,
+        };
+        policies.push((p, v.clone()));
+    }
+    vault.set_policies_blocking(policies);
+    Ok(vault)
+}
+
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.len() > 32 || name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        anyhow::bail!("account name must match [a-z0-9_-]{{1,32}}");
+    }
+    Ok(())
+}
+
+fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
+    Ok(match s {
+        "claude" | "anthropic" => alex_core::Provider::Anthropic,
+        "codex" | "openai" | "chatgpt" => alex_core::Provider::Openai,
+        "grok" | "xai" => alex_core::Provider::Xai,
+        "gemini" | "google" => alex_core::Provider::Gemini,
+        other => anyhow::bail!("unknown provider '{other}'"),
+    })
 }
 
 struct DarioGlue(Arc<dario::DarioSupervisor>);
@@ -1358,9 +1405,51 @@ async fn main() -> Result<()> {
             }
         }
         Command::Auth { command } => match command {
-            AuthCommand::Import { source } => {
+            AuthCommand::Import { source, name, force } => {
+                validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
-                for outcome in import_all(&vault, &source).await? {
+                let provider = if source != "all" { Some(provider_from_cli(&source)?) } else { None };
+                if !force {
+                    if let Some(p) = provider {
+                        if vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+                    } else if name != "default" {
+                        anyhow::bail!("--name with source=all is ambiguous; import one provider at a time");
+                    }
+                }
+                let pre_default = if name != "default" {
+                    if let Some(p) = provider {
+                        vault.list().await.into_iter().find(|a| a.id == named_account_id(p, "oauth", "default"))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut outcomes = import_all(&vault, &source).await?;
+                if name != "default" {
+                    let imported: Vec<String> = outcomes.iter().flat_map(|o| o.imported.clone()).collect();
+                    for id in imported {
+                        if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
+                            a.name = name.clone();
+                            a.id = named_account_id(a.provider, &a.kind, &name);
+                            a.path = None;
+                            vault.upsert(a).await?;
+                        }
+                    }
+                    for o in &mut outcomes {
+                        for id in &mut o.imported {
+                            if let Some(a) = vault.list().await.into_iter().find(|a| a.name == name && a.provider.as_str() == provider.map(|p| p.as_str()).unwrap_or("")) {
+                                *id = a.id;
+                            }
+                        }
+                    }
+                    if let Some(a) = pre_default {
+                        vault.upsert(a).await?;
+                    } else if let Some(p) = provider {
+                        let _ = vault.remove(&named_account_id(p, "oauth", "default")).await?;
+                    }
+                }
+                for outcome in outcomes {
                     if outcome.imported.is_empty() {
                         println!(
                             "{:<8} skipped ({})",
@@ -1376,8 +1465,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            AuthCommand::Login { provider } => {
+            AuthCommand::Login { provider, name, force } => {
                 use std::io::IsTerminal;
+                validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
                 let provider = match provider {
                     Some(p) => p,
@@ -1393,8 +1483,37 @@ async fn main() -> Result<()> {
                         alex_auth::login::PROVIDERS.join(", ")
                     ),
                 };
+                let p = provider_from_cli(&provider)?;
+                if !force && vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+                let default_id = named_account_id(p, "oauth", "default");
+                let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
                 let id = alex_auth::login::login(&vault, &provider).await?;
-                println!("saved account: {id}");
+                if name != "default" {
+                    if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
+                        a.name = name.clone();
+                        a.id = named_account_id(a.provider, &a.kind, &name);
+                        a.path = None;
+                        vault.upsert(a).await?;
+                    }
+                    if let Some(a) = pre_default {
+                        vault.upsert(a).await?;
+                    } else {
+                        let _ = vault.remove(&default_id).await?;
+                    }
+                }
+                println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
+            }
+            AuthCommand::Pause { provider, name } => {
+                validate_account_name(&name)?;
+                let vault = open_vault(&config)?;
+                vault.pause(provider_from_cli(&provider)?, &name, true).await?;
+                println!("paused {provider}/{name}");
+            }
+            AuthCommand::Resume { provider, name } => {
+                validate_account_name(&name)?;
+                let vault = open_vault(&config)?;
+                vault.pause(provider_from_cli(&provider)?, &name, false).await?;
+                println!("resumed {provider}/{name}");
             }
             AuthCommand::GeminiKey { key } => {
                 let key = key
@@ -1405,9 +1524,12 @@ async fn main() -> Result<()> {
                     )?;
                 let vault = open_vault(&config)?;
                 let account = alex_auth::Account {
-                    id: "gemini-api-key".into(),
+                    id: named_account_id(alex_core::Provider::Gemini, "api_key", "default"),
                     provider: alex_core::Provider::Gemini,
                     kind: "api_key".into(),
+                    name: "default".into(),
+                    description: None,
+                    paused: false,
                     label: Some("gemini (AI Studio key)".into()),
                     access_token: None,
                     refresh_token: None,
@@ -1418,6 +1540,7 @@ async fn main() -> Result<()> {
                     account_meta: serde_json::Value::Null,
                     cooldown_until_ms: None,
                     status: "active".into(),
+                    path: None,
                 };
                 vault.upsert(account).await?;
                 println!(
@@ -1434,13 +1557,13 @@ async fn main() -> Result<()> {
                 for a in accounts {
                     let (dot, expiry) = account_indicators(&a);
                     println!(
-                        "{dot} {} {} {} {} {}  {}",
-                        ui::pad_right(&a.id, 18),
+                        "{dot} {} {} {} {} {} {}",
                         ui::pad_right(&ui::amber(a.provider.as_str()), 10),
+                        ui::pad_right(&a.name, 12),
                         ui::pad_right(&a.kind, 8),
-                        ui::pad_right(&a.status, 10),
+                        ui::pad_right(if a.paused { "paused" } else { &a.status }, 10),
                         ui::pad_right(&expiry, 20),
-                        ui::sand(&a.label.unwrap_or_default())
+                        a.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
                     );
                 }
             }
@@ -3454,6 +3577,7 @@ mod tests {
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             harness_overrides: BTreeMap::new(),
+            account_policy: BTreeMap::new(),
         }
     }
 
@@ -3565,6 +3689,7 @@ mod tests {
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             harness_overrides: BTreeMap::new(),
+            account_policy: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();

@@ -1198,6 +1198,7 @@ mod tests {
             trace_row_retention_days: 0,
             update_check_hours: crate::default_update_check_hours(),
             harness_overrides: BTreeMap::new(),
+            account_policy: BTreeMap::new(),
         }
     }
 

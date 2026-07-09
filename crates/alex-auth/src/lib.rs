@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alex_core::Provider;
@@ -45,6 +45,12 @@ pub struct Account {
     pub id: String,
     pub provider: Provider,
     pub kind: String,
+    #[serde(default = "default_account_name")]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -65,6 +71,12 @@ pub struct Account {
     pub cooldown_until_ms: Option<i64>,
     #[serde(default = "default_status")]
     pub status: String,
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
+}
+
+fn default_account_name() -> String {
+    "default".to_string()
 }
 
 fn default_status() -> String {
@@ -96,6 +108,37 @@ fn oauth_rank(account: &Account, prefer_oauth: bool) -> u8 {
     }
 }
 
+fn policy_rank(policy: &AccountPolicy, name: &str) -> usize {
+    policy.order.iter().position(|n| n == name).unwrap_or(usize::MAX / 2)
+}
+
+fn utilization_pct(account: &Account) -> Option<u8> {
+    account.account_meta
+        .get("rate_limit_pct")
+        .or_else(|| account.account_meta.get("utilization_pct"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(100) as u8)
+}
+
+fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oauth: bool, rr: usize) {
+    match policy.mode {
+        AccountPolicyMode::RoundRobin => {
+            let _ = rr;
+            accounts.sort_by_key(|a| (oauth_rank(a, prefer_oauth), policy_rank(policy, &a.name), a.name.clone(), a.id.clone()));
+        }
+        AccountPolicyMode::Threshold => {
+            let threshold = policy.threshold_pct.unwrap_or(80);
+            accounts.sort_by_key(|a| {
+                let over = utilization_pct(a).map(|p| p >= threshold).unwrap_or(false);
+                (oauth_rank(a, prefer_oauth), over, policy_rank(policy, &a.name), a.name.clone(), a.id.clone())
+            });
+        }
+        AccountPolicyMode::Priority => {
+            accounts.sort_by_key(|a| (oauth_rank(a, prefer_oauth), policy_rank(policy, &a.name), a.name.clone(), a.id.clone()));
+        }
+    }
+}
+
 pub fn rfc3339_to_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
@@ -111,11 +154,34 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
     v.get("exp")?.as_i64().map(|s| s * 1000)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountPolicyMode {
+    Priority,
+    RoundRobin,
+    Threshold,
+}
+
+impl Default for AccountPolicyMode {
+    fn default() -> Self { Self::Priority }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountPolicy {
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default)]
+    pub mode: AccountPolicyMode,
+    #[serde(default)]
+    pub threshold_pct: Option<u8>,
+}
+
 pub struct Vault {
     dir: PathBuf,
     accounts: RwLock<HashMap<String, Account>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rr_counter: AtomicUsize,
+    policies: StdRwLock<Vec<(Provider, AccountPolicy)>>,
     http: reqwest::Client,
 }
 
@@ -130,7 +196,11 @@ impl Vault {
                     .map_err(anyhow::Error::from)
                     .and_then(|s| serde_json::from_str::<Account>(&s).map_err(Into::into))
                 {
-                    Ok(acct) => {
+                    Ok(mut acct) => {
+                        if acct.name.is_empty() {
+                            acct.name = "default".into();
+                        }
+                        acct.path = Some(path.clone());
                         accounts.insert(acct.id.clone(), acct);
                     }
                     Err(e) => tracing::warn!("skipping unreadable account file {path:?}: {e}"),
@@ -142,14 +212,34 @@ impl Vault {
             accounts: RwLock::new(accounts),
             locks: Mutex::new(HashMap::new()),
             rr_counter: AtomicUsize::new(0),
+            policies: StdRwLock::new(Vec::new()),
             http: reqwest::Client::new(),
         })
     }
 
     pub async fn list(&self) -> Vec<Account> {
         let mut v: Vec<Account> = self.accounts.read().await.values().cloned().collect();
-        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v.sort_by(|a, b| (a.provider.as_str(), a.name.as_str(), a.kind.as_str()).cmp(&(b.provider.as_str(), b.name.as_str(), b.kind.as_str())));
         v
+    }
+
+    pub fn set_policies_blocking(&self, policies: Vec<(Provider, AccountPolicy)>) {
+        *self.policies.write().expect("policy lock poisoned") = policies;
+    }
+
+    pub async fn set_policies(&self, policies: Vec<(Provider, AccountPolicy)>) {
+        self.set_policies_blocking(policies);
+    }
+
+    pub async fn pause(&self, provider: Provider, name: &str, paused: bool) -> Result<()> {
+        let account = self.accounts.read().await.values().find(|a| a.provider == provider && a.name == name).cloned().ok_or_else(|| anyhow!("unknown {} account '{name}'", provider.as_str()))?;
+        let mut account = account;
+        account.paused = paused;
+        self.upsert(account).await
+    }
+
+    pub async fn has_account_name(&self, provider: Provider, name: &str) -> bool {
+        self.accounts.read().await.values().any(|a| a.provider == provider && a.name == name)
     }
 
     pub async fn upsert(&self, account: Account) -> Result<()> {
@@ -176,10 +266,11 @@ impl Vault {
             let map = self.accounts.read().await;
             let mut v: Vec<Account> = map
                 .values()
-                .filter(|a| a.provider == provider && a.status == "active")
+                .filter(|a| a.provider == provider && a.status == "active" && !a.paused)
                 .cloned()
                 .collect();
-            v.sort_by_key(|a| (oauth_rank(a, prefer_oauth), a.id.clone()));
+            let policy = self.policies.read().expect("policy lock poisoned").iter().find(|(p, _)| *p == provider).map(|(_, p)| p.clone()).unwrap_or_default();
+            sort_by_policy(&mut v, &policy, prefer_oauth, self.rr_counter.load(Ordering::Relaxed));
             v
         };
         if candidates.is_empty() {
@@ -205,13 +296,18 @@ impl Vault {
             );
             account
         } else {
-            let top_rank = oauth_rank(ready[0], prefer_oauth);
-            let group: Vec<&&Account> = ready
-                .iter()
-                .filter(|a| oauth_rank(a, prefer_oauth) == top_rank)
-                .collect();
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % group.len();
-            (*group[idx]).clone()
+            let policy_mode = self.policies.read().expect("policy lock poisoned").iter().find(|(p, _)| *p == provider).map(|(_, p)| p.mode.clone()).unwrap_or_default();
+            if policy_mode == AccountPolicyMode::RoundRobin {
+                let top_rank = oauth_rank(ready[0], prefer_oauth);
+                let group: Vec<&&Account> = ready
+                    .iter()
+                    .filter(|a| oauth_rank(a, prefer_oauth) == top_rank)
+                    .collect();
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % group.len();
+                (*group[idx]).clone()
+            } else {
+                ready[0].clone()
+            }
         };
         if account.needs_refresh() {
             return self.refresh(&account.id, false).await;
@@ -409,8 +505,20 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<RefreshedTokens
     serde_json::from_str(&text).context("bad token response")
 }
 
+pub fn named_account_id(provider: Provider, kind: &str, name: &str) -> String {
+    if name == "default" {
+        format!("{}-{kind}", provider.as_str())
+    } else {
+        format!("{}-{kind}-{name}", provider.as_str())
+    }
+}
+
+fn account_path(dir: &Path, account: &Account) -> PathBuf {
+    account.path.clone().unwrap_or_else(|| dir.join(format!("{}.json", account.id)))
+}
+
 fn write_account_file(dir: &Path, account: &Account) -> Result<()> {
-    let path = dir.join(format!("{}.json", account.id));
+    let path = account_path(dir, account);
     let data = serde_json::to_string_pretty(account)?;
     std::fs::write(&path, data)?;
     #[cfg(unix)]
@@ -477,9 +585,12 @@ async fn import_claude(vault: &Vault) -> ImportOutcome {
         return outcome;
     };
     let account = Account {
-        id: "anthropic-oauth".into(),
+        id: named_account_id(Provider::Anthropic, "oauth", "default"),
         provider: Provider::Anthropic,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: oauth["subscriptionType"]
             .as_str()
             .map(|s| format!("claude-code ({s})")),
@@ -492,6 +603,7 @@ async fn import_claude(vault: &Vault) -> ImportOutcome {
         account_meta: json!({"scopes": oauth["scopes"].clone()}),
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     match vault.upsert(account).await {
         Ok(()) => outcome.imported.push("anthropic-oauth".into()),
@@ -533,9 +645,12 @@ async fn import_codex(vault: &Vault) -> ImportOutcome {
     };
     if let Some(access) = v["tokens"]["access_token"].as_str() {
         let account = Account {
-            id: "openai-oauth".into(),
+            id: named_account_id(Provider::Openai, "oauth", "default"),
             provider: Provider::Openai,
             kind: "oauth".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
             label: Some("codex (chatgpt)".into()),
             access_token: Some(access.to_string()),
             refresh_token: v["tokens"]["refresh_token"].as_str().map(String::from),
@@ -546,6 +661,7 @@ async fn import_codex(vault: &Vault) -> ImportOutcome {
             account_meta: json!({"account_id": v["tokens"]["account_id"].clone()}),
             cooldown_until_ms: None,
             status: "active".into(),
+            path: None,
         };
         match vault.upsert(account).await {
             Ok(()) => outcome.imported.push("openai-oauth".into()),
@@ -554,9 +670,12 @@ async fn import_codex(vault: &Vault) -> ImportOutcome {
     }
     if let Some(key) = v["OPENAI_API_KEY"].as_str() {
         let account = Account {
-            id: "openai-api-key".into(),
+            id: named_account_id(Provider::Openai, "api_key", "default"),
             provider: Provider::Openai,
             kind: "api_key".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
             label: Some("codex (api key)".into()),
             access_token: None,
             refresh_token: None,
@@ -567,6 +686,7 @@ async fn import_codex(vault: &Vault) -> ImportOutcome {
             account_meta: Value::Null,
             cooldown_until_ms: None,
             status: "active".into(),
+            path: None,
         };
         match vault.upsert(account).await {
             Ok(()) => outcome.imported.push("openai-api-key".into()),
@@ -599,9 +719,12 @@ async fn import_gemini(vault: &Vault) -> ImportOutcome {
         return outcome;
     };
     let account = Account {
-        id: "gemini-oauth".into(),
+        id: named_account_id(Provider::Gemini, "oauth", "default"),
         provider: Provider::Gemini,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some("gemini-cli".into()),
         access_token: Some(access.to_string()),
         refresh_token: v["refresh_token"].as_str().map(String::from),
@@ -612,6 +735,7 @@ async fn import_gemini(vault: &Vault) -> ImportOutcome {
         account_meta: Value::Null,
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     match vault.upsert(account).await {
         Ok(()) => outcome.imported.push("gemini-oauth".into()),
@@ -669,6 +793,9 @@ pub fn grok_accounts_from_json(raw: &str) -> Vec<Account> {
             id,
             provider: Provider::Xai,
             kind: "oauth".into(),
+            name: if idx == 0 { "default".into() } else { format!("{}", idx + 1) },
+            description: None,
+            paused: false,
             label: Some(format!("grok ({email})")),
             access_token: Some(key.to_string()),
             refresh_token: entry["refresh_token"].as_str().map(String::from),
@@ -683,6 +810,7 @@ pub fn grok_accounts_from_json(raw: &str) -> Vec<Account> {
             }),
             cooldown_until_ms: None,
             status: "active".into(),
+            path: None,
         });
     }
     accounts
@@ -705,6 +833,9 @@ mod tests {
             id: id.into(),
             provider,
             kind: "api_key".into(),
+            name: id.rsplit('-').next().unwrap_or("default").into(),
+            description: None,
+            paused: false,
             label: None,
             access_token: None,
             refresh_token: None,
@@ -715,6 +846,7 @@ mod tests {
             account_meta: Value::Null,
             cooldown_until_ms: None,
             status: "active".into(),
+            path: None,
         }
     }
 
@@ -799,6 +931,7 @@ mod tests {
             .upsert(api_key_account("openai-key-b", Provider::Openai))
             .await
             .unwrap();
+        vault.set_policies(vec![(Provider::Openai, AccountPolicy { order: vec![], mode: AccountPolicyMode::RoundRobin, threshold_pct: None })]).await;
 
         let mut picks = Vec::new();
         for _ in 0..4 {
@@ -826,6 +959,56 @@ mod tests {
         let degraded = vault.account_for(Provider::Openai, false).await.unwrap();
         assert_eq!(degraded.id, "openai-key-a");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn vault_loads_multi_and_legacy_names() {
+        let dir = temp_dir("multi");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut legacy = api_key_account("openai-oauth", Provider::Openai);
+        legacy.kind = "oauth".into();
+        legacy.name = "default".into();
+        std::fs::write(dir.join("openai-oauth.json"), serde_json::to_string(&legacy).unwrap()).unwrap();
+        let mut work = api_key_account("openai-oauth-work", Provider::Openai);
+        work.kind = "oauth".into();
+        work.name = "work".into();
+        std::fs::write(dir.join("openai-oauth-work.json"), serde_json::to_string(&work).unwrap()).unwrap();
+        let vault = Vault::open(dir.clone()).unwrap();
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|a| a.name == "default" && a.path.as_ref().unwrap().ends_with("openai-oauth.json")));
+        assert!(accounts.iter().any(|a| a.name == "work" && a.path.as_ref().unwrap().ends_with("openai-oauth-work.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn policy_selection_priority_round_robin_threshold() {
+        let dir = temp_dir("policy");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let mut work = api_key_account("openai-api_key-work", Provider::Openai);
+        work.name = "work".into();
+        let mut personal = api_key_account("openai-api_key-personal", Provider::Openai);
+        personal.name = "personal".into();
+        vault.upsert(work).await.unwrap();
+        vault.upsert(personal).await.unwrap();
+        vault.set_policies(vec![(Provider::Openai, AccountPolicy { order: vec!["work".into(), "personal".into()], mode: AccountPolicyMode::Priority, threshold_pct: None })]).await;
+        assert_eq!(vault.account_for(Provider::Openai, false).await.unwrap().name, "work");
+        vault.pause(Provider::Openai, "work", true).await.unwrap();
+        assert_eq!(vault.account_for(Provider::Openai, false).await.unwrap().name, "personal");
+        vault.pause(Provider::Openai, "work", false).await.unwrap();
+        vault.mark_cooldown("openai-api_key-work", now_ms() + 60_000).await.unwrap();
+        assert_eq!(vault.account_for(Provider::Openai, false).await.unwrap().name, "personal");
+        vault.mark_cooldown("openai-api_key-work", now_ms() - 1).await.unwrap();
+        vault.set_policies(vec![(Provider::Openai, AccountPolicy { order: vec!["work".into(), "personal".into()], mode: AccountPolicyMode::RoundRobin, threshold_pct: None })]).await;
+        let a = vault.account_for(Provider::Openai, false).await.unwrap().name;
+        let b = vault.account_for(Provider::Openai, false).await.unwrap().name;
+        assert_ne!(a, b);
+        let mut over = vault.list().await.into_iter().find(|a| a.name == "work").unwrap();
+        over.account_meta = json!({"rate_limit_pct": 90});
+        vault.upsert(over).await.unwrap();
+        vault.set_policies(vec![(Provider::Openai, AccountPolicy { order: vec!["work".into(), "personal".into()], mode: AccountPolicyMode::Threshold, threshold_pct: Some(80) })]).await;
+        assert_eq!(vault.account_for(Provider::Openai, false).await.unwrap().name, "personal");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

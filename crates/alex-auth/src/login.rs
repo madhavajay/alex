@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    import_grok, jwt_exp_ms, now_ms, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
+    import_grok, jwt_exp_ms, named_account_id, now_ms, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
     OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
 use alex_core::Provider;
@@ -298,12 +298,24 @@ pub(crate) async fn wait_for_loopback_callback(
 }
 
 pub async fn login(vault: &Vault, provider: &str) -> Result<String> {
+    login_named(vault, provider, "default", false).await
+}
+
+pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool) -> Result<String> {
+    let p = match provider {
+        "claude" | "anthropic" => Provider::Anthropic,
+        "codex" | "openai" | "chatgpt" => Provider::Openai,
+        "grok" | "xai" => Provider::Xai,
+        "gemini" | "google" => Provider::Gemini,
+        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
+    };
+    if !force && vault.has_account_name(p, name).await { bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
     match provider {
         "claude" | "anthropic" => login_claude(vault).await,
         "codex" | "openai" | "chatgpt" => login_codex(vault).await,
         "grok" | "xai" => login_grok(vault).await,
         "gemini" | "google" => login_gemini(vault).await,
-        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
+        _ => unreachable!(),
     }
 }
 
@@ -335,9 +347,12 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
     let account = Account {
-        id: "anthropic-oauth".into(),
+        id: named_account_id(Provider::Anthropic, "oauth", "default"),
         provider: Provider::Anthropic,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some("claude (oauth login)".into()),
         access_token: Some(tokens.access_token),
         refresh_token: tokens.refresh_token,
@@ -348,6 +363,7 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         account_meta: json!({"scopes": scopes}),
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     vault.upsert(account).await?;
     Ok("anthropic-oauth".into())
@@ -381,9 +397,12 @@ pub async fn codex_exchange(vault: &Vault, verifier: &str, code: &str) -> Result
         .and_then(chatgpt_account_id)
         .or_else(|| chatgpt_account_id(&tokens.access_token));
     let account = Account {
-        id: "openai-oauth".into(),
+        id: named_account_id(Provider::Openai, "oauth", "default"),
         provider: Provider::Openai,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some("codex (chatgpt)".into()),
         access_token: Some(tokens.access_token.clone()),
         refresh_token: tokens.refresh_token,
@@ -397,6 +416,7 @@ pub async fn codex_exchange(vault: &Vault, verifier: &str, code: &str) -> Result
         account_meta: json!({"account_id": account_id}),
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     vault.upsert(account).await?;
     Ok("openai-oauth".into())
@@ -460,9 +480,12 @@ pub async fn gemini_exchange(
         None => "gemini (oauth login)".into(),
     };
     let account = Account {
-        id: "gemini-oauth".into(),
+        id: named_account_id(Provider::Gemini, "oauth", "default"),
         provider: Provider::Gemini,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some(label),
         access_token: Some(tokens.access_token.clone()),
         refresh_token: tokens.refresh_token,
@@ -473,6 +496,7 @@ pub async fn gemini_exchange(
         account_meta: json!({"email": email}),
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     vault.upsert(account).await?;
     Ok("gemini-oauth".into())
@@ -597,9 +621,12 @@ pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result
         None => "grok (device login)".into(),
     };
     let account = Account {
-        id: "xai-oauth".into(),
+        id: named_account_id(Provider::Xai, "oauth", "default"),
         provider: Provider::Xai,
         kind: "oauth".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some(label),
         access_token: Some(tokens.access_token.clone()),
         refresh_token: tokens.refresh_token.clone(),
@@ -617,6 +644,7 @@ pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result
         }),
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     vault.upsert(account).await?;
     Ok("xai-oauth".into())

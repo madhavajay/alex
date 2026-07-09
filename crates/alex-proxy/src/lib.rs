@@ -280,9 +280,12 @@ async fn admin_auth_gemini_key(
         return error_response(StatusCode::BAD_REQUEST, "missing 'key'");
     };
     let account = Account {
-        id: "gemini-api-key".into(),
+        id: alex_auth::named_account_id(Provider::Gemini, "api_key", "default"),
         provider: Provider::Gemini,
         kind: "api_key".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
         label: Some("gemini (AI Studio key)".into()),
         access_token: None,
         refresh_token: None,
@@ -293,6 +296,7 @@ async fn admin_auth_gemini_key(
         account_meta: Value::Null,
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     };
     match state.vault.upsert(account).await {
         Ok(()) => axum::Json(json!({"saved": "gemini-api-key"})).into_response(),
@@ -1448,8 +1452,12 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
+                "name": a.name,
                 "kind": a.kind,
                 "label": a.label,
+                "description": a.description,
+                "paused": a.paused,
+                "path": a.path.map(|p| p.display().to_string()),
                 "status": a.status,
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
@@ -1474,8 +1482,11 @@ async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
+                "name": a.name,
                 "kind": a.kind,
                 "status": a.status,
+                "paused": a.paused,
+                "path": a.path.map(|p| p.display().to_string()),
                 "token_expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
                 "last_heartbeat": last,
             })
@@ -1830,6 +1841,9 @@ fn dario_account(active: &DarioActive) -> Account {
         id: format!("dario:{}", active.generation_id),
         provider: Provider::Anthropic,
         kind: "dario".into(),
+        name: active.generation_id.clone(),
+        description: None,
+        paused: false,
         label: Some("dario generational proxy".into()),
         access_token: None,
         refresh_token: None,
@@ -1840,6 +1854,7 @@ fn dario_account(active: &DarioActive) -> Account {
         account_meta: Value::Null,
         cooldown_until_ms: None,
         status: "active".into(),
+        path: None,
     }
 }
 
@@ -3008,7 +3023,11 @@ async fn proxy(
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         };
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && account.kind != "dario" {
+        let retryable_status = resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+            || resp.status().is_server_error();
+        if retryable_status && account.kind != "dario" {
             let retry_after_s = resp
                 .headers()
                 .get("retry-after")
@@ -3016,17 +3035,23 @@ async fn proxy(
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(60)
                 .clamp(1, 3600);
-            tracing::warn!(
-                account = %account.id,
-                retry_after_s,
-                "upstream returned 429; cooling account down"
-            );
-            if let Err(e) = state
-                .vault
-                .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
-                .await
-            {
+            tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
+            if let Err(e) = state.vault.mark_cooldown(&account.id, now_ms() + retry_after_s * 1000).await {
                 tracing::warn!("failed to mark cooldown: {e}");
+            }
+            if attempt == 0 {
+                match plan_upstream(&state, format, provider, &routed_model, &mut body_json, &body, &trace_id).await {
+                    Ok(p) if p.account.id != account.id => {
+                        plan = p;
+                        account = plan.account.clone();
+                        trace.account_id = Some(account.id.clone());
+                        trace.upstream_format = Some(plan.upstream_format.into());
+                        tracing::warn!(account = %account.id, "retrying once with failover account");
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err((status, msg)) => tracing::warn!(status = %status, error = %msg, "no failover account available"),
+                }
             }
         }
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -3051,6 +3076,7 @@ async fn proxy(
         break;
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
+    trace.account_id = Some(account.id.clone());
 
     let status = upstream_resp.status();
     trace.status = Some(status.as_u16() as i64);
