@@ -30,6 +30,8 @@ import Testing
         #expect(row.cost == 0.00005262)
         #expect(row.errors == 2)
         #expect(row.runId == "run-77")
+        #expect(row.durationMs == 448_932)
+        #expect(row.duration == "7m 28s")
         #expect(row.tagsSummary == "job=j1 task=sparql")
         #expect(row.kindBadge == nil)
         #expect(!row.isPingOrTest)
@@ -50,12 +52,19 @@ import Testing
         #expect(row.runId.isEmpty)
         #expect(row.tagsSummary.isEmpty)
         #expect(row.iconAsset == nil)
+        #expect(row.duration == "0s")
     }
 
     @Test func shortSessionId() {
         #expect(SessionRow.shortId("exactly-22-characters-") == "exactly-22-characters-")
         #expect(SessionRow.shortId("exactly-23-characters-x") == "exactly-23…acters-x")
         #expect(SessionRow.shortId("abcdefghijklmnopqrstuvwxyz") == "abcdefghij…stuvwxyz")
+    }
+
+    @Test func sessionDurationFormatting() {
+        #expect(SessionDuration.format(ms: 45_000) == "45s")
+        #expect(SessionDuration.format(ms: 252_000) == "4m 12s")
+        #expect(SessionDuration.format(ms: 3_780_000) == "1h 03m")
     }
 
     @Test func kindBadges() {

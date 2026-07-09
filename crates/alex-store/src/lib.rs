@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS traces (
   run_id            TEXT,
   tags_json         TEXT,
   client_ip         TEXT,
-  key_fingerprint   TEXT
+  key_fingerprint   TEXT,
+  reasoning_effort  TEXT,
+  thinking_budget   INTEGER
 );
 CREATE INDEX IF NOT EXISTS traces_session ON traces(session_id);
 CREATE INDEX IF NOT EXISTS traces_ts ON traces(ts_request_ms);
@@ -111,7 +113,7 @@ const TRACE_COLS: &str = "id, ts_request_ms, ts_response_ms, harness, client_for
      input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
      cost_usd, billing_bucket, error, session_id, resp_body_path,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
-     account_id, run_id, tags_json, client_ip, key_fingerprint";
+     account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget";
 
 fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let ts_request_ms = r.get::<_, i64>(1)?;
@@ -147,6 +149,8 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "tags_json": r.get::<_, Option<String>>(27)?,
         "client_ip": r.get::<_, Option<String>>(28)?,
         "key_fingerprint": r.get::<_, Option<String>>(29)?,
+        "reasoning_effort": r.get::<_, Option<String>>(30)?,
+        "thinking_budget": r.get::<_, Option<i64>>(31)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
     }))
 }
@@ -168,6 +172,8 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
         "tags_json TEXT",
         "client_ip TEXT",
         "key_fingerprint TEXT",
+        "reasoning_effort TEXT",
+        "thinking_budget INTEGER",
     ] {
         if let Err(e) = conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {col}")) {
             if !e.to_string().contains("duplicate column name") {
@@ -201,6 +207,7 @@ pub struct TraceFilter {
     pub status: Option<i64>,
     pub errors_only: bool,
     pub key_fingerprint: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub limit: usize,
 }
 
@@ -218,6 +225,7 @@ impl Default for TraceFilter {
             status: None,
             errors_only: false,
             key_fingerprint: None,
+            reasoning_effort: None,
             limit: DEFAULT_SEARCH_LIMIT,
         }
     }
@@ -309,8 +317,8 @@ impl Store {
                 cost_usd, billing_bucket,
                 req_body_path, upstream_req_body_path, resp_body_path,
                 req_headers_json, resp_headers_json, error, account_id,
-                run_id, tags_json, client_ip, key_fingerprint
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)"#,
+                run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)"#,
             params![
                 t.id,
                 t.ts_request_ms,
@@ -344,6 +352,8 @@ impl Store {
                 t.tags,
                 t.client_ip,
                 t.key_fingerprint,
+                t.reasoning_effort,
+                t.thinking_budget,
             ],
         )?;
         Ok(())
@@ -411,6 +421,10 @@ impl Store {
             sql.push_str(" AND key_fingerprint = ?");
             args.push(k.clone());
         }
+        if let Some(e) = &f.reasoning_effort {
+            sql.push_str(" AND reasoning_effort = ?");
+            args.push(e.clone());
+        }
         sql.push_str(" ORDER BY ts_request_ms DESC LIMIT ?");
         args.push(effective_limit(f.limit).to_string());
         let mut stmt = conn.prepare(&sql)?;
@@ -428,7 +442,8 @@ impl Store {
                     COALESCE(SUM(CASE WHEN error IS NOT NULL OR status >= 400 THEN 1 ELSE 0 END),0),
                     (SELECT t2.status FROM traces t2 WHERE t2.session_id = traces.session_id
                      ORDER BY t2.ts_request_ms DESC LIMIT 1),
-                    GROUP_CONCAT(tags_json, char(31))
+                    GROUP_CONCAT(tags_json, char(31)),
+                    GROUP_CONCAT(DISTINCT reasoning_effort)
              FROM traces WHERE session_id IS NOT NULL",
         );
         let mut args: Vec<String> = vec![];
@@ -457,6 +472,10 @@ impl Store {
                     }
                 }
             }
+            let efforts: Vec<String> = r
+                .get::<_, Option<String>>(13)?
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
             Ok(json!({
                 "session_id": r.get::<_, String>(0)?,
                 "run_id": r.get::<_, Option<String>>(1)?,
@@ -471,6 +490,7 @@ impl Store {
                 "errors": r.get::<_, i64>(10)?,
                 "last_status": r.get::<_, Option<i64>>(11)?,
                 "tags": tags,
+                "efforts": efforts,
             }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1051,6 +1071,8 @@ mod tests {
         let store = Store::open(tmpdir("search")).unwrap();
         let mut a = trace("a", 1000, Some("run-1"));
         a.key_fingerprint = Some("deadbeefdeadbeef".into());
+        a.reasoning_effort = Some("high".into());
+        a.thinking_budget = Some(16_384);
         let mut b = trace("b", 2000, Some("run-1"));
         b.status = Some(429);
         b.error = Some("rate limited".into());
@@ -1062,6 +1084,8 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert_eq!(all[0]["id"], "c");
         assert_eq!(all[0]["latency_ms"], 250);
+        assert_eq!(all[2]["reasoning_effort"], "high");
+        assert_eq!(all[2]["thinking_budget"], 16_384);
         let window = store
             .search_traces(&TraceFilter {
                 since_ms: Some(1500),
@@ -1101,6 +1125,14 @@ mod tests {
             .unwrap();
         assert_eq!(by_key.len(), 1);
         assert_eq!(by_key[0]["id"], "a");
+        let by_effort = store
+            .search_traces(&TraceFilter {
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_effort.len(), 1);
+        assert_eq!(by_effort[0]["id"], "a");
         let limited = store
             .search_traces(&TraceFilter {
                 limit: 1,
@@ -1117,12 +1149,14 @@ mod tests {
         a.session_id = Some("ses_1".into());
         a.tags = Some(r#"{"suite":"swebench"}"#.into());
         a.harness = Some("codex".into());
+        a.reasoning_effort = Some("high".into());
         let mut b = trace("b", 2000, None);
         b.session_id = Some("ses_1".into());
         b.status = Some(500);
         b.error = Some("boom".into());
         b.routed_model = Some("gpt-5.5".into());
         b.tags = Some(r#"{"case":"x1"}"#.into());
+        b.reasoning_effort = Some("minimal".into());
         let mut c = trace("c", 5000, None);
         c.session_id = Some("ses_2".into());
         let d = trace("d", 9000, None);
@@ -1145,6 +1179,14 @@ mod tests {
         assert_eq!(s1["last_status"], 500);
         assert_eq!(s1["tags"]["suite"], "swebench");
         assert_eq!(s1["tags"]["case"], "x1");
+        let efforts: Vec<String> = s1["efforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert!(efforts.contains(&"high".to_string()));
+        assert!(efforts.contains(&"minimal".to_string()));
         let models: Vec<String> = s1["models"]
             .as_array()
             .unwrap()
@@ -1506,6 +1548,8 @@ mod tests {
         assert_eq!(rows[0]["run_id"], "run-1");
         assert_eq!(rows[1]["id"], "old");
         assert_eq!(rows[1]["run_id"], Value::Null);
+        assert_eq!(rows[1]["reasoning_effort"], Value::Null);
+        assert_eq!(rows[1]["thinking_budget"], Value::Null);
     }
 }
 

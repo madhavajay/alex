@@ -17,6 +17,9 @@ import Testing
         #expect(q.status == "401")
         #expect(q.run == "r-1")
         #expect(q.session == "abc")
+        let effort = OmniQuery.parse("effort:high duration:5m")
+        #expect(effort.effort == "high")
+        #expect(effort.duration == "5m")
         #expect(q.hasTokenFilters)
         #expect(!q.isEmpty)
     }
@@ -185,13 +188,16 @@ import Testing
                 tags: ["harness": "codex", "task": "sparql-university", "job": "job-42"]),
             makeSession(
                 id: "s2", models: ["grok-code-fast-1"], harness: "codex-cli", runId: nil,
-                lastStatus: nil, tags: ["model": "gpt-5.5", "task": "algebra"]),
+                lastStatus: nil, tags: ["model": "gpt-5.5", "task": "algebra"],
+                efforts: ["minimal"]),
             makeSession(id: "s3", models: nil, harness: nil, runId: nil, lastStatus: nil),
         ]
         #expect(TagFilterDimension.harness.values(in: sessions) == ["codex", "codex-cli"])
         #expect(TagFilterDimension.task.values(in: sessions) == ["algebra", "sparql-university"])
         #expect(TagFilterDimension.job.values(in: sessions) == ["job-42"])
         #expect(TagFilterDimension.model.values(in: sessions) == ["gpt-5.5", "grok-code-fast-1"])
+        #expect(TagFilterDimension.effort.values(in: sessions) == ["minimal"])
+        #expect(TagFilterDimension.duration.values(in: sessions) == ["1m", "5m", "15m", "1h"])
         #expect(TagFilterDimension.harness.activeValue(in: OmniQuery.parse("harness:codex")) == "codex")
         #expect(TagFilterDimension.task.activeValue(in: OmniQuery.parse("job:j")) == nil)
     }
@@ -223,6 +229,26 @@ import Testing
         #expect(visible("task:algebra") == ["s-grok"])
         #expect(visible("status:200") == ["s-multi"])
         #expect(visible("status:500") == ["s-grok"])
+    }
+
+    @Test func effortAndDurationFilters() {
+        let high = makeSession(
+            id: "s-high", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            firstTsMs: 0, lastTsMs: 5 * 60_000, efforts: ["high"])
+        let old = makeSession(
+            id: "s-old", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            firstTsMs: 0, lastTsMs: 45_000)
+        #expect(OmniQuery.parse("effort:high").matches(high))
+        #expect(!OmniQuery.parse("effort:high").matches(old))
+        #expect(OmniQuery.parse("duration:5m").matches(high))
+        #expect(!OmniQuery.parse("duration:1m").matches(old))
+
+        let json = #"""
+        {"session_id":"s-high","turns":[{"trace_id":"a","ts_request_ms":0,"reasoning_effort":"high"},{"trace_id":"b","ts_request_ms":1,"reasoning_effort":null,"thinking_budget":16000}]}
+        """#
+        let turns = try! decode(json, as: TranscriptResponse.self).turns
+        #expect(OmniQuery.parse("effort:high").matches(turns[0]))
+        #expect(!OmniQuery.parse("effort:high").matches(turns[1]))
     }
 
     @Test func modelDropdownSplitsJoinedValues() {
@@ -285,38 +311,42 @@ import Testing
 
     @Test func sessionsDecoding() throws {
         let json = #"""
-        {"sessions":[{"errors":0,"first_ts_ms":1783484392318,"harness":"alexandria-ping","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1"],"run_id":null,"session_id":"auto-36237cced1dcc659","tags":{},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}]}
+        {"sessions":[{"efforts":["minimal"],"errors":0,"first_ts_ms":1783484392318,"harness":"alexandria-ping","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1"],"run_id":null,"session_id":"auto-36237cced1dcc659","tags":{},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}]}
         """#
         let sessions = try decode(json, as: TraceSessionsResponse.self).sessions
         #expect(sessions.count == 1)
         #expect(sessions[0].sessionId == "auto-36237cced1dcc659")
         #expect(sessions[0].traceCount == 3)
         #expect(sessions[0].models == ["grok-code-fast-1"])
+        #expect(sessions[0].efforts == ["minimal"])
         #expect(sessions[0].lastStatus == 200)
         #expect(sessions[0].isPingOrTest)
     }
 
     @Test func transcriptDecoding() throws {
         let json = #"""
-        {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"status":200,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
+        {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"reasoning_effort":"high","status":200,"thinking_budget":null,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"thinking_budget":16000,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
         """#
         let transcript = try decode(json, as: TranscriptResponse.self)
         #expect(transcript.sessionId == "auto-1")
         #expect(transcript.turns.count == 2)
         #expect(transcript.turns[0].assistant == "creds ok")
         #expect(transcript.turns[0].status == 200)
+        #expect(transcript.turns[0].reasoningEffort == "high")
         #expect(transcript.turns[1].error == "upstream 429")
         #expect(transcript.turns[1].model == nil)
+        #expect(transcript.turns[1].thinkingBudget == 16_000)
     }
 
     @Test func searchDecoding() throws {
         let json = #"""
-        {"scan_cap":300,"scanned":300,"traces":[{"id":"42f56581","session_id":"auto-1","status":200},{"id":"aa","session_id":null}]}
+        {"scan_cap":300,"scanned":300,"traces":[{"id":"42f56581","reasoning_effort":"minimal","session_id":"auto-1","status":200,"thinking_budget":null},{"id":"aa","session_id":null}]}
         """#
         let resp = try decode(json, as: TraceSearchResponse.self)
         #expect(resp.scanned == 300)
         #expect(resp.traces.count == 2)
         #expect(resp.traces[0].sessionId == "auto-1")
+        #expect(resp.traces[0].reasoningEffort == "minimal")
         #expect(resp.traces[1].sessionId == nil)
     }
 
@@ -396,18 +426,20 @@ import Testing
 
     private func makeSession(
         id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?,
-        tags: [String: String]? = nil, lastTsMs: Int64 = 0
+        tags: [String: String]? = nil, firstTsMs: Int64 = 0, lastTsMs: Int64 = 0,
+        efforts: [String]? = nil
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
             "run_id": runId as Any,
-            "first_ts_ms": 0,
+            "first_ts_ms": firstTsMs,
             "last_ts_ms": lastTsMs,
             "trace_count": 1,
             "models": models as Any,
             "harness": harness as Any,
             "last_status": lastStatus as Any,
             "tags": tags as Any,
+            "efforts": efforts as Any,
         ]
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(TraceSession.self, from: data)

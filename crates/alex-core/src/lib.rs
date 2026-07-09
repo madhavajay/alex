@@ -368,6 +368,8 @@ pub struct TraceRecord {
     pub tags: Option<String>,
     pub client_ip: Option<String>,
     pub key_fingerprint: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<i64>,
 }
 
 pub fn parse_trace_tags(values: &[&str]) -> Value {

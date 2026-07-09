@@ -745,6 +745,7 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
         key_fingerprint: q.get("key_fingerprint").cloned(),
+        reasoning_effort: q.get("effort").cloned(),
         limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
     }
 }
@@ -997,6 +998,8 @@ fn transcript_turn(row: &Value) -> Value {
         "status": row["status"],
         "input_tokens": row["input_tokens"],
         "output_tokens": row["output_tokens"],
+        "reasoning_effort": row["reasoning_effort"],
+        "thinking_budget": row["thinking_budget"],
         "cost_usd": row["cost_usd"],
         "error": row["error"],
         "user": user,
@@ -1021,6 +1024,13 @@ async fn traces_session_transcript(
     };
     let turns: Vec<Value> = rows.iter().take(limit).map(transcript_turn).collect();
     axum::Json(json!({"session_id": session_id, "turns": turns})).into_response()
+}
+
+fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
+    (
+        req["reasoning"]["effort"].as_str().map(String::from),
+        req["thinking"]["budget_tokens"].as_i64(),
+    )
 }
 
 fn trace_extras(req: &Value) -> Value {
@@ -1052,9 +1062,10 @@ fn trace_extras(req: &Value) -> Value {
     };
     let system_chars = system_text.as_ref().map(|s| s.chars().count());
     let system_prompt = system_text.map(|s| truncate_chars(s, 64_000));
+    let (reasoning_effort, thinking_budget) = trace_reasoning_fields(req);
     json!({
-        "reasoning_effort": req["reasoning"]["effort"],
-        "thinking_budget": req["thinking"]["budget_tokens"],
+        "reasoning_effort": reasoning_effort,
+        "thinking_budget": thinking_budget,
         "max_tokens": req["max_tokens"].as_i64().or(req["max_output_tokens"].as_i64()),
         "temperature": req["temperature"],
         "message_count": req["messages"].as_array().or(req["input"].as_array()).map(|a| a.len()),
@@ -2076,7 +2087,10 @@ async fn plan_upstream(
 
 #[cfg(test)]
 mod trace_api_tests {
-    use super::{session_from_metadata, trace_extras, transcript_turn, truncate_chars};
+    use super::{
+        session_from_metadata, trace_extras, trace_reasoning_fields, transcript_turn,
+        truncate_chars,
+    };
     use serde_json::json;
 
     #[test]
@@ -2105,6 +2119,7 @@ mod trace_api_tests {
         });
         let e = trace_extras(&anthropic);
         assert_eq!(e["thinking_budget"], 4096);
+        assert_eq!(trace_reasoning_fields(&anthropic), (None, Some(4096)));
         assert_eq!(e["max_tokens"], 100);
         assert_eq!(e["temperature"], 0.5);
         assert_eq!(e["message_count"], 1);
@@ -2118,6 +2133,10 @@ mod trace_api_tests {
         });
         let e = trace_extras(&responses);
         assert_eq!(e["reasoning_effort"], "high");
+        assert_eq!(
+            trace_reasoning_fields(&responses),
+            (Some("high".into()), None)
+        );
         assert_eq!(e["max_tokens"], 200);
         assert_eq!(e["message_count"], 2);
         assert_eq!(e["system_chars"], 3);
@@ -2136,6 +2155,7 @@ mod trace_api_tests {
             "id": "t1", "ts_request_ms": 1, "ts_response_ms": 2,
             "routed_model": "m", "status": 200,
             "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01, "error": null,
+            "reasoning_effort": "minimal", "thinking_budget": null,
             "req_body_path": "/nonexistent/x.gz", "resp_body_path": null,
             "client_format": "anthropic", "upstream_format": "anthropic",
         });
@@ -2144,6 +2164,8 @@ mod trace_api_tests {
         assert_eq!(turn["user"], serde_json::Value::Null);
         assert_eq!(turn["assistant"], serde_json::Value::Null);
         assert_eq!(turn["model"], "m");
+        assert_eq!(turn["reasoning_effort"], "minimal");
+        assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
     }
 }
 
@@ -2659,6 +2681,9 @@ async fn proxy(
             return error_response(StatusCode::BAD_REQUEST, &format!("body is not JSON: {e}"))
         }
     };
+    let (reasoning_effort, thinking_budget) = trace_reasoning_fields(&body_json);
+    trace.reasoning_effort = reasoning_effort;
+    trace.thinking_budget = thinking_budget;
 
     trace.session_id = headers
         .get("x-session-id")

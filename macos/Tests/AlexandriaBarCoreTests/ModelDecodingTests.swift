@@ -144,4 +144,26 @@ import Testing
         #expect(Format.duration(45) == "45s")
         #expect(Format.duration(90061) == "1d 1h")
     }
+
+    @Test func traceRowsDecodeEffortAndThinking() throws {
+        let sessionJson = #"""
+        {"session_id":"s1","first_ts_ms":1000,"last_ts_ms":253000,"trace_count":2,"efforts":["high","minimal"]}
+        """#
+        let session = try decode(sessionJson, as: TraceSession.self)
+        #expect(session.efforts == ["high", "minimal"])
+
+        let transcriptJson = #"""
+        {"session_id":"s1","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2000,"reasoning_effort":"high","thinking_budget":16000}]}
+        """#
+        let turn = try decode(transcriptJson, as: TranscriptResponse.self).turns[0]
+        #expect(turn.reasoningEffort == "high")
+        #expect(turn.thinkingBudget == 16_000)
+
+        let traceJson = #"""
+        {"trace":{"id":"t1","reasoning_effort":"minimal","thinking_budget":4096},"extras":null}
+        """#
+        let detail = try decode(traceJson, as: TraceDetailResponse.self).trace
+        #expect(detail.reasoningEffort == "minimal")
+        #expect(detail.thinkingBudget == 4096)
+    }
 }

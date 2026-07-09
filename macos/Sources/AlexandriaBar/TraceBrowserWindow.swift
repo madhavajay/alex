@@ -19,6 +19,7 @@ final class TraceBrowserModel {
     private var sessionsFingerprint = ""
     private var turnsFingerprint = ""
     private var rowsById: [String: SessionRow] = [:]
+    private var allTurns: [TranscriptTurn] = []
     private var selectionState = SessionSelection()
 
     var selectedSessionId: String? { selectionState.selectedId }
@@ -209,7 +210,7 @@ final class TraceBrowserModel {
     }
 
     var showsTagFilterBar: Bool {
-        sessions.contains { $0.tags?.isEmpty == false }
+        !sessions.isEmpty
     }
 
     func filterValues(_ dimension: TagFilterDimension) -> [String] {
@@ -277,6 +278,7 @@ final class TraceBrowserModel {
     }
 
     private func resetTurns() {
+        allTurns = []
         turns = []
         turnsFingerprint = ""
         inspectorTraceId = nil
@@ -461,9 +463,9 @@ final class TraceBrowserModel {
             if fingerprint != turnsFingerprint {
                 turnsFingerprint = fingerprint
                 BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
-                    turns = resp.turns
+                    allTurns = resp.turns
                 }
-                scheduleRender()
+                applyTurnFilter()
                 ensureFirstTraceDetail()
             }
         } catch is AlexandriaClient.ClientError {
@@ -476,6 +478,7 @@ final class TraceBrowserModel {
     private func queryChanged() {
         searchTask?.cancel()
         let query = parsedQuery
+        applyTurnFilter()
         guard !query.freeText.isEmpty else {
             searchSessionIds = nil
             recomputeVisible()
@@ -487,6 +490,14 @@ final class TraceBrowserModel {
             guard !Task.isCancelled else { return }
             await self?.runSearch(query)
         }
+    }
+
+    private func applyTurnFilter() {
+        let filtered = parsedQuery.effort == nil ? allTurns : allTurns.filter(parsedQuery.matches)
+        guard filtered != turns else { return }
+        turns = filtered
+        renderState = nil
+        scheduleRender()
     }
 
     private func runSearch(_ query: OmniQuery) async {
@@ -649,7 +660,7 @@ struct TraceBrowserView: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                 TextField(
-                    "Search — free text + model: harness: task: job: tag:key=value status: run: session:",
+                    "Search — free text + model: harness: effort: duration: task: job: tag:key=value status: run: session:",
                     text: $model.queryText
                 )
                 .textFieldStyle(.plain)
@@ -717,19 +728,19 @@ private struct TagFilterBar: View {
             Button {
                 model.setFilter(dimension, nil)
             } label: {
-                menuItemLabel("All", checked: active == nil)
+                menuItemLabel("Any", checked: active == nil)
             }
             Divider()
             ForEach(values, id: \.self) { value in
                 Button {
                     model.setFilter(dimension, value)
                 } label: {
-                    menuItemLabel(value, checked: active == value)
+                    menuItemLabel(dimension.label(for: value), checked: active == value)
                 }
             }
         } label: {
             HStack(spacing: 3) {
-                Text(active.map { "\(dimension.rawValue): \($0)" } ?? dimension.title)
+                Text(active.map { "\(dimension.rawValue): \(dimension.label(for: $0))" } ?? dimension.title)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Image(systemName: "chevron.down")
@@ -895,6 +906,11 @@ private struct SessionListView: View {
         }
         .width(min: 36, ideal: 44)
         .customizationID("turns")
+        TableColumn("Duration", value: \.durationMs) { (row: SessionRow) in
+            numericCell(row.duration)
+        }
+        .width(min: 48, ideal: 58)
+        .customizationID("duration")
         TableColumn("Tokens in", value: \.tokensIn) { (row: SessionRow) in
             numericCell(TraceFormat.tokens(row.tokensIn))
         }

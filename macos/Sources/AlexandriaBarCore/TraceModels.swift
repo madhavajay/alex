@@ -19,6 +19,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let errors: Int64?
     public let lastStatus: Int?
     public let tags: [String: String]?
+    public let efforts: [String]?
 
     public var id: String { sessionId }
 
@@ -27,7 +28,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case models, harness, errors, tags
+        case models, harness, errors, tags, efforts
         case sessionId = "session_id"
         case runId = "run_id"
         case firstTsMs = "first_ts_ms"
@@ -50,7 +51,7 @@ public struct TranscriptResponse: Codable, Sendable {
     }
 }
 
-public struct TranscriptTurn: Codable, Sendable, Identifiable {
+public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let traceId: String
     public let tsRequestMs: Int64
     public let tsResponseMs: Int64?
@@ -58,6 +59,8 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable {
     public let status: Int?
     public let inputTokens: Int64?
     public let outputTokens: Int64?
+    public let reasoningEffort: String?
+    public let thinkingBudget: Int64?
     public let costUsd: Double?
     public let error: String?
     public let user: String?
@@ -73,6 +76,8 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable {
         case tsResponseMs = "ts_response_ms"
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case reasoningEffort = "reasoning_effort"
+        case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
         case toolCalls = "tool_calls"
     }
@@ -144,6 +149,8 @@ public struct TraceDetail: Codable, Sendable {
     public let cacheCreationTokens: Int64?
     public let outputTokens: Int64?
     public let reasoningTokens: Int64?
+    public let reasoningEffort: String?
+    public let thinkingBudget: Int64?
     public let costUsd: Double?
     public let reqHeadersJson: String?
     public let respHeadersJson: String?
@@ -173,6 +180,8 @@ public struct TraceDetail: Codable, Sendable {
         case cacheCreationTokens = "cache_creation_tokens"
         case outputTokens = "output_tokens"
         case reasoningTokens = "reasoning_tokens"
+        case reasoningEffort = "reasoning_effort"
+        case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
         case reqHeadersJson = "req_headers_json"
         case respHeadersJson = "resp_headers_json"
@@ -367,12 +376,21 @@ public enum TurnHeader {
         return String(format: "%.1fs", Double(responseMs - requestMs) / 1000.0)
     }
 
+    public static func effort(reasoningEffort: String?, thinkingBudget: Int64?) -> String {
+        if let reasoningEffort, !reasoningEffort.isEmpty { return reasoningEffort }
+        if let thinkingBudget { return "\(TraceNumberFormat.tokens(thinkingBudget)) think" }
+        return "-"
+    }
+
     public static func separatorFacts(
         turnNumber: Int, time: String, status: Int?,
-        requestMs: Int64, responseMs: Int64?, costUsd: Double? = nil
+        requestMs: Int64, responseMs: Int64?, costUsd: Double? = nil,
+        reasoningEffort: String? = nil, thinkingBudget: Int64? = nil
     ) -> String {
         var parts = ["turn \(turnNumber)", time]
         if let status { parts.append("\(status)") }
+        let effortLabel = effort(reasoningEffort: reasoningEffort, thinkingBudget: thinkingBudget)
+        if effortLabel != "-" { parts.append(effortLabel) }
         if let dur = duration(requestMs: requestMs, responseMs: responseMs) {
             parts.append(dur)
         }
@@ -614,10 +632,14 @@ public struct TraceSearchResponse: Codable, Sendable {
 public struct TraceSearchRow: Codable, Sendable {
     public let id: String
     public let sessionId: String?
+    public let reasoningEffort: String?
+    public let thinkingBudget: Int64?
 
     enum CodingKeys: String, CodingKey {
         case id
         case sessionId = "session_id"
+        case reasoningEffort = "reasoning_effort"
+        case thinkingBudget = "thinking_budget"
     }
 }
 
@@ -654,6 +676,7 @@ public enum SessionKind {
 
 public struct SessionRow: Identifiable, Sendable, Equatable {
     public let id: String
+    public let firstTsMs: Int64
     public let lastTsMs: Int64
     public let lastTs: Date
     public let sessionShort: String
@@ -668,6 +691,8 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public let cost: Double
     public let errors: Int
     public let runId: String
+    public let durationMs: Int64
+    public let duration: String
     public let tagsSummary: String
     public let kindBadge: String?
     public let iconAsset: String?
@@ -676,6 +701,7 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
 
     public init(session: TraceSession) {
         id = session.sessionId
+        firstTsMs = session.firstTsMs
         lastTsMs = session.lastTsMs
         lastTs = Date(timeIntervalSince1970: Double(session.lastTsMs) / 1000)
         sessionShort = Self.shortId(session.sessionId)
@@ -691,6 +717,8 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         cost = session.totalCostUsd ?? 0
         errors = Int(session.errors ?? 0)
         runId = session.runId ?? ""
+        durationMs = max(0, session.lastTsMs - session.firstTsMs)
+        duration = SessionDuration.format(ms: durationMs)
         tagsSummary = (session.tags ?? [:])
             .filter { !$0.value.isEmpty }
             .sorted { $0.key < $1.key }
@@ -704,6 +732,15 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     static func shortId(_ id: String, maxLength: Int = 22) -> String {
         guard id.count > maxLength else { return id }
         return "\(id.prefix(10))…\(id.suffix(8))"
+    }
+}
+
+public enum SessionDuration {
+    public static func format(ms: Int64) -> String {
+        let seconds = max(0, ms / 1000)
+        if seconds >= 3600 { return String(format: "%dh %02dm", seconds / 3600, (seconds % 3600) / 60) }
+        if seconds >= 60 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds)s"
     }
 }
 
@@ -945,6 +982,8 @@ public struct OmniQuery: Equatable, Sendable {
     public var task: String?
     public var job: String?
     public var tag: String?
+    public var effort: String?
+    public var duration: String?
 
     public init() {}
 
@@ -956,6 +995,7 @@ public struct OmniQuery: Equatable, Sendable {
         model != nil || provider != nil || harness != nil
             || status != nil || run != nil || session != nil
             || task != nil || job != nil || tag != nil
+            || effort != nil || duration != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -976,6 +1016,8 @@ public struct OmniQuery: Equatable, Sendable {
                     case "task": query.task = value; continue
                     case "job": query.job = value; continue
                     case "tag": query.tag = value; continue
+                    case "effort": query.effort = value; continue
+                    case "duration": query.duration = value; continue
                     default: break
                     }
                 }
@@ -1034,7 +1076,21 @@ public struct OmniQuery: Equatable, Sendable {
         if let status {
             guard let last = session.lastStatus, String(last) == status else { return false }
         }
+        if let effort {
+            guard (session.efforts ?? []).contains(effort) else { return false }
+        }
+        if let duration {
+            guard let minimum = SessionDurationFilter(rawValue: duration)?.minimumMs else {
+                return false
+            }
+            guard session.lastTsMs - session.firstTsMs >= minimum else { return false }
+        }
         return true
+    }
+
+    public func matches(_ turn: TranscriptTurn) -> Bool {
+        guard let effort else { return true }
+        return turn.reasoningEffort == effort
     }
 
     public func freeTextMatchesTags(_ session: TraceSession) -> Bool {
@@ -1102,12 +1158,40 @@ public enum SessionTagChips {
     }
 }
 
+public enum SessionDurationFilter: String, CaseIterable, Sendable {
+    case oneMinute = "1m"
+    case fiveMinutes = "5m"
+    case fifteenMinutes = "15m"
+    case oneHour = "1h"
+
+    public var minimumMs: Int64 {
+        switch self {
+        case .oneMinute: 60_000
+        case .fiveMinutes: 5 * 60_000
+        case .fifteenMinutes: 15 * 60_000
+        case .oneHour: 60 * 60_000
+        }
+    }
+
+    public var label: String { ">=\(rawValue)" }
+}
+
 public enum TagFilterDimension: String, CaseIterable, Sendable {
-    case harness, task, job, model
+    case harness, task, job, model, effort, duration
 
     public var title: String { rawValue.capitalized }
 
+    public func label(for value: String) -> String {
+        if self == .duration, let filter = SessionDurationFilter(rawValue: value) {
+            return filter.label
+        }
+        return value
+    }
+
     public func values(in sessions: [TraceSession]) -> [String] {
+        if self == .duration {
+            return SessionDurationFilter.allCases.map(\.rawValue)
+        }
         var seen = Set<String>()
         var out: [String] = []
         func add(_ value: String?) {
@@ -1133,6 +1217,10 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
                 add(tags["task"])
             case .job:
                 add(tags["job"])
+            case .effort:
+                (session.efforts ?? []).forEach { add($0) }
+            case .duration:
+                break
             }
         }
         return out.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
@@ -1144,6 +1232,8 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
         case .task: query.task
         case .job: query.job
         case .model: query.model
+        case .effort: query.effort
+        case .duration: query.duration
         }
     }
 }
@@ -1159,6 +1249,7 @@ public enum TraceFingerprint {
         let last = turns.last
         return "\(turns.count)|\(last?.traceId ?? "")|\(last?.tsRequestMs ?? 0)"
             + "|\(last?.tsResponseMs ?? -1)|\(last?.status ?? -1)"
+            + "|\(last?.reasoningEffort ?? "")|\(last?.thinkingBudget ?? -1)"
     }
 }
 
@@ -1492,6 +1583,7 @@ public enum TranscriptRender {
         "\(turn.tsResponseMs ?? -1)|\(turn.status ?? -1)|\(turn.user?.count ?? -1)"
             + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
             + "|\(turn.toolCalls?.count ?? -1)"
+            + "|\(turn.reasoningEffort ?? "")|\(turn.thinkingBudget ?? -1)"
     }
 
     public static func document(
@@ -1618,7 +1710,9 @@ public enum TranscriptRender {
                     from: Date(timeIntervalSince1970: Double(turn.tsRequestMs) / 1000)),
                 status: turn.status,
                 requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
-                costUsd: turn.costUsd)
+                costUsd: turn.costUsd,
+                reasoningEffort: turn.reasoningEffort,
+                thinkingBudget: turn.thinkingBudget)
             let isError = (turn.status ?? 0) >= 400
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) ·", attributes: sepAttrs))
