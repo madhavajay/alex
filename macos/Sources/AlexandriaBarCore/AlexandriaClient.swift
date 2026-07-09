@@ -4,6 +4,8 @@ public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
     case response
+    case darioUpstreamRequest = "dario-upstream-request"
+    case darioUpstreamResponse = "dario-upstream-response"
 }
 
 public struct TraceBodyContent: Sendable, Equatable {
@@ -145,6 +147,10 @@ public struct AlexandriaClient: Sendable {
 
     public func darioUpdate() async throws {
         _ = try await request("admin/dario/update", method: "POST")
+    }
+
+    public func darioPromptCacheClear(key: String) async throws {
+        _ = try await request("admin/dario/prompt-caches/\(key)", method: "DELETE")
     }
 
     public func authLoginStart(provider: String) async throws -> LoginSession {

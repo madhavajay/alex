@@ -769,6 +769,8 @@ async fn main() -> Result<()> {
                 let settings = dario::DarioSettings {
                     install_root: config.data_dir.join("dario"),
                     log_root: config.data_dir.join("dario").join("logs"),
+                    capture_root: config.data_dir.join("bodies"),
+                    prompt_cache_root: config.data_dir.join("dario-prompt-cache"),
                     api_key: config.dario_api_key.clone(),
                     update_check_minutes: config.dario_update_check_minutes,
                     version_pin: config.dario_version.clone(),

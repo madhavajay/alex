@@ -81,6 +81,8 @@ struct TraceInspectorView: View {
     @State private var loadError: String?
     @State private var reqBody = BodyLoad()
     @State private var respBody = BodyLoad()
+    @State private var darioReqBody = BodyLoad()
+    @State private var darioRespBody = BodyLoad()
     @State private var copiedAll = false
     @State private var isLoading = false
     @AppStorage("InspectorRawMode") private var rawMode = false
@@ -88,6 +90,8 @@ struct TraceInspectorView: View {
     @AppStorage("InspectorRespHeadersOpen") private var respHeadersOpen = false
     @AppStorage("InspectorReqBodyOpen") private var reqBodyOpen = false
     @AppStorage("InspectorRespBodyOpen") private var respBodyOpen = false
+    @AppStorage("InspectorDarioReqBodyOpen") private var darioReqBodyOpen = false
+    @AppStorage("InspectorDarioRespBodyOpen") private var darioRespBodyOpen = false
 
     struct BodyLoad {
         var phase = Phase.idle
@@ -139,7 +143,17 @@ struct TraceInspectorView: View {
             } else {
                 respBody = BodyLoad()
             }
+            darioReqBody = BodyLoad()
+            darioRespBody = BodyLoad()
             await loadDetail()
+            if let capture = detail?.extras?.darioCapture {
+                if darioReqBodyOpen && capture.requestAvailable {
+                    loadBody(.darioUpstreamRequest, into: $darioReqBody)
+                }
+                if darioRespBodyOpen && capture.responseAvailable {
+                    loadBody(.darioUpstreamResponse, into: $darioRespBody)
+                }
+            }
             isLoading = false
         }
     }
@@ -230,6 +244,20 @@ struct TraceInspectorView: View {
                 InfoRow(label: "temperature", value: extras.temperature.map { "\($0)" })
                 InfoRow(label: "messages", value: extras.messageCount.map { "\($0)" })
                 InfoRow(label: "system chars", value: extras.systemChars.map { "\($0)" })
+                if let capture = extras.darioCapture {
+                    InfoRow(
+                        label: "Dario request",
+                        value: capture.requestAvailable ? (capture.requestPath ?? "captured") : nil)
+                    InfoRow(
+                        label: "Dario response",
+                        value: capture.responseAvailable ? (capture.responsePath ?? "captured") : nil)
+                    if let prompt = capture.promptCache {
+                        InfoRow(label: "prompt model", value: prompt.model)
+                        InfoRow(label: "prompt cache", value: promptCacheLine(prompt))
+                        InfoRow(label: "prompt path", value: prompt.path)
+                        InfoRow(label: "prompt error", value: prompt.error, color: .red)
+                    }
+                }
             }
         }
         Divider()
@@ -244,6 +272,18 @@ struct TraceInspectorView: View {
             title: "Request body", kind: .request, load: $reqBody, isExpanded: $reqBodyOpen)
         bodyGroup(
             title: "Response body", kind: .response, load: $respBody, isExpanded: $respBodyOpen)
+        if let capture = response.extras?.darioCapture {
+            if capture.requestAvailable {
+                bodyGroup(
+                    title: "Dario → Anthropic", kind: .darioUpstreamRequest,
+                    load: $darioReqBody, isExpanded: $darioReqBodyOpen)
+            }
+            if capture.responseAvailable {
+                bodyGroup(
+                    title: "Anthropic → Dario", kind: .darioUpstreamResponse,
+                    load: $darioRespBody, isExpanded: $darioRespBodyOpen)
+            }
+        }
     }
 
     private func copyAll() {
@@ -327,6 +367,16 @@ struct TraceInspectorView: View {
             parts.append("reasoning \(TraceNumberFormat.tokens(reasoning))")
         }
         return parts.joined(separator: " · ")
+    }
+
+    private func promptCacheLine(_ prompt: DarioPromptCacheUse) -> String? {
+        let parts = [
+            prompt.status,
+            prompt.applied.map { $0 ? "applied" : "not applied" },
+            prompt.systemPromptChars.map { "\($0) chars" },
+            prompt.claudeVersion,
+        ].compactMap(\.self)
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     @ViewBuilder

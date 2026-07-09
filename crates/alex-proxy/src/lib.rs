@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,6 +165,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/limits", get(admin_limits))
         .route("/admin/update", get(admin_update))
         .route("/admin/dario", get(admin_dario))
+        .route("/admin/dario/prompt-caches", get(admin_dario_prompt_caches))
+        .route(
+            "/admin/dario/prompt-caches/{key}",
+            axum::routing::delete(admin_dario_prompt_cache_delete),
+        )
         .route("/admin/auth/import", post(admin_auth_import))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
         .route("/admin/auth/login/complete", post(admin_auth_login_complete))
@@ -564,8 +570,94 @@ async fn admin_update(State(state): State<Arc<AppState>>) -> Response {
 
 async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
     match &state.dario {
-        Some(d) => axum::Json(d.status()).into_response(),
+        Some(d) => {
+            let mut status = d.status();
+            if let Some(obj) = status.as_object_mut() {
+                obj.insert("prompt_caches".into(), json!(dario_prompt_caches(&state)));
+            }
+            axum::Json(status).into_response()
+        }
         None => error_response(StatusCode::NOT_FOUND, "dario mode is not enabled"),
+    }
+}
+
+fn dario_prompt_cache_dir(state: &AppState) -> PathBuf {
+    state.store.data_dir.join("dario-prompt-cache")
+}
+
+fn dario_prompt_cache_key_valid(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn dario_prompt_cache_summary(path: PathBuf) -> Option<Value> {
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let key = path.file_stem()?.to_string_lossy().to_string();
+    let runs: Vec<Value> = value["runs"]
+        .as_array()
+        .map(|runs| runs.iter().rev().take(12).cloned().collect())
+        .unwrap_or_default();
+    Some(json!({
+        "key": value["key"].as_str().unwrap_or(&key),
+        "model": value["model"],
+        "source": value["source"],
+        "captured_at": value["captured_at"],
+        "last_used_at": value["last_used_at"],
+        "trace_id": value["trace_id"],
+        "claude_bin": value["claude_bin"],
+        "claude_version": value["claude_version"],
+        "system_prompt_chars": value["system_prompt_chars"],
+        "agent_identity_chars": value["agent_identity_chars"],
+        "path": path.to_string_lossy(),
+        "runs": runs,
+    }))
+}
+
+fn dario_prompt_caches(state: &AppState) -> Vec<Value> {
+    let dir = dario_prompt_cache_dir(state);
+    let mut caches: Vec<Value> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|s| s.to_str()) == Some("json"))
+                .then(|| dario_prompt_cache_summary(path))
+                .flatten()
+        })
+        .collect();
+    caches.sort_by(|a, b| {
+        b["last_used_at"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["last_used_at"].as_str().unwrap_or(""))
+    });
+    caches
+}
+
+async fn admin_dario_prompt_caches(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(json!({"prompt_caches": dario_prompt_caches(&state)})).into_response()
+}
+
+async fn admin_dario_prompt_cache_delete(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    if !dario_prompt_cache_key_valid(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid prompt cache key");
+    }
+    let path = dario_prompt_cache_dir(&state).join(format!("{key}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => axum::Json(json!({"deleted": true, "key": key})).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            error_response(StatusCode::NOT_FOUND, "unknown prompt cache")
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -779,6 +871,81 @@ fn read_gz_text(path: Option<&str>) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).to_string())
 }
 
+fn body_date_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+}
+
+fn dario_capture_suffix(kind: &str) -> Option<&'static str> {
+    match kind {
+        "dario-upstream-request" => Some("dario-upstream-request.json.gz"),
+        "dario-upstream-response" => Some("dario-upstream-response.json.gz"),
+        _ => None,
+    }
+}
+
+fn is_dario_trace(row: &Value) -> bool {
+    row["account_id"]
+        .as_str()
+        .map(|id| id.starts_with("dario:"))
+        .unwrap_or(false)
+}
+
+fn find_dario_capture_path(state: &AppState, row: &Value, kind: &str) -> Option<String> {
+    if !is_dario_trace(row) {
+        return None;
+    }
+    let trace_id = row["id"].as_str()?;
+    let suffix = dario_capture_suffix(kind)?;
+    let filename = format!("{trace_id}.{suffix}");
+    let bodies = state.store.data_dir.join("bodies");
+    let mut days: Vec<PathBuf> = std::fs::read_dir(&bodies)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (entry.path().is_dir() && body_date_dir_name(&name)).then(|| entry.path())
+        })
+        .collect();
+    days.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for day in days {
+        let path = day.join(&filename);
+        if path.is_file() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn dario_capture_summary(state: &AppState, row: &Value) -> Option<Value> {
+    let request_path = find_dario_capture_path(state, row, "dario-upstream-request");
+    let response_path = find_dario_capture_path(state, row, "dario-upstream-response");
+    if request_path.is_none() && response_path.is_none() {
+        return None;
+    }
+    let prompt_cache = request_path
+        .as_deref()
+        .and_then(|path| read_gz_json(Some(path)))
+        .and_then(|body| {
+            body["prompt_cache"]
+                .as_object()
+                .map(|_| body["prompt_cache"].clone())
+        });
+    Some(json!({
+        "request_available": request_path.is_some(),
+        "response_available": response_path.is_some(),
+        "request_path": request_path,
+        "response_path": response_path,
+        "prompt_cache": prompt_cache,
+    }))
+}
+
 async fn traces_sessions(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -899,9 +1066,17 @@ fn trace_extras(req: &Value) -> Value {
 async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.store.get_trace(&id) {
         Ok(Some(row)) => {
-            let extras = read_gz_json(row["req_body_path"].as_str())
+            let mut extras = read_gz_json(row["req_body_path"].as_str())
                 .map(|req| trace_extras(&req))
                 .unwrap_or_else(|| json!({}));
+            if let Some(summary) = dario_capture_summary(&state, &row) {
+                if !extras.is_object() {
+                    extras = json!({});
+                }
+                if let Some(obj) = extras.as_object_mut() {
+                    obj.insert("dario_capture".into(), summary);
+                }
+            }
             axum::Json(json!({"trace": row, "extras": extras})).into_response()
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -920,18 +1095,21 @@ async fn trace_body(
         }
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let column = match kind.as_str() {
-        "request" => "req_body_path",
-        "upstream-request" => "upstream_req_body_path",
-        "response" => "resp_body_path",
+    let path = match kind.as_str() {
+        "request" => row["req_body_path"].as_str().map(String::from),
+        "upstream-request" => row["upstream_req_body_path"].as_str().map(String::from),
+        "response" => row["resp_body_path"].as_str().map(String::from),
+        "dario-upstream-request" | "dario-upstream-response" => {
+            find_dario_capture_path(&state, &row, &kind)
+        }
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "kind must be request|upstream-request|response",
+                "kind must be request|upstream-request|response|dario-upstream-request|dario-upstream-response",
             )
         }
     };
-    match read_gz_text(row[column].as_str()) {
+    match read_gz_text(path.as_deref()) {
         Some(text) => {
             let ct = if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
                 "application/json; charset=utf-8"
@@ -941,7 +1119,7 @@ async fn trace_body(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", ct)
-                .header("x-alexandria-body-path", row[column].as_str().unwrap_or(""))
+                .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
                 .body(Body::from(text))
                 .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
         }
@@ -1612,11 +1790,12 @@ async fn plan_upstream(
                 )),
             };
             let dario_active = state.dario.as_ref().and_then(|d| d.active());
-            let (base, account, dario_guard) = match (&state.dario, dario_active) {
+            let (base, account, dario_guard, dario_capture) = match (&state.dario, dario_active) {
                 (Some(dario), Some(active)) => (
                     active.base_url.trim_end_matches('/').to_string(),
                     dario_account(&active),
                     dario.begin(&active.generation_id),
+                    true,
                 ),
                 _ => {
                     let account = state
@@ -1624,7 +1803,7 @@ async fn plan_upstream(
                         .account_for(provider, true)
                         .await
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None)
+                    (ANTHROPIC_BASE.to_string(), account, None, false)
                 }
             };
             let (body, respond_as) = match converted {
@@ -1652,7 +1831,14 @@ async fn plan_upstream(
                 destream: false,
                 respond_as,
                 client_stream,
-                extra_headers: vec![],
+                extra_headers: if dario_capture {
+                    vec![
+                        ("x-dario-capture-id".into(), trace_id.into()),
+                        ("x-dario-capture-model".into(), routed_model.into()),
+                    ]
+                } else {
+                    vec![]
+                },
                 dario_guard,
             })
         }

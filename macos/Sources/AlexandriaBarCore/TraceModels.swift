@@ -183,6 +183,59 @@ public struct TraceDetail: Codable, Sendable {
     }
 }
 
+public struct DarioCaptureExtras: Codable, Sendable {
+    public let requestPath: String?
+    public let responsePath: String?
+    public let requestAvailable: Bool
+    public let responseAvailable: Bool
+    public let promptCache: DarioPromptCacheUse?
+
+    public init(
+        requestPath: String?,
+        responsePath: String?,
+        requestAvailable: Bool,
+        responseAvailable: Bool,
+        promptCache: DarioPromptCacheUse? = nil
+    ) {
+        self.requestPath = requestPath
+        self.responsePath = responsePath
+        self.requestAvailable = requestAvailable
+        self.responseAvailable = responseAvailable
+        self.promptCache = promptCache
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case requestPath = "request_path"
+        case responsePath = "response_path"
+        case requestAvailable = "request_available"
+        case responseAvailable = "response_available"
+        case promptCache = "prompt_cache"
+    }
+}
+
+public struct DarioPromptCacheUse: Codable, Sendable, Equatable {
+    public let key: String?
+    public let model: String?
+    public let status: String?
+    public let applied: Bool?
+    public let path: String?
+    public let capturedAt: String?
+    public let lastUsedAt: String?
+    public let systemPromptChars: Int?
+    public let agentIdentityChars: Int?
+    public let claudeVersion: String?
+    public let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case key, model, status, applied, path, error
+        case capturedAt = "captured_at"
+        case lastUsedAt = "last_used_at"
+        case systemPromptChars = "system_prompt_chars"
+        case agentIdentityChars = "agent_identity_chars"
+        case claudeVersion = "claude_version"
+    }
+}
+
 public struct TraceExtras: Codable, Sendable {
     public let reasoningEffort: String?
     public let thinkingBudget: Int64?
@@ -191,10 +244,12 @@ public struct TraceExtras: Codable, Sendable {
     public let messageCount: Int?
     public let systemChars: Int?
     public let systemPrompt: String?
+    public let darioCapture: DarioCaptureExtras?
 
     public var hasAny: Bool {
         reasoningEffort != nil || thinkingBudget != nil || maxTokens != nil
             || temperature != nil || messageCount != nil || systemChars != nil
+            || darioCapture != nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -205,6 +260,7 @@ public struct TraceExtras: Codable, Sendable {
         case messageCount = "message_count"
         case systemChars = "system_chars"
         case systemPrompt = "system_prompt"
+        case darioCapture = "dario_capture"
     }
 }
 
@@ -1304,6 +1360,18 @@ public enum TurnExport {
         add("temperature", extras.temperature.map { "\($0)" })
         add("messages", extras.messageCount.map { "\($0)" })
         add("system chars", extras.systemChars.map { "\($0)" })
+        if let capture = extras.darioCapture {
+            let states = [
+                capture.requestAvailable ? "request" : nil,
+                capture.responseAvailable ? "response" : nil,
+            ].compactMap(\.self)
+            add("Dario capture", states.isEmpty ? nil : states.joined(separator: ", "))
+            if let prompt = capture.promptCache {
+                add("Dario prompt cache", [prompt.model, prompt.status]
+                    .compactMap { $0 }
+                    .joined(separator: " · "))
+            }
+        }
         return lines
     }
 
@@ -1688,10 +1756,53 @@ public enum TranscriptRender {
 public struct DarioAdminStatus: Codable, Sendable {
     public let activeGenerationId: String?
     public let generations: [DarioGenerationDetail]
+    public let promptCaches: [DarioPromptCacheSummary]?
 
     enum CodingKeys: String, CodingKey {
         case generations
+        case promptCaches = "prompt_caches"
         case activeGenerationId = "active_generation_id"
+    }
+}
+
+public struct DarioPromptCacheSummary: Codable, Sendable, Identifiable, Equatable {
+    public let key: String
+    public let model: String?
+    public let source: String?
+    public let capturedAt: String?
+    public let lastUsedAt: String?
+    public let traceId: String?
+    public let claudeBin: String?
+    public let claudeVersion: String?
+    public let systemPromptChars: Int?
+    public let agentIdentityChars: Int?
+    public let path: String?
+    public let runs: [DarioPromptCacheRun]?
+
+    public var id: String { key }
+
+    enum CodingKeys: String, CodingKey {
+        case key, model, source, path, runs
+        case capturedAt = "captured_at"
+        case lastUsedAt = "last_used_at"
+        case traceId = "trace_id"
+        case claudeBin = "claude_bin"
+        case claudeVersion = "claude_version"
+        case systemPromptChars = "system_prompt_chars"
+        case agentIdentityChars = "agent_identity_chars"
+    }
+}
+
+public struct DarioPromptCacheRun: Codable, Sendable, Equatable {
+    public let traceId: String?
+    public let usedAt: String?
+    public let status: String?
+    public let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, error
+        case traceId = "trace_id"
+        case usedAt = "used_at"
     }
 }
 

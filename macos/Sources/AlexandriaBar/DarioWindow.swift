@@ -48,6 +48,10 @@ final class DarioModel {
         status?.generations ?? []
     }
 
+    var promptCaches: [DarioPromptCacheSummary] {
+        status?.promptCaches ?? []
+    }
+
     var activeGeneration: DarioGenerationDetail? {
         guard let id = status?.activeGenerationId else { return nil }
         return generations.first { $0.id == id }
@@ -135,6 +139,21 @@ final class DarioModel {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
+    func clearPromptCache(_ cache: DarioPromptCacheSummary) {
+        guard let client = client() else { return }
+        actionInFlight = true
+        Task { [weak self] in
+            do {
+                try await client.darioPromptCacheClear(key: cache.key)
+                self?.showActionResult("cleared \(cache.model ?? cache.key)")
+            } catch {
+                self?.showActionResult("failed: \(error.localizedDescription)")
+            }
+            self?.actionInFlight = false
+            await self?.pollStatus()
+        }
+    }
+
     func confirmAction(update: Bool) {
         let alert = NSAlert()
         alert.messageText = update ? "Check for dario update?" : "Restart dario?"
@@ -197,8 +216,13 @@ struct DarioView: View {
                 header
                 Divider()
                 VSplitView {
-                    GenerationTable(model: model)
-                        .frame(minHeight: 120, idealHeight: 180)
+                    VStack(spacing: 0) {
+                        GenerationTable(model: model)
+                            .frame(minHeight: 110, idealHeight: 160)
+                        Divider()
+                        PromptCacheTable(model: model)
+                            .frame(minHeight: 92, idealHeight: 120)
+                    }
                     LogPane(model: model)
                         .frame(minHeight: 160, maxHeight: .infinity)
                 }
@@ -252,6 +276,88 @@ struct DarioView: View {
     private var headerTitle: String {
         guard let active = model.activeGeneration else { return "dario — no active generation" }
         return "dario \(active.version) · active \(active.id)"
+    }
+}
+
+private struct PromptCacheTable: View {
+    @Bindable var model: DarioModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerRow
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(model.promptCaches) { cache in
+                        PromptCacheRow(cache: cache, actionInFlight: model.actionInFlight) {
+                            model.clearPromptCache(cache)
+                        }
+                    }
+                    if model.promptCaches.isEmpty {
+                        Text("No prompt caches yet")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 14)
+                    }
+                }
+                .padding(4)
+            }
+        }
+    }
+
+    private var headerRow: some View {
+        HStack(spacing: 0) {
+            GenerationRow.cell("prompt cache", width: nil, alignment: .leading)
+            GenerationRow.cell("status", width: 80)
+            GenerationRow.cell("chars", width: 72)
+            GenerationRow.cell("version", width: 80)
+            GenerationRow.cell("last used", width: 92)
+            GenerationRow.cell("", width: 54)
+        }
+        .font(.system(size: 10, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+    }
+}
+
+private struct PromptCacheRow: View {
+    let cache: DarioPromptCacheSummary
+    let actionInFlight: Bool
+    let clear: () -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(cache.model ?? cache.key)
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let path = cache.path {
+                    Text(path)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            GenerationRow.cell(cache.runs?.first?.status ?? "cached", width: 80)
+            GenerationRow.cell(cache.systemPromptChars.map(String.init) ?? "-", width: 72)
+            GenerationRow.cell(cache.claudeVersion ?? "-", width: 80)
+            GenerationRow.cell(relative(cache.lastUsedAt ?? cache.capturedAt), width: 92)
+            Button("Clear", action: clear)
+                .controlSize(.mini)
+                .disabled(actionInFlight)
+                .frame(width: 54)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+    }
+
+    private func relative(_ iso: String?) -> String {
+        guard let iso, let date = ISO8601DateFormatter().date(from: iso) else { return "-" }
+        return TraceFormat.relative(Int64(date.timeIntervalSince1970 * 1000))
     }
 }
 

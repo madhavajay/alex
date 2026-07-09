@@ -25,16 +25,22 @@ const PROBE_TOTAL_TIMEOUT_MS: u64 = 30_000;
 const PROBE_BODY_SNIPPET_MAX: usize = 256;
 const SUSPECT_DEBOUNCE_MS: i64 = 5_000;
 const RESPAWN_RETRY_MS: i64 = 10_000;
-
 pub struct DarioSettings {
     pub install_root: PathBuf,
     pub log_root: PathBuf,
+    pub capture_root: PathBuf,
+    pub prompt_cache_root: PathBuf,
     pub api_key: String,
     pub update_check_minutes: u64,
     pub version_pin: Option<String>,
     pub probe_seconds: u64,
     pub probe_failures: u32,
     pub probe_model: String,
+}
+
+struct RuntimeShims {
+    claude_bin: PathBuf,
+    fetch_capture_preload: PathBuf,
 }
 
 #[derive(Clone)]
@@ -644,6 +650,23 @@ impl DarioSupervisor {
         }
     }
 
+    fn prepare_runtime_shims(&self) -> Result<RuntimeShims> {
+        let dir = self.settings.install_root.join("shims");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir:?}"))?;
+
+        let claude_bin = dir.join(claude_shim_name());
+        write_if_changed(&claude_bin, claude_capture_shim())?;
+        make_executable(&claude_bin)?;
+
+        let fetch_capture_preload_path = dir.join("dario-fetch-capture.cjs");
+        write_if_changed(&fetch_capture_preload_path, fetch_capture_preload())?;
+
+        Ok(RuntimeShims {
+            claude_bin,
+            fetch_capture_preload: fetch_capture_preload_path,
+        })
+    }
+
     fn spawn_generation(&self, version: &str, bin: &Path) -> Result<Arc<Generation>> {
         let port = alloc_port()?;
         let id = generation_id(version, port);
@@ -653,14 +676,32 @@ impl DarioSupervisor {
             .with_context(|| format!("creating {stdout_log:?}"))?;
         let err = std::fs::File::create(&stderr_log)
             .with_context(|| format!("creating {stderr_log:?}"))?;
-        let child = Command::new(bin)
+        quarantine_fable_live_cache();
+        let shims = self.prepare_runtime_shims()?;
+        let node_options = node_options_with_require(&shims.fetch_capture_preload);
+        let mut child_cmd = Command::new(bin);
+        child_cmd
             .arg("proxy")
             .arg("--host=127.0.0.1")
             .arg(format!("--port={port}"))
             .env("DARIO_API_KEY", &self.settings.api_key)
+            .env("DARIO_CLAUDE_BIN", &shims.claude_bin)
+            .env("ALEXANDRIA_DARIO_CAPTURE_DIR", &self.settings.capture_root)
+            .env(
+                "ALEXANDRIA_DARIO_PROMPT_CACHE_DIR",
+                &self.settings.prompt_cache_root,
+            )
+            .env("NODE_OPTIONS", node_options)
+            // The fetch-capture preload is a Node hook. Keeping supervised
+            // Dario in Node avoids losing trace capture to Bun auto-relaunch.
+            .env("DARIO_NO_BUN", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
+            .stderr(Stdio::from(err));
+        if let Some(real) = std::env::var_os("DARIO_CLAUDE_BIN") {
+            child_cmd.env("ALEXANDRIA_REAL_CLAUDE_BIN", real);
+        }
+        let child = child_cmd
             .spawn()
             .with_context(|| format!("spawning {bin:?}"))?;
         let pid = child.id().unwrap_or(0);
@@ -1083,6 +1124,588 @@ fn reap_action(
         ReapAction::Sigterm
     } else {
         ReapAction::Keep
+    }
+}
+
+fn claude_shim_name() -> &'static str {
+    if cfg!(windows) {
+        "claude-alexandria-shim.cmd"
+    } else {
+        "claude-alexandria-shim"
+    }
+}
+
+fn claude_capture_shim() -> String {
+    if cfg!(windows) {
+        r#"@echo off
+setlocal
+set "REAL=%ALEXANDRIA_REAL_CLAUDE_BIN%"
+if "%REAL%"=="" set "REAL=claude"
+set "MODEL=%ALEXANDRIA_DARIO_CAPTURE_MODEL%"
+set "HAS_MODEL="
+set "PASSTHROUGH="
+for %%A in (%*) do (
+  if "%%~A"=="--model" set "HAS_MODEL=1"
+  echo %%~A | findstr /B /C:"--model=" >nul && set "HAS_MODEL=1"
+  if "%%~A"=="--version" set "PASSTHROUGH=1"
+)
+set "NODE_OPTIONS="
+if defined PASSTHROUGH "%REAL%" %* & exit /b %ERRORLEVEL%
+if defined HAS_MODEL "%REAL%" %* & exit /b %ERRORLEVEL%
+if defined MODEL "%REAL%" --model "%MODEL%" %* & exit /b %ERRORLEVEL%
+"%REAL%" %*
+"#
+        .to_string()
+    } else {
+        r#"#!/bin/sh
+set -eu
+real="${ALEXANDRIA_REAL_CLAUDE_BIN:-}"
+model="${ALEXANDRIA_DARIO_CAPTURE_MODEL:-}"
+if [ -z "$real" ]; then
+  real="$(command -v claude 2>/dev/null || true)"
+fi
+if [ -z "$real" ]; then
+  echo "alexandria dario claude shim: claude not found" >&2
+  exit 127
+fi
+has_model=0
+pass_through=0
+for arg in "$@"; do
+  case "$arg" in
+    --model|--model=*) has_model=1 ;;
+    --version) pass_through=1 ;;
+  esac
+done
+unset NODE_OPTIONS
+if [ "$pass_through" = "1" ] || [ "$has_model" = "1" ]; then
+  exec "$real" "$@"
+fi
+if [ -n "$model" ]; then
+  exec "$real" --model "$model" "$@"
+fi
+exec "$real" "$@"
+"#
+        .to_string()
+    }
+}
+
+fn fetch_capture_preload() -> &'static str {
+    r#"'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
+const http = require('node:http');
+const childProcess = require('node:child_process');
+const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { syncBuiltinESMExports } = require('node:module');
+
+const captureDir = process.env.ALEXANDRIA_DARIO_CAPTURE_DIR || '';
+const promptCacheDir = process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_DIR || '';
+const idPattern = /^[A-Za-z0-9._-]{1,128}$/;
+const modelPattern = /^[A-Za-z0-9._:[\]-]{1,160}$/;
+const promptCacheTtlMs = 24 * 60 * 60 * 1000;
+const clientSystemPreface = '\n\n---\n\nIMPORTANT: The operator of this session has supplied the following task-specific instructions.';
+const als = new AsyncLocalStorage();
+const promptCaptures = new Map();
+
+function capturePath(id, kind) {
+  const date = new Date().toISOString().slice(0, 10);
+  return path.join(captureDir, date, `${id}.${kind}.json.gz`);
+}
+
+function captureHeaders(headers) {
+  const out = {};
+  try {
+    const h = new Headers(headers || {});
+    h.forEach((value, name) => {
+      const key = String(name).toLowerCase();
+      out[key] = ['authorization', 'x-api-key', 'cookie', 'set-cookie'].includes(key)
+        ? '<redacted>'
+        : String(value);
+    });
+  } catch {
+    for (const [name, value] of Object.entries(headers || {})) {
+      const key = String(name).toLowerCase();
+      out[key] = ['authorization', 'x-api-key', 'cookie', 'set-cookie'].includes(key)
+        ? '<redacted>'
+        : String(value);
+    }
+  }
+  return out;
+}
+
+function captureBody(body) {
+  if (body == null) return null;
+  let text;
+  if (typeof body === 'string') {
+    text = body;
+  } else if (Buffer.isBuffer(body)) {
+    text = body.toString('utf8');
+  } else if (body instanceof Uint8Array) {
+    text = Buffer.from(body).toString('utf8');
+  } else {
+    return `[${body.constructor?.name || 'body'}]`;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function writeCapture(id, kind, payload) {
+  if (!captureDir || !idPattern.test(id)) return;
+  const file = capturePath(id, kind);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, zlib.gzipSync(Buffer.from(JSON.stringify(payload, null, 2), 'utf8')));
+  } catch (err) {
+    try { process.stderr.write(`[alexandria] dario capture failed: ${err.message}\n`); } catch {}
+  }
+}
+
+function firstHeader(req, name) {
+  const raw = req?.headers?.[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+function normalizeCaptureModel(model) {
+  if (typeof model !== 'string') return null;
+  const trimmed = model.trim();
+  if (!trimmed || !modelPattern.test(trimmed)) return null;
+  return trimmed.replace(/\[[^\]]+\]$/, '');
+}
+
+function requestCaptureContext(req) {
+  const rawId = firstHeader(req, 'x-dario-capture-id');
+  const id = typeof rawId === 'string' && idPattern.test(rawId) ? rawId : null;
+  if (!id) return null;
+  return {
+    id,
+    model: normalizeCaptureModel(firstHeader(req, 'x-dario-capture-model')),
+    attempt: 0,
+  };
+}
+
+function promptCacheKey(model) {
+  const slug = model
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'model';
+  const hash = crypto.createHash('sha256').update(model).digest('hex').slice(0, 12);
+  return `${slug}-${hash}`;
+}
+
+function promptCachePath(model) {
+  return path.join(promptCacheDir, `${promptCacheKey(model)}.json`);
+}
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+function promptCacheMeta(entry, file, status, applied, error) {
+  return {
+    key: entry?.key,
+    model: entry?.model,
+    status,
+    applied,
+    path: file,
+    captured_at: entry?.captured_at,
+    last_used_at: entry?.last_used_at,
+    system_prompt_chars: entry?.system_prompt_chars,
+    agent_identity_chars: entry?.agent_identity_chars,
+    claude_version: entry?.claude_version,
+    error: error ? String(error) : undefined,
+  };
+}
+
+function freshPromptCache(model) {
+  if (!promptCacheDir || !model) return null;
+  const file = promptCachePath(model);
+  const entry = readJsonFile(file);
+  if (!entry || typeof entry.system_prompt !== 'string') return null;
+  const capturedMs = Date.parse(entry.captured_at || '');
+  if (Number.isFinite(capturedMs) && Date.now() - capturedMs > promptCacheTtlMs) return null;
+  return { entry, file };
+}
+
+function recordPromptCacheUse(model, traceId, status, error) {
+  if (!promptCacheDir || !model) return null;
+  const file = promptCachePath(model);
+  const entry = readJsonFile(file);
+  if (!entry) return null;
+  const run = {
+    trace_id: traceId,
+    used_at: new Date().toISOString(),
+    status,
+    error: error ? String(error) : undefined,
+  };
+  entry.last_used_at = run.used_at;
+  entry.runs = Array.isArray(entry.runs) ? entry.runs : [];
+  entry.runs.push(run);
+  entry.runs = entry.runs.slice(-50);
+  try {
+    writeJsonFile(file, entry);
+  } catch (err) {
+    try { process.stderr.write(`[alexandria] dario prompt-cache use failed: ${err.message}\n`); } catch {}
+  }
+  return { entry, file };
+}
+
+function findRealClaude() {
+  if (process.env.ALEXANDRIA_REAL_CLAUDE_BIN) return process.env.ALEXANDRIA_REAL_CLAUDE_BIN;
+  const pathEnv = process.env.PATH || '';
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const names = process.platform === 'win32' ? ['claude.exe', 'claude.cmd', 'claude'] : ['claude'];
+  for (const dir of pathEnv.split(sep).filter(Boolean)) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      try {
+        if (fs.existsSync(candidate)) return candidate;
+      } catch {}
+    }
+  }
+  return 'claude';
+}
+
+function pickTextBlock(block) {
+  if (!block) return '';
+  if (typeof block.text === 'string') return block.text;
+  if (Array.isArray(block.content)) {
+    return block.content
+      .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n');
+  }
+  return '';
+}
+
+function extractClaudeVersion(headers) {
+  const billing = headers?.['x-anthropic-billing-header'] || '';
+  const userAgent = headers?.['user-agent'] || '';
+  const fromBilling = /cc_version=([^;]+)/.exec(billing);
+  if (fromBilling) return fromBilling[1];
+  const fromUa = /claude-cli\/([^\s]+)/.exec(userAgent);
+  return fromUa ? fromUa[1] : undefined;
+}
+
+async function capturePromptForModel(model, traceId) {
+  const key = promptCacheKey(model);
+  const file = promptCachePath(model);
+  const claudeBin = findRealClaude();
+  const captured = await new Promise((resolve) => {
+    let child;
+    let done = false;
+    const settle = (value) => {
+      if (done) return;
+      done = true;
+      try { server.close(); } catch {}
+      try { child?.kill('SIGTERM'); } catch {}
+      resolve(value);
+    };
+    const server = http.createServer((req, res) => {
+      if (!req.url?.includes('/v1/messages')) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{"type":"error","error":{"type":"not_found_error","message":"not found"}}');
+        return;
+      }
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        let body = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch {}
+        const headers = {};
+        for (const [name, value] of Object.entries(req.headers || {})) {
+          headers[String(name).toLowerCase()] = Array.isArray(value) ? value.join(',') : String(value);
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+          'anthropic-ratelimit-unified-status': 'allowed',
+        });
+        res.end([
+          `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_alexandria_capture', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })}\n\n`,
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`,
+          `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+        ].join(''));
+        setTimeout(() => settle({ body, headers }), 100);
+      });
+    });
+    server.on('error', () => settle(null));
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') return settle(null);
+      const env = {
+        ...process.env,
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${addr.port}`,
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-dario-fingerprint-capture',
+        CLAUDE_NONINTERACTIVE: '1',
+        ALEXANDRIA_DARIO_CAPTURE_MODEL: model,
+      };
+      delete env.NODE_OPTIONS;
+      delete env.DARIO_CLAUDE_BIN;
+      const useShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(claudeBin);
+      try {
+        child = childProcess.spawn(claudeBin, ['--model', model, '--print', '-p', 'hi'], {
+          env,
+          stdio: ['ignore', 'ignore', 'ignore'],
+          windowsHide: true,
+          shell: useShell,
+        });
+        child.on('error', () => settle(null));
+        child.on('exit', () => setTimeout(() => settle(null), 200));
+      } catch {
+        settle(null);
+      }
+    });
+    setTimeout(() => settle(null), 15_000);
+  });
+
+  const system = captured?.body?.system;
+  const systemPrompt = Array.isArray(system) ? pickTextBlock(system[2]) : '';
+  const agentIdentity = Array.isArray(system) ? pickTextBlock(system[1]) : '';
+  if (!systemPrompt) throw new Error(`no system prompt captured for ${model}`);
+  const now = new Date().toISOString();
+  const entry = {
+    key,
+    model,
+    source: 'alexandria-claude-live-capture',
+    captured_at: now,
+    last_used_at: now,
+    trace_id: traceId,
+    claude_bin: claudeBin,
+    claude_version: extractClaudeVersion(captured.headers),
+    system_prompt_chars: systemPrompt.length,
+    agent_identity_chars: agentIdentity.length || undefined,
+    system_prompt: systemPrompt,
+    agent_identity: agentIdentity || undefined,
+    runs: [{ trace_id: traceId, used_at: now, status: 'refreshed' }],
+  };
+  writeJsonFile(file, entry);
+  return { entry, file };
+}
+
+async function ensurePromptCache(model, traceId) {
+  if (!promptCacheDir || !model) {
+    return { systemPrompt: null, agentIdentity: null, meta: promptCacheMeta(null, null, 'disabled', false) };
+  }
+  const cached = freshPromptCache(model);
+  if (cached) {
+    const used = recordPromptCacheUse(model, traceId, 'hit') || cached;
+    return {
+      systemPrompt: used.entry.system_prompt,
+      agentIdentity: used.entry.agent_identity,
+      meta: promptCacheMeta(used.entry, used.file, 'hit', false),
+    };
+  }
+
+  if (!promptCaptures.has(model)) {
+    promptCaptures.set(model, capturePromptForModel(model, traceId)
+      .finally(() => promptCaptures.delete(model)));
+  }
+  try {
+    const refreshed = await promptCaptures.get(model);
+    return {
+      systemPrompt: refreshed.entry.system_prompt,
+      agentIdentity: refreshed.entry.agent_identity,
+      meta: promptCacheMeta(refreshed.entry, refreshed.file, 'refreshed', false),
+    };
+  } catch (err) {
+    return {
+      systemPrompt: null,
+      agentIdentity: null,
+      meta: promptCacheMeta({ key: promptCacheKey(model), model }, promptCachePath(model), 'failed', false, err.message),
+    };
+  }
+}
+
+function applyPromptCache(body, cache) {
+  if (!cache?.systemPrompt || !body || typeof body !== 'object') return false;
+  if (!Array.isArray(body.system) || body.system.length < 3) return false;
+  const promptBlock = body.system[2];
+  if (!promptBlock || typeof promptBlock.text !== 'string') return false;
+  const original = promptBlock.text;
+  const prefaceIndex = original.indexOf(clientSystemPreface);
+  const suffix = prefaceIndex >= 0 ? original.slice(prefaceIndex) : '';
+  promptBlock.text = `${cache.systemPrompt}${suffix}`;
+  if (cache.agentIdentity && body.system[1] && typeof body.system[1].text === 'string') {
+    body.system[1].text = cache.agentIdentity;
+  }
+  return true;
+}
+
+const originalCreateServer = http.createServer;
+http.createServer = function patchedCreateServer(...args) {
+  const idx = args.findIndex((arg) => typeof arg === 'function');
+  if (idx >= 0) {
+    const listener = args[idx];
+    args[idx] = function wrappedRequestListener(req, res) {
+      const ctx = requestCaptureContext(req);
+      if (!ctx) return listener.call(this, req, res);
+      return als.run(ctx, () => listener.call(this, req, res));
+    };
+  }
+  return originalCreateServer.apply(this, args);
+};
+try { syncBuiltinESMExports(); } catch {}
+
+function requestUrl(input) {
+  if (typeof input === 'string') return input;
+  if (input && typeof input.href === 'string') return input.href;
+  if (input && typeof input.url === 'string') return input.url;
+  return '';
+}
+
+const originalFetch = globalThis.fetch;
+if (typeof originalFetch === 'function') {
+  globalThis.fetch = async function patchedFetch(input, init = undefined) {
+    const store = als.getStore();
+    const url = requestUrl(input);
+    if (!store || !captureDir || !url.startsWith('https://api.anthropic.com/')) {
+      return originalFetch.call(this, input, init);
+    }
+
+    const attempt = ++store.attempt;
+    let fetchInit = init;
+    let requestBody = captureBody(init?.body);
+    const model = normalizeCaptureModel(store.model || requestBody?.model);
+    let promptCache = await ensurePromptCache(model, store.id);
+    if (requestBody && typeof requestBody === 'object') {
+      const applied = applyPromptCache(requestBody, promptCache);
+      promptCache.meta.applied = applied;
+      if (applied) {
+        const headers = new Headers(init?.headers ?? input?.headers ?? {});
+        headers.delete('content-length');
+        fetchInit = { ...(init || {}), headers, body: JSON.stringify(requestBody) };
+      }
+    }
+
+    const headers = fetchInit?.headers ?? input?.headers ?? {};
+    writeCapture(store.id, 'dario-upstream-request', {
+      trace_id: store.id,
+      captured_at: new Date().toISOString(),
+      direction: 'dario->anthropic',
+      attempt,
+      method: fetchInit?.method ?? input?.method ?? 'GET',
+      url,
+      headers: captureHeaders(headers),
+      prompt_cache: promptCache.meta,
+      body: requestBody,
+    });
+
+    const response = await originalFetch.call(this, input, fetchInit);
+    try {
+      const clone = response.clone();
+      clone.text().then((text) => {
+        writeCapture(store.id, 'dario-upstream-response', {
+          trace_id: store.id,
+          captured_at: new Date().toISOString(),
+          direction: 'anthropic->dario',
+          attempt,
+          status: response.status,
+          headers: captureHeaders(response.headers),
+          body: captureBody(text),
+        });
+      }).catch(() => {});
+    } catch {}
+    return response;
+  };
+}
+"#
+}
+
+fn write_if_changed(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let contents = contents.as_ref();
+    if std::fs::read(path)
+        .map(|current| current == contents)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {path:?}"))
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn node_options_with_require(preload: &Path) -> String {
+    let require = format!("--require={}", preload.to_string_lossy());
+    match std::env::var("NODE_OPTIONS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {require}"),
+        _ => require,
+    }
+}
+
+fn quarantine_fable_live_cache() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let path = home.join(".dario").join("cc-template.live.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    if value["system_prompt_fable"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let prompt = value["system_prompt"].as_str().unwrap_or("");
+    let contaminated = prompt.contains("This iteration of Claude is Claude Fable 5")
+        || prompt.contains("exact model ID is claude-fable-5");
+    if !contaminated {
+        return;
+    }
+    let quarantine = path.with_file_name(format!(
+        "cc-template.live.json.alexandria-quarantine-{}",
+        now_ms()
+    ));
+    match std::fs::rename(&path, &quarantine) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            quarantine = %quarantine.display(),
+            "quarantined Dario live template captured from Fable default model"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "could not quarantine Fable-contaminated Dario live template"
+        ),
     }
 }
 
