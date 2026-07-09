@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use alex_auth::{now_ms, Account, Vault};
 use alex_core::{
-    compute_cost, conversation_root, parse_since, parse_sse_usage, parse_trace_tags, route_model,
-    usage_from_json, ClientFormat, Provider, TraceRecord,
+    compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
+    parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
+    ClientFormat, Provider, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{Store, TraceFilter};
 use axum::body::{Body, Bytes};
@@ -77,6 +78,7 @@ pub struct AppState {
     pub started_ms: i64,
     pub base_url: String,
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
+    pub xai_usage: std::sync::Mutex<UsageCache>,
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
@@ -130,6 +132,7 @@ pub fn build_state(
         started_ms: now_ms(),
         base_url,
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
+        xai_usage: std::sync::Mutex::new(UsageCache::default()),
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
@@ -540,9 +543,144 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     }
 }
 
+/// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
+/// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
+async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state.vault.account_for(Provider::Xai, true).await.ok()?;
+    if account.kind != "oauth" {
+        return None;
+    }
+    let token = account.access_token.as_deref()?.to_string();
+    {
+        let cache = state.xai_usage.lock().unwrap();
+        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
+            return cache.entry.clone();
+        }
+        if now_ms() < cache.cooldown_until_ms {
+            return cache.entry.clone();
+        }
+    }
+
+    let result = state
+        .http
+        .post(GROK_CREDITS_ENDPOINT)
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", "https://grok.com")
+        .header("referer", "https://grok.com/?_s=usage")
+        .header("accept", "*/*")
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .header("x-user-agent", "connect-es/2.1.1")
+        .header("user-agent", "Alexandria")
+        .body(GROK_CREDITS_REQUEST_BODY.to_vec())
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            let headers_for_grpc: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str();
+                    if key.starts_with("grpc-") {
+                        v.to_str().ok().map(|val| (key.to_string(), val.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if let Err(e) = validate_grpc_status_headers(headers_for_grpc) {
+                tracing::debug!(error = %e, "xai grok credits grpc header status failed");
+                let mut cache = state.xai_usage.lock().unwrap();
+                cache.failures += 1;
+                let cooldown = usage_backoff_ms(cache.failures, None);
+                cache.cooldown_until_ms = now_ms() + cooldown;
+                return cache.entry.clone();
+            }
+            let body = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(error = %e, "xai grok credits body read failed");
+                    let mut cache = state.xai_usage.lock().unwrap();
+                    cache.failures += 1;
+                    let cooldown = usage_backoff_ms(cache.failures, None);
+                    cache.cooldown_until_ms = now_ms() + cooldown;
+                    return cache.entry.clone();
+                }
+            };
+            let now_s = now_ms() / 1000;
+            match parse_grpc_web_response(&body, now_s) {
+                Ok(snap) => {
+                    let label = window_label(snap.resets_at_s, now_s);
+                    let mut window = json!({
+                        "window": label,
+                        "used_pct": snap.used_percent,
+                    });
+                    if let Some(ts) = snap.resets_at_s {
+                        window["resets_at_s"] = json!(ts);
+                    }
+                    let entry = json!({
+                        "provider": "xai",
+                        "source": "grok web billing",
+                        "plan": account.label,
+                        "windows": [window],
+                    });
+                    let mut cache = state.xai_usage.lock().unwrap();
+                    cache.fetched_at_ms = now_ms();
+                    cache.cooldown_until_ms = 0;
+                    cache.failures = 0;
+                    cache.entry = Some(entry.clone());
+                    Some(entry)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "xai grok credits parse failed");
+                    let mut cache = state.xai_usage.lock().unwrap();
+                    cache.failures += 1;
+                    let cooldown = usage_backoff_ms(cache.failures, None);
+                    cache.cooldown_until_ms = now_ms() + cooldown;
+                    cache.entry.clone()
+                }
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|s| s.clamp(30, 3600) * 1000);
+            let mut cache = state.xai_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, retry_after);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            tracing::debug!(
+                status,
+                failures = cache.failures,
+                cooldown_ms = cooldown,
+                "xai grok web billing unavailable; backing off"
+            );
+            cache.entry.clone()
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "xai grok web billing request failed");
+            let mut cache = state.xai_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, None);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            cache.entry.clone()
+        }
+    }
+}
+
 pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
     let mut providers: Vec<Value> = Vec::new();
     if let Some(entry) = anthropic_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = xai_usage_entry(state).await {
         providers.push(entry);
     }
     for (provider_str, ts_ms, headers_json) in

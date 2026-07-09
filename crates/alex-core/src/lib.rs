@@ -1,4 +1,10 @@
+pub mod grok_billing;
 pub mod translate;
+
+pub use grok_billing::{
+    parse_grpc_web_response, validate_grpc_status_headers, window_label, GrokWebBillingError,
+    GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
