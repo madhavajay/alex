@@ -7,6 +7,25 @@ enum HarnessIconLoader {
     private static var cache: [String: NSImage] = [:]
     private static var misses: Set<String> = []
 
+    // Bundle.module traps when the SwiftPM resource bundle can't be resolved,
+    // which took the whole app down from an icon lookup (0.1.19 Trace Browser
+    // crash). Resolve it by hand and treat a missing bundle as "no icon".
+    private static let resourceBundle: Bundle? = {
+        let name = "AlexandriaBar_AlexandriaBar.bundle"
+        let candidates = [
+            Bundle.main.resourceURL,
+            Bundle.main.bundleURL,
+            Bundle.main.executableURL?.deletingLastPathComponent(),
+        ]
+        for base in candidates {
+            if let url = base?.appendingPathComponent(name), let bundle = Bundle(url: url) {
+                return bundle
+            }
+        }
+        BarLog.warn(.ui, "harness icon resource bundle missing; icons disabled")
+        return nil
+    }()
+
     static func image(harness: String?, tags: [String: String]?) -> NSImage? {
         guard let file = HarnessIcon.assetName(harness: harness, tags: tags) else { return nil }
         if let cached = cache[file] { return cached }
@@ -14,7 +33,7 @@ enum HarnessIconLoader {
         let name = (file as NSString).deletingPathExtension
         let ext = (file as NSString).pathExtension
         guard
-            let url = Bundle.module.url(
+            let url = resourceBundle?.url(
                 forResource: name, withExtension: ext, subdirectory: "logos"),
             let image = NSImage(contentsOf: url), image.isValid
         else {
