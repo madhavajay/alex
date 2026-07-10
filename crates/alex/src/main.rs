@@ -619,7 +619,9 @@ fn open_vault(config: &Config) -> Result<Vault> {
         };
         policies.push((p, v.clone()));
     }
-    vault.set_policies_blocking(policies);
+    if !policies.is_empty() {
+        vault.set_policies_blocking(policies);
+    }
     Ok(vault)
 }
 

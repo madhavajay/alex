@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alex_auth::{now_ms, Account, Vault};
+use alex_auth::{now_ms, Account, AccountPolicy, AccountPolicyMode, Vault};
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
     parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
@@ -66,6 +66,39 @@ fn suspect_dario(state: &AppState, account: &Account) {
     if let (Some(dario), Some(gen)) = (&state.dario, account.id.strip_prefix("dario:")) {
         dario.suspect(gen);
     }
+}
+
+fn codex_limits_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    const LIMIT_HEADERS: &[&str] = &[
+        "x-codex-primary-used-percent",
+        "x-codex-primary-window-minutes",
+        "x-codex-primary-reset-at",
+        "x-codex-secondary-used-percent",
+        "x-codex-secondary-window-minutes",
+        "x-codex-secondary-reset-at",
+        "x-codex-plan-type",
+        "x-codex-active-limit",
+        "x-codex-credits-balance",
+        "x-codex-credits-has-credits",
+        "x-codex-credits-unlimited",
+    ];
+    let mut safe = serde_json::Map::new();
+    for name in LIMIT_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) {
+            safe.insert((*name).to_string(), json!(value));
+        }
+    }
+    if safe.is_empty() {
+        return None;
+    }
+    let parsed = alex_core::parse_limit_headers(Provider::Openai, &Value::Object(safe));
+    let has_windows = parsed
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(|windows| !windows.is_empty())
+        .unwrap_or(false);
+    let has_plan = parsed.get("plan").is_some_and(|value| !value.is_null());
+    (has_windows || has_plan).then_some(parsed)
 }
 
 pub struct AppState {
@@ -182,6 +215,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/accounts/analytics", get(admin_account_analytics))
+        .route(
+            "/admin/accounts/routing/openai",
+            get(admin_codex_routing).put(admin_codex_routing_update),
+        )
         .route(
             "/admin/accounts/{id}",
             axum::routing::delete(admin_account_remove).put(admin_account_update),
@@ -1486,12 +1523,29 @@ async fn traces_run_artifacts(
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let openai_policy = state.vault.policy(Provider::Openai);
     let accounts: Vec<Value> = state
         .vault
         .list()
         .await
         .into_iter()
         .map(|a| {
+            let routing = if a.provider == Provider::Openai {
+                json!({
+                    "eligible": !openai_policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
+                    "priority": openai_policy.order.iter().position(|name| name == &a.name),
+                })
+            } else {
+                Value::Null
+            };
+            let limits = if a.provider == Provider::Openai {
+                a.account_meta
+                    .get("codex_limits")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -1504,10 +1558,171 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "status": a.status,
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
+                "routing": routing,
+                "limits": limits,
             })
         })
         .collect();
     axum::Json(json!({"accounts": accounts}))
+}
+
+fn codex_strategy_name(mode: &AccountPolicyMode) -> &'static str {
+    match mode {
+        AccountPolicyMode::ResetFirst => "reset_first",
+        AccountPolicyMode::RoundRobin => "round_robin",
+        AccountPolicyMode::Priority | AccountPolicyMode::Threshold => "priority",
+    }
+}
+
+async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
+    let policy = state.vault.policy(Provider::Openai);
+    let mut accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| account.provider == Provider::Openai)
+        .collect();
+    accounts.sort_by_key(|account| {
+        (
+            policy
+                .order
+                .iter()
+                .position(|name| name == &account.name)
+                .unwrap_or(usize::MAX / 2),
+            account.name.clone(),
+            account.id.clone(),
+        )
+    });
+    let accounts: Vec<Value> = accounts
+        .into_iter()
+        .enumerate()
+        .map(|(fallback_priority, account)| {
+            let eligible = !policy
+                .disabled
+                .iter()
+                .any(|name| name == &account.name || name == &account.id);
+            let priority = policy
+                .order
+                .iter()
+                .position(|name| name == &account.name)
+                .unwrap_or(fallback_priority);
+            let limits = account
+                .account_meta
+                .get("codex_limits")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            json!({
+                "account_id": account.id,
+                "eligible": eligible,
+                "priority": priority,
+                "observed_at_ms": limits.get("observed_at_ms"),
+                "plan": limits.get("plan"),
+                "active_limit": limits.get("active_limit"),
+                "windows": limits.get("windows").cloned().unwrap_or_else(|| json!([])),
+                "credits": limits.get("credits").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    json!({
+        "provider": "openai",
+        "strategy": codex_strategy_name(&policy.mode),
+        "reserve_pct": policy.reserve_pct.unwrap_or(10).min(100),
+        "accounts": accounts,
+    })
+}
+
+async fn admin_codex_routing(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(codex_routing_snapshot(&state).await).into_response()
+}
+
+async fn admin_codex_routing_update(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let mode = match body.0.get("strategy").and_then(Value::as_str) {
+        Some("reset_first") => AccountPolicyMode::ResetFirst,
+        Some("priority") => AccountPolicyMode::Priority,
+        Some("round_robin") => AccountPolicyMode::RoundRobin,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "strategy must be reset_first, priority, or round_robin",
+            )
+        }
+    };
+    let Some(reserve_pct) = body.0.get("reserve_pct").and_then(Value::as_u64) else {
+        return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer");
+    };
+    if reserve_pct > 100 {
+        return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be between 0 and 100");
+    }
+    let Some(requested) = body.0.get("accounts").and_then(Value::as_array) else {
+        return error_response(StatusCode::BAD_REQUEST, "accounts must be an array");
+    };
+    let openai_accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| account.provider == Provider::Openai)
+        .collect();
+    let by_id: HashMap<String, String> = openai_accounts
+        .iter()
+        .map(|account| (account.id.clone(), account.name.clone()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    for item in requested {
+        let Some(account_id) = item.get("account_id").and_then(Value::as_str) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs account_id");
+        };
+        let Some(eligible) = item.get("eligible").and_then(Value::as_bool) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs boolean eligible");
+        };
+        let Some(priority) = item.get("priority").and_then(Value::as_u64) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs integer priority");
+        };
+        let Some(name) = by_id.get(account_id) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown OpenAI account '{account_id}'"),
+            );
+        };
+        if !seen.insert(account_id.to_string()) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate OpenAI account '{account_id}'"),
+            );
+        }
+        ordered.push((priority, name.clone(), eligible));
+    }
+    if seen.len() != by_id.len() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "account list changed; refresh Settings and save again",
+        );
+    }
+    ordered.sort_by_key(|(priority, name, _)| (*priority, name.clone()));
+    let policy = AccountPolicy {
+        order: ordered.iter().map(|(_, name, _)| name.clone()).collect(),
+        mode,
+        threshold_pct: None,
+        reserve_pct: Some(reserve_pct as u8),
+        disabled: ordered
+            .iter()
+            .filter(|(_, _, eligible)| !*eligible)
+            .map(|(_, name, _)| name.clone())
+            .collect(),
+    };
+    match state
+        .vault
+        .set_policy_persisted(Provider::Openai, policy)
+        .await
+    {
+        Ok(()) => axum::Json(codex_routing_snapshot(&state).await).into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
@@ -3066,6 +3281,17 @@ async fn proxy(
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         };
+        if account.provider == Provider::Openai && account.kind == "oauth" {
+            if let Some(snapshot) = codex_limits_from_headers(resp.headers()) {
+                if let Err(error) = state
+                    .vault
+                    .record_codex_limits(&account.id, snapshot)
+                    .await
+                {
+                    tracing::warn!(account = %account.id, %error, "could not persist Codex limit snapshot");
+                }
+            }
+        }
         let retryable_status = resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
             || resp.status() == reqwest::StatusCode::UNAUTHORIZED
             || resp.status() == reqwest::StatusCode::FORBIDDEN
@@ -3528,6 +3754,101 @@ mod tests {
             };
             Box::pin(async move { result })
         }
+    }
+
+    fn test_openai_account(name: &str) -> Account {
+        Account {
+            id: if name == "default" {
+                "openai-oauth".into()
+            } else {
+                format!("openai-oauth-{name}")
+            },
+            provider: Provider::Openai,
+            kind: "oauth".into(),
+            name: name.into(),
+            description: None,
+            paused: false,
+            label: Some("codex (test)".into()),
+            access_token: Some(format!("token-{name}")),
+            refresh_token: Some(format!("refresh-{name}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 3_600_000),
+            last_refresh_ms: Some(now_ms()),
+            account_meta: json!({"account_id": format!("chatgpt-{name}")}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn captures_only_safe_codex_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        headers.insert("x-codex-plan-type", HeaderValue::from_static("plus"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("300"),
+        );
+        headers.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("1800000000"),
+        );
+        let snapshot = codex_limits_from_headers(&headers).unwrap();
+        assert_eq!(snapshot["plan"], "plus");
+        assert_eq!(snapshot["windows"][0]["window"], "5h");
+        assert_eq!(snapshot["windows"][0]["used_pct"], 42.0);
+        assert!(!snapshot.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn codex_routing_api_updates_eligibility_order_and_reserve() {
+        let state = test_state("codex-routing");
+        state
+            .vault
+            .upsert(test_openai_account("default"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_openai_account("work"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(
+            admin_codex_routing_update(
+                State(state.clone()),
+                axum::Json(json!({
+                    "strategy": "priority",
+                    "reserve_pct": 15,
+                    "accounts": [
+                        {"account_id": "openai-oauth-work", "eligible": true, "priority": 0},
+                        {"account_id": "openai-oauth", "eligible": false, "priority": 1}
+                    ]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["strategy"], "priority");
+        assert_eq!(body["reserve_pct"], 15);
+        assert_eq!(body["accounts"][0]["account_id"], "openai-oauth-work");
+        assert_eq!(body["accounts"][0]["eligible"], true);
+        assert_eq!(body["accounts"][1]["eligible"], false);
+        assert_eq!(
+            state
+                .vault
+                .account_for(Provider::Openai, true)
+                .await
+                .unwrap()
+                .name,
+            "work"
+        );
     }
 
     #[tokio::test]
