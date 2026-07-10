@@ -77,8 +77,6 @@ struct HarnessActionResultView: View {
     var onCancel: (() -> Void)? = nil
     let onClose: () -> Void
 
-    private let listCap = 12
-
     static let minSize = CGSize(width: 420, height: 360)
     static let idealSize = CGSize(width: 480, height: 420)
 
@@ -298,7 +296,6 @@ struct HarnessActionResultView: View {
 
 struct HarnessConfigWriteSummaryView: View {
     let result: HarnessConfigWriteResponse
-    private let listCap = 12
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -365,23 +362,16 @@ struct HarnessConfigWriteSummaryView: View {
 
     @ViewBuilder
     private func modelList(title: String, ids: [String], tint: Color) -> some View {
-        let shown = Array(ids.prefix(listCap))
-        let overflow = max(0, ids.count - listCap)
         VStack(alignment: .leading, spacing: 3) {
             Text("\(title) (\(ids.count))")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(tint)
-            ForEach(shown, id: \.self) { id in
+            ForEach(ids, id: \.self) { id in
                 Text(id)
                     .font(.system(size: 11, design: .monospaced))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
-            }
-            if overflow > 0 {
-                Text("+\(overflow) more")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -389,7 +379,6 @@ struct HarnessConfigWriteSummaryView: View {
 
 struct HarnessDisconnectSummaryView: View {
     let result: HarnessDisconnectResponse
-    private let listCap = 12
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -411,22 +400,15 @@ struct HarnessDisconnectSummaryView: View {
                     .foregroundStyle(.secondary)
             }
             if !result.removed.isEmpty {
-                let shown = Array(result.removed.prefix(listCap))
-                let overflow = max(0, result.removed.count - listCap)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Removed (\(result.removed.count))")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.orange)
-                    ForEach(shown, id: \.self) { id in
+                    ForEach(result.removed, id: \.self) { id in
                         Text(id)
                             .font(.system(size: 11, design: .monospaced))
                             .lineLimit(1)
                             .truncationMode(.middle)
-                    }
-                    if overflow > 0 {
-                        Text("+\(overflow) more")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
                     }
                 }
             }
