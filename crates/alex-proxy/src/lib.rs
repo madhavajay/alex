@@ -2056,6 +2056,61 @@ fn client_key(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+const CLAUDE_CODE_PASSTHROUGH_HEADERS: &[&str] = &[
+    "accept",
+    "x-app",
+    "x-claude-code-session-id",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-timeout",
+    "anthropic-dangerous-direct-browser-access",
+];
+
+fn is_genuine_claude_code_request(
+    format: ClientFormat,
+    headers: &HeaderMap,
+    body: &Value,
+) -> bool {
+    if format != ClientFormat::AnthropicMessages {
+        return false;
+    }
+
+    for harness in headers.get_all("x-alexandria-harness").iter() {
+        let Ok(harness) = harness.to_str() else {
+            return false;
+        };
+        let harness = harness.trim().to_ascii_lowercase();
+        if !matches!(harness.as_str(), "claude" | "claude-code") {
+            return false;
+        }
+    }
+
+    let claude_user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("claude-cli/"));
+    let cli_app = headers
+        .get("x-app")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cli"));
+    let has_session = headers
+        .get("x-claude-code-session-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_billing_header = body["system"]
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block["text"].as_str())
+        .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"));
+
+    claude_user_agent && cli_app && has_session && has_billing_header
+}
+
 fn redacted_headers(headers: &HeaderMap) -> String {
     let map: HashMap<String, String> = headers
         .iter()
@@ -2242,9 +2297,12 @@ async fn plan_upstream(
     original_body: &[u8],
     trace_id: &str,
     excluded_accounts: &HashSet<String>,
+    client_headers: &HeaderMap,
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
     use alex_core::translate;
     let client_stream = body_json["stream"].as_bool().unwrap_or(false);
+    let genuine_claude_code =
+        is_genuine_claude_code_request(format, client_headers, body_json);
     match provider {
         Provider::Anthropic => {
             let converted = match format {
@@ -2262,21 +2320,47 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let dario_active = state.dario.as_ref().and_then(|d| d.active());
-            let (base, account, dario_guard, dario_capture) = match (&state.dario, dario_active) {
-                (Some(dario), Some(active)) => (
-                    active.base_url.trim_end_matches('/').to_string(),
-                    dario_account(&active),
-                    dario.begin(&active.generation_id),
-                    true,
-                ),
-                _ => {
-                    let account = state
-                        .vault
-                        .account_for_excluding(provider, true, excluded_accounts)
-                        .await
-                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None, false)
+            let (base, account, dario_guard, dario_capture) = if genuine_claude_code {
+                let account = state
+                    .vault
+                    .account_for_excluding(provider, true, excluded_accounts)
+                    .await
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                (ANTHROPIC_BASE.to_string(), account, None, false)
+            } else {
+                let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
+                match (&state.dario, dario_active) {
+                    (Some(dario), Some(active)) => {
+                        let guard = dario.begin(&active.generation_id).ok_or_else(|| {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Dario became unavailable while routing the Anthropic request"
+                                    .to_string(),
+                            )
+                        })?;
+                        (
+                            active.base_url.trim_end_matches('/').to_string(),
+                            dario_account(&active),
+                            Some(guard),
+                            true,
+                        )
+                    }
+                    (Some(_), None) => {
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Dario is configured but no healthy generation is available"
+                                .to_string(),
+                        ));
+                    }
+                    (None, None) => {
+                        let account = state
+                            .vault
+                            .account_for_excluding(provider, true, excluded_accounts)
+                            .await
+                            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                        (ANTHROPIC_BASE.to_string(), account, None, false)
+                    }
+                    (None, Some(_)) => unreachable!("Dario cannot be active when it is disabled"),
                 }
             };
             let (body, respond_as) = match converted {
@@ -2728,6 +2812,7 @@ mod usage_tests {
 fn upstream_headers(
     account: &Account,
     client_headers: &HeaderMap,
+    genuine_claude_code: bool,
 ) -> Result<reqwest::header::HeaderMap, (StatusCode, String)> {
     let mut h = reqwest::header::HeaderMap::new();
     h.insert("content-type", HeaderValue::from_static("application/json"));
@@ -2870,6 +2955,13 @@ fn upstream_headers(
                 HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
+        }
+    }
+    if genuine_claude_code && account.provider == Provider::Anthropic {
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            if let Some(value) = client_headers.get(*name) {
+                h.insert(*name, value.clone());
+            }
         }
     }
     Ok(h)
@@ -3178,6 +3270,7 @@ async fn proxy(
     let (reasoning_effort, thinking_budget) = trace_reasoning_fields(&body_json);
     trace.reasoning_effort = reasoning_effort;
     trace.thinking_budget = thinking_budget;
+    let genuine_claude_code = is_genuine_claude_code_request(format, &headers, &body_json);
 
     trace.session_id = headers
         .get("x-session-id")
@@ -3223,6 +3316,7 @@ async fn proxy(
         &body,
         &trace_id,
         &attempted_accounts,
+        &headers,
     )
     .await
     {
@@ -3251,6 +3345,7 @@ async fn proxy(
         provider = provider.as_str(),
         account = %plan.account.id,
         url = %plan.url,
+        genuine_claude_code,
         "proxying request"
     );
 
@@ -3264,7 +3359,8 @@ async fn proxy(
 
         let mut forced_oauth_refresh = false;
         loop {
-            let mut up_headers = match upstream_headers(&account, &headers) {
+            let mut up_headers =
+                match upstream_headers(&account, &headers, genuine_claude_code) {
                 Ok(h) => h,
                 Err((status, msg)) => {
                     trace.status = Some(status.as_u16() as i64);
@@ -3311,7 +3407,6 @@ async fn proxy(
                     }
                 }
             }
-
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 && account.kind == "oauth"
                 && !forced_oauth_refresh
@@ -3359,6 +3454,7 @@ async fn proxy(
                     &body,
                     &trace_id,
                     &attempted_accounts,
+                    &headers,
                 )
                 .await
                 {
@@ -3773,6 +3869,13 @@ mod tests {
     }
 
     fn test_state(name: &str) -> Arc<AppState> {
+        test_state_with_dario(name, None)
+    }
+
+    fn test_state_with_dario(
+        name: &str,
+        dario: Option<Arc<dyn DarioRouter>>,
+    ) -> Arc<AppState> {
         let dir = tmpdir(name);
         let store = Arc::new(Store::open(dir.join("store")).unwrap());
         let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
@@ -3780,9 +3883,323 @@ mod tests {
             "alx-local".into(),
             vault,
             store,
-            None,
+            dario,
             "http://127.0.0.1:4100".into(),
         )
+    }
+
+    fn anthropic_account() -> Account {
+        Account {
+            id: "anthropic:test".into(),
+            provider: Provider::Anthropic,
+            kind: "oauth".into(),
+            name: "test".into(),
+            description: None,
+            paused: false,
+            label: None,
+            access_token: Some("direct-token".into()),
+            refresh_token: None,
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 3_600_000),
+            last_refresh_ms: None,
+            account_meta: Value::Null,
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    struct FakeDario {
+        active: Option<DarioActive>,
+        begin_succeeds: bool,
+    }
+
+    impl DarioRouter for FakeDario {
+        fn active(&self) -> Option<DarioActive> {
+            self.active.clone()
+        }
+
+        fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
+            self.begin_succeeds
+                .then(|| Box::new(()) as Box<dyn std::any::Any + Send>)
+        }
+
+        fn status(&self) -> Value {
+            json!({"active": self.active.is_some()})
+        }
+
+        fn suspect(&self, _generation_id: &str) {}
+    }
+
+    fn active_dario() -> Arc<dyn DarioRouter> {
+        Arc::new(FakeDario {
+            active: Some(DarioActive {
+                generation_id: "test-generation".into(),
+                base_url: "http://127.0.0.1:9191".into(),
+                api_key: "dario-key".into(),
+            }),
+            begin_succeeds: true,
+        })
+    }
+
+    fn claude_code_request() -> (HeaderMap, Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.0"));
+        headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-123"),
+        );
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.0"
+            }],
+            "messages": []
+        });
+        (headers, body)
+    }
+
+    #[test]
+    fn claude_code_detection_requires_the_complete_signature() {
+        let (headers, body) = claude_code_request();
+        assert!(is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &headers,
+            &body
+        ));
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::OpenaiChat,
+            &headers,
+            &body
+        ));
+
+        for required in ["user-agent", "x-app", "x-claude-code-session-id"] {
+            let mut missing = headers.clone();
+            missing.remove(required);
+            assert!(
+                !is_genuine_claude_code_request(
+                    ClientFormat::AnthropicMessages,
+                    &missing,
+                    &body
+                ),
+                "request without {required} must not bypass Dario"
+            );
+        }
+
+        let mut missing_billing = body.clone();
+        missing_billing["system"] = json!([]);
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &headers,
+            &missing_billing
+        ));
+
+        let mut explicit_other_harness = headers;
+        explicit_other_harness.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("pi"),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &explicit_other_harness,
+            &body
+        ));
+
+        let (mut conflicting_harness, body) = claude_code_request();
+        conflicting_harness.append(
+            "x-alexandria-harness",
+            HeaderValue::from_static("claude-code"),
+        );
+        conflicting_harness.append(
+            "x-alexandria-harness",
+            HeaderValue::from_static("codex"),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &conflicting_harness,
+            &body
+        ));
+
+        let (mut malformed_harness, body) = claude_code_request();
+        malformed_harness.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_bytes(b"\x80").unwrap(),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &malformed_harness,
+            &body
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_routing_bypasses_dario_only_for_claude_code() {
+        let state = test_state_with_dario("dario-routing", Some(active_dario()));
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (claude_headers, request) = claude_code_request();
+        let original = serde_json::to_vec(&request).unwrap();
+        let excluded = HashSet::new();
+
+        let mut direct_body = request.clone();
+        let direct = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut direct_body,
+            &original,
+            "trace-direct",
+            &excluded,
+            &claude_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(direct.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(direct.account.id, "anthropic:test");
+        assert!(direct.extra_headers.is_empty());
+
+        let mut harness_headers = HeaderMap::new();
+        harness_headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        let mut dario_body = request;
+        let dario = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut dario_body,
+            &original,
+            "trace-dario",
+            &excluded,
+            &harness_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dario.url, "http://127.0.0.1:9191/v1/messages");
+        assert_eq!(dario.account.kind, "dario");
+        assert!(dario
+            .extra_headers
+            .contains(&("x-dario-capture-id".into(), "trace-dario".into())));
+    }
+
+    #[tokio::test]
+    async fn configured_dario_fails_closed_when_unhealthy() {
+        let state = test_state_with_dario(
+            "dario-unhealthy",
+            Some(Arc::new(FakeDario {
+                active: None,
+                begin_succeeds: false,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (_, mut request) = claude_code_request();
+        let client_headers = HeaderMap::new();
+        let excluded = HashSet::new();
+        let original = serde_json::to_vec(&request).unwrap();
+
+        let result = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut request,
+            &original,
+            "trace-unhealthy",
+            &excluded,
+            &client_headers,
+        )
+        .await;
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(message.contains("no healthy generation"));
+            }
+            Ok(_) => panic!("an unhealthy configured Dario must not fall back to direct traffic"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dario_generation_race_fails_closed() {
+        let state = test_state_with_dario(
+            "dario-generation-race",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "vanished-generation".into(),
+                    base_url: "http://127.0.0.1:9191".into(),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: false,
+            })),
+        );
+        let (_, mut request) = claude_code_request();
+        let original = serde_json::to_vec(&request).unwrap();
+        let client_headers = HeaderMap::new();
+        let excluded = HashSet::new();
+
+        let result = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut request,
+            &original,
+            "trace-race",
+            &excluded,
+            &client_headers,
+        )
+        .await;
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(message.contains("became unavailable"));
+            }
+            Ok(_) => panic!("a vanished Dario generation must not fall back to direct traffic"),
+        }
+    }
+
+    #[test]
+    fn direct_claude_code_headers_are_allowlisted() {
+        let (mut client_headers, _) = claude_code_request();
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            client_headers.insert(*name, HeaderValue::from_static("safe-client-value"));
+        }
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-secret"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
+        client_headers.insert("host", HeaderValue::from_static("attacker.invalid"));
+        client_headers.insert("content-length", HeaderValue::from_static("999"));
+        client_headers.insert("connection", HeaderValue::from_static("close"));
+        client_headers.insert("accept-encoding", HeaderValue::from_static("br"));
+        client_headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("claude"),
+        );
+        client_headers.insert(
+            "x-dario-capture-id",
+            HeaderValue::from_static("spoofed"),
+        );
+
+        let direct = upstream_headers(&anthropic_account(), &client_headers, true).unwrap();
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            assert_eq!(direct[*name], "safe-client-value", "missing {name}");
+        }
+        assert_eq!(direct["authorization"], "Bearer direct-token");
+        assert!(direct.get("x-api-key").is_none());
+        assert!(direct.get("host").is_none());
+        assert!(direct.get("content-length").is_none());
+        assert!(direct.get("connection").is_none());
+        assert_eq!(direct["accept-encoding"], "identity");
+        assert!(direct.get("x-alexandria-harness").is_none());
+        assert!(direct.get("x-dario-capture-id").is_none());
+
+        let non_claude = upstream_headers(&anthropic_account(), &client_headers, false).unwrap();
+        assert!(non_claude.get("x-app").is_none());
+        assert!(non_claude.get("x-claude-code-session-id").is_none());
+        assert_eq!(non_claude["authorization"], "Bearer direct-token");
     }
 
     async fn response_json(resp: Response) -> (StatusCode, Value) {
@@ -4093,6 +4510,7 @@ mod tests {
 
         let original = json!({"model": "gpt-5.3-codex", "stream": true});
         let raw = serde_json::to_vec(&original).unwrap();
+        let client_headers = HeaderMap::new();
         let mut excluded = HashSet::new();
         let mut selected = Vec::new();
         for _ in 0..3 {
@@ -4106,6 +4524,7 @@ mod tests {
                 &raw,
                 "trace-test",
                 &excluded,
+                &client_headers,
             )
             .await
             .unwrap();
@@ -4127,6 +4546,7 @@ mod tests {
             &raw,
             "trace-test",
             &excluded,
+            &client_headers,
         )
         .await
         .is_err());

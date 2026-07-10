@@ -670,6 +670,15 @@ impl DarioSupervisor {
     fn spawn_generation(&self, version: &str, bin: &Path) -> Result<Arc<Generation>> {
         let port = alloc_port()?;
         let id = generation_id(version, port);
+        let work_dir = self.settings.install_root.join("workspace");
+        std::fs::create_dir_all(&work_dir)
+            .with_context(|| format!("creating private Dario workspace {work_dir:?}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing private Dario workspace {work_dir:?}"))?;
+        }
         let stdout_log = self.settings.log_root.join(format!("{id}.out.log"));
         let stderr_log = self.settings.log_root.join(format!("{id}.err.log"));
         let out = std::fs::File::create(&stdout_log)
@@ -691,10 +700,12 @@ impl DarioSupervisor {
                 "ALEXANDRIA_DARIO_PROMPT_CACHE_DIR",
                 &self.settings.prompt_cache_root,
             )
+            .env("ALEXANDRIA_DARIO_WORK_DIR", &work_dir)
             .env("NODE_OPTIONS", node_options)
             // The fetch-capture preload is a Node hook. Keeping supervised
             // Dario in Node avoids losing trace capture to Bun auto-relaunch.
             .env("DARIO_NO_BUN", "1")
+            .current_dir(&work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
@@ -1468,6 +1479,7 @@ async function capturePromptForModel(model, traceId) {
       try {
         child = childProcess.spawn(claudeBin, ['--model', model, '--print', '-p', 'hi'], {
           env,
+          cwd: process.env.ALEXANDRIA_DARIO_WORK_DIR || process.cwd(),
           stdio: ['ignore', 'ignore', 'ignore'],
           windowsHide: true,
           shell: useShell,
@@ -1865,6 +1877,12 @@ mod tests {
     #[test]
     fn generation_id_format() {
         assert_eq!(generation_id("4.8.139", 5555), "gen-4.8.139-5555");
+    }
+
+    #[test]
+    fn claude_prompt_capture_uses_private_working_directory() {
+        let preload = fetch_capture_preload();
+        assert!(preload.contains("cwd: process.env.ALEXANDRIA_DARIO_WORK_DIR"));
     }
 
     #[test]
