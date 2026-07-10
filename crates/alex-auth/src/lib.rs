@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -273,12 +273,28 @@ impl Vault {
     }
 
     pub async fn account_for(&self, provider: Provider, prefer_oauth: bool) -> Result<Account> {
+        let excluded = HashSet::new();
+        self.account_for_excluding(provider, prefer_oauth, &excluded)
+            .await
+    }
+
+    pub async fn account_for_excluding(
+        &self,
+        provider: Provider,
+        prefer_oauth: bool,
+        excluded: &HashSet<String>,
+    ) -> Result<Account> {
         let now = now_ms();
         let candidates: Vec<Account> = {
             let map = self.accounts.read().await;
             let mut v: Vec<Account> = map
                 .values()
-                .filter(|a| a.provider == provider && a.status == "active" && !a.paused)
+                .filter(|a| {
+                    a.provider == provider
+                        && a.status == "active"
+                        && !a.paused
+                        && !excluded.contains(&a.id)
+                })
                 .cloned()
                 .collect();
             let policy = self.policies.read().expect("policy lock poisoned").iter().find(|(p, _)| *p == provider).map(|(_, p)| p.clone()).unwrap_or_default();
@@ -970,6 +986,63 @@ mod tests {
             .unwrap();
         let degraded = vault.account_for(Provider::Openai, false).await.unwrap();
         assert_eq!(degraded.id, "openai-key-a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn exclusions_visit_each_active_account_once_even_in_degraded_mode() {
+        let dir = temp_dir("excluded-pool");
+        let vault = Vault::open(dir.clone()).unwrap();
+        for id in ["openai-key-a", "openai-key-b", "openai-key-c"] {
+            vault
+                .upsert(api_key_account(id, Provider::Openai))
+                .await
+                .unwrap();
+        }
+
+        let mut paused = api_key_account("openai-key-paused", Provider::Openai);
+        paused.paused = true;
+        vault.upsert(paused).await.unwrap();
+        let mut inactive = api_key_account("openai-key-inactive", Provider::Openai);
+        inactive.status = "disabled".into();
+        vault.upsert(inactive).await.unwrap();
+
+        let now = now_ms();
+        vault
+            .mark_cooldown("openai-key-a", now + 30_000)
+            .await
+            .unwrap();
+        vault
+            .mark_cooldown("openai-key-b", now + 20_000)
+            .await
+            .unwrap();
+        vault
+            .mark_cooldown("openai-key-c", now + 10_000)
+            .await
+            .unwrap();
+
+        let mut excluded = HashSet::new();
+        let mut selected = Vec::new();
+        for _ in 0..3 {
+            let account = vault
+                .account_for_excluding(Provider::Openai, false, &excluded)
+                .await
+                .unwrap();
+            assert!(excluded.insert(account.id.clone()));
+            selected.push(account.id);
+        }
+
+        assert_eq!(
+            selected,
+            vec!["openai-key-c", "openai-key-b", "openai-key-a"]
+        );
+        assert!(vault
+            .account_for_excluding(Provider::Openai, false, &excluded)
+            .await
+            .is_err());
+        assert!(!excluded.contains("openai-key-paused"));
+        assert!(!excluded.contains("openai-key-inactive"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
