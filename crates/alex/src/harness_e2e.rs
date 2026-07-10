@@ -86,6 +86,7 @@ pub struct RunOptions {
     pub container_base_url: String,
     pub timeout_secs: u64,
     pub no_trace_check: bool,
+    pub dario_enabled: bool,
     pub local_key: String,
     pub data_dir: PathBuf,
 }
@@ -109,6 +110,7 @@ pub struct HarnessListRow {
 pub struct CaptureCheck {
     pub trace_count: usize,
     pub checked_trace_id: Option<String>,
+    pub account_id: Option<String>,
     pub complete: bool,
     pub missing: Vec<String>,
 }
@@ -290,7 +292,9 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         .clone()
         .or_else(|| catalog_harness.default_model.clone())
         .unwrap_or_else(|| spec.default_model.to_string());
-    let (_, routed_model) = route_model(&model);
+    let (routed_provider, routed_model) = route_model(&model);
+    let anthropic_route =
+        expected_dario_route(routed_provider, spec.kind, opts.dario_enabled);
     let prompt = opts.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
     let started_ms = now_ms();
     let nonce: u32 = rand::Rng::gen(&mut rand::thread_rng());
@@ -391,11 +395,18 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         CaptureCheck {
             trace_count: 0,
             checked_trace_id: None,
+            account_id: None,
             complete: false,
             missing: vec![],
         }
     } else {
-        verify_capture(&opts.data_dir, started_ms, &routed_model)?
+        verify_capture(
+            &opts.data_dir,
+            started_ms,
+            &routed_model,
+            spec.kind,
+            anthropic_route,
+        )?
     };
     if !opts.no_trace_check && !capture.complete {
         bail!(
@@ -642,18 +653,26 @@ fn run_with_timeout(argv: &[String], timeout: Duration) -> Result<CommandOutcome
     }
 }
 
-fn verify_capture(data_dir: &Path, started_ms: i64, routed_model: &str) -> Result<CaptureCheck> {
+fn verify_capture(
+    data_dir: &Path,
+    started_ms: i64,
+    routed_model: &str,
+    harness: HarnessKind,
+    expect_dario: Option<bool>,
+) -> Result<CaptureCheck> {
     let store = Store::open(data_dir.to_path_buf())?;
     let rows = store.list_traces(100, None, Some(routed_model))?;
     let mut matches = rows
         .into_iter()
         .filter(|r| r["ts_request_ms"].as_i64().unwrap_or(0) >= started_ms)
+        .filter(|r| trace_matches_harness(r["harness"].as_str(), harness))
         .collect::<Vec<_>>();
     matches.sort_by_key(|r| r["ts_request_ms"].as_i64().unwrap_or(0));
     let Some(trace) = matches.last() else {
         return Ok(CaptureCheck {
             trace_count: 0,
             checked_trace_id: None,
+            account_id: None,
             complete: false,
             missing: vec!["trace row".to_string()],
         });
@@ -666,6 +685,7 @@ fn verify_capture(data_dir: &Path, started_ms: i64, routed_model: &str) -> Resul
         "client_format",
         "upstream_provider",
         "upstream_format",
+        "account_id",
         "requested_model",
         "routed_model",
         "req_headers_json",
@@ -689,13 +709,44 @@ fn verify_capture(data_dir: &Path, started_ms: i64, routed_model: &str) -> Resul
     if !usage_present {
         missing.push("usage tokens".to_string());
     }
+    if let Some(expect_dario) = expect_dario {
+        let used_dario = trace["account_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("dario:"));
+        if expect_dario != used_dario {
+            missing.push(if expect_dario {
+                "Dario Anthropic route".to_string()
+            } else {
+                "direct Anthropic route".to_string()
+            });
+        }
+    }
 
     Ok(CaptureCheck {
         trace_count: matches.len(),
         checked_trace_id: trace["id"].as_str().map(String::from),
+        account_id: trace["account_id"].as_str().map(String::from),
         complete: missing.is_empty(),
         missing,
     })
+}
+
+fn trace_matches_harness(user_agent: Option<&str>, harness: HarnessKind) -> bool {
+    let user_agent = user_agent.unwrap_or_default().to_ascii_lowercase();
+    match harness {
+        HarnessKind::Claude => user_agent.starts_with("claude-cli/"),
+        HarnessKind::Codex => user_agent.contains("codex"),
+        HarnessKind::Grok => user_agent.contains("grok") || user_agent.contains("xai"),
+    }
+}
+
+fn expected_dario_route(
+    provider: Option<alex_core::Provider>,
+    harness: HarnessKind,
+    dario_enabled: bool,
+) -> Option<bool> {
+    (provider == Some(alex_core::Provider::Anthropic))
+        .then_some(harness != HarnessKind::Claude && dario_enabled)
 }
 
 fn status_label(status: ExitStatus) -> String {
@@ -878,5 +929,46 @@ mod tests {
         ]);
         assert_eq!(redacted[1], "OPENAI_API_KEY=<redacted>");
         assert_eq!(redacted[2], "ANTHROPIC_API_KEY=<redacted>");
+    }
+
+    #[test]
+    fn capture_matching_separates_parallel_harnesses() {
+        assert!(trace_matches_harness(
+            Some("claude-cli/2.1.0"),
+            HarnessKind::Claude
+        ));
+        assert!(!trace_matches_harness(
+            Some("codex_cli_rs"),
+            HarnessKind::Claude
+        ));
+        assert!(trace_matches_harness(
+            Some("codex_cli_rs"),
+            HarnessKind::Codex
+        ));
+        assert!(trace_matches_harness(
+            Some("xai-grok-workspace"),
+            HarnessKind::Grok
+        ));
+    }
+
+    #[test]
+    fn dario_expectation_exempts_only_claude_code() {
+        let anthropic = Some(alex_core::Provider::Anthropic);
+        assert_eq!(
+            expected_dario_route(anthropic, HarnessKind::Claude, true),
+            Some(false)
+        );
+        assert_eq!(
+            expected_dario_route(anthropic, HarnessKind::Codex, true),
+            Some(true)
+        );
+        assert_eq!(
+            expected_dario_route(anthropic, HarnessKind::Codex, false),
+            Some(false)
+        );
+        assert_eq!(
+            expected_dario_route(Some(alex_core::Provider::Openai), HarnessKind::Codex, true),
+            None
+        );
     }
 }

@@ -666,6 +666,28 @@ impl alex_proxy::DarioRouter for DarioGlue {
     }
 }
 
+struct DarioUnavailable(String);
+
+impl alex_proxy::DarioRouter for DarioUnavailable {
+    fn active(&self) -> Option<alex_proxy::DarioActive> {
+        None
+    }
+
+    fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configured": true,
+            "available": false,
+            "error": self.0,
+        })
+    }
+
+    fn suspect(&self, _generation_id: &str) {}
+}
+
 fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
@@ -1242,7 +1264,13 @@ async fn main() -> Result<()> {
                         supervisor = Some(sup);
                     }
                     Err(e) => {
-                        eprintln!("dario: failed to start ({e}); using direct anthropic upstream");
+                        eprintln!(
+                            "dario: failed to start ({e}); Claude Code remains direct, other Anthropic traffic will fail closed"
+                        );
+                        dario_router = Some(
+                            Arc::new(DarioUnavailable(e.to_string()))
+                                as Arc<dyn alex_proxy::DarioRouter>,
+                        );
                     }
                 }
             }
@@ -1707,6 +1735,7 @@ async fn main() -> Result<()> {
                     }),
                     timeout_secs: timeout_secs.unwrap_or_else(harness_e2e::default_timeout_secs),
                     no_trace_check,
+                    dario_enabled: config.dario_enabled(),
                     local_key: config.local_key.clone(),
                     data_dir: config.data_dir.clone(),
                 })?;
