@@ -230,12 +230,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         sub.addItem(.separator())
         action("Re-auth \(name)…", symbol: "key") { [weak self] in
-            self?.openAuth(provider: account.provider)
+            self?.openAuth(provider: account.provider, accountName: account.name)
         }
         action("Re-auth in Terminal…", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
             TerminalLauncher.launch(
-                command: "\(bin) auth login \(ProviderInfo.loginArg(account.provider))")
+                command: "\(bin) auth login \(ProviderInfo.loginArg(account.provider)) --name \(account.name) --force")
         }
         action("Re-import credentials", symbol: "square.and.arrow.down") { [weak self] in
             self?.importCredentials()

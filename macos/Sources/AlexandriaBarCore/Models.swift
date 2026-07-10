@@ -191,6 +191,98 @@ public struct AccountUsageBucket: Codable, Sendable, Identifiable {
     }
 }
 
+public enum CodexRoutingStrategy: String, Codable, Sendable, CaseIterable, Hashable {
+    case resetFirst = "reset_first"
+    case priority
+    case roundRobin = "round_robin"
+}
+
+public struct CodexRoutingResponse: Codable, Sendable {
+    public let provider: String
+    public let strategy: CodexRoutingStrategy
+    public let reservePct: Double
+    public let accounts: [CodexRoutingAccount]
+
+    enum CodingKeys: String, CodingKey {
+        case provider, strategy, accounts
+        case reservePct = "reserve_pct"
+    }
+}
+
+public struct CodexRoutingAccount: Codable, Sendable, Identifiable {
+    public let accountId: String
+    public let eligible: Bool
+    public let priority: Int
+    public let observedAtMs: Int64?
+    public let windows: [LimitWindow]
+
+    public var id: String { accountId }
+
+    enum CodingKeys: String, CodingKey {
+        case eligible, priority, windows
+        case accountId = "account_id"
+        case observedAtMs = "observed_at_ms"
+    }
+
+    public init(
+        accountId: String,
+        eligible: Bool,
+        priority: Int,
+        observedAtMs: Int64? = nil,
+        windows: [LimitWindow] = []
+    ) {
+        self.accountId = accountId
+        self.eligible = eligible
+        self.priority = priority
+        self.observedAtMs = observedAtMs
+        self.windows = windows
+    }
+}
+
+public struct CodexRoutingUpdate: Codable, Sendable {
+    public let strategy: CodexRoutingStrategy
+    public let reservePct: Double
+    public let accounts: [CodexRoutingAccountUpdate]
+
+    enum CodingKeys: String, CodingKey {
+        case strategy, accounts
+        case reservePct = "reserve_pct"
+    }
+
+    public init(
+        strategy: CodexRoutingStrategy,
+        reservePct: Double,
+        accounts: [CodexRoutingAccountUpdate]
+    ) {
+        self.strategy = strategy
+        self.reservePct = reservePct
+        self.accounts = accounts
+    }
+}
+
+public struct CodexRoutingAccountUpdate: Codable, Sendable {
+    public let accountId: String
+    public let eligible: Bool
+    public let priority: Int
+
+    enum CodingKeys: String, CodingKey {
+        case eligible, priority
+        case accountId = "account_id"
+    }
+
+    public init(accountId: String, eligible: Bool, priority: Int) {
+        self.accountId = accountId
+        self.eligible = eligible
+        self.priority = priority
+    }
+}
+
+public extension LimitWindow {
+    var remainingPct: Double? {
+        usedPct.map { max(0, min(100, 100 - $0)) }
+    }
+}
+
 public struct AnalyticsTotals: Codable, Sendable {
     public let requests: Int64
     public let costUsd: Double

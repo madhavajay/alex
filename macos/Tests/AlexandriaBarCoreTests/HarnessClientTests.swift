@@ -3,6 +3,71 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite(.serialized) struct HarnessClientTests {
+    @Test func codexRoutingGetsPolicyAndPerAccountWindows() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/accounts/routing/openai")
+            #expect(request.httpMethod == "GET")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"""
+            {"provider":"openai","strategy":"priority","reserve_pct":15,"accounts":[{"account_id":"openai-oauth-work","eligible":true,"priority":0,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":20,"resets_at_s":1783477712}]}]}
+            """#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let routing = try await client.codexRouting()
+        #expect(routing.strategy == .priority)
+        #expect(routing.reservePct == 15)
+        #expect(routing.accounts[0].windows[0].remainingPct == 80)
+    }
+
+    @Test func codexRoutingPutsAtomicPolicy() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/accounts/routing/openai")
+            #expect(request.httpMethod == "PUT")
+            #expect(request.value(forHTTPHeaderField: "content-type") == "application/json")
+            let body = try requestBody(request)
+            let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            #expect(json["strategy"] as? String == "round_robin")
+            #expect(json["reserve_pct"] as? Double == 10)
+            let accounts = try #require(json["accounts"] as? [[String: Any]])
+            #expect(accounts.count == 2)
+            #expect(accounts[0]["account_id"] as? String == "openai-oauth-personal")
+            #expect(accounts[0]["eligible"] as? Bool == true)
+            #expect(accounts[0]["priority"] as? Int == 0)
+            #expect(accounts[1]["eligible"] as? Bool == false)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        let update = CodexRoutingUpdate(
+            strategy: .roundRobin,
+            reservePct: 10,
+            accounts: [
+                CodexRoutingAccountUpdate(
+                    accountId: "openai-oauth-personal", eligible: true, priority: 0),
+                CodexRoutingAccountUpdate(
+                    accountId: "openai-oauth-work", eligible: false, priority: 1),
+            ])
+
+        try await client.updateCodexRouting(update)
+    }
+
     @Test func harnesses404MapsToUnsupported() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses")
@@ -205,6 +270,22 @@ import Testing
         #expect(result.removed == ["alex/claude-opus-4-8"])
         #expect(result.path.hasSuffix("models.json"))
     }
+}
+
+private func requestBody(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody { return body }
+    let stream = try #require(request.httpBodyStream)
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    var buffer = [UInt8](repeating: 0, count: 4_096)
+    while stream.hasBytesAvailable {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 { throw stream.streamError ?? CocoaError(.fileReadUnknown) }
+        if count == 0 { break }
+        data.append(buffer, count: count)
+    }
+    return data
 }
 
 private final class HarnessEndpointURLProtocol: URLProtocol, @unchecked Sendable {

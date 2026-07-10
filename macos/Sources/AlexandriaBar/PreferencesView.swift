@@ -1,4 +1,5 @@
 import AppKit
+import Charts
 import SwiftUI
 import Observation
 import AlexandriaBarCore
@@ -48,8 +49,7 @@ struct PreferencesView: View {
             }
             .formStyle(.grouped)
         }
-        .frame(width: 560)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 620, height: 680)
     }
 
     @ViewBuilder
@@ -115,9 +115,17 @@ private struct SubscriptionsPreferencesSection: View {
         Dictionary(uniqueKeysWithValues: (store.accountAnalytics?.byAccount ?? []).map { ($0.accountId, $0) })
     }
 
+    private var codexAccounts: [Account] {
+        store.accounts.filter { $0.provider == "openai" }
+    }
+
+    private var routingByAccount: [String: CodexRoutingAccount] {
+        Dictionary(uniqueKeysWithValues: (store.codexRouting?.accounts ?? []).map { ($0.accountId, $0) })
+    }
+
     var body: some View {
         Section("Subscriptions") {
-            Text("Each account is a separate subscription or API credential. Pause one to keep it out of routing without deleting it.")
+            Text("Each account is a separate subscription or API credential. Account pause and proxy selection are controlled separately.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
@@ -126,23 +134,43 @@ private struct SubscriptionsPreferencesSection: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(store.accounts) { account in
-                    SubscriptionAccountRow(account: account, usage: usageByAccount[account.id], store: store) {
+                    SubscriptionAccountRow(
+                        account: account,
+                        usage: usageByAccount[account.id],
+                        routing: routingByAccount[account.id],
+                        reservePct: store.codexRouting?.reservePct ?? 10,
+                        store: store
+                    ) {
                         onAuthenticate(account.provider, account.name)
                     }
                 }
             }
+
+            Button {
+                accountName = ""
+                providerToAdd = "openai"
+            } label: {
+                Label("Add another Codex account", systemImage: "person.badge.plus")
+            }
         }
+
+
+        CodexRoutingPreferencesSection(
+            store: store,
+            accounts: codexAccounts,
+            routing: store.codexRouting)
 
         if let analytics = store.accountAnalytics {
             Section("Usage · last 24 hours") {
                 SubscriptionUsageChart(usages: analytics.byAccount)
+                SubscriptionTokenTimeline(series: analytics.series, accounts: store.accounts)
                 ForEach(analytics.byAccount) { usage in
                     HStack {
                         Text(usage.accountId)
                             .font(.system(size: 10, design: .monospaced))
                             .lineLimit(1)
                         Spacer()
-                        Text("\(usage.requests) requests · \(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens")
+                        Text(usageSummary(usage))
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
@@ -151,7 +179,7 @@ private struct SubscriptionsPreferencesSection: View {
         }
 
         Section("Add subscription") {
-            ForEach(providers, id: \.self) { provider in
+            ForEach(providers.filter { $0 != "openai" }, id: \.self) { provider in
                 Button {
                     accountName = ""
                     providerToAdd = provider
@@ -176,11 +204,316 @@ private struct SubscriptionsPreferencesSection: View {
             }
         }
     }
+
+    private func usageSummary(_ usage: AccountUsage) -> String {
+        var pieces = [
+            "\(usage.requests) requests",
+            "\(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens",
+            String(format: "$%.4f", usage.costUsd),
+        ]
+        if let errors = usage.errors, errors > 0 {
+            pieces.append("\(errors) errors")
+        }
+        return pieces.joined(separator: " · ")
+    }
+}
+
+private struct CodexRoutingPreferencesSection: View {
+    let store: SnapshotStore
+    let accounts: [Account]
+    let routing: CodexRoutingResponse?
+    @State private var strategy = CodexRoutingStrategy.resetFirst
+    @State private var reservePct = 10.0
+    @State private var draftAccounts: [CodexRoutingAccountUpdate] = []
+    @State private var savedSignature = ""
+    @State private var busy = false
+    @State private var error: String?
+
+    private var routingKey: String {
+        guard let routing else {
+            return "unavailable|" + accounts.map(\.id).sorted().joined(separator: "|")
+        }
+        let accountKey = routing.accounts
+            .sorted { $0.priority < $1.priority }
+            .map { "\($0.accountId):\($0.eligible):\($0.priority):\($0.observedAtMs ?? 0)" }
+            .joined(separator: "|")
+        return "\(routing.strategy.rawValue)|\(routing.reservePct)|\(accountKey)"
+    }
+
+    private var isDirty: Bool {
+        !savedSignature.isEmpty && savedSignature != currentSignature
+    }
+
+    var body: some View {
+        Section("Codex proxy routing") {
+            if accounts.isEmpty {
+                Text("Add a Codex account above to configure proxy routing.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else if routing == nil {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Text("The running daemon does not expose per-account Codex routing yet. Update and restart alex to configure it here.")
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            } else {
+                Picker("Selection mode", selection: $strategy) {
+                    ForEach(CodexRoutingStrategy.allCases, id: \.self) { value in
+                        Text(value.displayName).tag(value)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text(strategy.explanation)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
+                Stepper(value: $reservePct, in: 0...100, step: 5) {
+                    LabeledContent("Quota reserve") {
+                        Text("\(Int(reservePct))% remaining")
+                            .monospacedDigit()
+                    }
+                }
+
+                Text("When another eligible account is available, Alexandria avoids an account at or below its reserve.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
+                ForEach(Array(draftAccounts.enumerated()), id: \.element.accountId) { index, draft in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Toggle("Use for proxy", isOn: eligibleBinding(accountId: draft.accountId))
+                                .toggleStyle(.switch)
+                                .controlSize(.small)
+                                .disabled(account(draft.accountId)?.paused == true || busy)
+                            Spacer()
+                            Text(account(draft.accountId)?.name ?? draft.accountId)
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(1)
+                            Text("#\(index + 1)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Button { move(index, by: -1) } label: {
+                                Image(systemName: "arrow.up")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(index == 0 || busy)
+                            .help("Move earlier in fallback order")
+                            Button { move(index, by: 1) } label: {
+                                Image(systemName: "arrow.down")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(index == draftAccounts.count - 1 || busy)
+                            .help("Move later in fallback order")
+                        }
+                        if account(draft.accountId)?.paused == true {
+                            Text("This account is paused, so it cannot receive proxy traffic even while selected here.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+
+
+                if !draftAccounts.contains(where: \.eligible) {
+                    Label(
+                        "No Codex account is selected. Codex proxy requests will fail until at least one account is enabled.",
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                }
+
+                HStack {
+                    Button("Save proxy routing") { save() }
+                        .disabled(busy || !isDirty)
+                    if busy { ProgressView().controlSize(.small) }
+                    if !busy && !isDirty && error == nil {
+                        Text("Saved")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let error {
+                    Text(error)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .task(id: routingKey) {
+            loadRouting()
+        }
+    }
+
+    private var currentSignature: String {
+        let accountKey = draftAccounts.enumerated().map { index, account in
+            "\(account.accountId):\(account.eligible):\(index)"
+        }.joined(separator: "|")
+        return "\(strategy.rawValue)|\(reservePct)|\(accountKey)"
+    }
+
+    private func account(_ id: String) -> Account? {
+        accounts.first { $0.id == id }
+    }
+
+    private func eligibleBinding(accountId: String) -> Binding<Bool> {
+        Binding {
+            draftAccounts.first { $0.accountId == accountId }?.eligible ?? false
+        } set: { value in
+            guard let index = draftAccounts.firstIndex(where: { $0.accountId == accountId }) else { return }
+            let item = draftAccounts[index]
+            draftAccounts[index] = CodexRoutingAccountUpdate(
+                accountId: item.accountId,
+                eligible: value,
+                priority: index)
+        }
+    }
+
+    private func loadRouting() {
+        guard let routing else {
+            draftAccounts = []
+            savedSignature = ""
+            return
+        }
+        strategy = routing.strategy
+        reservePct = routing.reservePct
+        let responseAccounts = routing.accounts.sorted { $0.priority < $1.priority }
+        var draft = responseAccounts.map {
+            CodexRoutingAccountUpdate(
+                accountId: $0.accountId,
+                eligible: $0.eligible,
+                priority: $0.priority)
+        }
+        for account in accounts where !draft.contains(where: { $0.accountId == account.id }) {
+            draft.append(CodexRoutingAccountUpdate(
+                accountId: account.id,
+                eligible: !account.paused,
+                priority: draft.count))
+        }
+        draftAccounts = normalized(draft)
+        error = nil
+        savedSignature = currentSignature
+    }
+
+    private func move(_ index: Int, by offset: Int) {
+        let destination = index + offset
+        guard draftAccounts.indices.contains(index), draftAccounts.indices.contains(destination) else { return }
+        draftAccounts.swapAt(index, destination)
+        draftAccounts = normalized(draftAccounts)
+    }
+
+    private func normalized(_ values: [CodexRoutingAccountUpdate]) -> [CodexRoutingAccountUpdate] {
+        values.enumerated().map { index, value in
+            CodexRoutingAccountUpdate(
+                accountId: value.accountId,
+                eligible: value.eligible,
+                priority: index)
+        }
+    }
+
+    private func save() {
+        guard let config = store.config else { return }
+        busy = true
+        error = nil
+        let update = CodexRoutingUpdate(
+            strategy: strategy,
+            reservePct: reservePct,
+            accounts: normalized(draftAccounts))
+        Task {
+            do {
+                try await AlexandriaClient(config: config).updateCodexRouting(update)
+                await store.refresh()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+}
+
+private extension CodexRoutingStrategy {
+    var displayName: String {
+        switch self {
+        case .resetFirst: "Reset first"
+        case .priority: "Priority"
+        case .roundRobin: "Round robin"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .resetFirst:
+            "Prefer an eligible account whose active limit resets sooner, while respecting the reserve."
+        case .priority:
+            "Use the first eligible account in the order below until it reaches the reserve, then fall back."
+        case .roundRobin:
+            "Rotate requests across eligible accounts, skipping accounts that have reached the reserve."
+        }
+    }
+}
+
+private struct CodexLimitWindowsView: View {
+    let routing: CodexRoutingAccount?
+    let reservePct: Double
+
+    var body: some View {
+        if let routing, !routing.windows.isEmpty {
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(routing.windows.enumerated()), id: \.offset) { _, window in
+                    HStack(spacing: 8) {
+                        Text(window.window)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .frame(width: 24, alignment: .leading)
+                        if let remaining = window.remainingPct {
+                            ProgressView(value: remaining, total: 100)
+                                .progressViewStyle(.linear)
+                                .tint(remaining <= reservePct ? .orange : .green)
+                                .frame(width: 90)
+                            Text("\(remaining.formatted(.number.precision(.fractionLength(0))))% remaining")
+                                .font(.system(size: 10))
+                                .monospacedDigit()
+                        } else {
+                            Text("usage unavailable")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if let reset = window.resetsDate {
+                            Text("resets \(relative(reset))")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if let observed = routing.observedAtMs {
+                    Text("Quota observed \(relative(Date(timeIntervalSince1970: Double(observed) / 1_000)))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        } else {
+            Text("Codex quota: waiting for limit data from this account’s first proxied response.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func relative(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
 }
 
 private struct SubscriptionAccountRow: View {
     let account: Account
     let usage: AccountUsage?
+    let routing: CodexRoutingAccount?
+    let reservePct: Double
     let store: SnapshotStore
     let reauthenticate: () -> Void
     @State private var deleting = false
@@ -211,8 +544,11 @@ private struct SubscriptionAccountRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
+            if account.provider == "openai" {
+                CodexLimitWindowsView(routing: routing, reservePct: reservePct)
+            }
             HStack(spacing: 8) {
-                Button(account.paused ? "Resume" : "Pause") { setPaused(!account.paused) }
+                Button(account.paused ? "Resume account" : "Pause account") { setPaused(!account.paused) }
                     .controlSize(.small)
                     .disabled(busy)
                 Button("Re-authenticate") { reauthenticate() }
@@ -264,6 +600,51 @@ private struct SubscriptionAccountRow: View {
             }
             busy = false
         }
+    }
+}
+
+private struct SubscriptionTokenTimeline: View {
+    let series: [AccountUsageBucket]
+    let accounts: [Account]
+
+    private var tokenSeries: [AccountUsageBucket] {
+        series
+            .filter { $0.inputTokens + $0.outputTokens > 0 }
+            .sorted { lhs, rhs in
+                if lhs.bucketMs == rhs.bucketMs { return lhs.accountId < rhs.accountId }
+                return lhs.bucketMs < rhs.bucketMs
+            }
+    }
+
+    var body: some View {
+        if tokenSeries.isEmpty {
+            Text("No per-account token activity to graph yet.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Tokens routed over time")
+                    .font(.system(size: 10, weight: .medium))
+                Chart(tokenSeries) { point in
+                    let date = Date(timeIntervalSince1970: Double(point.bucketMs) / 1_000)
+                    let tokens = point.inputTokens + point.outputTokens
+                    LineMark(
+                        x: .value("Time", date),
+                        y: .value("Tokens", tokens),
+                        series: .value("Account", point.accountId))
+                        .foregroundStyle(by: .value("Account", accountLabel(point.accountId)))
+                        .symbol(by: .value("Account", accountLabel(point.accountId)))
+                        .interpolationMethod(.linear)
+                }
+                .chartLegend(position: .bottom, alignment: .leading, spacing: 6)
+                .frame(height: 145)
+            }
+        }
+    }
+
+    private func accountLabel(_ id: String) -> String {
+        guard let account = accounts.first(where: { $0.id == id }) else { return id }
+        return "\(ProviderInfo.displayName(account.provider)) · \(account.name)"
     }
 }
 
