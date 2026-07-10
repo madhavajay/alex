@@ -593,7 +593,9 @@ impl Vault {
             locks: Mutex::new(HashMap::new()),
             rr_counter: AtomicUsize::new(0),
             policies: StdRwLock::new(policies),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?,
             refresh_endpoint_override: StdRwLock::new(None),
         })
     }
@@ -658,56 +660,96 @@ impl Vault {
         write_routing_policies(&self.dir, &policies)
     }
 
-    pub async fn record_routing_limits(&self, id: &str, mut snapshot: Value) -> Result<()> {
+    pub async fn record_routing_limits(&self, id: &str, snapshot: Value) -> Result<()> {
+        self.record_routing_limits_inner(id, None, snapshot).await
+    }
+
+    pub async fn record_routing_limits_for_workspace(
+        &self,
+        id: &str,
+        expected_workspace_id: &str,
+        snapshot: Value,
+    ) -> Result<()> {
+        self.record_routing_limits_inner(id, Some(expected_workspace_id), snapshot)
+            .await
+    }
+
+    async fn record_routing_limits_inner(
+        &self,
+        id: &str,
+        expected_workspace_id: Option<&str>,
+        mut snapshot: Value,
+    ) -> Result<()> {
+        let lock = self.account_lock(id).await;
+        let _guard = lock.lock().await;
         let now = now_ms();
+        let mut account = self
+            .accounts
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown account {id}"))?;
+        if expected_workspace_id.is_some() && account.provider != Provider::Openai {
+            bail!("account {id} is not an OpenAI account");
+        }
+        if let Some(expected_workspace_id) = expected_workspace_id {
+            let current_workspace_id = account.chatgpt_account_id();
+            if current_workspace_id.as_deref() != Some(expected_workspace_id) {
+                bail!("Codex workspace identity changed while refreshing account {id}");
+            }
+        }
+        if account
+            .account_meta
+            .get("routing_limits")
+            .or_else(|| account.account_meta.get("codex_limits"))
+            .and_then(|value| value.get("observed_at_ms"))
+            .and_then(Value::as_i64)
+            .map(|observed| now - observed < 30_000)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         if let Some(object) = snapshot.as_object_mut() {
             object.insert("observed_at_ms".into(), json!(now));
         }
-        if !self
-            .update(id, |account| {
-                if account
-                    .account_meta
-                    .get("routing_limits")
-                    .or_else(|| account.account_meta.get("codex_limits"))
-                    .and_then(|value| value.get("observed_at_ms"))
-                    .and_then(Value::as_i64)
-                    .map(|observed| now - observed < 30_000)
-                    .unwrap_or(false)
-                {
-                    return;
+        if let (Some(existing), Some(incoming)) = (
+            account
+                .account_meta
+                .get("routing_limits")
+                .or_else(|| account.account_meta.get("codex_limits"))
+                .and_then(Value::as_object),
+            snapshot.as_object(),
+        ) {
+            let mut merged = existing.clone();
+            for (key, value) in incoming {
+                if !value.is_null() {
+                    merged.insert(key.clone(), value.clone());
                 }
-                if !account.account_meta.is_object() {
-                    account.account_meta = json!({});
-                }
-                account
-                    .account_meta
-                    .as_object_mut()
-                    .expect("account_meta initialized as object")
-                    .insert("routing_limits".into(), snapshot);
-            })
-            .await?
-        {
-            bail!("unknown account {id}");
+            }
+            snapshot = Value::Object(merged);
         }
-        Ok(())
+        if !account.account_meta.is_object() {
+            account.account_meta = json!({});
+        }
+        account
+            .account_meta
+            .as_object_mut()
+            .expect("account_meta initialized as object")
+            .insert("routing_limits".into(), snapshot);
+        self.upsert_unlocked(account).await
     }
 
     pub async fn pause(&self, provider: Provider, name: &str, paused: bool) -> Result<()> {
-        let account = self
+        let id = self
             .accounts
             .read()
             .await
             .values()
             .find(|a| a.provider == provider && a.name == name)
-            .cloned()
+            .map(|account| account.id.clone())
             .ok_or_else(|| anyhow!("unknown {} account '{name}'", provider.as_str()))?;
-        if !self
-            .update(&account.id, |account| account.paused = paused)
-            .await?
-        {
-            bail!("unknown {} account '{name}'", provider.as_str());
-        }
-        Ok(())
+        self.set_paused(&id, paused).await
     }
 
     pub async fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
@@ -726,6 +768,12 @@ impl Vault {
     }
 
     pub async fn upsert(&self, account: Account) -> Result<()> {
+        let lock = self.account_lock(&account.id).await;
+        let _guard = lock.lock().await;
+        self.upsert_unlocked(account).await
+    }
+
+    async fn upsert_unlocked(&self, account: Account) -> Result<()> {
         write_account_file(&self.dir, &account)?;
         self.accounts
             .write()
@@ -737,6 +785,8 @@ impl Vault {
     /// Mutate an existing account while holding the write lock, then persist
     /// the resulting account once. Returns `false` when `id` does not exist.
     pub async fn update(&self, id: &str, f: impl FnOnce(&mut Account)) -> Result<bool> {
+        let lock = self.account_lock(id).await;
+        let _guard = lock.lock().await;
         let mut accounts = self.accounts.write().await;
         let Some(account) = accounts.get_mut(id) else {
             return Ok(false);
@@ -751,6 +801,8 @@ impl Vault {
     }
 
     pub async fn remove(&self, id: &str) -> Result<bool> {
+        let lock = self.account_lock(id).await;
+        let _guard = lock.lock().await;
         let account = self.accounts.read().await.get(id).cloned();
         let Some(account) = account else {
             return Ok(false);
@@ -892,6 +944,14 @@ impl Vault {
                 serde_json::from_slice(&std::fs::read(path).ok()?).ok()
             })
             .collect()
+    }
+
+    async fn account_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().await;
+        locks
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn account_for(&self, provider: Provider, prefer_oauth: bool) -> Result<Account> {
@@ -1055,14 +1115,28 @@ impl Vault {
     }
 
     pub async fn refresh(&self, id: &str, force: bool) -> Result<Account> {
-        let lock = {
-            let mut locks = self.locks.lock().await;
-            locks
-                .entry(id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
+        self.refresh_inner(id, force, true, None).await
+    }
+
+    pub async fn refresh_without_native_reimport(
+        &self,
+        id: &str,
+        force: bool,
+        expected_workspace_id: &str,
+    ) -> Result<Account> {
+        self.refresh_inner(id, force, false, Some(expected_workspace_id))
+            .await
+    }
+
+    async fn refresh_inner(
+        &self,
+        id: &str,
+        force: bool,
+        allow_native_reimport: bool,
+        expected_workspace_id: Option<&str>,
+    ) -> Result<Account> {
+        let lock = self.account_lock(id).await;
+        let guard = lock.lock().await;
 
         let account = self
             .accounts
@@ -1071,6 +1145,11 @@ impl Vault {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown account {id}"))?;
+        if let Some(expected_workspace_id) = expected_workspace_id {
+            if account.chatgpt_account_id().as_deref() != Some(expected_workspace_id) {
+                bail!("Codex workspace identity changed while refreshing account {id}");
+            }
+        }
         if !force && !account.needs_refresh() {
             return Ok(account);
         }
@@ -1101,6 +1180,10 @@ impl Vault {
         let refreshed = match result {
             Ok(r) => r,
             Err(e) => {
+                if !allow_native_reimport {
+                    return Err(e);
+                }
+                drop(guard);
                 tracing::warn!("refresh failed for {id}: {e}; re-importing from native creds");
                 if let Some(fresh) = self.reimport_native(&account).await {
                     return Ok(fresh);
@@ -1130,6 +1213,16 @@ impl Vault {
             .map(|s| now_ms() + s * 1000)
             .or_else(|| updated.access_token.as_deref().and_then(jwt_exp_ms));
         updated.last_refresh_ms = Some(now_ms());
+        if let Some(expected_workspace_id) = expected_workspace_id {
+            if updated
+                .access_token
+                .as_deref()
+                .and_then(crate::login::chatgpt_account_id)
+                .is_some_and(|workspace_id| workspace_id != expected_workspace_id)
+            {
+                bail!("refreshed Codex token belongs to a different workspace");
+            }
+        }
         if let Some(meta) = updated.account_meta.as_object_mut() {
             meta.remove("needs_reauth");
         }
@@ -1144,7 +1237,7 @@ impl Vault {
                 }
             }
         }
-        self.upsert(updated.clone()).await?;
+        self.upsert_unlocked(updated.clone()).await?;
         Ok(updated)
     }
 
@@ -3254,6 +3347,52 @@ mod tests {
             42.0
         );
         assert!(account.account_meta["routing_limits"]["observed_at_ms"].is_i64());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_limit_refresh_requires_same_workspace_and_preserves_safe_fields() {
+        let dir = temp_dir("codex-limit-workspace");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let mut account = api_key_account("openai-api_key-work", Provider::Openai);
+        account.account_meta = json!({
+            "account_id": "workspace-a",
+            "routing_limits": {"active_limit": "premium"},
+        });
+        vault.upsert(account).await.unwrap();
+
+        let snapshot = json!({
+            "plan": "plus",
+            "windows": [{"window": "5h", "used_pct": 4.0, "resets_at_s": now_ms() / 1000 + 600}],
+        });
+        assert!(vault
+            .record_routing_limits_for_workspace(
+                "openai-api_key-work",
+                "workspace-b",
+                snapshot.clone(),
+            )
+            .await
+            .is_err());
+        vault
+            .record_routing_limits_for_workspace(
+                "openai-api_key-work",
+                "workspace-a",
+                snapshot,
+            )
+            .await
+            .unwrap();
+
+        let account = vault
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == "openai-api_key-work")
+            .unwrap();
+        assert_eq!(
+            account.account_meta["routing_limits"]["active_limit"],
+            "premium"
+        );
+        assert_eq!(account.account_meta["routing_limits"]["plan"], "plus");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

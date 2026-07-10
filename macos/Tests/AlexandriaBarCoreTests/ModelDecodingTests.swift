@@ -223,6 +223,21 @@ import Testing
         #expect(windows[3].remainingSeverity(warnUsedPct: 90) == .critical)
     }
 
+    @Test func expiredAllowanceWindowIsNotPresentedAsCurrent() throws {
+        let json = #"""
+        [
+          {"window":"5h","used_pct":100,"resets_at_s":1799999999},
+          {"window":"5h","used_pct":100,"resets_at_s":1800000060}
+        ]
+        """#
+        let windows = try decode(json, as: [LimitWindow].self)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(windows[0].resetHasPassed(relativeTo: now))
+        #expect(windows[0].remainingPct(relativeTo: now) == nil)
+        #expect(!windows[1].resetHasPassed(relativeTo: now))
+        #expect(windows[1].remainingPct(relativeTo: now) == 0)
+    }
+
     @Test func accountUsageSeries() throws {
         let json = #"""
         {"since_ms":1783470000000,"bucket_ms":3600000,"by_account":[
