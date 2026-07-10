@@ -1485,23 +1485,28 @@ async fn main() -> Result<()> {
                 };
                 let p = provider_from_cli(&provider)?;
                 if !force && vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
-                let default_id = named_account_id(p, "oauth", "default");
-                let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
-                let id = alex_auth::login::login(&vault, &provider).await?;
-                if name != "default" {
-                    if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
-                        a.name = name.clone();
-                        a.id = named_account_id(a.provider, &a.kind, &name);
-                        a.path = None;
-                        vault.upsert(a).await?;
+                if p == alex_core::Provider::Openai {
+                    let id = alex_auth::login::login_named(&vault, &provider, &name, force).await?;
+                    println!("saved account: {id}");
+                } else {
+                    let default_id = named_account_id(p, "oauth", "default");
+                    let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
+                    let id = alex_auth::login::login(&vault, &provider).await?;
+                    if name != "default" {
+                        if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
+                            a.name = name.clone();
+                            a.id = named_account_id(a.provider, &a.kind, &name);
+                            a.path = None;
+                            vault.upsert(a).await?;
+                        }
+                        if let Some(a) = pre_default {
+                            vault.upsert(a).await?;
+                        } else {
+                            let _ = vault.remove(&default_id).await?;
+                        }
                     }
-                    if let Some(a) = pre_default {
-                        vault.upsert(a).await?;
-                    } else {
-                        let _ = vault.remove(&default_id).await?;
-                    }
+                    println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
                 }
-                println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
             }
             AuthCommand::Pause { provider, name } => {
                 validate_account_name(&name)?;

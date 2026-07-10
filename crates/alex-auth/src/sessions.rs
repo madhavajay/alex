@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_exchange, generate_pkce,
+    anthropic_authorize_url, claude_exchange, codex_exchange_named, generate_pkce,
     openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
     xai_upsert_from_tokens, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_REDIRECT_URI,
 };
@@ -180,11 +180,8 @@ impl LoginManager {
             )
             .await
             {
-                Ok(Ok(code)) => match codex_exchange(&vault, &verifier, &code).await {
-                    Ok(account_id) => match rename_login_account(&vault, &account_id, &account_name).await {
-                        Ok(account_id) => LoginPhase::Done { account_id },
-                        Err(e) => LoginPhase::Failed { error: e.to_string() },
-                    },
+                Ok(Ok(code)) => match codex_exchange_named(&vault, &verifier, &code, &account_name).await {
+                    Ok(account_id) => LoginPhase::Done { account_id },
                     Err(e) => LoginPhase::Failed { error: e.to_string() },
                 },
                 Ok(Err(e)) => LoginPhase::Failed { error: e.to_string() },
