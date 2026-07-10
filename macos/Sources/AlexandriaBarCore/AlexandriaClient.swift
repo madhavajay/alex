@@ -145,6 +145,19 @@ public struct AlexandriaClient: Sendable {
             as: AccountAnalyticsResponse.self)
     }
 
+    public func codexRouting() async throws -> CodexRoutingResponse {
+        try await get(
+            "admin/accounts/routing/openai",
+            as: CodexRoutingResponse.self)
+    }
+
+    public func updateCodexRouting(_ update: CodexRoutingUpdate) async throws {
+        _ = try await request(
+            "admin/accounts/routing/openai",
+            method: "PUT",
+            body: body(update))
+    }
+
     public func dario() async throws -> DarioStatus? {
         do {
             return try await get("admin/dario", as: DarioStatus.self)

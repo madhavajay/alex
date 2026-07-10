@@ -62,6 +62,41 @@ import Testing
         #expect(providers[2].tokens?.remaining == 5_000_000)
     }
 
+    @Test func codexAccountRoutingAndLimitWindows() throws {
+        let json = #"""
+        {"provider":"openai","strategy":"reset_first","reserve_pct":10,"accounts":[
+          {"account_id":"openai-oauth-personal","eligible":true,"priority":0,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":6,"resets_at_s":1783477712},{"window":"7d","used_pct":82,"resets_at_s":1783667025}]},
+          {"account_id":"openai-oauth-work","eligible":false,"priority":1,"windows":[]}
+        ]}
+        """#
+        let routing = try decode(json, as: CodexRoutingResponse.self)
+        #expect(routing.provider == "openai")
+        #expect(routing.strategy == .resetFirst)
+        #expect(routing.reservePct == 10)
+        #expect(routing.accounts.count == 2)
+        #expect(routing.accounts[0].eligible)
+        #expect(routing.accounts[0].windows[0].remainingPct == 94)
+        #expect(routing.accounts[0].windows[1].remainingPct == 18)
+        #expect(routing.accounts[0].windows[0].resetsDate == Date(timeIntervalSince1970: 1783477712))
+        #expect(!routing.accounts[1].eligible)
+    }
+
+    @Test func accountUsageSeries() throws {
+        let json = #"""
+        {"since_ms":1783470000000,"bucket_ms":3600000,"by_account":[
+          {"account_id":"openai-oauth-personal","provider":"openai","requests":7,"input_tokens":1200,"output_tokens":300,"cost_usd":0.0125,"errors":1,"last_ts_ms":1783477280438}
+        ],"series":[
+          {"bucket_ms":1783470000000,"account_id":"openai-oauth-personal","requests":4,"input_tokens":700,"output_tokens":100,"cost_usd":0.007,"errors":0},
+          {"bucket_ms":1783473600000,"account_id":"openai-oauth-personal","requests":3,"input_tokens":500,"output_tokens":200,"cost_usd":0.0055,"errors":1}
+        ]}
+        """#
+        let analytics = try decode(json, as: AccountAnalyticsResponse.self)
+        #expect(analytics.byAccount[0].costUsd == 0.0125)
+        #expect(analytics.byAccount[0].errors == 1)
+        #expect(analytics.series.count == 2)
+        #expect(analytics.series[0].inputTokens + analytics.series[0].outputTokens == 800)
+    }
+
     @Test func analytics() throws {
         let json = #"""
         {"by_model":[
