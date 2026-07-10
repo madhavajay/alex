@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -2241,6 +2241,7 @@ async fn plan_upstream(
     body_json: &mut Value,
     original_body: &[u8],
     trace_id: &str,
+    excluded_accounts: &HashSet<String>,
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
     use alex_core::translate;
     let client_stream = body_json["stream"].as_bool().unwrap_or(false);
@@ -2272,7 +2273,7 @@ async fn plan_upstream(
                 _ => {
                     let account = state
                         .vault
-                        .account_for(provider, true)
+                        .account_for_excluding(provider, true, excluded_accounts)
                         .await
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                     (ANTHROPIC_BASE.to_string(), account, None, false)
@@ -2318,7 +2319,7 @@ async fn plan_upstream(
             let prefer_oauth = format != ClientFormat::OpenaiChat;
             let account = state
                 .vault
-                .account_for(provider, prefer_oauth)
+                .account_for_excluding(provider, prefer_oauth, excluded_accounts)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
@@ -2438,7 +2439,7 @@ async fn plan_upstream(
         Provider::Xai => {
             let account = state
                 .vault
-                .account_for(provider, true)
+                .account_for_excluding(provider, true, excluded_accounts)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let extra_headers = vec![
@@ -2493,7 +2494,7 @@ async fn plan_upstream(
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
                 .vault
-                .account_for(provider, false)
+                .account_for_excluding(provider, false, excluded_accounts)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let (gemini_req, respond_as) = match format {
@@ -3091,6 +3092,13 @@ fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
     serde_json::to_string(&tags).ok()
 }
 
+fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status.is_server_error()
+}
+
 async fn proxy(
     state: Arc<AppState>,
     format: ClientFormat,
@@ -3204,6 +3212,8 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
 
+    let original_body_json = body_json.clone();
+    let mut attempted_accounts = HashSet::new();
     let mut plan = match plan_upstream(
         &state,
         format,
@@ -3212,6 +3222,7 @@ async fn proxy(
         &mut body_json,
         &body,
         &trace_id,
+        &attempted_accounts,
     )
     .await
     {
@@ -3245,104 +3256,150 @@ async fn proxy(
 
     let mut account = plan.account.clone();
     let mut upstream_resp = None;
-    for attempt in 0..2 {
-        let mut up_headers = match upstream_headers(&account, &headers) {
-            Ok(h) => h,
-            Err((status, msg)) => {
-                trace.status = Some(status.as_u16() as i64);
-                trace.error = Some(msg.clone());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
-                return error_response(status, &msg);
-            }
-        };
-        for (k, v) in &plan.extra_headers {
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
-            ) {
-                up_headers.insert(name, value);
-            }
+    'accounts: loop {
+        if !attempted_accounts.insert(account.id.clone()) {
+            tracing::error!(account = %account.id, "refusing to retry an already-attempted account");
+            break;
         }
-        let resp = match state
-            .http
-            .post(&plan.url)
-            .headers(up_headers)
-            .body(plan.body.clone())
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = format!("upstream request failed: {e}");
-                suspect_dario(&state, &account);
-                trace.status = Some(502);
-                trace.error = Some(msg.clone());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
-                return error_response(StatusCode::BAD_GATEWAY, &msg);
-            }
-        };
-        if account.provider == Provider::Openai && account.kind == "oauth" {
-            if let Some(snapshot) = codex_limits_from_headers(resp.headers()) {
-                if let Err(error) = state
-                    .vault
-                    .record_codex_limits(&account.id, snapshot)
-                    .await
-                {
-                    tracing::warn!(account = %account.id, %error, "could not persist Codex limit snapshot");
+
+        let mut forced_oauth_refresh = false;
+        loop {
+            let mut up_headers = match upstream_headers(&account, &headers) {
+                Ok(h) => h,
+                Err((status, msg)) => {
+                    trace.status = Some(status.as_u16() as i64);
+                    trace.error = Some(msg.clone());
+                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    return error_response(status, &msg);
+                }
+            };
+            for (k, v) in &plan.extra_headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    up_headers.insert(name, value);
                 }
             }
-        }
-        let retryable_status = resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-            || resp.status().is_server_error();
-        if retryable_status && account.kind != "dario" {
-            let retry_after_s = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(60)
-                .clamp(1, 3600);
-            tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
-            if let Err(e) = state.vault.mark_cooldown(&account.id, now_ms() + retry_after_s * 1000).await {
-                tracing::warn!("failed to mark cooldown: {e}");
+            let resp = match state
+                .http
+                .post(&plan.url)
+                .headers(up_headers)
+                .body(plan.body.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("upstream request failed: {e}");
+                    suspect_dario(&state, &account);
+                    trace.status = Some(502);
+                    trace.error = Some(msg.clone());
+                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    return error_response(StatusCode::BAD_GATEWAY, &msg);
+                }
+            };
+
+            if account.provider == Provider::Openai && account.kind == "oauth" {
+                if let Some(snapshot) = codex_limits_from_headers(resp.headers()) {
+                    if let Err(error) = state
+                        .vault
+                        .record_codex_limits(&account.id, snapshot)
+                        .await
+                    {
+                        tracing::warn!(account = %account.id, %error, "could not persist Codex limit snapshot");
+                    }
+                }
             }
-            if attempt == 0 {
-                match plan_upstream(&state, format, provider, &routed_model, &mut body_json, &body, &trace_id).await {
-                    Ok(p) if p.account.id != account.id => {
-                        plan = p;
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && account.kind == "oauth"
+                && !forced_oauth_refresh
+            {
+                tracing::warn!(
+                    account = %account.id,
+                    "upstream returned 401 for oauth account; forcing token refresh and retrying"
+                );
+                forced_oauth_refresh = true;
+                match state.vault.refresh(&account.id, true).await {
+                    Ok(fresh) => {
+                        account = fresh;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("forced refresh failed: {e}");
+                    }
+                }
+            }
+
+            if retryable_failover_status(resp.status()) && account.kind != "dario" {
+                let retry_after_s = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(60)
+                    .clamp(1, 3600);
+                tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
+                if let Err(e) = state
+                    .vault
+                    .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
+                    .await
+                {
+                    tracing::warn!("failed to mark cooldown: {e}");
+                }
+
+                let mut retry_body_json = original_body_json.clone();
+                match plan_upstream(
+                    &state,
+                    format,
+                    provider,
+                    &routed_model,
+                    &mut retry_body_json,
+                    &body,
+                    &trace_id,
+                    &attempted_accounts,
+                )
+                .await
+                {
+                    Ok(next_plan) if !attempted_accounts.contains(&next_plan.account.id) => {
+                        plan = next_plan;
                         account = plan.account.clone();
                         trace.account_id = Some(account.id.clone());
                         trace.upstream_format = Some(plan.upstream_format.into());
-                        tracing::warn!(account = %account.id, "retrying once with failover account");
-                        continue;
+                        trace.billing_bucket = Some(
+                            if account.kind == "oauth" || account.kind == "dario" {
+                                "subscription"
+                            } else {
+                                "api"
+                            }
+                            .into(),
+                        );
+                        tracing::warn!(
+                            account = %account.id,
+                            attempted = attempted_accounts.len(),
+                            "retrying with failover account"
+                        );
+                        continue 'accounts;
                     }
-                    Ok(_) => {}
-                    Err((status, msg)) => tracing::warn!(status = %status, error = %msg, "no failover account available"),
+                    Ok(next_plan) => {
+                        tracing::error!(
+                            account = %next_plan.account.id,
+                            "account selector returned an already-attempted failover account"
+                        );
+                    }
+                    Err((status, msg)) => tracing::warn!(
+                        status = %status,
+                        error = %msg,
+                        attempted = attempted_accounts.len(),
+                        "no untried failover account available"
+                    ),
                 }
             }
+
+            upstream_resp = Some(resp);
+            break 'accounts;
         }
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            && account.kind == "oauth"
-            && attempt == 0
-        {
-            tracing::warn!(
-                account = %account.id,
-                "upstream returned 401 for oauth account; forcing token refresh and retrying"
-            );
-            match state.vault.refresh(&account.id, true).await {
-                Ok(fresh) => {
-                    account = fresh;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("forced refresh failed: {e}");
-                }
-            }
-        }
-        upstream_resp = Some(resp);
-        break;
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
     trace.account_id = Some(account.id.clone());
@@ -3971,5 +4028,107 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("label"));
+    }
+
+    #[test]
+    fn failover_statuses_are_limited_to_auth_rate_limit_and_server_errors() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                retryable_failover_status(status),
+                "{status} should fail over"
+            );
+        }
+        for status in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                !retryable_failover_status(status),
+                "{status} should be returned without failover"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_planning_excludes_every_account_already_attempted() {
+        let state = test_state("codex-plan-exclusions");
+        for (id, name) in [
+            ("openai-oauth-a", "a"),
+            ("openai-oauth-b", "b"),
+            ("openai-oauth-c", "c"),
+        ] {
+            state
+                .vault
+                .upsert(Account {
+                    id: id.into(),
+                    provider: Provider::Openai,
+                    kind: "oauth".into(),
+                    name: name.into(),
+                    description: None,
+                    paused: false,
+                    label: None,
+                    access_token: Some(format!("access-{name}")),
+                    refresh_token: Some(format!("refresh-{name}")),
+                    id_token: None,
+                    api_key: None,
+                    expires_at_ms: Some(now_ms() + 3_600_000),
+                    last_refresh_ms: Some(now_ms()),
+                    account_meta: json!({"account_id": format!("chatgpt-{name}")}),
+                    cooldown_until_ms: None,
+                    status: "active".into(),
+                    path: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let original = json!({"model": "gpt-5.3-codex", "stream": true});
+        let raw = serde_json::to_vec(&original).unwrap();
+        let mut excluded = HashSet::new();
+        let mut selected = Vec::new();
+        for _ in 0..3 {
+            let mut body = original.clone();
+            let plan = plan_upstream(
+                &state,
+                ClientFormat::OpenaiResponses,
+                Provider::Openai,
+                "gpt-5.3-codex",
+                &mut body,
+                &raw,
+                "trace-test",
+                &excluded,
+            )
+            .await
+            .unwrap();
+            assert!(excluded.insert(plan.account.id.clone()));
+            selected.push(plan.account.id);
+        }
+
+        assert_eq!(
+            selected,
+            vec!["openai-oauth-a", "openai-oauth-b", "openai-oauth-c"]
+        );
+        let mut body = original;
+        assert!(plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-test",
+            &excluded,
+        )
+        .await
+        .is_err());
     }
 }
