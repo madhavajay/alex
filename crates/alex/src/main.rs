@@ -1289,6 +1289,35 @@ async fn main() -> Result<()> {
                     config: config.clone(),
                 }),
             );
+            {
+                let quota_vault = state.vault.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+                    loop {
+                        interval.tick().await;
+                        for (account_id, result) in alex_auth::login::refresh_due_codex_usage(
+                            &quota_vault,
+                            alex_auth::login::CODEX_USAGE_REFRESH_MAX_AGE_MS,
+                        )
+                        .await
+                        {
+                            match result {
+                                Ok(()) => tracing::debug!(
+                                    account = %account_id,
+                                    "refreshed Codex allowance snapshot"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    account = %account_id,
+                                    %error,
+                                    "Codex allowance refresh failed; retaining previous snapshot"
+                                ),
+                            }
+                        }
+                    }
+                });
+                eprintln!("codex quota refresh: every 5m (usage endpoint only)");
+            }
             if config.update_check_hours > 0 {
                 let update_status = state.update_status.clone();
                 let hours = config.update_check_hours;

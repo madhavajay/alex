@@ -654,11 +654,19 @@ private struct CodexLimitWindowsView: View {
         if let routing, !routing.windows.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
                 ForEach(Array(routing.windows.enumerated()), id: \.offset) { _, window in
+                    let resetPassed = window.resetHasPassed()
                     HStack(spacing: 8) {
                         Text(window.window)
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
                             .frame(width: 24, alignment: .leading)
-                        if let remaining = window.remainingPct {
+                        if resetPassed {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .frame(width: 90)
+                            Text("refresh pending")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        } else if let remaining = window.remainingPct {
                             ProgressView(value: remaining, total: 100)
                                 .progressViewStyle(.linear)
                                 .tint(barColor(window))
@@ -672,7 +680,11 @@ private struct CodexLimitWindowsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if let reset = window.resetsDate {
+                        if resetPassed {
+                            Text("reset passed")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        } else if let reset = window.resetsDate {
                             Text("resets \(relative(reset))")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)

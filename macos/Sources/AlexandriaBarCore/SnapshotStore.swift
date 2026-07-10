@@ -250,6 +250,7 @@ public final class SnapshotStore {
 
         for provider in limits {
             for window in provider.windows ?? [] {
+                guard !window.resetHasPassed() else { continue }
                 if let pct = window.usedPct, pct >= limitWarnPct {
                     let resets = window.resetsDate.map { " · resets in \(Format.countdown(to: $0))" } ?? ""
                     out.append(StoreAlert(

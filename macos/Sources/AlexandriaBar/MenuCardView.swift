@@ -143,7 +143,8 @@ struct LimitsCardView: View {
 
     @ViewBuilder
     private func windowRow(_ window: LimitWindow) -> some View {
-        let remaining = window.remainingPct
+        let resetPassed = window.resetHasPassed()
+        let remaining = window.remainingPct(relativeTo: Date())
         HStack(spacing: 8) {
             Text(window.window)
                 .font(.system(size: 10, design: .monospaced))
@@ -160,13 +161,13 @@ struct LimitsCardView: View {
                 }
             }
             .frame(height: 6)
-            Text(remaining.map { "\(Int($0.rounded()))% left" } ?? "—")
+            Text(resetPassed ? "refresh pending" : (remaining.map { "\(Int($0.rounded()))% left" } ?? "—"))
                 .font(.system(size: 10, design: .monospaced))
-                .frame(width: 62, alignment: .trailing)
-            Text(window.resetsDate.map { Format.countdown(to: $0) } ?? "")
+                .frame(width: 86, alignment: .trailing)
+            Text(resetPassed ? "reset passed" : (window.resetsDate.map { Format.countdown(to: $0) } ?? ""))
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .trailing)
+                .frame(width: 68, alignment: .trailing)
         }
     }
 
