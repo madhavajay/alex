@@ -109,32 +109,9 @@ final class AuthFlowModel {
         }
     }
 
-    var browserApplications: [URL] {
-        guard let url = authorizeUrl.flatMap(URL.init(string:)) else { return [] }
-        var seen = Set<String>()
-        return NSWorkspace.shared.urlsForApplications(toOpen: url)
-            .filter { seen.insert($0.standardizedFileURL.path).inserted }
-            .sorted { browserName($0).localizedCaseInsensitiveCompare(browserName($1)) == .orderedAscending }
-    }
-
-    func browserName(_ applicationURL: URL) -> String {
-        FileManager.default.displayName(atPath: applicationURL.path)
-            .replacingOccurrences(of: ".app", with: "")
-    }
-
-    func openAuthorizeUrl(with applicationURL: URL? = nil) {
-        guard let url = authorizeUrl.flatMap(URL.init(string:)) else { return }
-        guard let applicationURL else {
+    func openAuthorizeUrl() {
+        if let url = authorizeUrl.flatMap(URL.init(string:)) {
             NSWorkspace.shared.open(url)
-            return
-        }
-        let configuration = NSWorkspace.OpenConfiguration()
-        NSWorkspace.shared.open(
-            [url], withApplicationAt: applicationURL, configuration: configuration
-        ) { _, error in
-            if let error {
-                BarLog.error(.ui, "opening authorization browser failed: \(error.localizedDescription)")
-            }
         }
     }
 
@@ -207,20 +184,10 @@ struct AuthFlowView: View {
         VStack(alignment: .leading, spacing: 14) {
             step(1, "Open the authorization page.") {
                 HStack(spacing: 8) {
-                    Menu {
-                        Button("Default Browser") {
-                            model.openAuthorizeUrl()
-                        }
-                        if !model.browserApplications.isEmpty {
-                            Divider()
-                            ForEach(model.browserApplications, id: \.path) { applicationURL in
-                                Button(model.browserName(applicationURL)) {
-                                    model.openAuthorizeUrl(with: applicationURL)
-                                }
-                            }
-                        }
+                    Button {
+                        model.openAuthorizeUrl()
                     } label: {
-                        Label("Open in Browser…", systemImage: "arrow.up.forward.square")
+                        Label("Open in Browser", systemImage: "arrow.up.forward.square")
                     }
                     if let url = model.authorizeUrl {
                         Button {

@@ -18,13 +18,15 @@ import Testing
     @Test func accounts() throws {
         let json = #"""
         {"accounts":[
-          {"expires_at_ms":1783504994142,"expires_in_s":27538,"id":"anthropic-oauth","kind":"oauth","label":"claude-code (max)","name":"default","paused":false,"provider":"anthropic","status":"active"},
+          {"email":"person@example.com","expires_at_ms":1783504994142,"expires_in_s":27538,"id":"anthropic-oauth","kind":"oauth","label":"claude-code (max)","name":"default","paused":false,"provider":"anthropic","status":"active"},
           {"expires_at_ms":null,"expires_in_s":null,"id":"gemini-oauth","kind":"oauth","label":"gemini-cli","name":"default","paused":false,"provider":"gemini","status":"active"},
           {"expires_at_ms":1783439548981,"expires_in_s":-37906,"id":"xai-oauth","kind":"oauth","label":"grok (me@madhavajay.com)","name":"default","paused":false,"provider":"xai","status":"active"}
         ]}
         """#
         let accounts = try decode(json, as: AccountsResponse.self).accounts
         #expect(accounts.count == 3)
+        #expect(accounts[0].email == "person@example.com")
+        #expect(accounts[1].email == nil)
         #expect(!accounts[0].isExpired)
         #expect(!accounts[1].isExpired)
         #expect(accounts[2].isExpired)

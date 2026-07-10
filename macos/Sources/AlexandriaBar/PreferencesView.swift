@@ -281,13 +281,17 @@ private struct CodexRoutingPreferencesSection: View {
                 ForEach(Array(draftAccounts.enumerated()), id: \.element.accountId) { index, draft in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
-                            Toggle("Use for proxy", isOn: eligibleBinding(accountId: draft.accountId))
+                            Toggle("Allow proxy traffic", isOn: eligibleBinding(accountId: draft.accountId))
                                 .toggleStyle(.switch)
                                 .controlSize(.small)
                                 .disabled(account(draft.accountId)?.paused == true || busy)
+                                .help("Allow Alexandria to select this subscription for new Codex requests and failover")
                             Spacer()
-                            Text(account(draft.accountId)?.name ?? draft.accountId)
-                                .font(.system(size: 11, design: .monospaced))
+                            Text(account(draft.accountId)?.email
+                                ?? account(draft.accountId)?.description
+                                ?? account(draft.accountId)?.name
+                                ?? draft.accountId)
+                                .font(.system(size: 11))
                                 .lineLimit(1)
                             Text("#\(index + 1)")
                                 .font(.system(size: 10, design: .monospaced))
@@ -524,7 +528,7 @@ private struct SubscriptionAccountRow: View {
                     .foregroundStyle(account.paused ? .orange : .green)
                 Text(ProviderInfo.displayName(account.provider))
                     .fontWeight(.medium)
-                Text(account.description ?? account.label ?? account.name)
+                Text(account.email ?? account.description ?? account.label ?? account.name)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -536,6 +540,9 @@ private struct SubscriptionAccountRow: View {
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+            Text("Email: \(account.email ?? "not supplied by provider")")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
             if let usage {
                 Text("Last 24h: \(usage.requests) requests · \(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens · \(usage.errors ?? 0) errors")
                     .font(.system(size: 10))

@@ -1536,6 +1536,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .await
         .into_iter()
         .map(|a| {
+            let email = a.email();
             let routing = if a.provider == Provider::Openai {
                 json!({
                     "eligible": !openai_policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
@@ -1559,6 +1560,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "kind": a.kind,
                 "label": a.label,
                 "description": a.description,
+                "email": email,
                 "paused": a.paused,
                 "path": a.path.map(|p| p.display().to_string()),
                 "status": a.status,

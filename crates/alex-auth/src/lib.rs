@@ -91,6 +91,45 @@ impl Account {
             .map(String::from)
     }
 
+    /// A display-only identity hint. This never returns token material.
+    pub fn email(&self) -> Option<String> {
+        fn normalize(value: &str) -> Option<String> {
+            let value = value.trim();
+            (value.contains('@') && !value.chars().any(char::is_whitespace))
+                .then(|| value.to_ascii_lowercase())
+        }
+
+        fn payload_email(token: &str) -> Option<String> {
+            let payload = crate::login::jwt_payload(token)?;
+            payload
+                .get("email")
+                .and_then(Value::as_str)
+                .and_then(normalize)
+                .or_else(|| {
+                    payload
+                        .get("https://api.openai.com/profile")
+                        .and_then(|profile| profile.get("email"))
+                        .and_then(Value::as_str)
+                        .and_then(normalize)
+                })
+        }
+
+        self.account_meta
+            .get("email")
+            .and_then(Value::as_str)
+            .and_then(normalize)
+            .or_else(|| self.description.as_deref().and_then(normalize))
+            .or_else(|| self.id_token.as_deref().and_then(payload_email))
+            .or_else(|| self.access_token.as_deref().and_then(payload_email))
+            .or_else(|| {
+                self.label.as_deref().and_then(|label| {
+                    label
+                        .split(['(', ')', ' ', '·'])
+                        .find_map(normalize)
+                })
+            })
+    }
+
     fn needs_refresh(&self) -> bool {
         self.kind == "oauth"
             && match self.expires_at_ms {
@@ -1084,6 +1123,23 @@ mod tests {
             Some(1_000_000_000_000)
         );
         assert_eq!(rfc3339_to_ms("not a timestamp"), None);
+    }
+
+    #[test]
+    fn account_email_prefers_metadata_and_falls_back_to_jwt_profile() {
+        let mut account = api_key_account("openai-oauth-default", Provider::Openai);
+        account.kind = "oauth".into();
+        account.api_key = None;
+        account.account_meta = json!({"email": "Primary@Example.com"});
+        assert_eq!(account.email().as_deref(), Some("primary@example.com"));
+
+        account.account_meta = json!({});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({"https://api.openai.com/profile": {"email": "Workspace@Example.com"}})
+                .to_string(),
+        );
+        account.id_token = Some(format!("header.{payload}.signature"));
+        assert_eq!(account.email().as_deref(), Some("workspace@example.com"));
     }
 
     #[test]

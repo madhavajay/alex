@@ -26,13 +26,14 @@ public struct Account: Codable, Sendable, Identifiable {
     public let kind: String
     public let label: String?
     public let description: String?
+    public let email: String?
     public let paused: Bool
     public let status: String
     public let expiresAtMs: Int64?
     public let expiresInS: Int64?
 
     enum CodingKeys: String, CodingKey {
-        case id, provider, name, kind, label, description, paused, status
+        case id, provider, name, kind, label, description, email, paused, status
         case expiresAtMs = "expires_at_ms"
         case expiresInS = "expires_in_s"
     }

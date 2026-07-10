@@ -179,7 +179,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func accountTitle(_ account: Account) -> String {
         var title = ProviderInfo.displayName(account.provider)
-        if let label = account.label, !label.isEmpty { title += " · \(label)" }
+        if let email = account.email, !email.isEmpty { title += " · \(email)" }
+        else if let label = account.label, !label.isEmpty { title += " · \(label)" }
         else if account.name != "default" { title += " · \(account.name)" }
         return title
     }
@@ -216,6 +217,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             sub.addItem(item)
         }
 
+        info("Email: \(account.email ?? "not supplied by provider")")
         info("\(account.id) · \(account.kind) · \(account.status)")
         if let expires = account.expiresInS {
             info(expires < 0
