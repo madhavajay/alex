@@ -510,17 +510,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         pingWindow.show(target: target, title: name, store: store)
     }
 
-    private func openAuth(provider: String, accountName: String = "default") {
-        authWindows.show(provider: provider, accountName: accountName, store: store) { [weak self] provider in
-            self?.pingAfterAuth(provider: provider)
+    private func openAuth(
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false
+    ) {
+        let callback: (@MainActor (String) -> Void)?
+        if autoIdentity {
+            callback = nil
+        } else {
+            callback = { [weak self] provider in
+                self?.pingAfterAuth(provider: provider)
+            }
         }
+        authWindows.show(
+            provider: provider, accountName: accountName, autoIdentity: autoIdentity, store: store,
+            onAuthenticated: callback)
     }
 
     private func addAnotherAccount(provider: String) {
+        if provider == "openai" {
+            openAuth(provider: provider, accountName: nil, autoIdentity: true)
+            return
+        }
         let providerName = ProviderInfo.displayName(provider)
         let alert = NSAlert()
         alert.messageText = "Add another \(providerName) account"
-        alert.informativeText = "Choose a short local name (letters, numbers, _ and -). It identifies this subscription in routing and Settings."
+        alert.informativeText = "Choose a short local name (letters, numbers, _ and -)."
         let field = NSTextField(string: "")
         field.placeholderString = "e.g. personal or work"
         field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)

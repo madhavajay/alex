@@ -3,6 +3,35 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite(.serialized) struct HarnessClientTests {
+    @Test func codexAutoIdentityLoginOmitsNameAndRequestsDeviceFlow() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/login/start")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let body = try requestBody(request)
+            let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            #expect(json["provider"] as? String == "codex")
+            #expect(json["auto_identity"] as? Bool == true)
+            #expect(json["name"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"login_id":"login-test","provider":"codex","mode":"device","state":"pending","authorize_url":"https://auth.openai.com/codex/device","user_code":"ABCD-EFGH"}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let login = try await client.authLoginStart(
+            provider: "codex", name: nil, autoIdentity: true)
+        #expect(login.mode == "device")
+        #expect(login.userCode == "ABCD-EFGH")
+    }
+
     @Test func codexRoutingGetsPolicyAndPerAccountWindows() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/accounts/routing/openai")

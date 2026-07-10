@@ -19,7 +19,7 @@ final class PreferencesViewState {
 struct PreferencesView: View {
     @Bindable var state: PreferencesViewState
     let store: SnapshotStore
-    let onAuthenticate: (String, String) -> Void
+    let onAuthenticate: (String, String?, Bool) -> Void
     @AppStorage("refreshSeconds") private var refreshSeconds: Double = 60
     @AppStorage("limitWarnPct") private var limitWarnPct: Double = 90
     @AppStorage("notifyEnabled") private var notifyEnabled = true
@@ -105,9 +105,8 @@ struct PreferencesView: View {
 
 private struct SubscriptionsPreferencesSection: View {
     let store: SnapshotStore
-    let onAuthenticate: (String, String) -> Void
+    let onAuthenticate: (String, String?, Bool) -> Void
     @State private var providerToAdd: String?
-    @State private var accountName = ""
 
     private let providers = ["anthropic", "openai", "gemini", "xai"]
 
@@ -141,14 +140,13 @@ private struct SubscriptionsPreferencesSection: View {
                         reservePct: store.codexRouting?.reservePct ?? 10,
                         store: store
                     ) {
-                        onAuthenticate(account.provider, account.name)
+                        onAuthenticate(account.provider, account.name, false)
                     }
                 }
             }
 
             Button {
-                accountName = ""
-                providerToAdd = "openai"
+                onAuthenticate("openai", nil, true)
             } label: {
                 Label("Add another Codex account", systemImage: "person.badge.plus")
             }
@@ -181,7 +179,6 @@ private struct SubscriptionsPreferencesSection: View {
         Section("Add subscription") {
             ForEach(providers.filter { $0 != "openai" }, id: \.self) { provider in
                 Button {
-                    accountName = ""
                     providerToAdd = provider
                 } label: {
                     Label("Add another \(ProviderInfo.displayName(provider)) account", systemImage: "person.badge.plus")
@@ -197,7 +194,7 @@ private struct SubscriptionsPreferencesSection: View {
             if let provider = providerToAdd {
                 SubscriptionNameSheet(provider: provider) { name in
                     providerToAdd = nil
-                    onAuthenticate(provider, name)
+                    onAuthenticate(provider, name, false)
                 } onCancel: {
                     providerToAdd = nil
                 }
@@ -527,8 +524,8 @@ private struct SubscriptionAccountRow: View {
                     .foregroundStyle(account.paused ? .orange : .green)
                 Text(ProviderInfo.displayName(account.provider))
                     .fontWeight(.medium)
-                Text(account.name)
-                    .font(.system(size: 11, design: .monospaced))
+                Text(account.description ?? account.label ?? account.name)
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Text(account.paused ? "Paused" : account.status.capitalized)
@@ -1064,9 +1061,11 @@ final class PreferencesWindowController {
             let host = NSHostingController(rootView: PreferencesView(
                 state: state,
                 store: store,
-                onAuthenticate: { [weak self] provider, name in
+                onAuthenticate: { [weak self] provider, name, autoIdentity in
                     guard let self else { return }
-                    self.authWindows.show(provider: provider, accountName: name, store: self.store)
+                    self.authWindows.show(
+                        provider: provider, accountName: name, autoIdentity: autoIdentity,
+                        store: self.store)
                 }))
             let win = NSWindow(contentViewController: host)
             win.title = "AlexandriaBar Settings"

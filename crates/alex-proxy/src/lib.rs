@@ -366,6 +366,12 @@ async fn admin_auth_login_start(
     let Some(provider) = body.0["provider"].as_str() else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
     };
+    if body.0["auto_identity"].as_bool() == Some(true) {
+        return match state.logins.start_auto(state.vault.clone(), provider).await {
+            Ok(snapshot) => axum::Json(snapshot).into_response(),
+            Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+        };
+    }
     let name = body.0["name"].as_str().unwrap_or("default");
     match state.logins.start(state.vault.clone(), provider, name).await {
         Ok(snapshot) => axum::Json(snapshot).into_response(),

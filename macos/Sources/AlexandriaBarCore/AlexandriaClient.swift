@@ -1,5 +1,16 @@
 import Foundation
 
+private struct AuthLoginStartBody: Encodable {
+    let provider: String
+    let name: String?
+    let autoIdentity: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case provider, name
+        case autoIdentity = "auto_identity"
+    }
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -224,9 +235,15 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/dario/prompt-caches/\(key)", method: "DELETE")
     }
 
-    public func authLoginStart(provider: String, name: String = "default") async throws -> LoginSession {
+    public func authLoginStart(
+        provider: String,
+        name: String? = "default",
+        autoIdentity: Bool = false
+    ) async throws -> LoginSession {
         let data = try await request(
-            "admin/auth/login/start", method: "POST", body: body(["provider": provider, "name": name]))
+            "admin/auth/login/start", method: "POST",
+            body: body(AuthLoginStartBody(
+                provider: provider, name: name, autoIdentity: autoIdentity)))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 

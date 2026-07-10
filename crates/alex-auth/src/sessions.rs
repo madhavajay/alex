@@ -6,9 +6,11 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_exchange_named, generate_pkce,
+    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
+    codex_device_poll_once, codex_device_start, codex_exchange_named, generate_pkce,
     openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
-    xai_upsert_from_tokens, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_REDIRECT_URI,
+    xai_upsert_from_tokens, CodexDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
+    OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
 use crate::{named_account_id, now_ms, Vault};
 
@@ -85,6 +87,18 @@ impl LoginManager {
             "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
             other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
         };
+        let snapshot = shared.lock().await.snapshot();
+        self.sessions.lock().await.insert(id, shared);
+        Ok(snapshot)
+    }
+
+    pub async fn start_auto(&self, vault: Arc<Vault>, provider: &str) -> Result<Value> {
+        self.prune().await;
+        if !matches!(provider, "codex" | "openai" | "chatgpt") {
+            bail!("automatic identity login is currently supported only for Codex");
+        }
+        let id = random_id();
+        let shared = self.start_codex_device(&id, vault).await?;
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
         Ok(snapshot)
@@ -188,6 +202,66 @@ impl LoginManager {
                 Err(_) => LoginPhase::Failed {
                     error: "timed out waiting for the browser callback".into(),
                 },
+            };
+            worker.lock().await.phase = phase;
+        });
+        Ok(shared)
+    }
+
+    async fn start_codex_device(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+        const DEVICE_TTL_MS: i64 = 15 * 60 * 1000;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let start = codex_device_start(&http).await?;
+        let session = LoginSession {
+            id: id.to_string(),
+            provider: "codex".into(),
+            mode: "device",
+            authorize_url: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            user_code: Some(start.user_code.clone()),
+            verification_uri: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            verification_uri_complete: None,
+            created_ms: now_ms(),
+            expires_at_ms: now_ms() + DEVICE_TTL_MS,
+            account_name: String::new(),
+            verifier: None,
+            phase: LoginPhase::Pending,
+        };
+        let shared = Arc::new(Mutex::new(session));
+        let worker = shared.clone();
+        tokio::spawn(async move {
+            let deadline = now_ms() + DEVICE_TTL_MS;
+            let phase = loop {
+                if now_ms() > deadline {
+                    break LoginPhase::Failed {
+                        error: "Codex device code expired before authorization completed".into(),
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(start.interval_s)).await;
+                match codex_device_poll_once(&http, &start).await {
+                    CodexDevicePoll::Pending => continue,
+                    CodexDevicePoll::Done {
+                        authorization_code,
+                        code_verifier,
+                    } => {
+                        break match codex_device_exchange_auto(
+                            &vault,
+                            &authorization_code,
+                            &code_verifier,
+                        )
+                        .await
+                        {
+                            Ok(account_id) => LoginPhase::Done { account_id },
+                            Err(error) => LoginPhase::Failed {
+                                error: error.to_string(),
+                            },
+                        }
+                    }
+                    CodexDevicePoll::Failed(error) => {
+                        break LoginPhase::Failed { error }
+                    }
+                }
             };
             worker.lock().await.phase = phase;
         });

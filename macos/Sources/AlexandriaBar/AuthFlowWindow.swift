@@ -14,7 +14,8 @@ final class AuthFlowModel {
     }
 
     let provider: String
-    let accountName: String
+    let accountName: String?
+    let autoIdentity: Bool
     let store: SnapshotStore
     private(set) var stage: Stage = .starting
     private(set) var session: LoginSession?
@@ -22,9 +23,13 @@ final class AuthFlowModel {
     var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
     private var pollTask: Task<Void, Never>?
 
-    init(provider: String, accountName: String = "default", store: SnapshotStore) {
+    init(
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false,
+        store: SnapshotStore
+    ) {
         self.provider = provider
         self.accountName = accountName
+        self.autoIdentity = autoIdentity
         self.store = store
     }
 
@@ -46,7 +51,8 @@ final class AuthFlowModel {
             do {
                 let session = try await client.authLoginStart(
                     provider: ProviderInfo.loginArg(self?.provider ?? ""),
-                    name: self?.accountName ?? "default")
+                    name: self?.accountName,
+                    autoIdentity: self?.autoIdentity ?? false)
                 self?.sessionUpdated(session)
             } catch {
                 self?.stage = .failed(error.localizedDescription)
@@ -103,9 +109,32 @@ final class AuthFlowModel {
         }
     }
 
-    func openAuthorizeUrl() {
-        if let url = authorizeUrl.flatMap(URL.init(string:)) {
+    var browserApplications: [URL] {
+        guard let url = authorizeUrl.flatMap(URL.init(string:)) else { return [] }
+        var seen = Set<String>()
+        return NSWorkspace.shared.urlsForApplications(toOpen: url)
+            .filter { seen.insert($0.standardizedFileURL.path).inserted }
+            .sorted { browserName($0).localizedCaseInsensitiveCompare(browserName($1)) == .orderedAscending }
+    }
+
+    func browserName(_ applicationURL: URL) -> String {
+        FileManager.default.displayName(atPath: applicationURL.path)
+            .replacingOccurrences(of: ".app", with: "")
+    }
+
+    func openAuthorizeUrl(with applicationURL: URL? = nil) {
+        guard let url = authorizeUrl.flatMap(URL.init(string:)) else { return }
+        guard let applicationURL else {
             NSWorkspace.shared.open(url)
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open(
+            [url], withApplicationAt: applicationURL, configuration: configuration
+        ) { _, error in
+            if let error {
+                BarLog.error(.ui, "opening authorization browser failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -120,9 +149,9 @@ struct AuthFlowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(model.accountName == "default"
-                ? "Re-authenticate \(model.providerName)"
-                : "Add \(model.providerName) account ‘\(model.accountName)’")
+            Text(model.autoIdentity
+                ? "Add \(model.providerName) Account"
+                : "Re-authenticate \(model.providerName)")
                 .font(.title2.bold())
             content
             Spacer(minLength: 0)
@@ -149,14 +178,14 @@ struct AuthFlowView: View {
             }
         case .awaiting:
             awaiting
-        case .done(let account):
+        case .done:
             VStack(alignment: .leading, spacing: 8) {
-                Label("Authenticated", systemImage: "checkmark.circle.fill")
+                Label("Account added", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.headline)
-                if !account.isEmpty {
-                    Text("Account: \(account)").font(.callout)
-                }
+                Text("The account identity was detected automatically and saved. Alexandria also requested its current Codex usage without sending a model prompt.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         case .failed(let error):
             VStack(alignment: .leading, spacing: 10) {
@@ -178,10 +207,20 @@ struct AuthFlowView: View {
         VStack(alignment: .leading, spacing: 14) {
             step(1, "Open the authorization page.") {
                 HStack(spacing: 8) {
-                    Button {
-                        model.openAuthorizeUrl()
+                    Menu {
+                        Button("Default Browser") {
+                            model.openAuthorizeUrl()
+                        }
+                        if !model.browserApplications.isEmpty {
+                            Divider()
+                            ForEach(model.browserApplications, id: \.path) { applicationURL in
+                                Button(model.browserName(applicationURL)) {
+                                    model.openAuthorizeUrl(with: applicationURL)
+                                }
+                            }
+                        }
                     } label: {
-                        Label("Open \(model.providerName) Authorization", systemImage: "arrow.up.forward.square")
+                        Label("Open in Browser…", systemImage: "arrow.up.forward.square")
                     }
                     if let url = model.authorizeUrl {
                         Button {
@@ -278,16 +317,18 @@ final class AuthWindowController {
     private var models: [String: AuthFlowModel] = [:]
 
     func show(
-        provider: String, accountName: String = "default", store: SnapshotStore,
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false,
+        store: SnapshotStore,
         onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
     ) {
-        let key = "\(provider):\(accountName)"
+        let key = autoIdentity ? "\(provider):add" : "\(provider):reauth:\(accountName ?? "default")"
         if let window = windows[key] {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let model = AuthFlowModel(provider: provider, accountName: accountName, store: store)
+        let model = AuthFlowModel(
+            provider: provider, accountName: accountName, autoIdentity: autoIdentity, store: store)
         model.onAuthenticated = onAuthenticated
         models[key] = model
         let view = AuthFlowView(model: model) { [weak self] in
@@ -295,9 +336,9 @@ final class AuthWindowController {
         }
         let host = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: host)
-        window.title = accountName == "default"
-            ? "Re-authenticate \(ProviderInfo.displayName(provider))"
-            : "Add \(ProviderInfo.displayName(provider)) Account"
+        window.title = autoIdentity
+            ? "Add \(ProviderInfo.displayName(provider)) Account"
+            : "Re-authenticate \(ProviderInfo.displayName(provider))"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.center()
