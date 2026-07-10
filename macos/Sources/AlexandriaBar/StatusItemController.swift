@@ -153,9 +153,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func buildLimits() {
-        guard !store.limits.isEmpty else { return }
+        guard !store.limits.isEmpty || store.accounts.contains(where: { $0.provider == "openai" }) else {
+            return
+        }
         let item = NSMenuItem()
-        let card = LimitsCardView(limits: store.limits, warnPct: store.limitWarnPct)
+        let card = LimitsCardView(
+            limits: store.limits,
+            accounts: store.accounts,
+            warnPct: store.limitWarnPct)
         let host = NSHostingView(rootView: card)
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
         item.view = host
@@ -179,7 +184,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func accountTitle(_ account: Account) -> String {
         var title = ProviderInfo.displayName(account.provider)
-        if let label = account.label, !label.isEmpty { title += " · \(label)" }
+        if let email = account.email, !email.isEmpty { title += " · \(email)" }
+        else if let label = account.label, !label.isEmpty { title += " · \(label)" }
+        else if account.name != "default" { title += " · \(account.name)" }
         return title
     }
 
@@ -215,6 +222,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             sub.addItem(item)
         }
 
+        info("Email: \(account.email ?? "not supplied by provider")")
         info("\(account.id) · \(account.kind) · \(account.status)")
         if let expires = account.expiresInS {
             info(expires < 0
@@ -229,12 +237,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         sub.addItem(.separator())
         action("Re-auth \(name)…", symbol: "key") { [weak self] in
-            self?.openAuth(provider: account.provider)
+            self?.openAuth(provider: account.provider, accountName: account.name)
         }
         action("Re-auth in Terminal…", symbol: "terminal") {
             let bin = DaemonController.findBinary() ?? "alexandria"
             TerminalLauncher.launch(
-                command: "\(bin) auth login \(ProviderInfo.loginArg(account.provider))")
+                command: "\(bin) auth login \(ProviderInfo.loginArg(account.provider)) --name \(account.name) --force")
         }
         action("Re-import credentials", symbol: "square.and.arrow.down") { [weak self] in
             self?.importCredentials()
@@ -254,6 +262,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             action("Start 5h Window Now…", symbol: "hourglass.bottomhalf.filled") { [weak self] in
                 self?.confirmStartCodexWindow()
             }
+        }
+        sub.addItem(.separator())
+        action("Add another \(name) account…", symbol: "person.badge.plus") { [weak self] in
+            self?.addAnotherAccount(provider: account.provider)
         }
         sub.addItem(.separator())
         action("Remove Account", symbol: "trash") { [weak self] in
@@ -314,7 +326,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildHarnesses() {
         guard store.harnessesSupported == true else { return }
-        let installed = HarnessCatalog.rows(store.harnesses).filter(\.installed)
+        // Keep the menu-bar surface limited to the user-tested Pi workflow.
+        // Settings and the daemon catalog still retain every supported harness.
+        let installed = HarnessCatalog.rows(store.harnesses).filter {
+            $0.installed && $0.name.caseInsensitiveCompare("pi") == .orderedSame
+        }
         guard !installed.isEmpty else { return }
         let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -325,19 +341,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             harnessItem.submenu = harnessSubmenu(harness)
             sub.addItem(harnessItem)
         }
-        sub.addItem(.separator())
-        let updateAll = NSMenuItem(
-            title: "Update All Harnesses",
-            action: #selector(runHandler(_:)),
-            keyEquivalent: "")
-        updateAll.target = self
-        updateAll.image = NSImage(
-            systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)
-        updateAll.representedObject = MenuHandler { [weak self] in
-            guard let self else { return }
-            self.harnessActionWindow.showUpdateAll(store: self.store)
-        }
-        sub.addItem(updateAll)
         item.submenu = sub
         menu.addItem(item)
         menu.addItem(.separator())
@@ -505,10 +508,45 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         pingWindow.show(target: target, title: name, store: store)
     }
 
-    private func openAuth(provider: String) {
-        authWindows.show(provider: provider, store: store) { [weak self] provider in
-            self?.pingAfterAuth(provider: provider)
+    private func openAuth(
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false
+    ) {
+        let callback: (@MainActor (String) -> Void)?
+        if autoIdentity {
+            callback = nil
+        } else {
+            callback = { [weak self] provider in
+                self?.pingAfterAuth(provider: provider)
+            }
         }
+        authWindows.show(
+            provider: provider, accountName: accountName, autoIdentity: autoIdentity, store: store,
+            onAuthenticated: callback)
+    }
+
+    private func addAnotherAccount(provider: String) {
+        if provider == "openai" {
+            openAuth(provider: provider, accountName: nil, autoIdentity: true)
+            return
+        }
+        let providerName = ProviderInfo.displayName(provider)
+        let alert = NSAlert()
+        alert.messageText = "Add another \(providerName) account"
+        alert.informativeText = "Choose a short local name (letters, numbers, _ and -)."
+        let field = NSTextField(string: "")
+        field.placeholderString = "e.g. personal or work"
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard name.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil else {
+            notify(title: "Invalid account name", body: "Use 1–32 lowercase letters, numbers, _ or -.")
+            return
+        }
+        openAuth(provider: provider, accountName: name)
     }
 
     private func pingAfterAuth(provider: String) {

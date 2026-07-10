@@ -14,6 +14,8 @@ final class AuthFlowModel {
     }
 
     let provider: String
+    let accountName: String?
+    let autoIdentity: Bool
     let store: SnapshotStore
     private(set) var stage: Stage = .starting
     private(set) var session: LoginSession?
@@ -21,8 +23,13 @@ final class AuthFlowModel {
     var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
     private var pollTask: Task<Void, Never>?
 
-    init(provider: String, store: SnapshotStore) {
+    init(
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false,
+        store: SnapshotStore
+    ) {
         self.provider = provider
+        self.accountName = accountName
+        self.autoIdentity = autoIdentity
         self.store = store
     }
 
@@ -43,7 +50,9 @@ final class AuthFlowModel {
         Task { [weak self] in
             do {
                 let session = try await client.authLoginStart(
-                    provider: ProviderInfo.loginArg(self?.provider ?? ""))
+                    provider: ProviderInfo.loginArg(self?.provider ?? ""),
+                    name: self?.accountName,
+                    autoIdentity: self?.autoIdentity ?? false)
                 self?.sessionUpdated(session)
             } catch {
                 self?.stage = .failed(error.localizedDescription)
@@ -117,7 +126,9 @@ struct AuthFlowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Re-authenticate \(model.providerName)")
+            Text(model.autoIdentity
+                ? "Add \(model.providerName) Account"
+                : "Re-authenticate \(model.providerName)")
                 .font(.title2.bold())
             content
             Spacer(minLength: 0)
@@ -144,14 +155,14 @@ struct AuthFlowView: View {
             }
         case .awaiting:
             awaiting
-        case .done(let account):
+        case .done:
             VStack(alignment: .leading, spacing: 8) {
-                Label("Authenticated", systemImage: "checkmark.circle.fill")
+                Label("Account added", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.headline)
-                if !account.isEmpty {
-                    Text("Account: \(account)").font(.callout)
-                }
+                Text("The account identity was detected automatically and saved. Alexandria also requested its current Codex usage without sending a model prompt.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         case .failed(let error):
             VStack(alignment: .leading, spacing: 10) {
@@ -176,7 +187,7 @@ struct AuthFlowView: View {
                     Button {
                         model.openAuthorizeUrl()
                     } label: {
-                        Label("Open \(model.providerName) Authorization", systemImage: "arrow.up.forward.square")
+                        Label("Open in Browser", systemImage: "arrow.up.forward.square")
                     }
                     if let url = model.authorizeUrl {
                         Button {
@@ -273,36 +284,41 @@ final class AuthWindowController {
     private var models: [String: AuthFlowModel] = [:]
 
     func show(
-        provider: String, store: SnapshotStore,
+        provider: String, accountName: String? = "default", autoIdentity: Bool = false,
+        store: SnapshotStore,
         onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
     ) {
-        if let window = windows[provider] {
+        let key = autoIdentity ? "\(provider):add" : "\(provider):reauth:\(accountName ?? "default")"
+        if let window = windows[key] {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let model = AuthFlowModel(provider: provider, store: store)
+        let model = AuthFlowModel(
+            provider: provider, accountName: accountName, autoIdentity: autoIdentity, store: store)
         model.onAuthenticated = onAuthenticated
-        models[provider] = model
+        models[key] = model
         let view = AuthFlowView(model: model) { [weak self] in
-            self?.closeWindow(provider: provider)
+            self?.closeWindow(key: key)
         }
         let host = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: host)
-        window.title = "Re-authenticate \(ProviderInfo.displayName(provider))"
+        window.title = autoIdentity
+            ? "Add \(ProviderInfo.displayName(provider)) Account"
+            : "Re-authenticate \(ProviderInfo.displayName(provider))"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.center()
-        windows[provider] = window
+        windows[key] = window
         model.begin()
         DockIconManager.shared.track(window)
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func closeWindow(provider: String) {
-        models[provider]?.cancel()
-        windows[provider]?.close()
-        windows[provider] = nil
-        models[provider] = nil
+    private func closeWindow(key: String) {
+        models[key]?.cancel()
+        windows[key]?.close()
+        windows[key] = nil
+        models[key] = nil
     }
 }

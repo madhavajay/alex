@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alex_auth::{now_ms, Account, Vault};
+use alex_auth::{
+    codex_reserve_blocked, codex_reserve_pct, codex_reset_selection, now_ms, Account,
+    AccountPolicy, AccountPolicyMode, Vault,
+};
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
     parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
@@ -31,6 +34,8 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct DarioActive {
@@ -68,6 +73,39 @@ fn suspect_dario(state: &AppState, account: &Account) {
     }
 }
 
+fn codex_limits_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    const LIMIT_HEADERS: &[&str] = &[
+        "x-codex-primary-used-percent",
+        "x-codex-primary-window-minutes",
+        "x-codex-primary-reset-at",
+        "x-codex-secondary-used-percent",
+        "x-codex-secondary-window-minutes",
+        "x-codex-secondary-reset-at",
+        "x-codex-plan-type",
+        "x-codex-active-limit",
+        "x-codex-credits-balance",
+        "x-codex-credits-has-credits",
+        "x-codex-credits-unlimited",
+    ];
+    let mut safe = serde_json::Map::new();
+    for name in LIMIT_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) {
+            safe.insert((*name).to_string(), json!(value));
+        }
+    }
+    if safe.is_empty() {
+        return None;
+    }
+    let parsed = alex_core::parse_limit_headers(Provider::Openai, &Value::Object(safe));
+    let has_windows = parsed
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(|windows| !windows.is_empty())
+        .unwrap_or(false);
+    let has_plan = parsed.get("plan").is_some_and(|value| !value.is_null());
+    (has_windows || has_plan).then_some(parsed)
+}
+
 pub struct AppState {
     pub local_key: String,
     pub vault: Arc<Vault>,
@@ -83,6 +121,9 @@ pub struct AppState {
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
+    codex_affinity: std::sync::Mutex<CodexAffinityCache>,
+    codex_affinity_locks:
+        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +131,112 @@ pub struct CachedRunKey {
     pub run_id: Option<String>,
     pub tags_json: Option<String>,
     pub expires_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexAffinityEntry {
+    account_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct CodexAffinityCache {
+    entries: HashMap<String, CodexAffinityEntry>,
+    ttl_ms: i64,
+    max_entries: usize,
+}
+
+impl Default for CodexAffinityCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl_ms: CODEX_AFFINITY_TTL_MS,
+            max_entries: CODEX_AFFINITY_MAX_ENTRIES,
+        }
+    }
+}
+
+impl CodexAffinityCache {
+    fn preferred(&mut self, session_id: &str, now: i64) -> Option<String> {
+        let entry = self.entries.get_mut(session_id)?;
+        if entry.expires_at_ms <= now {
+            self.entries.remove(session_id);
+            return None;
+        }
+        // Sliding expiry keeps an active thread sticky without retaining
+        // abandoned session IDs forever.
+        entry.expires_at_ms = now.saturating_add(self.ttl_ms);
+        Some(entry.account_id.clone())
+    }
+
+    fn bind(&mut self, session_id: &str, account_id: &str, now: i64) {
+        self.entries.retain(|_, entry| entry.expires_at_ms > now);
+        if !self.entries.contains_key(session_id) && self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at_ms)
+                .map(|(session, _)| session.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            session_id.to_string(),
+            CodexAffinityEntry {
+                account_id: account_id.to_string(),
+                expires_at_ms: now.saturating_add(self.ttl_ms),
+            },
+        );
+    }
+
+    fn unbind(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+}
+
+fn preferred_codex_account(state: &AppState, session_id: Option<&str>) -> Option<String> {
+    let session_id = session_id.filter(|value| !value.is_empty())?;
+    state
+        .codex_affinity
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .preferred(session_id, now_ms())
+}
+
+fn codex_affinity_lock(state: &AppState, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = state
+        .codex_affinity_locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+fn bind_codex_account(state: &AppState, session_id: Option<&str>, account: &Account) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if account.provider != Provider::Openai {
+        return;
+    }
+    let mut affinity = state
+        .codex_affinity
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if account.kind == "oauth" {
+        affinity.bind(session_id, &account.id, now_ms());
+    } else {
+        // An API-key fallback is not a Codex subscription affinity. Forget a
+        // stale subscription binding so the failed account is not restored as
+        // soon as its cooldown ends.
+        affinity.unbind(session_id);
+    }
 }
 
 struct InFlight(Arc<AppState>);
@@ -137,6 +284,8 @@ pub fn build_state(
         run_keys: std::sync::RwLock::new(HashMap::new()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
+        codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
+        codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -181,9 +330,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/storage/prune", post(admin_storage_prune))
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/accounts/analytics", get(admin_account_analytics))
+        .route(
+            "/admin/accounts/routing/openai",
+            get(admin_codex_routing).put(admin_codex_routing_update),
+        )
         .route(
             "/admin/accounts/{id}",
-            axum::routing::delete(admin_account_remove),
+            axum::routing::delete(admin_account_remove).put(admin_account_update),
         )
         .route("/admin/auth/gemini-key", post(admin_auth_gemini_key))
         .route("/admin/health", get(admin_health))
@@ -272,6 +426,23 @@ async fn admin_account_remove(
     }
 }
 
+async fn admin_account_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(paused) = body.0["paused"].as_bool() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing boolean 'paused'");
+    };
+    match state.vault.set_paused(&id, paused).await {
+        Ok(()) => axum::Json(json!({"id": id, "paused": paused})).into_response(),
+        Err(e) if e.to_string().starts_with("unknown account") => {
+            error_response(StatusCode::NOT_FOUND, &e.to_string())
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 async fn admin_auth_gemini_key(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
@@ -311,7 +482,14 @@ async fn admin_auth_login_start(
     let Some(provider) = body.0["provider"].as_str() else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
     };
-    match state.logins.start(state.vault.clone(), provider).await {
+    if body.0["auto_identity"].as_bool() == Some(true) {
+        return match state.logins.start_auto(state.vault.clone(), provider).await {
+            Ok(snapshot) => axum::Json(snapshot).into_response(),
+            Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+        };
+    }
+    let name = body.0["name"].as_str().unwrap_or("default");
+    match state.logins.start(state.vault.clone(), provider, name).await {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
@@ -437,6 +615,29 @@ async fn admin_analytics(
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     match state.store.analytics(now_ms() - minutes * 60_000) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_account_analytics(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let minutes: i64 = q
+        .get("since_minutes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24 * 60)
+        .clamp(1, 30 * 24 * 60);
+    let bucket_minutes: i64 = q
+        .get("bucket_minutes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+        .clamp(1, 24 * 60);
+    match state
+        .store
+        .account_analytics(now_ms() - minutes * 60_000, bucket_minutes * 60_000)
+    {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1193,6 +1394,7 @@ fn transcript_turn(row: &Value) -> Value {
         "reasoning_effort": row["reasoning_effort"],
         "thinking_budget": row["thinking_budget"],
         "cost_usd": row["cost_usd"],
+        "account_id": row["account_id"],
         "error": row["error"],
         "user": user,
         "assistant": assistant,
@@ -1443,12 +1645,34 @@ async fn traces_run_artifacts(
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let openai_policy = state.vault.policy(Provider::Openai);
     let accounts: Vec<Value> = state
         .vault
         .list()
         .await
         .into_iter()
         .map(|a| {
+            let email = a.email();
+            let routing = if a.provider == Provider::Openai {
+                let reserve_pct = codex_reserve_pct(&a, &openai_policy);
+                json!({
+                    "eligible": !openai_policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
+                    "priority": openai_policy.order.iter().position(|name| name == &a.name),
+                    "reserve_pct": reserve_pct,
+                    "reserve_blocked": codex_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
+                    "reset_selection": codex_reset_selection(&a, now_ms() / 1000),
+                })
+            } else {
+                Value::Null
+            };
+            let limits = if a.provider == Provider::Openai {
+                a.account_meta
+                    .get("codex_limits")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -1456,15 +1680,218 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "kind": a.kind,
                 "label": a.label,
                 "description": a.description,
+                "email": email,
                 "paused": a.paused,
                 "path": a.path.map(|p| p.display().to_string()),
                 "status": a.status,
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
+                "routing": routing,
+                "limits": limits,
             })
         })
         .collect();
     axum::Json(json!({"accounts": accounts}))
+}
+
+fn codex_strategy_name(mode: &AccountPolicyMode) -> &'static str {
+    match mode {
+        AccountPolicyMode::ResetFirst => "reset_first",
+        AccountPolicyMode::RoundRobin => "round_robin",
+        AccountPolicyMode::Priority | AccountPolicyMode::Threshold => "priority",
+    }
+}
+
+async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
+    let policy = state.vault.policy(Provider::Openai);
+    let mut accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| account.provider == Provider::Openai)
+        .collect();
+    accounts.sort_by_key(|account| {
+        (
+            policy
+                .order
+                .iter()
+                .position(|name| name == &account.name)
+                .unwrap_or(usize::MAX / 2),
+            account.name.clone(),
+            account.id.clone(),
+        )
+    });
+    let accounts: Vec<Value> = accounts
+        .into_iter()
+        .enumerate()
+        .map(|(fallback_priority, account)| {
+            let eligible = !policy
+                .disabled
+                .iter()
+                .any(|name| name == &account.name || name == &account.id);
+            let priority = policy
+                .order
+                .iter()
+                .position(|name| name == &account.name)
+                .unwrap_or(fallback_priority);
+            let limits = account
+                .account_meta
+                .get("codex_limits")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let reserve_pct = codex_reserve_pct(&account, &policy);
+            let reset_selection = codex_reset_selection(&account, now_ms() / 1000);
+            json!({
+                "account_id": account.id,
+                "eligible": eligible,
+                "priority": priority,
+                "reserve_pct": reserve_pct,
+                "reserve_blocked": codex_reserve_blocked(&account, reserve_pct, now_ms() / 1000),
+                "reset_selection": reset_selection,
+                "observed_at_ms": limits.get("observed_at_ms"),
+                "plan": limits.get("plan"),
+                "active_limit": limits.get("active_limit"),
+                "windows": limits.get("windows").cloned().unwrap_or_else(|| json!([])),
+                "credits": limits.get("credits").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    json!({
+        "provider": "openai",
+        "strategy": codex_strategy_name(&policy.mode),
+        "reserve_pct": policy.reserve_pct.unwrap_or(10).min(100),
+        "allow_mid_thread_failover": policy.allow_mid_thread_failover,
+        "reset_selection_rule": "highest_used_pct_then_earliest_reset",
+        "accounts": accounts,
+    })
+}
+
+async fn admin_codex_routing(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(codex_routing_snapshot(&state).await).into_response()
+}
+
+async fn admin_codex_routing_update(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let current_policy = state.vault.policy(Provider::Openai);
+    let mode = match body.0.get("strategy").and_then(Value::as_str) {
+        Some("reset_first") => AccountPolicyMode::ResetFirst,
+        Some("priority") => AccountPolicyMode::Priority,
+        Some("round_robin") => AccountPolicyMode::RoundRobin,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "strategy must be reset_first, priority, or round_robin",
+            )
+        }
+    };
+    let reserve_pct = match body.0.get("reserve_pct") {
+        Some(value) => match value.as_u64() {
+            Some(value) => value,
+            None => return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer"),
+        },
+        None => current_policy.reserve_pct.unwrap_or(10) as u64,
+    };
+    if reserve_pct > 100 {
+        return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be between 0 and 100");
+    }
+    let allow_mid_thread_failover = match body.0.get("allow_mid_thread_failover") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return error_response(
+                StatusCode::BAD_REQUEST,
+                "allow_mid_thread_failover must be boolean",
+            ),
+        },
+        None => current_policy.allow_mid_thread_failover,
+    };
+    let Some(requested) = body.0.get("accounts").and_then(Value::as_array) else {
+        return error_response(StatusCode::BAD_REQUEST, "accounts must be an array");
+    };
+    let openai_accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| account.provider == Provider::Openai)
+        .collect();
+    let by_id: HashMap<String, String> = openai_accounts
+        .iter()
+        .map(|account| (account.id.clone(), account.name.clone()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    for item in requested {
+        let Some(account_id) = item.get("account_id").and_then(Value::as_str) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs account_id");
+        };
+        let Some(eligible) = item.get("eligible").and_then(Value::as_bool) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs boolean eligible");
+        };
+        let Some(priority) = item.get("priority").and_then(Value::as_u64) else {
+            return error_response(StatusCode::BAD_REQUEST, "each account needs integer priority");
+        };
+        let account_reserve_pct = match item.get("reserve_pct") {
+            Some(value) => match value.as_u64() {
+                Some(value) if value <= 100 => value as u8,
+                Some(_) => return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "account reserve_pct must be between 0 and 100",
+                ),
+                None => return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "account reserve_pct must be an integer",
+                ),
+            },
+            None => reserve_pct as u8,
+        };
+        let Some(name) = by_id.get(account_id) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown OpenAI account '{account_id}'"),
+            );
+        };
+        if !seen.insert(account_id.to_string()) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate OpenAI account '{account_id}'"),
+            );
+        }
+        ordered.push((priority, name.clone(), eligible, account_reserve_pct));
+    }
+    if seen.len() != by_id.len() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "account list changed; refresh Settings and save again",
+        );
+    }
+    ordered.sort_by_key(|(priority, name, _, _)| (*priority, name.clone()));
+    let policy = AccountPolicy {
+        order: ordered.iter().map(|(_, name, _, _)| name.clone()).collect(),
+        mode,
+        threshold_pct: None,
+        reserve_pct: Some(reserve_pct as u8),
+        account_reserve_pct: ordered
+            .iter()
+            .map(|(_, name, _, reserve_pct)| (name.clone(), *reserve_pct))
+            .collect(),
+        allow_mid_thread_failover,
+        disabled: ordered
+            .iter()
+            .filter(|(_, _, eligible, _)| !*eligible)
+            .map(|(_, name, _, _)| name.clone())
+            .collect(),
+    };
+    match state
+        .vault
+        .set_policy_persisted(Provider::Openai, policy)
+        .await
+    {
+        Ok(()) => axum::Json(codex_routing_snapshot(&state).await).into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
@@ -1798,6 +2225,61 @@ fn client_key(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+const CLAUDE_CODE_PASSTHROUGH_HEADERS: &[&str] = &[
+    "accept",
+    "x-app",
+    "x-claude-code-session-id",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-timeout",
+    "anthropic-dangerous-direct-browser-access",
+];
+
+fn is_genuine_claude_code_request(
+    format: ClientFormat,
+    headers: &HeaderMap,
+    body: &Value,
+) -> bool {
+    if format != ClientFormat::AnthropicMessages {
+        return false;
+    }
+
+    for harness in headers.get_all("x-alexandria-harness").iter() {
+        let Ok(harness) = harness.to_str() else {
+            return false;
+        };
+        let harness = harness.trim().to_ascii_lowercase();
+        if !matches!(harness.as_str(), "claude" | "claude-code") {
+            return false;
+        }
+    }
+
+    let claude_user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("claude-cli/"));
+    let cli_app = headers
+        .get("x-app")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cli"));
+    let has_session = headers
+        .get("x-claude-code-session-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_billing_header = body["system"]
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block["text"].as_str())
+        .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"));
+
+    claude_user_agent && cli_app && has_session && has_billing_header
+}
+
 fn redacted_headers(headers: &HeaderMap) -> String {
     let map: HashMap<String, String> = headers
         .iter()
@@ -1983,9 +2465,14 @@ async fn plan_upstream(
     body_json: &mut Value,
     original_body: &[u8],
     trace_id: &str,
+    excluded_accounts: &HashSet<String>,
+    affinity_session: Option<&str>,
+    client_headers: &HeaderMap,
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
     use alex_core::translate;
     let client_stream = body_json["stream"].as_bool().unwrap_or(false);
+    let genuine_claude_code =
+        is_genuine_claude_code_request(format, client_headers, body_json);
     match provider {
         Provider::Anthropic => {
             let converted = match format {
@@ -2003,21 +2490,47 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let dario_active = state.dario.as_ref().and_then(|d| d.active());
-            let (base, account, dario_guard, dario_capture) = match (&state.dario, dario_active) {
-                (Some(dario), Some(active)) => (
-                    active.base_url.trim_end_matches('/').to_string(),
-                    dario_account(&active),
-                    dario.begin(&active.generation_id),
-                    true,
-                ),
-                _ => {
-                    let account = state
-                        .vault
-                        .account_for(provider, true)
-                        .await
-                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None, false)
+            let (base, account, dario_guard, dario_capture) = if genuine_claude_code {
+                let account = state
+                    .vault
+                    .account_for_excluding(provider, true, excluded_accounts)
+                    .await
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                (ANTHROPIC_BASE.to_string(), account, None, false)
+            } else {
+                let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
+                match (&state.dario, dario_active) {
+                    (Some(dario), Some(active)) => {
+                        let guard = dario.begin(&active.generation_id).ok_or_else(|| {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Dario became unavailable while routing the Anthropic request"
+                                    .to_string(),
+                            )
+                        })?;
+                        (
+                            active.base_url.trim_end_matches('/').to_string(),
+                            dario_account(&active),
+                            Some(guard),
+                            true,
+                        )
+                    }
+                    (Some(_), None) => {
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Dario is configured but no healthy generation is available"
+                                .to_string(),
+                        ));
+                    }
+                    (None, None) => {
+                        let account = state
+                            .vault
+                            .account_for_excluding(provider, true, excluded_accounts)
+                            .await
+                            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                        (ANTHROPIC_BASE.to_string(), account, None, false)
+                    }
+                    (None, Some(_)) => unreachable!("Dario cannot be active when it is disabled"),
                 }
             };
             let (body, respond_as) = match converted {
@@ -2057,13 +2570,33 @@ async fn plan_upstream(
             })
         }
         Provider::Openai => {
+            // Serialize only the account-planning step for the same thread.
+            // This closes the first-request race without blocking unrelated
+            // sessions or holding a lock during the upstream model request.
+            let _affinity_guard = match affinity_session.filter(|value| !value.is_empty()) {
+                Some(session_id) => Some(
+                    codex_affinity_lock(state, session_id)
+                        .lock_owned()
+                        .await,
+                ),
+                None => None,
+            };
             let prefer_oauth = format != ClientFormat::OpenaiChat;
+            let policy = state.vault.policy(Provider::Openai);
+            let preferred = preferred_codex_account(state, affinity_session);
             let account = state
                 .vault
-                .account_for(provider, prefer_oauth)
+                .account_for_excluding_preferred_mode(
+                    provider,
+                    prefer_oauth,
+                    excluded_accounts,
+                    preferred.as_deref(),
+                    preferred.is_some() && !policy.allow_mid_thread_failover,
+                )
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
+            bind_codex_account(state, affinity_session, &account);
             match format {
                 ClientFormat::OpenaiChat if !oauth => {
                     body_json["model"] = json!(routed_model);
@@ -2180,7 +2713,7 @@ async fn plan_upstream(
         Provider::Xai => {
             let account = state
                 .vault
-                .account_for(provider, true)
+                .account_for_excluding(provider, true, excluded_accounts)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let extra_headers = vec![
@@ -2235,7 +2768,7 @@ async fn plan_upstream(
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
                 .vault
-                .account_for(provider, false)
+                .account_for_excluding(provider, false, excluded_accounts)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let (gemini_req, respond_as) = match format {
@@ -2316,9 +2849,10 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        session_from_metadata, trace_extras, trace_reasoning_fields, transcript_turn,
+        session_from_metadata, trace_extras, trace_harness, trace_reasoning_fields, transcript_turn,
         truncate_chars,
     };
+    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     #[test]
@@ -2334,6 +2868,21 @@ mod trace_api_tests {
             Some("{\"device_id\":\"d1\"}".into())
         );
         assert_eq!(session_from_metadata(&json!({})), None);
+    }
+
+    #[test]
+    fn explicit_harness_header_wins_over_sdk_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("Anthropic/JS 0.91.1"),
+        );
+        assert_eq!(trace_harness(&headers).as_deref(), Some("Anthropic/JS 0.91.1"));
+        headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("pi"),
+        );
+        assert_eq!(trace_harness(&headers).as_deref(), Some("pi"));
     }
 
     #[test]
@@ -2469,6 +3018,7 @@ mod usage_tests {
 fn upstream_headers(
     account: &Account,
     client_headers: &HeaderMap,
+    genuine_claude_code: bool,
 ) -> Result<reqwest::header::HeaderMap, (StatusCode, String)> {
     let mut h = reqwest::header::HeaderMap::new();
     h.insert("content-type", HeaderValue::from_static("application/json"));
@@ -2611,6 +3161,13 @@ fn upstream_headers(
                 HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
+        }
+    }
+    if genuine_claude_code && account.provider == Provider::Anthropic {
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            if let Some(value) = client_headers.get(*name) {
+                h.insert(*name, value.clone());
+            }
         }
     }
     Ok(h)
@@ -2797,6 +3354,21 @@ fn session_from_metadata(body_json: &Value) -> Option<String> {
     Some(raw.to_string())
 }
 
+fn trace_harness(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-alexandria-harness")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok())
+                .map(String::from)
+        })
+}
+
 const METADATA_HEADERS: &[(&str, &str)] = &[
     ("x-alexandria-harness", "harness"),
     ("x-alexandria-harness-version", "harness_version"),
@@ -2831,6 +3403,21 @@ fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     serde_json::to_string(&tags).ok()
+}
+
+fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status.is_server_error()
+}
+
+fn retry_failover_allowed(
+    provider: Provider,
+    thread_was_affined: bool,
+    allow_mid_thread_failover: bool,
+) -> bool {
+    provider != Provider::Openai || !thread_was_affined || allow_mid_thread_failover
 }
 
 async fn proxy(
@@ -2884,10 +3471,7 @@ async fn proxy(
         method: Some("POST".into()),
         path: Some(path.into()),
         client_format: Some(format.as_str().into()),
-        harness: headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
+        harness: trace_harness(&headers),
         req_headers_json: Some(redacted_headers(&headers)),
         run_id: headers
             .get("x-alexandria-run-id")
@@ -2912,6 +3496,7 @@ async fn proxy(
     let (reasoning_effort, thinking_budget) = trace_reasoning_fields(&body_json);
     trace.reasoning_effort = reasoning_effort;
     trace.thinking_budget = thinking_budget;
+    let genuine_claude_code = is_genuine_claude_code_request(format, &headers, &body_json);
 
     trace.session_id = headers
         .get("x-session-id")
@@ -2923,7 +3508,20 @@ async fn proxy(
                 .and_then(|v| v.to_str().ok())
                 .map(String::from)
         })
+        .or_else(|| {
+            headers
+                .get("x-claude-code-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
         .or_else(|| session_from_metadata(&body_json))
+        .or_else(|| {
+            body_json
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        })
         .or_else(|| {
             conversation_root(format, &body_json).map(|root| {
                 let ua = headers
@@ -2946,6 +3544,18 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
 
+    // Capture this before planning binds a brand-new session. The policy only
+    // suppresses failover for a thread that arrived with an existing affinity;
+    // an unaffined first request may still fail over and then pin its winner.
+    let codex_thread_was_affined = provider == Provider::Openai
+        && preferred_codex_account(&state, trace.session_id.as_deref()).is_some();
+    let allow_mid_thread_failover = state
+        .vault
+        .policy(Provider::Openai)
+        .allow_mid_thread_failover;
+
+    let original_body_json = body_json.clone();
+    let mut attempted_accounts = HashSet::new();
     let mut plan = match plan_upstream(
         &state,
         format,
@@ -2954,6 +3564,9 @@ async fn proxy(
         &mut body_json,
         &body,
         &trace_id,
+        &attempted_accounts,
+        trace.session_id.as_deref(),
+        &headers,
     )
     .await
     {
@@ -2982,98 +3595,172 @@ async fn proxy(
         provider = provider.as_str(),
         account = %plan.account.id,
         url = %plan.url,
+        genuine_claude_code,
         "proxying request"
     );
 
     let mut account = plan.account.clone();
     let mut upstream_resp = None;
-    for attempt in 0..2 {
-        let mut up_headers = match upstream_headers(&account, &headers) {
-            Ok(h) => h,
-            Err((status, msg)) => {
-                trace.status = Some(status.as_u16() as i64);
-                trace.error = Some(msg.clone());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
-                return error_response(status, &msg);
-            }
-        };
-        for (k, v) in &plan.extra_headers {
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
-            ) {
-                up_headers.insert(name, value);
-            }
+    'accounts: loop {
+        if !attempted_accounts.insert(account.id.clone()) {
+            tracing::error!(account = %account.id, "refusing to retry an already-attempted account");
+            break;
         }
-        let resp = match state
-            .http
-            .post(&plan.url)
-            .headers(up_headers)
-            .body(plan.body.clone())
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = format!("upstream request failed: {e}");
-                suspect_dario(&state, &account);
-                trace.status = Some(502);
-                trace.error = Some(msg.clone());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
-                return error_response(StatusCode::BAD_GATEWAY, &msg);
+
+        let mut forced_oauth_refresh = false;
+        loop {
+            let mut up_headers =
+                match upstream_headers(&account, &headers, genuine_claude_code) {
+                Ok(h) => h,
+                Err((status, msg)) => {
+                    trace.status = Some(status.as_u16() as i64);
+                    trace.error = Some(msg.clone());
+                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    return error_response(status, &msg);
+                }
+            };
+            for (k, v) in &plan.extra_headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    up_headers.insert(name, value);
+                }
             }
-        };
-        let retryable_status = resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-            || resp.status().is_server_error();
-        if retryable_status && account.kind != "dario" {
-            let retry_after_s = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(60)
-                .clamp(1, 3600);
-            tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
-            if let Err(e) = state.vault.mark_cooldown(&account.id, now_ms() + retry_after_s * 1000).await {
-                tracing::warn!("failed to mark cooldown: {e}");
+            let resp = match state
+                .http
+                .post(&plan.url)
+                .headers(up_headers)
+                .body(plan.body.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("upstream request failed: {e}");
+                    suspect_dario(&state, &account);
+                    trace.status = Some(502);
+                    trace.error = Some(msg.clone());
+                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    return error_response(StatusCode::BAD_GATEWAY, &msg);
+                }
+            };
+
+            if account.provider == Provider::Openai && account.kind == "oauth" {
+                if let Some(snapshot) = codex_limits_from_headers(resp.headers()) {
+                    if let Err(error) = state
+                        .vault
+                        .record_codex_limits(&account.id, snapshot)
+                        .await
+                    {
+                        tracing::warn!(account = %account.id, %error, "could not persist Codex limit snapshot");
+                    }
+                }
             }
-            if attempt == 0 {
-                match plan_upstream(&state, format, provider, &routed_model, &mut body_json, &body, &trace_id).await {
-                    Ok(p) if p.account.id != account.id => {
-                        plan = p;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && account.kind == "oauth"
+                && !forced_oauth_refresh
+            {
+                tracing::warn!(
+                    account = %account.id,
+                    "upstream returned 401 for oauth account; forcing token refresh and retrying"
+                );
+                forced_oauth_refresh = true;
+                match state.vault.refresh(&account.id, true).await {
+                    Ok(fresh) => {
+                        account = fresh;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("forced refresh failed: {e}");
+                    }
+                }
+            }
+
+            if retryable_failover_status(resp.status()) && account.kind != "dario" {
+                let retry_after_s = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(60)
+                    .clamp(1, 3600);
+                tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
+                if let Err(e) = state
+                    .vault
+                    .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
+                    .await
+                {
+                    tracing::warn!("failed to mark cooldown: {e}");
+                }
+
+                if !retry_failover_allowed(
+                    provider,
+                    codex_thread_was_affined,
+                    allow_mid_thread_failover,
+                ) {
+                    tracing::warn!(
+                        account = %account.id,
+                        status = %resp.status(),
+                        "returning retryable Codex error without switching an affined thread"
+                    );
+                    upstream_resp = Some(resp);
+                    break 'accounts;
+                }
+
+                let mut retry_body_json = original_body_json.clone();
+                match plan_upstream(
+                    &state,
+                    format,
+                    provider,
+                    &routed_model,
+                    &mut retry_body_json,
+                    &body,
+                    &trace_id,
+                    &attempted_accounts,
+                    trace.session_id.as_deref(),
+                    &headers,
+                )
+                .await
+                {
+                    Ok(next_plan) if !attempted_accounts.contains(&next_plan.account.id) => {
+                        plan = next_plan;
                         account = plan.account.clone();
                         trace.account_id = Some(account.id.clone());
                         trace.upstream_format = Some(plan.upstream_format.into());
-                        tracing::warn!(account = %account.id, "retrying once with failover account");
-                        continue;
+                        trace.billing_bucket = Some(
+                            if account.kind == "oauth" || account.kind == "dario" {
+                                "subscription"
+                            } else {
+                                "api"
+                            }
+                            .into(),
+                        );
+                        tracing::warn!(
+                            account = %account.id,
+                            attempted = attempted_accounts.len(),
+                            "retrying with failover account"
+                        );
+                        continue 'accounts;
                     }
-                    Ok(_) => {}
-                    Err((status, msg)) => tracing::warn!(status = %status, error = %msg, "no failover account available"),
+                    Ok(next_plan) => {
+                        tracing::error!(
+                            account = %next_plan.account.id,
+                            "account selector returned an already-attempted failover account"
+                        );
+                    }
+                    Err((status, msg)) => tracing::warn!(
+                        status = %status,
+                        error = %msg,
+                        attempted = attempted_accounts.len(),
+                        "no untried failover account available"
+                    ),
                 }
             }
+
+            upstream_resp = Some(resp);
+            break 'accounts;
         }
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            && account.kind == "oauth"
-            && attempt == 0
-        {
-            tracing::warn!(
-                account = %account.id,
-                "upstream returned 401 for oauth account; forcing token refresh and retrying"
-            );
-            match state.vault.refresh(&account.id, true).await {
-                Ok(fresh) => {
-                    account = fresh;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("forced refresh failed: {e}");
-                }
-            }
-        }
-        upstream_resp = Some(resp);
-        break;
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
     trace.account_id = Some(account.id.clone());
@@ -3447,6 +4134,13 @@ mod tests {
     }
 
     fn test_state(name: &str) -> Arc<AppState> {
+        test_state_with_dario(name, None)
+    }
+
+    fn test_state_with_dario(
+        name: &str,
+        dario: Option<Arc<dyn DarioRouter>>,
+    ) -> Arc<AppState> {
         let dir = tmpdir(name);
         let store = Arc::new(Store::open(dir.join("store")).unwrap());
         let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
@@ -3454,9 +4148,327 @@ mod tests {
             "alx-local".into(),
             vault,
             store,
-            None,
+            dario,
             "http://127.0.0.1:4100".into(),
         )
+    }
+
+    fn anthropic_account() -> Account {
+        Account {
+            id: "anthropic:test".into(),
+            provider: Provider::Anthropic,
+            kind: "oauth".into(),
+            name: "test".into(),
+            description: None,
+            paused: false,
+            label: None,
+            access_token: Some("direct-token".into()),
+            refresh_token: None,
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 3_600_000),
+            last_refresh_ms: None,
+            account_meta: Value::Null,
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    struct FakeDario {
+        active: Option<DarioActive>,
+        begin_succeeds: bool,
+    }
+
+    impl DarioRouter for FakeDario {
+        fn active(&self) -> Option<DarioActive> {
+            self.active.clone()
+        }
+
+        fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
+            self.begin_succeeds
+                .then(|| Box::new(()) as Box<dyn std::any::Any + Send>)
+        }
+
+        fn status(&self) -> Value {
+            json!({"active": self.active.is_some()})
+        }
+
+        fn suspect(&self, _generation_id: &str) {}
+    }
+
+    fn active_dario() -> Arc<dyn DarioRouter> {
+        Arc::new(FakeDario {
+            active: Some(DarioActive {
+                generation_id: "test-generation".into(),
+                base_url: "http://127.0.0.1:9191".into(),
+                api_key: "dario-key".into(),
+            }),
+            begin_succeeds: true,
+        })
+    }
+
+    fn claude_code_request() -> (HeaderMap, Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.0"));
+        headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-123"),
+        );
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.0"
+            }],
+            "messages": []
+        });
+        (headers, body)
+    }
+
+    #[test]
+    fn claude_code_detection_requires_the_complete_signature() {
+        let (headers, body) = claude_code_request();
+        assert!(is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &headers,
+            &body
+        ));
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::OpenaiChat,
+            &headers,
+            &body
+        ));
+
+        for required in ["user-agent", "x-app", "x-claude-code-session-id"] {
+            let mut missing = headers.clone();
+            missing.remove(required);
+            assert!(
+                !is_genuine_claude_code_request(
+                    ClientFormat::AnthropicMessages,
+                    &missing,
+                    &body
+                ),
+                "request without {required} must not bypass Dario"
+            );
+        }
+
+        let mut missing_billing = body.clone();
+        missing_billing["system"] = json!([]);
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &headers,
+            &missing_billing
+        ));
+
+        let mut explicit_other_harness = headers;
+        explicit_other_harness.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("pi"),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &explicit_other_harness,
+            &body
+        ));
+
+        let (mut conflicting_harness, body) = claude_code_request();
+        conflicting_harness.append(
+            "x-alexandria-harness",
+            HeaderValue::from_static("claude-code"),
+        );
+        conflicting_harness.append(
+            "x-alexandria-harness",
+            HeaderValue::from_static("codex"),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &conflicting_harness,
+            &body
+        ));
+
+        let (mut malformed_harness, body) = claude_code_request();
+        malformed_harness.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_bytes(b"\x80").unwrap(),
+        );
+        assert!(!is_genuine_claude_code_request(
+            ClientFormat::AnthropicMessages,
+            &malformed_harness,
+            &body
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_routing_bypasses_dario_only_for_claude_code() {
+        let state = test_state_with_dario("dario-routing", Some(active_dario()));
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (claude_headers, request) = claude_code_request();
+        let original = serde_json::to_vec(&request).unwrap();
+        let excluded = HashSet::new();
+
+        let mut direct_body = request.clone();
+        let direct = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut direct_body,
+            &original,
+            "trace-direct",
+            &excluded,
+            None,
+            &claude_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(direct.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(direct.account.id, "anthropic:test");
+        assert!(direct.extra_headers.is_empty());
+
+        let mut harness_headers = HeaderMap::new();
+        harness_headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        let mut dario_body = request;
+        let dario = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut dario_body,
+            &original,
+            "trace-dario",
+            &excluded,
+            None,
+            &harness_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dario.url, "http://127.0.0.1:9191/v1/messages");
+        assert_eq!(dario.account.kind, "dario");
+        assert!(dario
+            .extra_headers
+            .contains(&("x-dario-capture-id".into(), "trace-dario".into())));
+    }
+
+    #[tokio::test]
+    async fn configured_dario_fails_closed_when_unhealthy() {
+        let state = test_state_with_dario(
+            "dario-unhealthy",
+            Some(Arc::new(FakeDario {
+                active: None,
+                begin_succeeds: false,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (_, mut request) = claude_code_request();
+        let client_headers = HeaderMap::new();
+        let excluded = HashSet::new();
+        let original = serde_json::to_vec(&request).unwrap();
+
+        let result = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut request,
+            &original,
+            "trace-unhealthy",
+            &excluded,
+            None,
+            &client_headers,
+        )
+        .await;
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(message.contains("no healthy generation"));
+            }
+            Ok(_) => panic!("an unhealthy configured Dario must not fall back to direct traffic"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dario_generation_race_fails_closed() {
+        let state = test_state_with_dario(
+            "dario-generation-race",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "vanished-generation".into(),
+                    base_url: "http://127.0.0.1:9191".into(),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: false,
+            })),
+        );
+        let (_, mut request) = claude_code_request();
+        let original = serde_json::to_vec(&request).unwrap();
+        let client_headers = HeaderMap::new();
+        let excluded = HashSet::new();
+
+        let result = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut request,
+            &original,
+            "trace-race",
+            &excluded,
+            None,
+            &client_headers,
+        )
+        .await;
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(message.contains("became unavailable"));
+            }
+            Ok(_) => panic!("a vanished Dario generation must not fall back to direct traffic"),
+        }
+    }
+
+    #[test]
+    fn direct_claude_code_headers_are_allowlisted() {
+        let (mut client_headers, _) = claude_code_request();
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            client_headers.insert(*name, HeaderValue::from_static("safe-client-value"));
+        }
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-secret"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
+        client_headers.insert("host", HeaderValue::from_static("attacker.invalid"));
+        client_headers.insert("content-length", HeaderValue::from_static("999"));
+        client_headers.insert("connection", HeaderValue::from_static("close"));
+        client_headers.insert("accept-encoding", HeaderValue::from_static("br"));
+        client_headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("claude"),
+        );
+        client_headers.insert(
+            "x-dario-capture-id",
+            HeaderValue::from_static("spoofed"),
+        );
+
+        let direct = upstream_headers(&anthropic_account(), &client_headers, true).unwrap();
+        for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
+            assert_eq!(direct[*name], "safe-client-value", "missing {name}");
+        }
+        assert_eq!(direct["authorization"], "Bearer direct-token");
+        assert!(direct.get("x-api-key").is_none());
+        assert!(direct.get("host").is_none());
+        assert!(direct.get("content-length").is_none());
+        assert!(direct.get("connection").is_none());
+        assert_eq!(direct["accept-encoding"], "identity");
+        assert!(direct.get("x-alexandria-harness").is_none());
+        assert!(direct.get("x-dario-capture-id").is_none());
+
+        let non_claude = upstream_headers(&anthropic_account(), &client_headers, false).unwrap();
+        assert!(non_claude.get("x-app").is_none());
+        assert!(non_claude.get("x-claude-code-session-id").is_none());
+        assert_eq!(non_claude["authorization"], "Bearer direct-token");
     }
 
     async fn response_json(resp: Response) -> (StatusCode, Value) {
@@ -3485,6 +4497,131 @@ mod tests {
             };
             Box::pin(async move { result })
         }
+    }
+
+    fn test_openai_account(name: &str) -> Account {
+        Account {
+            id: if name == "default" {
+                "openai-oauth".into()
+            } else {
+                format!("openai-oauth-{name}")
+            },
+            provider: Provider::Openai,
+            kind: "oauth".into(),
+            name: name.into(),
+            description: None,
+            paused: false,
+            label: Some("codex (test)".into()),
+            access_token: Some(format!("token-{name}")),
+            refresh_token: Some(format!("refresh-{name}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 3_600_000),
+            last_refresh_ms: Some(now_ms()),
+            account_meta: json!({"account_id": format!("chatgpt-{name}")}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn codex_affinity_cache_expires_and_evicts_oldest_session() {
+        let mut cache = CodexAffinityCache {
+            entries: HashMap::new(),
+            ttl_ms: 100,
+            max_entries: 2,
+        };
+        cache.bind("session-a", "account-a", 0);
+        cache.bind("session-b", "account-b", 10);
+        assert_eq!(cache.preferred("session-a", 20).as_deref(), Some("account-a"));
+
+        // session-a's lookup extends its expiry, so session-b is oldest.
+        cache.bind("session-c", "account-c", 30);
+        assert!(cache.preferred("session-b", 30).is_none());
+        assert_eq!(cache.preferred("session-a", 30).as_deref(), Some("account-a"));
+        assert_eq!(cache.preferred("session-c", 30).as_deref(), Some("account-c"));
+        assert!(cache.preferred("session-a", 131).is_none());
+    }
+
+    #[test]
+    fn captures_only_safe_codex_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        headers.insert("x-codex-plan-type", HeaderValue::from_static("plus"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("300"),
+        );
+        headers.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("1800000000"),
+        );
+        let snapshot = codex_limits_from_headers(&headers).unwrap();
+        assert_eq!(snapshot["plan"], "plus");
+        assert_eq!(snapshot["windows"][0]["window"], "5h");
+        assert_eq!(snapshot["windows"][0]["used_pct"], 42.0);
+        assert!(!snapshot.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn codex_routing_api_updates_eligibility_order_and_reserve() {
+        let state = test_state("codex-routing");
+        state
+            .vault
+            .upsert(test_openai_account("default"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_openai_account("work"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(
+            admin_codex_routing_update(
+                State(state.clone()),
+                axum::Json(json!({
+                    "strategy": "priority",
+                    "reserve_pct": 15,
+                    "allow_mid_thread_failover": false,
+                    "accounts": [
+                        {"account_id": "openai-oauth-work", "eligible": true, "priority": 0, "reserve_pct": 22},
+                        {"account_id": "openai-oauth", "eligible": false, "priority": 1}
+                    ]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["strategy"], "priority");
+        assert_eq!(body["reserve_pct"], 15);
+        assert_eq!(body["allow_mid_thread_failover"], false);
+        assert_eq!(body["accounts"][0]["account_id"], "openai-oauth-work");
+        assert_eq!(body["accounts"][0]["eligible"], true);
+        assert_eq!(body["accounts"][0]["reserve_pct"], 22);
+        assert_eq!(body["accounts"][1]["eligible"], false);
+        assert_eq!(body["accounts"][1]["reserve_pct"], 15);
+        assert_eq!(
+            state
+                .vault
+                .policy(Provider::Openai)
+                .account_reserve_pct["work"],
+            22
+        );
+        assert_eq!(
+            state
+                .vault
+                .account_for(Provider::Openai, true)
+                .await
+                .unwrap()
+                .name,
+            "work"
+        );
     }
 
     #[tokio::test]
@@ -3607,5 +4744,247 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("label"));
+    }
+
+    #[test]
+    fn failover_statuses_are_limited_to_auth_rate_limit_and_server_errors() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                retryable_failover_status(status),
+                "{status} should fail over"
+            );
+        }
+        for status in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                !retryable_failover_status(status),
+                "{status} should be returned without failover"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_mid_thread_failover_only_pins_existing_codex_threads() {
+        assert!(!retry_failover_allowed(Provider::Openai, true, false));
+        assert!(retry_failover_allowed(Provider::Openai, false, false));
+        assert!(retry_failover_allowed(Provider::Openai, true, true));
+        assert!(retry_failover_allowed(Provider::Anthropic, true, false));
+    }
+
+    #[tokio::test]
+    async fn codex_planning_excludes_every_account_already_attempted() {
+        let state = test_state("codex-plan-exclusions");
+        for (id, name) in [
+            ("openai-oauth-a", "a"),
+            ("openai-oauth-b", "b"),
+            ("openai-oauth-c", "c"),
+        ] {
+            state
+                .vault
+                .upsert(Account {
+                    id: id.into(),
+                    provider: Provider::Openai,
+                    kind: "oauth".into(),
+                    name: name.into(),
+                    description: None,
+                    paused: false,
+                    label: None,
+                    access_token: Some(format!("access-{name}")),
+                    refresh_token: Some(format!("refresh-{name}")),
+                    id_token: None,
+                    api_key: None,
+                    expires_at_ms: Some(now_ms() + 3_600_000),
+                    last_refresh_ms: Some(now_ms()),
+                    account_meta: json!({"account_id": format!("chatgpt-{name}")}),
+                    cooldown_until_ms: None,
+                    status: "active".into(),
+                    path: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let original = json!({"model": "gpt-5.3-codex", "stream": true});
+        let raw = serde_json::to_vec(&original).unwrap();
+        let client_headers = HeaderMap::new();
+        let mut excluded = HashSet::new();
+        let mut selected = Vec::new();
+        for _ in 0..3 {
+            let mut body = original.clone();
+            let plan = plan_upstream(
+                &state,
+                ClientFormat::OpenaiResponses,
+                Provider::Openai,
+                "gpt-5.3-codex",
+                &mut body,
+                &raw,
+                "trace-test",
+                &excluded,
+                None,
+                &client_headers,
+            )
+            .await
+            .unwrap();
+            assert!(excluded.insert(plan.account.id.clone()));
+            selected.push(plan.account.id);
+        }
+
+        assert_eq!(
+            selected,
+            vec!["openai-oauth-a", "openai-oauth-b", "openai-oauth-c"]
+        );
+        let mut body = original;
+        assert!(plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-test",
+            &excluded,
+            None,
+            &client_headers,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_sessions_stay_affined_and_failover_rebinds() {
+        let state = test_state("codex-session-affinity");
+        state
+            .vault
+            .upsert(test_openai_account("a"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_openai_account("b"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .set_policies(vec![(
+                Provider::Openai,
+                AccountPolicy {
+                    order: vec!["a".into(), "b".into()],
+                    mode: AccountPolicyMode::RoundRobin,
+                    reserve_pct: Some(0),
+                    ..AccountPolicy::default()
+                },
+            )])
+            .await;
+
+        let request = json!({"model": "gpt-5.3-codex", "stream": true});
+        let raw = serde_json::to_vec(&request).unwrap();
+        let headers = HeaderMap::new();
+        let none_excluded = HashSet::new();
+
+        let mut body = request.clone();
+        let session_a_first = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-1",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+
+        let mut body = request.clone();
+        let session_b_first = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-b-1",
+            &none_excluded,
+            Some("session-b"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_ne!(session_a_first, session_b_first);
+
+        let mut body = request.clone();
+        let session_a_again = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-2",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(session_a_again, session_a_first);
+
+        let excluded = HashSet::from([session_a_first.clone()]);
+        let mut body = request.clone();
+        let failover = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-failover",
+            &excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(failover, session_b_first);
+
+        let mut body = request;
+        let after_failover = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-3",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(after_failover, failover);
     }
 }

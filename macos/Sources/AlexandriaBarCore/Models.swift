@@ -22,19 +22,43 @@ public struct AccountsResponse: Codable, Sendable {
 public struct Account: Codable, Sendable, Identifiable {
     public let id: String
     public let provider: String
+    public let name: String
     public let kind: String
     public let label: String?
+    public let description: String?
+    public let email: String?
+    public let limits: AccountLimits?
+    public let paused: Bool
     public let status: String
     public let expiresAtMs: Int64?
     public let expiresInS: Int64?
 
     enum CodingKeys: String, CodingKey {
-        case id, provider, kind, label, status
+        case id, provider, name, kind, label, description, email, limits, paused, status
         case expiresAtMs = "expires_at_ms"
         case expiresInS = "expires_in_s"
     }
 
     public var isExpired: Bool { (expiresInS ?? 1) < 0 }
+}
+
+/// A quota snapshot tied to one credential rather than a provider-wide aggregate.
+///
+/// The daemon currently supplies these for Codex accounts. Keeping the shape
+/// provider-neutral lets other subscription providers expose the same data later.
+public struct AccountLimits: Codable, Sendable {
+    public let plan: String?
+    public let source: String?
+    public let error: String?
+    public let windows: [LimitWindow]?
+    public let requests: CountPair?
+    public let tokens: CountPair?
+    public let observedAtMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case plan, source, error, windows, requests, tokens
+        case observedAtMs = "observed_at_ms"
+    }
 }
 
 public struct HealthResponse: Codable, Sendable {
@@ -129,6 +153,235 @@ public struct Analytics: Codable, Sendable {
         case byModel = "by_model"
         case sinceMs = "since_ms"
     }
+}
+
+public struct AccountAnalyticsResponse: Codable, Sendable {
+    public let sinceMs: Int64
+    public let bucketMs: Int64
+    public let byAccount: [AccountUsage]
+    public let series: [AccountUsageBucket]
+
+    enum CodingKeys: String, CodingKey {
+        case sinceMs = "since_ms"
+        case bucketMs = "bucket_ms"
+        case byAccount = "by_account"
+        case series
+    }
+}
+
+public struct AccountUsage: Codable, Sendable, Identifiable {
+    public let accountId: String
+    public let provider: String?
+    public let requests: Int64
+    public let inputTokens: Int64
+    public let outputTokens: Int64
+    public let costUsd: Double
+    public let errors: Int64?
+    public let lastTsMs: Int64?
+
+    public var id: String { accountId }
+
+    enum CodingKeys: String, CodingKey {
+        case provider, requests, errors
+        case accountId = "account_id"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+        case lastTsMs = "last_ts_ms"
+    }
+}
+
+public struct AccountUsageBucket: Codable, Sendable, Identifiable {
+    public let bucketMs: Int64
+    public let accountId: String
+    public let requests: Int64
+    public let inputTokens: Int64
+    public let outputTokens: Int64
+    public let costUsd: Double
+    public let errors: Int64?
+
+    public var id: String { "\(bucketMs):\(accountId)" }
+
+    enum CodingKeys: String, CodingKey {
+        case requests, errors
+        case bucketMs = "bucket_ms"
+        case accountId = "account_id"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+    }
+}
+
+public enum CodexRoutingStrategy: String, Codable, Sendable, CaseIterable, Hashable {
+    case resetFirst = "reset_first"
+    case priority
+    case roundRobin = "round_robin"
+}
+
+public struct CodexRoutingResponse: Codable, Sendable {
+    public let provider: String
+    public let strategy: CodexRoutingStrategy
+    public let reservePct: Double
+    public let allowMidThreadFailover: Bool
+    public let accounts: [CodexRoutingAccount]
+
+    enum CodingKeys: String, CodingKey {
+        case provider, strategy, accounts
+        case reservePct = "reserve_pct"
+        case allowMidThreadFailover = "allow_mid_thread_failover"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try values.decode(String.self, forKey: .provider)
+        strategy = try values.decode(CodexRoutingStrategy.self, forKey: .strategy)
+        reservePct = try values.decode(Double.self, forKey: .reservePct)
+        allowMidThreadFailover = try values.decodeIfPresent(
+            Bool.self, forKey: .allowMidThreadFailover) ?? true
+        accounts = try values.decode([CodexRoutingAccount].self, forKey: .accounts)
+    }
+}
+
+public struct CodexRoutingAccount: Codable, Sendable, Identifiable {
+    public let accountId: String
+    public let eligible: Bool
+    public let priority: Int
+    public let reservePct: Double?
+    public let reserveBlocked: Bool
+    public let observedAtMs: Int64?
+    public let windows: [LimitWindow]
+    public let resetSelection: CodexResetSelection?
+
+    public var id: String { accountId }
+
+    enum CodingKeys: String, CodingKey {
+        case eligible, priority, windows
+        case accountId = "account_id"
+        case reservePct = "reserve_pct"
+        case reserveBlocked = "reserve_blocked"
+        case observedAtMs = "observed_at_ms"
+        case resetSelection = "reset_selection"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        accountId = try values.decode(String.self, forKey: .accountId)
+        eligible = try values.decode(Bool.self, forKey: .eligible)
+        priority = try values.decode(Int.self, forKey: .priority)
+        reservePct = try values.decodeIfPresent(Double.self, forKey: .reservePct)
+        reserveBlocked = try values.decodeIfPresent(Bool.self, forKey: .reserveBlocked) ?? false
+        observedAtMs = try values.decodeIfPresent(Int64.self, forKey: .observedAtMs)
+        windows = try values.decodeIfPresent([LimitWindow].self, forKey: .windows) ?? []
+        resetSelection = try values.decodeIfPresent(
+            CodexResetSelection.self, forKey: .resetSelection)
+    }
+
+    public init(
+        accountId: String,
+        eligible: Bool,
+        priority: Int,
+        reservePct: Double? = nil,
+        reserveBlocked: Bool = false,
+        observedAtMs: Int64? = nil,
+        windows: [LimitWindow] = [],
+        resetSelection: CodexResetSelection? = nil
+    ) {
+        self.accountId = accountId
+        self.eligible = eligible
+        self.priority = priority
+        self.reservePct = reservePct
+        self.reserveBlocked = reserveBlocked
+        self.observedAtMs = observedAtMs
+        self.windows = windows
+        self.resetSelection = resetSelection
+    }
+}
+
+public struct CodexResetSelection: Codable, Sendable, Equatable {
+    public let window: String?
+    public let usedPct: Double
+    public let resetsAtS: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case window
+        case usedPct = "used_pct"
+        case resetsAtS = "resets_at_s"
+    }
+
+    public var resetsDate: Date {
+        Date(timeIntervalSince1970: TimeInterval(resetsAtS))
+    }
+}
+
+public struct CodexRoutingUpdate: Codable, Sendable {
+    public let strategy: CodexRoutingStrategy
+    public let reservePct: Double
+    public let allowMidThreadFailover: Bool
+    public let accounts: [CodexRoutingAccountUpdate]
+
+    enum CodingKeys: String, CodingKey {
+        case strategy, accounts
+        case reservePct = "reserve_pct"
+        case allowMidThreadFailover = "allow_mid_thread_failover"
+    }
+
+    public init(
+        strategy: CodexRoutingStrategy,
+        reservePct: Double,
+        allowMidThreadFailover: Bool = true,
+        accounts: [CodexRoutingAccountUpdate]
+    ) {
+        self.strategy = strategy
+        self.reservePct = reservePct
+        self.allowMidThreadFailover = allowMidThreadFailover
+        self.accounts = accounts
+    }
+}
+
+public struct CodexRoutingAccountUpdate: Codable, Sendable {
+    public let accountId: String
+    public let eligible: Bool
+    public let priority: Int
+    public let reservePct: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case eligible, priority
+        case accountId = "account_id"
+        case reservePct = "reserve_pct"
+    }
+
+    public init(
+        accountId: String, eligible: Bool, priority: Int, reservePct: Double? = nil
+    ) {
+        self.accountId = accountId
+        self.eligible = eligible
+        self.priority = priority
+        self.reservePct = reservePct
+    }
+}
+
+public extension LimitWindow {
+    var remainingPct: Double? {
+        usedPct.map { max(0, min(100, 100 - $0)) }
+    }
+
+    /// Interprets the existing warning preference as a used-quota threshold,
+    /// while presenting the allowance as quota remaining.
+    func remainingSeverity(warnUsedPct: Double) -> RemainingQuotaSeverity? {
+        guard let remainingPct else { return nil }
+        let warnUsedPct = max(0, min(100, warnUsedPct))
+        let criticalRemaining = 100 - warnUsedPct
+        let warningRemaining = 100 - (warnUsedPct * 0.75)
+        if remainingPct <= criticalRemaining { return .critical }
+        if remainingPct <= warningRemaining { return .warning }
+        return .healthy
+    }
+}
+
+public enum RemainingQuotaSeverity: Sendable, Equatable {
+    case healthy
+    case warning
+    case critical
 }
 
 public struct AnalyticsTotals: Codable, Sendable {

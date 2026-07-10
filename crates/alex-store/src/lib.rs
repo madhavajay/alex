@@ -443,7 +443,8 @@ impl Store {
                     (SELECT t2.status FROM traces t2 WHERE t2.session_id = traces.session_id
                      ORDER BY t2.ts_request_ms DESC LIMIT 1),
                     GROUP_CONCAT(tags_json, char(31)),
-                    GROUP_CONCAT(DISTINCT reasoning_effort)
+                    GROUP_CONCAT(DISTINCT reasoning_effort),
+                    GROUP_CONCAT(DISTINCT account_id)
              FROM traces WHERE session_id IS NOT NULL",
         );
         let mut args: Vec<String> = vec![];
@@ -476,6 +477,10 @@ impl Store {
                 .get::<_, Option<String>>(13)?
                 .map(|s| s.split(',').map(str::to_string).collect())
                 .unwrap_or_default();
+            let account_ids: Vec<String> = r
+                .get::<_, Option<String>>(14)?
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
             Ok(json!({
                 "session_id": r.get::<_, String>(0)?,
                 "run_id": r.get::<_, Option<String>>(1)?,
@@ -491,6 +496,7 @@ impl Store {
                 "last_status": r.get::<_, Option<i64>>(11)?,
                 "tags": tags,
                 "efforts": efforts,
+                "account_ids": account_ids,
             }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -773,6 +779,62 @@ impl Store {
             "totals": {"requests": requests, "cost_usd": cost, "errors": errors, "cost_by_bucket": buckets},
             "by_model": rows,
         }))
+    }
+
+    pub fn account_analytics(&self, since_ms: i64, bucket_ms: i64) -> Result<Value> {
+        let conn = self.conn.lock().unwrap();
+        let mut accounts = conn.prepare(
+            "SELECT account_id, upstream_provider, COUNT(*),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END),
+                    MAX(ts_request_ms)
+             FROM traces
+             WHERE ts_request_ms >= ?1 AND account_id IS NOT NULL
+             GROUP BY account_id, upstream_provider
+             ORDER BY MAX(ts_request_ms) DESC",
+        )?;
+        let by_account: Vec<Value> = accounts
+            .query_map(params![since_ms], |r| {
+                Ok(json!({
+                    "account_id": r.get::<_, String>(0)?,
+                    "provider": r.get::<_, Option<String>>(1)?,
+                    "requests": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "output_tokens": r.get::<_, i64>(4)?,
+                    "cost_usd": r.get::<_, f64>(5)?,
+                    "errors": r.get::<_, Option<i64>>(6)?,
+                    "last_ts_ms": r.get::<_, Option<i64>>(7)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut series = conn.prepare(
+            "SELECT ((ts_request_ms / ?2) * ?2) AS bucket_ms, account_id,
+                    COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END)
+             FROM traces
+             WHERE ts_request_ms >= ?1 AND account_id IS NOT NULL
+             GROUP BY bucket_ms, account_id
+             ORDER BY bucket_ms ASC, account_id ASC",
+        )?;
+        let series: Vec<Value> = series
+            .query_map(params![since_ms, bucket_ms.max(60_000)], |r| {
+                Ok(json!({
+                    "bucket_ms": r.get::<_, i64>(0)?,
+                    "account_id": r.get::<_, String>(1)?,
+                    "requests": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "output_tokens": r.get::<_, i64>(4)?,
+                    "cost_usd": r.get::<_, f64>(5)?,
+                    "errors": r.get::<_, Option<i64>>(6)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(json!({"since_ms": since_ms, "bucket_ms": bucket_ms.max(60_000), "by_account": by_account, "series": series}))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1150,6 +1212,7 @@ mod tests {
         a.tags = Some(r#"{"suite":"swebench"}"#.into());
         a.harness = Some("codex".into());
         a.reasoning_effort = Some("high".into());
+        a.account_id = Some("openai-oauth-personal".into());
         let mut b = trace("b", 2000, None);
         b.session_id = Some("ses_1".into());
         b.status = Some(500);
@@ -1157,6 +1220,7 @@ mod tests {
         b.routed_model = Some("gpt-5.5".into());
         b.tags = Some(r#"{"case":"x1"}"#.into());
         b.reasoning_effort = Some("minimal".into());
+        b.account_id = Some("openai-oauth-work".into());
         let mut c = trace("c", 5000, None);
         c.session_id = Some("ses_2".into());
         let d = trace("d", 9000, None);
@@ -1195,6 +1259,14 @@ mod tests {
             .collect();
         assert!(models.contains(&"claude-haiku-4-5".to_string()));
         assert!(models.contains(&"gpt-5.5".to_string()));
+        let account_ids: Vec<String> = s1["account_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|account| account.as_str().unwrap().to_string())
+            .collect();
+        assert!(account_ids.contains(&"openai-oauth-personal".to_string()));
+        assert!(account_ids.contains(&"openai-oauth-work".to_string()));
         let recent = store.sessions(Some(3000), 0).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["session_id"], "ses_2");

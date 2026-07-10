@@ -18,13 +18,15 @@ import Testing
     @Test func accounts() throws {
         let json = #"""
         {"accounts":[
-          {"expires_at_ms":1783504994142,"expires_in_s":27538,"id":"anthropic-oauth","kind":"oauth","label":"claude-code (max)","provider":"anthropic","status":"active"},
-          {"expires_at_ms":null,"expires_in_s":null,"id":"gemini-oauth","kind":"oauth","label":"gemini-cli","provider":"gemini","status":"active"},
-          {"expires_at_ms":1783439548981,"expires_in_s":-37906,"id":"xai-oauth","kind":"oauth","label":"grok (me@madhavajay.com)","provider":"xai","status":"active"}
+          {"email":"person@example.com","expires_at_ms":1783504994142,"expires_in_s":27538,"id":"anthropic-oauth","kind":"oauth","label":"claude-code (max)","name":"default","paused":false,"provider":"anthropic","status":"active"},
+          {"expires_at_ms":null,"expires_in_s":null,"id":"gemini-oauth","kind":"oauth","label":"gemini-cli","name":"default","paused":false,"provider":"gemini","status":"active"},
+          {"expires_at_ms":1783439548981,"expires_in_s":-37906,"id":"xai-oauth","kind":"oauth","label":"grok (me@madhavajay.com)","name":"default","paused":false,"provider":"xai","status":"active"}
         ]}
         """#
         let accounts = try decode(json, as: AccountsResponse.self).accounts
         #expect(accounts.count == 3)
+        #expect(accounts[0].email == "person@example.com")
+        #expect(accounts[1].email == nil)
         #expect(!accounts[0].isExpired)
         #expect(!accounts[1].isExpired)
         #expect(accounts[2].isExpired)
@@ -60,6 +62,99 @@ import Testing
         #expect(providers[2].windows == nil)
         #expect(providers[2].requests?.limit == 120)
         #expect(providers[2].tokens?.remaining == 5_000_000)
+    }
+
+    @Test func codexAccountRoutingAndLimitWindows() throws {
+        let json = #"""
+        {"provider":"openai","strategy":"reset_first","reserve_pct":10,"accounts":[
+          {"account_id":"openai-oauth-personal","eligible":true,"priority":0,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":6,"resets_at_s":1783477712},{"window":"7d","used_pct":82,"resets_at_s":1783667025}]},
+          {"account_id":"openai-oauth-work","eligible":false,"priority":1,"windows":[]}
+        ]}
+        """#
+        let routing = try decode(json, as: CodexRoutingResponse.self)
+        #expect(routing.provider == "openai")
+        #expect(routing.strategy == .resetFirst)
+        #expect(routing.reservePct == 10)
+        #expect(routing.allowMidThreadFailover)
+        #expect(routing.accounts.count == 2)
+        #expect(routing.accounts[0].reservePct == nil)
+        #expect(!routing.accounts[0].reserveBlocked)
+        #expect(routing.accounts[0].resetSelection == nil)
+        #expect(routing.accounts[0].eligible)
+        #expect(routing.accounts[0].windows[0].remainingPct == 94)
+        #expect(routing.accounts[0].windows[1].remainingPct == 18)
+        #expect(routing.accounts[0].windows[0].resetsDate == Date(timeIntervalSince1970: 1783477712))
+        #expect(!routing.accounts[1].eligible)
+    }
+
+    @Test func codexRoutingDecodesPerAccountReserveFailoverAndResetSelection() throws {
+        let json = #"""
+        {"provider":"openai","strategy":"reset_first","reserve_pct":10,"allow_mid_thread_failover":false,"accounts":[
+          {"account_id":"openai-oauth-personal","eligible":true,"priority":0,"reserve_pct":15,"reserve_blocked":true,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":65,"resets_at_s":1783477712}],"reset_selection":{"window":"5h","used_pct":65,"resets_at_s":1783477712}},
+          {"account_id":"openai-oauth-work","eligible":true,"priority":1,"reserve_pct":5,"windows":[],"reset_selection":null}
+        ]}
+        """#
+        let routing = try decode(json, as: CodexRoutingResponse.self)
+        #expect(!routing.allowMidThreadFailover)
+        #expect(routing.accounts.map(\.reservePct) == [15, 5])
+        #expect(routing.accounts[0].reserveBlocked)
+        #expect(!routing.accounts[1].reserveBlocked)
+        #expect(routing.accounts[0].resetSelection?.window == "5h")
+        #expect(routing.accounts[0].resetSelection?.usedPct == 65)
+        #expect(
+            routing.accounts[0].resetSelection?.resetsDate
+                == Date(timeIntervalSince1970: 1_783_477_712))
+        #expect(routing.accounts[1].resetSelection == nil)
+    }
+
+    @Test func perAccountCodexLimitsPreserveIdentityAndSeparateWindows() throws {
+        let json = #"""
+        {"accounts":[
+          {"id":"openai-oauth-personal","provider":"openai","name":"acct-personal","kind":"oauth","label":"codex (personal@example.com)","description":"personal@example.com","email":"personal@example.com","paused":false,"status":"active","expires_at_ms":null,"expires_in_s":null,"limits":{"plan":"pro","source":"Codex usage API","observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":49,"resets_at_s":1783477712},{"window":"7d","used_pct":8,"resets_at_s":1783667025}]}},
+          {"id":"openai-oauth-work","provider":"openai","name":"acct-work","kind":"oauth","label":"codex (work@example.com)","description":"work@example.com","email":"work@example.com","paused":false,"status":"active","expires_at_ms":null,"expires_in_s":null,"limits":{"plan":"team","source":"Codex usage API","observed_at_ms":1783477300000,"windows":[{"window":"5h","used_pct":12,"resets_at_s":1783478800},{"window":"7d","used_pct":31,"resets_at_s":1783670000}]}}
+        ]}
+        """#
+        let accounts = try decode(json, as: AccountsResponse.self).accounts
+        #expect(accounts.count == 2)
+        #expect(accounts.map(\.email) == ["personal@example.com", "work@example.com"])
+        #expect(accounts[0].limits?.plan == "pro")
+        #expect(accounts[0].limits?.windows?[0].usedPct == 49)
+        #expect(accounts[1].limits?.plan == "team")
+        #expect(accounts[1].limits?.windows?[1].usedPct == 31)
+        #expect(accounts[0].limits?.observedAtMs == 1_783_477_280_438)
+    }
+
+    @Test func allowancePresentationUsesRemainingQuotaAndLegacyUsedThreshold() throws {
+        let json = #"""
+        [
+          {"window":"5h","used_pct":0},
+          {"window":"5h","used_pct":70},
+          {"window":"5h","used_pct":90},
+          {"window":"5h","used_pct":100}
+        ]
+        """#
+        let windows = try decode(json, as: [LimitWindow].self)
+        #expect(windows.map(\.remainingPct) == [100, 30, 10, 0])
+        #expect(windows[0].remainingSeverity(warnUsedPct: 90) == .healthy)
+        #expect(windows[1].remainingSeverity(warnUsedPct: 90) == .warning)
+        #expect(windows[2].remainingSeverity(warnUsedPct: 90) == .critical)
+        #expect(windows[3].remainingSeverity(warnUsedPct: 90) == .critical)
+    }
+
+    @Test func accountUsageSeries() throws {
+        let json = #"""
+        {"since_ms":1783470000000,"bucket_ms":3600000,"by_account":[
+          {"account_id":"openai-oauth-personal","provider":"openai","requests":7,"input_tokens":1200,"output_tokens":300,"cost_usd":0.0125,"errors":1,"last_ts_ms":1783477280438}
+        ],"series":[
+          {"bucket_ms":1783470000000,"account_id":"openai-oauth-personal","requests":4,"input_tokens":700,"output_tokens":100,"cost_usd":0.007,"errors":0},
+          {"bucket_ms":1783473600000,"account_id":"openai-oauth-personal","requests":3,"input_tokens":500,"output_tokens":200,"cost_usd":0.0055,"errors":1}
+        ]}
+        """#
+        let analytics = try decode(json, as: AccountAnalyticsResponse.self)
+        #expect(analytics.byAccount[0].costUsd == 0.0125)
+        #expect(analytics.byAccount[0].errors == 1)
+        #expect(analytics.series.count == 2)
+        #expect(analytics.series[0].inputTokens + analytics.series[0].outputTokens == 800)
     }
 
     @Test func analytics() throws {

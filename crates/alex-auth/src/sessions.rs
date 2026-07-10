@@ -6,11 +6,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_exchange, generate_pkce,
+    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
+    codex_device_poll_once, codex_device_start, codex_exchange_named, generate_pkce,
     openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
-    xai_upsert_from_tokens, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_REDIRECT_URI,
+    xai_upsert_from_tokens, CodexDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
+    OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
-use crate::{now_ms, Vault};
+use crate::{named_account_id, now_ms, Vault};
 
 const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
 
@@ -31,6 +33,7 @@ pub struct LoginSession {
     pub verification_uri_complete: Option<String>,
     pub created_ms: i64,
     pub expires_at_ms: i64,
+    account_name: String,
     verifier: Option<String>,
     pub phase: LoginPhase,
 }
@@ -73,16 +76,29 @@ fn random_id() -> String {
 }
 
 impl LoginManager {
-    pub async fn start(&self, vault: Arc<Vault>, provider: &str) -> Result<Value> {
+    pub async fn start(&self, vault: Arc<Vault>, provider: &str, account_name: &str) -> Result<Value> {
         self.prune().await;
+        validate_account_name(account_name)?;
         let id = random_id();
         let shared = match provider {
-            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id))),
-            "codex" | "openai" | "chatgpt" => self.start_codex(&id, vault.clone()).await?,
-            "grok" | "xai" => self.start_grok(&id, vault.clone()).await?,
-            "gemini" | "google" => self.start_gemini(&id, vault.clone()).await?,
+            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, account_name))),
+            "codex" | "openai" | "chatgpt" => self.start_codex(&id, vault.clone(), account_name).await?,
+            "grok" | "xai" => self.start_grok(&id, vault.clone(), account_name).await?,
+            "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
             other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
         };
+        let snapshot = shared.lock().await.snapshot();
+        self.sessions.lock().await.insert(id, shared);
+        Ok(snapshot)
+    }
+
+    pub async fn start_auto(&self, vault: Arc<Vault>, provider: &str) -> Result<Value> {
+        self.prune().await;
+        if !matches!(provider, "codex" | "openai" | "chatgpt") {
+            bail!("automatic identity login is currently supported only for Codex");
+        }
+        let id = random_id();
+        let shared = self.start_codex_device(&id, vault).await?;
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
         Ok(snapshot)
@@ -115,13 +131,16 @@ impl LoginManager {
         }
         let verifier = session.verifier.clone().context("session has no verifier")?;
         match claude_exchange(&vault, &verifier, input).await {
-            Ok(account_id) => session.phase = LoginPhase::Done { account_id },
+            Ok(account_id) => match rename_login_account(&vault, &account_id, &session.account_name).await {
+                Ok(account_id) => session.phase = LoginPhase::Done { account_id },
+                Err(e) => session.phase = LoginPhase::Failed { error: e.to_string() },
+            },
             Err(e) => session.phase = LoginPhase::Failed { error: e.to_string() },
         }
         Ok(session.snapshot())
     }
 
-    fn start_claude(&self, id: &str) -> LoginSession {
+    fn start_claude(&self, id: &str, account_name: &str) -> LoginSession {
         let pkce = generate_pkce();
         let url = anthropic_authorize_url(&pkce.challenge, &pkce.verifier);
         LoginSession {
@@ -134,12 +153,13 @@ impl LoginManager {
             verification_uri_complete: None,
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
+            account_name: account_name.to_string(),
             verifier: Some(pkce.verifier),
             phase: LoginPhase::Pending,
         }
     }
 
-    async fn start_codex(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+    async fn start_codex(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
         let listener = tokio::net::TcpListener::bind(OPENAI_CALLBACK_ADDR)
             .await
             .with_context(|| {
@@ -158,12 +178,14 @@ impl LoginManager {
             verification_uri_complete: None,
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
+            account_name: account_name.to_string(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let verifier = pkce.verifier;
+        let account_name = account_name.to_string();
         tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
             let phase = match tokio::time::timeout(
@@ -172,7 +194,7 @@ impl LoginManager {
             )
             .await
             {
-                Ok(Ok(code)) => match codex_exchange(&vault, &verifier, &code).await {
+                Ok(Ok(code)) => match codex_exchange_named(&vault, &verifier, &code, &account_name).await {
                     Ok(account_id) => LoginPhase::Done { account_id },
                     Err(e) => LoginPhase::Failed { error: e.to_string() },
                 },
@@ -186,7 +208,67 @@ impl LoginManager {
         Ok(shared)
     }
 
-    async fn start_gemini(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+    async fn start_codex_device(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+        const DEVICE_TTL_MS: i64 = 15 * 60 * 1000;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let start = codex_device_start(&http).await?;
+        let session = LoginSession {
+            id: id.to_string(),
+            provider: "codex".into(),
+            mode: "device",
+            authorize_url: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            user_code: Some(start.user_code.clone()),
+            verification_uri: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            verification_uri_complete: None,
+            created_ms: now_ms(),
+            expires_at_ms: now_ms() + DEVICE_TTL_MS,
+            account_name: String::new(),
+            verifier: None,
+            phase: LoginPhase::Pending,
+        };
+        let shared = Arc::new(Mutex::new(session));
+        let worker = shared.clone();
+        tokio::spawn(async move {
+            let deadline = now_ms() + DEVICE_TTL_MS;
+            let phase = loop {
+                if now_ms() > deadline {
+                    break LoginPhase::Failed {
+                        error: "Codex device code expired before authorization completed".into(),
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(start.interval_s)).await;
+                match codex_device_poll_once(&http, &start).await {
+                    CodexDevicePoll::Pending => continue,
+                    CodexDevicePoll::Done {
+                        authorization_code,
+                        code_verifier,
+                    } => {
+                        break match codex_device_exchange_auto(
+                            &vault,
+                            &authorization_code,
+                            &code_verifier,
+                        )
+                        .await
+                        {
+                            Ok(account_id) => LoginPhase::Done { account_id },
+                            Err(error) => LoginPhase::Failed {
+                                error: error.to_string(),
+                            },
+                        }
+                    }
+                    CodexDevicePoll::Failed(error) => {
+                        break LoginPhase::Failed { error }
+                    }
+                }
+            };
+            worker.lock().await.phase = phase;
+        });
+        Ok(shared)
+    }
+
+    async fn start_gemini(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
         let (listener, port) = crate::login::bind_loopback().await?;
         let redirect_uri = format!("http://localhost:{port}{}", crate::login::GEMINI_CALLBACK_PATH);
         let pkce = generate_pkce();
@@ -202,12 +284,14 @@ impl LoginManager {
             verification_uri_complete: None,
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
+            account_name: account_name.to_string(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let verifier = pkce.verifier;
+        let account_name = account_name.to_string();
         tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
             let phase = match tokio::time::timeout(
@@ -224,7 +308,10 @@ impl LoginManager {
                     match crate::login::gemini_exchange(&vault, &verifier, &redirect_uri, &code)
                         .await
                     {
-                        Ok(account_id) => LoginPhase::Done { account_id },
+                        Ok(account_id) => match rename_login_account(&vault, &account_id, &account_name).await {
+                            Ok(account_id) => LoginPhase::Done { account_id },
+                            Err(e) => LoginPhase::Failed { error: e.to_string() },
+                        },
                         Err(e) => LoginPhase::Failed { error: e.to_string() },
                     }
                 }
@@ -238,7 +325,7 @@ impl LoginManager {
         Ok(shared)
     }
 
-    async fn start_grok(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+    async fn start_grok(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
         let http = reqwest::Client::new();
         let start = xai_device_start(&http).await?;
         let session = LoginSession {
@@ -254,11 +341,13 @@ impl LoginManager {
             verification_uri_complete: start.verification_uri_complete.clone(),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
+            account_name: account_name.to_string(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
+        let account_name = account_name.to_string();
         tokio::spawn(async move {
             let deadline = now_ms() + start.expires_in * 1000;
             let mut interval = start.interval.max(1) as u64;
@@ -277,7 +366,10 @@ impl LoginManager {
                     }
                     XaiDevicePoll::Done(tokens) => {
                         break match xai_upsert_from_tokens(&vault, &tokens).await {
-                            Ok(account_id) => LoginPhase::Done { account_id },
+                            Ok(account_id) => match rename_login_account(&vault, &account_id, &account_name).await {
+                                Ok(account_id) => LoginPhase::Done { account_id },
+                                Err(e) => LoginPhase::Failed { error: e.to_string() },
+                            },
                             Err(e) => LoginPhase::Failed { error: e.to_string() },
                         };
                     }
@@ -299,6 +391,45 @@ impl LoginManager {
                 Err(_) => true,
             });
     }
+}
+
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 32 || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        bail!("account name must match [a-z0-9_-]{{1,32}}");
+    }
+    Ok(())
+}
+
+async fn rename_login_account(vault: &Vault, account_id: &str, account_name: &str) -> Result<String> {
+    if account_name == "default" {
+        return Ok(account_id.to_string());
+    }
+    let mut account = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .context("login completed but the saved account could not be found")?;
+    if vault.has_account_name(account.provider, account_name).await {
+        bail!("{} account '{account_name}' already exists", account.provider.as_str());
+    }
+    let default_id = named_account_id(account.provider, &account.kind, "default");
+    let previous_default = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|candidate| candidate.id == default_id && candidate.id != account.id);
+    account.name = account_name.to_string();
+    account.id = named_account_id(account.provider, &account.kind, account_name);
+    account.path = None;
+    let renamed_id = account.id.clone();
+    vault.upsert(account).await?;
+    if let Some(previous_default) = previous_default {
+        vault.upsert(previous_default).await?;
+    } else {
+        let _ = vault.remove(&default_id).await?;
+    }
+    Ok(renamed_id)
 }
 
 #[cfg(test)]
@@ -324,7 +455,7 @@ mod tests {
     async fn claude_session_lifecycle() {
         let (dir, vault) = temp_vault("claude");
         let mgr = LoginManager::default();
-        let snap = mgr.start(vault.clone(), "claude").await.unwrap();
+        let snap = mgr.start(vault.clone(), "claude", "default").await.unwrap();
         assert_eq!(snap["mode"], "paste");
         assert_eq!(snap["state"], "pending");
         let url = snap["authorize_url"].as_str().unwrap();
@@ -343,7 +474,7 @@ mod tests {
     async fn unknown_provider_rejected() {
         let (dir, vault) = temp_vault("unknown");
         let mgr = LoginManager::default();
-        assert!(mgr.start(vault, "hal9000").await.is_err());
+        assert!(mgr.start(vault, "hal9000", "default").await.is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -351,7 +482,7 @@ mod tests {
     async fn gemini_starts_loopback_oauth() {
         let (dir, vault) = temp_vault("gemini");
         let mgr = LoginManager::default();
-        let snap = mgr.start(vault, "gemini").await.unwrap();
+        let snap = mgr.start(vault, "gemini", "default").await.unwrap();
         assert_eq!(snap["mode"], "loopback");
         assert_eq!(snap["state"], "pending");
         let url = snap["authorize_url"].as_str().unwrap();

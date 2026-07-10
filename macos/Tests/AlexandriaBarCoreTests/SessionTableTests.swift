@@ -13,7 +13,7 @@ import Testing
 
     @Test func rowFromFullJSON() throws {
         let json = #"""
-        {"errors":2,"first_ts_ms":1783484392318,"harness":"codex","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1","claude-4"],"run_id":"run-77","session_id":"auto-36237cced1dcc659-extra","tags":{"task":"sparql","job":"j1","empty":""},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}
+        {"account_ids":["openai-oauth-a"],"errors":2,"first_ts_ms":1783484392318,"harness":"codex","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1","claude-4"],"run_id":"run-77","session_id":"auto-36237cced1dcc659-extra","tags":{"task":"sparql","job":"j1","empty":""},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}
         """#
         let decoded = try JSONDecoder().decode(TraceSession.self, from: Data(json.utf8))
         let row = SessionRow(session: decoded)
@@ -24,6 +24,8 @@ import Testing
         #expect(row.models == "grok-code-fast-1, claude-4")
         #expect(row.providers == ["xai", "anthropic"])
         #expect(row.harness == "codex")
+        #expect(row.accountIds == ["openai-oauth-a"])
+        #expect(row.accounts == "openai-oauth-a")
         #expect(row.turns == 3)
         #expect(row.tokensIn == 426)
         #expect(row.tokensOut == 9)
@@ -45,6 +47,7 @@ import Testing
         #expect(row.providers.isEmpty)
         #expect(row.harness.isEmpty)
         #expect(row.harnessRaw == nil)
+        #expect(row.accountIds.isEmpty)
         #expect(row.tokensIn == 0)
         #expect(row.tokensOut == 0)
         #expect(row.cost == 0)
@@ -53,6 +56,16 @@ import Testing
         #expect(row.tagsSummary.isEmpty)
         #expect(row.iconAsset == nil)
         #expect(row.duration == "0s")
+    }
+
+    @Test func explicitHarnessTagOverridesRawSdkUserAgent() {
+        let row = SessionRow(session: session([
+            "session_id": "pi-session",
+            "harness": "Anthropic/JS 0.91.1",
+            "tags": ["harness": "pi", "harness_version": "0.80.6"],
+        ]))
+        #expect(row.harness == "pi")
+        #expect(row.harnessRaw == "Anthropic/JS 0.91.1")
     }
 
     @Test func shortSessionId() {

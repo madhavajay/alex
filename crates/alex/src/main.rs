@@ -619,7 +619,9 @@ fn open_vault(config: &Config) -> Result<Vault> {
         };
         policies.push((p, v.clone()));
     }
-    vault.set_policies_blocking(policies);
+    if !policies.is_empty() {
+        vault.set_policies_blocking(policies);
+    }
     Ok(vault)
 }
 
@@ -664,6 +666,28 @@ impl alex_proxy::DarioRouter for DarioGlue {
     fn suspect(&self, generation_id: &str) {
         self.0.suspect(generation_id);
     }
+}
+
+struct DarioUnavailable(String);
+
+impl alex_proxy::DarioRouter for DarioUnavailable {
+    fn active(&self) -> Option<alex_proxy::DarioActive> {
+        None
+    }
+
+    fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configured": true,
+            "available": false,
+            "error": self.0,
+        })
+    }
+
+    fn suspect(&self, _generation_id: &str) {}
 }
 
 fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> axum::Router {
@@ -1242,7 +1266,13 @@ async fn main() -> Result<()> {
                         supervisor = Some(sup);
                     }
                     Err(e) => {
-                        eprintln!("dario: failed to start ({e}); using direct anthropic upstream");
+                        eprintln!(
+                            "dario: failed to start ({e}); Claude Code remains direct, other Anthropic traffic will fail closed"
+                        );
+                        dario_router = Some(
+                            Arc::new(DarioUnavailable(e.to_string()))
+                                as Arc<dyn alex_proxy::DarioRouter>,
+                        );
                     }
                 }
             }
@@ -1485,23 +1515,28 @@ async fn main() -> Result<()> {
                 };
                 let p = provider_from_cli(&provider)?;
                 if !force && vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
-                let default_id = named_account_id(p, "oauth", "default");
-                let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
-                let id = alex_auth::login::login(&vault, &provider).await?;
-                if name != "default" {
-                    if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
-                        a.name = name.clone();
-                        a.id = named_account_id(a.provider, &a.kind, &name);
-                        a.path = None;
-                        vault.upsert(a).await?;
+                if p == alex_core::Provider::Openai {
+                    let id = alex_auth::login::login_named(&vault, &provider, &name, force).await?;
+                    println!("saved account: {id}");
+                } else {
+                    let default_id = named_account_id(p, "oauth", "default");
+                    let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
+                    let id = alex_auth::login::login(&vault, &provider).await?;
+                    if name != "default" {
+                        if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
+                            a.name = name.clone();
+                            a.id = named_account_id(a.provider, &a.kind, &name);
+                            a.path = None;
+                            vault.upsert(a).await?;
+                        }
+                        if let Some(a) = pre_default {
+                            vault.upsert(a).await?;
+                        } else {
+                            let _ = vault.remove(&default_id).await?;
+                        }
                     }
-                    if let Some(a) = pre_default {
-                        vault.upsert(a).await?;
-                    } else {
-                        let _ = vault.remove(&default_id).await?;
-                    }
+                    println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
                 }
-                println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
             }
             AuthCommand::Pause { provider, name } => {
                 validate_account_name(&name)?;
@@ -1707,6 +1742,7 @@ async fn main() -> Result<()> {
                     }),
                     timeout_secs: timeout_secs.unwrap_or_else(harness_e2e::default_timeout_secs),
                     no_trace_check,
+                    dario_enabled: config.dario_enabled(),
                     local_key: config.local_key.clone(),
                     data_dir: config.data_dir.clone(),
                 })?;

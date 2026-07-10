@@ -322,6 +322,10 @@ import Testing
 
     @Test func harnessDisplayName() {
         #expect(HarnessName.display(harness: nil, tags: ["harness": "pi"]) == "pi")
+        #expect(
+            HarnessName.display(
+                harness: "Anthropic/JS 0.91.1", tags: ["harness": "pi"])
+                == "pi")
         #expect(HarnessName.display(harness: "ureq/2.12.1", tags: ["harness": "custom-rig"])
             == "custom-rig")
         #expect(HarnessName.display(harness: "claude-cli/1.0 (darwin)", tags: nil)

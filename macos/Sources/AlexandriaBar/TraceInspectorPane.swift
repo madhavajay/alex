@@ -57,10 +57,14 @@ struct SessionInfoCard: View {
     @ViewBuilder
     private func facts(_ trace: TraceDetail) -> some View {
         let session = model.selectedSession
-        InfoRow(label: "harness", value: trace.harness ?? session?.harness)
+        InfoRow(label: "harness", value: model.harnessName(for: trace))
         InfoRow(label: "client ip", value: trace.clientIp)
         InfoRow(label: "key fingerprint", value: trace.keyFingerprint)
-        InfoRow(label: "billing", value: trace.billingBucket)
+        InfoRow(label: "billing type", value: trace.billingBucket)
+        InfoRow(
+            label: "subscription account",
+            value: model.accountIdentity(trace.accountId))
+        InfoRow(label: "internal route", value: model.internalRoute(trace.accountId))
         FormatRow(clientFormat: trace.clientFormat, upstreamFormat: trace.upstreamFormat)
         InfoRow(label: "provider", value: trace.upstreamProvider)
         if let tags = session?.tags, !tags.isEmpty {
@@ -329,10 +333,14 @@ struct TraceInspectorView: View {
                         ?? trace.latencyMs.map { "\($0)ms" })
             }
             InfoRow(label: "model", value: modelLine(trace))
+            InfoRow(label: "harness", value: model.harnessName(for: trace))
             InfoRow(label: "provider", value: trace.upstreamProvider)
             FormatRow(clientFormat: trace.clientFormat, upstreamFormat: trace.upstreamFormat)
-            InfoRow(label: "billing", value: trace.billingBucket)
-            InfoRow(label: "account", value: trace.accountId)
+            InfoRow(label: "billing type", value: trace.billingBucket)
+            InfoRow(
+                label: "subscription account",
+                value: model.accountIdentity(trace.accountId))
+            InfoRow(label: "internal route", value: model.internalRoute(trace.accountId))
             InfoRow(label: "session", value: trace.sessionId)
             InfoRow(label: "run", value: trace.runId)
             InfoRow(label: "client ip", value: trace.clientIp)

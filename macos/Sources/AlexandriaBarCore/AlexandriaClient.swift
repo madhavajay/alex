@@ -1,5 +1,16 @@
 import Foundation
 
+private struct AuthLoginStartBody: Encodable {
+    let provider: String
+    let name: String?
+    let autoIdentity: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case provider, name
+        case autoIdentity = "auto_identity"
+    }
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -114,6 +125,18 @@ public struct AlexandriaClient: Sendable {
         try await get("health", as: DaemonHealth.self)
     }
 
+    /// Returns the daemon-generated shell exports used by `alex credentials`.
+    /// Keep this value ephemeral: callers should copy it directly rather than log it.
+    public func credentialsEnvironment() async throws -> String {
+        let data = try await request(
+            "connect",
+            query: [URLQueryItem(name: "format", value: "env")])
+        guard let environment = String(data: data, encoding: .utf8) else {
+            throw ClientError.http(0, "credential response was not UTF-8")
+        }
+        return environment
+    }
+
     public func accounts() async throws -> [Account] {
         try await get("admin/accounts", as: AccountsResponse.self).accounts
     }
@@ -131,6 +154,31 @@ public struct AlexandriaClient: Sendable {
             "admin/analytics",
             query: [URLQueryItem(name: "since_minutes", value: "\(sinceMinutes)")],
             as: Analytics.self)
+    }
+
+    public func accountAnalytics(
+        sinceMinutes: Int = 24 * 60, bucketMinutes: Int = 60
+    ) async throws -> AccountAnalyticsResponse {
+        try await get(
+            "admin/accounts/analytics",
+            query: [
+                URLQueryItem(name: "since_minutes", value: "\(sinceMinutes)"),
+                URLQueryItem(name: "bucket_minutes", value: "\(bucketMinutes)"),
+            ],
+            as: AccountAnalyticsResponse.self)
+    }
+
+    public func codexRouting() async throws -> CodexRoutingResponse {
+        try await get(
+            "admin/accounts/routing/openai",
+            as: CodexRoutingResponse.self)
+    }
+
+    public func updateCodexRouting(_ update: CodexRoutingUpdate) async throws {
+        _ = try await request(
+            "admin/accounts/routing/openai",
+            method: "PUT",
+            body: body(update))
     }
 
     public func dario() async throws -> DarioStatus? {
@@ -199,9 +247,15 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/dario/prompt-caches/\(key)", method: "DELETE")
     }
 
-    public func authLoginStart(provider: String) async throws -> LoginSession {
+    public func authLoginStart(
+        provider: String,
+        name: String? = "default",
+        autoIdentity: Bool = false
+    ) async throws -> LoginSession {
         let data = try await request(
-            "admin/auth/login/start", method: "POST", body: body(["provider": provider]))
+            "admin/auth/login/start", method: "POST",
+            body: body(AuthLoginStartBody(
+                provider: provider, name: name, autoIdentity: autoIdentity)))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 
@@ -351,6 +405,12 @@ public struct AlexandriaClient: Sendable {
     public func removeAccount(id: String) async throws {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         _ = try await request("admin/accounts/\(encoded)", method: "DELETE")
+    }
+
+    public func setAccountPaused(id: String, paused: Bool) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        _ = try await request(
+            "admin/accounts/\(encoded)", method: "PUT", body: body(["paused": paused]))
     }
 
     public func setGeminiKey(_ key: String) async throws {

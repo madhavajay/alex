@@ -33,3 +33,77 @@ jobs:
       - name: Test AlexandriaBar
         working-directory: macos
         run: swift test
+
+  macos-pr-artifact:
+    name: macOS PR test bundle
+    if: github.event_name == 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-pr-artifact
+
+      - name: Build release daemon and CLI
+        run: cargo build --release --locked -p alex --bins
+
+      - name: Build ad-hoc AlexandriaBar app
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          CONFIGURATION=release \
+            IDENTITY=- \
+            BUNDLE_ID=com.madhavajay.alexandria-macos \
+            VERSION="$version" \
+            ./macos/Scripts/package_app.sh
+          codesign --verify --deep --strict macos/dist/AlexandriaBar.app
+
+      - name: Assemble test bundle
+        id: bundle
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          bundle_name="alexandria-macos-pr-${PR_NUMBER}-${short_sha}"
+          stage="$RUNNER_TEMP/$bundle_name"
+          output="$GITHUB_WORKSPACE/dist/ci-macos"
+
+          rm -rf "$stage" "$output"
+          mkdir -p "$stage/bin" "$output"
+          ditto macos/dist/AlexandriaBar.app "$stage/AlexandriaBar.app"
+          cp target/release/alex target/release/alexandria "$stage/bin/"
+          cp packaging/ci-macos/install.sh packaging/ci-macos/README.md "$stage/"
+          chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
+
+          {
+            echo "Alexandria macOS PR test bundle"
+            echo "pull_request=${PR_NUMBER}"
+            echo "commit=${GITHUB_SHA}"
+            echo "runner_arch=$(uname -m)"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "app_bundle_id=$(defaults read "$stage/AlexandriaBar.app/Contents/Info" CFBundleIdentifier)"
+            echo "app_version=$(defaults read "$stage/AlexandriaBar.app/Contents/Info" CFBundleShortVersionString)"
+          } > "$stage/BUILD_INFO.txt"
+
+          tar -C "$RUNNER_TEMP" -czf "$output/$bundle_name.tar.gz" "$bundle_name"
+          shasum -a 256 "$output/$bundle_name.tar.gz" > "$output/$bundle_name.tar.gz.sha256"
+          printf 'Extract %s, then run ./%s/install.sh\n' \
+            "$bundle_name.tar.gz" "$bundle_name" > "$output/HOW_TO_INSTALL.txt"
+          echo "artifact_name=$bundle_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS test bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.bundle.outputs.artifact_name }}
+          path: dist/ci-macos/
+          if-no-files-found: error
+          retention-days: 14

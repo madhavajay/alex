@@ -30,6 +30,20 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 
 ## Install
 
+Install the precompiled CLI/daemon and, on macOS, the menu-bar app:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh
+```
+
+The macOS path uses Homebrew: the formula installs the `alex` CLI/daemon, the
+cask installs `AlexandriaBar.app`, and the bootstrap registers the daemon with
+launchd. The DMG by itself contains only the menu-bar app; it does not install
+the daemon. Linux downloads and SHA-256 verifies the precompiled x86_64 release
+binary, so neither platform needs a Rust compiler.
+
+Equivalent manual commands:
+
 ```bash
 brew install madhavajay/alex/alex               # CLI + daemon
 brew install --cask madhavajay/alex/alexandria  # macOS menu bar app
