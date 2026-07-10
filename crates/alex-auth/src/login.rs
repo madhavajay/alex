@@ -309,14 +309,41 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
         "gemini" | "google" => Provider::Gemini,
         other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
     };
+    validate_account_name(name)?;
     if !force && vault.has_account_name(p, name).await { bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
     match provider {
         "claude" | "anthropic" => login_claude(vault).await,
-        "codex" | "openai" | "chatgpt" => login_codex(vault).await,
+        "codex" | "openai" | "chatgpt" => login_codex(vault, name).await,
         "grok" | "xai" => login_grok(vault).await,
         "gemini" | "google" => login_gemini(vault).await,
         _ => unreachable!(),
     }
+}
+
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        bail!("account name must match [a-z0-9_-]{{1,32}}");
+    }
+    Ok(())
+}
+
+async fn save_named_login_account(
+    vault: &Vault,
+    mut account: Account,
+    account_name: &str,
+) -> Result<String> {
+    validate_account_name(account_name)?;
+    account.name = account_name.to_string();
+    account.id = named_account_id(account.provider, &account.kind, account_name);
+    account.path = None;
+    let id = account.id.clone();
+    vault.upsert(account).await?;
+    Ok(id)
 }
 
 pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Result<String> {
@@ -379,6 +406,15 @@ async fn login_claude(vault: &Vault) -> Result<String> {
 }
 
 pub async fn codex_exchange(vault: &Vault, verifier: &str, code: &str) -> Result<String> {
+    codex_exchange_named(vault, verifier, code, "default").await
+}
+
+pub async fn codex_exchange_named(
+    vault: &Vault,
+    verifier: &str,
+    code: &str,
+    account_name: &str,
+) -> Result<String> {
     let resp = reqwest::Client::new()
         .post(OPENAI_TOKEN_URL)
         .form(&[
@@ -418,11 +454,10 @@ pub async fn codex_exchange(vault: &Vault, verifier: &str, code: &str) -> Result
         status: "active".into(),
         path: None,
     };
-    vault.upsert(account).await?;
-    Ok("openai-oauth".into())
+    save_named_login_account(vault, account, account_name).await
 }
 
-async fn login_codex(vault: &Vault) -> Result<String> {
+async fn login_codex(vault: &Vault, account_name: &str) -> Result<String> {
     let listener = TcpListener::bind(OPENAI_CALLBACK_ADDR)
         .await
         .with_context(|| format!("binding {OPENAI_CALLBACK_ADDR} for the oauth callback"))?;
@@ -433,7 +468,7 @@ async fn login_codex(vault: &Vault) -> Result<String> {
     println!("waiting for the browser callback on {OPENAI_REDIRECT_URI} ...");
     open_browser(&url);
     let code = wait_for_openai_callback(&listener, &state).await?;
-    codex_exchange(vault, &pkce.verifier, &code).await
+    codex_exchange_named(vault, &pkce.verifier, &code, account_name).await
 }
 
 pub fn gemini_authorize_url(challenge: &str, state: &str, redirect_uri: &str) -> String {
@@ -700,6 +735,58 @@ async fn login_grok(vault: &Vault) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_codex_account(token: &str) -> Account {
+        Account {
+            id: named_account_id(Provider::Openai, "oauth", "default"),
+            provider: Provider::Openai,
+            kind: "oauth".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
+            label: Some("codex (test)".into()),
+            access_token: Some(token.into()),
+            refresh_token: Some(format!("refresh-{token}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 60_000),
+            last_refresh_ms: Some(now_ms()),
+            account_meta: json!({"account_id": format!("account-{token}")}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn named_codex_save_preserves_existing_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "alexandria-named-codex-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let vault = Vault::open(dir.clone()).unwrap();
+        vault.upsert(test_codex_account("default-token")).await.unwrap();
+
+        let named_id = save_named_login_account(
+            &vault,
+            test_codex_account("second-token"),
+            "work",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(named_id, "openai-oauth-work");
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        let default = accounts.iter().find(|account| account.name == "default").unwrap();
+        let work = accounts.iter().find(|account| account.name == "work").unwrap();
+        assert_eq!(default.access_token.as_deref(), Some("default-token"));
+        assert_eq!(work.access_token.as_deref(), Some("second-token"));
+        assert!(dir.join("openai-oauth.json").exists());
+        assert!(dir.join("openai-oauth-work.json").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn pkce_shape() {
