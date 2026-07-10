@@ -62,6 +62,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let reasoningEffort: String?
     public let thinkingBudget: Int64?
     public let costUsd: Double?
+    public let accountId: String?
     public let error: String?
     public let user: String?
     public let assistant: String?
@@ -79,6 +80,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case reasoningEffort = "reasoning_effort"
         case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
+        case accountId = "account_id"
         case toolCalls = "tool_calls"
     }
 }
@@ -385,7 +387,7 @@ public enum TurnHeader {
     public static func separatorFacts(
         turnNumber: Int, time: String, status: Int?,
         requestMs: Int64, responseMs: Int64?, costUsd: Double? = nil,
-        reasoningEffort: String? = nil, thinkingBudget: Int64? = nil
+        reasoningEffort: String? = nil, thinkingBudget: Int64? = nil, accountId: String? = nil
     ) -> String {
         var parts = ["turn \(turnNumber)", time]
         if let status { parts.append("\(status)") }
@@ -395,6 +397,7 @@ public enum TurnHeader {
             parts.append(dur)
         }
         if let costUsd, costUsd > 0 { parts.append(TraceNumberFormat.cost(costUsd)) }
+        if let accountId, !accountId.isEmpty { parts.append("acct \(accountId)") }
         return parts.joined(separator: " · ")
     }
 
@@ -1722,7 +1725,8 @@ public enum TranscriptRender {
                 requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
                 costUsd: turn.costUsd,
                 reasoningEffort: turn.reasoningEffort,
-                thinkingBudget: turn.thinkingBudget)
+                thinkingBudget: turn.thinkingBudget,
+                accountId: turn.accountId)
             let isError = (turn.status ?? 0) >= 400
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) ·", attributes: sepAttrs))

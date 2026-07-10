@@ -22,14 +22,17 @@ public struct AccountsResponse: Codable, Sendable {
 public struct Account: Codable, Sendable, Identifiable {
     public let id: String
     public let provider: String
+    public let name: String
     public let kind: String
     public let label: String?
+    public let description: String?
+    public let paused: Bool
     public let status: String
     public let expiresAtMs: Int64?
     public let expiresInS: Int64?
 
     enum CodingKeys: String, CodingKey {
-        case id, provider, kind, label, status
+        case id, provider, name, kind, label, description, paused, status
         case expiresAtMs = "expires_at_ms"
         case expiresInS = "expires_in_s"
     }
@@ -128,6 +131,63 @@ public struct Analytics: Codable, Sendable {
         case totals
         case byModel = "by_model"
         case sinceMs = "since_ms"
+    }
+}
+
+public struct AccountAnalyticsResponse: Codable, Sendable {
+    public let sinceMs: Int64
+    public let bucketMs: Int64
+    public let byAccount: [AccountUsage]
+    public let series: [AccountUsageBucket]
+
+    enum CodingKeys: String, CodingKey {
+        case sinceMs = "since_ms"
+        case bucketMs = "bucket_ms"
+        case byAccount = "by_account"
+        case series
+    }
+}
+
+public struct AccountUsage: Codable, Sendable, Identifiable {
+    public let accountId: String
+    public let provider: String?
+    public let requests: Int64
+    public let inputTokens: Int64
+    public let outputTokens: Int64
+    public let costUsd: Double
+    public let errors: Int64?
+    public let lastTsMs: Int64?
+
+    public var id: String { accountId }
+
+    enum CodingKeys: String, CodingKey {
+        case provider, requests, errors
+        case accountId = "account_id"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+        case lastTsMs = "last_ts_ms"
+    }
+}
+
+public struct AccountUsageBucket: Codable, Sendable, Identifiable {
+    public let bucketMs: Int64
+    public let accountId: String
+    public let requests: Int64
+    public let inputTokens: Int64
+    public let outputTokens: Int64
+    public let costUsd: Double
+    public let errors: Int64?
+
+    public var id: String { "\(bucketMs):\(accountId)" }
+
+    enum CodingKeys: String, CodingKey {
+        case requests, errors
+        case bucketMs = "bucket_ms"
+        case accountId = "account_id"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
     }
 }
 

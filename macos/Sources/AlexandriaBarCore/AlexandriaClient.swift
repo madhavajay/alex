@@ -133,6 +133,18 @@ public struct AlexandriaClient: Sendable {
             as: Analytics.self)
     }
 
+    public func accountAnalytics(
+        sinceMinutes: Int = 24 * 60, bucketMinutes: Int = 60
+    ) async throws -> AccountAnalyticsResponse {
+        try await get(
+            "admin/accounts/analytics",
+            query: [
+                URLQueryItem(name: "since_minutes", value: "\(sinceMinutes)"),
+                URLQueryItem(name: "bucket_minutes", value: "\(bucketMinutes)"),
+            ],
+            as: AccountAnalyticsResponse.self)
+    }
+
     public func dario() async throws -> DarioStatus? {
         do {
             return try await get("admin/dario", as: DarioStatus.self)
@@ -199,9 +211,9 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/dario/prompt-caches/\(key)", method: "DELETE")
     }
 
-    public func authLoginStart(provider: String) async throws -> LoginSession {
+    public func authLoginStart(provider: String, name: String = "default") async throws -> LoginSession {
         let data = try await request(
-            "admin/auth/login/start", method: "POST", body: body(["provider": provider]))
+            "admin/auth/login/start", method: "POST", body: body(["provider": provider, "name": name]))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 
@@ -351,6 +363,12 @@ public struct AlexandriaClient: Sendable {
     public func removeAccount(id: String) async throws {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         _ = try await request("admin/accounts/\(encoded)", method: "DELETE")
+    }
+
+    public func setAccountPaused(id: String, paused: Bool) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        _ = try await request(
+            "admin/accounts/\(encoded)", method: "PUT", body: body(["paused": paused]))
     }
 
     public func setGeminiKey(_ key: String) async throws {

@@ -775,6 +775,62 @@ impl Store {
         }))
     }
 
+    pub fn account_analytics(&self, since_ms: i64, bucket_ms: i64) -> Result<Value> {
+        let conn = self.conn.lock().unwrap();
+        let mut accounts = conn.prepare(
+            "SELECT account_id, upstream_provider, COUNT(*),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END),
+                    MAX(ts_request_ms)
+             FROM traces
+             WHERE ts_request_ms >= ?1 AND account_id IS NOT NULL
+             GROUP BY account_id, upstream_provider
+             ORDER BY MAX(ts_request_ms) DESC",
+        )?;
+        let by_account: Vec<Value> = accounts
+            .query_map(params![since_ms], |r| {
+                Ok(json!({
+                    "account_id": r.get::<_, String>(0)?,
+                    "provider": r.get::<_, Option<String>>(1)?,
+                    "requests": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "output_tokens": r.get::<_, i64>(4)?,
+                    "cost_usd": r.get::<_, f64>(5)?,
+                    "errors": r.get::<_, Option<i64>>(6)?,
+                    "last_ts_ms": r.get::<_, Option<i64>>(7)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut series = conn.prepare(
+            "SELECT ((ts_request_ms / ?2) * ?2) AS bucket_ms, account_id,
+                    COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END)
+             FROM traces
+             WHERE ts_request_ms >= ?1 AND account_id IS NOT NULL
+             GROUP BY bucket_ms, account_id
+             ORDER BY bucket_ms ASC, account_id ASC",
+        )?;
+        let series: Vec<Value> = series
+            .query_map(params![since_ms, bucket_ms.max(60_000)], |r| {
+                Ok(json!({
+                    "bucket_ms": r.get::<_, i64>(0)?,
+                    "account_id": r.get::<_, String>(1)?,
+                    "requests": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "output_tokens": r.get::<_, i64>(4)?,
+                    "cost_usd": r.get::<_, f64>(5)?,
+                    "errors": r.get::<_, Option<i64>>(6)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(json!({"since_ms": since_ms, "bucket_ms": bucket_ms.max(60_000), "by_account": by_account, "series": series}))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_run_key(
         &self,

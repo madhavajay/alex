@@ -180,6 +180,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func accountTitle(_ account: Account) -> String {
         var title = ProviderInfo.displayName(account.provider)
         if let label = account.label, !label.isEmpty { title += " · \(label)" }
+        else if account.name != "default" { title += " · \(account.name)" }
         return title
     }
 
@@ -254,6 +255,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             action("Start 5h Window Now…", symbol: "hourglass.bottomhalf.filled") { [weak self] in
                 self?.confirmStartCodexWindow()
             }
+        }
+        sub.addItem(.separator())
+        action("Add another \(name) account…", symbol: "person.badge.plus") { [weak self] in
+            self?.addAnotherAccount(provider: account.provider)
         }
         sub.addItem(.separator())
         action("Remove Account", symbol: "trash") { [weak self] in
@@ -505,10 +510,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         pingWindow.show(target: target, title: name, store: store)
     }
 
-    private func openAuth(provider: String) {
-        authWindows.show(provider: provider, store: store) { [weak self] provider in
+    private func openAuth(provider: String, accountName: String = "default") {
+        authWindows.show(provider: provider, accountName: accountName, store: store) { [weak self] provider in
             self?.pingAfterAuth(provider: provider)
         }
+    }
+
+    private func addAnotherAccount(provider: String) {
+        let providerName = ProviderInfo.displayName(provider)
+        let alert = NSAlert()
+        alert.messageText = "Add another \(providerName) account"
+        alert.informativeText = "Choose a short local name (letters, numbers, _ and -). It identifies this subscription in routing and Settings."
+        let field = NSTextField(string: "")
+        field.placeholderString = "e.g. personal or work"
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard name.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil else {
+            notify(title: "Invalid account name", body: "Use 1–32 lowercase letters, numbers, _ or -.")
+            return
+        }
+        openAuth(provider: provider, accountName: name)
     }
 
     private func pingAfterAuth(provider: String) {

@@ -181,9 +181,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/storage/prune", post(admin_storage_prune))
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/accounts/analytics", get(admin_account_analytics))
         .route(
             "/admin/accounts/{id}",
-            axum::routing::delete(admin_account_remove),
+            axum::routing::delete(admin_account_remove).put(admin_account_update),
         )
         .route("/admin/auth/gemini-key", post(admin_auth_gemini_key))
         .route("/admin/health", get(admin_health))
@@ -272,6 +273,23 @@ async fn admin_account_remove(
     }
 }
 
+async fn admin_account_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(paused) = body.0["paused"].as_bool() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing boolean 'paused'");
+    };
+    match state.vault.set_paused(&id, paused).await {
+        Ok(()) => axum::Json(json!({"id": id, "paused": paused})).into_response(),
+        Err(e) if e.to_string().starts_with("unknown account") => {
+            error_response(StatusCode::NOT_FOUND, &e.to_string())
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 async fn admin_auth_gemini_key(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
@@ -311,7 +329,8 @@ async fn admin_auth_login_start(
     let Some(provider) = body.0["provider"].as_str() else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
     };
-    match state.logins.start(state.vault.clone(), provider).await {
+    let name = body.0["name"].as_str().unwrap_or("default");
+    match state.logins.start(state.vault.clone(), provider, name).await {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
@@ -437,6 +456,29 @@ async fn admin_analytics(
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     match state.store.analytics(now_ms() - minutes * 60_000) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_account_analytics(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let minutes: i64 = q
+        .get("since_minutes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24 * 60)
+        .clamp(1, 30 * 24 * 60);
+    let bucket_minutes: i64 = q
+        .get("bucket_minutes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+        .clamp(1, 24 * 60);
+    match state
+        .store
+        .account_analytics(now_ms() - minutes * 60_000, bucket_minutes * 60_000)
+    {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1193,6 +1235,7 @@ fn transcript_turn(row: &Value) -> Value {
         "reasoning_effort": row["reasoning_effort"],
         "thinking_budget": row["thinking_budget"],
         "cost_usd": row["cost_usd"],
+        "account_id": row["account_id"],
         "error": row["error"],
         "user": user,
         "assistant": assistant,

@@ -33,6 +33,7 @@ public final class SnapshotStore {
     public private(set) var healthAccounts: [HealthAccount] = []
     public private(set) var limits: [ProviderLimits] = []
     public private(set) var analytics: Analytics?
+    public private(set) var accountAnalytics: AccountAnalyticsResponse?
     public private(set) var dario: DarioStatus?
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
@@ -121,6 +122,7 @@ public final class SnapshotStore {
         async let healthR = try? client.accountHealth()
         async let limitsR = try? client.limits()
         async let analyticsR = try? client.analytics(sinceMinutes: 60)
+        async let accountAnalyticsR = try? client.accountAnalytics()
         async let darioR = try? client.dario()
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnesses()
@@ -130,6 +132,7 @@ public final class SnapshotStore {
         let oldLimits = limits
         limits = await limitsR ?? []
         analytics = await analyticsR
+        accountAnalytics = await accountAnalyticsR
         dario = await darioR ?? nil
         daemonUpdate = await daemonUpdateR
         do {

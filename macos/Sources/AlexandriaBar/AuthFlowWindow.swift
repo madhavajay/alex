@@ -14,6 +14,7 @@ final class AuthFlowModel {
     }
 
     let provider: String
+    let accountName: String
     let store: SnapshotStore
     private(set) var stage: Stage = .starting
     private(set) var session: LoginSession?
@@ -21,8 +22,9 @@ final class AuthFlowModel {
     var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
     private var pollTask: Task<Void, Never>?
 
-    init(provider: String, store: SnapshotStore) {
+    init(provider: String, accountName: String = "default", store: SnapshotStore) {
         self.provider = provider
+        self.accountName = accountName
         self.store = store
     }
 
@@ -43,7 +45,8 @@ final class AuthFlowModel {
         Task { [weak self] in
             do {
                 let session = try await client.authLoginStart(
-                    provider: ProviderInfo.loginArg(self?.provider ?? ""))
+                    provider: ProviderInfo.loginArg(self?.provider ?? ""),
+                    name: self?.accountName ?? "default")
                 self?.sessionUpdated(session)
             } catch {
                 self?.stage = .failed(error.localizedDescription)
@@ -117,7 +120,9 @@ struct AuthFlowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Re-authenticate \(model.providerName)")
+            Text(model.accountName == "default"
+                ? "Re-authenticate \(model.providerName)"
+                : "Add \(model.providerName) account ‘\(model.accountName)’")
                 .font(.title2.bold())
             content
             Spacer(minLength: 0)
@@ -273,36 +278,39 @@ final class AuthWindowController {
     private var models: [String: AuthFlowModel] = [:]
 
     func show(
-        provider: String, store: SnapshotStore,
+        provider: String, accountName: String = "default", store: SnapshotStore,
         onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
     ) {
-        if let window = windows[provider] {
+        let key = "\(provider):\(accountName)"
+        if let window = windows[key] {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let model = AuthFlowModel(provider: provider, store: store)
+        let model = AuthFlowModel(provider: provider, accountName: accountName, store: store)
         model.onAuthenticated = onAuthenticated
-        models[provider] = model
+        models[key] = model
         let view = AuthFlowView(model: model) { [weak self] in
-            self?.closeWindow(provider: provider)
+            self?.closeWindow(key: key)
         }
         let host = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: host)
-        window.title = "Re-authenticate \(ProviderInfo.displayName(provider))"
+        window.title = accountName == "default"
+            ? "Re-authenticate \(ProviderInfo.displayName(provider))"
+            : "Add \(ProviderInfo.displayName(provider)) Account"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.center()
-        windows[provider] = window
+        windows[key] = window
         model.begin()
         DockIconManager.shared.track(window)
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func closeWindow(provider: String) {
-        models[provider]?.cancel()
-        windows[provider]?.close()
-        windows[provider] = nil
-        models[provider] = nil
+    private func closeWindow(key: String) {
+        models[key]?.cancel()
+        windows[key]?.close()
+        windows[key] = nil
+        models[key] = nil
     }
 }

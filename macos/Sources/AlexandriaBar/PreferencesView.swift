@@ -5,6 +5,7 @@ import AlexandriaBarCore
 
 enum PreferencesSection: String, CaseIterable, Hashable {
     case general = "General"
+    case subscriptions = "Subscriptions"
     case harnesses = "Harnesses"
 }
 
@@ -17,6 +18,7 @@ final class PreferencesViewState {
 struct PreferencesView: View {
     @Bindable var state: PreferencesViewState
     let store: SnapshotStore
+    let onAuthenticate: (String, String) -> Void
     @AppStorage("refreshSeconds") private var refreshSeconds: Double = 60
     @AppStorage("limitWarnPct") private var limitWarnPct: Double = 90
     @AppStorage("notifyEnabled") private var notifyEnabled = true
@@ -38,6 +40,8 @@ struct PreferencesView: View {
                 switch state.section {
                 case .general:
                     generalSections
+                case .subscriptions:
+                    SubscriptionsPreferencesSection(store: store, onAuthenticate: onAuthenticate)
                 case .harnesses:
                     HarnessesPreferencesSection(store: store)
                 }
@@ -96,6 +100,252 @@ struct PreferencesView: View {
                     .textSelection(.enabled)
             }
         }
+    }
+}
+
+private struct SubscriptionsPreferencesSection: View {
+    let store: SnapshotStore
+    let onAuthenticate: (String, String) -> Void
+    @State private var providerToAdd: String?
+    @State private var accountName = ""
+
+    private let providers = ["anthropic", "openai", "gemini", "xai"]
+
+    private var usageByAccount: [String: AccountUsage] {
+        Dictionary(uniqueKeysWithValues: (store.accountAnalytics?.byAccount ?? []).map { ($0.accountId, $0) })
+    }
+
+    var body: some View {
+        Section("Subscriptions") {
+            Text("Each account is a separate subscription or API credential. Pause one to keep it out of routing without deleting it.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            if store.accounts.isEmpty {
+                Text("No accounts found. Add an account to start routing requests.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(store.accounts) { account in
+                    SubscriptionAccountRow(account: account, usage: usageByAccount[account.id], store: store) {
+                        onAuthenticate(account.provider, account.name)
+                    }
+                }
+            }
+        }
+
+        if let analytics = store.accountAnalytics {
+            Section("Usage · last 24 hours") {
+                SubscriptionUsageChart(usages: analytics.byAccount)
+                ForEach(analytics.byAccount) { usage in
+                    HStack {
+                        Text(usage.accountId)
+                            .font(.system(size: 10, design: .monospaced))
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(usage.requests) requests · \(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+
+        Section("Add subscription") {
+            ForEach(providers, id: \.self) { provider in
+                Button {
+                    accountName = ""
+                    providerToAdd = provider
+                } label: {
+                    Label("Add another \(ProviderInfo.displayName(provider)) account", systemImage: "person.badge.plus")
+                }
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { providerToAdd != nil },
+                set: { if !$0 { providerToAdd = nil } }
+            )
+        ) {
+            if let provider = providerToAdd {
+                SubscriptionNameSheet(provider: provider) { name in
+                    providerToAdd = nil
+                    onAuthenticate(provider, name)
+                } onCancel: {
+                    providerToAdd = nil
+                }
+            }
+        }
+    }
+}
+
+private struct SubscriptionAccountRow: View {
+    let account: Account
+    let usage: AccountUsage?
+    let store: SnapshotStore
+    let reauthenticate: () -> Void
+    @State private var deleting = false
+    @State private var busy = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: account.paused ? "pause.circle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(account.paused ? .orange : .green)
+                Text(ProviderInfo.displayName(account.provider))
+                    .fontWeight(.medium)
+                Text(account.name)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(account.paused ? "Paused" : account.status.capitalized)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(account.paused ? .orange : .secondary)
+            }
+            Text(account.id)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            if let usage {
+                Text("Last 24h: \(usage.requests) requests · \(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens · \(usage.errors ?? 0) errors")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                Button(account.paused ? "Resume" : "Pause") { setPaused(!account.paused) }
+                    .controlSize(.small)
+                    .disabled(busy)
+                Button("Re-authenticate") { reauthenticate() }
+                    .controlSize(.small)
+                Button("Remove", role: .destructive) { deleting = true }
+                    .controlSize(.small)
+                    .disabled(busy)
+            }
+            if let error {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.vertical, 4)
+        .alert("Remove \(ProviderInfo.displayName(account.provider)) account ‘\(account.name)’?", isPresented: $deleting) {
+            Button("Remove", role: .destructive) { remove() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Alexandria will stop using and pinging this account.")
+        }
+    }
+
+    private func setPaused(_ paused: Bool) {
+        guard let config = store.config else { return }
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await AlexandriaClient(config: config).setAccountPaused(id: account.id, paused: paused)
+                await store.refresh()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+
+    private func remove() {
+        guard let config = store.config else { return }
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await AlexandriaClient(config: config).removeAccount(id: account.id)
+                await store.refresh()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+}
+
+private struct SubscriptionUsageChart: View {
+    let usages: [AccountUsage]
+
+    private var total: Int64 { usages.reduce(0) { $0 + $1.requests } }
+
+    var body: some View {
+        if usages.isEmpty {
+            Text("No routed account activity in this period yet.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                GeometryReader { geometry in
+                    HStack(spacing: 2) {
+                        ForEach(Array(usages.enumerated()), id: \.element.id) { index, usage in
+                            Capsule()
+                                .fill(color(index))
+                                .frame(width: max(3, geometry.size.width * share(usage)))
+                                .help("\(usage.accountId): \(usage.requests) requests")
+                        }
+                    }
+                }
+                .frame(height: 10)
+                HStack(spacing: 10) {
+                    ForEach(Array(usages.enumerated()), id: \.element.id) { index, usage in
+                        HStack(spacing: 3) {
+                            Circle().fill(color(index)).frame(width: 6, height: 6)
+                            Text("\(usage.accountId) \(Int(share(usage) * 100))%")
+                                .lineLimit(1)
+                        }
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func share(_ usage: AccountUsage) -> CGFloat {
+        guard total > 0 else { return 0 }
+        return CGFloat(Double(usage.requests) / Double(total))
+    }
+
+    private func color(_ index: Int) -> Color {
+        [.blue, .green, .orange, .purple, .pink, .teal][index % 6]
+    }
+}
+
+private struct SubscriptionNameSheet: View {
+    let provider: String
+    let onContinue: (String) -> Void
+    let onCancel: () -> Void
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Add \(ProviderInfo.displayName(provider)) account")
+                .font(.title3.bold())
+            Text("Give this subscription a local name so you can choose, pause, and order it later.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            TextField("Name, e.g. personal", text: $name)
+                .textFieldStyle(.roundedBorder)
+            Text("Lowercase letters, numbers, _ and - only.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Continue") {
+                    onContinue(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 
@@ -421,6 +671,7 @@ final class PreferencesWindowController {
     private var window: NSWindow?
     private let state = PreferencesViewState()
     private let store: SnapshotStore
+    private let authWindows = AuthWindowController()
 
     init(store: SnapshotStore) {
         self.store = store
@@ -429,7 +680,13 @@ final class PreferencesWindowController {
     func show(section: PreferencesSection = .general) {
         state.section = section
         if window == nil {
-            let host = NSHostingController(rootView: PreferencesView(state: state, store: store))
+            let host = NSHostingController(rootView: PreferencesView(
+                state: state,
+                store: store,
+                onAuthenticate: { [weak self] provider, name in
+                    guard let self else { return }
+                    self.authWindows.show(provider: provider, accountName: name, store: self.store)
+                }))
             let win = NSWindow(contentViewController: host)
             win.title = "AlexandriaBar Settings"
             win.styleMask = [.titled, .closable]

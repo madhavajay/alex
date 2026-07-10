@@ -238,6 +238,18 @@ impl Vault {
         self.upsert(account).await
     }
 
+    pub async fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let mut account = self
+            .accounts
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown account {id}"))?;
+        account.paused = paused;
+        self.upsert(account).await
+    }
+
     pub async fn has_account_name(&self, provider: Provider, name: &str) -> bool {
         self.accounts.read().await.values().any(|a| a.provider == provider && a.name == name)
     }
