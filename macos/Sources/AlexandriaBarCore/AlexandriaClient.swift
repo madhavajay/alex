@@ -125,6 +125,18 @@ public struct AlexandriaClient: Sendable {
         try await get("health", as: DaemonHealth.self)
     }
 
+    /// Returns the daemon-generated shell exports used by `alex credentials`.
+    /// Keep this value ephemeral: callers should copy it directly rather than log it.
+    public func credentialsEnvironment() async throws -> String {
+        let data = try await request(
+            "connect",
+            query: [URLQueryItem(name: "format", value: "env")])
+        guard let environment = String(data: data, encoding: .utf8) else {
+            throw ClientError.http(0, "credential response was not UTF-8")
+        }
+        return environment
+    }
+
     public func accounts() async throws -> [Account] {
         try await get("admin/accounts", as: AccountsResponse.self).accounts
     }

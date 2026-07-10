@@ -20,6 +20,8 @@ import Testing
         let effort = OmniQuery.parse("effort:high duration:5m")
         #expect(effort.effort == "high")
         #expect(effort.duration == "5m")
+        let account = OmniQuery.parse("account:openai-oauth-acct-2")
+        #expect(account.account == "openai-oauth-acct-2")
         #expect(q.hasTokenFilters)
         #expect(!q.isEmpty)
     }
@@ -189,7 +191,7 @@ import Testing
             makeSession(
                 id: "s2", models: ["grok-code-fast-1"], harness: "codex-cli", runId: nil,
                 lastStatus: nil, tags: ["model": "gpt-5.5", "task": "algebra"],
-                efforts: ["minimal"]),
+                efforts: ["minimal"], accountIds: ["openai-oauth-b"]),
             makeSession(id: "s3", models: nil, harness: nil, runId: nil, lastStatus: nil),
         ]
         #expect(TagFilterDimension.harness.values(in: sessions) == ["codex", "codex-cli"])
@@ -197,15 +199,20 @@ import Testing
         #expect(TagFilterDimension.job.values(in: sessions) == ["job-42"])
         #expect(TagFilterDimension.model.values(in: sessions) == ["gpt-5.5", "grok-code-fast-1"])
         #expect(TagFilterDimension.effort.values(in: sessions) == ["minimal"])
+        #expect(TagFilterDimension.account.values(in: sessions) == ["openai-oauth-b"])
         #expect(TagFilterDimension.duration.values(in: sessions) == ["1m", "5m", "15m", "1h"])
         #expect(TagFilterDimension.harness.activeValue(in: OmniQuery.parse("harness:codex")) == "codex")
         #expect(TagFilterDimension.task.activeValue(in: OmniQuery.parse("job:j")) == nil)
+        #expect(
+            TagFilterDimension.account.activeValue(
+                in: OmniQuery.parse("account:openai-oauth-b")) == "openai-oauth-b")
     }
 
     @Test func multiModelFilterPipeline() {
         let multi = makeSession(
             id: "s-multi", models: ["claude-haiku-4-5", "gpt-5.5"], harness: "codex-cli",
-            runId: nil, lastStatus: 200, lastTsMs: 2000)
+            runId: nil, lastStatus: 200, lastTsMs: 2000,
+            accountIds: ["openai-oauth-a"])
         let other = makeSession(
             id: "s-grok", models: ["grok-code-fast-1"], harness: "pi/0.1", runId: nil,
             lastStatus: 500, tags: ["task": "algebra"], lastTsMs: 1000)
@@ -229,6 +236,8 @@ import Testing
         #expect(visible("task:algebra") == ["s-grok"])
         #expect(visible("status:200") == ["s-multi"])
         #expect(visible("status:500") == ["s-grok"])
+        #expect(visible("account:openai-oauth-a") == ["s-multi"])
+        #expect(visible("account:openai-oauth-b").isEmpty)
     }
 
     @Test func effortAndDurationFilters() {
@@ -249,6 +258,33 @@ import Testing
         let turns = try! decode(json, as: TranscriptResponse.self).turns
         #expect(OmniQuery.parse("effort:high").matches(turns[0]))
         #expect(!OmniQuery.parse("effort:high").matches(turns[1]))
+    }
+
+    @Test func accountFilterMatchesIndividualTurns() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"a","ts_request_ms":0,"account_id":"openai-oauth-a"},{"trace_id":"b","ts_request_ms":1,"account_id":"openai-oauth-b"}]}
+        """#
+        let turns = try decode(json, as: TranscriptResponse.self).turns
+        let query = OmniQuery.parse("account:openai-oauth-b")
+        #expect(!query.matches(turns[0]))
+        #expect(query.matches(turns[1]))
+    }
+
+    @Test func accountIdentityPrefersEmailAndKeepsExactId() throws {
+        let json = #"""
+        {"id":"openai-oauth-a","provider":"openai","name":"acct-a","kind":"oauth","label":"Personal","description":"Codex account","email":"person@example.com","paused":false,"status":"active","expires_at_ms":null,"expires_in_s":100}
+        """#
+        let account = try decode(json, as: Account.self)
+        #expect(
+            AccountIdentity.name(accountId: account.id, accounts: [account])
+                == "person@example.com")
+        #expect(
+            AccountIdentity.label(accountId: account.id, accounts: [account])
+                == "person@example.com · openai-oauth-a")
+        #expect(
+            AccountIdentity.summary(
+                accountIds: [account.id, account.id, "openai-oauth-b"], accounts: [account])
+                == "person@example.com · openai-oauth-a, openai-oauth-b")
     }
 
     @Test func modelDropdownSplitsJoinedValues() {
@@ -311,7 +347,7 @@ import Testing
 
     @Test func sessionsDecoding() throws {
         let json = #"""
-        {"sessions":[{"efforts":["minimal"],"errors":0,"first_ts_ms":1783484392318,"harness":"alexandria-ping","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1"],"run_id":null,"session_id":"auto-36237cced1dcc659","tags":{},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}]}
+        {"sessions":[{"account_ids":["openai-oauth-a","openai-oauth-b"],"efforts":["minimal"],"errors":0,"first_ts_ms":1783484392318,"harness":"alexandria-ping","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1"],"run_id":null,"session_id":"auto-36237cced1dcc659","tags":{},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}]}
         """#
         let sessions = try decode(json, as: TraceSessionsResponse.self).sessions
         #expect(sessions.count == 1)
@@ -320,6 +356,7 @@ import Testing
         #expect(sessions[0].models == ["grok-code-fast-1"])
         #expect(sessions[0].efforts == ["minimal"])
         #expect(sessions[0].lastStatus == 200)
+        #expect(sessions[0].accountIds == ["openai-oauth-a", "openai-oauth-b"])
         #expect(sessions[0].isPingOrTest)
     }
 
@@ -427,7 +464,7 @@ import Testing
     private func makeSession(
         id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?,
         tags: [String: String]? = nil, firstTsMs: Int64 = 0, lastTsMs: Int64 = 0,
-        efforts: [String]? = nil
+        efforts: [String]? = nil, accountIds: [String]? = nil
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
@@ -440,6 +477,7 @@ import Testing
             "last_status": lastStatus as Any,
             "tags": tags as Any,
             "efforts": efforts as Any,
+            "account_ids": accountIds as Any,
         ]
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(TraceSession.self, from: data)

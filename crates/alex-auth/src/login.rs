@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    import_grok, jwt_exp_ms, named_account_id, now_ms, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
+    fetch_provider_email, import_grok, jwt_exp_ms, named_account_id, normalize_email, now_ms,
+    persist_account_email, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
     OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
 use alex_core::Provider;
@@ -145,6 +146,15 @@ pub fn chatgpt_account_id(token: &str) -> Option<String> {
         .get("chatgpt_account_id")?
         .as_str()
         .map(String::from)
+}
+
+fn jwt_email(token: &str) -> Option<String> {
+    jwt_payload(token)
+        .and_then(|payload| payload.get("email").and_then(Value::as_str).and_then(normalize_email))
+}
+
+fn token_email(id_token: Option<&str>, access_token: &str) -> Option<String> {
+    id_token.and_then(jwt_email).or_else(|| jwt_email(access_token))
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,17 +390,28 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         .as_deref()
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
-    let account = Account {
+    let access_token = tokens.access_token;
+    let email = match fetch_provider_email(
+        &reqwest::Client::new(),
+        Provider::Anthropic,
+        &access_token,
+    )
+    .await
+    {
+        Some(email) => Some(email),
+        None => token_email(tokens.id_token.as_deref(), &access_token),
+    };
+    let mut account = Account {
         id: named_account_id(Provider::Anthropic, "oauth", "default"),
         provider: Provider::Anthropic,
         kind: "oauth".into(),
         name: "default".into(),
-        description: None,
+        description: email.clone(),
         paused: false,
-        label: Some("claude (oauth login)".into()),
-        access_token: Some(tokens.access_token),
+        label: Some(email.as_ref().map(|email| format!("claude ({email})")).unwrap_or_else(|| "claude (oauth login)".into())),
+        access_token: Some(access_token),
         refresh_token: tokens.refresh_token,
-        id_token: None,
+        id_token: tokens.id_token,
         api_key: None,
         expires_at_ms: tokens.expires_in.map(|s| now_ms() + s * 1000),
         last_refresh_ms: Some(now_ms()),
@@ -399,6 +420,9 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         status: "active".into(),
         path: None,
     };
+    if let Some(email) = email {
+        persist_account_email(&mut account, &email);
+    }
     vault.upsert(account).await?;
     Ok("anthropic-oauth".into())
 }
@@ -901,6 +925,8 @@ pub struct XaiTokens {
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
+    pub id_token: Option<String>,
+    #[serde(default)]
     pub expires_in: Option<i64>,
 }
 
@@ -962,23 +988,29 @@ pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> 
 }
 
 pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result<String> {
-    let email = jwt_payload(&tokens.access_token)
-        .and_then(|p| p.get("email").and_then(|v| v.as_str().map(String::from)));
+    // Prefer xAI's HTTPS OIDC userinfo response over locally decoded JWT
+    // claims. The latter are not signature-verified here.
+    let email = fetch_provider_email(
+        &reqwest::Client::new(),
+        Provider::Xai,
+        &tokens.access_token,
+    )
+    .await;
     let label = match &email {
         Some(e) => format!("grok ({e})"),
         None => "grok (device login)".into(),
     };
-    let account = Account {
+    let mut account = Account {
         id: named_account_id(Provider::Xai, "oauth", "default"),
         provider: Provider::Xai,
         kind: "oauth".into(),
         name: "default".into(),
-        description: None,
+        description: email.clone(),
         paused: false,
         label: Some(label),
         access_token: Some(tokens.access_token.clone()),
         refresh_token: tokens.refresh_token.clone(),
-        id_token: None,
+        id_token: tokens.id_token.clone(),
         api_key: None,
         expires_at_ms: tokens
             .expires_in
@@ -994,6 +1026,9 @@ pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result
         status: "active".into(),
         path: None,
     };
+    if let Some(email) = email {
+        persist_account_email(&mut account, &email);
+    }
     vault.upsert(account).await?;
     Ok("xai-oauth".into())
 }

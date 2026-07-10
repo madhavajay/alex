@@ -236,11 +236,66 @@ final class TraceBrowserModel {
     }
 
     func filterValues(_ dimension: TagFilterDimension) -> [String] {
-        dimension.values(in: sessions)
+        if dimension == .account {
+            let known = Set(billingAccounts.map(\.id))
+            let observed = dimension.values(in: sessions).filter { known.contains($0) }
+            return Array(Set(observed).union(known)).sorted {
+                AccountIdentity.name(accountId: $0, accounts: billingAccounts)
+                    .localizedCaseInsensitiveCompare(
+                        AccountIdentity.name(accountId: $1, accounts: billingAccounts))
+                    == .orderedAscending
+            }
+        }
+        return dimension.values(in: sessions)
     }
 
     func activeFilter(_ dimension: TagFilterDimension) -> String? {
         dimension.activeValue(in: parsedQuery)
+    }
+
+    func filterLabel(_ dimension: TagFilterDimension, value: String) -> String {
+        if dimension == .account {
+            return AccountIdentity.label(accountId: value, accounts: billingAccounts)
+        }
+        return dimension.label(for: value)
+    }
+
+    func accountIdentity(_ accountId: String?) -> String? {
+        guard let accountId, !accountId.isEmpty else { return nil }
+        guard billingAccounts.contains(where: { $0.id == accountId }) else { return nil }
+        return AccountIdentity.label(accountId: accountId, accounts: billingAccounts)
+    }
+
+    func accountIdentity(_ accountIds: [String]) -> String? {
+        AccountIdentity.summary(
+            accountIds: billingAccountIds(accountIds), accounts: billingAccounts)
+    }
+
+    func accountNames(_ accountIds: [String]) -> String? {
+        AccountIdentity.nameSummary(
+            accountIds: billingAccountIds(accountIds), accounts: billingAccounts)
+    }
+
+    func internalRoute(_ accountId: String?) -> String? {
+        guard let accountId, !accountId.isEmpty, accountIdentity(accountId) == nil else {
+            return nil
+        }
+        return accountId
+    }
+
+    func harnessName(for trace: TraceDetail) -> String {
+        HarnessName.display(
+            harness: trace.harness ?? selectedSession?.harness,
+            tags: selectedSession?.tags)
+    }
+
+    private var billingAccounts: [Account] {
+        store.accounts.filter { $0.kind == "oauth" || $0.provider == "openrouter" }
+    }
+
+    private func billingAccountIds(_ accountIds: [String]) -> [String] {
+        let known = Set(billingAccounts.map(\.id))
+        return accountIds.filter { known.contains($0) }
     }
 
     func setFilter(_ dimension: TagFilterDimension, _ value: String?) {
@@ -392,6 +447,7 @@ final class TraceBrowserModel {
             providers: Dictionary(uniqueKeysWithValues: providerNames.map {
                 ($0, ProviderChipRenderer.image(for: $0))
             }))
+        let billingAccountIds = Set(billingAccounts.map(\.id))
         let prev = renderChain
         renderChain = Task { [weak self] in
             await prev?.value
@@ -399,7 +455,7 @@ final class TraceBrowserModel {
                 let start = ContinuousClock.now
                 let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
-                    icons: icons, rawMode: rawMode)
+                    icons: icons, rawMode: rawMode, billingAccountIds: billingAccountIds)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
@@ -517,7 +573,9 @@ final class TraceBrowserModel {
     }
 
     private func applyTurnFilter() {
-        let filtered = parsedQuery.effort == nil ? allTurns : allTurns.filter(parsedQuery.matches)
+        let filtered = parsedQuery.effort == nil && parsedQuery.account == nil
+            ? allTurns
+            : allTurns.filter(parsedQuery.matches)
         defer { retargetInspector() }
         guard filtered != turns else { return }
         turns = filtered
@@ -711,7 +769,7 @@ struct TraceBrowserView: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                 TextField(
-                    "Search — free text + model: harness: effort: duration: task: job: tag:key=value status: run: session:",
+                    "Search — free text + model: harness: account: effort: duration: task: job: tag:key=value status: run: session:",
                     text: $model.queryText
                 )
                 .textFieldStyle(.plain)
@@ -812,19 +870,21 @@ private struct TagFilterBar: View {
             Button {
                 model.setFilter(dimension, nil)
             } label: {
-                menuItemLabel("Any", checked: active == nil)
+                menuItemLabel(
+                    dimension == .account ? "All Accounts" : "Any",
+                    checked: active == nil)
             }
             Divider()
             ForEach(values, id: \.self) { value in
                 Button {
                     model.setFilter(dimension, value)
                 } label: {
-                    menuItemLabel(dimension.label(for: value), checked: active == value)
+                    menuItemLabel(model.filterLabel(dimension, value: value), checked: active == value)
                 }
             }
         } label: {
             HStack(spacing: 3) {
-                Text(active.map { "\(dimension.rawValue): \(dimension.label(for: $0))" } ?? dimension.title)
+                Text(active.map { "\(dimension.rawValue): \(model.filterLabel(dimension, value: $0))" } ?? dimension.title)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Image(systemName: "chevron.down")
@@ -973,9 +1033,11 @@ private struct SessionListView: View {
             SessionCellView(
                 row: row,
                 pinned: model.pinned && row.id == model.selectedSessionId,
-                showPingBadge: model.showPings && row.isPingOrTest)
+                showPingBadge: model.showPings && row.isPingOrTest,
+                accountName: model.accountNames(row.accountIds),
+                accountIdentity: model.accountIdentity(row.accountIds))
         }
-        .width(min: 180)
+        .width(min: 240)
         .customizationID("session")
         .disabledCustomizationBehavior(.visibility)
         TableColumn("Last activity", value: \.lastTs) { (row: SessionRow) in
@@ -1039,6 +1101,16 @@ private struct SessionListView: View {
         }
         .customizationID("harness")
         .defaultVisibility(.hidden)
+        TableColumn("Billing Account", value: \.accounts) { (row: SessionRow) in
+            Text(model.accountNames(row.accountIds) ?? "")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(model.accountIdentity(row.accountIds) ?? "")
+        }
+        .width(min: 110, ideal: 180)
+        .customizationID("account")
         TableColumn("Run", value: \.runId) { (row: SessionRow) in
             Text(row.runId)
                 .font(.system(size: 10, design: .monospaced))
@@ -1114,6 +1186,8 @@ private struct SessionCellView: View {
     let row: SessionRow
     let pinned: Bool
     let showPingBadge: Bool
+    let accountName: String?
+    let accountIdentity: String?
 
     var body: some View {
         HStack(spacing: 5) {
@@ -1129,6 +1203,17 @@ private struct SessionCellView: View {
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if let accountName {
+                Text(accountName)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                    .help(accountIdentity ?? accountName)
+            }
             if row.errors > 0 {
                 Text("✗ \(row.errors)")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -1243,6 +1328,17 @@ private struct TranscriptView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
+                if let accountName = model.accountNames(session.accountIds ?? []) {
+                    Text(accountName)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                        .help(model.accountIdentity(session.accountIds ?? []) ?? accountName)
+                }
                 let chips = SessionTagChips.chips(
                     tags: session.tags, harness: session.harness, models: session.models)
                 ForEach(chips, id: \.key) { chip in

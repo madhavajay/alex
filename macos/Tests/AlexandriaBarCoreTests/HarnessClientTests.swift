@@ -40,7 +40,7 @@ import Testing
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             let payload = #"""
-            {"provider":"openai","strategy":"priority","reserve_pct":15,"accounts":[{"account_id":"openai-oauth-work","eligible":true,"priority":0,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":20,"resets_at_s":1783477712}]}]}
+            {"provider":"openai","strategy":"priority","reserve_pct":15,"allow_mid_thread_failover":false,"accounts":[{"account_id":"openai-oauth-work","eligible":true,"priority":0,"reserve_pct":20,"observed_at_ms":1783477280438,"windows":[{"window":"5h","used_pct":20,"resets_at_s":1783477712}],"reset_selection":{"window":"5h","used_pct":20,"resets_at_s":1783477712}}]}
             """#
             return (response, Data(payload.utf8))
         }
@@ -55,6 +55,9 @@ import Testing
         let routing = try await client.codexRouting()
         #expect(routing.strategy == .priority)
         #expect(routing.reservePct == 15)
+        #expect(!routing.allowMidThreadFailover)
+        #expect(routing.accounts[0].reservePct == 20)
+        #expect(routing.accounts[0].resetSelection?.window == "5h")
         #expect(routing.accounts[0].windows[0].remainingPct == 80)
     }
 
@@ -67,11 +70,13 @@ import Testing
             let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
             #expect(json["strategy"] as? String == "round_robin")
             #expect(json["reserve_pct"] as? Double == 10)
+            #expect(json["allow_mid_thread_failover"] as? Bool == false)
             let accounts = try #require(json["accounts"] as? [[String: Any]])
             #expect(accounts.count == 2)
             #expect(accounts[0]["account_id"] as? String == "openai-oauth-personal")
             #expect(accounts[0]["eligible"] as? Bool == true)
             #expect(accounts[0]["priority"] as? Int == 0)
+            #expect(accounts[0]["reserve_pct"] as? Double == 15)
             #expect(accounts[1]["eligible"] as? Bool == false)
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!
@@ -87,11 +92,14 @@ import Testing
         let update = CodexRoutingUpdate(
             strategy: .roundRobin,
             reservePct: 10,
+            allowMidThreadFailover: false,
             accounts: [
                 CodexRoutingAccountUpdate(
-                    accountId: "openai-oauth-personal", eligible: true, priority: 0),
+                    accountId: "openai-oauth-personal", eligible: true, priority: 0,
+                    reservePct: 15),
                 CodexRoutingAccountUpdate(
-                    accountId: "openai-oauth-work", eligible: false, priority: 1),
+                    accountId: "openai-oauth-work", eligible: false, priority: 1,
+                    reservePct: 5),
             ])
 
         try await client.updateCodexRouting(update)

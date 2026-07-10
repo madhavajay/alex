@@ -20,6 +20,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let lastStatus: Int?
     public let tags: [String: String]?
     public let efforts: [String]?
+    public let accountIds: [String]?
 
     public var id: String { sessionId }
 
@@ -38,6 +39,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         case totalOutputTokens = "total_output_tokens"
         case totalCostUsd = "total_cost_usd"
         case lastStatus = "last_status"
+        case accountIds = "account_ids"
     }
 }
 
@@ -687,6 +689,8 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public let providers: [String]
     public let harness: String
     public let harnessRaw: String?
+    public let accountIds: [String]
+    public let accounts: String
     public let tags: [String: String]?
     public let turns: Int
     public let tokensIn: Int64
@@ -712,8 +716,13 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         models = modelsList.joined(separator: ", ")
         providers = ModelProvider.providers(in: modelsList)
         harnessRaw = session.harness
-        harness = session.harness ?? ""
+        let taggedHarness = session.tags?["harness"]?.trimmingCharacters(in: .whitespaces)
+        harness = session.harness != nil || taggedHarness?.isEmpty == false
+            ? HarnessName.display(harness: session.harness, tags: session.tags)
+            : ""
         tags = session.tags
+        accountIds = session.accountIds ?? []
+        accounts = accountIds.joined(separator: ", ")
         turns = session.traceCount
         tokensIn = session.totalInputTokens ?? 0
         tokensOut = session.totalOutputTokens ?? 0
@@ -987,6 +996,7 @@ public struct OmniQuery: Equatable, Sendable {
     public var tag: String?
     public var effort: String?
     public var duration: String?
+    public var account: String?
 
     public init() {}
 
@@ -998,7 +1008,7 @@ public struct OmniQuery: Equatable, Sendable {
         model != nil || provider != nil || harness != nil
             || status != nil || run != nil || session != nil
             || task != nil || job != nil || tag != nil
-            || effort != nil || duration != nil
+            || effort != nil || duration != nil || account != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -1021,6 +1031,7 @@ public struct OmniQuery: Equatable, Sendable {
                     case "tag": query.tag = value; continue
                     case "effort": query.effort = value; continue
                     case "duration": query.duration = value; continue
+                    case "account": query.account = value; continue
                     default: break
                     }
                 }
@@ -1088,12 +1099,20 @@ public struct OmniQuery: Equatable, Sendable {
             }
             guard session.lastTsMs - session.firstTsMs >= minimum else { return false }
         }
+        if let account {
+            guard (session.accountIds ?? []).contains(where: {
+                $0.caseInsensitiveCompare(account) == .orderedSame
+            }) else { return false }
+        }
         return true
     }
 
     public func matches(_ turn: TranscriptTurn) -> Bool {
-        guard let effort else { return true }
-        return turn.reasoningEffort == effort
+        if let effort, turn.reasoningEffort != effort { return false }
+        if let account, turn.accountId?.caseInsensitiveCompare(account) != .orderedSame {
+            return false
+        }
+        return true
     }
 
     public func freeTextMatchesTags(_ session: TraceSession) -> Bool {
@@ -1180,9 +1199,11 @@ public enum SessionDurationFilter: String, CaseIterable, Sendable {
 }
 
 public enum TagFilterDimension: String, CaseIterable, Sendable {
-    case harness, task, job, model, effort, duration
+    case harness, task, job, model, account, effort, duration
 
-    public var title: String { rawValue.capitalized }
+    public var title: String {
+        self == .account ? "Billing Account" : rawValue.capitalized
+    }
 
     public func label(for value: String) -> String {
         if self == .duration, let filter = SessionDurationFilter(rawValue: value) {
@@ -1211,8 +1232,10 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
             let tags = session.tags ?? [:]
             switch self {
             case .harness:
-                add(session.harness)
-                add(tags["harness"])
+                let tagged = tags["harness"]?.trimmingCharacters(in: .whitespaces)
+                if session.harness != nil || tagged?.isEmpty == false {
+                    add(HarnessName.display(harness: session.harness, tags: session.tags))
+                }
             case .model:
                 (session.models ?? []).forEach { addSplittingList($0) }
                 addSplittingList(tags["model"])
@@ -1222,6 +1245,8 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
                 add(tags["job"])
             case .effort:
                 (session.efforts ?? []).forEach { add($0) }
+            case .account:
+                (session.accountIds ?? []).forEach { add($0) }
             case .duration:
                 break
             }
@@ -1237,7 +1262,50 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
         case .model: query.model
         case .effort: query.effort
         case .duration: query.duration
+        case .account: query.account
         }
+    }
+}
+
+public enum AccountIdentity {
+    public static func name(accountId: String, accounts: [Account]) -> String {
+        guard let account = accounts.first(where: { $0.id == accountId }) else {
+            return accountId
+        }
+        let identity = [account.email, account.description, account.label, account.name]
+            .compactMap { value -> String? in
+                guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !value.isEmpty
+                else { return nil }
+                return value
+            }
+            .first
+        return identity ?? accountId
+    }
+
+    public static func label(accountId: String, accounts: [Account]) -> String {
+        let identity = name(accountId: accountId, accounts: accounts)
+        return identity == accountId ? accountId : "\(identity) · \(accountId)"
+    }
+
+    public static func summary(accountIds: [String], accounts: [Account]) -> String? {
+        let unique = accountIds.reduce(into: [String]()) { result, accountId in
+            guard !accountId.isEmpty, !result.contains(accountId) else { return }
+            result.append(accountId)
+        }
+        guard !unique.isEmpty else { return nil }
+        return unique.map { label(accountId: $0, accounts: accounts) }
+            .joined(separator: ", ")
+    }
+
+    public static func nameSummary(accountIds: [String], accounts: [Account]) -> String? {
+        let unique = accountIds.reduce(into: [String]()) { result, accountId in
+            guard !accountId.isEmpty, !result.contains(accountId) else { return }
+            result.append(accountId)
+        }
+        guard !unique.isEmpty else { return nil }
+        return unique.map { name(accountId: $0, accounts: accounts) }
+            .joined(separator: ", ")
     }
 }
 
@@ -1245,7 +1313,11 @@ public enum TraceFingerprint {
     public static func sessions(_ sessions: [TraceSession]) -> String {
         let newest = sessions.max { $0.lastTsMs < $1.lastTsMs }
         let totalTraces = sessions.reduce(0) { $0 + $1.traceCount }
-        return "\(sessions.count)|\(newest?.sessionId ?? "")|\(newest?.lastTsMs ?? 0)|\(totalTraces)"
+        let accountFingerprint = sessions
+            .flatMap { $0.accountIds ?? [] }
+            .sorted()
+            .joined(separator: ",")
+        return "\(sessions.count)|\(newest?.sessionId ?? "")|\(newest?.lastTsMs ?? 0)|\(totalTraces)|\(accountFingerprint)"
     }
 
     public static func turns(_ turns: [TranscriptTurn]) -> String {
@@ -1601,17 +1673,19 @@ public enum TranscriptRender {
 
     public static func document(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none, rawMode: Bool = false
+        icons: TranscriptIcons = .none, rawMode: Bool = false,
+        billingAccountIds: Set<String>? = nil
     ) -> NSAttributedString {
         build(
             turns: turns, firstTurnNumber: firstTurnNumber, harnessName: harnessName,
-            icons: icons, rawMode: rawMode
+            icons: icons, rawMode: rawMode, billingAccountIds: billingAccountIds
         ).text
     }
 
     public static func build(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none, rawMode: Bool = false
+        icons: TranscriptIcons = .none, rawMode: Bool = false,
+        billingAccountIds: Set<String>? = nil
     ) -> TranscriptDocument {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -1726,7 +1800,9 @@ public enum TranscriptRender {
                 costUsd: turn.costUsd,
                 reasoningEffort: turn.reasoningEffort,
                 thinkingBudget: turn.thinkingBudget,
-                accountId: turn.accountId)
+                accountId: turn.accountId.flatMap { accountId in
+                    billingAccountIds?.contains(accountId) == false ? nil : accountId
+                })
             let isError = (turn.status ?? 0) >= 400
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) ·", attributes: sepAttrs))

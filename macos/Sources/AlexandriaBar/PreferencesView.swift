@@ -26,6 +26,8 @@ struct PreferencesView: View {
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
     @AppStorage("menuIconStyle") private var menuIconStyle = "logo"
+    @State private var copyingCredentials = false
+    @State private var credentialCopyStatus: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -97,9 +99,80 @@ struct PreferencesView: View {
                 Text(DaemonDiscovery.configPath.path)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                .textSelection(.enabled)
             }
         }
+        Section("Proxy credentials") {
+            Text("Copy credentials for generic API clients, or a ready-to-edit command that mints a tagged run key. Both use the currently loaded local daemon settings.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button {
+                    copyGenericCredentials()
+                } label: {
+                    Label("Copy environment block", systemImage: "doc.on.doc")
+                }
+                .disabled(copyingCredentials || store.config == nil)
+                .help("Copy the same shell exports printed by alex credentials")
+
+                Button {
+                    copyRunKeyCurl()
+                } label: {
+                    Label("Copy run-key curl", systemImage: "terminal")
+                }
+                .disabled(store.config == nil)
+                .help("Copy an editable POST /admin/run-keys example using this daemon")
+
+                if copyingCredentials { ProgressView().controlSize(.small) }
+            }
+            if let credentialCopyStatus {
+                Text(credentialCopyStatus)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func copyGenericCredentials() {
+        guard let config = store.config else { return }
+        copyingCredentials = true
+        credentialCopyStatus = nil
+        Task {
+            do {
+                let environment = try await AlexandriaClient(config: config)
+                    .credentialsEnvironment()
+                copyToPasteboard(environment)
+                credentialCopyStatus = "Environment credential block copied."
+            } catch {
+                NSSound.beep()
+                credentialCopyStatus = "Could not load credentials from the local daemon."
+            }
+            copyingCredentials = false
+        }
+    }
+
+    private func copyRunKeyCurl() {
+        guard let config = store.config else { return }
+        let endpoint = config.baseURL.appendingPathComponent("admin/run-keys").absoluteString
+        let body = #"{"run_id":"demo-run-001","tags":{"harness":"pi","project":"my-project"},"ttl_seconds":86400,"label":"example tagged run"}"#
+        let command = """
+        curl -sS -X POST \\
+          -H \(shellQuote("x-api-key: \(config.localKey)")) \\
+          -H 'content-type: application/json' \\
+          --data \(shellQuote(body)) \\
+          \(shellQuote(endpoint))
+        """
+        copyToPasteboard(command)
+        credentialCopyStatus = "Editable run-key curl command copied."
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 
@@ -138,6 +211,7 @@ private struct SubscriptionsPreferencesSection: View {
                         usage: usageByAccount[account.id],
                         routing: routingByAccount[account.id],
                         reservePct: store.codexRouting?.reservePct ?? 10,
+                        warnUsedPct: store.limitWarnPct,
                         store: store
                     ) {
                         onAuthenticate(account.provider, account.name, false)
@@ -220,8 +294,11 @@ private struct CodexRoutingPreferencesSection: View {
     let accounts: [Account]
     let routing: CodexRoutingResponse?
     @State private var strategy = CodexRoutingStrategy.resetFirst
-    @State private var reservePct = 10.0
+    @State private var fallbackReservePct = 10.0
+    @State private var allowMidThreadFailover = true
     @State private var draftAccounts: [CodexRoutingAccountUpdate] = []
+    @State private var resetSelections: [String: CodexResetSelection] = [:]
+    @State private var reserveBlocked: [String: Bool] = [:]
     @State private var savedSignature = ""
     @State private var busy = false
     @State private var error: String?
@@ -232,9 +309,11 @@ private struct CodexRoutingPreferencesSection: View {
         }
         let accountKey = routing.accounts
             .sorted { $0.priority < $1.priority }
-            .map { "\($0.accountId):\($0.eligible):\($0.priority):\($0.observedAtMs ?? 0)" }
+            .map {
+                "\($0.accountId):\($0.eligible):\($0.priority):\($0.reservePct ?? routing.reservePct):\($0.reserveBlocked):\($0.resetSelection?.resetsAtS ?? 0):\($0.observedAtMs ?? 0)"
+            }
             .joined(separator: "|")
-        return "\(routing.strategy.rawValue)|\(routing.reservePct)|\(accountKey)"
+        return "\(routing.strategy.rawValue)|\(routing.reservePct)|\(routing.allowMidThreadFailover)|\(accountKey)"
     }
 
     private var isDirty: Bool {
@@ -256,6 +335,10 @@ private struct CodexRoutingPreferencesSection: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             } else {
+                Text("Choose which connected accounts may receive Codex requests. Pausing an account disables it more broadly and always overrides this setting.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
                 Picker("Selection mode", selection: $strategy) {
                     ForEach(CodexRoutingStrategy.allCases, id: \.self) { value in
                         Text(value.displayName).tag(value)
@@ -267,48 +350,45 @@ private struct CodexRoutingPreferencesSection: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 
-                Stepper(value: $reservePct, in: 0...100, step: 5) {
-                    LabeledContent("Quota reserve") {
-                        Text("\(Int(reservePct))% remaining")
-                            .monospacedDigit()
-                    }
-                }
+                Toggle(
+                    "Allow mid-thread subscription failover",
+                    isOn: $allowMidThreadFailover)
+                    .help(
+                        "Retry an active thread on a different eligible Codex subscription when its assigned account is unavailable")
 
-                Text("When another eligible account is available, Alexandria avoids an account at or below its reserve.")
+                Text(allowMidThreadFailover
+                    ? "If the assigned subscription hits an auth, rate-limit, or server failure, Alexandria may move that thread to another eligible subscription. This keeps work moving but can reduce prompt-cache reuse."
+                    : "Auth, rate-limit, and server failures stay on the thread’s assigned subscription instead of retrying another one. Explicitly pausing, disabling, or removing that account can still reassign the thread.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 
-                ForEach(Array(draftAccounts.enumerated()), id: \.element.accountId) { index, draft in
+                ForEach(Array(displayedAccounts.enumerated()), id: \.element.accountId) { index, draft in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
-                            Toggle("Allow proxy traffic", isOn: eligibleBinding(accountId: draft.accountId))
+                            Toggle("Use for Codex requests", isOn: eligibleBinding(accountId: draft.accountId))
                                 .toggleStyle(.switch)
                                 .controlSize(.small)
                                 .disabled(account(draft.accountId)?.paused == true || busy)
-                                .help("Allow Alexandria to select this subscription for new Codex requests and failover")
+                                .help("Include this subscription in Codex request routing and failover")
                             Spacer()
-                            Text(account(draft.accountId)?.email
-                                ?? account(draft.accountId)?.description
-                                ?? account(draft.accountId)?.name
-                                ?? draft.accountId)
+                            Text(accountName(draft.accountId))
                                 .font(.system(size: 11))
                                 .lineLimit(1)
-                            Text("#\(index + 1)")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                            Button { move(index, by: -1) } label: {
-                                Image(systemName: "arrow.up")
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(index == 0 || busy)
-                            .help("Move earlier in fallback order")
-                            Button { move(index, by: 1) } label: {
-                                Image(systemName: "arrow.down")
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(index == draftAccounts.count - 1 || busy)
-                            .help("Move later in fallback order")
+                            strategyControls(accountId: draft.accountId, displayedIndex: index)
                         }
+                        Stepper(
+                            value: reserveBinding(accountId: draft.accountId),
+                            in: 0...100, step: 5
+                        ) {
+                            LabeledContent("Keep unused for this account") {
+                                Text("\(Int(draftReserve(draft.accountId)))% remaining")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .monospacedDigit()
+                            }
+                        }
+                        .controlSize(.small)
+                        .help(
+                            "Prefer another eligible Codex subscription once this account reaches its remaining-quota reserve")
                         if account(draft.accountId)?.paused == true {
                             Text("This account is paused, so it cannot receive proxy traffic even while selected here.")
                                 .font(.system(size: 10))
@@ -317,7 +397,6 @@ private struct CodexRoutingPreferencesSection: View {
                     }
                     .padding(.vertical, 2)
                 }
-
 
                 if !draftAccounts.contains(where: \.eligible) {
                     Label(
@@ -352,9 +431,25 @@ private struct CodexRoutingPreferencesSection: View {
 
     private var currentSignature: String {
         let accountKey = draftAccounts.enumerated().map { index, account in
-            "\(account.accountId):\(account.eligible):\(index)"
+            "\(account.accountId):\(account.eligible):\(index):\(account.reservePct ?? fallbackReservePct)"
         }.joined(separator: "|")
-        return "\(strategy.rawValue)|\(reservePct)|\(accountKey)"
+        return "\(strategy.rawValue)|\(allowMidThreadFailover)|\(accountKey)"
+    }
+
+    private var displayedAccounts: [CodexRoutingAccountUpdate] {
+        guard strategy == .resetFirst else { return draftAccounts }
+        return draftAccounts.sorted { lhs, rhs in
+            let leftUsable = isUsable(lhs)
+            let rightUsable = isUsable(rhs)
+            if leftUsable != rightUsable { return leftUsable && !rightUsable }
+            let leftBlocked = reserveBlocked[lhs.accountId] ?? false
+            let rightBlocked = reserveBlocked[rhs.accountId] ?? false
+            if leftBlocked != rightBlocked { return !leftBlocked && rightBlocked }
+            let left = resetSelections[lhs.accountId]?.resetsAtS ?? Int64.max
+            let right = resetSelections[rhs.accountId]?.resetsAtS ?? Int64.max
+            if left != right { return left < right }
+            return lhs.priority < rhs.priority
+        }
     }
 
     private func account(_ id: String) -> Account? {
@@ -370,8 +465,32 @@ private struct CodexRoutingPreferencesSection: View {
             draftAccounts[index] = CodexRoutingAccountUpdate(
                 accountId: item.accountId,
                 eligible: value,
-                priority: index)
+                priority: item.priority,
+                reservePct: item.reservePct ?? fallbackReservePct)
         }
+    }
+
+    private func reserveBinding(accountId: String) -> Binding<Double> {
+        Binding {
+            draftReserve(accountId)
+        } set: { value in
+            guard let index = draftAccounts.firstIndex(where: { $0.accountId == accountId })
+            else { return }
+            let item = draftAccounts[index]
+            draftAccounts[index] = CodexRoutingAccountUpdate(
+                accountId: item.accountId,
+                eligible: item.eligible,
+                priority: item.priority,
+                reservePct: value)
+        }
+    }
+
+    private func draftReserve(_ accountId: String) -> Double {
+        draftAccounts.first { $0.accountId == accountId }?.reservePct ?? fallbackReservePct
+    }
+
+    private func isUsable(_ draft: CodexRoutingAccountUpdate) -> Bool {
+        draft.eligible && account(draft.accountId)?.paused != true
     }
 
     private func loadRouting() {
@@ -381,19 +500,29 @@ private struct CodexRoutingPreferencesSection: View {
             return
         }
         strategy = routing.strategy
-        reservePct = routing.reservePct
+        fallbackReservePct = routing.reservePct
+        allowMidThreadFailover = routing.allowMidThreadFailover
+        resetSelections = Dictionary(uniqueKeysWithValues: routing.accounts.compactMap {
+            guard let selection = $0.resetSelection else { return nil }
+            return ($0.accountId, selection)
+        })
+        reserveBlocked = Dictionary(uniqueKeysWithValues: routing.accounts.map {
+            ($0.accountId, $0.reserveBlocked)
+        })
         let responseAccounts = routing.accounts.sorted { $0.priority < $1.priority }
         var draft = responseAccounts.map {
             CodexRoutingAccountUpdate(
                 accountId: $0.accountId,
                 eligible: $0.eligible,
-                priority: $0.priority)
+                priority: $0.priority,
+                reservePct: $0.reservePct ?? routing.reservePct)
         }
         for account in accounts where !draft.contains(where: { $0.accountId == account.id }) {
             draft.append(CodexRoutingAccountUpdate(
                 accountId: account.id,
                 eligible: !account.paused,
-                priority: draft.count))
+                priority: draft.count,
+                reservePct: routing.reservePct))
         }
         draftAccounts = normalized(draft)
         error = nil
@@ -412,8 +541,66 @@ private struct CodexRoutingPreferencesSection: View {
             CodexRoutingAccountUpdate(
                 accountId: value.accountId,
                 eligible: value.eligible,
-                priority: index)
+                priority: index,
+                reservePct: value.reservePct ?? fallbackReservePct)
         }
+    }
+
+    @ViewBuilder
+    private func strategyControls(accountId: String, displayedIndex: Int) -> some View {
+        switch strategy {
+        case .priority:
+            let index = draftAccounts.firstIndex { $0.accountId == accountId } ?? displayedIndex
+            Text("#\(index + 1)")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Button { move(index, by: -1) } label: {
+                Image(systemName: "arrow.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(index == 0 || busy)
+            .help("Move earlier in priority order")
+            Button { move(index, by: 1) } label: {
+                Image(systemName: "arrow.down")
+            }
+            .buttonStyle(.borderless)
+            .disabled(index == draftAccounts.count - 1 || busy)
+            .help("Move later in priority order")
+        case .roundRobin:
+            Label("alternates", systemImage: "arrow.triangle.2.circlepath")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .help("New threads cycle across enabled subscriptions")
+        case .resetFirst:
+            Label(resetLabel(accountId: accountId, index: displayedIndex), systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .help(resetHelp(accountId))
+        }
+    }
+
+    private func accountName(_ id: String) -> String {
+        account(id)?.email
+            ?? account(id)?.description
+            ?? account(id)?.name
+            ?? id
+    }
+
+    private func resetLabel(accountId: String, index: Int) -> String {
+        guard let selection = resetSelections[accountId] else { return "reset unavailable" }
+        let window = selection.window ?? "window"
+        let draft = draftAccounts.first { $0.accountId == accountId }
+        let position = draft.map(isUsable) == false ? "excluded" : (index == 0 ? "sooner" : "later")
+        let reserve = reserveBlocked[accountId] == true ? "reserve reached · " : ""
+        let reset = selection.resetsDate.formatted(date: .abbreviated, time: .shortened)
+        return "\(reserve)\(window) · resets \(reset) · \(position)"
+    }
+
+    private func resetHelp(_ accountId: String) -> String {
+        guard let selection = resetSelections[accountId] else {
+            return "Waiting for this subscription's Codex reset data"
+        }
+        return "Backend selected the \(selection.window ?? "active") window at \(selection.usedPct.formatted(.number.precision(.fractionLength(0))))% used; exact reset: \(selection.resetsDate.formatted(date: .abbreviated, time: .standard))"
     }
 
     private func save() {
@@ -422,7 +609,8 @@ private struct CodexRoutingPreferencesSection: View {
         error = nil
         let update = CodexRoutingUpdate(
             strategy: strategy,
-            reservePct: reservePct,
+            reservePct: fallbackReservePct,
+            allowMidThreadFailover: allowMidThreadFailover,
             accounts: normalized(draftAccounts))
         Task {
             do {
@@ -448,11 +636,11 @@ private extension CodexRoutingStrategy {
     var explanation: String {
         switch self {
         case .resetFirst:
-            "Prefer an eligible account whose active limit resets sooner, while respecting the reserve."
+            "Assign each new session to an eligible account whose active limit resets sooner, while respecting the reserve."
         case .priority:
-            "Use the first eligible account in the order below until it reaches the reserve, then fall back."
+            "Assign each new session to the first eligible account below that remains above the reserve."
         case .roundRobin:
-            "Rotate requests across eligible accounts, skipping accounts that have reached the reserve."
+            "Alternate new sessions across eligible accounts, skipping accounts that have reached the reserve."
         }
     }
 }
@@ -460,6 +648,7 @@ private extension CodexRoutingStrategy {
 private struct CodexLimitWindowsView: View {
     let routing: CodexRoutingAccount?
     let reservePct: Double
+    let warnUsedPct: Double
 
     var body: some View {
         if let routing, !routing.windows.isEmpty {
@@ -472,7 +661,7 @@ private struct CodexLimitWindowsView: View {
                         if let remaining = window.remainingPct {
                             ProgressView(value: remaining, total: 100)
                                 .progressViewStyle(.linear)
-                                .tint(remaining <= reservePct ? .orange : .green)
+                                .tint(barColor(window))
                                 .frame(width: 90)
                             Text("\(remaining.formatted(.number.precision(.fractionLength(0))))% remaining")
                                 .font(.system(size: 10))
@@ -508,6 +697,14 @@ private struct CodexLimitWindowsView: View {
         formatter.unitsStyle = .abbreviated
         return formatter.localizedString(for: date, relativeTo: Date())
     }
+
+    private func barColor(_ window: LimitWindow) -> Color {
+        switch window.remainingSeverity(warnUsedPct: warnUsedPct) {
+        case .critical: .red
+        case .warning: .orange
+        case .healthy, .none: .green
+        }
+    }
 }
 
 private struct SubscriptionAccountRow: View {
@@ -515,6 +712,7 @@ private struct SubscriptionAccountRow: View {
     let usage: AccountUsage?
     let routing: CodexRoutingAccount?
     let reservePct: Double
+    let warnUsedPct: Double
     let store: SnapshotStore
     let reauthenticate: () -> Void
     @State private var deleting = false
@@ -549,7 +747,10 @@ private struct SubscriptionAccountRow: View {
                     .foregroundStyle(.secondary)
             }
             if account.provider == "openai" {
-                CodexLimitWindowsView(routing: routing, reservePct: reservePct)
+                CodexLimitWindowsView(
+                    routing: routing,
+                    reservePct: reservePct,
+                    warnUsedPct: warnUsedPct)
             }
             HStack(spacing: 8) {
                 Button(account.paused ? "Resume account" : "Pause account") { setPaused(!account.paused) }

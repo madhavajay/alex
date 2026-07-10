@@ -153,9 +153,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func buildLimits() {
-        guard !store.limits.isEmpty else { return }
+        guard !store.limits.isEmpty || store.accounts.contains(where: { $0.provider == "openai" }) else {
+            return
+        }
         let item = NSMenuItem()
-        let card = LimitsCardView(limits: store.limits, warnPct: store.limitWarnPct)
+        let card = LimitsCardView(
+            limits: store.limits,
+            accounts: store.accounts,
+            warnPct: store.limitWarnPct)
         let host = NSHostingView(rootView: card)
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
         item.view = host
@@ -321,7 +326,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildHarnesses() {
         guard store.harnessesSupported == true else { return }
-        let installed = HarnessCatalog.rows(store.harnesses).filter(\.installed)
+        // Keep the menu-bar surface limited to the user-tested Pi workflow.
+        // Settings and the daemon catalog still retain every supported harness.
+        let installed = HarnessCatalog.rows(store.harnesses).filter {
+            $0.installed && $0.name.caseInsensitiveCompare("pi") == .orderedSame
+        }
         guard !installed.isEmpty else { return }
         let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -332,19 +341,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             harnessItem.submenu = harnessSubmenu(harness)
             sub.addItem(harnessItem)
         }
-        sub.addItem(.separator())
-        let updateAll = NSMenuItem(
-            title: "Update All Harnesses",
-            action: #selector(runHandler(_:)),
-            keyEquivalent: "")
-        updateAll.target = self
-        updateAll.image = NSImage(
-            systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)
-        updateAll.representedObject = MenuHandler { [weak self] in
-            guard let self else { return }
-            self.harnessActionWindow.showUpdateAll(store: self.store)
-        }
-        sub.addItem(updateAll)
         item.submenu = sub
         menu.addItem(item)
         menu.addItem(.separator())

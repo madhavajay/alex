@@ -5,7 +5,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alex_auth::{now_ms, Account, AccountPolicy, AccountPolicyMode, Vault};
+use alex_auth::{
+    codex_reserve_blocked, codex_reserve_pct, codex_reset_selection, now_ms, Account,
+    AccountPolicy, AccountPolicyMode, Vault,
+};
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
     parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
@@ -31,6 +34,8 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct DarioActive {
@@ -116,6 +121,9 @@ pub struct AppState {
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
+    codex_affinity: std::sync::Mutex<CodexAffinityCache>,
+    codex_affinity_locks:
+        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +131,112 @@ pub struct CachedRunKey {
     pub run_id: Option<String>,
     pub tags_json: Option<String>,
     pub expires_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexAffinityEntry {
+    account_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct CodexAffinityCache {
+    entries: HashMap<String, CodexAffinityEntry>,
+    ttl_ms: i64,
+    max_entries: usize,
+}
+
+impl Default for CodexAffinityCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl_ms: CODEX_AFFINITY_TTL_MS,
+            max_entries: CODEX_AFFINITY_MAX_ENTRIES,
+        }
+    }
+}
+
+impl CodexAffinityCache {
+    fn preferred(&mut self, session_id: &str, now: i64) -> Option<String> {
+        let entry = self.entries.get_mut(session_id)?;
+        if entry.expires_at_ms <= now {
+            self.entries.remove(session_id);
+            return None;
+        }
+        // Sliding expiry keeps an active thread sticky without retaining
+        // abandoned session IDs forever.
+        entry.expires_at_ms = now.saturating_add(self.ttl_ms);
+        Some(entry.account_id.clone())
+    }
+
+    fn bind(&mut self, session_id: &str, account_id: &str, now: i64) {
+        self.entries.retain(|_, entry| entry.expires_at_ms > now);
+        if !self.entries.contains_key(session_id) && self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at_ms)
+                .map(|(session, _)| session.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            session_id.to_string(),
+            CodexAffinityEntry {
+                account_id: account_id.to_string(),
+                expires_at_ms: now.saturating_add(self.ttl_ms),
+            },
+        );
+    }
+
+    fn unbind(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+}
+
+fn preferred_codex_account(state: &AppState, session_id: Option<&str>) -> Option<String> {
+    let session_id = session_id.filter(|value| !value.is_empty())?;
+    state
+        .codex_affinity
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .preferred(session_id, now_ms())
+}
+
+fn codex_affinity_lock(state: &AppState, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = state
+        .codex_affinity_locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+fn bind_codex_account(state: &AppState, session_id: Option<&str>, account: &Account) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if account.provider != Provider::Openai {
+        return;
+    }
+    let mut affinity = state
+        .codex_affinity
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if account.kind == "oauth" {
+        affinity.bind(session_id, &account.id, now_ms());
+    } else {
+        // An API-key fallback is not a Codex subscription affinity. Forget a
+        // stale subscription binding so the failed account is not restored as
+        // soon as its cooldown ends.
+        affinity.unbind(session_id);
+    }
 }
 
 struct InFlight(Arc<AppState>);
@@ -170,6 +284,8 @@ pub fn build_state(
         run_keys: std::sync::RwLock::new(HashMap::new()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
+        codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
+        codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -1538,9 +1654,13 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .map(|a| {
             let email = a.email();
             let routing = if a.provider == Provider::Openai {
+                let reserve_pct = codex_reserve_pct(&a, &openai_policy);
                 json!({
                     "eligible": !openai_policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
                     "priority": openai_policy.order.iter().position(|name| name == &a.name),
+                    "reserve_pct": reserve_pct,
+                    "reserve_blocked": codex_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
+                    "reset_selection": codex_reset_selection(&a, now_ms() / 1000),
                 })
             } else {
                 Value::Null
@@ -1620,10 +1740,15 @@ async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
                 .get("codex_limits")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let reserve_pct = codex_reserve_pct(&account, &policy);
+            let reset_selection = codex_reset_selection(&account, now_ms() / 1000);
             json!({
                 "account_id": account.id,
                 "eligible": eligible,
                 "priority": priority,
+                "reserve_pct": reserve_pct,
+                "reserve_blocked": codex_reserve_blocked(&account, reserve_pct, now_ms() / 1000),
+                "reset_selection": reset_selection,
                 "observed_at_ms": limits.get("observed_at_ms"),
                 "plan": limits.get("plan"),
                 "active_limit": limits.get("active_limit"),
@@ -1636,6 +1761,8 @@ async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
         "provider": "openai",
         "strategy": codex_strategy_name(&policy.mode),
         "reserve_pct": policy.reserve_pct.unwrap_or(10).min(100),
+        "allow_mid_thread_failover": policy.allow_mid_thread_failover,
+        "reset_selection_rule": "highest_used_pct_then_earliest_reset",
         "accounts": accounts,
     })
 }
@@ -1648,6 +1775,7 @@ async fn admin_codex_routing_update(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
 ) -> Response {
+    let current_policy = state.vault.policy(Provider::Openai);
     let mode = match body.0.get("strategy").and_then(Value::as_str) {
         Some("reset_first") => AccountPolicyMode::ResetFirst,
         Some("priority") => AccountPolicyMode::Priority,
@@ -1659,12 +1787,26 @@ async fn admin_codex_routing_update(
             )
         }
     };
-    let Some(reserve_pct) = body.0.get("reserve_pct").and_then(Value::as_u64) else {
-        return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer");
+    let reserve_pct = match body.0.get("reserve_pct") {
+        Some(value) => match value.as_u64() {
+            Some(value) => value,
+            None => return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer"),
+        },
+        None => current_policy.reserve_pct.unwrap_or(10) as u64,
     };
     if reserve_pct > 100 {
         return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be between 0 and 100");
     }
+    let allow_mid_thread_failover = match body.0.get("allow_mid_thread_failover") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return error_response(
+                StatusCode::BAD_REQUEST,
+                "allow_mid_thread_failover must be boolean",
+            ),
+        },
+        None => current_policy.allow_mid_thread_failover,
+    };
     let Some(requested) = body.0.get("accounts").and_then(Value::as_array) else {
         return error_response(StatusCode::BAD_REQUEST, "accounts must be an array");
     };
@@ -1691,6 +1833,20 @@ async fn admin_codex_routing_update(
         let Some(priority) = item.get("priority").and_then(Value::as_u64) else {
             return error_response(StatusCode::BAD_REQUEST, "each account needs integer priority");
         };
+        let account_reserve_pct = match item.get("reserve_pct") {
+            Some(value) => match value.as_u64() {
+                Some(value) if value <= 100 => value as u8,
+                Some(_) => return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "account reserve_pct must be between 0 and 100",
+                ),
+                None => return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "account reserve_pct must be an integer",
+                ),
+            },
+            None => reserve_pct as u8,
+        };
         let Some(name) = by_id.get(account_id) else {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -1703,7 +1859,7 @@ async fn admin_codex_routing_update(
                 &format!("duplicate OpenAI account '{account_id}'"),
             );
         }
-        ordered.push((priority, name.clone(), eligible));
+        ordered.push((priority, name.clone(), eligible, account_reserve_pct));
     }
     if seen.len() != by_id.len() {
         return error_response(
@@ -1711,16 +1867,21 @@ async fn admin_codex_routing_update(
             "account list changed; refresh Settings and save again",
         );
     }
-    ordered.sort_by_key(|(priority, name, _)| (*priority, name.clone()));
+    ordered.sort_by_key(|(priority, name, _, _)| (*priority, name.clone()));
     let policy = AccountPolicy {
-        order: ordered.iter().map(|(_, name, _)| name.clone()).collect(),
+        order: ordered.iter().map(|(_, name, _, _)| name.clone()).collect(),
         mode,
         threshold_pct: None,
         reserve_pct: Some(reserve_pct as u8),
+        account_reserve_pct: ordered
+            .iter()
+            .map(|(_, name, _, reserve_pct)| (name.clone(), *reserve_pct))
+            .collect(),
+        allow_mid_thread_failover,
         disabled: ordered
             .iter()
-            .filter(|(_, _, eligible)| !*eligible)
-            .map(|(_, name, _)| name.clone())
+            .filter(|(_, _, eligible, _)| !*eligible)
+            .map(|(_, name, _, _)| name.clone())
             .collect(),
     };
     match state
@@ -2305,6 +2466,7 @@ async fn plan_upstream(
     original_body: &[u8],
     trace_id: &str,
     excluded_accounts: &HashSet<String>,
+    affinity_session: Option<&str>,
     client_headers: &HeaderMap,
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
     use alex_core::translate;
@@ -2408,13 +2570,33 @@ async fn plan_upstream(
             })
         }
         Provider::Openai => {
+            // Serialize only the account-planning step for the same thread.
+            // This closes the first-request race without blocking unrelated
+            // sessions or holding a lock during the upstream model request.
+            let _affinity_guard = match affinity_session.filter(|value| !value.is_empty()) {
+                Some(session_id) => Some(
+                    codex_affinity_lock(state, session_id)
+                        .lock_owned()
+                        .await,
+                ),
+                None => None,
+            };
             let prefer_oauth = format != ClientFormat::OpenaiChat;
+            let policy = state.vault.policy(Provider::Openai);
+            let preferred = preferred_codex_account(state, affinity_session);
             let account = state
                 .vault
-                .account_for_excluding(provider, prefer_oauth, excluded_accounts)
+                .account_for_excluding_preferred_mode(
+                    provider,
+                    prefer_oauth,
+                    excluded_accounts,
+                    preferred.as_deref(),
+                    preferred.is_some() && !policy.allow_mid_thread_failover,
+                )
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
+            bind_codex_account(state, affinity_session, &account);
             match format {
                 ClientFormat::OpenaiChat if !oauth => {
                     body_json["model"] = json!(routed_model);
@@ -2667,9 +2849,10 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        session_from_metadata, trace_extras, trace_reasoning_fields, transcript_turn,
+        session_from_metadata, trace_extras, trace_harness, trace_reasoning_fields, transcript_turn,
         truncate_chars,
     };
+    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     #[test]
@@ -2685,6 +2868,21 @@ mod trace_api_tests {
             Some("{\"device_id\":\"d1\"}".into())
         );
         assert_eq!(session_from_metadata(&json!({})), None);
+    }
+
+    #[test]
+    fn explicit_harness_header_wins_over_sdk_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("Anthropic/JS 0.91.1"),
+        );
+        assert_eq!(trace_harness(&headers).as_deref(), Some("Anthropic/JS 0.91.1"));
+        headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("pi"),
+        );
+        assert_eq!(trace_harness(&headers).as_deref(), Some("pi"));
     }
 
     #[test]
@@ -3156,6 +3354,21 @@ fn session_from_metadata(body_json: &Value) -> Option<String> {
     Some(raw.to_string())
 }
 
+fn trace_harness(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-alexandria-harness")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok())
+                .map(String::from)
+        })
+}
+
 const METADATA_HEADERS: &[(&str, &str)] = &[
     ("x-alexandria-harness", "harness"),
     ("x-alexandria-harness-version", "harness_version"),
@@ -3197,6 +3410,14 @@ fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
         || status.is_server_error()
+}
+
+fn retry_failover_allowed(
+    provider: Provider,
+    thread_was_affined: bool,
+    allow_mid_thread_failover: bool,
+) -> bool {
+    provider != Provider::Openai || !thread_was_affined || allow_mid_thread_failover
 }
 
 async fn proxy(
@@ -3250,10 +3471,7 @@ async fn proxy(
         method: Some("POST".into()),
         path: Some(path.into()),
         client_format: Some(format.as_str().into()),
-        harness: headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
+        harness: trace_harness(&headers),
         req_headers_json: Some(redacted_headers(&headers)),
         run_id: headers
             .get("x-alexandria-run-id")
@@ -3290,7 +3508,20 @@ async fn proxy(
                 .and_then(|v| v.to_str().ok())
                 .map(String::from)
         })
+        .or_else(|| {
+            headers
+                .get("x-claude-code-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
         .or_else(|| session_from_metadata(&body_json))
+        .or_else(|| {
+            body_json
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        })
         .or_else(|| {
             conversation_root(format, &body_json).map(|root| {
                 let ua = headers
@@ -3313,6 +3544,16 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
 
+    // Capture this before planning binds a brand-new session. The policy only
+    // suppresses failover for a thread that arrived with an existing affinity;
+    // an unaffined first request may still fail over and then pin its winner.
+    let codex_thread_was_affined = provider == Provider::Openai
+        && preferred_codex_account(&state, trace.session_id.as_deref()).is_some();
+    let allow_mid_thread_failover = state
+        .vault
+        .policy(Provider::Openai)
+        .allow_mid_thread_failover;
+
     let original_body_json = body_json.clone();
     let mut attempted_accounts = HashSet::new();
     let mut plan = match plan_upstream(
@@ -3324,6 +3565,7 @@ async fn proxy(
         &body,
         &trace_id,
         &attempted_accounts,
+        trace.session_id.as_deref(),
         &headers,
     )
     .await
@@ -3452,6 +3694,20 @@ async fn proxy(
                     tracing::warn!("failed to mark cooldown: {e}");
                 }
 
+                if !retry_failover_allowed(
+                    provider,
+                    codex_thread_was_affined,
+                    allow_mid_thread_failover,
+                ) {
+                    tracing::warn!(
+                        account = %account.id,
+                        status = %resp.status(),
+                        "returning retryable Codex error without switching an affined thread"
+                    );
+                    upstream_resp = Some(resp);
+                    break 'accounts;
+                }
+
                 let mut retry_body_json = original_body_json.clone();
                 match plan_upstream(
                     &state,
@@ -3462,6 +3718,7 @@ async fn proxy(
                     &body,
                     &trace_id,
                     &attempted_accounts,
+                    trace.session_id.as_deref(),
                     &headers,
                 )
                 .await
@@ -4061,6 +4318,7 @@ mod tests {
             &original,
             "trace-direct",
             &excluded,
+            None,
             &claude_headers,
         )
         .await
@@ -4081,6 +4339,7 @@ mod tests {
             &original,
             "trace-dario",
             &excluded,
+            None,
             &harness_headers,
         )
         .await
@@ -4116,6 +4375,7 @@ mod tests {
             &original,
             "trace-unhealthy",
             &excluded,
+            None,
             &client_headers,
         )
         .await;
@@ -4155,6 +4415,7 @@ mod tests {
             &original,
             "trace-race",
             &excluded,
+            None,
             &client_headers,
         )
         .await;
@@ -4265,6 +4526,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_affinity_cache_expires_and_evicts_oldest_session() {
+        let mut cache = CodexAffinityCache {
+            entries: HashMap::new(),
+            ttl_ms: 100,
+            max_entries: 2,
+        };
+        cache.bind("session-a", "account-a", 0);
+        cache.bind("session-b", "account-b", 10);
+        assert_eq!(cache.preferred("session-a", 20).as_deref(), Some("account-a"));
+
+        // session-a's lookup extends its expiry, so session-b is oldest.
+        cache.bind("session-c", "account-c", 30);
+        assert!(cache.preferred("session-b", 30).is_none());
+        assert_eq!(cache.preferred("session-a", 30).as_deref(), Some("account-a"));
+        assert_eq!(cache.preferred("session-c", 30).as_deref(), Some("account-c"));
+        assert!(cache.preferred("session-a", 131).is_none());
+    }
+
+    #[test]
     fn captures_only_safe_codex_limit_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
@@ -4307,8 +4587,9 @@ mod tests {
                 axum::Json(json!({
                     "strategy": "priority",
                     "reserve_pct": 15,
+                    "allow_mid_thread_failover": false,
                     "accounts": [
-                        {"account_id": "openai-oauth-work", "eligible": true, "priority": 0},
+                        {"account_id": "openai-oauth-work", "eligible": true, "priority": 0, "reserve_pct": 22},
                         {"account_id": "openai-oauth", "eligible": false, "priority": 1}
                     ]
                 })),
@@ -4319,9 +4600,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["strategy"], "priority");
         assert_eq!(body["reserve_pct"], 15);
+        assert_eq!(body["allow_mid_thread_failover"], false);
         assert_eq!(body["accounts"][0]["account_id"], "openai-oauth-work");
         assert_eq!(body["accounts"][0]["eligible"], true);
+        assert_eq!(body["accounts"][0]["reserve_pct"], 22);
         assert_eq!(body["accounts"][1]["eligible"], false);
+        assert_eq!(body["accounts"][1]["reserve_pct"], 15);
+        assert_eq!(
+            state
+                .vault
+                .policy(Provider::Openai)
+                .account_reserve_pct["work"],
+            22
+        );
         assert_eq!(
             state
                 .vault
@@ -4483,6 +4774,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disabled_mid_thread_failover_only_pins_existing_codex_threads() {
+        assert!(!retry_failover_allowed(Provider::Openai, true, false));
+        assert!(retry_failover_allowed(Provider::Openai, false, false));
+        assert!(retry_failover_allowed(Provider::Openai, true, true));
+        assert!(retry_failover_allowed(Provider::Anthropic, true, false));
+    }
+
     #[tokio::test]
     async fn codex_planning_excludes_every_account_already_attempted() {
         let state = test_state("codex-plan-exclusions");
@@ -4532,6 +4831,7 @@ mod tests {
                 &raw,
                 "trace-test",
                 &excluded,
+                None,
                 &client_headers,
             )
             .await
@@ -4554,9 +4854,137 @@ mod tests {
             &raw,
             "trace-test",
             &excluded,
+            None,
             &client_headers,
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_sessions_stay_affined_and_failover_rebinds() {
+        let state = test_state("codex-session-affinity");
+        state
+            .vault
+            .upsert(test_openai_account("a"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_openai_account("b"))
+            .await
+            .unwrap();
+        state
+            .vault
+            .set_policies(vec![(
+                Provider::Openai,
+                AccountPolicy {
+                    order: vec!["a".into(), "b".into()],
+                    mode: AccountPolicyMode::RoundRobin,
+                    reserve_pct: Some(0),
+                    ..AccountPolicy::default()
+                },
+            )])
+            .await;
+
+        let request = json!({"model": "gpt-5.3-codex", "stream": true});
+        let raw = serde_json::to_vec(&request).unwrap();
+        let headers = HeaderMap::new();
+        let none_excluded = HashSet::new();
+
+        let mut body = request.clone();
+        let session_a_first = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-1",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+
+        let mut body = request.clone();
+        let session_b_first = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-b-1",
+            &none_excluded,
+            Some("session-b"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_ne!(session_a_first, session_b_first);
+
+        let mut body = request.clone();
+        let session_a_again = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-2",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(session_a_again, session_a_first);
+
+        let excluded = HashSet::from([session_a_first.clone()]);
+        let mut body = request.clone();
+        let failover = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-failover",
+            &excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(failover, session_b_first);
+
+        let mut body = request;
+        let after_failover = plan_upstream(
+            &state,
+            ClientFormat::OpenaiResponses,
+            Provider::Openai,
+            "gpt-5.3-codex",
+            &mut body,
+            &raw,
+            "trace-a-3",
+            &none_excluded,
+            Some("session-a"),
+            &headers,
+        )
+        .await
+        .unwrap()
+        .account
+        .id;
+        assert_eq!(after_failover, failover);
     }
 }
