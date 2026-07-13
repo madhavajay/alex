@@ -3,6 +3,10 @@ name: Build Signed macOS App
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to build"
+        required: true
+        type: string
       notarize:
         description: "Submit the DMG to Apple notarization"
         required: true
@@ -30,16 +34,47 @@ jobs:
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
       SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
       SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+
+      - name: Validate release source
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          current="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          if [[ "$RELEASE_TAG" != "v$current" ]]; then
+            echo "tag $RELEASE_TAG does not match Cargo.toml version $current" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "release tag $RELEASE_TAG is not on origin/main" >&2
+            exit 1
+          }
 
       - name: Show toolchain
         run: |
           swift --version
           xcodebuild -version
+
+      - name: Test AlexandriaBar
+        working-directory: macos
+        run: swift test
+
+      - name: Smoke test packaged app
+        run: |
+          chmod +x macos/Scripts/package_app.sh scripts/smoke-packaged-app.sh
+          CONFIGURATION=release IDENTITY=- ./macos/Scripts/package_app.sh
+          ./scripts/smoke-packaged-app.sh macos/dist/AlexandriaBar.app
 
       - name: Validate signing secrets
         run: |
@@ -83,7 +118,7 @@ jobs:
         if: ${{ inputs.notarize && inputs.publish_release }}
         run: |
           version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
-          tag="v${version}"
+          tag="$RELEASE_TAG"
           dmg="$(ls -t macos/dist/*.dmg | head -1)"
 
           if [[ -z "$version" || -z "$dmg" ]]; then
@@ -109,7 +144,8 @@ jobs:
             gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber
           else
             if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
-              --target "$GITHUB_SHA" \
+              --verify-tag \
+              --target "$(git rev-parse HEAD)" \
               --title "Alexandria ${RELEASE_TAG}" \
               --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
               gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber

@@ -1,23 +1,64 @@
 name: Release to crates.io
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'macos/**'
-      - '.github/workflows/build-signed-macos.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing vX.Y.Z tag to retry'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  rust-tests:
+    name: Release Rust tests
     runs-on: ubuntu-latest
-    if: "!startsWith(github.event.head_commit.message, 'release: v')"
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+
+  swift-tests:
+    name: Release Swift and packaged-app tests
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Test AlexandriaBar
+        working-directory: macos
+        run: swift test
+      - name: Package AlexandriaBar
+        run: |
+          chmod +x macos/Scripts/package_app.sh scripts/smoke-packaged-app.sh
+          CONFIGURATION=release IDENTITY=- ./macos/Scripts/package_app.sh
+      - name: Smoke test packaged app
+        run: ./scripts/smoke-packaged-app.sh macos/dist/AlexandriaBar.app
+
+  publish:
+    needs: [rust-tests, swift-tests]
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     permissions:
@@ -26,35 +67,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo test --workspace
-
-      - name: Bump version if current one is already published
+      - name: Validate release tag and version
         id: version
         run: |
           set -euo pipefail
-          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          status=$(curl -s -o /dev/null -w "%{http_code}" \
-            -A "alex-release-workflow" \
-            "https://crates.io/api/v1/crates/alex/${current}")
-          if [ "$status" = "200" ]; then
-            IFS=. read -r major minor patch <<<"$current"
-            next="${major}.${minor}.$((patch + 1))"
-            echo "bumping ${current} -> ${next}"
-            sed -i "s/^version = \"${current}\"/version = \"${next}\"/" Cargo.toml
-            sed -i "s/version = \"${current}\" }/version = \"${next}\" }/" Cargo.toml
-            cargo update --workspace
-            version="$next"
-            bumped=1
-          else
-            echo "version ${current} not on crates.io yet; publishing as-is"
-            version="$current"
-            bumped=0
+          tag="$RELEASE_TAG"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $tag" >&2
+            exit 1
           fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "bumped=${bumped}" >> "$GITHUB_OUTPUT"
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$tag" != "v$current" ]]; then
+            echo "tag $tag does not match Cargo.toml version $current" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "release tag $tag is not on origin/main" >&2
+            exit 1
+          }
+          echo "version=${current}" >> "$GITHUB_OUTPUT"
 
       - name: Publish crates in dependency order
         env:
@@ -70,32 +106,10 @@ jobs:
             if [ "$status" = "200" ]; then
               echo "${crate} ${version} already published; skipping"
             else
-              cargo publish -p "$crate" --allow-dirty
+              cargo publish -p "$crate" --locked
             fi
             echo "::endgroup::"
           done
-
-      - name: Commit bump and tag
-        if: steps.version.outputs.bumped == '1'
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "release: v${version}"
-          git tag "v${version}"
-          git push origin HEAD:main "v${version}"
-
-      - name: Tag initial release
-        if: steps.version.outputs.bumped == '0'
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f "v${version}"
-          git push origin "v${version}" || true
 
       - name: Build CLI binary from crates.io
         run: |
@@ -139,6 +153,7 @@ jobs:
             gh release upload "$tag" "$asset_dir"/* --clobber
           else
             if ! gh release create "$tag" "$asset_dir"/* \
+              --verify-tag \
               --target "$(git rev-parse HEAD)" \
               --title "Alexandria ${tag}" \
               --notes "$notes"; then
@@ -162,7 +177,7 @@ jobs:
           asset="alex-cli-${version}-windows-x86_64.zip"
 
           for attempt in {1..12}; do
-            if cargo install alex --version "$version" --root "$root" --force --bins; then
+            if cargo install alex --version "$version" --root "$root" --force --bins --locked; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then
@@ -211,7 +226,7 @@ jobs:
             local root="$1"
             shift
             for attempt in {1..12}; do
-              if cargo install alex --version "$version" --root "$root" --force --bins "$@"; then
+              if cargo install alex --version "$version" --root "$root" --force --bins --locked "$@"; then
                 return 0
               fi
               if [[ "$attempt" -eq 12 ]]; then
@@ -334,7 +349,7 @@ jobs:
       - publish
       - windows-asset
       - macos-asset
-    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.macos-asset.result == 'success' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.windows-asset.result == 'success' && needs.macos-asset.result == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -342,6 +357,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set manifest metadata
         id: version
@@ -391,6 +408,8 @@ jobs:
       TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Check tap deploy key
         id: tap_key
