@@ -54,6 +54,34 @@ cargo install alex        # installs the `alex` and `alexandria` binaries
 ./install.sh --service    # also run at login (launchd/systemd)
 ```
 
+### Beta channel
+
+Betas ship ahead of stable so new features can be tested on real builds. The catch
+is that the channel setting lives *inside* the beta build, so a stable install has
+no way to ask for one. This installer is the way in:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-beta.sh | sh
+```
+
+It resolves the newest **prerelease** (GitHub's `releases/latest` never points at
+one, which is why the normal installer can't reach a beta), SHA-256 verifies the
+CLI tarball, opens the signed DMG for the menu-bar app, and sets your update
+channel to `beta`. It does not use Homebrew — there is no beta cask.
+
+That bootstrap is a one-time cost. From then on betas arrive as ordinary updates:
+
+```bash
+alex update                      # follows the configured channel
+alex update --set-channel beta   # or stable, to go back
+```
+
+In the app: **Preferences → Updates → Release channel**. Switching back to stable
+always works — the baked-in Sparkle feed URL never changes, only the channel does.
+Stable users are never offered a prerelease.
+
+To pin one exact build: `ALEX_BETA_TAG=v0.1.26-beta.1 sh install-beta.sh`.
+
 ## Quick start
 
 ```bash
