@@ -307,6 +307,16 @@ struct HarnessConfigWriteSummaryView: View {
                     .textSelection(.enabled)
                     .help(result.path)
             }
+            if let extensionPath = result.extensionPath {
+                labeled("Session hook") {
+                    Text(extensionPath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .help(extensionPath)
+                }
+            }
             labeled("Summary") {
                 Text(summaryLine)
                     .font(.system(size: 11))

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
@@ -2822,6 +2822,151 @@ fn current_uid() -> String {
         .unwrap_or_default()
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn service_environment_path(
+    home: &Path,
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> Result<String> {
+    let dirs = harness_connect::binary_search_dirs(Some(home), inherited_path);
+    let joined = std::env::join_paths(dirs).context("building service PATH")?;
+    Ok(joined.to_string_lossy().into_owned())
+}
+
+fn render_launchd_plist(executable: &str, service_path: &str) -> String {
+    LAUNCHD_TEMPLATE
+        .replace("/usr/local/bin/alexandria", &xml_escape(executable))
+        .replace("__ALEXANDRIA_PATH__", &xml_escape(service_path))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchdInstallMode {
+    BootstrapNow,
+    ReplaceAfterParentExit,
+}
+
+fn launchd_install_mode(state: &ServiceState) -> LaunchdInstallMode {
+    if matches!(state, ServiceState::LaunchdLoaded { .. }) {
+        LaunchdInstallMode::ReplaceAfterParentExit
+    } else {
+        LaunchdInstallMode::BootstrapNow
+    }
+}
+
+fn launchd_handoff_args(parent_pid: u32, uid: &str, plist: &Path) -> Vec<OsString> {
+    vec![
+        "service".into(),
+        "__launchd-handoff".into(),
+        "--parent-pid".into(),
+        parent_pid.to_string().into(),
+        "--uid".into(),
+        uid.into(),
+        "--plist".into(),
+        plist.as_os_str().to_owned(),
+    ]
+}
+
+fn launchd_handoff_command(
+    executable: &Path,
+    parent_pid: u32,
+    uid: &str,
+    plist: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.args(launchd_handoff_args(parent_pid, uid, plist));
+    command
+}
+
+fn bootstrap_launchd(uid: &str, plist: &Path) -> Result<()> {
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", &format!("gui/{uid}")])
+        .arg(plist)
+        .output()
+        .context("running launchctl bootstrap")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn wait_for_parent_exit(parent_pid: u32) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while process_is_alive(parent_pid) {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("installer process {parent_pid} did not exit within 120 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Give the caller enough time to deliver the completed tool response before
+    // launchd asks the old daemon to drain its in-flight connections.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    Ok(())
+}
+
+fn launchd_service_handoff(parent_pid: u32, uid: &str, plist: &Path) -> Result<()> {
+    wait_for_parent_exit(parent_pid)?;
+    let bootout = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}")])
+        .arg(plist)
+        .output()
+        .context("running launchctl bootout")?;
+    if !bootout.status.success() {
+        eprintln!(
+            "warning: launchctl bootout failed; attempting bootstrap: {}",
+            String::from_utf8_lossy(&bootout.stderr).trim()
+        );
+    }
+    bootstrap_launchd(uid, plist)?;
+    eprintln!("launchd service replacement completed");
+    Ok(())
+}
+
+fn spawn_launchd_handoff(
+    executable: &Path,
+    uid: &str,
+    plist: &Path,
+    home: &Path,
+) -> Result<(u32, PathBuf)> {
+    let log_dir = home.join(".alexandria");
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("service-install.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let log_err = log.try_clone()?;
+    let mut command = launchd_handoff_command(executable, std::process::id(), uid, plist);
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
+        .spawn()
+        .context("starting detached launchd handoff")?;
+    Ok((child.id(), log_path))
+}
+
 fn service_install() -> Result<()> {
     let exe = std::env::current_exe()?
         .canonicalize()
@@ -2835,36 +2980,36 @@ fn service_install() -> Result<()> {
             ))
         );
     }
+    let mut handoff_pending = false;
     if cfg!(target_os = "macos") {
-        let dst = dirs::home_dir()
-            .context("no home dir")?
-            .join("Library/LaunchAgents/com.alexandria.daemon.plist");
+        let home = dirs::home_dir().context("no home dir")?;
+        let dst = home.join("Library/LaunchAgents/com.alexandria.daemon.plist");
+        let inherited_path = std::env::var_os("PATH");
+        let service_path = service_environment_path(&home, inherited_path.as_deref())?;
         std::fs::create_dir_all(dst.parent().unwrap())?;
-        std::fs::write(
-            &dst,
-            LAUNCHD_TEMPLATE.replace("/usr/local/bin/alexandria", &exe_str),
-        )?;
+        std::fs::write(&dst, render_launchd_plist(&exe_str, &service_path))?;
         let uid = current_uid();
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}")])
-            .arg(&dst)
-            .output();
-        let out = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}")])
-            .arg(&dst)
-            .output()
-            .context("running launchctl bootstrap")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootstrap failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+        match launchd_install_mode(&detect_service_state()) {
+            LaunchdInstallMode::BootstrapNow => {
+                bootstrap_launchd(&uid, &dst)?;
+                println!(
+                    "{} {}",
+                    ui::gold(ui::ankh()),
+                    ui::bold("launchd service installed and started")
+                );
+            }
+            LaunchdInstallMode::ReplaceAfterParentExit => {
+                let (helper_pid, log_path) = spawn_launchd_handoff(&exe, &uid, &dst, &home)?;
+                handoff_pending = true;
+                println!(
+                    "{} {}",
+                    ui::gold(ui::ankh()),
+                    ui::bold("launchd service replacement scheduled")
+                );
+                println!("  helper pid: {helper_pid}");
+                println!("  status/errors: {}", log_path.display());
+            }
         }
-        println!(
-            "{} {}",
-            ui::gold(ui::ankh()),
-            ui::bold("launchd service installed and started")
-        );
         println!("  {}", ui::dim(&dst.to_string_lossy()));
     } else if cfg!(target_os = "linux") {
         let dst = dirs::home_dir()
@@ -2912,7 +3057,9 @@ fn service_install() -> Result<()> {
     } else {
         anyhow::bail!("service install supports macOS (launchd) and Linux (systemd) only");
     }
-    println!("  {}", service_state_label(&detect_service_state()));
+    if !handoff_pending {
+        println!("  {}", service_state_label(&detect_service_state()));
+    }
     Ok(())
 }
 
@@ -4023,6 +4170,67 @@ mod tests {
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("does not support connect"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_plist_persists_safe_augmented_path() {
+        let home = tmpdir("launchd & path");
+        let nvm_bin = home.join(".nvm/versions/node/v23.6.1/bin");
+        std::fs::create_dir_all(&nvm_bin).unwrap();
+        let inherited = std::env::join_paths([
+            nvm_bin.clone(),
+            PathBuf::from("/usr/bin"),
+            nvm_bin.clone(),
+            PathBuf::from("relative-bin"),
+        ])
+        .unwrap();
+
+        let path = service_environment_path(&home, Some(&inherited)).unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(std::ffi::OsStr::new(&path)).collect();
+        assert_eq!(dirs.first(), Some(&nvm_bin));
+        assert_eq!(dirs.iter().filter(|dir| *dir == &nvm_bin).count(), 1);
+        assert!(!dirs.iter().any(|dir| dir == Path::new("relative-bin")));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&home.join(".local/bin")));
+
+        let plist = render_launchd_plist("/Applications/Alex & Co/alex", &path);
+        assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("/Applications/Alex &amp; Co/alex"));
+        assert!(plist.contains("launchd &amp; path"));
+        assert!(!plist.contains("__ALEXANDRIA_PATH__"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn loaded_launchd_service_uses_detached_handoff_command() {
+        assert_eq!(
+            launchd_install_mode(&ServiceState::LaunchdLoaded { pid: Some(42) }),
+            LaunchdInstallMode::ReplaceAfterParentExit
+        );
+        assert_eq!(
+            launchd_install_mode(&ServiceState::LaunchdNotLoaded),
+            LaunchdInstallMode::BootstrapNow
+        );
+
+        let executable = Path::new("/Applications/Alex Test/alex");
+        let plist = Path::new("/Users/test/Library/LaunchAgents/com.alexandria.daemon.plist");
+        let command = launchd_handoff_command(executable, 1234, "501", plist);
+        assert_eq!(command.get_program(), executable.as_os_str());
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("service"),
+                OsString::from("__launchd-handoff"),
+                OsString::from("--parent-pid"),
+                OsString::from("1234"),
+                OsString::from("--uid"),
+                OsString::from("501"),
+                OsString::from("--plist"),
+                plist.as_os_str().to_owned(),
+            ]
+        );
     }
 
     #[test]

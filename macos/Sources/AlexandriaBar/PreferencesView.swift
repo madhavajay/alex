@@ -1099,10 +1099,12 @@ private struct HarnessRowView: View {
 
     @ViewBuilder
     private var statusDot: some View {
-        if !harness.installed {
+        if harness.connected {
+            Circle().fill(Color.green)
+        } else if !harness.installed {
             Circle().stroke(.secondary, lineWidth: 1.5)
         } else {
-            Circle().fill(harness.connected ? Color.green : Color.secondary)
+            Circle().fill(Color.secondary)
         }
     }
 

@@ -81,6 +81,7 @@ public struct HealthAccount: Codable, Sendable, Identifiable {
 }
 
 public struct Heartbeat: Codable, Sendable {
+    public let accountId: String?
     public let ok: Bool
     public let status: Int?
     public let latencyMs: Int64?
@@ -89,6 +90,7 @@ public struct Heartbeat: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case ok, status, message
+        case accountId = "account_id"
         case latencyMs = "latency_ms"
         case tsMs = "ts_ms"
     }
@@ -216,6 +218,22 @@ public enum CodexRoutingStrategy: String, Codable, Sendable, CaseIterable, Hasha
     case resetFirst = "reset_first"
     case priority
     case roundRobin = "round_robin"
+
+    public var displayName: String {
+        switch self {
+        case .priority: "Priority"
+        case .resetFirst: "Reset first"
+        case .roundRobin: "Round robin"
+        }
+    }
+
+    public var shortCode: String {
+        switch self {
+        case .priority: "PRI"
+        case .resetFirst: "RF"
+        case .roundRobin: "RR"
+        }
+    }
 }
 
 public struct CodexRoutingResponse: Codable, Sendable {
@@ -310,6 +328,123 @@ public struct CodexResetSelection: Codable, Sendable, Equatable {
 
     public var resetsDate: Date {
         Date(timeIntervalSince1970: TimeInterval(resetsAtS))
+    }
+}
+
+public enum CodexBondedAccountStatus: Sendable, Equatable {
+    case ready
+    case paused
+    case inactive
+    case proxyOff
+    case reserveHeld
+
+    public var label: String {
+        switch self {
+        case .ready: "ready"
+        case .paused: "paused"
+        case .inactive: "inactive"
+        case .proxyOff: "proxy off"
+        case .reserveHeld: "reserve held"
+        }
+    }
+}
+
+public struct CodexBondedAccountOrder: Sendable, Equatable, Identifiable {
+    public let accountId: String
+    public let accountAlias: String
+    public let priorityAlias: String
+    public let status: CodexBondedAccountStatus
+
+    public var id: String { accountId }
+}
+
+/// A stable menu representation of configured priority and current effective
+/// routing order. Account aliases stay tied to configured order, so a reset-first
+/// reorder can be shown as (for example) `Now A2 → A1` without relabeling rows.
+public struct CodexBondedOrderSummary: Sendable, Equatable {
+    public let strategy: CodexRoutingStrategy
+    public let configuredAccounts: [CodexBondedAccountOrder]
+    public let effectiveAccountAliases: [String]
+
+    public init(routing: CodexRoutingResponse, accounts: [Account]) {
+        let oauthAccounts = accounts.filter {
+            $0.provider == "openai" && $0.kind == "oauth"
+        }
+        let accountById = Dictionary(uniqueKeysWithValues: oauthAccounts.map { ($0.id, $0) })
+        let oauthAccountIds = Set(accountById.keys)
+        let configured = routing.accounts.filter {
+            oauthAccountIds.contains($0.accountId)
+        }.sorted {
+            if $0.priority == $1.priority { return $0.accountId < $1.accountId }
+            return $0.priority < $1.priority
+        }
+        let aliasById = Dictionary(uniqueKeysWithValues: configured.enumerated().map {
+            ($0.element.accountId, "A\($0.offset + 1)")
+        })
+
+        func status(_ route: CodexRoutingAccount) -> CodexBondedAccountStatus {
+            if let account = accountById[route.accountId] {
+                if account.paused { return .paused }
+                if account.status != "active" { return .inactive }
+            }
+            if !route.eligible { return .proxyOff }
+            if route.reserveBlocked { return .reserveHeld }
+            return .ready
+        }
+
+        configuredAccounts = configured.enumerated().map { index, route in
+            CodexBondedAccountOrder(
+                accountId: route.accountId,
+                accountAlias: "A\(index + 1)",
+                priorityAlias: "P\(index + 1)",
+                status: status(route))
+        }
+
+        let usable = configured.filter { route in
+            let state = status(route)
+            return state == .ready || state == .reserveHeld
+        }
+        let effective: [CodexRoutingAccount]
+        switch routing.strategy {
+        case .roundRobin:
+            let available = usable.filter { !$0.reserveBlocked }
+            effective = available.isEmpty ? usable : available
+        case .priority:
+            effective = usable.sorted {
+                if $0.reserveBlocked != $1.reserveBlocked {
+                    return !$0.reserveBlocked && $1.reserveBlocked
+                }
+                if $0.priority == $1.priority { return $0.accountId < $1.accountId }
+                return $0.priority < $1.priority
+            }
+        case .resetFirst:
+            effective = usable.sorted {
+                if $0.reserveBlocked != $1.reserveBlocked {
+                    return !$0.reserveBlocked && $1.reserveBlocked
+                }
+                let lhsReset = $0.resetSelection?.resetsAtS ?? Int64.max
+                let rhsReset = $1.resetSelection?.resetsAtS ?? Int64.max
+                if lhsReset != rhsReset { return lhsReset < rhsReset }
+                if $0.priority == $1.priority { return $0.accountId < $1.accountId }
+                return $0.priority < $1.priority
+            }
+        }
+        effectiveAccountAliases = effective.compactMap { aliasById[$0.accountId] }
+        strategy = routing.strategy
+    }
+
+    public var configuredOrderLabel: String {
+        configuredAccounts
+            .map { "\($0.accountAlias)/\($0.priorityAlias)" }
+            .joined(separator: " → ")
+    }
+
+    public var effectiveOrderLabel: String {
+        guard !effectiveAccountAliases.isEmpty else { return "No proxy accounts available" }
+        if strategy == .roundRobin {
+            return "Cycle " + effectiveAccountAliases.joined(separator: " ↔ ")
+        }
+        return "Now " + effectiveAccountAliases.joined(separator: " → ")
     }
 }
 

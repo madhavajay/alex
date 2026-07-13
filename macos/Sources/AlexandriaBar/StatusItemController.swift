@@ -93,7 +93,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard !issues.isEmpty else { return }
         for alert in issues {
             let item = NSMenuItem(title: alert.title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
+            switch alert.remediation {
+            case let .reauthenticate(provider, accountName):
+                item.action = #selector(runHandler(_:))
+                item.target = self
+                item.representedObject = MenuHandler { [weak self] in
+                    self?.openAuth(provider: provider, accountName: accountName)
+                }
+                item.isEnabled = true
+            case nil:
+                item.isEnabled = false
+            }
             item.image = NSImage(
                 systemSymbolName: "exclamationmark.triangle.fill",
                 accessibilityDescription: nil)?
@@ -160,6 +170,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let card = LimitsCardView(
             limits: store.limits,
             accounts: store.accounts,
+            routing: store.codexRouting,
             warnPct: store.limitWarnPct)
         let host = NSHostingView(rootView: card)
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -328,9 +339,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard store.harnessesSupported == true else { return }
         // Keep the menu-bar surface limited to the user-tested Pi workflow.
         // Settings and the daemon catalog still retain every supported harness.
-        let installed = HarnessCatalog.rows(store.harnesses).filter {
-            $0.installed && $0.name.caseInsensitiveCompare("pi") == .orderedSame
-        }
+        let installed = HarnessCatalog.menuBarRows(store.harnesses)
         guard !installed.isEmpty else { return }
         let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -373,6 +382,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         info(harness.version.map { "\(name) · v\($0)" } ?? name)
+        if !harness.installed {
+            info("Binary not visible to daemon")
+        }
         if let configDir = harness.configDir, !configDir.isEmpty {
             info(configDir)
         }

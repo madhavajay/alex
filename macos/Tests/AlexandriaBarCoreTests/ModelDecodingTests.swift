@@ -40,6 +40,7 @@ import Testing
         ]}
         """#
         let accounts = try decode(json, as: HealthResponse.self).accounts
+        #expect(accounts[0].lastHeartbeat?.accountId == "anthropic-oauth")
         #expect(accounts[0].lastHeartbeat?.ok == true)
         #expect(accounts[0].lastHeartbeat?.latencyMs == 2244)
         #expect(accounts[1].lastHeartbeat == nil)
@@ -105,6 +106,101 @@ import Testing
             routing.accounts[0].resetSelection?.resetsDate
                 == Date(timeIntervalSince1970: 1_783_477_712))
         #expect(routing.accounts[1].resetSelection == nil)
+    }
+
+    @Test func bondedCodexStrategyNamesAreShortAndUnambiguous() {
+        #expect(CodexRoutingStrategy.priority.displayName == "Priority")
+        #expect(CodexRoutingStrategy.priority.shortCode == "PRI")
+        #expect(CodexRoutingStrategy.resetFirst.displayName == "Reset first")
+        #expect(CodexRoutingStrategy.resetFirst.shortCode == "RF")
+        #expect(CodexRoutingStrategy.roundRobin.displayName == "Round robin")
+        #expect(CodexRoutingStrategy.roundRobin.shortCode == "RR")
+    }
+
+    @Test func bondedCodexResetFirstKeepsStableAliasesAndShowsEffectiveOrder() throws {
+        let accounts = try decode(#"""
+        {"accounts":[
+          {"id":"openai-oauth-personal","provider":"openai","name":"personal","kind":"oauth","email":"same@example.com","paused":false,"status":"active"},
+          {"id":"openai-oauth-work","provider":"openai","name":"work","kind":"oauth","email":"same@example.com","paused":false,"status":"active"},
+          {"id":"openai-oauth-paused","provider":"openai","name":"paused","kind":"oauth","paused":true,"status":"active"},
+          {"id":"openai-oauth-off","provider":"openai","name":"off","kind":"oauth","paused":false,"status":"active"}
+        ]}
+        """#, as: AccountsResponse.self).accounts
+        let routing = try decode(#"""
+        {"provider":"openai","strategy":"reset_first","reserve_pct":10,"accounts":[
+          {"account_id":"openai-oauth-personal","eligible":true,"priority":0,"reserve_blocked":false,"reset_selection":{"window":"5h","used_pct":20,"resets_at_s":2000}},
+          {"account_id":"openai-oauth-work","eligible":true,"priority":1,"reserve_blocked":false,"reset_selection":{"window":"5h","used_pct":20,"resets_at_s":1000}},
+          {"account_id":"openai-oauth-paused","eligible":true,"priority":2,"reserve_blocked":false,"reset_selection":{"window":"5h","used_pct":20,"resets_at_s":500}},
+          {"account_id":"openai-oauth-off","eligible":false,"priority":3,"reserve_blocked":false,"reset_selection":{"window":"5h","used_pct":20,"resets_at_s":250}}
+        ]}
+        """#, as: CodexRoutingResponse.self)
+
+        let summary = CodexBondedOrderSummary(routing: routing, accounts: accounts)
+        #expect(summary.configuredAccounts.map(\.accountAlias) == ["A1", "A2", "A3", "A4"])
+        #expect(summary.configuredAccounts.map(\.priorityAlias) == ["P1", "P2", "P3", "P4"])
+        #expect(summary.configuredAccounts.map(\.status) == [.ready, .ready, .paused, .proxyOff])
+        #expect(summary.configuredOrderLabel == "A1/P1 → A2/P2 → A3/P3 → A4/P4")
+        #expect(summary.effectiveAccountAliases == ["A2", "A1"])
+        #expect(summary.effectiveOrderLabel == "Now A2 → A1")
+    }
+
+    @Test func bondedCodexPriorityAndRoundRobinRespectReserveWithoutInventingCursor() throws {
+        let accounts = try decode(#"""
+        {"accounts":[
+          {"id":"openai-oauth-a","provider":"openai","name":"a","kind":"oauth","paused":false,"status":"active"},
+          {"id":"openai-oauth-b","provider":"openai","name":"b","kind":"oauth","paused":false,"status":"active"},
+          {"id":"openai-oauth-c","provider":"openai","name":"c","kind":"oauth","paused":true,"status":"active"}
+        ]}
+        """#, as: AccountsResponse.self).accounts
+        let base = #"""
+        {"provider":"openai","strategy":"STRATEGY","reserve_pct":10,"accounts":[
+          {"account_id":"openai-oauth-a","eligible":true,"priority":0,"reserve_blocked":true},
+          {"account_id":"openai-oauth-b","eligible":true,"priority":1,"reserve_blocked":false},
+          {"account_id":"openai-oauth-c","eligible":true,"priority":2,"reserve_blocked":false}
+        ]}
+        """#
+
+        let priority = try decode(
+            base.replacingOccurrences(of: "STRATEGY", with: "priority"),
+            as: CodexRoutingResponse.self)
+        let prioritySummary = CodexBondedOrderSummary(routing: priority, accounts: accounts)
+        #expect(prioritySummary.effectiveAccountAliases == ["A2", "A1"])
+        #expect(prioritySummary.effectiveOrderLabel == "Now A2 → A1")
+        #expect(prioritySummary.configuredAccounts[0].status == .reserveHeld)
+
+        let roundRobin = try decode(
+            base.replacingOccurrences(of: "STRATEGY", with: "round_robin"),
+            as: CodexRoutingResponse.self)
+        let roundRobinSummary = CodexBondedOrderSummary(routing: roundRobin, accounts: accounts)
+        #expect(roundRobinSummary.effectiveAccountAliases == ["A2"])
+        #expect(roundRobinSummary.effectiveOrderLabel == "Cycle A2")
+        #expect(!roundRobinSummary.effectiveOrderLabel.lowercased().contains("next"))
+    }
+
+    @Test func bondedCodexIgnoresApiKeyRoutesBeforeAssigningAliases() throws {
+        let accounts = try decode(#"""
+        {"accounts":[
+          {"id":"openai-api_key-default","provider":"openai","name":"api","kind":"api_key","paused":false,"status":"active"},
+          {"id":"openai-oauth-personal","provider":"openai","name":"personal","kind":"oauth","email":"personal@example.com","paused":false,"status":"active"},
+          {"id":"openai-oauth-work","provider":"openai","name":"work","kind":"oauth","email":"work@example.com","paused":false,"status":"active"}
+        ]}
+        """#, as: AccountsResponse.self).accounts
+        let routing = try decode(#"""
+        {"provider":"openai","strategy":"priority","reserve_pct":10,"accounts":[
+          {"account_id":"openai-api_key-default","eligible":true,"priority":0,"reserve_blocked":false},
+          {"account_id":"openai-oauth-personal","eligible":true,"priority":1,"reserve_blocked":false},
+          {"account_id":"openai-oauth-work","eligible":true,"priority":2,"reserve_blocked":false}
+        ]}
+        """#, as: CodexRoutingResponse.self)
+
+        let summary = CodexBondedOrderSummary(routing: routing, accounts: accounts)
+        #expect(summary.configuredAccounts.map(\.accountId) == [
+            "openai-oauth-personal", "openai-oauth-work",
+        ])
+        #expect(summary.configuredAccounts.map(\.accountAlias) == ["A1", "A2"])
+        #expect(summary.configuredAccounts.map(\.priorityAlias) == ["P1", "P2"])
+        #expect(summary.configuredOrderLabel == "A1/P1 → A2/P2")
+        #expect(summary.effectiveOrderLabel == "Now A1 → A2")
     }
 
     @Test func perAccountCodexLimitsPreserveIdentityAndSeparateWindows() throws {
@@ -253,13 +349,14 @@ import Testing
 
     @Test func harnessConnectConfigWriteResponse() throws {
         let json = #"""
-        {"path":"/tmp/pi/models.json","models_total":12,"added":["alex/a","alex/b"],"removed":["alex/z"],"unchanged":10,"key":"minted","base_url":"http://127.0.0.1:4100","key_id":"rk-abc"}
+        {"path":"/tmp/pi/models.json","extension_path":"/tmp/pi/extensions/alexandria-session.ts","models_total":12,"added":["alex/a","alex/b"],"removed":["alex/z"],"unchanged":10,"key":"minted","base_url":"http://127.0.0.1:4100","key_id":"rk-abc"}
         """#
         let response = try decode(json, as: HarnessConfigWriteResponse.self)
         #expect(response.refreshed == nil)
         #expect(response.modelsTotal == 12)
         #expect(response.key == "minted")
         #expect(response.keyId == "rk-abc")
+        #expect(response.extensionPath?.hasSuffix("extensions/alexandria-session.ts") == true)
         #expect(response.added.count == 2)
         #expect(response.removed == ["alex/z"])
     }

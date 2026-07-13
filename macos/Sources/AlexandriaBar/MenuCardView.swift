@@ -4,14 +4,19 @@ import AlexandriaBarCore
 struct LimitsCardView: View {
     let limits: [ProviderLimits]
     let accounts: [Account]
+    let routing: CodexRoutingResponse?
     let warnPct: Double
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(displayProviders, id: \.self) { providerName in
                 if providerName == "openai", !codexAccounts.isEmpty {
-                    ForEach(codexAccounts) { account in
-                        accountSection(account)
+                    if codexAccounts.count > 1 {
+                        bondedCodexSection
+                    } else {
+                        ForEach(codexAccounts) { account in
+                            accountSection(account)
+                        }
                     }
                 } else if let provider = limits.first(where: { $0.provider == providerName }) {
                     providerSection(provider)
@@ -21,6 +26,124 @@ struct LimitsCardView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(width: 320, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var bondedCodexSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Codex · \(codexAccounts.count) bonded")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if let routing {
+                    Text("\(routing.strategy.displayName) · \(routing.strategy.shortCode)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Routing unavailable")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            if let routing {
+                let summary = CodexBondedOrderSummary(routing: routing, accounts: codexAccounts)
+                Text("\(Int(routing.reservePct.rounded()))% reserve · configured \(summary.configuredOrderLabel)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(summary.effectiveOrderLabel)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+
+                ForEach(summary.configuredAccounts) { order in
+                    if let account = codexAccounts.first(where: { $0.id == order.accountId }) {
+                        bondedAccountSection(
+                            account,
+                            accountAlias: order.accountAlias,
+                            priorityAlias: order.priorityAlias,
+                            status: order.status,
+                            route: routing.accounts.first { $0.accountId == order.accountId })
+                    }
+                }
+            } else {
+                ForEach(Array(codexAccounts.enumerated()), id: \.element.id) { index, account in
+                    bondedAccountSection(
+                        account,
+                        accountAlias: "A\(index + 1)",
+                        priorityAlias: "P\(index + 1)",
+                        status: fallbackStatus(account),
+                        route: nil)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bondedAccountSection(
+        _ account: Account,
+        accountAlias: String,
+        priorityAlias: String,
+        status: CodexBondedAccountStatus,
+        route: CodexRoutingAccount?
+    ) -> some View {
+        let accountLimits = account.limits
+        let routedWindows = route?.windows ?? []
+        let windows = routedWindows.isEmpty ? (accountLimits?.windows ?? []) : routedWindows
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(accountAlias)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                Text("· \(priorityAlias) ·")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(account.email ?? account.name)
+                    .font(.system(size: 10))
+                    .foregroundStyle(account.email == nil ? .orange : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(status.label)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(statusColor(status))
+                    .lineLimit(1)
+            }
+            if let plan = accountLimits?.plan {
+                Text(plan)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+            if let error = accountLimits?.error {
+                Text(error)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+            if windows.isEmpty {
+                Text("Waiting for quota data from this account")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(windows, id: \.window) { window in
+                    windowRow(window)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func fallbackStatus(_ account: Account) -> CodexBondedAccountStatus {
+        if account.paused { return .paused }
+        if account.status != "active" { return .inactive }
+        return .ready
+    }
+
+    private func statusColor(_ status: CodexBondedAccountStatus) -> Color {
+        switch status {
+        case .ready: .green
+        case .paused, .proxyOff, .reserveHeld: .orange
+        case .inactive: .red
+        }
     }
 
     /// Keep the provider card's stable order while ensuring Codex accounts are

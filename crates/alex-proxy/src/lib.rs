@@ -12,7 +12,8 @@ use alex_auth::{
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
     parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
-    ClientFormat, Provider, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+    ClientFormat, GrokWebBillingError, Provider, TraceRecord, GROK_CREDITS_ENDPOINT,
+    GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{Store, TraceFilter};
 use axum::body::{Body, Bytes};
@@ -653,6 +654,7 @@ pub struct UsageCache {
     entry: Option<Value>,
     cooldown_until_ms: i64,
     failures: u32,
+    credential_key: Option<String>,
 }
 
 fn usage_backoff_ms(failures: u32, retry_after_ms: Option<i64>) -> i64 {
@@ -660,6 +662,87 @@ fn usage_backoff_ms(failures: u32, retry_after_ms: Option<i64>) -> i64 {
         .saturating_mul(1i64 << failures.saturating_sub(1).min(6))
         .min(USAGE_BACKOFF_MAX_MS);
     exp.max(retry_after_ms.unwrap_or(0))
+}
+
+fn xai_billing_unavailable(plan: Option<&str>, error: &str) -> Value {
+    json!({
+        "provider": "xai",
+        "source": "grok web billing",
+        "plan": plan,
+        "windows": [],
+        "error": error,
+    })
+}
+
+fn xai_usage_failure(
+    state: &AppState,
+    plan: Option<&str>,
+    retry_after_ms: Option<i64>,
+    error: &str,
+) -> Value {
+    let mut cache = state.xai_usage.lock().unwrap();
+    cache.failures += 1;
+    let cooldown = usage_backoff_ms(cache.failures, retry_after_ms);
+    cache.cooldown_until_ms = now_ms() + cooldown;
+    let entry = xai_billing_unavailable(plan, error);
+    cache.entry = Some(entry.clone());
+    entry
+}
+
+fn xai_billing_rpc_error(error: &GrokWebBillingError) -> &'static str {
+    match error {
+        GrokWebBillingError::RpcFailed { status: 7 | 16, .. } => {
+            "Grok billing authentication failed; re-authenticate Grok"
+        }
+        GrokWebBillingError::EmptyResponse
+        | GrokWebBillingError::ParseFailed
+        | GrokWebBillingError::RpcFailed { .. } => {
+            "Grok billing is temporarily unavailable"
+        }
+    }
+}
+
+fn xai_account_error(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if [
+        "invalid_grant",
+        "invalid refresh",
+        "revoked",
+        "unauthorized",
+        "forbidden",
+        "no refresh token",
+        "no active",
+        "status 400",
+        "status 401",
+        "status 403",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+    {
+        "Grok authentication failed; re-authenticate Grok"
+    } else {
+        "Grok billing is temporarily unavailable"
+    }
+}
+
+fn xai_credential_key(account: &Account) -> String {
+    let token_fingerprint = account
+        .access_token
+        .as_deref()
+        .map(key_fingerprint)
+        .unwrap_or_else(|| "missing".into());
+    format!("{}:{token_fingerprint}", account.id)
+}
+
+fn sync_xai_cache_credential(cache: &mut UsageCache, credential_key: &str) {
+    if cache.credential_key.as_deref() == Some(credential_key) {
+        return;
+    }
+    cache.fetched_at_ms = 0;
+    cache.entry = None;
+    cache.cooldown_until_ms = 0;
+    cache.failures = 0;
+    cache.credential_key = Some(credential_key.to_string());
 }
 
 async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
@@ -751,20 +834,77 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
 /// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
 async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
-    let account = state.vault.account_for(Provider::Xai, true).await.ok()?;
-    if account.kind != "oauth" {
+    // A configured OAuth account owns the xAI subscription-usage slot even when
+    // it cannot currently authenticate. Otherwise a failed billing fetch would
+    // fall through to generic API response-header limits, which are not the
+    // user's SuperGrok subscription quota.
+    let configured_oauth = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.provider == Provider::Xai && account.kind == "oauth");
+    let Some(configured_oauth) = configured_oauth else {
+        // API-key-only xAI accounts continue to use captured response headers.
         return None;
-    }
-    let token = account.access_token.as_deref()?.to_string();
+    };
+    let plan = configured_oauth
+        .account_meta
+        .get("plan")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut credential_key = xai_credential_key(&configured_oauth);
     {
-        let cache = state.xai_usage.lock().unwrap();
+        let mut cache = state.xai_usage.lock().unwrap();
+        sync_xai_cache_credential(&mut cache, &credential_key);
         if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
             return cache.entry.clone();
         }
         if now_ms() < cache.cooldown_until_ms {
-            return cache.entry.clone();
+            return Some(cache.entry.clone().unwrap_or_else(|| {
+                xai_billing_unavailable(
+                    plan.as_deref(),
+                    "Grok billing is temporarily unavailable",
+                )
+            }));
         }
     }
+
+    if configured_oauth.status != "active" {
+        return Some(xai_usage_failure(
+            state,
+            plan.as_deref(),
+            None,
+            "Grok OAuth account is unavailable; re-authenticate Grok",
+        ));
+    }
+    let account = match state.vault.refresh(&configured_oauth.id, false).await {
+        Ok(account) => account,
+        Err(error) => {
+            tracing::debug!(%error, "xai oauth account unavailable for grok billing");
+            let error = xai_account_error(&error.to_string());
+            return Some(xai_usage_failure(
+                state,
+                plan.as_deref(),
+                None,
+                error,
+            ));
+        }
+    };
+    let refreshed_credential_key = xai_credential_key(&account);
+    if refreshed_credential_key != credential_key {
+        credential_key = refreshed_credential_key;
+        let mut cache = state.xai_usage.lock().unwrap();
+        sync_xai_cache_credential(&mut cache, &credential_key);
+    }
+    let Some(token) = account.access_token.as_deref().map(str::to_string) else {
+        return Some(xai_usage_failure(
+            state,
+            plan.as_deref(),
+            None,
+            "Grok authentication is missing; re-authenticate Grok",
+        ));
+    };
 
     let result = state
         .http
@@ -798,21 +938,23 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 .collect();
             if let Err(e) = validate_grpc_status_headers(headers_for_grpc) {
                 tracing::debug!(error = %e, "xai grok credits grpc header status failed");
-                let mut cache = state.xai_usage.lock().unwrap();
-                cache.failures += 1;
-                let cooldown = usage_backoff_ms(cache.failures, None);
-                cache.cooldown_until_ms = now_ms() + cooldown;
-                return cache.entry.clone();
+                return Some(xai_usage_failure(
+                    state,
+                    plan.as_deref(),
+                    None,
+                    xai_billing_rpc_error(&e),
+                ));
             }
             let body = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::debug!(error = %e, "xai grok credits body read failed");
-                    let mut cache = state.xai_usage.lock().unwrap();
-                    cache.failures += 1;
-                    let cooldown = usage_backoff_ms(cache.failures, None);
-                    cache.cooldown_until_ms = now_ms() + cooldown;
-                    return cache.entry.clone();
+                    return Some(xai_usage_failure(
+                        state,
+                        plan.as_deref(),
+                        None,
+                        "Grok billing response could not be read",
+                    ));
                 }
             };
             let now_s = now_ms() / 1000;
@@ -829,7 +971,7 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                     let entry = json!({
                         "provider": "xai",
                         "source": "grok web billing",
-                        "plan": account.label,
+                        "plan": plan,
                         "windows": [window],
                     });
                     let mut cache = state.xai_usage.lock().unwrap();
@@ -841,11 +983,12 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "xai grok credits parse failed");
-                    let mut cache = state.xai_usage.lock().unwrap();
-                    cache.failures += 1;
-                    let cooldown = usage_backoff_ms(cache.failures, None);
-                    cache.cooldown_until_ms = now_ms() + cooldown;
-                    cache.entry.clone()
+                    Some(xai_usage_failure(
+                        state,
+                        plan.as_deref(),
+                        None,
+                        xai_billing_rpc_error(&e),
+                    ))
                 }
             }
         }
@@ -857,40 +1000,42 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<i64>().ok())
                 .map(|s| s.clamp(30, 3600) * 1000);
-            let mut cache = state.xai_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, retry_after);
-            cache.cooldown_until_ms = now_ms() + cooldown;
+            let error = if matches!(status, 401 | 403) {
+                "Grok billing authentication failed; re-authenticate Grok"
+            } else {
+                "Grok billing is temporarily unavailable"
+            };
+            let entry = xai_usage_failure(state, plan.as_deref(), retry_after, error);
+            let cache = state.xai_usage.lock().unwrap();
             tracing::debug!(
                 status,
                 failures = cache.failures,
-                cooldown_ms = cooldown,
+                cooldown_until_ms = cache.cooldown_until_ms,
                 "xai grok web billing unavailable; backing off"
             );
-            cache.entry.clone()
+            Some(entry)
         }
         Err(e) => {
             tracing::debug!(error = %e, "xai grok web billing request failed");
-            let mut cache = state.xai_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, None);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            cache.entry.clone()
+            Some(xai_usage_failure(
+                state,
+                plan.as_deref(),
+                None,
+                "Grok billing is temporarily unavailable",
+            ))
         }
     }
 }
 
-pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
-    let mut providers: Vec<Value> = Vec::new();
-    if let Some(entry) = anthropic_usage_entry(state).await {
-        providers.push(entry);
-    }
-    if let Some(entry) = xai_usage_entry(state).await {
-        providers.push(entry);
-    }
-    for (provider_str, ts_ms, headers_json) in
-        state.store.latest_provider_headers().unwrap_or_default()
-    {
+fn append_captured_limit_entries(
+    providers: &mut Vec<Value>,
+    captured: impl IntoIterator<Item = (String, i64, String)>,
+    allow_captured_xai: bool,
+) {
+    for (provider_str, ts_ms, headers_json) in captured {
+        if provider_str == Provider::Xai.as_str() && !allow_captured_xai {
+            continue;
+        }
         if providers
             .iter()
             .any(|p| p["provider"].as_str() == Some(&provider_str))
@@ -909,6 +1054,27 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
             providers.push(parsed);
         }
     }
+}
+
+pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
+    let mut providers: Vec<Value> = Vec::new();
+    let has_xai_api_key = state
+        .vault
+        .list()
+        .await
+        .iter()
+        .any(|account| account.provider == Provider::Xai && account.kind == "api_key");
+    if let Some(entry) = anthropic_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = xai_usage_entry(state).await {
+        providers.push(entry);
+    }
+    append_captured_limit_entries(
+        &mut providers,
+        state.store.latest_provider_headers().unwrap_or_default(),
+        has_xai_api_key,
+    );
     providers.sort_by_key(|p| p["provider"].as_str().unwrap_or("").to_string());
     json!({"providers": providers})
 }
@@ -1894,6 +2060,13 @@ async fn admin_codex_routing_update(
     }
 }
 
+fn heartbeat_for_account(heartbeats: &[Value], account_id: &str) -> Option<Value> {
+    heartbeats
+        .iter()
+        .find(|heartbeat| heartbeat["account_id"].as_str() == Some(account_id))
+        .cloned()
+}
+
 async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
     let heartbeats = state.store.last_heartbeats().unwrap_or_default();
     let accounts: Vec<Value> = state
@@ -1902,10 +2075,7 @@ async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
         .await
         .into_iter()
         .map(|a| {
-            let last = heartbeats
-                .iter()
-                .find(|h| h["provider"].as_str() == Some(a.provider.as_str()))
-                .cloned();
+            let last = heartbeat_for_account(&heartbeats, &a.id);
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -1989,12 +2159,7 @@ pub async fn ping_provider(
             }),
         ),
     };
-    let account_id = state
-        .vault
-        .account_for(provider, true)
-        .await
-        .ok()
-        .map(|a| a.id);
+    let routed_account = Arc::new(std::sync::Mutex::new(None));
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-api-key",
@@ -2008,6 +2173,7 @@ pub async fn ping_provider(
         headers,
         Bytes::from(serde_json::to_vec(&body).expect("ping body")),
         None,
+        Some(&routed_account),
     )
     .await;
     let status = resp.status().as_u16();
@@ -2016,6 +2182,7 @@ pub async fn ping_provider(
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let message = extract_reply(&text).unwrap_or_else(|| snippet(&text));
+    let account_id = routed_account.lock().unwrap().clone();
     PingResult {
         provider: provider.as_str(),
         account_id,
@@ -2118,6 +2285,7 @@ async fn anthropic_messages(
         headers,
         body,
         Some(peer),
+        None,
     )
     .await
 }
@@ -2135,6 +2303,7 @@ async fn openai_chat(
         headers,
         body,
         Some(peer),
+        None,
     )
     .await
 }
@@ -2152,6 +2321,7 @@ async fn openai_responses(
         headers,
         body,
         Some(peer),
+        None,
     )
     .await
 }
@@ -2199,6 +2369,7 @@ async fn gemini_generate(
         headers,
         body,
         Some(peer),
+        None,
     )
     .await
 }
@@ -2991,7 +3162,27 @@ mod run_key_tests {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::{key_fingerprint, usage_backoff_ms};
+    use super::{
+        append_captured_limit_entries, heartbeat_for_account, key_fingerprint, usage_backoff_ms,
+        sync_xai_cache_credential, xai_account_error, xai_billing_rpc_error,
+        xai_billing_unavailable, UsageCache,
+    };
+    use alex_core::GrokWebBillingError;
+    use serde_json::json;
+
+    fn captured_xai_limits() -> Vec<(String, i64, String)> {
+        vec![(
+            "xai".to_string(),
+            123,
+            json!({
+                "x-ratelimit-limit-requests": "120",
+                "x-ratelimit-remaining-requests": "120",
+                "x-ratelimit-limit-tokens": "5000000",
+                "x-ratelimit-remaining-tokens": "5000000",
+            })
+            .to_string(),
+        )]
+    }
 
     #[test]
     fn fingerprint_is_first_8_sha256_bytes_hex() {
@@ -3012,6 +3203,136 @@ mod usage_tests {
     fn retry_after_wins_when_larger() {
         assert_eq!(usage_backoff_ms(1, Some(600_000)), 600_000);
         assert_eq!(usage_backoff_ms(5, Some(1_000)), 960_000);
+    }
+
+    #[test]
+    fn grok_rpc_errors_only_request_reauthentication_for_credentials() {
+        for status in [7, 16] {
+            assert_eq!(
+                xai_billing_rpc_error(&GrokWebBillingError::RpcFailed {
+                    status,
+                    message: "denied".into(),
+                }),
+                "Grok billing authentication failed; re-authenticate Grok"
+            );
+        }
+
+        for status in [8, 13, 14] {
+            assert_eq!(
+                xai_billing_rpc_error(&GrokWebBillingError::RpcFailed {
+                    status,
+                    message: "unavailable".into(),
+                }),
+                "Grok billing is temporarily unavailable"
+            );
+        }
+        assert_eq!(
+            xai_billing_rpc_error(&GrokWebBillingError::ParseFailed),
+            "Grok billing is temporarily unavailable"
+        );
+    }
+
+    #[test]
+    fn grok_token_refresh_errors_only_request_reauthentication_for_credentials() {
+        assert_eq!(
+            xai_account_error("token refresh failed (400): {\"error\":\"invalid_grant\"}"),
+            "Grok authentication failed; re-authenticate Grok"
+        );
+        assert_eq!(
+            xai_account_error("error sending request: connection timed out"),
+            "Grok billing is temporarily unavailable"
+        );
+    }
+
+    #[test]
+    fn changed_grok_credentials_clear_cached_auth_failure_and_cooldown() {
+        let mut cache = UsageCache {
+            fetched_at_ms: 10,
+            entry: Some(xai_billing_unavailable(
+                Some("SuperGrok"),
+                "Grok authentication failed; re-authenticate Grok",
+            )),
+            cooldown_until_ms: i64::MAX,
+            failures: 6,
+            credential_key: Some("xai-oauth:old-token".into()),
+        };
+
+        sync_xai_cache_credential(&mut cache, "xai-oauth:new-token");
+
+        assert_eq!(cache.credential_key.as_deref(), Some("xai-oauth:new-token"));
+        assert!(cache.entry.is_none());
+        assert_eq!(cache.fetched_at_ms, 0);
+        assert_eq!(cache.cooldown_until_ms, 0);
+        assert_eq!(cache.failures, 0);
+    }
+
+    #[test]
+    fn oauth_billing_error_claims_xai_and_blocks_generic_api_limits() {
+        let mut providers = vec![xai_billing_unavailable(
+            Some("grok (test)"),
+            "Grok authentication failed; re-authenticate Grok",
+        )];
+
+        append_captured_limit_entries(&mut providers, captured_xai_limits(), true);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["provider"], "xai");
+        assert_eq!(providers[0]["source"], "grok web billing");
+        assert!(providers[0]["error"].as_str().is_some());
+        assert!(providers[0].get("requests").is_none());
+        assert!(providers[0].get("tokens").is_none());
+    }
+
+    #[test]
+    fn stale_oauth_billing_claims_xai_and_blocks_generic_api_limits() {
+        let mut providers = vec![json!({
+            "provider": "xai",
+            "source": "grok web billing",
+            "windows": [{"window": "7d", "used_pct": 42.0}],
+        })];
+
+        append_captured_limit_entries(&mut providers, captured_xai_limits(), true);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["windows"][0]["used_pct"], 42.0);
+        assert!(providers[0].get("requests").is_none());
+    }
+
+    #[test]
+    fn api_key_only_xai_keeps_captured_api_limits() {
+        let mut providers = Vec::new();
+
+        append_captured_limit_entries(&mut providers, captured_xai_limits(), true);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["source"], "captured response headers");
+        assert_eq!(providers[0]["requests"]["limit"], 120);
+        assert_eq!(providers[0]["tokens"]["limit"], 5_000_000);
+    }
+
+    #[test]
+    fn historical_xai_headers_are_ignored_without_an_api_key_account() {
+        let mut providers = Vec::new();
+
+        append_captured_limit_entries(&mut providers, captured_xai_limits(), false);
+
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_is_only_attached_to_the_account_that_was_routed() {
+        let heartbeats = vec![json!({
+            "provider": "openai",
+            "account_id": "openai-oauth-work",
+            "ok": false,
+            "status": 401,
+        })];
+
+        assert!(heartbeat_for_account(&heartbeats, "openai-oauth").is_none());
+        assert_eq!(
+            heartbeat_for_account(&heartbeats, "openai-oauth-work").unwrap()["status"],
+            401
+        );
     }
 }
 
@@ -3427,6 +3748,7 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
     peer: Option<std::net::SocketAddr>,
+    routed_account: Option<&Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Response {
     let mut run_key: Option<CachedRunKey> = None;
     let client_fingerprint = match client_key(&headers) {
@@ -3580,6 +3902,9 @@ async fn proxy(
     };
     trace.upstream_format = Some(plan.upstream_format.into());
     trace.account_id = Some(plan.account.id.clone());
+    if let Some(capture) = routed_account {
+        *capture.lock().unwrap() = Some(plan.account.id.clone());
+    }
     trace.billing_bucket = Some(
         if plan.account.kind == "oauth" || plan.account.kind == "dario" {
             "subscription"
@@ -3727,6 +4052,9 @@ async fn proxy(
                         plan = next_plan;
                         account = plan.account.clone();
                         trace.account_id = Some(account.id.clone());
+                        if let Some(capture) = routed_account {
+                            *capture.lock().unwrap() = Some(account.id.clone());
+                        }
                         trace.upstream_format = Some(plan.upstream_format.into());
                         trace.billing_bucket = Some(
                             if account.kind == "oauth" || account.kind == "dario" {

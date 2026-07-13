@@ -8,18 +8,55 @@ public struct StoreAlert: Sendable, Identifiable, Equatable {
         public static func < (lhs: Severity, rhs: Severity) -> Bool { lhs.rawValue < rhs.rawValue }
     }
 
+    public enum Remediation: Sendable, Equatable {
+        case reauthenticate(provider: String, accountName: String)
+    }
+
     public let id: String
     public let severity: Severity
     public let title: String
     public let body: String
     public let provider: String?
+    public let remediation: Remediation?
 
-    public init(id: String, severity: Severity, title: String, body: String, provider: String? = nil) {
+    public init(
+        id: String,
+        severity: Severity,
+        title: String,
+        body: String,
+        provider: String? = nil,
+        remediation: Remediation? = nil
+    ) {
         self.id = id
         self.severity = severity
         self.title = title
         self.body = body
         self.provider = provider
+        self.remediation = remediation
+    }
+}
+
+public enum StoreAlertPolicy {
+    public static func heartbeatBelongsToAccount(
+        heartbeatAccountId: String?, enclosingAccountId: String
+    ) -> Bool {
+        heartbeatAccountId == enclosingAccountId
+    }
+
+    public static func isCredentialFailure(status: Int?, message: String?) -> Bool {
+        if status == 401 || status == 403 { return true }
+        let message = message?.lowercased() ?? ""
+        return [
+            "invalid_grant", "unauthorized", "credential", "oauth", "refresh token",
+            "token expired", "token has expired", "token has been revoked", "re-auth",
+        ].contains { message.contains($0) }
+    }
+
+    public static func suppressHeartbeat(
+        credentialFailure: Bool,
+        alreadyHasCredentialAlert: Bool
+    ) -> Bool {
+        credentialFailure && alreadyHasCredentialAlert
     }
 }
 
@@ -220,31 +257,63 @@ public final class SnapshotStore {
             return out
         }
 
+        var credentialAlertAccountIds: Set<String> = []
+        let accountsById = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
         for account in accounts {
             let name = ProviderInfo.displayName(account.provider)
             if account.status != "active" {
+                let remediation: StoreAlert.Remediation? = account.kind == "oauth"
+                    ? .reauthenticate(provider: account.provider, accountName: account.name) : nil
                 out.append(StoreAlert(
                     id: "acct-\(account.id)-status", severity: .critical,
                     title: "\(name) account \(account.status)",
-                    body: "\(account.id) needs re-auth", provider: account.provider))
+                    body: remediation == nil
+                        ? "\(account.id) needs attention" : "Click to re-authenticate this subscription.",
+                    provider: account.provider,
+                    remediation: remediation))
+                if remediation != nil { credentialAlertAccountIds.insert(account.id) }
             } else if account.isExpired, account.kind == "oauth" {
-                let hint = account.provider == "xai"
-                    ? "Run the grok CLI to refresh, then re-import"
-                    : "Token expired — re-auth if requests fail"
                 out.append(StoreAlert(
                     id: "acct-\(account.id)-expired", severity: .warning,
                     title: "\(name) token expired",
-                    body: hint, provider: account.provider))
+                    body: "Click to re-authenticate this subscription.",
+                    provider: account.provider,
+                    remediation: .reauthenticate(
+                        provider: account.provider, accountName: account.name)))
+                credentialAlertAccountIds.insert(account.id)
             }
         }
 
         for account in healthAccounts {
             if let hb = account.lastHeartbeat, !hb.ok {
+                guard StoreAlertPolicy.heartbeatBelongsToAccount(
+                    heartbeatAccountId: hb.accountId,
+                    enclosingAccountId: account.id
+                ) else {
+                    continue
+                }
+                let credentialFailure = StoreAlertPolicy.isCredentialFailure(
+                    status: hb.status, message: hb.message)
+                if StoreAlertPolicy.suppressHeartbeat(
+                    credentialFailure: credentialFailure,
+                    alreadyHasCredentialAlert: credentialAlertAccountIds.contains(account.id)
+                ) {
+                    continue
+                }
+                let sourceAccount = accountsById[account.id]
+                let remediation: StoreAlert.Remediation? = credentialFailure
+                    && sourceAccount?.kind == "oauth"
+                    ? .reauthenticate(
+                        provider: account.provider,
+                        accountName: sourceAccount?.name ?? "default") : nil
                 out.append(StoreAlert(
                     id: "hb-\(account.id)", severity: .critical,
-                    title: "\(ProviderInfo.displayName(account.provider)) failing health checks",
+                    title: credentialFailure
+                        ? "\(ProviderInfo.displayName(account.provider)) authentication failed"
+                        : "\(ProviderInfo.displayName(account.provider)) failing health checks",
                     body: hb.message ?? "heartbeat failed (status \(hb.status.map(String.init) ?? "?"))",
-                    provider: account.provider))
+                    provider: account.provider,
+                    remediation: remediation))
             }
         }
 

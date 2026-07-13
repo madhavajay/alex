@@ -88,6 +88,7 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
     public let key: String
     public let baseUrl: String
     public let keyId: String?
+    public let extensionPath: String?
 
     public init(
         refreshed: Bool? = nil,
@@ -98,7 +99,8 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
         unchanged: Int,
         key: String,
         baseUrl: String,
-        keyId: String? = nil
+        keyId: String? = nil,
+        extensionPath: String? = nil
     ) {
         self.refreshed = refreshed
         self.path = path
@@ -109,6 +111,7 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
         self.key = key
         self.baseUrl = baseUrl
         self.keyId = keyId
+        self.extensionPath = extensionPath
     }
 
     enum CodingKeys: String, CodingKey {
@@ -116,6 +119,7 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
         case modelsTotal = "models_total"
         case baseUrl = "base_url"
         case keyId = "key_id"
+        case extensionPath = "extension_path"
     }
 
     /// Prefer this for connect notifications that previously used `models`.
@@ -218,5 +222,15 @@ public enum HarnessCatalog {
     /// Order follows `rows(_:)`; not hard-coded to a name list beyond display ordering.
     public static func refreshTargets(_ harnesses: [Harness]) -> [Harness] {
         rows(harnesses).filter { $0.supportsConnect && $0.connected }
+    }
+
+    /// The menu-bar flyout is intentionally limited to Pi for now, but a
+    /// configured Pi must remain visible even when launchd cannot discover its
+    /// binary on PATH. Refresh/disconnect operate on the existing config.
+    public static func menuBarRows(_ harnesses: [Harness]) -> [Harness] {
+        rows(harnesses).filter {
+            $0.name.caseInsensitiveCompare("pi") == .orderedSame
+                && ($0.installed || $0.connected)
+        }
     }
 }
