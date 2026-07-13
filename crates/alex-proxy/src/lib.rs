@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alex_auth::{
-    codex_reserve_blocked, codex_reserve_pct, codex_reset_selection, now_ms, Account,
+    now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
     AccountPolicy, AccountPolicyMode, Vault,
 };
 use alex_core::{
@@ -74,8 +74,11 @@ fn suspect_dario(state: &AppState, account: &Account) {
     }
 }
 
-fn codex_limits_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Value> {
-    const LIMIT_HEADERS: &[&str] = &[
+fn routing_limits_from_headers(
+    provider: Provider,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Value> {
+    const OPENAI_LIMIT_HEADERS: &[&str] = &[
         "x-codex-primary-used-percent",
         "x-codex-primary-window-minutes",
         "x-codex-primary-reset-at",
@@ -89,15 +92,24 @@ fn codex_limits_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Val
         "x-codex-credits-unlimited",
     ];
     let mut safe = serde_json::Map::new();
-    for name in LIMIT_HEADERS {
-        if let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) {
-            safe.insert((*name).to_string(), json!(value));
+    for (name, value) in headers {
+        let name = name.as_str();
+        let allowed = match provider {
+            Provider::Openai => OPENAI_LIMIT_HEADERS.contains(&name),
+            Provider::Anthropic => name.starts_with("anthropic-ratelimit-"),
+            Provider::Xai => name.starts_with("x-ratelimit-"),
+            Provider::Gemini | Provider::Amp => false,
+        };
+        if allowed {
+            if let Ok(value) = value.to_str() {
+                safe.insert(name.to_string(), json!(value));
+            }
         }
     }
     if safe.is_empty() {
         return None;
     }
-    let parsed = alex_core::parse_limit_headers(Provider::Openai, &Value::Object(safe));
+    let parsed = alex_core::parse_limit_headers(provider, &Value::Object(safe));
     let has_windows = parsed
         .get("windows")
         .and_then(Value::as_array)
@@ -349,8 +361,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/accounts/analytics", get(admin_account_analytics))
         .route(
+            "/admin/routing/{provider}",
+            get(admin_routing).put(admin_routing_update),
+        )
+        // Compatibility aliases for released macOS clients.
+        .route(
+            "/admin/codex-routing",
+            get(admin_openai_routing).put(admin_openai_routing_update),
+        )
+        .route(
             "/admin/accounts/routing/openai",
-            get(admin_codex_routing).put(admin_codex_routing_update),
+            get(admin_openai_routing).put(admin_openai_routing_update),
         )
         .route(
             "/admin/accounts/{id}",
@@ -1825,7 +1846,6 @@ async fn traces_run_artifacts(
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let openai_policy = state.vault.policy(Provider::Openai);
     let accounts: Vec<Value> = state
         .vault
         .list()
@@ -1833,26 +1853,20 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .into_iter()
         .map(|a| {
             let email = a.email();
-            let routing = if a.provider == Provider::Openai {
-                let reserve_pct = codex_reserve_pct(&a, &openai_policy);
-                json!({
-                    "eligible": !openai_policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
-                    "priority": openai_policy.order.iter().position(|name| name == &a.name),
-                    "reserve_pct": reserve_pct,
-                    "reserve_blocked": codex_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
-                    "reset_selection": codex_reset_selection(&a, now_ms() / 1000),
-                })
-            } else {
-                Value::Null
-            };
-            let limits = if a.provider == Provider::Openai {
-                a.account_meta
-                    .get("codex_limits")
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            };
+            let policy = state.vault.policy(a.provider);
+            let reserve_pct = routing_reserve_pct(&a, &policy);
+            let routing = json!({
+                "eligible": !policy.disabled.iter().any(|name| name == &a.name || name == &a.id),
+                "priority": policy.order.iter().position(|name| name == &a.name),
+                "reserve_pct": reserve_pct,
+                "reserve_blocked": routing_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
+                "reset_selection": routing_reset_selection(&a, now_ms() / 1000),
+            });
+            let limits = a.account_meta
+                .get("routing_limits")
+                .or_else(|| a.account_meta.get("codex_limits"))
+                .cloned()
+                .unwrap_or(Value::Null);
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -1874,7 +1888,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
     axum::Json(json!({"accounts": accounts}))
 }
 
-fn codex_strategy_name(mode: &AccountPolicyMode) -> &'static str {
+fn routing_strategy_name(mode: &AccountPolicyMode) -> &'static str {
     match mode {
         AccountPolicyMode::ResetFirst => "reset_first",
         AccountPolicyMode::RoundRobin => "round_robin",
@@ -1882,14 +1896,14 @@ fn codex_strategy_name(mode: &AccountPolicyMode) -> &'static str {
     }
 }
 
-async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
-    let policy = state.vault.policy(Provider::Openai);
+async fn routing_snapshot(state: &Arc<AppState>, provider: Provider) -> Value {
+    let policy = state.vault.policy(provider);
     let mut accounts: Vec<Account> = state
         .vault
         .list()
         .await
         .into_iter()
-        .filter(|account| account.provider == Provider::Openai)
+        .filter(|account| account.provider == provider)
         .collect();
     accounts.sort_by_key(|account| {
         (
@@ -1917,17 +1931,18 @@ async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
                 .unwrap_or(fallback_priority);
             let limits = account
                 .account_meta
-                .get("codex_limits")
+                .get("routing_limits")
+                .or_else(|| account.account_meta.get("codex_limits"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let reserve_pct = codex_reserve_pct(&account, &policy);
-            let reset_selection = codex_reset_selection(&account, now_ms() / 1000);
+            let reserve_pct = routing_reserve_pct(&account, &policy);
+            let reset_selection = routing_reset_selection(&account, now_ms() / 1000);
             json!({
                 "account_id": account.id,
                 "eligible": eligible,
                 "priority": priority,
                 "reserve_pct": reserve_pct,
-                "reserve_blocked": codex_reserve_blocked(&account, reserve_pct, now_ms() / 1000),
+                "reserve_blocked": routing_reserve_blocked(&account, reserve_pct, now_ms() / 1000),
                 "reset_selection": reset_selection,
                 "observed_at_ms": limits.get("observed_at_ms"),
                 "plan": limits.get("plan"),
@@ -1938,8 +1953,8 @@ async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
         })
         .collect();
     json!({
-        "provider": "openai",
-        "strategy": codex_strategy_name(&policy.mode),
+        "provider": provider.as_str(),
+        "strategy": routing_strategy_name(&policy.mode),
         "reserve_pct": policy.reserve_pct.unwrap_or(10).min(100),
         "allow_mid_thread_failover": policy.allow_mid_thread_failover,
         "reset_selection_rule": "highest_used_pct_then_earliest_reset",
@@ -1947,16 +1962,13 @@ async fn codex_routing_snapshot(state: &Arc<AppState>) -> Value {
     })
 }
 
-async fn admin_codex_routing(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(codex_routing_snapshot(&state).await).into_response()
-}
-
-async fn admin_codex_routing_update(
-    State(state): State<Arc<AppState>>,
-    body: axum::Json<Value>,
+async fn update_routing(
+    state: Arc<AppState>,
+    provider: Provider,
+    body: Value,
 ) -> Response {
-    let current_policy = state.vault.policy(Provider::Openai);
-    let mode = match body.0.get("strategy").and_then(Value::as_str) {
+    let current_policy = state.vault.policy(provider);
+    let mode = match body.get("strategy").and_then(Value::as_str) {
         Some("reset_first") => AccountPolicyMode::ResetFirst,
         Some("priority") => AccountPolicyMode::Priority,
         Some("round_robin") => AccountPolicyMode::RoundRobin,
@@ -1967,7 +1979,7 @@ async fn admin_codex_routing_update(
             )
         }
     };
-    let reserve_pct = match body.0.get("reserve_pct") {
+    let reserve_pct = match body.get("reserve_pct") {
         Some(value) => match value.as_u64() {
             Some(value) => value,
             None => return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer"),
@@ -1977,7 +1989,7 @@ async fn admin_codex_routing_update(
     if reserve_pct > 100 {
         return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be between 0 and 100");
     }
-    let allow_mid_thread_failover = match body.0.get("allow_mid_thread_failover") {
+    let allow_mid_thread_failover = match body.get("allow_mid_thread_failover") {
         Some(value) => match value.as_bool() {
             Some(value) => value,
             None => return error_response(
@@ -1987,17 +1999,17 @@ async fn admin_codex_routing_update(
         },
         None => current_policy.allow_mid_thread_failover,
     };
-    let Some(requested) = body.0.get("accounts").and_then(Value::as_array) else {
+    let Some(requested) = body.get("accounts").and_then(Value::as_array) else {
         return error_response(StatusCode::BAD_REQUEST, "accounts must be an array");
     };
-    let openai_accounts: Vec<Account> = state
+    let provider_accounts: Vec<Account> = state
         .vault
         .list()
         .await
         .into_iter()
-        .filter(|account| account.provider == Provider::Openai)
+        .filter(|account| account.provider == provider)
         .collect();
-    let by_id: HashMap<String, String> = openai_accounts
+    let by_id: HashMap<String, String> = provider_accounts
         .iter()
         .map(|account| (account.id.clone(), account.name.clone()))
         .collect();
@@ -2030,13 +2042,13 @@ async fn admin_codex_routing_update(
         let Some(name) = by_id.get(account_id) else {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &format!("unknown OpenAI account '{account_id}'"),
+                &format!("unknown {} account '{account_id}'", provider.as_str()),
             );
         };
         if !seen.insert(account_id.to_string()) {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &format!("duplicate OpenAI account '{account_id}'"),
+                &format!("duplicate {} account '{account_id}'", provider.as_str()),
             );
         }
         ordered.push((priority, name.clone(), eligible, account_reserve_pct));
@@ -2066,12 +2078,53 @@ async fn admin_codex_routing_update(
     };
     match state
         .vault
-        .set_policy_persisted(Provider::Openai, policy)
+        .set_policy_persisted(provider, policy)
         .await
     {
-        Ok(()) => axum::Json(codex_routing_snapshot(&state).await).into_response(),
+        Ok(()) => axum::Json(routing_snapshot(&state, provider).await).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
+}
+
+fn routing_provider(value: &str) -> Result<Provider, Response> {
+    Provider::from_str_loose(value).ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("unknown provider '{value}'"),
+        )
+    })
+}
+
+async fn admin_routing(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+) -> Response {
+    match routing_provider(&provider) {
+        Ok(provider) => axum::Json(routing_snapshot(&state, provider).await).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn admin_routing_update(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    body: axum::Json<Value>,
+) -> Response {
+    match routing_provider(&provider) {
+        Ok(provider) => update_routing(state, provider, body.0).await,
+        Err(response) => response,
+    }
+}
+
+async fn admin_openai_routing(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(routing_snapshot(&state, Provider::Openai).await).into_response()
+}
+
+async fn admin_openai_routing_update(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    update_routing(state, Provider::Openai, body.0).await
 }
 
 async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
@@ -4137,14 +4190,14 @@ async fn proxy(
                 }
             };
 
-            if account.provider == Provider::Openai && account.kind == "oauth" {
-                if let Some(snapshot) = codex_limits_from_headers(resp.headers()) {
+            if account.kind == "oauth" {
+                if let Some(snapshot) = routing_limits_from_headers(account.provider, resp.headers()) {
                     if let Err(error) = state
                         .vault
-                        .record_codex_limits(&account.id, snapshot)
+                        .record_routing_limits(&account.id, snapshot)
                         .await
                     {
-                        tracing::warn!(account = %account.id, %error, "could not persist Codex limit snapshot");
+                        tracing::warn!(account = %account.id, %error, "could not persist routing limit snapshot");
                     }
                 }
             }
@@ -5035,7 +5088,7 @@ mod tests {
     }
 
     #[test]
-    fn captures_only_safe_codex_limit_headers() {
+    fn captures_only_safe_routing_limit_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         headers.insert("x-codex-plan-type", HeaderValue::from_static("plus"));
@@ -5051,7 +5104,7 @@ mod tests {
             "x-codex-primary-reset-at",
             HeaderValue::from_static("1800000000"),
         );
-        let snapshot = codex_limits_from_headers(&headers).unwrap();
+        let snapshot = routing_limits_from_headers(Provider::Openai, &headers).unwrap();
         assert_eq!(snapshot["plan"], "plus");
         assert_eq!(snapshot["windows"][0]["window"], "5h");
         assert_eq!(snapshot["windows"][0]["used_pct"], 42.0);
@@ -5059,7 +5112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_routing_api_updates_eligibility_order_and_reserve() {
+    async fn routing_api_updates_eligibility_order_and_reserve() {
         let state = test_state("codex-routing");
         state
             .vault
@@ -5072,9 +5125,10 @@ mod tests {
             .await
             .unwrap();
         let (status, body) = response_json(
-            admin_codex_routing_update(
-                State(state.clone()),
-                axum::Json(json!({
+            update_routing(
+                state.clone(),
+                Provider::Openai,
+                json!({
                     "strategy": "priority",
                     "reserve_pct": 15,
                     "allow_mid_thread_failover": false,
@@ -5082,7 +5136,7 @@ mod tests {
                         {"account_id": "openai-oauth-work", "eligible": true, "priority": 0, "reserve_pct": 22},
                         {"account_id": "openai-oauth", "eligible": false, "priority": 1}
                     ]
-                })),
+                }),
             )
             .await,
         )
@@ -5112,6 +5166,101 @@ mod tests {
                 .name,
             "work"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_routing_endpoint_updates_a_non_codex_provider() {
+        let state = test_state("anthropic-routing");
+        let mut personal = anthropic_account();
+        personal.id = "anthropic:personal".into();
+        personal.name = "personal".into();
+        let mut work = anthropic_account();
+        work.id = "anthropic:work".into();
+        work.name = "work".into();
+        state.vault.upsert(personal).await.unwrap();
+        state.vault.upsert(work).await.unwrap();
+
+        let (status, body) = response_json(
+            admin_routing_update(
+                State(state.clone()),
+                Path("anthropic".into()),
+                axum::Json(json!({
+                    "strategy": "round_robin",
+                    "reserve_pct": 7,
+                    "accounts": [
+                        {"account_id": "anthropic:work", "eligible": true, "priority": 0, "reserve_pct": 3},
+                        {"account_id": "anthropic:personal", "eligible": true, "priority": 1}
+                    ]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["provider"], "anthropic");
+        assert_eq!(body["strategy"], "round_robin");
+        assert_eq!(body["reserve_pct"], 7);
+        assert_eq!(body["accounts"][0]["reserve_pct"], 3);
+        assert_eq!(state.vault.policy(Provider::Anthropic).account_reserve_pct["work"], 3);
+    }
+
+    #[tokio::test]
+    async fn codex_routing_endpoint_keeps_the_legacy_shape() {
+        let state = test_state("codex-routing-compatibility");
+        state.vault.upsert(test_openai_account("default")).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let legacy: Value = client
+            .get(format!("http://{address}/admin/codex-routing"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let general: Value = client
+            .get(format!("http://{address}/admin/routing/openai"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(legacy, general);
+        let fields = legacy.as_object().unwrap();
+        for field in [
+            "provider",
+            "strategy",
+            "reserve_pct",
+            "allow_mid_thread_failover",
+            "reset_selection_rule",
+            "accounts",
+        ] {
+            assert!(fields.contains_key(field), "missing legacy field {field}");
+        }
+        let account = legacy["accounts"][0].as_object().unwrap();
+        for field in [
+            "account_id",
+            "eligible",
+            "priority",
+            "reserve_pct",
+            "reserve_blocked",
+            "reset_selection",
+            "observed_at_ms",
+            "plan",
+            "active_limit",
+            "windows",
+            "credits",
+        ] {
+            assert!(account.contains_key(field), "missing legacy account field {field}");
+        }
     }
 
     #[tokio::test]
