@@ -1,5 +1,6 @@
 pub mod amp_usage;
 pub mod grok_billing;
+pub mod openrouter_catalog;
 pub mod translate;
 
 pub use amp_usage::{
@@ -10,6 +11,7 @@ pub use grok_billing::{
     parse_grpc_web_response, validate_grpc_status_headers, window_label, GrokWebBillingError,
     GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
+pub use openrouter_catalog::parse_models_response as parse_openrouter_models_response;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +23,7 @@ pub enum Provider {
     Openai,
     Gemini,
     Xai,
+    Openrouter,
     /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
     Amp,
 }
@@ -32,6 +35,7 @@ impl Provider {
             Provider::Openai => "openai",
             Provider::Gemini => "gemini",
             Provider::Xai => "xai",
+            Provider::Openrouter => "openrouter",
             Provider::Amp => "amp",
         }
     }
@@ -42,6 +46,7 @@ impl Provider {
             "openai" | "codex" | "chatgpt" => Some(Provider::Openai),
             "gemini" | "google" => Some(Provider::Gemini),
             "xai" | "grok" => Some(Provider::Xai),
+            "openrouter" | "or" => Some(Provider::Openrouter),
             "amp" | "ampcode" => Some(Provider::Amp),
             _ => None,
         }
@@ -83,6 +88,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("gemini:", Provider::Gemini),
     ("grok:", Provider::Xai),
     ("xai:", Provider::Xai),
+    ("openrouter:", Provider::Openrouter),
     ("claude/", Provider::Anthropic),
     ("anthropic/", Provider::Anthropic),
     ("openai/", Provider::Openai),
@@ -92,6 +98,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("google/", Provider::Gemini),
     ("grok/", Provider::Xai),
     ("xai/", Provider::Xai),
+    ("openrouter/", Provider::Openrouter),
 ];
 
 const PASSTHROUGH: &[&str] = &["cove/", "alexandria/", "alex/"];
@@ -185,7 +192,7 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
                 "remaining": hi(h, "x-ratelimit-remaining-tokens"),
             },
         }),
-        Provider::Gemini | Provider::Amp => Value::Null,
+        Provider::Gemini | Provider::Openrouter | Provider::Amp => Value::Null,
     }
 }
 
@@ -527,6 +534,13 @@ mod tests {
         assert_eq!(route_model("google/gemini-3-pro").0, Some(Provider::Gemini));
         assert_eq!(route_model("grok/grok-4").0, Some(Provider::Xai));
         assert_eq!(route_model("xai/grok-4").0, Some(Provider::Xai));
+        assert_eq!(
+            route_model("alexandria/openrouter/anthropic/claude-3.5-sonnet"),
+            (
+                Some(Provider::Openrouter),
+                "anthropic/claude-3.5-sonnet".to_string()
+            )
+        );
     }
 
     #[test]

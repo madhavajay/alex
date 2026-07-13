@@ -766,6 +766,9 @@ impl Vault {
                 self.refresh_xai(&rt, &client_id).await
             }
             (Provider::Gemini, Some(rt)) => self.refresh_gemini(&rt).await,
+            (Provider::Openrouter, _) => Err(anyhow!(
+                "openrouter accounts use a long-lived API key; re-run `alex auth openrouter-key`"
+            )),
             (Provider::Amp, _) => Err(anyhow!(
                 "amp accounts use a long-lived API key; re-run `alex auth import amp` or `alex auth amp-key`"
             )),
@@ -827,6 +830,7 @@ impl Vault {
             Provider::Amp => {
                 let _ = import_amp(self).await;
             }
+            Provider::Openrouter => {}
         };
         let fresh = self.accounts.read().await.get(&stale.id).cloned()?;
         let changed = fresh.access_token != stale.access_token;
@@ -1316,6 +1320,50 @@ pub async fn save_amp_api_key(vault: &Vault, api_key: &str) -> Result<String> {
     Ok("amp-api-key".into())
 }
 
+/// Save an OpenRouter API key and optional, locally configured attribution.
+/// Neither attribution field is ever sourced from an inbound proxy request.
+pub async fn save_openrouter_api_key(
+    vault: &Vault,
+    api_key: &str,
+    http_referer: Option<&str>,
+    x_title: Option<&str>,
+) -> Result<String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        bail!("empty openrouter api key");
+    }
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+    let account = Account {
+        id: "openrouter-api-key".into(),
+        provider: Provider::Openrouter,
+        kind: "api_key".into(),
+        name: "default".into(),
+        description: None,
+        paused: false,
+        label: Some("openrouter (api key)".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(key.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: json!({
+            "http_referer": clean(http_referer),
+            "x_title": clean(x_title),
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: None,
+    };
+    vault.upsert(account).await?;
+    Ok("openrouter-api-key".into())
+}
+
 async fn import_grok(vault: &Vault) -> ImportOutcome {
     let mut outcome = ImportOutcome {
         source: "grok".into(),
@@ -1513,6 +1561,35 @@ mod tests {
             Some(1_000_000_000_000)
         );
         assert_eq!(rfc3339_to_ms("not a timestamp"), None);
+    }
+
+    #[tokio::test]
+    async fn openrouter_api_key_round_trips_through_vault() {
+        let dir = temp_dir("openrouter-key");
+        let vault = Vault::open(dir.clone()).unwrap();
+        save_openrouter_api_key(
+            &vault,
+            "or-test-key",
+            Some("https://alexandria.example"),
+            Some("Alexandria"),
+        )
+        .await
+        .unwrap();
+        drop(vault);
+
+        let reopened = Vault::open(dir.clone()).unwrap();
+        let account = reopened
+            .account_for(Provider::Openrouter, false)
+            .await
+            .unwrap();
+        assert_eq!(account.id, "openrouter-api-key");
+        assert_eq!(account.api_key.as_deref(), Some("or-test-key"));
+        assert_eq!(
+            account.account_meta["http_referer"],
+            "https://alexandria.example"
+        );
+        assert_eq!(account.account_meta["x_title"], "Alexandria");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

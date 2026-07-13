@@ -370,6 +370,20 @@ enum AuthCommand {
         /// The Amp API key; omit to read from the AMP_API_KEY env var
         key: Option<String>,
     },
+    /// Register or remove an OpenRouter API key (OPENROUTER_API_KEY)
+    OpenrouterKey {
+        /// The API key; omit to read from the OPENROUTER_API_KEY env var
+        key: Option<String>,
+        /// Optional OpenRouter HTTP-Referer attribution, stored in the vault
+        #[arg(long)]
+        referer: Option<String>,
+        /// Optional OpenRouter X-Title attribution, stored in the vault
+        #[arg(long)]
+        title: Option<String>,
+        /// Remove the stored OpenRouter API key
+        #[arg(long)]
+        remove: bool,
+    },
     /// List vault accounts
     List,
 }
@@ -594,6 +608,8 @@ struct Config {
     ping_xai_model: String,
     #[serde(default = "default_ping_gemini")]
     ping_gemini_model: String,
+    #[serde(default = "default_ping_openrouter")]
+    ping_openrouter_model: String,
     #[serde(default)]
     gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
@@ -686,6 +702,10 @@ fn default_ping_gemini() -> String {
     "gemini-2.5-flash".into()
 }
 
+fn default_ping_openrouter() -> String {
+    "anthropic/claude-3.5-sonnet".into()
+}
+
 fn default_anthropic_upstream() -> String {
     "direct".into()
 }
@@ -713,6 +733,7 @@ impl Config {
             openai: self.ping_openai_model.clone(),
             xai: self.ping_xai_model.clone(),
             gemini: self.ping_gemini_model.clone(),
+            openrouter: self.ping_openrouter_model.clone(),
         }
     }
 
@@ -778,6 +799,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         data_dir: home.clone(),
         local_key: random_key("alx"),
         ping_gemini_model: default_ping_gemini(),
+        ping_openrouter_model: default_ping_openrouter(),
         gemini_project: String::new(),
         heartbeat_minutes: default_heartbeat_minutes(),
         ping_anthropic_model: default_ping_anthropic(),
@@ -817,6 +839,7 @@ fn open_vault(config: &Config) -> Result<Vault> {
             "grok" | "xai" => alex_core::Provider::Xai,
             "gemini" | "google" => alex_core::Provider::Gemini,
             "amp" | "ampcode" => alex_core::Provider::Amp,
+            "openrouter" | "or" => alex_core::Provider::Openrouter,
             _ => continue,
         };
         policies.push((p, v.clone()));
@@ -841,6 +864,7 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
         "grok" | "xai" => alex_core::Provider::Xai,
         "gemini" | "google" => alex_core::Provider::Gemini,
         "amp" | "ampcode" => alex_core::Provider::Amp,
+        "openrouter" | "or" => alex_core::Provider::Openrouter,
         other => anyhow::bail!("unknown provider '{other}'"),
     })
 }
@@ -1816,6 +1840,42 @@ async fn main() -> Result<()> {
                     ui::green(ui::dot())
                 );
             }
+            AuthCommand::OpenrouterKey {
+                key,
+                referer,
+                title,
+                remove,
+            } => {
+                let vault = open_vault(&config)?;
+                if remove {
+                    if key.is_some() || referer.is_some() || title.is_some() {
+                        anyhow::bail!("--remove cannot be combined with a key, --referer, or --title");
+                    }
+                    if vault.remove("openrouter-api-key").await? {
+                        println!("{} removed openrouter-api-key", ui::green(ui::dot()));
+                    } else {
+                        println!("no OpenRouter API key was stored");
+                    }
+                } else {
+                    let key = key
+                        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                        .filter(|k| !k.trim().is_empty())
+                        .context(
+                            "provide the key: `alexandria auth openrouter-key <KEY>` or set OPENROUTER_API_KEY",
+                        )?;
+                    let id = alex_auth::save_openrouter_api_key(
+                        &vault,
+                        &key,
+                        referer.as_deref(),
+                        title.as_deref(),
+                    )
+                    .await?;
+                    println!(
+                        "{} saved {id} — use models such as openrouter/anthropic/claude-3.5-sonnet",
+                        ui::green(ui::dot())
+                    );
+                }
+            }
             AuthCommand::List => {
                 let vault = open_vault(&config)?;
                 let accounts = vault.list().await;
@@ -1933,6 +1993,7 @@ async fn main() -> Result<()> {
                                 | alex_core::Provider::Openai
                                 | alex_core::Provider::Xai
                                 | alex_core::Provider::Gemini
+                                | alex_core::Provider::Openrouter
                         )
                         && !seen.contains(&a.provider)
                     {
@@ -1943,7 +2004,7 @@ async fn main() -> Result<()> {
             } else {
                 vec![
                     alex_core::Provider::from_str_loose(&target).with_context(|| {
-                        format!("unknown target '{target}' (anthropic|openai|grok|all)")
+                        format!("unknown target '{target}' (anthropic|openai|grok|openrouter|all)")
                     })?,
                 ]
             };
@@ -4988,6 +5049,7 @@ async fn run_pings(
         alex_core::Provider::Openai => models.openai.clone(),
         alex_core::Provider::Xai => models.xai.clone(),
         alex_core::Provider::Gemini => models.gemini.clone(),
+        alex_core::Provider::Openrouter => models.openrouter.clone(),
         alex_core::Provider::Amp => "amp".to_string(),
     };
     if std::io::stdout().is_terminal() {
@@ -7005,6 +7067,7 @@ mod tests {
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
             ping_gemini_model: default_ping_gemini(),
+            ping_openrouter_model: default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_api_key: String::new(),
@@ -7274,6 +7337,7 @@ mod tests {
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
             ping_gemini_model: default_ping_gemini(),
+            ping_openrouter_model: default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_api_key: String::new(),
