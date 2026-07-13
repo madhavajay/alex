@@ -13,6 +13,9 @@ set -eu
 
 REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
+APP_DIR="${ALEX_APP_DIR:-/Applications}"
+APP_NAME="AlexandriaBar.app"
+APP_PROCESS="AlexandriaBar"
 
 say() {
   printf '%s\n' "$*"
@@ -98,24 +101,62 @@ install -m 0755 "$tmp/alexandria" "$INSTALL_DIR/alexandria"
 "$INSTALL_DIR/alex" update --set-channel beta || \
   say "Could not persist the beta channel; set it later with: alex update --set-channel beta"
 
+# `service install` deliberately refuses to hot-swap a daemon that is already
+# loaded -- replacing it is `service restart`, which waits for in-flight routed
+# requests rather than cutting a live session off mid-response.
 if "$INSTALL_DIR/alex" service install; then
-  say "Alexandria beta CLI installed and its service is registered."
+  say "Daemon service registered."
+elif "$INSTALL_DIR/alex" service restart; then
+  say "Running daemon replaced with the beta build."
 else
-  say "Alexandria beta CLI installed, but the service could not be registered."
-  say "Start it manually with: $INSTALL_DIR/alex daemon --background"
+  say "The running daemon was not replaced (routed requests may still be in flight)."
+  say "Re-run when idle: alex service restart"
 fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
   dmg_url="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/tags/$tag" \
     | awk -F'"' '/browser_download_url/ && /\.dmg/ { print $4; exit }')"
-  if [ -n "$dmg_url" ]; then
+  if [ -z "$dmg_url" ]; then
+    say "No DMG was attached to $tag; the CLI/daemon is installed but the app is not."
+  else
     say "Downloading the signed menu-bar app…"
     curl -fsSL "$dmg_url" -o "$tmp/AlexandriaBar-beta.dmg"
-    open "$tmp/AlexandriaBar-beta.dmg" || \
-      say "Open $tmp/AlexandriaBar-beta.dmg manually and drag AlexandriaBar to Applications."
-    say "Drag AlexandriaBar to Applications to finish the app install."
-  else
-    say "No DMG was attached to $tag; the CLI/daemon is installed but the app is not."
+
+    # The app bundle cannot be replaced underneath a running process, and a stale
+    # AlexandriaBar would keep showing the old version in the menu.
+    if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+      say "Quitting the running $APP_PROCESS…"
+      osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
+      waited=0
+      while pgrep -x "$APP_PROCESS" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+      done
+      if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+        pkill -x "$APP_PROCESS" >/dev/null 2>&1 || true
+      fi
+    fi
+
+    mount_point="$(mktemp -d "${TMPDIR:-/tmp}/alex-beta-dmg.XXXXXX")"
+    hdiutil attach "$tmp/AlexandriaBar-beta.dmg" -nobrowse -quiet -mountpoint "$mount_point"
+    if [ ! -d "$mount_point/$APP_NAME" ]; then
+      hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
+      rmdir "$mount_point" 2>/dev/null || true
+      say "$APP_NAME was not found inside the DMG; the app was not installed." >&2
+      exit 1
+    fi
+    if [ ! -w "$APP_DIR" ]; then
+      hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
+      rmdir "$mount_point" 2>/dev/null || true
+      say "$APP_DIR is not writable. Re-run with: sudo sh -c 'curl -fsSL <url> | sh'" >&2
+      exit 1
+    fi
+    rm -rf "${APP_DIR:?}/$APP_NAME"
+    ditto "$mount_point/$APP_NAME" "$APP_DIR/$APP_NAME"
+    hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
+    rmdir "$mount_point" 2>/dev/null || true
+    say "Installed $APP_NAME to $APP_DIR."
+    open -a "$APP_DIR/$APP_NAME" || say "Launch $APP_NAME manually from $APP_DIR."
   fi
 fi
 

@@ -65,9 +65,15 @@ curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-beta.s
 ```
 
 It resolves the newest **prerelease** (GitHub's `releases/latest` never points at
-one, which is why the normal installer can't reach a beta), SHA-256 verifies the
-CLI tarball, opens the signed DMG for the menu-bar app, and sets your update
-channel to `beta`. It does not use Homebrew — there is no beta cask.
+one, which is why the normal installer can't reach a beta), SHA-256 verifies and
+installs the CLI, replaces a running daemon via `service restart` (which waits for
+in-flight requests rather than cutting a session off), then quits AlexandriaBar,
+installs the signed app bundle into `/Applications`, and relaunches it. It sets
+your update channel to `beta`. It does not use Homebrew — there is no beta cask.
+
+Both halves must land for the menu bar to show the new version: the menu's
+`Alexandria app v… · daemon v…` line reports the **app bundle** and the **running
+daemon** separately, and they update independently.
 
 That bootstrap is a one-time cost. From then on betas arrive as ordinary updates:
 
