@@ -22,6 +22,8 @@
   <string>/tmp/alexandria.daemon.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key>
+    <string>__ALEX_LAUNCHD_PATH__</string>
     <key>RUST_LOG</key>
     <string>info,alexandria=debug</string>
   </dict>

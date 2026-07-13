@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
@@ -199,8 +199,10 @@ enum KeysCommand {
 
 #[derive(Subcommand)]
 enum ServiceCommand {
-    /// Install + start the OS user service pointing at this binary
+    /// Install the OS user service pointing at this binary
     Install,
+    /// Safely replace the loaded launchd service when it has no routed requests in flight
+    Restart,
     /// Stop + remove the OS user service
     Uninstall,
     /// Show service state
@@ -2028,7 +2030,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Service { command } => match command {
-            ServiceCommand::Install => service_install()?,
+            ServiceCommand::Install => service_install(&config)?,
+            ServiceCommand::Restart => service_restart(&config)?,
             ServiceCommand::Uninstall => service_uninstall()?,
             ServiceCommand::Status => {
                 println!("{}", service_state_label(&detect_service_state()));
@@ -4950,6 +4953,330 @@ const SYSTEMD_TEMPLATE: &str = include_str!(concat!(
     "/config/systemd/alexandria.service"
 ));
 
+const LAUNCHD_LABEL: &str = "com.alexandria.daemon";
+const LAUNCHD_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const LAUNCHD_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[derive(Debug, PartialEq)]
+enum LaunchdInstallMode {
+    Bootstrap,
+    UpdatedRestartRequired,
+}
+
+fn launchd_install_mode(loaded: bool) -> LaunchdInstallMode {
+    if loaded {
+        LaunchdInstallMode::UpdatedRestartRequired
+    } else {
+        LaunchdInstallMode::Bootstrap
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum LaunchdRestartOutcome {
+    Replaced,
+    RefusedInFlight { count: i64 },
+    RolledBack { cause: String },
+    Failed { cause: String },
+}
+
+trait LaunchctlControl {
+    fn is_loaded(&mut self) -> Result<bool>;
+    fn bootout(&mut self, plist: &Path) -> Result<()>;
+    fn bootstrap(&mut self, plist: &Path) -> Result<()>;
+}
+
+trait LaunchdHealthProbe {
+    fn in_flight(&mut self) -> Result<i64>;
+    fn wait_until_healthy(&mut self) -> bool;
+}
+
+trait LaunchdPlistRollback {
+    fn restore_previous(&mut self) -> Result<()>;
+}
+
+struct SystemLaunchctl {
+    domain: String,
+}
+
+impl SystemLaunchctl {
+    fn new() -> Self {
+        Self {
+            domain: format!("gui/{}", current_uid()),
+        }
+    }
+
+    fn run(&self, action: &str, plist: &Path) -> Result<()> {
+        let output = std::process::Command::new("launchctl")
+            .args([action, &self.domain])
+            .arg(plist)
+            .output()
+            .with_context(|| format!("running launchctl {action}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "launchctl {action} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+}
+
+impl LaunchctlControl for SystemLaunchctl {
+    fn is_loaded(&mut self) -> Result<bool> {
+        let output = std::process::Command::new("launchctl")
+            .args(["print", &format!("{}/{LAUNCHD_LABEL}", self.domain)])
+            .output()
+            .context("running launchctl print")?;
+        Ok(output.status.success())
+    }
+
+    fn bootout(&mut self, plist: &Path) -> Result<()> {
+        self.run("bootout", plist)
+    }
+
+    fn bootstrap(&mut self, plist: &Path) -> Result<()> {
+        self.run("bootstrap", plist)
+    }
+}
+
+struct LocalLaunchdHealthProbe {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    local_key: String,
+}
+
+impl LocalLaunchdHealthProbe {
+    fn new(config: &Config) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("building daemon health client")?,
+            base_url: config.base_url(),
+            local_key: config.local_key.clone(),
+        })
+    }
+
+    fn health(&self) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .header("x-api-key", &self.local_key)
+            .send()
+            .context("querying daemon /health")?;
+        if !response.status().is_success() {
+            anyhow::bail!("daemon /health returned {}", response.status());
+        }
+        response.json().context("parsing daemon /health response")
+    }
+}
+
+impl LaunchdHealthProbe for LocalLaunchdHealthProbe {
+    fn in_flight(&mut self) -> Result<i64> {
+        let count = self
+            .health()?
+            .get("in_flight")
+            .and_then(serde_json::Value::as_i64)
+            .context("daemon /health did not include an in_flight count")?;
+        if count < 0 {
+            anyhow::bail!("daemon /health returned an invalid in_flight count ({count})");
+        }
+        Ok(count)
+    }
+
+    fn wait_until_healthy(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + LAUNCHD_HEALTH_TIMEOUT;
+        loop {
+            if self
+                .health()
+                .map(|health| {
+                    health.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                        && health.get("service").and_then(serde_json::Value::as_str)
+                            == Some("alexandria")
+                })
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(LAUNCHD_HEALTH_POLL_INTERVAL);
+        }
+    }
+}
+
+struct FilesystemLaunchdRollback<'a> {
+    destination: &'a Path,
+    previous: &'a Path,
+}
+
+impl LaunchdPlistRollback for FilesystemLaunchdRollback<'_> {
+    fn restore_previous(&mut self) -> Result<()> {
+        let plist = std::fs::read(self.previous)
+            .with_context(|| format!("reading saved previous plist {}", self.previous.display()))?;
+        std::fs::write(self.destination, plist)
+            .with_context(|| format!("restoring previous plist {}", self.destination.display()))
+    }
+}
+
+/// Replace a loaded job only after the daemon reports that it is idle.  The
+/// launchctl and health operations are deliberately traits so this sequence is
+/// testable on platforms that do not have launchd.
+fn replace_loaded_launchd_service<C, H, F>(
+    launchctl: &mut C,
+    health: &mut H,
+    rollback: &mut F,
+    plist: &Path,
+) -> LaunchdRestartOutcome
+where
+    C: LaunchctlControl,
+    H: LaunchdHealthProbe,
+    F: LaunchdPlistRollback,
+{
+    let in_flight = match health.in_flight() {
+        Ok(count) => count,
+        Err(error) => {
+            return LaunchdRestartOutcome::Failed {
+                cause: format!("could not determine in-flight routed requests: {error:#}"),
+            }
+        }
+    };
+    if in_flight > 0 {
+        return LaunchdRestartOutcome::RefusedInFlight { count: in_flight };
+    }
+
+    if let Err(error) = launchctl.bootout(plist) {
+        return LaunchdRestartOutcome::Failed {
+            cause: format!("could not boot out the loaded daemon: {error:#}"),
+        };
+    }
+
+    let failure = match launchctl.bootstrap(plist) {
+        Ok(()) if health.wait_until_healthy() => return LaunchdRestartOutcome::Replaced,
+        Ok(()) => "the new daemon did not become healthy before the timeout".to_string(),
+        Err(error) => format!("bootstrapping the new daemon failed: {error:#}"),
+    };
+
+    // A successful bootstrap can still leave a broken job loaded.  Try to
+    // remove it before re-bootstrapping the previous plist.  A failed cleanup
+    // is not fatal by itself: the old bootstrap and health probe are the
+    // observable evidence that recovery succeeded.
+    let cleanup_error = launchctl.bootout(plist).err();
+    if let Err(error) = rollback.restore_previous() {
+        return LaunchdRestartOutcome::Failed {
+            cause: format!("{failure}; could not restore the previous plist: {error:#}"),
+        };
+    }
+    if let Err(error) = launchctl.bootstrap(plist) {
+        let cleanup = cleanup_error
+            .map(|error| format!("; cleanup also failed: {error:#}"))
+            .unwrap_or_default();
+        return LaunchdRestartOutcome::Failed {
+            cause: format!("{failure}; rollback bootstrap failed: {error:#}{cleanup}"),
+        };
+    }
+    if !health.wait_until_healthy() {
+        return LaunchdRestartOutcome::Failed {
+            cause: format!("{failure}; rollback daemon did not become healthy before the timeout"),
+        };
+    }
+    LaunchdRestartOutcome::RolledBack { cause: failure }
+}
+
+fn launchd_plist_path() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home dir")?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+fn launchd_previous_plist_path(plist: &Path) -> PathBuf {
+    plist.with_extension("plist.previous")
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn render_launchd_path(inherited_path: &str, known_dirs: &[PathBuf]) -> String {
+    let mut dirs: Vec<String> = inherited_path
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for dir in known_dirs {
+        let dir = dir.to_string_lossy().to_string();
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.join(":")
+}
+
+fn known_launchd_path_dirs(exe: &Path) -> Vec<PathBuf> {
+    let mut dirs = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+    ]);
+    if let Some(home) = dirs::home_dir() {
+        dirs.extend([
+            home.join(".local/bin"),
+            home.join(".cargo/bin"),
+            home.join(".bun/bin"),
+            home.join("Library/pnpm"),
+            home.join(".nvm/current/bin"),
+        ]);
+    }
+    dirs.retain(|dir| dir.is_dir());
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn render_launchd_plist(exe: &Path, inherited_path: &str, known_dirs: &[PathBuf]) -> String {
+    LAUNCHD_TEMPLATE
+        .replace(
+            "/usr/local/bin/alexandria",
+            &xml_escape(&exe.to_string_lossy()),
+        )
+        .replace(
+            "__ALEX_LAUNCHD_PATH__",
+            &xml_escape(&render_launchd_path(inherited_path, known_dirs)),
+        )
+}
+
+fn save_previous_launchd_plist_if_needed(destination: &Path, loaded: bool) -> Result<()> {
+    if !loaded {
+        return Ok(());
+    }
+    let previous = launchd_previous_plist_path(destination);
+    if previous.exists() || !destination.exists() {
+        return Ok(());
+    }
+    std::fs::copy(destination, &previous).with_context(|| {
+        format!(
+            "saving previous launchd plist {}",
+            previous.to_string_lossy()
+        )
+    })?;
+    Ok(())
+}
+
 fn current_uid() -> String {
     std::process::Command::new("id")
         .arg("-u")
@@ -4959,7 +5286,7 @@ fn current_uid() -> String {
         .unwrap_or_default()
 }
 
-fn service_install() -> Result<()> {
+fn service_install(config: &Config) -> Result<()> {
     let exe = std::env::current_exe()?
         .canonicalize()
         .context("resolving current binary path")?;
@@ -4973,36 +5300,46 @@ fn service_install() -> Result<()> {
         );
     }
     if cfg!(target_os = "macos") {
-        let dst = dirs::home_dir()
-            .context("no home dir")?
-            .join("Library/LaunchAgents/com.alexandria.daemon.plist");
+        let dst = launchd_plist_path()?;
         std::fs::create_dir_all(dst.parent().unwrap())?;
-        std::fs::write(
+        let mut launchctl = SystemLaunchctl::new();
+        let mode = launchd_install_mode(launchctl.is_loaded()?);
+        save_previous_launchd_plist_if_needed(
             &dst,
-            LAUNCHD_TEMPLATE.replace("/usr/local/bin/alexandria", &exe_str),
+            mode == LaunchdInstallMode::UpdatedRestartRequired,
         )?;
-        let uid = current_uid();
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}")])
-            .arg(&dst)
-            .output();
-        let out = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}")])
-            .arg(&dst)
-            .output()
-            .context("running launchctl bootstrap")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootstrap failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!(
-            "{} {}",
-            ui::gold(ui::ankh()),
-            ui::bold("launchd service installed and started")
+        let plist = render_launchd_plist(
+            &exe,
+            &std::env::var("PATH").unwrap_or_default(),
+            &known_launchd_path_dirs(&exe),
         );
-        println!("  {}", ui::dim(&dst.to_string_lossy()));
+        std::fs::write(&dst, plist)?;
+        match mode {
+            LaunchdInstallMode::UpdatedRestartRequired => {
+                eprintln!("launchd plist updated, but the loaded daemon was left running.");
+                eprintln!("  The on-disk plist is newer than the loaded service.");
+                eprintln!(
+                    "  Apply it when there are no in-flight routed requests: alex service restart"
+                );
+                anyhow::bail!("launchd service was not replaced (exit 1)");
+            }
+            LaunchdInstallMode::Bootstrap => {
+                launchctl.bootstrap(&dst)?;
+                let mut health = LocalLaunchdHealthProbe::new(config)?;
+                if !health.wait_until_healthy() {
+                    anyhow::bail!(
+                        "launchd bootstrap completed, but the daemon did not become healthy within {}s",
+                        LAUNCHD_HEALTH_TIMEOUT.as_secs()
+                    );
+                }
+                println!(
+                    "{} {}",
+                    ui::gold(ui::ankh()),
+                    ui::bold("launchd service installed and serving")
+                );
+                println!("  {}", ui::dim(&dst.to_string_lossy()));
+            }
+        }
     } else if cfg!(target_os = "linux") {
         let dst = dirs::home_dir()
             .context("no home dir")?
@@ -5051,6 +5388,65 @@ fn service_install() -> Result<()> {
     }
     println!("  {}", service_state_label(&detect_service_state()));
     Ok(())
+}
+
+fn service_restart(config: &Config) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("service restart supports macOS launchd only");
+    }
+
+    let plist = launchd_plist_path()?;
+    let previous = launchd_previous_plist_path(&plist);
+    let mut launchctl = SystemLaunchctl::new();
+    if !launchctl.is_loaded()? {
+        anyhow::bail!("no loaded launchd daemon to restart; run alex service install first");
+    }
+    if !previous.exists() {
+        anyhow::bail!(
+            "no saved previous plist is available for rollback; run alex service install first"
+        );
+    }
+
+    let mut health = LocalLaunchdHealthProbe::new(config)?;
+    let mut rollback = FilesystemLaunchdRollback {
+        destination: &plist,
+        previous: &previous,
+    };
+    match replace_loaded_launchd_service(&mut launchctl, &mut health, &mut rollback, &plist) {
+        LaunchdRestartOutcome::Replaced => {
+            std::fs::remove_file(&previous).with_context(|| {
+                format!(
+                    "removing saved previous plist {}",
+                    previous.to_string_lossy()
+                )
+            })?;
+            println!(
+                "{} {}",
+                ui::gold(ui::ankh()),
+                ui::bold("launchd service replaced and serving")
+            );
+            Ok(())
+        }
+        LaunchdRestartOutcome::RefusedInFlight { count } => {
+            eprintln!(
+                "launchd service was not replaced: {count} routed request(s) are still in flight."
+            );
+            eprintln!("  Wait for them to finish, then run: alex service restart");
+            anyhow::bail!("refused to interrupt in-flight routed requests (exit 1)");
+        }
+        LaunchdRestartOutcome::RolledBack { cause } => {
+            eprintln!(
+                "launchd replacement failed; the previous daemon was restored and is serving."
+            );
+            eprintln!("  Cause: {cause}");
+            anyhow::bail!("launchd service rollback completed (exit 1)");
+        }
+        LaunchdRestartOutcome::Failed { cause } => {
+            eprintln!("launchd replacement failed; rollback did not restore a healthy daemon.");
+            eprintln!("  Cause: {cause}");
+            anyhow::bail!("launchd service restart failed (exit 1)");
+        }
+    }
 }
 
 fn service_uninstall() -> Result<()> {
@@ -6588,6 +6984,162 @@ mod tests {
         assert_eq!(parse_launchctl_pid(""), None);
     }
 
+    struct FakeLaunchctl {
+        calls: Vec<&'static str>,
+        bootout_results: std::collections::VecDeque<bool>,
+        bootstrap_results: std::collections::VecDeque<bool>,
+    }
+
+    impl FakeLaunchctl {
+        fn succeeds() -> Self {
+            Self {
+                calls: Vec::new(),
+                bootout_results: [true].into(),
+                bootstrap_results: [true].into(),
+            }
+        }
+    }
+
+    impl LaunchctlControl for FakeLaunchctl {
+        fn is_loaded(&mut self) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn bootout(&mut self, _: &Path) -> Result<()> {
+            self.calls.push("bootout");
+            if self.bootout_results.pop_front().unwrap_or(true) {
+                Ok(())
+            } else {
+                anyhow::bail!("fake bootout failure")
+            }
+        }
+
+        fn bootstrap(&mut self, _: &Path) -> Result<()> {
+            self.calls.push("bootstrap");
+            if self.bootstrap_results.pop_front().unwrap_or(true) {
+                Ok(())
+            } else {
+                anyhow::bail!("fake bootstrap failure")
+            }
+        }
+    }
+
+    struct FakeHealth {
+        in_flight: i64,
+        healthy_results: std::collections::VecDeque<bool>,
+    }
+
+    impl LaunchdHealthProbe for FakeHealth {
+        fn in_flight(&mut self) -> Result<i64> {
+            Ok(self.in_flight)
+        }
+
+        fn wait_until_healthy(&mut self) -> bool {
+            self.healthy_results.pop_front().unwrap_or(false)
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRollback {
+        restored: bool,
+    }
+
+    impl LaunchdPlistRollback for FakeRollback {
+        fn restore_previous(&mut self) -> Result<()> {
+            self.restored = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn launchd_plist_rendering_preserves_path_and_escapes_values() {
+        let plist = render_launchd_plist(
+            Path::new("/Users/alex/bin/alex&ria"),
+            "/usr/bin:/custom/bin",
+            &[
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/custom/bin"),
+            ],
+        );
+        assert!(plist.contains("/Users/alex/bin/alex&amp;ria"));
+        assert!(plist.contains(
+            "<key>PATH</key>\n    <string>/usr/bin:/custom/bin:/opt/homebrew/bin</string>"
+        ));
+        assert_eq!(launchd_install_mode(false), LaunchdInstallMode::Bootstrap);
+        assert_eq!(
+            launchd_install_mode(true),
+            LaunchdInstallMode::UpdatedRestartRequired
+        );
+    }
+
+    #[test]
+    fn launchd_restart_refuses_while_routed_requests_are_in_flight() {
+        let mut launchctl = FakeLaunchctl::succeeds();
+        let mut health = FakeHealth {
+            in_flight: 2,
+            healthy_results: [].into(),
+        };
+        let mut rollback = FakeRollback::default();
+        assert_eq!(
+            replace_loaded_launchd_service(
+                &mut launchctl,
+                &mut health,
+                &mut rollback,
+                Path::new("daemon.plist"),
+            ),
+            LaunchdRestartOutcome::RefusedInFlight { count: 2 }
+        );
+        assert!(launchctl.calls.is_empty());
+        assert!(!rollback.restored);
+    }
+
+    #[test]
+    fn launchd_restart_boots_out_bootstraps_and_verifies_health() {
+        let mut launchctl = FakeLaunchctl::succeeds();
+        let mut health = FakeHealth {
+            in_flight: 0,
+            healthy_results: [true].into(),
+        };
+        let mut rollback = FakeRollback::default();
+        assert_eq!(
+            replace_loaded_launchd_service(
+                &mut launchctl,
+                &mut health,
+                &mut rollback,
+                Path::new("daemon.plist"),
+            ),
+            LaunchdRestartOutcome::Replaced
+        );
+        assert_eq!(launchctl.calls, ["bootout", "bootstrap"]);
+        assert!(!rollback.restored);
+    }
+
+    #[test]
+    fn launchd_restart_rolls_back_when_new_bootstrap_fails() {
+        let mut launchctl = FakeLaunchctl {
+            calls: Vec::new(),
+            bootout_results: [true, true].into(),
+            bootstrap_results: [false, true].into(),
+        };
+        let mut health = FakeHealth {
+            in_flight: 0,
+            healthy_results: [true].into(),
+        };
+        let mut rollback = FakeRollback::default();
+        let outcome = replace_loaded_launchd_service(
+            &mut launchctl,
+            &mut health,
+            &mut rollback,
+            Path::new("daemon.plist"),
+        );
+        assert!(matches!(outcome, LaunchdRestartOutcome::RolledBack { .. }));
+        assert_eq!(
+            launchctl.calls,
+            ["bootout", "bootstrap", "bootout", "bootstrap"]
+        );
+        assert!(rollback.restored);
+    }
+
     #[test]
     fn home_dir_is_platform_native() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -6601,7 +7153,7 @@ mod tests {
     #[test]
     fn windows_reports_service_unsupported() {
         assert!(matches!(detect_service_state(), ServiceState::Unsupported));
-        assert!(service_install().is_err());
+        assert!(service_install(&test_config(tmpdir("windows-service"))).is_err());
         assert!(!service_managed(&ServiceState::Unsupported));
     }
 
