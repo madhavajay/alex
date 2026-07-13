@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alex_core::Provider;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
@@ -77,6 +78,20 @@ pub struct Account {
     pub path: Option<PathBuf>,
 }
 
+/// Non-secret account metadata retained after credential removal. This
+/// sidecar makes removal durable even for callers that do not have the trace
+/// database open (for example a terminal login flow).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovedAccount {
+    pub id: String,
+    pub provider: Provider,
+    pub name: String,
+    pub kind: String,
+    pub subscription_identity: Option<String>,
+    pub email: Option<String>,
+    pub removed_ms: i64,
+}
+
 fn default_account_name() -> String {
     "default".to_string()
 }
@@ -132,6 +147,27 @@ impl Account {
                         .find_map(normalize_email)
                 })
             })
+    }
+
+    /// A durable, non-secret identifier for the upstream subscription behind
+    /// this local account.  Local account ids and names are deliberately not
+    /// used here: users can rename or remove those at any time.
+    pub fn subscription_identity(&self) -> Option<String> {
+        if self.provider == Provider::Openai {
+            if let Some(id) = self.chatgpt_account_id().filter(|id| !id.trim().is_empty()) {
+                return Some(format!("openai:chatgpt-account:{}", id.trim()));
+            }
+        }
+        if let Some(email) = self.email() {
+            return Some(format!("{}:email:{}", self.provider.as_str(), email));
+        }
+        // API keys have no provider-exposed account id in this application.
+        // A one-way fingerprint is stable across a local rename and avoids
+        // persisting the credential itself. It is intentionally last resort.
+        self.api_key.as_deref().filter(|key| !key.is_empty()).map(|key| {
+            let digest = Sha256::digest(key.as_bytes());
+            format!("{}:api-key-sha256:{digest:x}", self.provider.as_str())
+        })
     }
 
     fn needs_refresh(&self) -> bool {
@@ -470,6 +506,16 @@ impl Vault {
         v
     }
 
+    /// Best-effort synchronous snapshot for daemon construction. Normal
+    /// callers should use `list`; this avoids a blocking runtime bridge just
+    /// to seed non-secret trace attribution metadata.
+    pub fn list_cached(&self) -> Vec<Account> {
+        self.accounts
+            .try_read()
+            .map(|accounts| accounts.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn set_policies_blocking(&self, policies: Vec<(Provider, AccountPolicy)>) {
         *self.policies.write().expect("policy lock poisoned") = policies;
     }
@@ -575,12 +621,35 @@ impl Vault {
     }
 
     pub async fn remove(&self, id: &str) -> Result<bool> {
-        let existed = self.accounts.write().await.remove(id).is_some();
+        let account = self.accounts.read().await.get(id).cloned();
+        let Some(account) = account else { return Ok(false); };
+        let tombstone = RemovedAccount {
+            id: account.id.clone(), provider: account.provider, name: account.name.clone(), kind: account.kind.clone(),
+            subscription_identity: account.subscription_identity(), email: account.email(), removed_ms: now_ms(),
+        };
+        let tombstone_dir = self.dir.join("removed-accounts");
+        std::fs::create_dir_all(&tombstone_dir)?;
+        let tombstone_path = tombstone_dir.join(format!("{id}.json"));
+        let temporary = tombstone_path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&tombstone)?)?;
+        std::fs::rename(&temporary, &tombstone_path)?;
+        self.accounts.write().await.remove(id);
         let path = self.dir.join(format!("{id}.json"));
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
-        Ok(existed)
+        Ok(true)
+    }
+
+    /// Read non-secret removal tombstones. Corrupt individual sidecars are
+    /// ignored so a bad historical file cannot prevent the vault opening.
+    pub fn removed_accounts(&self) -> Vec<RemovedAccount> {
+        let dir = self.dir.join("removed-accounts");
+        let Ok(entries) = std::fs::read_dir(dir) else { return vec![]; };
+        entries.filter_map(|entry| {
+            let path = entry.ok()?.path();
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        }).collect()
     }
 
     pub async fn account_for(&self, provider: Provider, prefer_oauth: bool) -> Result<Account> {
@@ -1607,6 +1676,24 @@ mod tests {
         );
         account.id_token = Some(format!("header.{payload}.signature"));
         assert_eq!(account.email().as_deref(), Some("workspace@example.com"));
+    }
+
+    #[tokio::test]
+    async fn remove_writes_non_secret_tombstone_with_durable_identity() {
+        let dir = temp_dir("remove-tombstone");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let mut account = api_key_account("openai-oauth-personal", Provider::Openai);
+        account.kind = "oauth".into();
+        account.name = "personal".into();
+        account.account_meta = json!({"account_id": "acct_123", "email": "madhava@example.com"});
+        vault.upsert(account).await.unwrap();
+        assert!(vault.remove("openai-oauth-personal").await.unwrap());
+        let tombstones = vault.removed_accounts();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].name, "personal");
+        assert_eq!(tombstones[0].subscription_identity.as_deref(), Some("openai:chatgpt-account:acct_123"));
+        let raw = std::fs::read_to_string(dir.join("removed-accounts/openai-oauth-personal.json")).unwrap();
+        assert!(!raw.contains("api_key"));
     }
 
     #[test]

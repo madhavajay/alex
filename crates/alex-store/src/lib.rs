@@ -48,11 +48,27 @@ CREATE TABLE IF NOT EXISTS traces (
   client_ip         TEXT,
   key_fingerprint   TEXT,
   reasoning_effort  TEXT,
-  thinking_budget   INTEGER
+  thinking_budget   INTEGER,
+  subscription_identity TEXT
 );
 CREATE INDEX IF NOT EXISTS traces_session ON traces(session_id);
 CREATE INDEX IF NOT EXISTS traces_ts ON traces(ts_request_ms);
 CREATE INDEX IF NOT EXISTS traces_model ON traces(routed_model);
+
+-- A durable local catalogue, including removed accounts.  Trace rows retain
+-- their historical account_id; this table lets them be attributed after the
+-- local account file has gone away.
+CREATE TABLE IF NOT EXISTS known_accounts (
+  account_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subscription_identity TEXT,
+  email TEXT,
+  removed_ms INTEGER,
+  last_seen_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS known_accounts_identity ON known_accounts(subscription_identity);
 
 CREATE TABLE IF NOT EXISTS pricing (
   model TEXT PRIMARY KEY,
@@ -118,7 +134,7 @@ const TRACE_COLS: &str =
      cost_usd, billing_bucket, error, session_id, resp_body_path,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
      account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
-     method, path";
+     method, path, subscription_identity";
 
 fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let ts_request_ms = r.get::<_, i64>(1)?;
@@ -158,7 +174,41 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "thinking_budget": r.get::<_, Option<i64>>(31)?,
         "method": r.get::<_, Option<String>>(32)?,
         "path": r.get::<_, Option<String>>(33)?,
+        "subscription_identity": r.get::<_, Option<String>>(34)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
+    }))
+}
+
+fn annotate_trace_accounts(conn: &Connection, rows: &mut [Value]) -> Result<()> {
+    for row in rows {
+        let identity = row["subscription_identity"].as_str();
+        let account_id = row["account_id"].as_str();
+        // Prefer an active account sharing the durable identity. That is the
+        // automatic re-link after a user re-adds the subscription under a new
+        // nickname. Fall back to the original account tombstone.
+        let account = if let Some(identity) = identity {
+            conn.query_row(
+                "SELECT account_id, provider, name, kind, email, removed_ms FROM known_accounts
+                 WHERE subscription_identity=?1 AND removed_ms IS NULL ORDER BY last_seen_ms DESC LIMIT 1",
+                [identity], account_json_row,
+            ).optional()?
+        } else { None }.or_else(|| {
+            account_id.and_then(|id| conn.query_row(
+                "SELECT account_id, provider, name, kind, email, removed_ms FROM known_accounts WHERE account_id=?1",
+                [id], account_json_row,
+            ).optional().ok().flatten())
+        });
+        if let Some(account) = account { row["account"] = account; }
+    }
+    Ok(())
+}
+
+fn account_json_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let removed_ms = r.get::<_, Option<i64>>(5)?;
+    Ok(json!({
+        "id": r.get::<_, String>(0)?, "provider": r.get::<_, String>(1)?,
+        "name": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
+        "email": r.get::<_, Option<String>>(4)?, "removed": removed_ms.is_some(), "removed_ms": removed_ms,
     }))
 }
 
@@ -181,6 +231,7 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
         "key_fingerprint TEXT",
         "reasoning_effort TEXT",
         "thinking_budget INTEGER",
+        "subscription_identity TEXT",
     ] {
         if let Err(e) = conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {col}")) {
             if !e.to_string().contains("duplicate column name") {
@@ -188,8 +239,27 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
             }
         }
     }
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS traces_run ON traces(run_id)")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS traces_run ON traces(run_id); CREATE INDEX IF NOT EXISTS traces_subscription_identity ON traces(subscription_identity)")?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownAccount {
+    pub account_id: String,
+    pub provider: String,
+    pub name: String,
+    pub kind: String,
+    pub subscription_identity: Option<String>,
+    pub email: Option<String>,
+}
+
+impl KnownAccount {
+    pub fn new(
+        account_id: impl Into<String>, provider: impl Into<String>, name: impl Into<String>,
+        kind: impl Into<String>, subscription_identity: Option<String>, email: Option<String>,
+    ) -> Self {
+        Self { account_id: account_id.into(), provider: provider.into(), name: name.into(), kind: kind.into(), subscription_identity, email }
+    }
 }
 
 fn migrate_run_keys(conn: &Connection) -> Result<()> {
@@ -211,6 +281,10 @@ pub struct TraceFilter {
     pub session: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// Matches the historical account id and, where available, its durable
+    /// subscription identity so a removed account selection remains useful.
+    pub account_id: Option<String>,
+    pub account_ids: Vec<String>,
     pub path: Option<String>,
     pub harness: Option<String>,
     pub status: Option<i64>,
@@ -229,6 +303,8 @@ impl Default for TraceFilter {
             session: None,
             model: None,
             provider: None,
+            account_id: None,
+            account_ids: vec![],
             path: None,
             harness: None,
             status: None,
@@ -268,6 +344,9 @@ impl Store {
         let db_path = data_dir.join("alexandria.sqlite3");
         let conn =
             Connection::open(&db_path).with_context(|| format!("opening sqlite at {db_path:?}"))?;
+        // Migrations and account tombstones share the daemon's WAL database;
+        // wait for an in-flight writer instead of assuming exclusive startup.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
         migrate_traces(&conn)?;
@@ -317,6 +396,20 @@ impl Store {
 
     pub fn insert_trace(&self, t: &TraceRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Some older remote/wrap clients deserialize a TraceRecord without
+        // the new field and later update the same trace id. INSERT OR REPLACE
+        // must not erase an identity that was already recorded.
+        let subscription_identity = match &t.subscription_identity {
+            Some(identity) => Some(identity.clone()),
+            None => conn
+                .query_row(
+                    "SELECT subscription_identity FROM traces WHERE id=?1",
+                    [&t.id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
         conn.execute(
             r#"INSERT OR REPLACE INTO traces (
                 id, ts_request_ms, ts_response_ms, session_id, harness, client_format,
@@ -326,8 +419,9 @@ impl Store {
                 cost_usd, billing_bucket,
                 req_body_path, upstream_req_body_path, resp_body_path,
                 req_headers_json, resp_headers_json, error, account_id,
-                run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)"#,
+                run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
+                subscription_identity
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"#,
             params![
                 t.id,
                 t.ts_request_ms,
@@ -363,9 +457,98 @@ impl Store {
                 t.key_fingerprint,
                 t.reasoning_effort,
                 t.thinking_budget,
+                subscription_identity,
             ],
         )?;
         Ok(())
+    }
+
+    /// Record an active account. This is an upsert so it is safe to call on
+    /// every routing decision and does not require vault/database exclusivity.
+    pub fn upsert_known_account(&self, account: &KnownAccount) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO known_accounts (account_id, provider, name, kind, subscription_identity, email, removed_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+             ON CONFLICT(account_id) DO UPDATE SET provider=excluded.provider, name=excluded.name,
+               kind=excluded.kind, subscription_identity=excluded.subscription_identity,
+               email=excluded.email, removed_ms=NULL, last_seen_ms=excluded.last_seen_ms",
+            params![account.account_id, account.provider, account.name, account.kind,
+                account.subscription_identity, account.email, Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Keep account metadata after credential removal. No trace row is deleted
+    /// or changed by this operation.
+    pub fn tombstone_known_account(&self, account: &KnownAccount, removed_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO known_accounts (account_id, provider, name, kind, subscription_identity, email, removed_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id) DO UPDATE SET provider=excluded.provider, name=excluded.name,
+               kind=excluded.kind, subscription_identity=excluded.subscription_identity,
+               email=excluded.email, removed_ms=excluded.removed_ms, last_seen_ms=excluded.last_seen_ms",
+            params![account.account_id, account.provider, account.name, account.kind,
+                account.subscription_identity, account.email, removed_ms, removed_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Accounts for the Trace Browser. Removed rows remain present and are
+    /// explicitly marked, so callers can offer them as filterable selections.
+    pub fn list_known_accounts(&self) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.account_id, a.provider, a.name, a.kind, a.subscription_identity, a.email,
+                    a.removed_ms, a.last_seen_ms, COUNT(t.id)
+             FROM known_accounts a LEFT JOIN traces t ON t.account_id = a.account_id
+                OR (a.subscription_identity IS NOT NULL AND t.subscription_identity = a.subscription_identity)
+             GROUP BY a.account_id ORDER BY a.removed_ms IS NOT NULL, a.provider, a.name",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(json!({
+            "id": r.get::<_, String>(0)?, "provider": r.get::<_, String>(1)?,
+            "name": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
+            "subscription_identity": r.get::<_, Option<String>>(4)?,
+            "email": r.get::<_, Option<String>>(5)?, "removed": r.get::<_, Option<i64>>(6)?.is_some(),
+            "removed_ms": r.get::<_, Option<i64>>(6)?, "last_seen_ms": r.get::<_, i64>(7)?,
+            "trace_count": r.get::<_, i64>(8)?,
+        })))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Legacy trace groups that cannot currently resolve to an active account.
+    pub fn orphaned_trace_groups(&self) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.account_id, MAX(t.upstream_provider), GROUP_CONCAT(DISTINCT t.routed_model),
+                    MIN(t.ts_request_ms), MAX(t.ts_request_ms), COUNT(*)
+             FROM traces t
+             WHERE t.account_id IS NOT NULL AND t.subscription_identity IS NULL
+               AND NOT EXISTS (SELECT 1 FROM known_accounts a WHERE a.account_id=t.account_id AND a.removed_ms IS NULL)
+             GROUP BY t.account_id ORDER BY MAX(t.ts_request_ms) DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(json!({
+            "account_id": r.get::<_, String>(0)?, "provider": r.get::<_, Option<String>>(1)?,
+            "models": r.get::<_, Option<String>>(2)?, "first_ts_ms": r.get::<_, i64>(3)?,
+            "last_ts_ms": r.get::<_, i64>(4)?, "count": r.get::<_, i64>(5)?,
+        })))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Attach only untagged legacy traces to a selected account identity. The
+    /// caller must present the plan first; `confirmed=false` is a strict no-op.
+    pub fn reattach_orphaned_traces(&self, orphan_account_id: &str, target: &KnownAccount, confirmed: bool) -> Result<u64> {
+        if !confirmed { return Ok(0); }
+        let Some(identity) = target.subscription_identity.as_deref() else {
+            anyhow::bail!("target account has no durable subscription identity");
+        };
+        self.upsert_known_account(target)?;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE traces SET subscription_identity=?1 WHERE account_id=?2 AND subscription_identity IS NULL",
+            params![identity, orphan_account_id],
+        )? as u64)
     }
 
     pub fn list_traces(
@@ -411,6 +594,17 @@ impl Store {
             sql.push_str(" AND upstream_provider = ?");
             args.push(p.clone());
         }
+        if let Some(account_id) = &f.account_id {
+            sql.push_str(" AND (account_id = ? OR subscription_identity = (SELECT subscription_identity FROM known_accounts WHERE account_id = ?))");
+            args.push(account_id.clone());
+            args.push(account_id.clone());
+        }
+        if !f.account_ids.is_empty() {
+            let placeholders = std::iter::repeat("?").take(f.account_ids.len()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND (account_id IN ({placeholders}) OR subscription_identity IN (SELECT subscription_identity FROM known_accounts WHERE account_id IN ({placeholders})))"));
+            args.extend(f.account_ids.iter().cloned());
+            args.extend(f.account_ids.iter().cloned());
+        }
         if let Some(p) = &f.path {
             sql.push_str(" AND path = ?");
             args.push(p.clone());
@@ -438,7 +632,9 @@ impl Store {
         args.push(effective_limit(f.limit).to_string());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut rows: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
+        annotate_trace_accounts(&conn, &mut rows)?;
+        Ok(rows)
     }
 
     pub fn sessions(&self, since_ms: Option<i64>, limit: usize) -> Result<Vec<Value>> {
@@ -1725,6 +1921,83 @@ mod tests {
         assert_eq!(rows[1]["run_id"], Value::Null);
         assert_eq!(rows[1]["reasoning_effort"], Value::Null);
         assert_eq!(rows[1]["thinking_budget"], Value::Null);
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_existing_trace_history_stays_readable() {
+        let dir = tmpdir("subscription-identity-migrate");
+        let db_path = dir.join("alexandria.sqlite3");
+        // This is the pre-change traces schema as written by the current
+        // released binary (all of its then-current trace columns, but no new
+        // subscription_identity column).
+        Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TABLE traces (id TEXT PRIMARY KEY, ts_request_ms INTEGER NOT NULL,
+              ts_response_ms INTEGER, session_id TEXT, harness TEXT, client_format TEXT,
+              upstream_provider TEXT, upstream_format TEXT, requested_model TEXT, routed_model TEXT,
+              method TEXT, path TEXT, status INTEGER, streamed INTEGER, input_tokens INTEGER,
+              cached_input_tokens INTEGER, cache_creation_tokens INTEGER, output_tokens INTEGER,
+              reasoning_tokens INTEGER, cost_usd REAL, billing_bucket TEXT, req_body_path TEXT,
+              upstream_req_body_path TEXT, resp_body_path TEXT, req_headers_json TEXT,
+              resp_headers_json TEXT, error TEXT, account_id TEXT, run_id TEXT, tags_json TEXT,
+              client_ip TEXT, key_fingerprint TEXT, reasoning_effort TEXT, thinking_budget INTEGER);
+             INSERT INTO traces (id, ts_request_ms, upstream_provider, routed_model, account_id)
+              VALUES ('historic', 100, 'openai', 'gpt-5', 'openai-oauth-old');"
+        ).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        let old = KnownAccount::new("openai-oauth-old", "openai", "old", "oauth",
+            Some("openai:chatgpt-account:acct_123".into()), Some("madhava@example.com".into()));
+        store.tombstone_known_account(&old, 200).unwrap();
+        let rows = store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "historic");
+        assert_eq!(rows[0]["account"]["name"], "old");
+        assert_eq!(rows[0]["account"]["removed"], true);
+        drop(store);
+        let store = Store::open(dir).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let identity_cols: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('traces') WHERE name='subscription_identity'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(identity_cols, 1, "reopening must not alter the schema again");
+    }
+
+    #[test]
+    fn removed_account_trace_reattaches_when_readded_under_a_new_nickname() {
+        let store = Store::open(tmpdir("readd-identity")).unwrap();
+        let identity = Some("openai:chatgpt-account:acct_123".into());
+        let old = KnownAccount::new("openai-oauth-personal", "openai", "personal", "oauth", identity.clone(), Some("madhava@example.com".into()));
+        store.upsert_known_account(&old).unwrap();
+        let mut historic = trace("historic", 100, None);
+        historic.account_id = Some(old.account_id.clone());
+        historic.subscription_identity = identity.clone();
+        store.insert_trace(&historic).unwrap();
+        store.tombstone_known_account(&old, 200).unwrap();
+        let removed = store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(removed[0]["account"]["name"], "personal");
+        assert_eq!(removed[0]["account"]["removed"], true);
+        let readded = KnownAccount::new("openai-api_key-work", "openai", "work", "api_key", identity, Some("madhava@example.com".into()));
+        store.upsert_known_account(&readded).unwrap();
+        let rows = store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(rows[0]["account"]["id"], "openai-api_key-work");
+        assert_eq!(rows[0]["account"]["name"], "work");
+        assert_eq!(rows[0]["account"]["removed"], false);
+        let accounts = store.list_known_accounts().unwrap();
+        assert!(accounts.iter().any(|a| a["id"] == "openai-oauth-personal" && a["removed"] == true));
+    }
+
+    #[test]
+    fn traces_reattach_plan_is_a_noop_without_confirmation() {
+        let store = Store::open(tmpdir("reattach-confirmation")).unwrap();
+        let mut orphan = trace("orphan", 100, None);
+        orphan.account_id = Some("openai-oauth-removed".into());
+        store.insert_trace(&orphan).unwrap();
+        let target = KnownAccount::new("openai-oauth-new", "openai", "new", "oauth",
+            Some("openai:chatgpt-account:acct_456".into()), Some("new@example.com".into()));
+        assert_eq!(store.orphaned_trace_groups().unwrap()[0]["account_id"], "openai-oauth-removed");
+        assert_eq!(store.reattach_orphaned_traces("openai-oauth-removed", &target, false).unwrap(), 0);
+        assert!(store.search_traces(&TraceFilter::default()).unwrap()[0]["subscription_identity"].is_null());
+        assert_eq!(store.reattach_orphaned_traces("openai-oauth-removed", &target, true).unwrap(), 1);
+        assert_eq!(store.search_traces(&TraceFilter::default()).unwrap()[0]["account"]["id"], "openai-oauth-new");
     }
 }
 

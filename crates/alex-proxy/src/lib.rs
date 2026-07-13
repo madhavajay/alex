@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use alex_auth::{
     now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
-    AccountPolicy, AccountPolicyMode, Vault,
+    AccountPolicy, AccountPolicyMode, RemovedAccount, Vault,
 };
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
@@ -15,7 +15,7 @@ use alex_core::{
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
-use alex_store::{Store, TraceFilter};
+use alex_store::{KnownAccount, Store, TraceFilter};
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -283,6 +283,18 @@ pub fn build_state(
     dario: Option<Arc<dyn DarioRouter>>,
     base_url: String,
 ) -> Arc<AppState> {
+    // Import sidecars written by Vault::remove so a daemon restarted after a
+    // terminal-side removal still exposes removed history to the Trace Browser.
+    for removed in vault.removed_accounts() {
+        if let Err(e) = store.tombstone_known_account(&known_removed_account(&removed), removed.removed_ms) {
+            tracing::warn!(account = %removed.id, "failed to import account tombstone: {e}");
+        }
+    }
+    for account in vault.list_cached() {
+        if let Err(e) = store.upsert_known_account(&known_account(&account)) {
+            tracing::warn!(account = %account.id, "failed to seed trace account catalogue: {e}");
+        }
+    }
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -399,6 +411,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/auth/login/{id}", get(admin_auth_login_status))
         .route("/traces/search", get(traces_search))
+        .route("/traces/accounts", get(traces_accounts))
         .route("/traces/export.ndjson", get(traces_export))
         .route("/traces/sessions", get(traces_sessions))
         .route(
@@ -478,10 +491,40 @@ async fn admin_account_remove(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    let account = state.vault.list().await.into_iter().find(|a| a.id == id);
+    let Some(account) = account else {
+        return error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'"));
+    };
+    if let Err(e) = state.store.tombstone_known_account(&known_account(&account), now_ms()) {
+        // Do not remove credentials if we could not first preserve attribution.
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not preserve removed account history: {e}"));
+    }
     match state.vault.remove(&id).await {
         Ok(true) => axum::Json(json!({"removed": id})).into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn known_account(account: &Account) -> KnownAccount {
+    KnownAccount::new(
+        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
+        account.subscription_identity(), account.email(),
+    )
+}
+
+fn known_removed_account(account: &RemovedAccount) -> KnownAccount {
+    KnownAccount::new(
+        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
+        account.subscription_identity.clone(), account.email.clone(),
+    )
+}
+
+fn bind_trace_account(store: &Store, trace: &mut TraceRecord, account: &Account) {
+    trace.account_id = Some(account.id.clone());
+    trace.subscription_identity = account.subscription_identity();
+    if let Err(e) = store.upsert_known_account(&known_account(account)) {
+        tracing::error!(account = %account.id, "failed to preserve trace account attribution: {e}");
     }
 }
 
@@ -1330,6 +1373,8 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
         session: q.get("session").cloned(),
         model: q.get("model").cloned(),
         provider: q.get("provider").cloned(),
+        account_id: q.get("account_id").cloned(),
+        account_ids: q.get("account_ids").map(|ids| ids.split(',').map(str::trim).filter(|id| !id.is_empty()).map(String::from).collect()).unwrap_or_default(),
         path: q.get("path").cloned(),
         harness: q.get("harness").cloned(),
         status: q.get("status").and_then(|s| s.parse().ok()),
@@ -1435,6 +1480,17 @@ async fn traces_search(
             }
             None => axum::Json(json!({"traces": rows})).into_response(),
         },
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Trace Browser account selector API. The returned list deliberately includes
+/// removed accounts with `removed: true`. Multi-select with
+/// `/traces/search?account_ids=id1,id2`; matching durable identities are
+/// included as well as the historical ids.
+async fn traces_accounts(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.list_known_accounts() {
+        Ok(accounts) => axum::Json(json!({"accounts": accounts})).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -4255,7 +4311,7 @@ async fn proxy(
         }
     };
     trace.upstream_format = Some(plan.upstream_format.into());
-    trace.account_id = Some(plan.account.id.clone());
+    bind_trace_account(&state.store, &mut trace, &plan.account);
     trace.billing_bucket = Some(
         if plan.account.kind == "oauth" || plan.account.kind == "dario" {
             "subscription"
@@ -4402,7 +4458,7 @@ async fn proxy(
                     Ok(next_plan) if !attempted_accounts.contains(&next_plan.account.id) => {
                         plan = next_plan;
                         account = plan.account.clone();
-                        trace.account_id = Some(account.id.clone());
+                        bind_trace_account(&state.store, &mut trace, &account);
                         trace.upstream_format = Some(plan.upstream_format.into());
                         trace.billing_bucket = Some(
                             if account.kind == "oauth" || account.kind == "dario" {
@@ -4439,7 +4495,7 @@ async fn proxy(
         }
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
-    trace.account_id = Some(account.id.clone());
+    bind_trace_account(&state.store, &mut trace, &account);
 
     let status = upstream_resp.status();
     trace.status = Some(status.as_u16() as i64);
