@@ -4452,10 +4452,14 @@ async fn proxy(
         let _in_flight = in_flight;
         let mut buf: Vec<u8> = Vec::new();
         let mut stream_error: Option<String> = None;
+        let mut sse_error_observer = is_sse.then(|| SseErrorObserver::new(plan.upstream_format));
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(b) => {
                     buf.extend_from_slice(&b);
+                    if let Some(observer) = sse_error_observer.as_mut() {
+                        observer.observe(&b);
+                    }
                     let _ = tx.send(Ok(b)).await;
                 }
                 Err(e) => {
@@ -4473,7 +4477,13 @@ async fn proxy(
         drop(tx);
         trace.ts_response_ms = Some(now_ms());
         if trace.error.is_none() {
-            trace.error = stream_error;
+            trace.error = sse_error_observer
+                .as_mut()
+                .and_then(|observer| {
+                    observer.finish();
+                    observer.error()
+                })
+                .or(stream_error);
         }
         if trace.error.is_some() {
             if let (Some(dario), Some(gen)) = (
@@ -4542,6 +4552,192 @@ fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is
                 .unwrap_or(false);
             trace.cost_usd = Some(compute_cost(&trace.usage, &pricing, input_includes_cached));
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamSseError {
+    kind: String,
+    message: String,
+}
+
+impl UpstreamSseError {
+    fn trace_message(&self) -> String {
+        format!("upstream stream error: {}: {}", self.kind, self.message)
+    }
+}
+
+/// Passively observes one SSE stream. It retains only the current SSE event so
+/// an event split across transport chunks can still be decoded; it never holds
+/// back, changes, or coalesces the bytes sent to the client.
+struct SseErrorObserver {
+    upstream_format: &'static str,
+    pending_line: Vec<u8>,
+    event_name: Option<String>,
+    event_data: Vec<String>,
+    error: Option<UpstreamSseError>,
+}
+
+impl SseErrorObserver {
+    fn new(upstream_format: &'static str) -> Self {
+        Self {
+            upstream_format,
+            pending_line: Vec::new(),
+            event_name: None,
+            event_data: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        self.pending_line.extend_from_slice(chunk);
+        let mut consumed = 0;
+        for index in 0..self.pending_line.len() {
+            if self.pending_line[index] != b'\n' {
+                continue;
+            }
+            let line = String::from_utf8_lossy(&self.pending_line[consumed..index]).into_owned();
+            self.observe_line(line.strip_suffix('\r').unwrap_or(&line));
+            consumed = index + 1;
+        }
+        if consumed > 0 {
+            self.pending_line.drain(..consumed);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.pending_line.is_empty() {
+            let line = String::from_utf8_lossy(&self.pending_line).into_owned();
+            self.observe_line(line.strip_suffix('\r').unwrap_or(&line));
+            self.pending_line.clear();
+        }
+        self.finish_event();
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.as_ref().map(UpstreamSseError::trace_message)
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        if line.is_empty() {
+            self.finish_event();
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            return;
+        };
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => self.event_name = Some(value.to_string()),
+            "data" => self.event_data.push(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn finish_event(&mut self) {
+        if self.error.is_none() && !self.event_data.is_empty() && self.event_may_be_an_error() {
+            let data = self.event_data.join("\n");
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                self.error = upstream_sse_error(
+                    self.upstream_format,
+                    self.event_name.as_deref(),
+                    &value,
+                );
+            }
+        }
+        self.event_name = None;
+        self.event_data.clear();
+    }
+
+    /// Cheap pre-filter so we don't JSON-parse every content delta of every
+    /// stream just to learn it isn't an error. Every arm of `upstream_sse_error`
+    /// needs one of these markers, so anything without them cannot match. A
+    /// false positive here costs one parse and still yields no error.
+    fn event_may_be_an_error(&self) -> bool {
+        matches!(
+            self.event_name.as_deref(),
+            Some("error") | Some("response.failed")
+        ) || self
+            .event_data
+            .iter()
+            .any(|line| line.contains("error") || line.contains("failed"))
+    }
+}
+
+fn error_details(error: &Value, fallback_kind: &str) -> UpstreamSseError {
+    let kind = error["type"]
+        .as_str()
+        .or_else(|| error["code"].as_str())
+        .or_else(|| error["status"].as_str())
+        .unwrap_or(fallback_kind)
+        .to_string();
+    let message = error["message"]
+        .as_str()
+        .unwrap_or("upstream returned an error event")
+        .to_string();
+    UpstreamSseError { kind, message }
+}
+
+fn upstream_sse_error(
+    upstream_format: &str,
+    event_name: Option<&str>,
+    value: &Value,
+) -> Option<UpstreamSseError> {
+    let event_is_error = event_name == Some("error");
+    match upstream_format {
+        // Anthropic's documented stream error is `event: error` with a
+        // `{type: "error", error: {type, message}}` payload.
+        "anthropic" if event_is_error || value["type"] == "error" => {
+            Some(error_details(&value["error"], "error"))
+        }
+        // OpenAI chat streams can carry a normal API error object as an SSE
+        // frame. Responses additionally exposes the terminal
+        // `response.failed` event used by its stream reassembler above.
+        "openai-chat"
+            if event_is_error || value["type"] == "error" || value["error"].is_object() =>
+        {
+            let error = if value["error"].is_object() {
+                &value["error"]
+            } else {
+                value
+            };
+            Some(error_details(error, "error"))
+        }
+        "openai-responses"
+            if event_is_error
+                || value["type"] == "error"
+                || event_name == Some("response.failed")
+                || value["type"] == "response.failed" =>
+        {
+            let error = if value["response"]["error"].is_object() {
+                &value["response"]["error"]
+            } else if value["error"].is_object() {
+                &value["error"]
+            } else {
+                value
+            };
+            Some(error_details(error, "response_failed"))
+        }
+        // Gemini's stream reassembler accepts both direct and code-assist
+        // `response`-wrapped frames. Google error frames use the same shape.
+        "gemini"
+            if event_is_error
+                || value["error"].is_object()
+                || value["response"]["error"].is_object() =>
+        {
+            let error = if value["response"]["error"].is_object() {
+                &value["response"]["error"]
+            } else if value["error"].is_object() {
+                &value["error"]
+            } else {
+                value
+            };
+            Some(error_details(error, "error"))
+        }
+        _ => None,
     }
 }
 
@@ -4968,6 +5164,109 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
+    }
+
+    fn record_synthetic_sse_trace(
+        state: &Arc<AppState>,
+        id: &str,
+        upstream_format: &'static str,
+        chunks: &[&[u8]],
+    ) -> Vec<Vec<u8>> {
+        let mut observer = SseErrorObserver::new(upstream_format);
+        let mut forwarded = Vec::new();
+        for chunk in chunks {
+            // This mirrors the production ordering: inspect the chunk, then
+            // pass that exact chunk through unchanged.
+            observer.observe(chunk);
+            forwarded.push(chunk.to_vec());
+        }
+        observer.finish();
+
+        let mut trace = TraceRecord {
+            id: id.into(),
+            ts_request_ms: now_ms(),
+            status: Some(StatusCode::OK.as_u16() as i64),
+            streamed: Some(true),
+            upstream_format: Some(upstream_format.into()),
+            ..Default::default()
+        };
+        trace.error = observer.error();
+        let response: Vec<u8> = forwarded.iter().flatten().copied().collect();
+        finalize_trace(state, trace, b"{}", None, Some(&response));
+        forwarded
+    }
+
+    #[test]
+    fn anthropic_sse_error_trace_keeps_the_http_200_stream_unchanged() {
+        let state = test_state("anthropic-sse-error");
+        let stream = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+        let forwarded = record_synthetic_sse_trace(
+            &state,
+            "anthropic-sse-error",
+            "anthropic",
+            &[stream.as_slice()],
+        );
+
+        assert_eq!(forwarded, vec![stream.to_vec()]);
+        let trace = state
+            .store
+            .get_trace("anthropic-sse-error")
+            .unwrap()
+            .unwrap();
+        assert_eq!(trace["status"], StatusCode::OK.as_u16());
+        assert_eq!(
+            trace["error"],
+            "upstream stream error: overloaded_error: Overloaded"
+        );
+    }
+
+    #[test]
+    fn split_responses_sse_error_trace_keeps_each_forwarded_chunk_unchanged() {
+        let state = test_state("split-responses-sse-error");
+        let first = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"overloaded_error\",\"mes";
+        let second = b"sage\":\"try again later\"}}}\n\n";
+
+        let forwarded = record_synthetic_sse_trace(
+            &state,
+            "split-responses-sse-error",
+            "openai-responses",
+            &[first.as_slice(), second.as_slice()],
+        );
+
+        assert_eq!(forwarded, vec![first.to_vec(), second.to_vec()]);
+        let trace = state
+            .store
+            .get_trace("split-responses-sse-error")
+            .unwrap()
+            .unwrap();
+        assert_eq!(trace["status"], StatusCode::OK.as_u16());
+        assert_eq!(
+            trace["error"],
+            "upstream stream error: overloaded_error: try again later"
+        );
+    }
+
+    #[test]
+    fn sse_error_observer_recognizes_openai_chat_and_gemini_error_frames() {
+        let cases = [
+            (
+                "openai-chat",
+                b"data: {\"error\":{\"type\":\"server_error\",\"message\":\"temporarily unavailable\"}}\n\n".as_slice(),
+                "upstream stream error: server_error: temporarily unavailable",
+            ),
+            (
+                "gemini",
+                b"data: {\"response\":{\"error\":{\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"quota exhausted\"}}}\n\n".as_slice(),
+                "upstream stream error: RESOURCE_EXHAUSTED: quota exhausted",
+            ),
+        ];
+        for (upstream_format, frame, expected) in cases {
+            let mut observer = SseErrorObserver::new(upstream_format);
+            observer.observe(frame);
+            observer.finish();
+            assert_eq!(observer.error().as_deref(), Some(expected));
+        }
     }
 
     struct FakeUpdater {
