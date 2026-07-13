@@ -99,7 +99,7 @@ fn routing_limits_from_headers(
             Provider::Openai => OPENAI_LIMIT_HEADERS.contains(&name),
             Provider::Anthropic => name.starts_with("anthropic-ratelimit-"),
             Provider::Xai => name.starts_with("x-ratelimit-"),
-            Provider::Gemini | Provider::Amp => false,
+            Provider::Gemini | Provider::Openrouter | Provider::Amp => false,
         };
         if allowed {
             if let Ok(value) = value.to_str() {
