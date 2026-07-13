@@ -231,6 +231,15 @@ When a subscription expires you get a notification and a one-click fix. Each pro
 cd macos && swift test    # menu bar app tests
 ```
 
+## Got a bug or feature request?
+
+Open one — bugs, ideas, and feature requests all go to
+[GitHub Issues](https://github.com/madhavajay/alex/issues/new). The macOS app has the same link
+under **Report a Bug or Request a Feature…** in the menu bar and in Settings → General.
+
+Built by [madhavajay](https://github.com/madhavajay/) — message me on X:
+[@madhavajay](https://x.com/madhavajay).
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
