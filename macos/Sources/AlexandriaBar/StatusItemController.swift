@@ -453,6 +453,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             TerminalLauncher.launch(command: "\(bin) tui")
         }
         menu.addItem(.separator())
+        addAction("Report a Bug or Request a Feature…", symbol: "exclamationmark.bubble") {
+            NSWorkspace.shared.open(PreferencesView.issuesURL)
+        }
         addAction("Settings…", symbol: "gearshape") { [weak self] in
             self?.openPreferences()
         }

@@ -149,7 +149,25 @@ struct PreferencesView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        Section("Feedback") {
+            Link("Report a bug or request a feature", destination: Self.issuesURL)
+            Text("Bugs, ideas, and feature requests all go to GitHub Issues.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        Section("About") {
+            LabeledContent("Built by") {
+                Link("github.com/madhavajay", destination: Self.authorURL)
+            }
+            LabeledContent("Message me on X") {
+                Link("@madhavajay", destination: Self.authorXURL)
+            }
+        }
     }
+
+    static let issuesURL = URL(string: "https://github.com/madhavajay/alex/issues/new")!
+    static let authorURL = URL(string: "https://github.com/madhavajay/")!
+    static let authorXURL = URL(string: "https://x.com/madhavajay")!
 
     private func copyGenericCredentials() {
         guard let config = store.config else { return }
