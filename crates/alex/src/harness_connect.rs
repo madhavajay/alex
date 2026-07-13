@@ -1326,6 +1326,7 @@ mod tests {
             ping_openai_model: crate::default_ping_openai(),
             ping_xai_model: crate::default_ping_xai(),
             ping_gemini_model: crate::default_ping_gemini(),
+            ping_openrouter_model: crate::default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
             dario_api_key: String::new(),

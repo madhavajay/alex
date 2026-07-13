@@ -28,6 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 const OPENAI_BASE: &str = "https://api.openai.com";
+const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const XAI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION: &str = "0.2.77";
@@ -119,6 +120,7 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
+    openrouter_models: std::sync::Mutex<Vec<String>>,
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     trace_ingest_lock: tokio::sync::Mutex<()>,
@@ -285,6 +287,7 @@ pub fn build_state(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
+        openrouter_models: std::sync::Mutex::new(Vec::new()),
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         trace_ingest_lock: tokio::sync::Mutex::new(()),
@@ -630,8 +633,43 @@ async fn connect_info(
     axum::Json(payload).into_response()
 }
 
+async fn refresh_openrouter_models(state: &AppState) {
+    let Ok(account) = state.vault.account_for(Provider::Openrouter, false).await else {
+        return;
+    };
+    let Ok(headers) = openrouter_auth_headers(&account) else {
+        return;
+    };
+    let Ok(response) = state
+        .http
+        .get(format!("{OPENROUTER_BASE}/models"))
+        .headers(headers)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(payload) = response.json::<Value>().await else {
+        return;
+    };
+    let models = alex_core::parse_openrouter_models_response(&payload);
+    if let Ok(mut cached) = state.openrouter_models.lock() {
+        *cached = models;
+    }
+}
+
 async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // OpenRouter is the sole dynamic provider catalog. Refresh only on an
+    // explicit model-list request; Alexandria has no catalog refresh worker.
+    refresh_openrouter_models(&state).await;
     let mut ids = state.store.pricing_models();
+    if let Ok(models) = state.openrouter_models.lock() {
+        ids.extend(models.iter().map(|id| format!("openrouter/{id}")));
+    }
     for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
@@ -2118,6 +2156,7 @@ pub struct PingModels {
     pub openai: String,
     pub xai: String,
     pub gemini: String,
+    pub openrouter: String,
 }
 
 pub async fn ping_provider(
@@ -2166,6 +2205,15 @@ pub async fn ping_provider(
                 "model": models.gemini,
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": 64},
+            }),
+        ),
+        Provider::Openrouter => (
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            json!({
+                "model": format!("openrouter/{}", models.openrouter),
+                "stream": false,
+                "messages": [{"role": "user", "content": prompt}],
             }),
         ),
         Provider::Amp => {
@@ -2283,6 +2331,7 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
                         | Provider::Openai
                         | Provider::Xai
                         | Provider::Gemini
+                        | Provider::Openrouter
                         | Provider::Amp
                 )
                 && !seen.contains(&a.provider)
@@ -2986,6 +3035,54 @@ async fn plan_upstream(
                 )),
             }
         }
+        Provider::Openrouter => {
+            let account = state
+                .vault
+                .account_for_excluding(provider, false, excluded_accounts)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            match format {
+                ClientFormat::OpenaiChat => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        account,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::AnthropicMessages => {
+                    let mut converted = translate::anthropic_to_openai_chat(body_json);
+                    converted["model"] = json!(routed_model);
+                    converted["stream"] = json!(false);
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        account,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                    })
+                }
+                ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "the OpenRouter upstream speaks OpenAI chat completions; POST to /v1/chat/completions or /v1/messages"
+                        .to_string(),
+                )),
+            }
+        }
         Provider::Amp => Err((
             StatusCode::NOT_IMPLEMENTED,
             "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
@@ -3272,8 +3369,10 @@ fn upstream_headers(
     h.insert("content-type", HeaderValue::from_static("application/json"));
     h.insert("accept", HeaderValue::from_static("*/*"));
     h.insert("accept-encoding", HeaderValue::from_static("identity"));
-    if let Some(ua) = client_headers.get("user-agent") {
-        h.insert("user-agent", ua.clone());
+    if account.provider != Provider::Openrouter {
+        if let Some(ua) = client_headers.get("user-agent") {
+            h.insert("user-agent", ua.clone());
+        }
     }
     match (account.provider, account.kind.as_str()) {
         (Provider::Anthropic, "oauth") => {
@@ -3366,6 +3465,9 @@ fn upstream_headers(
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
         }
+        (Provider::Openrouter, _) => {
+            h.extend(openrouter_auth_headers(account)?);
+        }
         (Provider::Xai, _) => {
             let token = account
                 .access_token
@@ -3424,6 +3526,36 @@ fn upstream_headers(
         }
     }
     Ok(h)
+}
+
+/// OpenRouter credentials and attribution come only from the selected vault
+/// account. This deliberately has no access to inbound client headers.
+fn openrouter_auth_headers(
+    account: &Account,
+) -> Result<reqwest::header::HeaderMap, (StatusCode, String)> {
+    let key = account.api_key.as_deref().ok_or((
+        StatusCode::BAD_GATEWAY,
+        "openrouter account has no api key".to_string(),
+    ))?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+    );
+    for (meta_key, header_name) in [
+        ("http_referer", "http-referer"),
+        ("x_title", "x-title"),
+    ] {
+        if let Some(value) = account.account_meta.get(meta_key).and_then(Value::as_str) {
+            headers.insert(
+                header_name,
+                HeaderValue::from_str(value)
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
+        }
+    }
+    Ok(headers)
 }
 
 fn insert_anthropic_version(h: &mut reqwest::header::HeaderMap, client_headers: &HeaderMap) {
@@ -4665,6 +4797,31 @@ mod tests {
         }
     }
 
+    fn openrouter_account() -> Account {
+        Account {
+            id: "openrouter-api-key".into(),
+            provider: Provider::Openrouter,
+            kind: "api_key".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
+            label: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+            api_key: Some("openrouter-secret".into()),
+            expires_at_ms: None,
+            last_refresh_ms: None,
+            account_meta: json!({
+                "http_referer": "https://alexandria.example",
+                "x_title": "Alexandria",
+            }),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
     struct FakeDario {
         active: Option<DarioActive>,
         begin_succeeds: bool,
@@ -4959,6 +5116,31 @@ mod tests {
         assert!(non_claude.get("x-app").is_none());
         assert!(non_claude.get("x-claude-code-session-id").is_none());
         assert_eq!(non_claude["authorization"], "Bearer direct-token");
+    }
+
+    #[test]
+    fn openrouter_headers_use_only_vault_credentials_and_attribution() {
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("another-provider-key"));
+        client_headers.insert(
+            "http-referer",
+            HeaderValue::from_static("https://caller.example"),
+        );
+        client_headers.insert("x-title", HeaderValue::from_static("Caller title"));
+        client_headers.insert("user-agent", HeaderValue::from_static("caller-agent"));
+
+        let headers = upstream_headers(&openrouter_account(), &client_headers, false).unwrap();
+        assert_eq!(headers["authorization"], "Bearer openrouter-secret");
+        assert_eq!(headers["http-referer"], "https://alexandria.example");
+        assert_eq!(headers["x-title"], "Alexandria");
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("user-agent").is_none());
+        assert_ne!(headers["authorization"], "Bearer caller-secret");
+        assert_ne!(headers["http-referer"], "https://caller.example");
     }
 
     async fn response_json(resp: Response) -> (StatusCode, Value) {
