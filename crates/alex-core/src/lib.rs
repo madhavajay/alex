@@ -1,6 +1,11 @@
+pub mod amp_usage;
 pub mod grok_billing;
 pub mod translate;
 
+pub use amp_usage::{
+    parse_usage_api_response, parse_usage_display_text, usage_to_limits_entry, AmpUsageSnapshot,
+    AmpWorkspaceBalance,
+};
 pub use grok_billing::{
     parse_grpc_web_response, validate_grpc_status_headers, window_label, GrokWebBillingError,
     GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
@@ -16,6 +21,8 @@ pub enum Provider {
     Openai,
     Gemini,
     Xai,
+    /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
+    Amp,
 }
 
 impl Provider {
@@ -25,6 +32,7 @@ impl Provider {
             Provider::Openai => "openai",
             Provider::Gemini => "gemini",
             Provider::Xai => "xai",
+            Provider::Amp => "amp",
         }
     }
 
@@ -34,6 +42,7 @@ impl Provider {
             "openai" | "codex" | "chatgpt" => Some(Provider::Openai),
             "gemini" | "google" => Some(Provider::Gemini),
             "xai" | "grok" => Some(Provider::Xai),
+            "amp" | "ampcode" => Some(Provider::Amp),
             _ => None,
         }
     }
@@ -176,7 +185,7 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
                 "remaining": hi(h, "x-ratelimit-remaining-tokens"),
             },
         }),
-        Provider::Gemini => Value::Null,
+        Provider::Gemini | Provider::Amp => Value::Null,
     }
 }
 
@@ -376,6 +385,14 @@ pub struct TraceRecord {
     pub key_fingerprint: Option<String>,
     pub reasoning_effort: Option<String>,
     pub thinking_budget: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceIngestPayload {
+    pub trace: TraceRecord,
+    pub request_body_b64: Option<String>,
+    pub upstream_request_body_b64: Option<String>,
+    pub response_body_b64: Option<String>,
 }
 
 pub fn parse_trace_tags(values: &[&str]) -> Value {
@@ -640,7 +657,10 @@ mod tests {
             Some("\nsolo".to_string())
         );
         assert_eq!(
-            conversation_root(ClientFormat::OpenaiChat, &serde_json::json!({"messages": []})),
+            conversation_root(
+                ClientFormat::OpenaiChat,
+                &serde_json::json!({"messages": []})
+            ),
             None
         );
     }
@@ -664,7 +684,10 @@ mod tests {
             Some("\nplain".to_string())
         );
         assert_eq!(
-            conversation_root(ClientFormat::OpenaiResponses, &serde_json::json!({"input": []})),
+            conversation_root(
+                ClientFormat::OpenaiResponses,
+                &serde_json::json!({"input": []})
+            ),
             None
         );
     }

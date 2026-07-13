@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "description": "Declarative wrap profiles for harness binaries that need special capture (base-URL override, env proxy, settings files, credential import). Update a profile here when a harness changes knobs \u2014 no code change required for env renames.",
+  "template_vars": {
+    "wrap_base_url": "URL of the local reverse wrap or HTTP proxy (e.g. http://127.0.0.1:4101)",
+    "credential": "Resolved API key / token for this harness",
+    "capture_dir": "Per-run directory for logs, settings dumps, flow jsonl",
+    "ca_cert_path": "Optional PEM CA for TLS-trusting clients (env_proxy mode)",
+    "settings_path": "Resolved settings file path for this run"
+  },
+  "harnesses": {
+    "amp": {
+      "aliases": [
+        "amp-code",
+        "ampcode"
+      ],
+      "binary": "amp",
+      "binary_candidates": [
+        "amp",
+        "~/.local/bin/amp",
+        "~/.amp/bin/amp"
+      ],
+      "description": "Sourcegraph Amp CLI. Inference rides actor WebSocket; AMP_URL funnels all API+WS to the wrap. amp.proxy alone misses the actor stream; HTTPS_PROXY env does not.",
+      "enabled": true,
+      "default_mode": "base_url",
+      "upstream": {
+        "default": "https://ampcode.com",
+        "notes": "Reverse wrap forwards management + actor traffic here when mode is base_url."
+      },
+      "reverse_inject": {
+        "notes": "Amp hardcodes Rivet public token as URL password only for non-localhost AMP_URL. When wrap binds on 127.0.0.1, the CLI omits rvt-token and production closes WS with guard.missing_header. Inject the public gateway token on actor paths.",
+        "query_params": {
+          "rvt-token": "pk_9tm4qz3zrMerdZXTlBRLRsmJIzSQIPH24meKBqiL6vVpscTvc4w1YPiBgymXf9Az"
+        },
+        "path_prefixes": [
+          "/actors/"
+        ],
+        "only_if_missing": true
+      },
+      "credentials": {
+        "kind": "secrets_json",
+        "path": "~/.local/share/amp/secrets.json",
+        "key_prefix": "apiKey@",
+        "prefer_url_contains": "ampcode.com",
+        "env_fallbacks": [
+          "AMP_API_KEY"
+        ],
+        "vault_provider": "amp",
+        "vault_account_id": "amp-api-key"
+      },
+      "capture": {
+        "jsonl_name": "flows.jsonl",
+        "log_name": "amp.log",
+        "interesting_path_prefixes": [
+          "/api/",
+          "/actors/",
+          "/auth/"
+        ],
+        "ignore_path_prefixes": [
+          "/static/",
+          "/assets/"
+        ],
+        "redact_query_keys": [
+          "rvt-token",
+          "auth_token",
+          "token",
+          "key",
+          "api_key"
+        ],
+        "redact_headers": [
+          "authorization",
+          "cookie",
+          "set-cookie",
+          "x-api-key",
+          "proxy-authorization"
+        ],
+        "max_body_preview_bytes": 8000,
+        "max_events": 10000
+      },
+      "modes": {
+        "base_url": {
+          "description": "AMP_URL / amp.url reverse wrap \u2014 single choke point for REST + actor WS path routing.",
+          "wrap_role": "reverse_http",
+          "preferred": true,
+          "env": {
+            "AMP_URL": "{wrap_base_url}",
+            "AMP_API_KEY": "{credential}"
+          },
+          "optional_env": {
+            "AMP_LOG_FILE": "{capture_dir}/amp.log",
+            "AMP_DEBUG": "1"
+          },
+          "settings_file": {
+            "path": "{capture_dir}/settings.json",
+            "cli_flag": "--settings-file",
+            "merge": {
+              "amp.url": "{wrap_base_url}",
+              "amp.updates.mode": "disabled",
+              "amp.network.timeout": 60
+            }
+          },
+          "cli_args_prefix": [],
+          "cli_args_suffix": [
+            "--log-file",
+            "{capture_dir}/amp.log"
+          ],
+          "notes": "Keys are scoped per AMP_URL; always pass AMP_API_KEY (or re-import) when pointing at localhost."
+        },
+        "env_proxy": {
+          "description": "HTTP(S)_PROXY env for clients that honor process proxy (captures actor WS when TLS is trusted).",
+          "wrap_role": "http_proxy",
+          "preferred": false,
+          "env": {
+            "HTTPS_PROXY": "{wrap_base_url}",
+            "HTTP_PROXY": "{wrap_base_url}",
+            "https_proxy": "{wrap_base_url}",
+            "http_proxy": "{wrap_base_url}",
+            "AMP_API_KEY": "{credential}"
+          },
+          "optional_env": {
+            "NODE_EXTRA_CA_CERTS": "{ca_cert_path}",
+            "SSL_CERT_FILE": "{ca_cert_path}",
+            "AMP_LOG_FILE": "{capture_dir}/amp.log"
+          },
+          "settings_file": {
+            "path": "{capture_dir}/settings.json",
+            "cli_flag": "--settings-file",
+            "merge": {
+              "amp.updates.mode": "disabled",
+              "amp.network.timeout": 60
+            }
+          },
+          "cli_args_suffix": [
+            "--log-file",
+            "{capture_dir}/amp.log"
+          ],
+          "notes": "Requires a TLS-capable HTTP proxy and CA trust. Do not confuse with amp.proxy settings (WS bypasses that)."
+        },
+        "amp_proxy_setting": {
+          "description": "amp.proxy settings only \u2014 incomplete (misses actor WebSocket). Kept for diagnostics.",
+          "wrap_role": "http_proxy",
+          "preferred": false,
+          "env": {
+            "AMP_API_KEY": "{credential}"
+          },
+          "settings_file": {
+            "path": "{capture_dir}/settings.json",
+            "cli_flag": "--settings-file",
+            "merge": {
+              "amp.proxy": "{wrap_base_url}",
+              "amp.updates.mode": "disabled",
+              "amp.network.timeout": 60
+            }
+          },
+          "notes": "Diagnostic-only: REST is captured, actor stream is not."
+        }
+      }
+    },
+    "agent": {
+      "aliases": [
+        "cursor-agent",
+        "cursor"
+      ],
+      "binary": "agent",
+      "binary_candidates": [
+        "agent",
+        "~/.local/bin/agent"
+      ],
+      "description": "Cursor Agent CLI. Hidden --endpoint points the Connect/Web/WS API at the local reverse wrap for capture.",
+      "enabled": true,
+      "default_mode": "base_url",
+      "upstream": {
+        "default": "https://api2.cursor.sh",
+        "notes": "Cursor Agent backend endpoint used by the CLI."
+      },
+      "capture": {
+        "jsonl_name": "flows.jsonl",
+        "log_name": "agent.log",
+        "interesting_path_prefixes": [
+          "/"
+        ],
+        "ignore_path_prefixes": [
+          "/static/",
+          "/assets/"
+        ],
+        "redact_query_keys": [
+          "token",
+          "key",
+          "api_key",
+          "auth_token"
+        ],
+        "redact_headers": [
+          "authorization",
+          "cookie",
+          "set-cookie",
+          "x-api-key",
+          "proxy-authorization"
+        ],
+        "max_body_preview_bytes": 8000,
+        "max_events": 10000
+      },
+      "modes": {
+        "base_url": {
+          "description": "Cursor Agent --endpoint reverse wrap \u2014 captures CLI API traffic without TLS MITM.",
+          "wrap_role": "reverse_http",
+          "preferred": true,
+          "env": {},
+          "optional_env": {
+            "CURSOR_API_KEY": "{credential}"
+          },
+          "cli_args_prefix": [
+            "--endpoint",
+            "{wrap_base_url}"
+          ],
+          "cli_args_suffix": [],
+          "notes": "Uses existing Cursor login unless CURSOR_API_KEY/CURSOR_AUTH_TOKEN is supplied. Use -- after alex args before agent flags."
+        }
+      }
+    }
+  }
+}

@@ -36,7 +36,11 @@ struct LimitsCardView: View {
                     .lineLimit(2)
             }
             ForEach(provider.windows ?? [], id: \.window) { window in
-                windowRow(window)
+                if window.window == "credits" || window.window.hasPrefix("ws:") {
+                    ampBalanceRow(window)
+                } else {
+                    windowRow(window)
+                }
             }
             if provider.windows?.isEmpty != false, let requests = provider.requests {
                 countRow("requests", requests)
@@ -71,6 +75,25 @@ struct LimitsCardView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
                 .frame(width: 52, alignment: .trailing)
+        }
+    }
+
+    @ViewBuilder
+    private func ampBalanceRow(_ window: LimitWindow) -> some View {
+        HStack(spacing: 8) {
+            Text(window.window == "credits" ? "credits" : window.window)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .leading)
+            if let usd = window.remainingUsd {
+                Text(String(format: "$%.2f remaining", usd))
+                    .font(.system(size: 10, design: .monospaced))
+            } else {
+                Text("—")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
         }
     }
 

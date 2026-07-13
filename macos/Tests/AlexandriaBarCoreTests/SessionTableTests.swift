@@ -55,6 +55,30 @@ import Testing
         #expect(row.duration == "0s")
     }
 
+    @Test func capturedProvidersOverrideModelInferenceForWrappedHarnesses() {
+        let amp = SessionRow(session: session([
+            "session_id": "amp-session",
+            "trace_count": 1,
+            "models": ["claude-opus-4-8"],
+            "providers": ["amp"],
+            "harness": "amp",
+            "tags": ["harness": "amp"],
+        ]))
+        #expect(amp.providers == ["amp"])
+        #expect(amp.iconAsset == "amp-code.svg")
+
+        let cursor = SessionRow(session: session([
+            "session_id": "cursor-session",
+            "trace_count": 1,
+            "models": ["cursor-agent"],
+            "providers": ["cursor"],
+            "harness": "agent",
+            "tags": ["harness": "agent"],
+        ]))
+        #expect(cursor.providers == ["cursor"])
+        #expect(cursor.iconAsset == "cursor-cli.png")
+    }
+
     @Test func shortSessionId() {
         #expect(SessionRow.shortId("exactly-22-characters-") == "exactly-22-characters-")
         #expect(SessionRow.shortId("exactly-23-characters-x") == "exactly-23…acters-x")
@@ -138,7 +162,7 @@ import Testing
         #expect(machine.selectedId == "A")
 
         #expect(machine.userSelect("B") == .selected("B"))
-        #expect(machine.pinned)
+        #expect(!machine.pinned)
         #expect(machine.selectedId == "B")
 
         #expect(machine.setLive(true, newestVisibleId: "A") == .selected("A"))
@@ -146,7 +170,7 @@ import Testing
         #expect(machine.selectedId == "A")
 
         #expect(machine.setLive(false, newestVisibleId: "A") == .none)
-        #expect(machine.pinned)
+        #expect(!machine.pinned)
     }
 
     @Test func selectionBindingGuard() {
@@ -157,12 +181,12 @@ import Testing
         #expect(machine.selectedId == "A")
 
         #expect(machine.bindingSelect("A") == .none)
-        #expect(machine.pinned)
+        #expect(!machine.pinned)
 
         machine.setLive(true, newestVisibleId: "A")
         #expect(!machine.pinned)
         #expect(machine.bindingSelect("B") == .selected("B"))
-        #expect(machine.pinned)
+        #expect(!machine.pinned)
         #expect(machine.selectedId == "B")
 
         #expect(machine.bindingSelect(nil) == .none)
@@ -178,7 +202,7 @@ import Testing
         #expect(machine.followSelect("A") == .none)
         #expect(!machine.pinned)
         #expect(machine.userSelect("A") == .none)
-        #expect(machine.pinned)
+        #expect(!machine.pinned)
     }
 
     @Test func customizationRoundtrip() throws {

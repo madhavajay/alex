@@ -8,8 +8,9 @@ use std::time::Duration;
 use alex_auth::{now_ms, Account, Vault};
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
-    parse_trace_tags, route_model, usage_from_json, validate_grpc_status_headers, window_label,
-    ClientFormat, Provider, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+    parse_trace_tags, parse_usage_api_response, route_model, usage_from_json,
+    usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
+    TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{Store, TraceFilter};
 use axum::body::{Body, Bytes};
@@ -79,14 +80,17 @@ pub struct AppState {
     pub base_url: String,
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
+    pub amp_usage: std::sync::Mutex<UsageCache>,
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
+    trace_ingest_lock: tokio::sync::Mutex<()>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CachedRunKey {
+    pub kind: String,
     pub run_id: Option<String>,
     pub tags_json: Option<String>,
     pub expires_ms: Option<i64>,
@@ -133,8 +137,10 @@ pub fn build_state(
         base_url,
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
+        amp_usage: std::sync::Mutex::new(UsageCache::default()),
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
+        trace_ingest_lock: tokio::sync::Mutex::new(()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
     })
@@ -161,6 +167,17 @@ async fn require_local_key(
         );
     }
     next.run(req).await
+}
+
+async fn require_trace_ingest_key(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match authenticate_trace_ingest(&state, req.headers()) {
+        Ok(_) => next.run(req).await,
+        Err(response) => response,
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -198,7 +215,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/auth/import", post(admin_auth_import))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
-        .route("/admin/auth/login/complete", post(admin_auth_login_complete))
+        .route(
+            "/admin/auth/login/complete",
+            post(admin_auth_login_complete),
+        )
         .route("/admin/auth/login/{id}", get(admin_auth_login_status))
         .route("/traces/search", get(traces_search))
         .route("/traces/export.ndjson", get(traces_export))
@@ -212,11 +232,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/traces/{id}/body/{kind}", get(trace_body))
         .route("/traces/runs/{run_id}", get(traces_run_summary))
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
-        .route("/traces/runs/{run_id}/export.ndjson", get(traces_run_export))
+        .route(
+            "/traces/runs/{run_id}/export.ndjson",
+            get(traces_run_export),
+        )
         .route("/traces/runs/{run_id}/artifacts", get(traces_run_artifacts))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_local_key,
+        ));
+    // Authenticate ingest before Axum buffers/parses its potentially large
+    // JSON body. The handler authenticates again to obtain ownership metadata.
+    let ingest = Router::new()
+        .route(
+            "/traces/ingest",
+            get(traces_ingest_status).post(traces_ingest),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_trace_ingest_key,
         ));
 
     Router::new()
@@ -229,6 +263,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(openai_chat))
         .route("/responses", post(openai_responses))
         .route("/v1beta/models/{model_action}", post(gemini_generate))
+        .merge(ingest)
         .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
@@ -276,7 +311,11 @@ async fn admin_auth_gemini_key(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
 ) -> Response {
-    let Some(key) = body.0["key"].as_str().map(str::trim).filter(|k| !k.is_empty()) else {
+    let Some(key) = body.0["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'key'");
     };
     let account = Account {
@@ -458,7 +497,11 @@ fn usage_backoff_ms(failures: u32, retry_after_ms: Option<i64>) -> i64 {
 }
 
 async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
-    let account = state.vault.account_for(Provider::Anthropic, true).await.ok()?;
+    let account = state
+        .vault
+        .account_for(Provider::Anthropic, true)
+        .await
+        .ok()?;
     if account.kind != "oauth" {
         return None;
     }
@@ -543,6 +586,93 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     }
 }
 
+const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
+
+/// Amp Free / individual / workspace credits via the same API CodexBar uses.
+async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state.vault.account_for(Provider::Amp, false).await.ok()?;
+    let token = account
+        .api_key
+        .as_deref()
+        .or(account.access_token.as_deref())?
+        .to_string();
+    {
+        let cache = state.amp_usage.lock().unwrap();
+        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
+            return cache.entry.clone();
+        }
+        if now_ms() < cache.cooldown_until_ms {
+            return cache.entry.clone();
+        }
+    }
+    let body = json!({ "method": "userDisplayBalanceInfo", "params": {} });
+    let result = state
+        .http
+        .post(AMP_USAGE_URL)
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .header("user-agent", "alexandria-amp-usage")
+        .json(&body)
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            let raw = resp.text().await.unwrap_or_default();
+            match parse_usage_api_response(&raw) {
+                Ok(snap) => {
+                    let entry = usage_to_limits_entry(&snap, account.label.as_deref());
+                    let mut cache = state.amp_usage.lock().unwrap();
+                    cache.fetched_at_ms = now_ms();
+                    cache.cooldown_until_ms = 0;
+                    cache.failures = 0;
+                    cache.entry = Some(entry.clone());
+                    Some(entry)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "amp usage parse failed");
+                    let mut cache = state.amp_usage.lock().unwrap();
+                    cache.failures += 1;
+                    let cooldown = usage_backoff_ms(cache.failures, None);
+                    cache.cooldown_until_ms = now_ms() + cooldown;
+                    cache.entry.clone().or_else(|| {
+                        Some(json!({
+                            "provider": "amp",
+                            "source": "amp usage API",
+                            "error": e,
+                            "plan": account.label,
+                        }))
+                    })
+                }
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let mut cache = state.amp_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, None);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            tracing::debug!(status, "amp usage endpoint unavailable; backing off");
+            cache.entry.clone().or_else(|| {
+                Some(json!({
+                    "provider": "amp",
+                    "source": "amp usage API",
+                    "error": format!("HTTP {status}"),
+                    "plan": account.label,
+                }))
+            })
+        }
+        Err(e) => {
+            let mut cache = state.amp_usage.lock().unwrap();
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, None);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            tracing::debug!(error = %e, "amp usage request failed");
+            cache.entry.clone()
+        }
+    }
+}
+
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
 /// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
 async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
@@ -585,7 +715,9 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 .filter_map(|(k, v)| {
                     let key = k.as_str();
                     if key.starts_with("grpc-") {
-                        v.to_str().ok().map(|val| (key.to_string(), val.to_string()))
+                        v.to_str()
+                            .ok()
+                            .map(|val| (key.to_string(), val.to_string()))
                     } else {
                         None
                     }
@@ -683,6 +815,9 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
     if let Some(entry) = xai_usage_entry(state).await {
         providers.push(entry);
     }
+    if let Some(entry) = amp_usage_entry(state).await {
+        providers.push(entry);
+    }
     for (provider_str, ts_ms, headers_json) in
         state.store.latest_provider_headers().unwrap_or_default()
     {
@@ -736,7 +871,10 @@ async fn admin_update_apply(State(state): State<Arc<AppState>>) -> Response {
         .ok()
         .and_then(|slot| slot.clone());
     let Some(updater) = updater else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "daemon updater is not configured");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon updater is not configured",
+        );
     };
     match updater.apply().await {
         Ok(body) => {
@@ -882,7 +1020,10 @@ async fn admin_storage_prune(
         v => match v.as_i64() {
             Some(ms) => ms,
             None => {
-                return error_response(StatusCode::BAD_REQUEST, "'older_than_ms' must be an integer")
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "'older_than_ms' must be an integer",
+                )
             }
         },
     };
@@ -939,7 +1080,9 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
 }
 
 fn wants_bodies(q: &HashMap<String, String>) -> bool {
-    q.get("bodies").map(|v| v == "1" || v == "true").unwrap_or(false)
+    q.get("bodies")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
 }
 
 fn read_gz_file(path: &str) -> Option<Vec<u8>> {
@@ -1147,6 +1290,38 @@ async fn traces_sessions(
     }
 }
 
+fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
+    let Ok(response) = serde_json::from_str::<Value>(resp_text) else {
+        return Vec::new();
+    };
+    let mut tool_calls = 0usize;
+    response
+        .pointer("/_alexandria/assistant_blocks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => block["text"].as_str().map(
+                |text| json!({"type": "text", "text": truncate_chars(text.to_string(), 8000)}),
+            ),
+            Some("tool_call") if tool_calls < 24 => {
+                let name = block["name"].as_str()?;
+                tool_calls += 1;
+                Some(json!({
+                    "type": "tool_call",
+                    "name": name,
+                    "arguments": truncate_chars(
+                        block["arguments"].as_str().unwrap_or_default().to_string(),
+                        600,
+                    ),
+                }))
+            }
+            _ => None,
+        })
+        .take(64)
+        .collect()
+}
+
 fn transcript_turn(row: &Value) -> Value {
     use alex_core::translate;
     let user = read_gz_json(row["req_body_path"].as_str())
@@ -1178,11 +1353,16 @@ fn transcript_turn(row: &Value) -> Value {
             c
         })
         .collect();
+    let assistant_blocks = resp_text
+        .as_deref()
+        .map(transcript_assistant_blocks)
+        .unwrap_or_default();
     json!({
         "trace_id": row["id"],
         "ts_request_ms": row["ts_request_ms"],
         "ts_response_ms": row["ts_response_ms"],
         "model": row["routed_model"],
+        "provider": row["upstream_provider"],
         "status": row["status"],
         "input_tokens": row["input_tokens"],
         "output_tokens": row["output_tokens"],
@@ -1193,6 +1373,7 @@ fn transcript_turn(row: &Value) -> Value {
         "user": user,
         "assistant": assistant,
         "tool_calls": tool_calls,
+        "assistant_blocks": assistant_blocks,
     })
 }
 
@@ -1216,7 +1397,10 @@ async fn traces_session_transcript(
 
 fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
     (
-        req["reasoning"]["effort"].as_str().map(String::from),
+        req["reasoning"]["effort"]
+            .as_str()
+            .or_else(|| req["output_config"]["effort"].as_str())
+            .map(String::from),
         req["thinking"]["budget_tokens"].as_i64(),
     )
 }
@@ -1289,9 +1473,7 @@ async fn trace_body(
 ) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
-        Ok(None) => {
-            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
-        }
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let path = match kind.as_str() {
@@ -1320,7 +1502,9 @@ async fn trace_body(
                 .header("content-type", ct)
                 .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
                 .body(Body::from(text))
-                .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+                .unwrap_or_else(|e| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                })
         }
         None => error_response(
             StatusCode::NOT_FOUND,
@@ -1333,9 +1517,7 @@ async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     use alex_core::translate;
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
-        Ok(None) => {
-            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
-        }
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let fmt = row["upstream_format"]
@@ -1360,9 +1542,7 @@ async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<Strin
 async fn trace_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.store.get_trace(&id) {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'"))
-        }
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
     match state.store.delete_trace(&id) {
@@ -1550,6 +1730,36 @@ pub async fn ping_provider(
                 "generationConfig": {"maxOutputTokens": 64},
             }),
         ),
+        Provider::Amp => {
+            let account_id = state
+                .vault
+                .account_for(Provider::Amp, false)
+                .await
+                .ok()
+                .map(|a| a.id);
+            let entry = amp_usage_entry(state).await;
+            let ok = entry
+                .as_ref()
+                .map(|e| e.get("error").is_none())
+                .unwrap_or(false);
+            let message = entry
+                .as_ref()
+                .and_then(|e| {
+                    e.get("display_text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.lines().next().unwrap_or(s).to_string())
+                        .or_else(|| e.get("error").and_then(|v| v.as_str()).map(String::from))
+                })
+                .unwrap_or_else(|| "no amp credentials".into());
+            return PingResult {
+                provider: "amp",
+                account_id,
+                ok,
+                status: if ok { Some(200) } else { None },
+                latency_ms: now_ms() - start,
+                message,
+            };
+        }
     };
     let account_id = state
         .vault
@@ -1631,7 +1841,11 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
             if a.status == "active"
                 && matches!(
                     a.provider,
-                    Provider::Anthropic | Provider::Openai | Provider::Xai | Provider::Gemini
+                    Provider::Anthropic
+                        | Provider::Openai
+                        | Provider::Xai
+                        | Provider::Gemini
+                        | Provider::Amp
                 )
                 && !seen.contains(&a.provider)
             {
@@ -1847,7 +2061,11 @@ async fn ensure_gemini_project(
     state: &AppState,
     account: &Account,
 ) -> Result<String, (StatusCode, String)> {
-    if let Some(p) = account.account_meta.get("project_id").and_then(|v| v.as_str()) {
+    if let Some(p) = account
+        .account_meta
+        .get("project_id")
+        .and_then(|v| v.as_str())
+    {
         if !p.is_empty() {
             return Ok(p.to_string());
         }
@@ -1861,10 +2079,12 @@ async fn ensure_gemini_project(
             return Ok(env_p);
         }
     }
-    let token = account
-        .access_token
-        .as_deref()
-        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "gemini account has no access token".into()))?;
+    let token = account.access_token.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "gemini account has no access token".into(),
+        )
+    })?;
     let load_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
     let load_body = json!({
         "cloudaicompanionProject": null,
@@ -1877,15 +2097,18 @@ async fn ensure_gemini_project(
         .json(&load_body)
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("loadCodeAssist failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("loadCodeAssist failed: {e}"),
+            )
+        })?;
     let load: Value = resp.json().await.unwrap_or(Value::Null);
     let extract = |v: &Value| -> Option<String> {
         for key in ["cloudaicompanionProject", "projectId", "project"] {
             match &v[key] {
                 Value::String(s) if !s.is_empty() => return Some(s.clone()),
-                obj if obj["id"].is_string() => {
-                    return obj["id"].as_str().map(String::from)
-                }
+                obj if obj["id"].is_string() => return obj["id"].as_str().map(String::from),
                 _ => {}
             }
         }
@@ -1926,8 +2149,7 @@ async fn ensure_gemini_project(
         .and_then(|t| t["id"].as_str())
         .unwrap_or("free-tier")
         .to_string();
-    let onboard_url =
-        format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
+    let onboard_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
     let onboard_body = json!({
         "tierId": tier,
         "cloudaicompanionProject": load["cloudaicompanionProject"],
@@ -2191,6 +2413,10 @@ async fn plan_upstream(
                 dario_guard: None,
             })
         }
+        Provider::Amp => Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
+        )),
         Provider::Gemini => {
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
@@ -2276,8 +2502,8 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        session_from_metadata, trace_extras, trace_reasoning_fields, transcript_turn,
-        truncate_chars,
+        session_from_metadata, trace_extras, trace_reasoning_fields, transcript_assistant_blocks,
+        transcript_turn, truncate_chars,
     };
     use serde_json::json;
 
@@ -2334,7 +2560,10 @@ mod trace_api_tests {
     #[test]
     fn truncates_on_char_boundaries() {
         assert_eq!(truncate_chars("abc".into(), 8000), "abc");
-        assert_eq!(truncate_chars("héllo".repeat(2000), 8000).chars().count(), 8000);
+        assert_eq!(
+            truncate_chars("héllo".repeat(2000), 8000).chars().count(),
+            8000
+        );
     }
 
     #[test]
@@ -2354,6 +2583,25 @@ mod trace_api_tests {
         assert_eq!(turn["model"], "m");
         assert_eq!(turn["reasoning_effort"], "minimal");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn transcript_assistant_blocks_preserve_text_tool_text_order() {
+        let response = json!({
+            "_alexandria": {"assistant_blocks": [
+                {"type": "text", "text": "Listing the workspace."},
+                {"type": "tool_call", "name": "Shell", "arguments": "{\"command\":\"ls\"}"},
+                {"type": "text", "text": "Here are the files."},
+            ]}
+        });
+        let blocks = transcript_assistant_blocks(&response.to_string());
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "Listing the workspace.");
+        assert_eq!(blocks[1]["type"], "tool_call");
+        assert_eq!(blocks[1]["name"], "Shell");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "Here are the files.");
     }
 }
 
@@ -2557,8 +2805,7 @@ fn upstream_headers(
             ))?;
             h.insert(
                 "x-goog-api-key",
-                HeaderValue::from_str(key)
-                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+                HeaderValue::from_str(key).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
         }
         (Provider::Gemini, _) => {
@@ -2571,6 +2818,12 @@ fn upstream_headers(
                 HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
             );
+        }
+        (Provider::Amp, _) => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "amp is wrap/billing-only".to_string(),
+            ));
         }
     }
     Ok(h)
@@ -2640,6 +2893,7 @@ fn run_key_entry(state: &AppState, key_hash: &str) -> Option<CachedRunKey> {
     }
     let row = state.store.lookup_run_key(key_hash, now).ok().flatten()?;
     let entry = CachedRunKey {
+        kind: row["kind"].as_str().unwrap_or("run").to_string(),
         run_id: row["run_id"].as_str().map(String::from),
         tags_json: row["tags"]
             .as_object()
@@ -2666,19 +2920,27 @@ async fn admin_run_keys_create(
         _ => return error_response(StatusCode::BAD_REQUEST, "'tags' must be an object"),
     };
     let kind = body["kind"].as_str().unwrap_or("run");
-    if kind != "run" && kind != "harness" {
-        return error_response(StatusCode::BAD_REQUEST, "'kind' must be 'run' or 'harness'");
+    if kind != "run" && kind != "harness" && kind != "wrap" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "'kind' must be 'run', 'harness', or 'wrap'",
+        );
     }
     let run_id = body["run_id"].as_str().map(String::from);
     let label = body["label"].as_str().map(String::from);
-    if kind == "harness" && label.as_deref().unwrap_or("").trim().is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "'label' is required for harness keys");
+    if (kind == "harness" || kind == "wrap") && label.as_deref().unwrap_or("").trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "'label' is required for harness and wrap keys",
+        );
     }
     let created_ms = now_ms();
-    let expires_ms = if kind == "harness" {
+    let expires_ms = if kind == "harness" || kind == "wrap" {
         None
     } else {
-        let ttl_seconds = body["ttl_seconds"].as_i64().unwrap_or(RUN_KEY_DEFAULT_TTL_S);
+        let ttl_seconds = body["ttl_seconds"]
+            .as_i64()
+            .unwrap_or(RUN_KEY_DEFAULT_TTL_S);
         if ttl_seconds <= 0 {
             return error_response(StatusCode::BAD_REQUEST, "'ttl_seconds' must be positive");
         }
@@ -2702,7 +2964,15 @@ async fn admin_run_keys_create(
         expires_ms,
     ) {
         Ok(()) => {
-            let (_, exports) = connect_payload(&state.base_url, &key);
+            let exports = if kind == "wrap" {
+                format!(
+                    "export ALEXANDRIA_TRACE_URL={}\nexport ALEXANDRIA_TRACE_KEY={}\n",
+                    state.base_url.trim_end_matches('/'),
+                    key
+                )
+            } else {
+                connect_payload(&state.base_url, &key).1
+            };
             (
                 StatusCode::CREATED,
                 axum::Json(json!({
@@ -2726,7 +2996,10 @@ async fn admin_run_keys_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let all = q.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let all = q
+        .get("all")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     match state.store.list_run_keys(all) {
         Ok(rows) => axum::Json(json!({"run_keys": rows})).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -2745,6 +3018,221 @@ async fn admin_run_keys_revoke(
         Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown run key '{id}'")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+const MAX_INGEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn valid_ingest_trace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn decode_ingest_body(encoded: Option<&str>, field: &str) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine;
+
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("'{field}' is not valid base64: {e}"))?;
+    if bytes.len() > MAX_INGEST_BODY_BYTES {
+        return Err(format!(
+            "'{field}' exceeds the {} byte limit",
+            MAX_INGEST_BODY_BYTES
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn authenticate_trace_ingest(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, Option<CachedRunKey>, bool), Response> {
+    let Some(key) = client_key(headers) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "trace ingest requires an Alexandria wrap key",
+        ));
+    };
+    if key == state.local_key {
+        return Ok((key_fingerprint(&key), None, true));
+    }
+    let key_hash = key_hash_hex(&key);
+    let Some(entry) = run_key_entry(state, &key_hash) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "wrap key expired, revoked, or unknown",
+        ));
+    };
+    if entry.kind != "wrap" {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "trace ingest requires a key minted with --kind wrap",
+        ));
+    }
+    Ok((key_hash.chars().take(16).collect(), Some(entry), false))
+}
+
+fn touch_trace_ingest_key(state: &AppState, key: Option<&CachedRunKey>, headers: &HeaderMap) {
+    if key.is_none() {
+        return;
+    }
+    let Some(raw_key) = client_key(headers) else {
+        return;
+    };
+    let key_hash = key_hash_hex(&raw_key);
+    if let Err(error) = state.store.touch_run_key(&key_hash, now_ms()) {
+        tracing::warn!("failed to touch wrap key: {error}");
+    }
+}
+
+async fn traces_ingest_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match authenticate_trace_ingest(&state, &headers) {
+        Ok((_, key, _)) => {
+            touch_trace_ingest_key(&state, key.as_ref(), &headers);
+            axum::Json(json!({
+                "ok": true,
+                "capability": "trace-ingest-v1",
+                "max_body_bytes": MAX_INGEST_BODY_BYTES,
+            }))
+            .into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+async fn traces_ingest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(mut payload): axum::Json<TraceIngestPayload>,
+) -> Response {
+    let (fingerprint, key, local_admin) = match authenticate_trace_ingest(&state, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    touch_trace_ingest_key(&state, key.as_ref(), &headers);
+    if !valid_ingest_trace_id(&payload.trace.id) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "trace.id must be 1-200 characters using only letters, numbers, '.', '_', or '-'",
+        );
+    }
+    if payload.trace.ts_request_ms <= 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "trace.ts_request_ms must be positive",
+        );
+    }
+    let request = match decode_ingest_body(payload.request_body_b64.as_deref(), "request_body_b64")
+    {
+        Ok(body) => body,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let upstream_request = match decode_ingest_body(
+        payload.upstream_request_body_b64.as_deref(),
+        "upstream_request_body_b64",
+    ) {
+        Ok(body) => body,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let response =
+        match decode_ingest_body(payload.response_body_b64.as_deref(), "response_body_b64") {
+            Ok(body) => body,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+        };
+
+    // Keep ownership check, body replacement, and row upsert together. This
+    // prevents two wrap credentials racing an unused trace id and replacing
+    // one another's bodies between the check and insert.
+    let _ingest_guard = state.trace_ingest_lock.lock().await;
+    let existing = match state.store.get_trace(&payload.trace.id) {
+        Ok(row) => row,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    if let Some(row) = &existing {
+        let owner = row["key_fingerprint"].as_str();
+        if !local_admin && owner != Some(fingerprint.as_str()) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "trace id already belongs to another credential",
+            );
+        }
+    }
+
+    payload.trace.run_id = payload
+        .trace
+        .run_id
+        .or_else(|| key.as_ref().and_then(|entry| entry.run_id.clone()));
+    payload.trace.tags = merge_run_key_tags(
+        key.as_ref().and_then(|entry| entry.tags_json.as_deref()),
+        payload.trace.tags.as_deref(),
+    );
+    payload.trace.key_fingerprint = Some(fingerprint);
+    payload.trace.client_ip = None;
+    payload.trace.req_body_path = existing
+        .as_ref()
+        .and_then(|row| row["req_body_path"].as_str().map(String::from));
+    payload.trace.upstream_req_body_path = existing
+        .as_ref()
+        .and_then(|row| row["upstream_req_body_path"].as_str().map(String::from));
+    payload.trace.resp_body_path = existing
+        .as_ref()
+        .and_then(|row| row["resp_body_path"].as_str().map(String::from));
+
+    if let Some(body) = request {
+        match state
+            .store
+            .write_body(&payload.trace.id, "request.json", &body)
+        {
+            Ok(path) => payload.trace.req_body_path = Some(path),
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        }
+    }
+    if let Some(body) = upstream_request {
+        match state
+            .store
+            .write_body(&payload.trace.id, "upstream-request.json", &body)
+        {
+            Ok(path) => payload.trace.upstream_req_body_path = Some(path),
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        }
+    }
+    if let Some(body) = response {
+        match state
+            .store
+            .write_body(&payload.trace.id, "response.body", &body)
+        {
+            Ok(path) => payload.trace.resp_body_path = Some(path),
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        }
+    }
+    if let Err(error) = state.store.insert_trace(&payload.trace) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let outcome = if existing.is_some() {
+        "updated"
+    } else {
+        "inserted"
+    };
+    (
+        if existing.is_some() {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        axum::Json(json!({"id": payload.trace.id, "outcome": outcome})),
+    )
+        .into_response()
 }
 
 fn session_from_metadata(body_json: &Value) -> Option<String> {
@@ -2807,6 +3295,12 @@ async fn proxy(
         Some(k) => {
             let key_hash = key_hash_hex(&k);
             match run_key_entry(&state, &key_hash) {
+                Some(entry) if entry.kind == "wrap" => {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "wrap keys may only post to /traces/ingest",
+                    )
+                }
                 Some(entry) => {
                     if let Err(e) = state.store.touch_run_key(&key_hash, now_ms()) {
                         tracing::warn!("failed to touch run key: {e}");
@@ -2815,10 +3309,7 @@ async fn proxy(
                     key_hash.chars().take(16).collect()
                 }
                 None if k.starts_with(RUN_KEY_PREFIX) => {
-                    return error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "run key expired or revoked",
-                    )
+                    return error_response(StatusCode::UNAUTHORIZED, "run key expired or revoked")
                 }
                 None => {
                     return error_response(
@@ -3105,10 +3596,9 @@ async fn proxy(
             (RespondAs::OpenaiChat, "anthropic") => {
                 translate::anthropic_response_to_openai_chat(&upstream_final, &requested_model)
             }
-            (RespondAs::OpenaiResponses, "anthropic") => translate::anthropic_response_to_openai_responses(
-                &upstream_final,
-                &requested_model,
-            ),
+            (RespondAs::OpenaiResponses, "anthropic") => {
+                translate::anthropic_response_to_openai_responses(&upstream_final, &requested_model)
+            }
             (RespondAs::Gemini, "anthropic") => {
                 translate::anthropic_response_to_gemini(&upstream_final, &requested_model)
             }
@@ -3495,10 +3985,9 @@ mod tests {
         assert_eq!(entry.expires_ms, None);
         assert_eq!(entry.tags_json.as_deref(), Some(r#"{"harness":"pi"}"#));
 
-        let (_status, listed) = response_json(
-            admin_run_keys_list(State(state.clone()), Query(HashMap::new())).await,
-        )
-        .await;
+        let (_status, listed) =
+            response_json(admin_run_keys_list(State(state.clone()), Query(HashMap::new())).await)
+                .await;
         assert_eq!(_status, StatusCode::OK);
         let rows = listed["run_keys"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -3529,9 +4018,232 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"].as_str().unwrap().contains("label"));
+    }
+
+    #[tokio::test]
+    async fn wrap_key_ingests_and_updates_trace_bodies() {
+        use base64::Engine;
+
+        let state = test_state("wrap-trace-ingest");
+        let (status, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({
+                    "kind": "wrap",
+                    "label": "remote-mac",
+                    "tags": {"machine": "remote-mac"},
+                }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["kind"], "wrap");
+        assert_eq!(created["expires_ms"], Value::Null);
+        let key = created["key"].as_str().unwrap();
+        assert!(created["exports"]
+            .as_str()
+            .unwrap()
+            .contains("ALEXANDRIA_TRACE_KEY"));
+        assert!(!created["exports"]
+            .as_str()
+            .unwrap()
+            .contains("OPENAI_API_KEY"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+        let response_body = |text: &str| {
+            base64::engine::general_purpose::STANDARD.encode(
+                json!({"choices":[{"message":{"role":"assistant","content":text}}]}).to_string(),
+            )
+        };
+        let payload = |text: &str| TraceIngestPayload {
+            trace: TraceRecord {
+                id: "agent-remote-session-1".into(),
+                ts_request_ms: 1000,
+                ts_response_ms: Some(2000),
+                session_id: Some("remote-session".into()),
+                harness: Some("agent".into()),
+                upstream_provider: Some("cursor".into()),
+                routed_model: Some("cursor-agent".into()),
+                tags: Some(r#"{"stream":"dialogue"}"#.into()),
+                ..Default::default()
+            },
+            request_body_b64: Some(
+                base64::engine::general_purpose::STANDARD.encode(br#"{"messages":[]}"#),
+            ),
+            upstream_request_body_b64: None,
+            response_body_b64: Some(response_body(text)),
+        };
+
+        let (status, body) = response_json(
+            traces_ingest(
+                State(state.clone()),
+                headers.clone(),
+                axum::Json(payload("progress")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["outcome"], "inserted");
+        let row = state
+            .store
+            .get_trace("agent-remote-session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row["key_fingerprint"], &key_hash_hex(key)[..16]);
+        assert_eq!(
+            row["tags_json"].as_str().unwrap().contains("remote-mac"),
+            true
+        );
+        assert!(row["req_body_path"].as_str().is_some());
+        assert!(read_gz_text(row["resp_body_path"].as_str())
+            .unwrap()
+            .contains("progress"));
+
+        let (status, body) = response_json(
+            traces_ingest(
+                State(state.clone()),
+                headers,
+                axum::Json(payload("final answer")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "updated");
+        let row = state
+            .store
+            .get_trace("agent-remote-session-1")
+            .unwrap()
+            .unwrap();
+        assert!(read_gz_text(row["resp_body_path"].as_str())
+            .unwrap()
+            .contains("final answer"));
+    }
+
+    #[tokio::test]
+    async fn trace_ingest_rejects_non_wrap_key() {
+        let state = test_state("trace-ingest-kind");
+        let (status, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({"kind": "run", "label": "not-wrap"}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(created["key"].as_str().unwrap()).unwrap(),
+        );
+        let (status, _) = response_json(
+            traces_ingest(
+                State(state),
+                headers,
+                axum::Json(TraceIngestPayload {
+                    trace: TraceRecord {
+                        id: "remote-1".into(),
+                        ts_request_ms: 1,
+                        ..Default::default()
+                    },
+                    request_body_b64: None,
+                    upstream_request_body_b64: None,
+                    response_body_b64: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn trace_ingest_rejects_updates_from_a_different_wrap_key() {
+        let state = test_state("trace-ingest-owner");
+        let mint = |label: &str| {
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({"kind": "wrap", "label": label}))),
+            )
+        };
+        let (_, first) = response_json(mint("first").await).await;
+        let (_, second) = response_json(mint("second").await).await;
+        let headers = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+            headers
+        };
+        let payload = || TraceIngestPayload {
+            trace: TraceRecord {
+                id: "owned-trace-1".into(),
+                ts_request_ms: 1,
+                ..Default::default()
+            },
+            request_body_b64: None,
+            upstream_request_body_b64: None,
+            response_body_b64: None,
+        };
+
+        let (status, _) = response_json(
+            traces_ingest(
+                State(state.clone()),
+                headers(first["key"].as_str().unwrap()),
+                axum::Json(payload()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = response_json(
+            traces_ingest(
+                State(state),
+                headers(second["key"].as_str().unwrap()),
+                axum::Json(payload()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("label"));
+            .contains("another credential"));
+    }
+
+    #[tokio::test]
+    async fn wrap_key_cannot_invoke_models() {
+        let state = test_state("wrap-key-inference");
+        let (_, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({"kind": "wrap", "label": "remote"}))),
+            )
+            .await,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(created["key"].as_str().unwrap()).unwrap(),
+        );
+        let response = proxy(
+            state,
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let (_, body) = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only post to /traces/ingest"));
     }
 }

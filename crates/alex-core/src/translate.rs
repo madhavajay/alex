@@ -119,7 +119,11 @@ pub fn openai_responses_to_anthropic(req: &Value) -> Value {
             for it in items {
                 match it["type"].as_str().unwrap_or("message") {
                     "message" => {
-                        let role = if it["role"] == "assistant" { "assistant" } else { "user" };
+                        let role = if it["role"] == "assistant" {
+                            "assistant"
+                        } else {
+                            "user"
+                        };
                         msgs.push(json!({"role": role, "content": txt(&it["content"])}));
                     }
                     "function_call" => msgs.push(json!({
@@ -187,7 +191,11 @@ pub fn anthropic_to_openai_responses(req: &Value) -> Value {
             }
             continue;
         }
-        let part = if role == "assistant" { "output_text" } else { "input_text" };
+        let part = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
         match &m["content"] {
             Value::String(s) => input.push(json!({
                 "type": "message",
@@ -258,6 +266,12 @@ pub fn anthropic_to_openai_responses(req: &Value) -> Value {
     }
     if let Some(mt) = req["max_tokens"].as_i64() {
         o.insert("max_output_tokens".to_string(), json!(mt));
+    }
+    // Pi speaks Anthropic Messages to the Alexandria provider. Adaptive-thinking
+    // models carry Pi's selected level in output_config.effort; preserve it when
+    // translating to the OpenAI Responses API used by Codex.
+    if let Some(effort) = req["output_config"]["effort"].as_str() {
+        o.insert("reasoning".to_string(), json!({"effort": effort}));
     }
     put(&mut o, "stream", &req["stream"]);
     Value::Object(o)
@@ -569,7 +583,12 @@ pub fn parse_responses_sse_final(sse: &str) -> Option<Value> {
         }
     }
     let mut resp = last?;
-    if resp["output"].as_array().map(|a| a.is_empty()).unwrap_or(true) && !items.is_empty() {
+    if resp["output"]
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
+        && !items.is_empty()
+    {
         resp["output"] = Value::Array(items);
     }
     Some(resp)
@@ -606,7 +625,9 @@ pub fn synth_openai_chat_sse(chat_resp: &Value) -> String {
             .collect();
         out.push_str(&chunk(json!({"tool_calls": tcs}), Value::Null, None));
     }
-    let usage = chat_resp["usage"].is_object().then_some(&chat_resp["usage"]);
+    let usage = chat_resp["usage"]
+        .is_object()
+        .then_some(&chat_resp["usage"]);
     out.push_str(&chunk(
         json!({}),
         chat_resp["choices"][0]["finish_reason"].clone(),
@@ -644,7 +665,7 @@ pub fn synth_openai_responses_sse(responses_resp: &Value) -> String {
                 json!({
                     "type": "response.output_text.delta",
                     "item_id": it["id"],
-                    "output_index": 0,
+                    "output_index": i,
                     "content_index": 0,
                     "delta": text,
                 }),
@@ -654,12 +675,22 @@ pub fn synth_openai_responses_sse(responses_resp: &Value) -> String {
                 json!({
                     "type": "response.output_text.done",
                     "item_id": it["id"],
-                    "output_index": 0,
+                    "output_index": i,
                     "content_index": 0,
                     "text": text,
                 }),
             ));
         }
+        // Codex consumes completed output items, including function calls, from
+        // this event. `response.completed` alone does not dispatch its tool loop.
+        out.push_str(&sse_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": i,
+                "item": it,
+            }),
+        ));
     }
     out.push_str(&sse_event(
         "response.completed",
@@ -817,9 +848,7 @@ pub fn last_user_text(format_str: &str, req: &Value) -> Option<String> {
                             return Some(t);
                         }
                     }
-                    "function_call_output" => {
-                        return Some(tool_result_snip(&txt(&it["output"])))
-                    }
+                    "function_call_output" => return Some(tool_result_snip(&txt(&it["output"]))),
                     _ => {}
                 }
             }
@@ -951,7 +980,12 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .map(|tc| tool_call_json(&tc["function"]["name"], &tc["function"]["arguments"]))
+                            .map(|tc| {
+                                tool_call_json(
+                                    &tc["function"]["name"],
+                                    &tc["function"]["arguments"],
+                                )
+                            })
                             .collect()
                     })
                     .unwrap_or_default()
@@ -1098,7 +1132,12 @@ pub fn gemini_to_anthropic(req: &Value) -> Value {
         .as_array()
         .into_iter()
         .flatten()
-        .flat_map(|t| t["functionDeclarations"].as_array().cloned().unwrap_or_default())
+        .flat_map(|t| {
+            t["functionDeclarations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
         .map(|fd| {
             let mut tool = Map::new();
             put(&mut tool, "name", &fd["name"]);
@@ -1186,7 +1225,11 @@ pub fn anthropic_to_gemini_request(req: &Value) -> Value {
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for m in req["messages"].as_array().into_iter().flatten() {
-        let role = if m["role"] == "assistant" { "model" } else { "user" };
+        let role = if m["role"] == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
         let mut parts = Vec::new();
         match &m["content"] {
             Value::String(s) => {
@@ -1430,7 +1473,10 @@ pub fn normalize_codex_request(req: &mut Value) {
     if !o.contains_key("parallel_tool_calls") {
         o.insert("parallel_tool_calls".to_string(), json!(true));
     }
-    o.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+    o.insert(
+        "include".to_string(),
+        json!(["reasoning.encrypted_content"]),
+    );
     for k in [
         "context_management",
         "max_completion_tokens",
@@ -1598,14 +1644,20 @@ mod tests {
         assert_eq!(g["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(g["generationConfig"]["maxOutputTokens"], 256);
         assert_eq!(g["generationConfig"]["temperature"], 0.3);
-        assert_eq!(g["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+        assert_eq!(
+            g["tools"][0]["functionDeclarations"][0]["name"],
+            "get_weather"
+        );
         let c = g["contents"].as_array().unwrap();
         assert_eq!(c[0]["role"], "user");
         assert_eq!(c[0]["parts"][0]["text"], "weather?");
         assert_eq!(c[1]["role"], "model");
         assert_eq!(c[1]["parts"][0]["functionCall"]["name"], "get_weather");
         assert_eq!(c[2]["parts"][0]["functionResponse"]["name"], "get_weather");
-        assert_eq!(c[2]["parts"][0]["functionResponse"]["response"]["result"], "18C");
+        assert_eq!(
+            c[2]["parts"][0]["functionResponse"]["response"]["result"],
+            "18C"
+        );
     }
 
     #[test]
@@ -1635,14 +1687,20 @@ mod tests {
             }
         });
         let final_v = parse_gemini_upstream_final(&wrapped.to_string()).unwrap();
-        assert_eq!(final_v["candidates"][0]["content"]["parts"][0]["text"], "hi");
+        assert_eq!(
+            final_v["candidates"][0]["content"]["parts"][0]["text"],
+            "hi"
+        );
         assert_eq!(final_v["usageMetadata"]["promptTokenCount"], 1);
 
         // streaming SSE with response-wrapped frames
         let sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"PO\"}]}}]}}\n\n\
                    data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"NG\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}}\n\n";
         let final_sse = parse_gemini_upstream_final(sse).unwrap();
-        assert_eq!(final_sse["candidates"][0]["content"]["parts"][0]["text"], "PONG");
+        assert_eq!(
+            final_sse["candidates"][0]["content"]["parts"][0]["text"],
+            "PONG"
+        );
         assert_eq!(final_sse["candidates"][0]["finishReason"], "STOP");
         assert_eq!(final_sse["usageMetadata"]["candidatesTokenCount"], 1);
     }
@@ -1720,7 +1778,10 @@ mod tests {
         assert_eq!(result["content"][0]["content"][0]["text"], "sunny");
         assert_eq!(out["tools"][0]["name"], "get_weather");
         assert_eq!(out["tools"][0]["input_schema"], json!({"type": "object"}));
-        assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "get_weather"}));
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "tool", "name": "get_weather"})
+        );
         assert_eq!(out["max_tokens"], 8192);
     }
 
@@ -1764,7 +1825,10 @@ mod tests {
     #[test]
     fn responses_to_anthropic_string_input() {
         let out = openai_responses_to_anthropic(&json!({"model": "m", "input": "hello"}));
-        assert_eq!(out["messages"][0], json!({"role": "user", "content": "hello"}));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "user", "content": "hello"})
+        );
         assert_eq!(out["max_tokens"], 8192);
         assert!(out.get("system").is_none());
     }
@@ -1786,6 +1850,8 @@ mod tests {
             ],
             "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}],
             "max_tokens": 256,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "xhigh"},
             "stream": true,
         });
         let out = anthropic_to_openai_responses(&req);
@@ -1801,6 +1867,7 @@ mod tests {
         assert_eq!(out["tools"][0]["parameters"], json!({"type": "object"}));
         assert_eq!(out["tools"][0]["strict"], false);
         assert_eq!(out["max_output_tokens"], 256);
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
         assert_eq!(out["stream"], true);
     }
 
@@ -1852,7 +1919,10 @@ mod tests {
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 3);
         let mut capped = anthropic_resp();
         capped["stop_reason"] = json!("max_tokens");
-        assert_eq!(anthropic_response_to_openai_responses(&capped, "m")["status"], "incomplete");
+        assert_eq!(
+            anthropic_response_to_openai_responses(&capped, "m")["status"],
+            "incomplete"
+        );
     }
 
     fn responses_resp() -> Value {
@@ -1884,10 +1954,16 @@ mod tests {
         assert_eq!(out["usage"]["cache_read_input_tokens"], 4);
         let mut inc = responses_resp();
         inc["status"] = json!("incomplete");
-        assert_eq!(responses_final_to_anthropic(&inc, "m")["stop_reason"], "max_tokens");
+        assert_eq!(
+            responses_final_to_anthropic(&inc, "m")["stop_reason"],
+            "max_tokens"
+        );
         let mut plain = responses_resp();
         plain["output"].as_array_mut().unwrap().pop();
-        assert_eq!(responses_final_to_anthropic(&plain, "m")["stop_reason"], "end_turn");
+        assert_eq!(
+            responses_final_to_anthropic(&plain, "m")["stop_reason"],
+            "end_turn"
+        );
     }
 
     #[test]
@@ -1969,8 +2045,14 @@ mod tests {
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(chunks[0]["object"], "chat.completion.chunk");
         assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "hi there");
-        assert_eq!(chunks[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
-        assert_eq!(chunks[2]["choices"][0]["delta"]["tool_calls"][0]["id"], "t1");
+        assert_eq!(
+            chunks[2]["choices"][0]["delta"]["tool_calls"][0]["index"],
+            0
+        );
+        assert_eq!(
+            chunks[2]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "t1"
+        );
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(last["usage"]["total_tokens"], 15);
@@ -1982,6 +2064,8 @@ mod tests {
         let sse = synth_openai_responses_sse(&responses_resp());
         assert!(sse.starts_with("event: response.created\n"));
         assert!(sse.contains("event: response.output_item.added\n"));
+        assert!(sse.contains("event: response.output_item.done\n"));
+        assert!(sse.contains("\"type\":\"function_call\""));
         assert!(sse.contains("event: response.output_text.delta\n"));
         assert!(sse.contains("event: response.output_text.done\n"));
         assert!(sse.contains("event: response.completed\n"));
@@ -2059,6 +2143,17 @@ mod tests {
     }
 
     #[test]
+    fn codex_normalize_preserves_ultra_effort() {
+        let mut req = json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "reasoning": {"effort": "ultra"},
+        });
+        normalize_codex_request(&mut req);
+        assert_eq!(req["reasoning"]["effort"], "ultra");
+    }
+
+    #[test]
     fn last_user_text_anthropic() {
         let req = json!({"messages": [
             {"role": "user", "content": "first"},
@@ -2068,7 +2163,10 @@ mod tests {
                 {"type": "text", "text": "part2"},
             ]},
         ]});
-        assert_eq!(last_user_text("anthropic", &req), Some("part1\npart2".into()));
+        assert_eq!(
+            last_user_text("anthropic", &req),
+            Some("part1\npart2".into())
+        );
         let long = "x".repeat(500);
         let tool = json!({"messages": [
             {"role": "user", "content": "q"},
@@ -2158,7 +2256,8 @@ mod tests {
 
     #[test]
     fn assistant_reply_openai_chat_plain_and_sse() {
-        let plain = json!({"choices": [{"message": {"role": "assistant", "content": "chat reply"}}]});
+        let plain =
+            json!({"choices": [{"message": {"role": "assistant", "content": "chat reply"}}]});
         assert_eq!(
             assistant_reply_text("openai-chat", &plain.to_string()),
             Some("chat reply".into())

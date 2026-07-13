@@ -256,13 +256,13 @@ final class TraceBrowserModel {
         sessionsTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.pollSessions()
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(1))
             }
         }
         transcriptTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.pollTranscript()
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }
@@ -386,7 +386,9 @@ final class TraceBrowserModel {
         let session = selectedSession
         let harnessName = HarnessName.display(harness: session?.harness, tags: session?.tags)
         let providerNames = Set(
-            slice.compactMap { $0.model.flatMap(ModelProvider.provider(forModel:)) })
+            slice.compactMap {
+                $0.provider ?? $0.model.flatMap(ModelProvider.provider(forModel:))
+            })
         let icons = TranscriptIcons(
             harness: HarnessIconLoader.image(harness: session?.harness, tags: session?.tags),
             providers: Dictionary(uniqueKeysWithValues: providerNames.map {
@@ -730,12 +732,10 @@ struct TraceBrowserView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
-            Toggle("Live", isOn: Binding(
-                get: { !model.pinned },
-                set: { model.setLive($0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
+            Label("Live", systemImage: "dot.radiowaves.left.and.right")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.green)
+                .help("The selected transcript refreshes automatically")
             Toggle("Show pings", isOn: $model.showPings)
                 .controlSize(.small)
             Toggle("Details", isOn: detailsBinding)
@@ -1091,14 +1091,6 @@ private struct SessionListView: View {
 
     @ViewBuilder
     private func contextMenu(_ session: TraceSession) -> some View {
-        let isPinnedRow = model.pinned && session.sessionId == model.selectedSessionId
-        Button(isPinnedRow ? "Unpin" : "Pin") {
-            if isPinnedRow {
-                model.setLive(true)
-            } else {
-                model.selectFromUser(session.sessionId)
-            }
-        }
         Button("Copy Session ID") { model.copySessionId(session) }
         Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
         Button("Export Session…") { model.exportSession(session) }
@@ -1224,20 +1216,9 @@ private struct TranscriptView: View {
         HStack(spacing: 8) {
             if let session = model.selectedSession {
                 HarnessIconView(harness: session.harness, tags: session.tags, size: 18)
-                if model.pinned {
-                    Button {
-                        model.setLive(true)
-                    } label: {
-                        Image(systemName: "pin.fill")
-                            .foregroundStyle(.orange)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Pinned — click to unpin and follow live")
-                } else {
-                    Image(systemName: "dot.radiowaves.left.and.right")
-                        .foregroundStyle(.green)
-                        .help("Live — following the most recent session")
-                }
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .foregroundStyle(.green)
+                    .help("Live — this transcript refreshes automatically")
                 Text(session.sessionId)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .lineLimit(1)

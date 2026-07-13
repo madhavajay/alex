@@ -12,6 +12,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let lastTsMs: Int64
     public let traceCount: Int
     public let models: [String]?
+    public let providers: [String]?
     public let harness: String?
     public let totalInputTokens: Int64?
     public let totalOutputTokens: Int64?
@@ -28,7 +29,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case models, harness, errors, tags, efforts
+        case models, providers, harness, errors, tags, efforts
         case sessionId = "session_id"
         case runId = "run_id"
         case firstTsMs = "first_ts_ms"
@@ -56,6 +57,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let tsRequestMs: Int64
     public let tsResponseMs: Int64?
     public let model: String?
+    public let provider: String?
     public let status: Int?
     public let inputTokens: Int64?
     public let outputTokens: Int64?
@@ -66,11 +68,12 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let user: String?
     public let assistant: String?
     public let toolCalls: [ToolCall]?
+    public let assistantBlocks: [AssistantBlock]?
 
     public var id: String { traceId }
 
     enum CodingKeys: String, CodingKey {
-        case model, status, error, user, assistant
+        case model, provider, status, error, user, assistant
         case traceId = "trace_id"
         case tsRequestMs = "ts_request_ms"
         case tsResponseMs = "ts_response_ms"
@@ -80,6 +83,21 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
         case toolCalls = "tool_calls"
+        case assistantBlocks = "assistant_blocks"
+    }
+}
+
+public struct AssistantBlock: Codable, Sendable, Equatable {
+    public let type: String
+    public let text: String?
+    public let name: String?
+    public let arguments: String?
+
+    public init(type: String, text: String? = nil, name: String? = nil, arguments: String? = nil) {
+        self.type = type
+        self.text = text
+        self.name = name
+        self.arguments = arguments
     }
 }
 
@@ -707,7 +725,11 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         sessionShort = Self.shortId(session.sessionId)
         let modelsList = session.models ?? []
         models = modelsList.joined(separator: ", ")
-        providers = ModelProvider.providers(in: modelsList)
+        if let capturedProviders = session.providers, !capturedProviders.isEmpty {
+            providers = capturedProviders
+        } else {
+            providers = ModelProvider.providers(in: modelsList)
+        }
         harnessRaw = session.harness
         harness = session.harness ?? ""
         tags = session.tags
@@ -788,7 +810,7 @@ public struct SessionSelection: Equatable, Sendable {
     @discardableResult
     public mutating func userSelect(_ id: String) -> Change {
         lastFollowId = nil
-        pinned = true
+        pinned = false
         guard selectedId != id else { return .none }
         selectedId = id
         return .selected(id)
@@ -805,7 +827,7 @@ public struct SessionSelection: Equatable, Sendable {
     @discardableResult
     public mutating func bindingSelect(_ id: String?) -> Change {
         guard let id else { return .none }
-        if id == lastFollowId {
+        if id == lastFollowId || id == selectedId {
             lastFollowId = nil
             return .none
         }
@@ -814,7 +836,7 @@ public struct SessionSelection: Equatable, Sendable {
 
     @discardableResult
     public mutating func setLive(_ live: Bool, newestVisibleId: String?) -> Change {
-        pinned = !live
+        pinned = false
         guard live, let newestVisibleId else { return .none }
         return followSelect(newestVisibleId)
     }
@@ -854,6 +876,8 @@ public enum HarnessIcon {
         "kimi": "kimi-code",
         "droid": "droid-cli",
         "cursor": "cursor-cli",
+        "agent": "cursor-cli",
+        "cursor-agent": "cursor-cli",
         "amp": "amp-code",
         "opensage": "opensage-adk",
     ]
@@ -926,6 +950,8 @@ public enum ModelProvider {
         }
         if m.hasPrefix("grok") { return "xai" }
         if m.hasPrefix("gemini") { return "gemini" }
+        if m.hasPrefix("cursor") || m.hasPrefix("composer") { return "cursor" }
+        if m.hasPrefix("amp") { return "amp" }
         return nil
     }
 
@@ -935,6 +961,8 @@ public enum ModelProvider {
         case "openai": "O"
         case "xai": "X"
         case "gemini": "G"
+        case "cursor": "C"
+        case "amp": "A"
         default: provider.first.map { String($0).uppercased() } ?? "?"
         }
     }
@@ -1240,16 +1268,66 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
 
 public enum TraceFingerprint {
     public static func sessions(_ sessions: [TraceSession]) -> String {
-        let newest = sessions.max { $0.lastTsMs < $1.lastTsMs }
-        let totalTraces = sessions.reduce(0) { $0 + $1.traceCount }
-        return "\(sessions.count)|\(newest?.sessionId ?? "")|\(newest?.lastTsMs ?? 0)|\(totalTraces)"
+        // The browser only requests recent sessions, so include every sidebar
+        // field here. Otherwise a still-open session can gain tokens, cost, or
+        // errors without changing its timestamp and leave the sidebar stale.
+        var hasher = Hasher()
+        hasher.combine(sessions.count)
+        for session in sessions.sorted(by: { $0.sessionId < $1.sessionId }) {
+            hasher.combine(session.sessionId)
+            hasher.combine(session.runId)
+            hasher.combine(session.firstTsMs)
+            hasher.combine(session.lastTsMs)
+            hasher.combine(session.traceCount)
+            hasher.combine(session.models)
+            hasher.combine(session.providers)
+            hasher.combine(session.harness)
+            hasher.combine(session.totalInputTokens)
+            hasher.combine(session.totalOutputTokens)
+            hasher.combine(session.totalCostUsd)
+            hasher.combine(session.errors)
+            hasher.combine(session.lastStatus)
+            hasher.combine(session.efforts)
+            for (key, value) in (session.tags ?? [:]).sorted(by: { $0.key < $1.key }) {
+                hasher.combine(key)
+                hasher.combine(value)
+            }
+        }
+        return "\(sessions.count)|\(hasher.finalize())"
     }
 
     public static func turns(_ turns: [TranscriptTurn]) -> String {
-        let last = turns.last
-        return "\(turns.count)|\(last?.traceId ?? "")|\(last?.tsRequestMs ?? 0)"
-            + "|\(last?.tsResponseMs ?? -1)|\(last?.status ?? -1)"
-            + "|\(last?.reasoningEffort ?? "")|\(last?.thinkingBudget ?? -1)"
+        var hasher = Hasher()
+        hasher.combine(turns.count)
+        for turn in turns {
+            hasher.combine(turn.traceId)
+            hasher.combine(turn.tsRequestMs)
+            hasher.combine(turn.tsResponseMs)
+            hasher.combine(turn.model)
+            hasher.combine(turn.provider)
+            hasher.combine(turn.status)
+            hasher.combine(turn.inputTokens)
+            hasher.combine(turn.outputTokens)
+            hasher.combine(turn.reasoningEffort)
+            hasher.combine(turn.thinkingBudget)
+            hasher.combine(turn.costUsd)
+            hasher.combine(turn.error)
+            hasher.combine(turn.user)
+            hasher.combine(turn.assistant)
+            hasher.combine(turn.toolCalls?.count)
+            for call in turn.toolCalls ?? [] {
+                hasher.combine(call.name)
+                hasher.combine(call.arguments)
+            }
+            hasher.combine(turn.assistantBlocks?.count)
+            for block in turn.assistantBlocks ?? [] {
+                hasher.combine(block.type)
+                hasher.combine(block.text)
+                hasher.combine(block.name)
+                hasher.combine(block.arguments)
+            }
+        }
+        return "\(turns.count)|\(hasher.finalize())"
     }
 }
 
@@ -1590,10 +1668,25 @@ public enum TranscriptRender {
     }
 
     static func signature(_ turn: TranscriptTurn) -> String {
-        "\(turn.tsResponseMs ?? -1)|\(turn.status ?? -1)|\(turn.user?.count ?? -1)"
-            + "|\(turn.assistant?.count ?? -1)|\(turn.error?.count ?? -1)"
-            + "|\(turn.toolCalls?.count ?? -1)"
-            + "|\(turn.reasoningEffort ?? "")|\(turn.thinkingBudget ?? -1)"
+        var hasher = Hasher()
+        hasher.combine(turn.tsResponseMs)
+        hasher.combine(turn.status)
+        hasher.combine(turn.user)
+        hasher.combine(turn.assistant)
+        hasher.combine(turn.error)
+        hasher.combine(turn.reasoningEffort)
+        hasher.combine(turn.thinkingBudget)
+        for call in turn.toolCalls ?? [] {
+            hasher.combine(call.name)
+            hasher.combine(call.arguments)
+        }
+        for block in turn.assistantBlocks ?? [] {
+            hasher.combine(block.type)
+            hasher.combine(block.text)
+            hasher.combine(block.name)
+            hasher.combine(block.arguments)
+        }
+        return String(hasher.finalize())
     }
 
     public static func document(
@@ -1711,6 +1804,20 @@ public enum TranscriptRender {
         }
 
         let out = NSMutableAttributedString()
+        func appendTool(name: String, arguments: String?) {
+            out.append(NSAttributedString(string: "⚙ \(name)\n", attributes: toolLabel))
+            let arguments = arguments ?? ""
+            if rawMode {
+                if !arguments.isEmpty {
+                    out.append(NSAttributedString(
+                        string: "\(cap(arguments))\n", attributes: tool))
+                }
+            } else if let command = ToolCall(name: name, arguments: arguments).command {
+                out.append(NSAttributedString(string: "\(cap(command))\n", attributes: tool))
+            } else if !arguments.isEmpty {
+                appendNice(arguments, to: out, keyAttrs: toolKey, valueAttrs: tool)
+            }
+        }
         var ranges: [TurnRange] = []
         for (index, turn) in turns.enumerated() {
             let turnStart = out.length
@@ -1755,10 +1862,13 @@ public enum TranscriptRender {
                 }
             }
             let calls = turn.toolCalls ?? []
+            let orderedBlocks = turn.assistantBlocks ?? []
             let hasModelText = turn.assistant?.isEmpty == false
-            if hasModelText || !calls.isEmpty {
+            if hasModelText || !calls.isEmpty || !orderedBlocks.isEmpty {
                 let labelAttrs = linked(modelLabel, turn.traceId)
-                if let icon = providerIcon(for: turn.model, icons: icons) {
+                if let icon = providerIcon(
+                    provider: turn.provider, model: turn.model, icons: icons)
+                {
                     out.append(iconString(icon, attributes: labelAttrs))
                     out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
@@ -1767,21 +1877,29 @@ public enum TranscriptRender {
                     attributes: labelAttrs))
                 out.append(infoMark(labelAttrs))
             }
-            if let text = turn.assistant, !text.isEmpty {
-                out.append(NSAttributedString(string: "\(cap(text))\n", attributes: assistant))
-            }
-            for call in calls {
-                out.append(NSAttributedString(string: "⚙ \(call.name)\n", attributes: toolLabel))
-                let arguments = call.arguments ?? ""
-                if rawMode {
-                    if !arguments.isEmpty {
-                        out.append(NSAttributedString(
-                            string: "\(cap(arguments))\n", attributes: tool))
+            if !orderedBlocks.isEmpty {
+                for block in orderedBlocks {
+                    switch block.type {
+                    case "text":
+                        if let text = block.text, !text.isEmpty {
+                            out.append(NSAttributedString(
+                                string: "\(cap(text))\n", attributes: assistant))
+                        }
+                    case "tool_call":
+                        if let name = block.name {
+                            appendTool(name: name, arguments: block.arguments)
+                        }
+                    default:
+                        continue
                     }
-                } else if let command = call.command {
-                    out.append(NSAttributedString(string: "\(cap(command))\n", attributes: tool))
-                } else if !arguments.isEmpty {
-                    appendNice(arguments, to: out, keyAttrs: toolKey, valueAttrs: tool)
+                }
+            } else {
+                if let text = turn.assistant, !text.isEmpty {
+                    out.append(NSAttributedString(
+                        string: "\(cap(text))\n", attributes: assistant))
+                }
+                for call in calls {
+                    appendTool(name: call.name, arguments: call.arguments)
                 }
             }
             if let text = turn.error, !text.isEmpty {
@@ -1829,8 +1947,12 @@ public enum TranscriptRender {
         }
     }
 
-    static func providerIcon(for model: String?, icons: TranscriptIcons) -> NSImage? {
-        guard let provider = model.flatMap(ModelProvider.provider(forModel:)) else { return nil }
+    static func providerIcon(
+        provider: String?, model: String?, icons: TranscriptIcons
+    ) -> NSImage? {
+        guard let provider = provider ?? model.flatMap(ModelProvider.provider(forModel:)) else {
+            return nil
+        }
         return icons.providers[provider]
     }
 

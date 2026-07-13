@@ -64,6 +64,12 @@ Alexandria speaks four API dialects on the way **in** and routes to whichever pr
 
 The upstream is chosen purely by the model name, so e.g. an **OpenAI Chat** request naming `claude-opus-4-8` is translated to Anthropic and back; a **Gemini** request naming `gpt-5.5` is translated to Codex and returned as Gemini `candidates`. Streaming works across the matrix — SSE events are re-synthesized in the client's dialect.
 
+### GPT-5.6 through Pi
+
+Alexandria advertises the Codex subscription models `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Running `alex harness connect pi` writes them into Pi's `alexandria` provider with their 372K context, 128K maximum output, image input, pricing metadata, and adaptive reasoning configuration. It also installs a small Pi extension that sends Pi's real session ID only on requests using the `alexandria` provider, keeping identical prompts in separate trace-browser sessions. Pi's `minimal` level maps to Codex `low`; `low`, `medium`, `high`, and `xhigh` pass through unchanged.
+
+The live Codex catalog also supports `max` on all three models and `ultra` on Sol and Terra. Pi's standard thinking-level UI currently ends at `xhigh`, so `max` and `ultra` are available to clients that can send raw Responses API reasoning effort, but are not relabeled or silently substituted for Pi's `xhigh` option. `ultra` additionally enables Codex's automatic task delegation.
+
 ### Serving the Gemini CLI with a different model
 
 Point the Gemini CLI at the proxy and let it run on, say, `gpt-5.5` — requests arrive as Gemini, get rewritten to OpenAI/Codex upstream, and responses convert back to Gemini shape:
@@ -124,6 +130,46 @@ curl -H "x-api-key: <local_key>" \
 curl -H "x-api-key: <local_key>" \
   "http://127.0.0.1:4100/traces/search?text=professor&session=$SESSION"  # body-text search
 ```
+
+## Remote wrap capture
+
+`alex wrap agent` and `alex wrap amp` can run on a different machine while sending their normalized conversation traces to a central Alexandria daemon. The remote reverse wrap still connects directly to Cursor or Amp; only the captured trace records and bodies are uploaded to Alexandria.
+
+On the central Alexandria machine, expose the daemon through HTTPS (or a trusted encrypted private network), then mint an ingest-only credential. The daemon defaults to loopback; if your TLS gateway is on another host, bind an appropriate private interface with `alex daemon --host <private-ip>` and restrict that listener with the host firewall.
+
+```bash
+alex keys mint --kind wrap --label remote-mac --json
+```
+
+The secret is shown once. On the remote machine, configure the central trace destination and run either wrapper:
+
+```bash
+export ALEXANDRIA_TRACE_URL=https://alex.example.net
+export ALEXANDRIA_TRACE_KEY=alxk-...     # the minted kind=wrap key
+
+./alex wrap agent
+./alex wrap amp
+```
+
+For a persistent machine, prefer a mode-`0600` key file instead of a shell environment variable:
+
+```bash
+./alex wrap agent \
+  --trace-url https://alex.example.net \
+  --trace-key-file ~/.config/alexandria/wrap.key
+```
+
+Environment equivalents are `ALEXANDRIA_TRACE_URL`, `ALEXANDRIA_TRACE_KEY`, and `ALEXANDRIA_TRACE_KEY_FILE`. Plain `http://` is accepted automatically only for loopback; a trusted private-network endpoint requires `--allow-insecure-http` (or `ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP=1`). Internet-facing deployments should use HTTPS.
+
+Remote traces are always spooled into the remote machine's local `~/.alexandria` first. A failed preflight or later upload does not stop Cursor Agent or Amp; the wrapper prints a warning and keeps the local capture. Replay the run after connectivity is restored:
+
+```bash
+alex traces push --run-id wrap-agent-1783641674567-46419171 \
+  --trace-url https://alex.example.net \
+  --trace-key-file ~/.config/alexandria/wrap.key
+```
+
+The central daemon accepts `kind=wrap` credentials only on `GET/POST /traces/ingest`; they cannot invoke models or read/administer traces. Revoke a remote machine with `alex keys revoke <rk-id>`.
 
 ## Trace Browser
 

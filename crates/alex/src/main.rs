@@ -104,6 +104,11 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Wrap a special harness for capture (amp, …) — application-level, not system intercept
+    Wrap {
+        #[command(subcommand)]
+        command: WrapCommand,
+    },
     /// Check for and install a newer alex release
     Update {
         /// Only check and report; never install
@@ -159,6 +164,9 @@ enum Command {
 enum KeysCommand {
     /// Mint a run key bound to run metadata; the key is printed exactly once
     Mint {
+        /// Credential capability: run, harness, or wrap
+        #[arg(long, default_value = "run")]
+        kind: String,
         #[arg(long)]
         run_id: Option<String>,
         /// Tag as k=v; repeatable
@@ -169,6 +177,8 @@ enum KeysCommand {
         ttl: String,
         #[arg(long)]
         label: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// List run keys (active only by default)
     List {
@@ -202,17 +212,135 @@ enum DarioCommand {
 }
 
 #[derive(Subcommand)]
+enum WrapCommand {
+    /// List configured wrap harnesses (from embedded catalog / ~/.alexandria/wrap-harnesses.json)
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print shell exports + write settings for a harness mode (config-driven)
+    Env {
+        /// Harness id (e.g. amp)
+        #[arg(default_value = "amp")]
+        harness: String,
+        /// Mode from catalog (default: preferred / default_mode)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Base URL of the local wrap (reverse or HTTP proxy)
+        #[arg(long, default_value = "http://127.0.0.1:4101")]
+        wrap_url: String,
+        /// Optional TLS CA PEM path (env_proxy mode)
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// Machine-readable plan (no shell exports)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start reverse wrap + run Amp: `alex wrap amp` or `alex wrap amp -- -x 'hi'`
+    Amp {
+        #[command(flatten)]
+        remote_trace: RemoteTraceArgs,
+        /// Mode from catalog (default: base_url)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Bind address for reverse wrap (`127.0.0.1:0` = ephemeral port)
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        /// Upstream to reverse to (default: catalog amp upstream)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Only run the reverse wrap until Ctrl-C (do not spawn amp)
+        #[arg(long)]
+        serve_only: bool,
+        /// Less stderr chatter
+        #[arg(long, short = 'q')]
+        quiet: bool,
+        /// Args passed through to `amp` (use `--` before flags like `-x`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start reverse wrap + run Cursor Agent: `alex wrap agent -- --print --trust 'hi'`
+    Agent {
+        #[command(flatten)]
+        remote_trace: RemoteTraceArgs,
+        /// Mode from catalog (default: base_url)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Bind address for reverse wrap (`127.0.0.1:0` = ephemeral port)
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        /// Upstream to reverse to (default: catalog agent upstream)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Only run the reverse wrap until Ctrl-C (do not spawn agent)
+        #[arg(long)]
+        serve_only: bool,
+        /// Less stderr chatter
+        #[arg(long, short = 'q')]
+        quiet: bool,
+        /// Args passed through to `agent` (use `--` before flags like `--print`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start reverse wrap + run any catalog harness: `alex wrap run amp -- -x hi`
+    Run {
+        /// Harness id from catalog
+        harness: String,
+        #[command(flatten)]
+        remote_trace: RemoteTraceArgs,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        #[arg(long)]
+        upstream: Option<String>,
+        #[arg(long)]
+        serve_only: bool,
+        #[arg(long, short = 'q')]
+        quiet: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run reverse-wrap smoke (mock upstream + catalog capture policy)
+    Smoke {
+        #[arg(long)]
+        json: bool,
+        /// Harness whose capture policy to apply (default: amp)
+        #[arg(long, default_value = "amp")]
+        harness: String,
+    },
+}
+
+#[derive(clap::Args, Clone, Default)]
+struct RemoteTraceArgs {
+    /// Central Alexandria base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
+    #[arg(long, alias = "alex-url")]
+    trace_url: Option<String>,
+    /// File containing a wrap key (env alternatives: ALEXANDRIA_TRACE_KEY[_FILE])
+    #[arg(long)]
+    trace_key_file: Option<PathBuf>,
+    /// Permit plaintext HTTP to a non-loopback trace destination
+    #[arg(long)]
+    allow_insecure_http: bool,
+}
+
+#[derive(Subcommand)]
 enum AuthCommand {
-    /// Import credentials from native tool locations (claude|codex|gemini|all)
+    /// Import credentials from native tool locations (claude|codex|gemini|grok|amp|all)
     Import {
         #[arg(default_value = "all")]
         source: String,
     },
-    /// Run an OAuth login flow from the terminal (claude|codex|grok|gemini); no arg opens a picker
+    /// Run an OAuth login flow from the terminal (claude|codex|grok|gemini|amp); no arg opens a picker
     Login { provider: Option<String> },
     /// Register a Google AI Studio API key for Gemini (from aistudio.google.com/apikey)
     GeminiKey {
         /// The API key; omit to read from the GEMINI_API_KEY env var
+        key: Option<String>,
+    },
+    /// Register an Amp access token (from ampcode.com/settings or AMP_API_KEY)
+    AmpKey {
+        /// The Amp API key; omit to read from the AMP_API_KEY env var
         key: Option<String>,
     },
     /// List vault accounts
@@ -313,6 +441,30 @@ enum TracesCommand {
     Du {
         #[arg(long)]
         json: bool,
+    },
+    /// Reconcile one wrapped Cursor Agent transcript from Cursor's local JSONL
+    RepairAgent {
+        #[arg(long)]
+        transcript_id: String,
+        /// Report changes without rewriting trace bodies
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-import the latest wrapped Amp websocket capture (including error-only turns)
+    RepairAmp {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Push a locally spooled wrap run to a central Alexandria daemon
+    Push {
+        #[arg(long)]
+        run_id: String,
+        #[command(flatten)]
+        remote_trace: RemoteTraceArgs,
     },
 }
 
@@ -773,8 +925,15 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         next.run(req).await
     }
 
-    fn error(status: axum::http::StatusCode, message: impl Into<String>) -> axum::response::Response {
-        (status, axum::Json(serde_json::json!({"error": message.into()}))).into_response()
+    fn error(
+        status: axum::http::StatusCode,
+        message: impl Into<String>,
+    ) -> axum::response::Response {
+        (
+            status,
+            axum::Json(serde_json::json!({"error": message.into()})),
+        )
+            .into_response()
     }
 
     fn key_hash_hex(key: &str) -> String {
@@ -833,6 +992,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 "claude-opus-4-8".into(),
                 "claude-sonnet-5".into(),
                 "claude-haiku-4-5".into(),
+                "gpt-5.6-sol".into(),
+                "gpt-5.6-terra".into(),
+                "gpt-5.6-luna".into(),
                 "gpt-5.5".into(),
                 "grok-code-fast-1".into(),
                 "gemini-2.5-flash".into(),
@@ -845,7 +1007,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
     async fn list() -> axum::response::Response {
         match load_or_create_config() {
             Ok((config, _)) => match harness_connect::harness_statuses(&config, None, true).await {
-                Ok(harnesses) => axum::Json(serde_json::json!({"harnesses": harnesses})).into_response(),
+                Ok(harnesses) => {
+                    axum::Json(serde_json::json!({"harnesses": harnesses})).into_response()
+                }
                 Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
             Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -900,6 +1064,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             Ok(summary) => axum::Json(serde_json::json!({
                 "key_id": summary.key_id,
                 "models": summary.models.len(),
+                "extension_path": summary.extension_path,
             }))
             .into_response(),
             Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -920,7 +1085,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let config_dir = harness_connect::resolve_config_dir(&config, harness_connect::pi_spec(), None);
+        let config_dir =
+            harness_connect::resolve_config_dir(&config, harness_connect::pi_spec(), None);
         let was_connected = match harness_connect::disconnect_pi_config(&config_dir) {
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1193,7 +1359,10 @@ async fn main() -> Result<()> {
                 );
             }
             let mut app = alex_proxy::router(state.clone());
-            app = app.merge(harness_admin_router(state.clone(), config.local_key.clone()));
+            app = app.merge(harness_admin_router(
+                state.clone(),
+                config.local_key.clone(),
+            ));
             if let Some(sup) = supervisor.clone() {
                 app = app.merge(dario_admin_router(sup, config.local_key.clone()));
             }
@@ -1307,6 +1476,20 @@ async fn main() -> Result<()> {
                     ui::green(ui::dot())
                 );
             }
+            AuthCommand::AmpKey { key } => {
+                let key = key
+                    .or_else(|| std::env::var("AMP_API_KEY").ok())
+                    .filter(|k| !k.trim().is_empty())
+                    .context(
+                        "provide the key: `alexandria auth amp-key <KEY>` (create one at https://ampcode.com/settings) or set AMP_API_KEY",
+                    )?;
+                let vault = open_vault(&config)?;
+                let id = alex_auth::save_amp_api_key(&vault, &key).await?;
+                println!(
+                    "{} saved {id} — amp credits show in `alex limits` / menu bar",
+                    ui::green(ui::dot())
+                );
+            }
             AuthCommand::List => {
                 let vault = open_vault(&config)?;
                 let accounts = vault.list().await;
@@ -1369,6 +1552,22 @@ async fn main() -> Result<()> {
             }
             Some(TracesCommand::Du { json }) => {
                 traces_du_cmd(&config, json)?;
+            }
+            Some(TracesCommand::RepairAgent {
+                transcript_id,
+                dry_run,
+                json,
+            }) => {
+                traces_repair_agent_cmd(&config, &transcript_id, dry_run, json)?;
+            }
+            Some(TracesCommand::RepairAmp { run_id, json }) => {
+                traces_repair_amp_cmd(&config, run_id.as_deref(), json)?;
+            }
+            Some(TracesCommand::Push {
+                run_id,
+                remote_trace,
+            }) => {
+                traces_push_cmd(&config, &run_id, &remote_trace).await?;
             }
         },
         Command::Env => {
@@ -1593,12 +1792,14 @@ async fn main() -> Result<()> {
         }
         Command::Keys { command } => match command {
             KeysCommand::Mint {
+                kind,
                 run_id,
                 tag,
                 ttl,
                 label,
+                json,
             } => {
-                keys_mint_cmd(&config, run_id, &tag, &ttl, label).await?;
+                keys_mint_cmd(&config, &kind, run_id, &tag, &ttl, label, json).await?;
             }
             KeysCommand::List { all, json } => {
                 keys_list_cmd(&config, all, json).await?;
@@ -1609,6 +1810,1904 @@ async fn main() -> Result<()> {
         },
         Command::Tui => {
             tui::run(&config.base_url(), &config.local_key).await?;
+        }
+        Command::Wrap { command } => match command {
+            WrapCommand::Status { json } => {
+                wrap_status_cmd(&config, json).await?;
+            }
+            WrapCommand::Env {
+                harness,
+                mode,
+                wrap_url,
+                ca_cert,
+                json,
+            } => {
+                wrap_env_cmd(&config, &harness, mode.as_deref(), &wrap_url, ca_cert, json).await?;
+            }
+            WrapCommand::Amp {
+                remote_trace,
+                mode,
+                bind,
+                upstream,
+                serve_only,
+                quiet,
+                args,
+            } => {
+                wrap_run_cmd(
+                    &config,
+                    "amp",
+                    remote_trace,
+                    mode,
+                    bind,
+                    upstream,
+                    serve_only,
+                    quiet,
+                    args,
+                )
+                .await?;
+            }
+            WrapCommand::Agent {
+                remote_trace,
+                mode,
+                bind,
+                upstream,
+                serve_only,
+                quiet,
+                args,
+            } => {
+                wrap_run_cmd(
+                    &config,
+                    "agent",
+                    remote_trace,
+                    mode,
+                    bind,
+                    upstream,
+                    serve_only,
+                    quiet,
+                    args,
+                )
+                .await?;
+            }
+            WrapCommand::Run {
+                harness,
+                remote_trace,
+                mode,
+                bind,
+                upstream,
+                serve_only,
+                quiet,
+                args,
+            } => {
+                wrap_run_cmd(
+                    &config,
+                    &harness,
+                    remote_trace,
+                    mode,
+                    bind,
+                    upstream,
+                    serve_only,
+                    quiet,
+                    args,
+                )
+                .await?;
+            }
+            WrapCommand::Smoke { json, harness } => {
+                wrap_smoke_cmd(&harness, json).await?;
+            }
+        },
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RemoteTraceConfig {
+    base_url: String,
+    key: String,
+}
+
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTraceConfig>> {
+    let base_url = args
+        .trace_url
+        .clone()
+        .or_else(|| std::env::var("ALEXANDRIA_TRACE_URL").ok())
+        .map(|value| value.trim_end_matches('/').to_string());
+    let key = if let Some(path) = &args.trace_key_file {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read trace key file {}", path.display()))?
+                .trim()
+                .to_string(),
+        )
+    } else if let Ok(value) = std::env::var("ALEXANDRIA_TRACE_KEY") {
+        Some(value.trim().to_string())
+    } else if let Ok(path) = std::env::var("ALEXANDRIA_TRACE_KEY_FILE") {
+        Some(
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("read trace key file {path}"))?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let Some(base_url) = base_url else {
+        if key
+            .as_deref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "ALEXANDRIA_TRACE_KEY was set without --trace-url / ALEXANDRIA_TRACE_URL"
+            );
+        }
+        return Ok(None);
+    };
+    let key = key.filter(|value| !value.is_empty()).with_context(|| {
+        "remote trace upload requires --trace-key-file, ALEXANDRIA_TRACE_KEY, or ALEXANDRIA_TRACE_KEY_FILE"
+    })?;
+    if !key.starts_with("alxk-") {
+        anyhow::bail!("remote trace credential is not an Alexandria key (expected alxk-...)");
+    }
+    let url = reqwest::Url::parse(&base_url)
+        .with_context(|| format!("invalid trace destination URL '{base_url}'"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("trace destination must use http:// or https://");
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+    });
+    let allow_insecure =
+        args.allow_insecure_http || truthy_env("ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP");
+    if url.scheme() == "http" && !loopback && !allow_insecure {
+        anyhow::bail!(
+            "refusing plaintext remote trace upload to {base_url}; use HTTPS or --allow-insecure-http on a trusted private network"
+        );
+    }
+    Ok(Some(RemoteTraceConfig { base_url, key }))
+}
+
+async fn preflight_remote_trace(config: &RemoteTraceConfig) -> Result<()> {
+    let url = format!("{}/traces/ingest", config.base_url);
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(&url)
+        .header("x-api-key", &config.key)
+        .send()
+        .await
+        .with_context(|| format!("could not reach remote trace ingest at {url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "remote trace ingest preflight returned {status}: {}",
+            ui::truncate(&detail, 300)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RemoteTraceSender {
+    tx: std::sync::mpsc::SyncSender<alex_core::TraceIngestPayload>,
+}
+
+impl RemoteTraceSender {
+    fn send(&self, payload: alex_core::TraceIngestPayload) -> Result<()> {
+        self.tx
+            .send(payload)
+            .context("remote trace uploader stopped unexpectedly")
+    }
+}
+
+struct RemoteTraceWorker {
+    sender: RemoteTraceSender,
+    join: std::thread::JoinHandle<Result<RemoteTraceUploadReport>>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteTraceUploadReport {
+    uploaded: usize,
+    failed: usize,
+    failures: Vec<String>,
+}
+
+impl RemoteTraceWorker {
+    fn start(config: RemoteTraceConfig) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<alex_core::TraceIngestPayload>(256);
+        let join = std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let url = format!("{}/traces/ingest", config.base_url);
+            let mut report = RemoteTraceUploadReport::default();
+            for payload in rx {
+                let trace_id = payload.trace.id.clone();
+                let mut delivered = false;
+                let mut last_error = String::new();
+                for (attempt, delay_ms) in [0u64, 250, 1_000, 2_000, 4_000].into_iter().enumerate()
+                {
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    match client
+                        .post(&url)
+                        .header("x-api-key", &config.key)
+                        .json(&payload)
+                        .send()
+                    {
+                        Ok(response) if response.status().is_success() => {
+                            delivered = true;
+                            report.uploaded += 1;
+                            break;
+                        }
+                        Ok(response)
+                            if response.status().is_server_error()
+                                || matches!(
+                                    response.status(),
+                                    reqwest::StatusCode::REQUEST_TIMEOUT
+                                        | reqwest::StatusCode::TOO_MANY_REQUESTS
+                                ) =>
+                        {
+                            last_error = format!("HTTP {}", response.status());
+                        }
+                        Ok(response) => {
+                            let status = response.status();
+                            let detail = response.text().unwrap_or_default();
+                            last_error = format!(
+                                "rejected with {status}: {}",
+                                ui::truncate(&detail, 300)
+                            );
+                            break;
+                        }
+                        Err(error) => last_error = error.to_string(),
+                    }
+                    if attempt == 4 {
+                        break;
+                    }
+                }
+                if !delivered {
+                    report.failed += 1;
+                    report.failures.push(format!("{trace_id}: {last_error}"));
+                }
+            }
+            Ok(report)
+        });
+        Self {
+            sender: RemoteTraceSender { tx },
+            join,
+        }
+    }
+
+    fn sender(&self) -> RemoteTraceSender {
+        self.sender.clone()
+    }
+
+    async fn stop(self) -> Result<RemoteTraceUploadReport> {
+        drop(self.sender);
+        tokio::task::spawn_blocking(move || {
+            self.join
+                .join()
+                .map_err(|_| anyhow::anyhow!("remote trace uploader panicked"))?
+        })
+        .await
+        .context("join remote trace uploader task")?
+    }
+}
+
+async fn wrap_run_cmd(
+    config: &Config,
+    harness: &str,
+    remote_trace: RemoteTraceArgs,
+    mode: Option<String>,
+    bind: String,
+    upstream: Option<String>,
+    serve_only: bool,
+    quiet: bool,
+    args: Vec<String>,
+) -> Result<()> {
+    let remote_config = match resolve_remote_trace_config(&remote_trace)? {
+        Some(remote) => match preflight_remote_trace(&remote).await {
+            Ok(()) => {
+                eprintln!(
+                    "alex wrap: normalized traces → {}/traces/ingest",
+                    remote.base_url
+                );
+                Some(remote)
+            }
+            Err(error) => {
+                eprintln!("alex wrap: remote trace upload unavailable: {error:#}");
+                eprintln!(
+                    "alex wrap: continuing with the local spool; replay with `alex traces push --run-id <run-id>`"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let remote_worker = remote_config.map(RemoteTraceWorker::start);
+    let remote_sender = remote_worker.as_ref().map(RemoteTraceWorker::sender);
+    let vault = open_vault(config)?;
+    let catalog = alex_wrap::load_catalog()?;
+    let provider = catalog
+        .resolve(harness)
+        .and_then(|(_, h)| {
+            h.credentials
+                .as_ref()
+                .and_then(|c| c.vault_provider.clone())
+        })
+        .unwrap_or_else(|| harness.to_string());
+    // Native harness credentials are the freshest source (Amp can rotate its
+    // secrets.json token independently). Use the vault only as a fallback.
+    let native_key = match catalog
+        .resolve(harness)
+        .and_then(|(_, profile)| profile.credentials.as_ref())
+    {
+        Some(credentials) => alex_wrap::resolve_credential(credentials)?,
+        None => None,
+    };
+    let credential_override = if let Some(key) = native_key {
+        Some(key)
+    } else {
+        vault
+            .list()
+            .await
+            .into_iter()
+            .find(|a| a.provider.as_str() == provider && a.status == "active")
+            .and_then(|a| a.api_key.or(a.access_token))
+    };
+
+    let amp_trace = if harness == "amp" {
+        Some(start_amp_trace_import(config.data_dir.clone(), harness, remote_sender.clone()).await?)
+    } else {
+        None
+    };
+    let agent_trace = if harness == "agent" {
+        Some(start_agent_trace_import(config.data_dir.clone(), remote_sender).await?)
+    } else {
+        None
+    };
+
+    let outcome = alex_wrap::run_wrapped(alex_wrap::RunOptions {
+        harness: harness.to_string(),
+        mode,
+        bind,
+        upstream,
+        capture_base: config.data_dir.clone(),
+        credential_override,
+        ca_cert_path: None,
+        serve_only,
+        args,
+        quiet,
+    })
+    .await;
+
+    let amp_result = if let Some(importer) = amp_trace {
+        importer.stop().await
+    } else {
+        Ok(())
+    };
+    let agent_result = if let Some(importer) = agent_trace {
+        importer.stop().await
+    } else {
+        Ok(())
+    };
+    if let Some(worker) = remote_worker {
+        match worker.stop().await {
+            Ok(report) if report.failed == 0 => {
+                eprintln!("alex wrap: uploaded {} trace update(s)", report.uploaded)
+            }
+            Ok(report) => {
+                eprintln!(
+                    "alex wrap: uploaded {} trace update(s); {} remain in the local spool",
+                    report.uploaded, report.failed
+                );
+                if let Some(error) = report.failures.first() {
+                    eprintln!("alex wrap: first upload failure: {error}");
+                }
+                eprintln!(
+                    "alex wrap: replay with `alex traces push --run-id <run-id>` after fixing the destination"
+                );
+            }
+            Err(error) => {
+                eprintln!("alex wrap: remote trace upload stopped: {error:#}");
+                eprintln!(
+                    "alex wrap: traces remain in the local spool; replay with `alex traces push --run-id <run-id>`"
+                );
+            }
+        }
+    }
+
+    amp_result?;
+    agent_result?;
+
+    let outcome = outcome?;
+
+    if outcome.exit_code != 0 {
+        std::process::exit(outcome.exit_code);
+    }
+    Ok(())
+}
+
+struct AmpTraceImporter {
+    stop: tokio::sync::oneshot::Sender<()>,
+    join: tokio::task::JoinHandle<Result<()>>,
+    run_id: String,
+}
+
+impl AmpTraceImporter {
+    async fn stop(self) -> Result<()> {
+        let _ = self.stop.send(());
+        self.join.await.context("join Amp trace importer")??;
+        eprintln!("alex wrap: amp traces imported with run_id={}", self.run_id);
+        Ok(())
+    }
+}
+
+async fn start_amp_trace_import(
+    data_dir: PathBuf,
+    harness: &str,
+    remote: Option<RemoteTraceSender>,
+) -> Result<AmpTraceImporter> {
+    let run_id = format!(
+        "wrap-{harness}-{}-{:08x}",
+        now_ms(),
+        rand::thread_rng().gen::<u32>()
+    );
+    let tags = serde_json::json!({
+        "harness": harness,
+        "wrap": "amp",
+        "source": "alex-wrap-ws",
+        "stream": "dialogue",
+    })
+    .to_string();
+    let run_key = alex_proxy::generate_run_key();
+    let run_key_hash = amp_key_hash_hex(&run_key);
+    let run_key_id = format!("rk-{}", &run_key_hash[..8]);
+    Store::open(data_dir.clone())?.insert_run_key(
+        &run_key_id,
+        &run_key_hash,
+        "harness",
+        Some(&run_id),
+        Some(&tags),
+        Some("amp-wrap"),
+        now_ms(),
+        None,
+    )?;
+    let capture_dir = alex_wrap::capture_dir_for(&data_dir, harness);
+    std::fs::create_dir_all(&capture_dir)?;
+    let ws_path = capture_dir.join("ws.jsonl");
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let run_id_c = run_id.clone();
+    let ws_path_c = ws_path.clone();
+    let join = tokio::spawn(async move {
+        let mut state = AmpWsTraceState::new(
+            data_dir,
+            run_id_c,
+            tags,
+            run_key_hash[..16].to_string(),
+            remote,
+        );
+        let mut offset = 0u64;
+        loop {
+            tokio::select! {
+                _ = &mut rx => {
+                    break state.ingest_new(&ws_path_c, &mut offset);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    if let Err(error) = state.ingest_new(&ws_path_c, &mut offset) {
+                        eprintln!("alex wrap: amp trace import failed: {error:#}");
+                    }
+                }
+            }
+        }
+    });
+    eprintln!("alex wrap: amp trace run_id={run_id} key={run_key_id}");
+    eprintln!("alex wrap: amp ws → traces from {}", ws_path.display());
+    Ok(AmpTraceImporter {
+        stop: tx,
+        join,
+        run_id,
+    })
+}
+
+struct AmpWsTraceState {
+    data_dir: PathBuf,
+    run_id: String,
+    tags: String,
+    key_fingerprint: String,
+    remote: Option<RemoteTraceSender>,
+    user_by_thread: BTreeMap<String, AmpUserMessage>,
+    inserted: std::collections::BTreeSet<String>,
+    active_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct AmpUserMessage {
+    id: String,
+    text: String,
+    ts_ms: i64,
+}
+
+impl AmpWsTraceState {
+    fn new(
+        data_dir: PathBuf,
+        run_id: String,
+        tags: String,
+        key_fingerprint: String,
+        remote: Option<RemoteTraceSender>,
+    ) -> Self {
+        Self {
+            data_dir,
+            run_id,
+            tags,
+            key_fingerprint,
+            remote,
+            user_by_thread: BTreeMap::new(),
+            inserted: std::collections::BTreeSet::new(),
+            active_error: None,
+        }
+    }
+
+    fn ingest_new(&mut self, path: &std::path::Path, offset: &mut u64) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return Ok(());
+        };
+        let len = f.metadata()?.len();
+        if len < *offset {
+            *offset = 0;
+        }
+        f.seek(SeekFrom::Start(*offset))?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        // The websocket capture is appended concurrently. Only advance over
+        // newline-terminated records so an in-progress JSONL write is retried
+        // intact on the next poll instead of being permanently skipped.
+        let complete_len = s.rfind('\n').map(|offset| offset + 1).unwrap_or(0);
+        let complete = &s[..complete_len];
+        *offset += complete_len as u64;
+        for line in complete.lines() {
+            if let Err(e) = self.ingest_line(line) {
+                tracing::debug!("amp ws trace import skipped line: {e:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn ingest_line(&mut self, line: &str) -> Result<()> {
+        let outer: serde_json::Value = serde_json::from_str(line)?;
+        if outer["direction"].as_str() != Some("upstream_to_client") {
+            return Ok(());
+        }
+        let Some(text) = outer["text"].as_str() else {
+            return Ok(());
+        };
+        if text == "pong" || text == "ping" {
+            return Ok(());
+        }
+        let msg: serde_json::Value = serde_json::from_str(text)?;
+        let method = msg["method"].as_str().unwrap_or_default();
+        match method {
+            "message_added" => self.ingest_message_added(&msg, outer["ts"].as_str()),
+            "plugin_message" => self.ingest_plugin_message(&msg, outer["ts"].as_str()),
+            "error_set" => {
+                self.active_error = msg["params"]["error"]["message"]
+                    .as_str()
+                    .map(String::from);
+                Ok(())
+            }
+            "error_cleared" => {
+                self.active_error = None;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn ingest_message_added(&mut self, msg: &serde_json::Value, ts: Option<&str>) -> Result<()> {
+        let m = &msg["params"]["message"];
+        let role = m["role"].as_str().unwrap_or_default();
+        let thread_id = m["threadId"].as_str().unwrap_or_default();
+        let message_id = m["messageId"].as_str().unwrap_or_default();
+        let text = amp_content_text(&m["content"]);
+        if thread_id.is_empty() || message_id.is_empty() {
+            return Ok(());
+        }
+        if role == "user" && !text.is_empty() {
+            // Amp also represents tool results as role=user messages. Those
+            // blocks have no direct human text and must not replace the
+            // question that originated the current assistant turn.
+            self.user_by_thread.insert(
+                thread_id.to_string(),
+                AmpUserMessage {
+                    id: message_id.to_string(),
+                    text,
+                    ts_ms: parse_ts_ms(ts).unwrap_or_else(now_ms),
+                },
+            );
+        } else if role == "assistant" && !text.is_empty() {
+            self.insert_amp_trace(thread_id, message_id, &text, &m["usage"], ts, None)?;
+        }
+        Ok(())
+    }
+
+    fn ingest_plugin_message(&mut self, msg: &serde_json::Value, ts: Option<&str>) -> Result<()> {
+        let pm = &msg["params"]["message"];
+        if pm["method"].as_str() != Some("agent.end") {
+            return Ok(());
+        }
+        let event = &pm["params"]["event"];
+        let thread_id = event["thread"]["id"].as_str().unwrap_or_default();
+        let messages = event["messages"].as_array().cloned().unwrap_or_default();
+        let mut user = None;
+        let mut assistant = None;
+        for m in messages {
+            match m["role"].as_str() {
+                Some("user") => {
+                    let text = amp_content_text(&m["content"]);
+                    if !text.is_empty() {
+                        user = Some(AmpUserMessage {
+                            id: m["id"].as_str().unwrap_or_default().to_string(),
+                            text,
+                            ts_ms: parse_ts_ms(ts).unwrap_or_else(now_ms),
+                        });
+                    }
+                }
+                Some("assistant") => {
+                    assistant = Some((
+                        m["id"].as_str().unwrap_or_default().to_string(),
+                        amp_content_text(&m["content"]),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(u) = user {
+            self.user_by_thread.insert(thread_id.to_string(), u);
+        }
+        if let Some((id, text)) = assistant {
+            if !id.is_empty() && !text.is_empty() {
+                self.insert_amp_trace(
+                    thread_id,
+                    &id,
+                    &text,
+                    &serde_json::Value::Null,
+                    ts,
+                    None,
+                )?;
+            }
+        } else if event["status"].as_str() == Some("error") {
+            let user_id = self
+                .user_by_thread
+                .get(thread_id)
+                .map(|user| user.id.as_str())
+                .or_else(|| event["id"].as_str())
+                .unwrap_or("unknown");
+            let message_id = format!("error-{user_id}");
+            let error = self
+                .active_error
+                .clone()
+                .unwrap_or_else(|| "Amp turn ended with an error".into());
+            self.insert_amp_trace(
+                thread_id,
+                &message_id,
+                "",
+                &serde_json::Value::Null,
+                ts,
+                Some(error),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_amp_trace(
+        &mut self,
+        thread_id: &str,
+        message_id: &str,
+        assistant_text: &str,
+        usage_v: &serde_json::Value,
+        ts: Option<&str>,
+        error: Option<String>,
+    ) -> Result<()> {
+        if self.inserted.contains(message_id) {
+            return Ok(());
+        }
+        let store = Store::open(self.data_dir.clone())?;
+        let user = self.user_by_thread.get(thread_id).cloned();
+        let ts_resp = parse_ts_ms(ts).unwrap_or_else(now_ms);
+        let ts_req = user.as_ref().map(|u| u.ts_ms).unwrap_or(ts_resp);
+        let model = usage_v["model"].as_str().unwrap_or("amp-actor").to_string();
+        let usage = alex_core::Usage {
+            input_tokens: usage_v["inputTokens"].as_i64(),
+            cached_input_tokens: usage_v["cacheReadInputTokens"].as_i64(),
+            cache_creation_tokens: usage_v["cacheCreationInputTokens"].as_i64(),
+            output_tokens: usage_v["outputTokens"].as_i64(),
+            reasoning_tokens: None,
+        };
+        let cost_usd = store
+            .pricing_for(&model)
+            .map(|p| alex_core::compute_cost(&usage, &p, false));
+        let trace_id = format!("amp-{message_id}");
+        // Store normalized OpenAI-chat-shaped bodies so the existing trace
+        // browser/transcript extractors can render Amp dialogue without
+        // learning every noisy actor event shape.
+        let req = serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": user.as_ref().map(|u| u.text.as_str()).unwrap_or(""),
+            }],
+            "amp": {
+                "thread_id": thread_id,
+                "message_id": user.as_ref().map(|u| u.id.as_str()),
+            }
+        });
+        let resp = serde_json::json!({
+            "id": message_id,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": if assistant_text.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(assistant_text.to_string())
+                }},
+                "finish_reason": if error.is_some() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String("stop".into())
+                }
+            }],
+            "error": error.as_ref().map(|message| serde_json::json!({"message": message})),
+            "usage": {
+                "prompt_tokens": usage.input_tokens,
+                "completion_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_tokens,
+                "cache_read_input_tokens": usage.cached_input_tokens
+            },
+            "amp": {
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "raw_usage": usage_v
+            }
+        });
+        let req_path = Some(store.write_body(
+            &trace_id,
+            "request.json",
+            serde_json::to_string_pretty(&req)?.as_bytes(),
+        )?);
+        let resp_path = Some(store.write_body(
+            &trace_id,
+            "response.body",
+            serde_json::to_string_pretty(&resp)?.as_bytes(),
+        )?);
+        let rec = alex_core::TraceRecord {
+            id: trace_id,
+            ts_request_ms: ts_req,
+            ts_response_ms: Some(ts_resp),
+            session_id: Some(thread_id.to_string()),
+            harness: Some("amp".into()),
+            client_format: Some("openai-chat".into()),
+            upstream_provider: Some("amp".into()),
+            upstream_format: Some("openai-chat".into()),
+            requested_model: Some(model.clone()),
+            routed_model: Some(model),
+            method: Some("WEBSOCKET".into()),
+            path: Some("/actors/gateway/threadActor/websocket/".into()),
+            status: Some(if error.as_deref().is_some_and(|message| message.contains("401")) {
+                401
+            } else if error.is_some() {
+                500
+            } else {
+                200
+            }),
+            streamed: Some(true),
+            usage,
+            cost_usd,
+            billing_bucket: Some("amp".into()),
+            req_body_path: req_path,
+            upstream_req_body_path: None,
+            resp_body_path: resp_path,
+            req_headers_json: Some(serde_json::json!({
+                "x-alexandria-wrap": "amp",
+                "x-alexandria-run-id": self.run_id,
+                "x-alexandria-trace-tag": "harness=amp,wrap=amp,source=alex-wrap-ws,stream=dialogue"
+            }).to_string()),
+            resp_headers_json: Some(serde_json::json!({
+                "x-alexandria-wrap": "amp",
+                "x-alexandria-source": "websocket",
+                "content-type": "application/json"
+            }).to_string()),
+            error,
+            account_id: None,
+            run_id: Some(self.run_id.clone()),
+            tags: Some(self.tags.clone()),
+            client_ip: None,
+            key_fingerprint: Some(self.key_fingerprint.clone()),
+            reasoning_effort: None,
+            thinking_budget: None,
+        };
+        store.insert_trace(&rec)?;
+        self.inserted.insert(message_id.to_string());
+        if let Some(remote) = &self.remote {
+            queue_remote_trace_update(remote, &store, &rec.id);
+        }
+        tracing::info!(trace_id = %rec.id, "amp wrap trace recorded");
+        Ok(())
+    }
+}
+
+fn amp_content_text(content: &serde_json::Value) -> String {
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ts_ms(ts: Option<&str>) -> Option<i64> {
+    let ts = ts?;
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|d| d.timestamp_millis())
+}
+
+fn amp_key_hash_hex(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+struct AgentTraceImporter {
+    stop: tokio::sync::oneshot::Sender<()>,
+    join: tokio::task::JoinHandle<Result<()>>,
+    run_id: String,
+}
+
+impl AgentTraceImporter {
+    async fn stop(self) -> Result<()> {
+        let _ = self.stop.send(());
+        self.join
+            .await
+            .context("join Cursor Agent trace importer")??;
+        eprintln!(
+            "alex wrap: agent trace importer stopped with run_id={}",
+            self.run_id
+        );
+        Ok(())
+    }
+}
+
+async fn start_agent_trace_import(
+    data_dir: PathBuf,
+    remote: Option<RemoteTraceSender>,
+) -> Result<AgentTraceImporter> {
+    let run_id = format!(
+        "wrap-agent-{}-{:08x}",
+        now_ms(),
+        rand::thread_rng().gen::<u32>()
+    );
+    let transcript_root = cursor_agent_transcript_root()?;
+    std::fs::create_dir_all(&transcript_root).ok();
+    let started_ms = now_ms();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let run_id_c = run_id.clone();
+    let transcript_root_c = transcript_root.clone();
+    let join = tokio::spawn(async move {
+        let mut seen = BTreeMap::new();
+        loop {
+            tokio::select! {
+                _ = &mut rx => {
+                    break import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref());
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    if let Err(error) = import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref()) {
+                        eprintln!("alex wrap: agent trace import failed: {error:#}");
+                    }
+                }
+            }
+        }
+    });
+    eprintln!("alex wrap: agent trace run_id={run_id}");
+    eprintln!(
+        "alex wrap: agent transcripts → traces from {}",
+        transcript_root.display()
+    );
+    Ok(AgentTraceImporter {
+        stop: tx,
+        join,
+        run_id,
+    })
+}
+
+fn cursor_agent_transcript_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let key = cwd
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-");
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not found"))?;
+    Ok(home
+        .join(".cursor/projects")
+        .join(key)
+        .join("agent-transcripts"))
+}
+
+fn import_agent_transcripts(
+    data_dir: &std::path::Path,
+    root: &std::path::Path,
+    run_id: &str,
+    started_ms: i64,
+    seen: &mut BTreeMap<String, AgentTranscriptTurn>,
+    remote: Option<&RemoteTraceSender>,
+) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    let store = Store::open(data_dir.to_path_buf())?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(id) = dir.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let path = dir.join(format!("{id}.jsonl"));
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if modified + 2_000 < started_ms {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let turns = parse_agent_transcript_turns(&raw);
+        for (offset, turn) in turns.into_iter().enumerate() {
+            let idx = offset + 1;
+            let key = format!("{id}-{idx}");
+            if seen.get(&key) == Some(&turn) {
+                continue;
+            }
+            let outcome = reconcile_agent_turn(&store, run_id, id, idx, modified, &turn, false)?;
+            if outcome != AgentReconcileOutcome::Unchanged {
+                if let Some(remote) = remote {
+                    let trace_id = format!("agent-{id}-{idx}");
+                    queue_remote_trace_update(remote, &store, &trace_id);
+                }
+            }
+            seen.insert(key, turn);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentToolCall {
+    name: String,
+    input: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentTranscriptTurn {
+    user: String,
+    assistant: String,
+    tool_calls: Vec<AgentToolCall>,
+    assistant_blocks: Vec<serde_json::Value>,
+    complete: bool,
+    end_status: Option<String>,
+}
+
+#[derive(Default)]
+struct AgentTurnBuilder {
+    user: String,
+    assistant_chunks: Vec<String>,
+    tool_calls: Vec<AgentToolCall>,
+    assistant_blocks: Vec<serde_json::Value>,
+    saw_assistant: bool,
+}
+
+impl AgentTurnBuilder {
+    fn finish(self, complete: bool, end_status: Option<String>) -> AgentTranscriptTurn {
+        AgentTranscriptTurn {
+            user: self.user,
+            assistant: self.assistant_chunks.join("\n\n"),
+            tool_calls: self.tool_calls,
+            assistant_blocks: self.assistant_blocks,
+            complete,
+            end_status,
+        }
+    }
+}
+
+fn push_agent_turn(
+    out: &mut Vec<AgentTranscriptTurn>,
+    current: &mut Option<AgentTurnBuilder>,
+    complete: bool,
+    end_status: Option<String>,
+) {
+    let Some(turn) = current.take() else {
+        return;
+    };
+    if turn.saw_assistant || complete {
+        out.push(turn.finish(complete, end_status));
+    }
+}
+
+fn parse_agent_transcript_turns(raw: &str) -> Vec<AgentTranscriptTurn> {
+    let mut out = Vec::new();
+    let mut current: Option<AgentTurnBuilder> = None;
+    for line in raw.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["role"].as_str() {
+            Some("user") => {
+                push_agent_turn(&mut out, &mut current, true, None);
+                let text = agent_content_text(&v["message"]["content"]);
+                current = Some(AgentTurnBuilder {
+                    user: extract_user_query(&text),
+                    ..AgentTurnBuilder::default()
+                });
+            }
+            Some("assistant") => {
+                let Some(turn) = current.as_mut() else {
+                    continue;
+                };
+                turn.saw_assistant = true;
+                for block in v["message"]["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("text") => {
+                            if let Some(text) = clean_agent_assistant_text(
+                                block["text"].as_str().unwrap_or_default(),
+                            ) {
+                                turn.assistant_chunks.push(text.clone());
+                                turn.assistant_blocks.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": text,
+                                }));
+                            }
+                        }
+                        Some("tool_use") => {
+                            if let Some(name) = block["name"].as_str() {
+                                let input = block.get("input").cloned().unwrap_or_default();
+                                turn.tool_calls.push(AgentToolCall {
+                                    name: name.to_string(),
+                                    input: input.clone(),
+                                });
+                                turn.assistant_blocks.push(serde_json::json!({
+                                    "type": "tool_call",
+                                    "name": name,
+                                    "arguments": serde_json::to_string(&input).unwrap_or_default(),
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if v["type"] == "turn_ended" {
+            push_agent_turn(
+                &mut out,
+                &mut current,
+                true,
+                v["status"].as_str().map(String::from),
+            );
+        }
+    }
+    push_agent_turn(&mut out, &mut current, false, None);
+    out
+}
+
+fn parse_agent_transcript_turns_strict(raw: &str) -> Result<Vec<AgentTranscriptTurn>> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("Cursor Agent transcript is empty");
+    }
+    for (offset, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        serde_json::from_str::<serde_json::Value>(line).with_context(|| {
+            format!(
+                "malformed Cursor Agent transcript JSON on line {}",
+                offset + 1
+            )
+        })?;
+    }
+    let turns = parse_agent_transcript_turns(raw);
+    if turns.is_empty() {
+        anyhow::bail!("Cursor Agent transcript contains no conversation turns");
+    }
+    Ok(turns)
+}
+
+fn agent_content_text(content: &serde_json::Value) -> String {
+    content
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn clean_agent_assistant_text(text: &str) -> Option<String> {
+    let trimmed_end = text.trim_end_matches([' ', '\t', '\r', '\n']);
+    let cleaned = if trimmed_end.trim() == "[REDACTED]" {
+        ""
+    } else if let Some(prefix) = trimmed_end.strip_suffix("[REDACTED]") {
+        if prefix.ends_with('\n') {
+            prefix.trim_end_matches(['\r', '\n'])
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+    (!cleaned.trim().is_empty()).then(|| cleaned.to_string())
+}
+
+fn extract_user_query(s: &str) -> String {
+    if let Some(start) = s.find("<user_query>") {
+        let rest = &s[start + "<user_query>".len()..];
+        if let Some(end) = rest.find("</user_query>") {
+            return rest[..end].trim().to_string();
+        }
+    }
+    s.trim().to_string()
+}
+
+fn agent_trace_bodies(
+    transcript_id: &str,
+    turn_index: usize,
+    turn: &AgentTranscriptTurn,
+) -> (serde_json::Value, serde_json::Value) {
+    let req = serde_json::json!({
+        "model": "cursor-agent",
+        "messages": [{"role": "user", "content": turn.user}],
+        "cursor": {"transcript_id": transcript_id}
+    });
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if turn.assistant.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(turn.assistant.clone())
+        }
+    });
+    if !turn.tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(
+            turn.tool_calls
+                .iter()
+                .enumerate()
+                .map(|(offset, call)| {
+                    serde_json::json!({
+                        "id": format!("call_cursor_{turn_index}_{}", offset + 1),
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": serde_json::to_string(&call.input).unwrap_or_default()
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    let resp = serde_json::json!({
+        "id": transcript_id,
+        "model": "cursor-agent",
+        "_alexandria": {"assistant_blocks": turn.assistant_blocks},
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": if turn.complete {
+                serde_json::Value::String("stop".into())
+            } else {
+                serde_json::Value::Null
+            }
+        }]
+    });
+    (req, resp)
+}
+
+fn read_gzip_json(path: &std::path::Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open compressed trace body {}", path.display()))?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .with_context(|| format!("read compressed trace body {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parse compressed trace body {}", path.display()))
+}
+
+fn read_gzip_bytes(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open compressed trace body {}", path.display()))?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut bytes = Vec::new();
+    decoder
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read compressed trace body {}", path.display()))?;
+    Ok(bytes)
+}
+
+fn trace_ingest_payload_from_store(
+    store: &Store,
+    trace_id: &str,
+) -> Result<alex_core::TraceIngestPayload> {
+    use base64::Engine;
+
+    let row = store
+        .get_trace(trace_id)?
+        .with_context(|| format!("trace disappeared before upload: {trace_id}"))?;
+    let string = |key: &str| row[key].as_str().map(String::from);
+    let body = |key: &str| -> Result<Option<String>> {
+        let Some(path) = row[key].as_str() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD
+                .encode(read_gzip_bytes(std::path::Path::new(path))?),
+        ))
+    };
+    let trace = alex_core::TraceRecord {
+        id: trace_id.to_string(),
+        ts_request_ms: row["ts_request_ms"].as_i64().unwrap_or_else(now_ms),
+        ts_response_ms: row["ts_response_ms"].as_i64(),
+        session_id: string("session_id"),
+        harness: string("harness"),
+        client_format: string("client_format"),
+        upstream_provider: string("upstream_provider"),
+        upstream_format: string("upstream_format"),
+        requested_model: string("requested_model"),
+        routed_model: string("routed_model"),
+        method: string("method"),
+        path: string("path"),
+        status: row["status"].as_i64(),
+        streamed: row["streamed"].as_i64().map(|value| value != 0),
+        usage: alex_core::Usage {
+            input_tokens: row["input_tokens"].as_i64(),
+            cached_input_tokens: row["cached_input_tokens"].as_i64(),
+            cache_creation_tokens: row["cache_creation_tokens"].as_i64(),
+            output_tokens: row["output_tokens"].as_i64(),
+            reasoning_tokens: row["reasoning_tokens"].as_i64(),
+        },
+        cost_usd: row["cost_usd"].as_f64(),
+        billing_bucket: string("billing_bucket"),
+        req_headers_json: string("req_headers_json"),
+        resp_headers_json: string("resp_headers_json"),
+        error: string("error"),
+        account_id: string("account_id"),
+        run_id: string("run_id"),
+        tags: string("tags_json"),
+        client_ip: string("client_ip"),
+        key_fingerprint: string("key_fingerprint"),
+        reasoning_effort: string("reasoning_effort"),
+        thinking_budget: row["thinking_budget"].as_i64(),
+        ..Default::default()
+    };
+    Ok(alex_core::TraceIngestPayload {
+        trace,
+        request_body_b64: body("req_body_path")?,
+        upstream_request_body_b64: body("upstream_req_body_path")?,
+        response_body_b64: body("resp_body_path")?,
+    })
+}
+
+fn queue_remote_trace_update(remote: &RemoteTraceSender, store: &Store, trace_id: &str) {
+    let result =
+        trace_ingest_payload_from_store(store, trace_id).and_then(|payload| remote.send(payload));
+    if let Err(error) = result {
+        eprintln!(
+            "alex wrap: could not queue remote trace {trace_id}: {error:#}; it remains in the local spool"
+        );
+    }
+}
+
+fn write_gzip_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("trace body has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("body.gz");
+    let tmp = parent.join(format!(
+        ".{file_name}.{}-{:08x}.tmp",
+        std::process::id(),
+        rand::thread_rng().gen::<u32>()
+    ));
+    let result = (|| -> Result<()> {
+        let file = std::fs::File::create(&tmp)
+            .with_context(|| format!("create temporary trace body {}", tmp.display()))?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "replace compressed trace body {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentReconcileOutcome {
+    Inserted,
+    Updated,
+    Unchanged,
+}
+
+fn reconcile_agent_turn(
+    store: &Store,
+    run_id: &str,
+    transcript_id: &str,
+    turn_index: usize,
+    ts_ms: i64,
+    turn: &AgentTranscriptTurn,
+    dry_run: bool,
+) -> Result<AgentReconcileOutcome> {
+    let trace_id = format!("agent-{transcript_id}-{turn_index}");
+    let (req, resp) = agent_trace_bodies(transcript_id, turn_index, turn);
+    if let Some(existing) = store.get_trace(&trace_id)? {
+        let req_path = existing["req_body_path"]
+            .as_str()
+            .map(std::path::PathBuf::from);
+        let resp_path = existing["resp_body_path"]
+            .as_str()
+            .map(std::path::PathBuf::from);
+        let req_matches = req_path
+            .as_deref()
+            .and_then(|path| read_gzip_json(path).ok())
+            .as_ref()
+            == Some(&req);
+        let resp_matches = resp_path
+            .as_deref()
+            .and_then(|path| read_gzip_json(path).ok())
+            .as_ref()
+            == Some(&resp);
+        if req_matches && resp_matches {
+            return Ok(AgentReconcileOutcome::Unchanged);
+        }
+        if !dry_run {
+            if !req_matches {
+                let path = req_path.with_context(|| {
+                    format!("existing Agent trace {trace_id} has no request body path")
+                })?;
+                write_gzip_json_atomic(&path, &req)?;
+            }
+            if !resp_matches {
+                let path = resp_path.with_context(|| {
+                    format!("existing Agent trace {trace_id} has no response body path")
+                })?;
+                write_gzip_json_atomic(&path, &resp)?;
+            }
+        }
+        return Ok(AgentReconcileOutcome::Updated);
+    }
+
+    if dry_run {
+        return Ok(AgentReconcileOutcome::Inserted);
+    }
+    let req_path = Some(store.write_body(
+        &trace_id,
+        "request.json",
+        serde_json::to_string_pretty(&req)?.as_bytes(),
+    )?);
+    let resp_path = Some(store.write_body(
+        &trace_id,
+        "response.body",
+        serde_json::to_string_pretty(&resp)?.as_bytes(),
+    )?);
+    let tags = serde_json::json!({"harness":"agent","wrap":"agent","source":"cursor-agent-transcript","stream":"dialogue"}).to_string();
+    let rec = alex_core::TraceRecord {
+        id: trace_id,
+        ts_request_ms: ts_ms + turn_index as i64,
+        ts_response_ms: Some(ts_ms + turn_index as i64),
+        session_id: Some(transcript_id.to_string()),
+        harness: Some("agent".into()),
+        client_format: Some("openai-chat".into()),
+        upstream_provider: Some("cursor".into()),
+        upstream_format: Some("openai-chat".into()),
+        requested_model: Some("cursor-agent".into()),
+        routed_model: Some("cursor-agent".into()),
+        method: Some("TRANSCRIPT".into()),
+        path: Some("cursor-agent-transcript".into()),
+        status: Some(200),
+        streamed: Some(true),
+        usage: alex_core::Usage::default(),
+        cost_usd: None,
+        billing_bucket: Some("cursor".into()),
+        req_body_path: req_path,
+        upstream_req_body_path: None,
+        resp_body_path: resp_path,
+        req_headers_json: Some(serde_json::json!({"x-alexandria-wrap":"agent","x-alexandria-run-id":run_id}).to_string()),
+        resp_headers_json: Some(serde_json::json!({"x-alexandria-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
+        error: None,
+        account_id: None,
+        run_id: Some(run_id.to_string()),
+        tags: Some(tags),
+        client_ip: None,
+        key_fingerprint: None,
+        reasoning_effort: None,
+        thinking_budget: None,
+    };
+    store.insert_trace(&rec)?;
+    Ok(AgentReconcileOutcome::Inserted)
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRepairReport {
+    transcript_id: String,
+    turns: usize,
+    inserted: usize,
+    updated: usize,
+    unchanged: usize,
+    dry_run: bool,
+}
+
+fn validate_agent_transcript_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("invalid Cursor Agent transcript id: {id}");
+    }
+    Ok(())
+}
+
+fn traces_repair_amp_cmd(config: &Config, run_id: Option<&str>, json_out: bool) -> Result<()> {
+    let capture_path = alex_wrap::capture_dir_for(&config.data_dir, "amp").join("ws.jsonl");
+    if !capture_path.exists() {
+        anyhow::bail!("Amp websocket capture not found: {}", capture_path.display());
+    }
+    let run_id = run_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("repair-amp-{}", now_ms()));
+    let tags = serde_json::json!({
+        "harness": "amp",
+        "wrap": "amp",
+        "source": "alex-wrap-ws-repair",
+        "stream": "dialogue",
+    })
+    .to_string();
+    let mut state = AmpWsTraceState::new(
+        config.data_dir.clone(),
+        run_id.clone(),
+        tags,
+        "amp-repair".into(),
+        None,
+    );
+    let mut offset = 0;
+    state.ingest_new(&capture_path, &mut offset)?;
+    let result = serde_json::json!({
+        "run_id": run_id,
+        "capture_path": capture_path,
+        "records_imported": state.inserted.len(),
+        "bytes_read": offset,
+    });
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "{} imported {} Amp trace record(s) from {}",
+            ui::green(ui::dot()),
+            state.inserted.len(),
+            capture_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn repair_agent_transcript(
+    data_dir: &std::path::Path,
+    transcript_root: &std::path::Path,
+    transcript_id: &str,
+    dry_run: bool,
+) -> Result<AgentRepairReport> {
+    validate_agent_transcript_id(transcript_id)?;
+    let path = transcript_root
+        .join(transcript_id)
+        .join(format!("{transcript_id}.jsonl"));
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("Cursor Agent transcript not found: {}", path.display()))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_else(now_ms);
+    let turns = parse_agent_transcript_turns_strict(&std::fs::read_to_string(&path)?)?;
+    let store = Store::open(data_dir.to_path_buf())?;
+    let existing = store.session_traces(transcript_id, None)?;
+    let run_id = existing
+        .iter()
+        .find_map(|row| row["run_id"].as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("repair-agent-{}", now_ms()));
+    let mut report = AgentRepairReport {
+        transcript_id: transcript_id.to_string(),
+        turns: turns.len(),
+        inserted: 0,
+        updated: 0,
+        unchanged: 0,
+        dry_run,
+    };
+    for (offset, turn) in turns.iter().enumerate() {
+        match reconcile_agent_turn(
+            &store,
+            &run_id,
+            transcript_id,
+            offset + 1,
+            modified,
+            turn,
+            dry_run,
+        )? {
+            AgentReconcileOutcome::Inserted => report.inserted += 1,
+            AgentReconcileOutcome::Updated => report.updated += 1,
+            AgentReconcileOutcome::Unchanged => report.unchanged += 1,
+        }
+    }
+    Ok(report)
+}
+
+fn traces_repair_agent_cmd(
+    config: &Config,
+    transcript_id: &str,
+    dry_run: bool,
+    json_out: bool,
+) -> Result<()> {
+    let root = cursor_agent_transcript_root()?;
+    let report = repair_agent_transcript(&config.data_dir, &root, transcript_id, dry_run)?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "{} Agent transcript {}: {} turn(s), {} inserted, {} updated, {} unchanged{}",
+            ui::green(ui::dot()),
+            ui::bold(&report.transcript_id),
+            report.turns,
+            report.inserted,
+            report.updated,
+            report.unchanged,
+            if report.dry_run { " (dry run)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+async fn traces_push_cmd(
+    config: &Config,
+    run_id: &str,
+    remote_args: &RemoteTraceArgs,
+) -> Result<()> {
+    let remote = resolve_remote_trace_config(remote_args)?
+        .context("traces push requires --trace-url / ALEXANDRIA_TRACE_URL")?;
+    preflight_remote_trace(&remote).await?;
+    let store = Store::open(config.data_dir.clone())?;
+    let trace_ids = store.run_trace_ids(run_id)?;
+    if trace_ids.is_empty() {
+        anyhow::bail!("no local traces found for run '{run_id}'");
+    }
+    let worker = RemoteTraceWorker::start(remote);
+    let sender = worker.sender();
+    for trace_id in &trace_ids {
+        sender.send(trace_ingest_payload_from_store(&store, trace_id)?)?;
+    }
+    drop(sender);
+    let report = worker.stop().await?;
+    if report.failed > 0 {
+        anyhow::bail!(
+            "pushed {} trace(s), but {} failed and remain in the local spool: {}",
+            report.uploaded,
+            report.failed,
+            report.failures.join("; ")
+        );
+    }
+    println!(
+        "{} pushed {} trace(s) from run {}",
+        ui::green(ui::dot()),
+        report.uploaded,
+        ui::bold(run_id)
+    );
+    Ok(())
+}
+
+async fn wrap_status_cmd(config: &Config, json_out: bool) -> Result<()> {
+    let catalog = alex_wrap::load_catalog()?;
+    let mut body = alex_wrap::status_json(&catalog);
+    // Enrich with vault account presence per harness.
+    let vault = open_vault(config)?;
+    let accounts = vault.list().await;
+    if let Some(obj) = body.get_mut("harnesses").and_then(|h| h.as_object_mut()) {
+        for (id, entry) in obj.iter_mut() {
+            let provider = entry
+                .pointer("/credentials/vault_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id);
+            let vault_id = accounts
+                .iter()
+                .find(|a| a.status == "active" && a.provider.as_str() == provider)
+                .map(|a| a.id.clone());
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("vault_account".into(), serde_json::json!(vault_id));
+            }
+        }
+    }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    println!("{}", ui::section("wrap status"));
+    println!(
+        "  catalog: {}",
+        body["catalog_source"].as_str().unwrap_or("?")
+    );
+    let Some(harnesses) = body["harnesses"].as_object() else {
+        return Ok(());
+    };
+    for (id, h) in harnesses {
+        let enabled = h["enabled"].as_bool().unwrap_or(true);
+        let modes: Vec<&str> = h["modes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["id"].as_str()).collect())
+            .unwrap_or_default();
+        let vault = h["vault_account"].as_str().unwrap_or("(none)");
+        let cred_ok = h
+            .pointer("/credentials/resolved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        println!(
+            "  {} {}  modes=[{}]  vault={}  secrets={}",
+            if enabled {
+                ui::green(ui::dot())
+            } else {
+                ui::dim(ui::circle())
+            },
+            ui::bold(id),
+            modes.join(", "),
+            vault,
+            if cred_ok { "ok" } else { "missing" }
+        );
+        if let Some(desc) = h["description"].as_str() {
+            println!("      {}", ui::dim(desc));
+        }
+    }
+    println!(
+        "  try:  alex wrap env amp [--mode base_url|env_proxy]\n        alex wrap smoke --json"
+    );
+    println!(
+        "  override catalog: {}",
+        alex_wrap::user_catalog_override_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    Ok(())
+}
+
+async fn wrap_env_cmd(
+    config: &Config,
+    harness: &str,
+    mode: Option<&str>,
+    wrap_url: &str,
+    ca_cert: Option<PathBuf>,
+    json_out: bool,
+) -> Result<()> {
+    let catalog = alex_wrap::load_catalog()?;
+    let vault = open_vault(config)?;
+    // Prefer vault key when catalog names a vault provider.
+    let vault_key = {
+        let resolved = catalog.resolve(harness);
+        if let Some((_, h)) = resolved {
+            if let Some(creds) = &h.credentials {
+                let provider = creds.vault_provider.as_deref().unwrap_or(harness);
+                vault
+                    .list()
+                    .await
+                    .into_iter()
+                    .find(|a| a.provider.as_str() == provider && a.status == "active")
+                    .and_then(|a| a.api_key.or(a.access_token))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let capture = alex_wrap::capture_dir_for(&config.data_dir, harness);
+    let (_id, plan) = alex_wrap::plan_for(
+        &catalog, harness, mode, wrap_url, &capture, vault_key, ca_cert,
+    )?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&plan.summary_json())?);
+        return Ok(());
+    }
+    for line in plan.export_lines() {
+        println!("{line}");
+    }
+    if let Some(path) = &plan.settings_path {
+        println!("# settings written: {}", path.display());
+    }
+    println!("# mode={} role={:?}", plan.mode_id, plan.wrap_role);
+    if let Some(notes) = &plan.notes {
+        println!("# note: {notes}");
+    }
+    println!(
+        "# then: {} {}",
+        plan.binary,
+        plan.argv_suffix
+            .iter()
+            .map(|s| shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!("# wrap must listen at {}", plan.wrap_base_url);
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r#"'"'"'"#))
+    }
+}
+
+async fn wrap_smoke_cmd(harness: &str, json_out: bool) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let catalog = alex_wrap::load_catalog()?;
+    let (_, h) = catalog
+        .resolve(harness)
+        .with_context(|| format!("unknown harness '{harness}' for smoke"))?;
+    let policy = h.capture.clone();
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = upstream.local_addr()?;
+    let up = tokio::spawn(async move {
+        let (mut sock, _) = upstream.accept().await?;
+        let mut buf = vec![0u8; 4096];
+        let n = sock.read(&mut buf).await?;
+        let req = String::from_utf8_lossy(&buf[..n]);
+        anyhow::ensure!(
+            req.contains("GET /api/internal?getUserInfo"),
+            "unexpected request: {req}"
+        );
+        let body = br#"{"ok":true,"result":{"user":"smoke"}}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await?;
+        sock.write_all(body).await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let log = alex_wrap::CaptureLog::with_policy(policy);
+    let wrap = alex_wrap::ReverseWrap::start_http_to_http(
+        "127.0.0.1:0".parse().unwrap(),
+        up_addr,
+        log.clone(),
+    )
+    .await?;
+
+    let mut client = tokio::net::TcpStream::connect(wrap.listen_addr).await?;
+    client
+        .write_all(
+            b"GET /api/internal?getUserInfo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await?;
+    let resp_s = String::from_utf8_lossy(&resp);
+    anyhow::ensure!(resp_s.contains("200 OK"), "bad response: {resp_s}");
+    anyhow::ensure!(
+        log.paths()
+            .iter()
+            .any(|p| p.contains("/api/internal?getUserInfo")),
+        "path not captured: {:?}",
+        log.paths()
+    );
+
+    // Plan resolution smoke (no network): ensure catalog templates expand.
+    let dir = std::env::temp_dir().join(format!(
+        "alex-wrap-smoke-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let (_id, plan) = alex_wrap::plan_for(
+        &catalog,
+        harness,
+        Some("base_url"),
+        &wrap.base_url(),
+        &dir,
+        Some("sgamp_smoke".into()),
+        None,
+    )?;
+    anyhow::ensure!(plan.env.contains_key("AMP_URL") || harness != "amp");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    wrap.shutdown().await;
+    up.await??;
+
+    let summary = serde_json::json!({
+        "ok": true,
+        "harness": harness,
+        "captured_paths": log.paths(),
+        "events": log.events().len(),
+        "plan": plan.summary_json(),
+    });
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "{} wrap smoke ok — harness={} captured {} event(s) mode={}",
+            ui::green(ui::dot()),
+            harness,
+            log.events().len(),
+            plan.mode_id
+        );
+        for p in log.paths() {
+            println!("  {p}");
         }
     }
     Ok(())
@@ -1934,16 +4033,21 @@ async fn daemon_send(
 
 async fn keys_mint_cmd(
     config: &Config,
+    kind: &str,
     run_id: Option<String>,
     tags: &[String],
     ttl: &str,
     label: Option<String>,
+    json_out: bool,
 ) -> Result<()> {
+    if !matches!(kind, "run" | "harness" | "wrap") {
+        anyhow::bail!("invalid --kind '{kind}' (use run, harness, or wrap)");
+    }
     let ttl_seconds = parse_ttl_seconds(ttl)
         .with_context(|| format!("invalid --ttl '{ttl}' (use seconds or 45s, 30m, 24h, 7d)"))?;
     let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
     let tag_values = alex_core::parse_trace_tags(&tag_refs);
-    let mut body = serde_json::json!({"ttl_seconds": ttl_seconds});
+    let mut body = serde_json::json!({"kind": kind, "ttl_seconds": ttl_seconds});
     if let Some(r) = &run_id {
         body["run_id"] = serde_json::json!(r);
     }
@@ -1965,6 +4069,10 @@ async fn keys_mint_cmd(
             ui::truncate(&resp.to_string(), 300)
         );
     }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
     let key = resp["key"].as_str().unwrap_or("-").to_string();
     println!("{}", ui::section("run key minted"));
     println!(
@@ -1982,13 +4090,19 @@ async fn keys_mint_cmd(
     println!();
     println!("{}", ui::bold(&ui::gold(&key)));
     println!();
-    println!(
-        "{}",
-        ui::dim("shown once — inject into the harness env (any of):")
-    );
-    println!("export ANTHROPIC_API_KEY={key}");
-    println!("export OPENAI_API_KEY={key}");
-    println!("export XAI_API_KEY={key}");
+    if kind == "wrap" {
+        println!("{}", ui::dim("shown once — configure the remote wrapper:"));
+        println!("export ALEXANDRIA_TRACE_URL={}", config.base_url());
+        println!("export ALEXANDRIA_TRACE_KEY={key}");
+    } else {
+        println!(
+            "{}",
+            ui::dim("shown once — inject into the harness env (any of):")
+        );
+        println!("export ANTHROPIC_API_KEY={key}");
+        println!("export OPENAI_API_KEY={key}");
+        println!("export XAI_API_KEY={key}");
+    }
     Ok(())
 }
 
@@ -2014,8 +4128,9 @@ async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
     }
     println!("{}", ui::section("run keys"));
     println!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         ui::pad_right(&ui::column_header("id"), 12),
+        ui::pad_right(&ui::column_header("kind"), 8),
         ui::pad_right(&ui::column_header("run"), 18),
         ui::pad_right(&ui::column_header("tags"), 26),
         ui::pad_left(&ui::column_header("uses"), 5),
@@ -2043,8 +4158,9 @@ async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
             }
         };
         println!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             ui::pad_right(&ui::amber(r["id"].as_str().unwrap_or("-")), 12),
+            ui::pad_right(&ui::sand(r["kind"].as_str().unwrap_or("run")), 8),
             ui::pad_right(
                 &ui::turquoise(&ui::truncate(r["run_id"].as_str().unwrap_or("-"), 18)),
                 18
@@ -2152,6 +4268,19 @@ fn print_limits(snap: &serde_json::Value) {
             .max(2);
         let mut printed = false;
         for w in &windows {
+            // Amp paid balances: show dollars remaining instead of an empty % bar.
+            if let Some(usd) = w["remaining_usd"].as_f64() {
+                let label = w["window"].as_str().unwrap_or("credits");
+                if label == "credits" || label.starts_with("ws:") {
+                    println!(
+                        "   {}  {}",
+                        ui::pad_right(label, label_width),
+                        ui::sand(&format!("${usd:.2} remaining"))
+                    );
+                    printed = true;
+                    continue;
+                }
+            }
             let pct = w["used_pct"].as_f64();
             let bar = pct
                 .map(|u| ui::gauge(u, 24))
@@ -2446,6 +4575,7 @@ async fn run_pings(
         alex_core::Provider::Openai => models.openai.clone(),
         alex_core::Provider::Xai => models.xai.clone(),
         alex_core::Provider::Gemini => models.gemini.clone(),
+        alex_core::Provider::Amp => "amp".to_string(),
     };
     if std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
@@ -3313,6 +5443,751 @@ mod tests {
         dir
     }
 
+    fn agent_jsonl(lines: Vec<serde_json::Value>) -> String {
+        lines
+            .into_iter()
+            .map(|line| serde_json::to_string(&line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn agent_transcript_aggregates_assistant_records_and_tool_calls() {
+        let raw = agent_jsonl(vec![
+            serde_json::json!({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "<user_query>\nhi whats going on\n</user_query>"}]}
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Checking the workspace.\n\n[REDACTED]"},
+                    {"type": "tool_use", "name": "Shell", "input": {"command": "git status"}},
+                    {"type": "tool_use", "name": "Glob", "input": {"glob_pattern": "README*"}},
+                    {"type": "tool_use", "name": "Glob", "input": {"glob_pattern": "*"}}
+                ]}
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "[REDACTED]"},
+                    {"type": "tool_use", "name": "Read", "input": {"path": "README.md"}},
+                    {"type": "tool_use", "name": "Shell", "input": {"command": "git diff"}},
+                    {"type": "tool_use", "name": "Shell", "input": {"command": "git log"}}
+                ]}
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "Here is the final answer."}]}
+            }),
+            serde_json::json!({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "<user_query>what is your name?</user_query>"}]}
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "I'm Auto."}]}
+            }),
+            serde_json::json!({"type": "turn_ended", "status": "success"}),
+        ]);
+
+        let turns = parse_agent_transcript_turns(&raw);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "hi whats going on");
+        assert_eq!(
+            turns[0].assistant,
+            "Checking the workspace.\n\nHere is the final answer."
+        );
+        assert_eq!(
+            turns[0]
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Shell", "Glob", "Glob", "Read", "Shell", "Shell"]
+        );
+        assert_eq!(
+            turns[0]
+                .assistant_blocks
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "text",
+                "tool_call",
+                "tool_call",
+                "tool_call",
+                "tool_call",
+                "tool_call",
+                "tool_call",
+                "text",
+            ]
+        );
+        assert!(turns[0].complete);
+        assert_eq!(turns[1].assistant, "I'm Auto.");
+        assert!(turns[1].complete);
+        assert_eq!(turns[1].end_status.as_deref(), Some("success"));
+
+        let (_, response) = agent_trace_bodies("transcript-1", 1, &turns[0]);
+        let tool_calls = response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_calls.len(), 6);
+        assert_eq!(tool_calls[0]["function"]["name"], "Shell");
+        assert_eq!(
+            response["_alexandria"]["assistant_blocks"][0]["text"],
+            "Checking the workspace."
+        );
+        assert_eq!(
+            response["_alexandria"]["assistant_blocks"][1]["name"],
+            "Shell"
+        );
+        assert_eq!(
+            response["_alexandria"]["assistant_blocks"][7]["text"],
+            "Here is the final answer."
+        );
+        let arguments: serde_json::Value =
+            serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["command"], "git status");
+    }
+
+    #[test]
+    fn agent_text_cleanup_only_removes_cursor_marker_lines() {
+        assert_eq!(
+            clean_agent_assistant_text("A literal [REDACTED] value stays."),
+            Some("A literal [REDACTED] value stays.".into())
+        );
+        assert_eq!(
+            clean_agent_assistant_text("Final answer.\n\n[REDACTED]\n"),
+            Some("Final answer.".into())
+        );
+        assert_eq!(clean_agent_assistant_text("[REDACTED]"), None);
+    }
+
+    #[test]
+    fn agent_turn_ended_changes_completion_without_changing_content() {
+        let user = serde_json::json!({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "<user_query>hi</user_query>"}]}
+        });
+        let assistant = serde_json::json!({
+            "role": "assistant",
+            "message": {"content": [{"type": "text", "text": "Done."}]}
+        });
+        let partial =
+            parse_agent_transcript_turns(&agent_jsonl(vec![user.clone(), assistant.clone()]));
+        let complete = parse_agent_transcript_turns(&agent_jsonl(vec![
+            user,
+            assistant,
+            serde_json::json!({"type": "turn_ended", "status": "success"}),
+        ]));
+
+        assert_eq!(partial[0].assistant, complete[0].assistant);
+        assert_eq!(partial[0].assistant_blocks, complete[0].assistant_blocks);
+        assert!(!partial[0].complete);
+        assert!(complete[0].complete);
+        assert_ne!(partial[0], complete[0]);
+        let (_, partial_body) = agent_trace_bodies("completion-only", 1, &partial[0]);
+        let (_, complete_body) = agent_trace_bodies("completion-only", 1, &complete[0]);
+        assert!(partial_body["choices"][0]["finish_reason"].is_null());
+        assert_eq!(complete_body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn agent_transcript_import_refreshes_a_growing_turn_in_place() {
+        let data_dir = tmpdir("agent-growing-data");
+        let transcript_root = tmpdir("agent-growing-source");
+        let transcript_id = "d22baa9e-0303-4678-87f1-9d8b46376eb4";
+        let transcript_dir = transcript_root.join(transcript_id);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{transcript_id}.jsonl"));
+        let user = serde_json::json!({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "<user_query>hi</user_query>"}]}
+        });
+        let progress = serde_json::json!({
+            "role": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "name": "Shell", "input": {"command": "git status"}}
+            ]}
+        });
+        std::fs::write(
+            &transcript_path,
+            agent_jsonl(vec![user.clone(), progress.clone()]),
+        )
+        .unwrap();
+
+        let mut seen = BTreeMap::new();
+        import_agent_transcripts(
+            &data_dir,
+            &transcript_root,
+            "wrap-agent-test",
+            0,
+            &mut seen,
+            None,
+        )
+        .unwrap();
+        let store = Store::open(data_dir.clone()).unwrap();
+        let trace_id = format!("agent-{transcript_id}-1");
+        let first = store.get_trace(&trace_id).unwrap().unwrap();
+        let first_ts = first["ts_request_ms"].as_i64().unwrap();
+        let first_run = first["run_id"].as_str().unwrap().to_string();
+        let first_path = first["resp_body_path"].as_str().unwrap().to_string();
+        let first_response = read_gzip_json(std::path::Path::new(&first_path)).unwrap();
+        assert_eq!(
+            first_response["choices"][0]["message"]["content"],
+            "Checking."
+        );
+        assert_eq!(
+            first_response["_alexandria"]["assistant_blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["text", "tool_call"]
+        );
+        assert!(first_response["choices"][0]["finish_reason"].is_null());
+
+        let final_answer = serde_json::json!({
+            "role": "assistant",
+            "message": {"content": [{"type": "text", "text": "Final answer."}]}
+        });
+        std::fs::write(
+            &transcript_path,
+            agent_jsonl(vec![
+                user,
+                progress,
+                final_answer,
+                serde_json::json!({"type": "turn_ended", "status": "success"}),
+            ]),
+        )
+        .unwrap();
+        import_agent_transcripts(
+            &data_dir,
+            &transcript_root,
+            "wrap-agent-test",
+            0,
+            &mut seen,
+            None,
+        )
+        .unwrap();
+
+        let rows = store.session_traces(transcript_id, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let updated = store.get_trace(&trace_id).unwrap().unwrap();
+        assert_eq!(updated["ts_request_ms"].as_i64(), Some(first_ts));
+        assert_eq!(updated["run_id"].as_str(), Some(first_run.as_str()));
+        assert_eq!(
+            updated["resp_body_path"].as_str(),
+            Some(first_path.as_str())
+        );
+        let response = read_gzip_json(std::path::Path::new(&first_path)).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            "Checking.\n\nFinal answer."
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            response["_alexandria"]["assistant_blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["text", "tool_call", "text"]
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "Shell"
+        );
+    }
+
+    #[test]
+    fn agent_transcript_repair_rejects_malformed_or_empty_jsonl() {
+        let data_dir = tmpdir("agent-repair-invalid-data");
+        let transcript_root = tmpdir("agent-repair-invalid-source");
+        let transcript_id = "bad-transcript";
+        let transcript_dir = transcript_root.join(transcript_id);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{transcript_id}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            "{\"role\":\"user\",\"message\":{\"content\":[]}}\n{broken",
+        )
+        .unwrap();
+
+        let error =
+            repair_agent_transcript(&data_dir, &transcript_root, transcript_id, true).unwrap_err();
+        assert!(error.to_string().contains("line 2"));
+
+        std::fs::write(&transcript_path, "\n").unwrap();
+        let error =
+            repair_agent_transcript(&data_dir, &transcript_root, transcript_id, true).unwrap_err();
+        assert!(error.to_string().contains("transcript is empty"));
+    }
+
+    #[test]
+    fn remote_trace_config_supports_env_key_files_and_https_guard() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for name in [
+            "ALEXANDRIA_TRACE_URL",
+            "ALEXANDRIA_TRACE_KEY",
+            "ALEXANDRIA_TRACE_KEY_FILE",
+            "ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP",
+        ] {
+            std::env::remove_var(name);
+        }
+        assert!(resolve_remote_trace_config(&RemoteTraceArgs::default())
+            .unwrap()
+            .is_none());
+
+        std::env::set_var("ALEXANDRIA_TRACE_URL", "http://10.0.0.8:4100/");
+        std::env::set_var("ALEXANDRIA_TRACE_KEY", "alxk-env-key");
+        let error = match resolve_remote_trace_config(&RemoteTraceArgs::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("plaintext remote URL should be rejected"),
+        };
+        assert!(error.to_string().contains("refusing plaintext"));
+
+        std::env::set_var("ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP", "true");
+        let config = resolve_remote_trace_config(&RemoteTraceArgs::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.base_url, "http://10.0.0.8:4100");
+        assert_eq!(config.key, "alxk-env-key");
+
+        let key_file = tmpdir("remote-trace-key").join("key");
+        std::fs::write(&key_file, "  alxk-file-key\n").unwrap();
+        let config = resolve_remote_trace_config(&RemoteTraceArgs {
+            trace_url: Some("https://alex.example.test/".into()),
+            trace_key_file: Some(key_file),
+            allow_insecure_http: false,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.base_url, "https://alex.example.test");
+        assert_eq!(config.key, "alxk-file-key");
+
+        for name in [
+            "ALEXANDRIA_TRACE_URL",
+            "ALEXANDRIA_TRACE_KEY",
+            "ALEXANDRIA_TRACE_KEY_FILE",
+            "ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn remote_trace_payload_preserves_metadata_and_reads_local_bodies() {
+        use base64::Engine;
+
+        let store = Store::open(tmpdir("remote-trace-payload")).unwrap();
+        let request_path = store
+            .write_body("remote-payload-1", "request.json", br#"{"prompt":"hi"}"#)
+            .unwrap();
+        let response_path = store
+            .write_body(
+                "remote-payload-1",
+                "response.body",
+                br#"{"answer":"hello"}"#,
+            )
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "remote-payload-1".into(),
+                ts_request_ms: 100,
+                ts_response_ms: Some(200),
+                session_id: Some("session-1".into()),
+                harness: Some("agent".into()),
+                upstream_provider: Some("cursor".into()),
+                requested_model: Some("cursor-agent".into()),
+                routed_model: Some("cursor-agent".into()),
+                method: Some("TRANSCRIPT".into()),
+                path: Some("cursor-agent-transcript".into()),
+                status: Some(200),
+                run_id: Some("wrap-agent-1".into()),
+                req_body_path: Some(request_path),
+                resp_body_path: Some(response_path),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let payload = trace_ingest_payload_from_store(&store, "remote-payload-1").unwrap();
+        assert_eq!(payload.trace.method.as_deref(), Some("TRANSCRIPT"));
+        assert_eq!(
+            payload.trace.path.as_deref(),
+            Some("cursor-agent-transcript")
+        );
+        assert_eq!(payload.trace.run_id.as_deref(), Some("wrap-agent-1"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.request_body_b64.unwrap())
+                .unwrap(),
+            br#"{"prompt":"hi"}"#
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.response_body_b64.unwrap())
+                .unwrap(),
+            br#"{"answer":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn amp_import_retries_a_partial_jsonl_tail() {
+        let data_dir = tmpdir("amp-partial-tail-data");
+        let capture_dir = tmpdir("amp-partial-tail-capture");
+        let path = capture_dir.join("ws.jsonl");
+        let message = serde_json::json!({
+            "method": "message_added",
+            "params": {"message": {
+                "role": "user",
+                "threadId": "thread-1",
+                "messageId": "user-1",
+                "content": [{"text": "hello"}],
+            }},
+        });
+        let line = serde_json::json!({
+            "direction": "upstream_to_client",
+            "ts": "2026-07-10T00:00:00Z",
+            "text": message.to_string(),
+        })
+        .to_string();
+        std::fs::write(&path, &line).unwrap();
+
+        let mut state = AmpWsTraceState::new(
+            data_dir,
+            "wrap-amp-test".into(),
+            "{}".into(),
+            "test-key".into(),
+            None,
+        );
+        let mut offset = 0;
+        state.ingest_new(&path, &mut offset).unwrap();
+        assert_eq!(offset, 0);
+        assert!(state.user_by_thread.is_empty());
+
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        state.ingest_new(&path, &mut offset).unwrap();
+        assert_eq!(offset as usize, line.len() + 1);
+        assert_eq!(
+            state.user_by_thread["thread-1"].text,
+            "hello",
+            "the completed record is parsed on the next poll"
+        );
+    }
+
+    #[test]
+    fn amp_import_preserves_human_questions_across_tool_using_turns() {
+        let data_dir = tmpdir("amp-multi-turn");
+        let mut state = AmpWsTraceState::new(
+            data_dir.clone(),
+            "wrap-amp-multi".into(),
+            r#"{"harness":"amp"}"#.into(),
+            "test-key".into(),
+            None,
+        );
+        let outer = |ts: &str, message: serde_json::Value| {
+            serde_json::json!({
+                "direction": "upstream_to_client",
+                "ts": ts,
+                "text": message.to_string(),
+            })
+            .to_string()
+        };
+        let message_added =
+            |role: &str, id: &str, content: serde_json::Value, usage: serde_json::Value| {
+                serde_json::json!({
+                    "method": "message_added",
+                    "params": {"message": {
+                        "role": role,
+                        "threadId": "thread-multi",
+                        "messageId": id,
+                        "content": content,
+                        "usage": usage,
+                    }},
+                })
+            };
+
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:00:00Z",
+                message_added(
+                    "user",
+                    "user-1",
+                    serde_json::json!([{"type": "text", "text": "what files are in my dir"}]),
+                    serde_json::Value::Null,
+                ),
+            ))
+            .unwrap();
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:00:01Z",
+                message_added(
+                    "assistant",
+                    "assistant-tool-1",
+                    serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "shell_command",
+                        "input": {"command": "ls -la"}
+                    }]),
+                    serde_json::Value::Null,
+                ),
+            ))
+            .unwrap();
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:00:01.500Z",
+                message_added(
+                    "user",
+                    "tool-result-1",
+                    serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "Cargo.toml\nREADME.md"
+                    }]),
+                    serde_json::Value::Null,
+                ),
+            ))
+            .unwrap();
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:00:02Z",
+                message_added(
+                    "assistant",
+                    "assistant-1",
+                    serde_json::json!([{"type": "text", "text": "Cargo.toml and README.md"}]),
+                    serde_json::json!({"model": "amp-test", "inputTokens": 10, "outputTokens": 4}),
+                ),
+            ))
+            .unwrap();
+
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:01:00Z",
+                message_added(
+                    "user",
+                    "user-2",
+                    serde_json::json!([{"type": "text", "text": "what is the weather like in Spain"}]),
+                    serde_json::Value::Null,
+                ),
+            ))
+            .unwrap();
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:01:01Z",
+                message_added(
+                    "user",
+                    "tool-result-2",
+                    serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tool-2",
+                        "content": [{"type": "text", "text": "Sunny and hot"}]
+                    }]),
+                    serde_json::Value::Null,
+                ),
+            ))
+            .unwrap();
+        state
+            .ingest_line(&outer(
+                "2026-07-10T00:01:02Z",
+                message_added(
+                    "assistant",
+                    "assistant-2",
+                    serde_json::json!([{"type": "text", "text": "Spain is generally hot in July."}]),
+                    serde_json::json!({"model": "amp-test", "inputTokens": 12, "outputTokens": 7}),
+                ),
+            ))
+            .unwrap();
+
+        let rows = Store::open(data_dir)
+            .unwrap()
+            .session_traces("thread-multi", None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let questions = rows
+            .iter()
+            .map(|row| {
+                let path = std::path::Path::new(row["req_body_path"].as_str().unwrap());
+                read_gzip_json(path).unwrap()["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            questions,
+            [
+                "what files are in my dir",
+                "what is the weather like in Spain"
+            ]
+        );
+    }
+
+    #[test]
+    fn amp_import_records_error_only_turns() {
+        let data_dir = tmpdir("amp-error-turn");
+        let mut state = AmpWsTraceState::new(
+            data_dir.clone(),
+            "wrap-amp-error".into(),
+            r#"{"harness":"amp"}"#.into(),
+            "test-key".into(),
+            None,
+        );
+        let outer = |message: serde_json::Value| {
+            serde_json::json!({
+                "direction": "upstream_to_client",
+                "ts": "2026-07-10T00:00:00Z",
+                "text": message.to_string(),
+            })
+            .to_string()
+        };
+        state
+            .ingest_line(&outer(serde_json::json!({
+                "method": "message_added",
+                "params": {"message": {
+                    "role": "user",
+                    "threadId": "thread-error",
+                    "messageId": "user-error",
+                    "content": [{"text": "hi"}],
+                }},
+            })))
+            .unwrap();
+        state
+            .ingest_line(&outer(serde_json::json!({
+                "method": "error_set",
+                "params": {"error": {"message": "Unexpected server response: 401"}},
+            })))
+            .unwrap();
+        state
+            .ingest_line(&outer(serde_json::json!({
+                "method": "plugin_message",
+                "params": {"message": {
+                    "method": "agent.end",
+                    "params": {"event": {
+                        "thread": {"id": "thread-error"},
+                        "id": "user-error",
+                        "status": "error",
+                        "messages": [{
+                            "role": "user",
+                            "id": "user-error",
+                            "content": [{"text": "hi"}],
+                        }],
+                    }},
+                }},
+            })))
+            .unwrap();
+
+        let rows = Store::open(data_dir)
+            .unwrap()
+            .session_traces("thread-error", None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], 401);
+        assert_eq!(rows[0]["error"], "Unexpected server response: 401");
+        assert_eq!(rows[0]["upstream_provider"], "amp");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_trace_worker_preflights_and_uploads() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let expected_key = "alxk-worker-key";
+        let app = Router::new().route(
+            "/traces/ingest",
+            get({
+                move |headers: HeaderMap| async move {
+                    if headers.get("x-api-key").and_then(|v| v.to_str().ok()) == Some(expected_key)
+                    {
+                        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({"ok": false})),
+                        )
+                    }
+                }
+            })
+            .post({
+                let uploads = uploads.clone();
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let uploads = uploads.clone();
+                    async move {
+                        if headers.get("x-api-key").and_then(|v| v.to_str().ok())
+                            != Some(expected_key)
+                        {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(serde_json::json!({"ok": false})),
+                            );
+                        }
+                        if body["trace"]["id"] == "remote-worker-rejected" {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": "bad trace"})),
+                            );
+                        }
+                        assert_eq!(body["trace"]["id"], "remote-worker-1");
+                        uploads.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::CREATED,
+                            Json(serde_json::json!({"outcome": "inserted"})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = RemoteTraceConfig {
+            base_url: format!("http://{address}"),
+            key: expected_key.into(),
+        };
+        preflight_remote_trace(&config).await.unwrap();
+        let worker = RemoteTraceWorker::start(config);
+        worker
+            .sender()
+            .send(alex_core::TraceIngestPayload {
+                trace: alex_core::TraceRecord {
+                    id: "remote-worker-rejected".into(),
+                    ts_request_ms: 1,
+                    ..Default::default()
+                },
+                request_body_b64: None,
+                upstream_request_body_b64: None,
+                response_body_b64: None,
+            })
+            .unwrap();
+        worker
+            .sender()
+            .send(alex_core::TraceIngestPayload {
+                trace: alex_core::TraceRecord {
+                    id: "remote-worker-1".into(),
+                    ts_request_ms: 1,
+                    ..Default::default()
+                },
+                request_body_b64: None,
+                upstream_request_body_b64: None,
+                response_body_b64: None,
+            })
+            .unwrap();
+        let report = worker.stop().await.unwrap();
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(report.failed, 1);
+        assert!(report.failures[0].contains("remote-worker-rejected"));
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     fn test_config(home: PathBuf) -> Config {
         Config {
             host: "127.0.0.1".into(),
@@ -3487,8 +6362,14 @@ mod tests {
         std::env::remove_var("ALEXANDRIA_HOME");
         assert!(!fresh);
         let override_ = loaded.harness_overrides.get("pi").unwrap();
-        assert_eq!(override_.binary.as_ref().unwrap(), &home.join("bin").join("pi"));
-        assert_eq!(override_.config_dir.as_ref().unwrap(), &home.join("pi-agent"));
+        assert_eq!(
+            override_.binary.as_ref().unwrap(),
+            &home.join("bin").join("pi")
+        );
+        assert_eq!(
+            override_.config_dir.as_ref().unwrap(),
+            &home.join("pi-agent")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3507,16 +6388,14 @@ mod tests {
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));
 
-        let (status, body) = router_json(
-            app,
-            Method::POST,
-            "/admin/harnesses/claude/connect",
-            None,
-        )
-        .await;
+        let (status, body) =
+            router_json(app, Method::POST, "/admin/harnesses/claude/connect", None).await;
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("does not support connect"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not support connect"));
     }
 
     #[cfg(unix)]
@@ -3591,9 +6470,28 @@ mod tests {
         assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
         assert!(body["models"].as_u64().unwrap() > 0);
         let models_path = config_dir.join("models.json");
+        let extension_path = config_dir.join("extensions/alexandria-session.ts");
+        assert!(extension_path.exists());
+        let extension = std::fs::read_to_string(extension_path).unwrap();
+        assert!(extension.contains("ctx.model.provider !== \"alexandria\""));
+        assert!(extension.contains("ctx.sessionManager.getSessionId()"));
         let models: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(models_path).unwrap()).unwrap();
         assert!(models["providers"]["alexandria"].is_object());
+        let generated = models["providers"]["alexandria"]["models"]
+            .as_array()
+            .unwrap();
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(generated.iter().any(|model| model["id"] == id));
+        }
+        let sol = generated
+            .iter()
+            .find(|model| model["id"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol["contextWindow"], 372000);
+        assert_eq!(sol["maxTokens"], 128000);
+        assert_eq!(sol["thinkingLevelMap"]["minimal"], "low");
+        assert_eq!(sol["compat"]["forceAdaptiveThinking"], true);
         let keys = state.store.list_run_keys(false).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0]["kind"], "harness");

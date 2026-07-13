@@ -88,6 +88,8 @@ enum ProviderChipRenderer {
         case "openai": NSColor(red: 0x10 / 255, green: 0xA3 / 255, blue: 0x7F / 255, alpha: 1)
         case "xai": .black
         case "gemini": NSColor(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255, alpha: 1)
+        case "cursor": NSColor(red: 0x8E / 255, green: 0x5C / 255, blue: 0xFF / 255, alpha: 1)
+        case "amp": .black
         default: .gray
         }
     }
@@ -134,6 +136,8 @@ struct ProviderBadgeView: View {
         case "openai": Color(red: 0x10 / 255, green: 0xA3 / 255, blue: 0x7F / 255)
         case "xai": Color.black
         case "gemini": Color(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255)
+        case "cursor": Color(red: 0x8E / 255, green: 0x5C / 255, blue: 0xFF / 255)
+        case "amp": Color.black
         default: Color.gray
         }
     }
@@ -144,6 +148,8 @@ struct ProviderBadgeView: View {
         case "openai": "OpenAI"
         case "xai": "xAI"
         case "gemini": "Gemini"
+        case "cursor": "Cursor"
+        case "amp": "Amp"
         default: provider.capitalized
         }
     }

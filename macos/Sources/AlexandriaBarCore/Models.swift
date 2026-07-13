@@ -100,12 +100,15 @@ public struct LimitWindow: Codable, Sendable {
     public let usedPct: Double?
     public let resetsAt: String?
     public let resetsAtS: Int64?
+    /// Amp paid balance remaining (USD), when the window is credits / workspace.
+    public let remainingUsd: Double?
 
     enum CodingKeys: String, CodingKey {
         case window
         case usedPct = "used_pct"
         case resetsAt = "resets_at"
         case resetsAtS = "resets_at_s"
+        case remainingUsd = "remaining_usd"
     }
 
     public var resetsDate: Date? {
@@ -276,6 +279,7 @@ public enum ProviderInfo {
         case "openai": "Codex"
         case "xai": "Grok"
         case "gemini": "Gemini"
+        case "amp": "Amp"
         default: provider.capitalized
         }
     }
@@ -285,13 +289,14 @@ public enum ProviderInfo {
         case "anthropic": "claude"
         case "openai": "codex"
         case "xai": "grok"
+        case "amp": "amp"
         default: provider
         }
     }
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai", "gemini": provider
+        case "anthropic", "openai", "gemini", "amp": provider
         case "xai": "grok"
         default: nil
         }

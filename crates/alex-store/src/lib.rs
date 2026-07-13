@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use alex_core::{Pricing, TraceRecord};
@@ -9,6 +10,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+
+static BODY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS traces (
@@ -108,12 +111,14 @@ fn run_key_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     }))
 }
 
-const TRACE_COLS: &str = "id, ts_request_ms, ts_response_ms, harness, client_format, upstream_provider,
+const TRACE_COLS: &str =
+    "id, ts_request_ms, ts_response_ms, harness, client_format, upstream_provider,
      requested_model, routed_model, status, streamed,
      input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
      cost_usd, billing_bucket, error, session_id, resp_body_path,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
-     account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget";
+     account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
+     method, path";
 
 fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let ts_request_ms = r.get::<_, i64>(1)?;
@@ -151,6 +156,8 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "key_fingerprint": r.get::<_, Option<String>>(29)?,
         "reasoning_effort": r.get::<_, Option<String>>(30)?,
         "thinking_budget": r.get::<_, Option<i64>>(31)?,
+        "method": r.get::<_, Option<String>>(32)?,
+        "path": r.get::<_, Option<String>>(33)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
     }))
 }
@@ -186,7 +193,9 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
 }
 
 fn migrate_run_keys(conn: &Connection) -> Result<()> {
-    if let Err(e) = conn.execute_batch("ALTER TABLE run_keys ADD COLUMN kind TEXT NOT NULL DEFAULT 'run'") {
+    if let Err(e) =
+        conn.execute_batch("ALTER TABLE run_keys ADD COLUMN kind TEXT NOT NULL DEFAULT 'run'")
+    {
         if !e.to_string().contains("duplicate column name") {
             return Err(e.into());
         }
@@ -443,7 +452,8 @@ impl Store {
                     (SELECT t2.status FROM traces t2 WHERE t2.session_id = traces.session_id
                      ORDER BY t2.ts_request_ms DESC LIMIT 1),
                     GROUP_CONCAT(tags_json, char(31)),
-                    GROUP_CONCAT(DISTINCT reasoning_effort)
+                    GROUP_CONCAT(DISTINCT reasoning_effort),
+                    GROUP_CONCAT(DISTINCT upstream_provider)
              FROM traces WHERE session_id IS NOT NULL",
         );
         let mut args: Vec<String> = vec![];
@@ -476,6 +486,10 @@ impl Store {
                 .get::<_, Option<String>>(13)?
                 .map(|s| s.split(',').map(str::to_string).collect())
                 .unwrap_or_default();
+            let providers: Vec<String> = r
+                .get::<_, Option<String>>(14)?
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
             Ok(json!({
                 "session_id": r.get::<_, String>(0)?,
                 "run_id": r.get::<_, Option<String>>(1)?,
@@ -483,6 +497,7 @@ impl Store {
                 "last_ts_ms": r.get::<_, Option<i64>>(3)?,
                 "trace_count": r.get::<_, i64>(4)?,
                 "models": models,
+                "providers": providers,
                 "harness": r.get::<_, Option<String>>(6)?,
                 "total_input_tokens": r.get::<_, i64>(7)?,
                 "total_output_tokens": r.get::<_, i64>(8)?,
@@ -575,14 +590,16 @@ impl Store {
             },
         )?;
         let mut status_counts = serde_json::Map::new();
-        let mut stmt = conn.prepare(
-            "SELECT status, COUNT(*) FROM traces WHERE run_id = ?1 GROUP BY status",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT status, COUNT(*) FROM traces WHERE run_id = ?1 GROUP BY status")?;
         let pairs = stmt.query_map(params![run_id], |r| {
             Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
         })?;
         for pair in pairs.flatten() {
-            let key = pair.0.map(|s| s.to_string()).unwrap_or_else(|| "none".into());
+            let key = pair
+                .0
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".into());
             status_counts.insert(key, json!(pair.1));
         }
         let distinct = |col: &str| -> Result<Vec<String>> {
@@ -658,6 +675,14 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn run_trace_ids(&self, run_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM traces WHERE run_id = ?1 ORDER BY ts_request_ms, id")?;
+        let rows = stmt.query_map(params![run_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn insert_heartbeat(
@@ -765,7 +790,10 @@ impl Store {
             requests += row["requests"].as_i64().unwrap_or(0);
             cost += row["cost_usd"].as_f64().unwrap_or(0.0);
             errors += row["errors"].as_i64().unwrap_or(0);
-            let bucket = row["billing_bucket"].as_str().unwrap_or("unknown").to_string();
+            let bucket = row["billing_bucket"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
             *buckets.entry(bucket).or_default() += row["cost_usd"].as_f64().unwrap_or(0.0);
         }
         Ok(json!({
@@ -844,7 +872,12 @@ impl Store {
         Ok(changed > 0)
     }
 
-    pub fn prune(&self, older_than_ms: i64, bodies_only: bool, dry_run: bool) -> Result<PruneReport> {
+    pub fn prune(
+        &self,
+        older_than_ms: i64,
+        bodies_only: bool,
+        dry_run: bool,
+    ) -> Result<PruneReport> {
         let mut report = PruneReport::default();
         let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
             let conn = self.conn.lock().unwrap();
@@ -986,14 +1019,38 @@ impl Store {
         self.write_body_dated(&date, trace_id, kind, bytes)
     }
 
-    fn write_body_dated(&self, date: &str, trace_id: &str, kind: &str, bytes: &[u8]) -> Result<String> {
+    fn write_body_dated(
+        &self,
+        date: &str,
+        trace_id: &str,
+        kind: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
         let dir = self.data_dir.join("bodies").join(date);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{trace_id}.{kind}.gz"));
-        let file = std::fs::File::create(&path)?;
-        let mut enc = GzEncoder::new(file, Compression::default());
-        enc.write_all(bytes)?;
-        enc.finish()?;
+        let sequence = BODY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(
+            ".{trace_id}.{kind}.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            let file = std::fs::File::create(&temp)?;
+            let mut enc = GzEncoder::new(file, Compression::default());
+            enc.write_all(bytes)?;
+            let file = enc.finish()?;
+            file.sync_all()?;
+            #[cfg(windows)]
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            std::fs::rename(&temp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result?;
         Ok(path.to_string_lossy().to_string())
     }
 }
@@ -1052,10 +1109,7 @@ mod tests {
         assert_eq!(s["last_ts_ms"], 2000);
         assert_eq!(s["status_counts"]["200"], 1);
         assert_eq!(s["status_counts"]["500"], 1);
-        assert_eq!(
-            s["models"],
-            json!(["claude-haiku-4-5", "gpt-5.5"])
-        );
+        assert_eq!(s["models"], json!(["claude-haiku-4-5", "gpt-5.5"]));
         assert_eq!(s["providers"], json!(["anthropic", "openai"]));
         assert_eq!(s["total_input_tokens"], 20);
         assert_eq!(s["total_output_tokens"], 10);
@@ -1173,6 +1227,7 @@ mod tests {
         assert_eq!(s1["last_ts_ms"], 2000);
         assert_eq!(s1["trace_count"], 2);
         assert_eq!(s1["harness"], "codex");
+        assert_eq!(s1["providers"], json!(["anthropic"]));
         assert_eq!(s1["total_input_tokens"], 20);
         assert_eq!(s1["total_output_tokens"], 10);
         assert_eq!(s1["errors"], 1);
@@ -1299,7 +1354,10 @@ mod tests {
         assert!(!store.data_dir.join("bodies").join("2024-01-02").exists());
         assert!(store.data_dir.join("bodies").join("2024-01-03").exists());
         assert!(scratch.exists());
-        assert_eq!(store.search_traces(&TraceFilter::default()).unwrap().len(), 3);
+        assert_eq!(
+            store.search_traces(&TraceFilter::default()).unwrap().len(),
+            3
+        );
         let pruned = store.get_trace("a").unwrap().unwrap();
         for key in [
             "req_body_path",
@@ -1313,7 +1371,10 @@ mod tests {
         let kept = store.get_trace("c").unwrap().unwrap();
         assert!(kept["req_body_path"].is_string());
         assert!(kept["req_headers_json"].is_string());
-        assert_eq!(store.prune(5000, true, false).unwrap(), PruneReport::default());
+        assert_eq!(
+            store.prune(5000, true, false).unwrap(),
+            PruneReport::default()
+        );
     }
 
     #[test]
@@ -1386,14 +1447,35 @@ mod tests {
     }
 
     #[test]
+    fn run_trace_ids_include_bodyless_traces_once_in_order() {
+        let store = Store::open(tmpdir("run-trace-ids")).unwrap();
+        store
+            .insert_trace(&trace("second", 2000, Some("run-1")))
+            .unwrap();
+        store
+            .insert_trace(&trace("first", 1000, Some("run-1")))
+            .unwrap();
+        store
+            .insert_trace(&trace("other", 500, Some("run-2")))
+            .unwrap();
+
+        assert_eq!(store.run_trace_ids("run-1").unwrap(), ["first", "second"]);
+        assert!(store.run_trace_ids("missing").unwrap().is_empty());
+    }
+
+    #[test]
     fn reopen_keeps_working() {
         let dir = tmpdir("reopen");
         {
             let store = Store::open(dir.clone()).unwrap();
-            store.insert_trace(&trace("a", 1000, Some("run-1"))).unwrap();
+            store
+                .insert_trace(&trace("a", 1000, Some("run-1")))
+                .unwrap();
         }
         let store = Store::open(dir).unwrap();
-        store.insert_trace(&trace("b", 2000, Some("run-1"))).unwrap();
+        store
+            .insert_trace(&trace("b", 2000, Some("run-1")))
+            .unwrap();
         let s = store.run_summary("run-1").unwrap();
         assert_eq!(s["trace_count"], 2);
     }
@@ -1414,7 +1496,16 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_run_key("rk-dddd4444", "dddd4444eeee5555ffff", "run", None, None, None, 2000, None)
+            .insert_run_key(
+                "rk-dddd4444",
+                "dddd4444eeee5555ffff",
+                "run",
+                None,
+                None,
+                None,
+                2000,
+                None,
+            )
             .unwrap();
         let k = store
             .lookup_run_key("aaaa1111bbbb2222cccc", 5000)
@@ -1434,7 +1525,10 @@ mod tests {
             .lookup_run_key("dddd4444eeee5555ffff", 10_000)
             .unwrap()
             .is_some());
-        assert!(store.lookup_run_key("unknown-hash", 5000).unwrap().is_none());
+        assert!(store
+            .lookup_run_key("unknown-hash", 5000)
+            .unwrap()
+            .is_none());
         store.touch_run_key("aaaa1111bbbb2222cccc", 3000).unwrap();
         store.touch_run_key("aaaa1111bbbb2222cccc", 4000).unwrap();
         let all = store.list_run_keys(true).unwrap();
@@ -1454,7 +1548,16 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0]["id"], "rk-dddd4444");
         assert!(store
-            .insert_run_key("rk-ffff6666", "aaaa1111bbbb2222cccc", "run", None, None, None, 1, None)
+            .insert_run_key(
+                "rk-ffff6666",
+                "aaaa1111bbbb2222cccc",
+                "run",
+                None,
+                None,
+                None,
+                1,
+                None
+            )
             .is_err());
     }
 

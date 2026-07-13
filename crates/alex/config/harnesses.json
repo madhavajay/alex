@@ -261,9 +261,9 @@
       "version_env": "AMP_VERSION",
       "default_version": "0.0.1783383739-g931303",
       "enabled": false,
-      "proxy_supported": false,
-      "proxy_mode": "native-only",
-      "notes": "Disabled from --harness all until Amp auth and provider routing are configured."
+      "proxy_supported": true,
+      "proxy_mode": "amp-url-wrap",
+      "notes": "Use `alex auth import amp` for billing + `alex wrap env amp` for AMP_URL capture. Full stream dump needs HTTPS_PROXY wrap (see alex-wrap). Actor protocol reroute still experimental."
     },
     "droid-cli": {
       "aliases": ["droid"],

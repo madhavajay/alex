@@ -514,14 +514,19 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
     ];
     if let Some(t) = snap.last_ok_at {
         spans.push(Span::styled(
-            format!("  refreshed {} ago", humanize_s(t.elapsed().as_secs() as i64)),
+            format!(
+                "  refreshed {} ago",
+                humanize_s(t.elapsed().as_secs() as i64)
+            ),
             Style::default().fg(SAND).add_modifier(Modifier::DIM),
         ));
     }
     if !snap.up && snap.ever {
         spans.push(Span::styled(
             "  ⚠ stale data",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -566,10 +571,7 @@ struct TraceCells {
 }
 
 fn jstr(v: &Value, k: &str) -> String {
-    v.get(k)
-        .and_then(|x| x.as_str())
-        .unwrap_or("-")
-        .to_string()
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("-").to_string()
 }
 
 fn jint(v: &Value, k: &str) -> Option<i64> {
@@ -591,7 +593,11 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn fmt_time_ms(ts: Option<i64>) -> String {
     ts.and_then(chrono::DateTime::from_timestamp_millis)
-        .map(|d| d.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| "--:--:--".into())
 }
 
@@ -614,7 +620,10 @@ fn trace_cells(t: &Value) -> TraceCells {
         .or_else(|| t.get("requested_model").and_then(|v| v.as_str()))
         .unwrap_or("-")
         .to_string();
-    let cf = t.get("client_format").and_then(|v| v.as_str()).unwrap_or("-");
+    let cf = t
+        .get("client_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
     let uf = t
         .get("upstream_format")
         .and_then(|v| v.as_str())
@@ -627,7 +636,11 @@ fn trace_cells(t: &Value) -> TraceCells {
         provider: jstr(t, "upstream_provider"),
         fmt: format!("{cf}→{uf}"),
         cross,
-        status: if code > 0 { code.to_string() } else { "-".into() },
+        status: if code > 0 {
+            code.to_string()
+        } else {
+            "-".into()
+        },
         status_class: (code / 100).clamp(0, 9) as u8,
         tokens_in: jint(t, "input_tokens")
             .map(|v| v.to_string())
@@ -678,15 +691,19 @@ fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
         (area, None)
     };
     let header = Row::new(
-        ["time", "model", "provider", "fmt", "st", "in", "out", "cost", "session", "error"]
-            .iter()
-            .map(|h| Cell::from(*h)),
+        [
+            "time", "model", "provider", "fmt", "st", "in", "out", "cost", "session", "error",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h)),
     )
     .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
     let rows = snap.traces.iter().map(|t| {
         let c = trace_cells(t);
         let fmt_style = if c.cross {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(SAND).add_modifier(Modifier::DIM)
         };
@@ -768,10 +785,13 @@ fn detail_lines(t: &Value) -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             key("status"),
-            val(jint(t, "status").map(|v| v.to_string()).unwrap_or_else(|| "-".into())),
+            val(jint(t, "status")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())),
             Span::raw("  "),
             key("streamed"),
-            val(t.get("streamed")
+            val(t
+                .get("streamed")
                 .and_then(|v| v.as_bool())
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "-".into())),
@@ -783,13 +803,21 @@ fn detail_lines(t: &Value) -> Vec<Line<'static>> {
             key("tokens in/out/cached"),
             val(format!(
                 "{}/{}/{}",
-                jint(t, "input_tokens").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                jint(t, "output_tokens").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                jint(t, "cached_input_tokens").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                jint(t, "input_tokens")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                jint(t, "output_tokens")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                jint(t, "cached_input_tokens")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
             )),
             Span::raw("  "),
             key("cost"),
-            val(jf64(t, "cost_usd").map(|c| format!("${c:.6}")).unwrap_or_else(|| "-".into())),
+            val(jf64(t, "cost_usd")
+                .map(|c| format!("${c:.6}"))
+                .unwrap_or_else(|| "-".into())),
             Span::raw("  "),
             key("bucket"),
             val(jstr(t, "billing_bucket")),
@@ -902,9 +930,18 @@ fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
         return;
     }
     let header = Row::new(
-        ["time", "session", "run", "models", "turns", "tokens in→out", "cost", "err"]
-            .iter()
-            .map(|h| Cell::from(*h)),
+        [
+            "time",
+            "session",
+            "run",
+            "models",
+            "turns",
+            "tokens in→out",
+            "cost",
+            "err",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h)),
     )
     .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
     let rows = vis.iter().map(|s| {
@@ -1027,7 +1064,11 @@ fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for t in turns {
         out.push(Line::from(Span::styled(turn_header_text(t), dim)));
-        if let Some(u) = t.get("user").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(u) = t
+            .get("user")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             let (lines, hidden) = cap_lines(wrap_text(u, w.saturating_sub(2)), TURN_TEXT_CAP);
             for (i, l) in lines.into_iter().enumerate() {
                 let prefix = if i == 0 { "❯ " } else { "  " };
@@ -1037,7 +1078,10 @@ fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
                 )));
             }
             if hidden > 0 {
-                out.push(Line::from(Span::styled(format!("  … (+{hidden} lines)"), dim)));
+                out.push(Line::from(Span::styled(
+                    format!("  … (+{hidden} lines)"),
+                    dim,
+                )));
             }
         }
         if let Some(a) = t
@@ -1050,10 +1094,17 @@ fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
                 out.push(Line::from(Span::raw(l)));
             }
             if hidden > 0 {
-                out.push(Line::from(Span::styled(format!("… (+{hidden} lines)"), dim)));
+                out.push(Line::from(Span::styled(
+                    format!("… (+{hidden} lines)"),
+                    dim,
+                )));
             }
         }
-        if let Some(e) = t.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(e) = t
+            .get("error")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             for l in wrap_text(&format!("✗ {e}"), w) {
                 out.push(Line::from(Span::styled(l, Style::default().fg(Color::Red))));
             }
@@ -1104,11 +1155,7 @@ fn draw_transcript(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             if ui.tsc_follow || ui.tsc_scroll > max_scroll {
                 ui.tsc_scroll = max_scroll;
             }
-            let visible: Vec<Line> = lines
-                .into_iter()
-                .skip(ui.tsc_scroll)
-                .take(view_h)
-                .collect();
+            let visible: Vec<Line> = lines.into_iter().skip(ui.tsc_scroll).take(view_h).collect();
             f.render_widget(Paragraph::new(visible), inner);
         }
         TranscriptView::Unsupported => {
@@ -1164,7 +1211,9 @@ fn reset_secs(w: &Value, now_s: i64) -> Option<i64> {
             return Some(d.timestamp() - now_s);
         }
     }
-    w.get("resets_at_s").and_then(|v| v.as_i64()).map(|e| e - now_s)
+    w.get("resets_at_s")
+        .and_then(|v| v.as_i64())
+        .map(|e| e - now_s)
 }
 
 enum LimitItem {
@@ -1223,7 +1272,9 @@ fn limit_items(providers: &[Value]) -> Vec<LimitItem> {
                 if limit > 0 {
                     let pct = ((limit - remaining).max(0) as f64 / limit as f64) * 100.0;
                     items.push(LimitItem::Meter {
-                        label: format!("{provider} {name} — {remaining}/{limit} remaining · {pct:.0}% used"),
+                        label: format!(
+                            "{provider} {name} — {remaining}/{limit} remaining · {pct:.0}% used"
+                        ),
                         pct,
                     });
                 }
@@ -1258,7 +1309,11 @@ fn draw_limits(f: &mut Frame, area: Rect, snap: &Snapshot) {
                 let g = Gauge::default()
                     .ratio((pct / 100.0).clamp(0.0, 1.0))
                     .label(Span::styled(label, Style::default().fg(Color::White)))
-                    .gauge_style(Style::default().fg(gauge_color(pct)).bg(Color::Indexed(236)));
+                    .gauge_style(
+                        Style::default()
+                            .fg(gauge_color(pct))
+                            .bg(Color::Indexed(236)),
+                    );
                 f.render_widget(g, row);
             }
         }
@@ -1268,17 +1323,23 @@ fn draw_limits(f: &mut Frame, area: Rect, snap: &Snapshot) {
 
 fn draw_accounts(f: &mut Frame, area: Rect, snap: &Snapshot) {
     let header = Row::new(
-        ["provider", "id", "kind", "status", "token expires", "heartbeat"]
-            .iter()
-            .map(|h| Cell::from(*h)),
+        [
+            "provider",
+            "id",
+            "kind",
+            "status",
+            "token expires",
+            "heartbeat",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h)),
     )
     .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let rows = snap.accounts.iter().map(|a| {
         let expiry = match a.get("token_expires_in_s").and_then(|v| v.as_i64()) {
-            Some(s) if s <= 0 => {
-                Cell::from("expired").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            }
+            Some(s) if s <= 0 => Cell::from("expired")
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Some(s) => Cell::from(humanize_s(s)).style(Style::default().fg(SAND)),
             None => Cell::from("-").style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
         };
@@ -1314,7 +1375,8 @@ fn draw_accounts(f: &mut Frame, area: Rect, snap: &Snapshot) {
         Row::new(vec![
             Cell::from(jstr(a, "provider")).style(Style::default().fg(LAPIS)),
             Cell::from(jstr(a, "id")).style(Style::default().fg(SAND)),
-            Cell::from(jstr(a, "kind")).style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+            Cell::from(jstr(a, "kind"))
+                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
             Cell::from(status).style(status_style),
             expiry,
             hb,
@@ -1341,7 +1403,9 @@ fn phase_style(phase: &str) -> Style {
         "ready" => Style::default().fg(Color::Green),
         "starting" | "draining" => Style::default().fg(Color::Yellow),
         "unhealthy" => Style::default().fg(Color::Red),
-        "dead" => Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        "dead" => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
         _ => Style::default().fg(SAND),
     }
 }
@@ -1371,8 +1435,7 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
             f.render_widget(p, v[1]);
         }
         DarioView::Enabled(v) => {
-            let chunks =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+            let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
             let active = v
                 .get("active_generation_id")
                 .and_then(|x| x.as_str())
@@ -1388,9 +1451,18 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
                 chunks[0],
             );
             let header = Row::new(
-                ["id", "version", "phase", "pid", "port", "in-flight", "fails", "probe"]
-                    .iter()
-                    .map(|h| Cell::from(*h)),
+                [
+                    "id",
+                    "version",
+                    "phase",
+                    "pid",
+                    "port",
+                    "in-flight",
+                    "fails",
+                    "probe",
+                ]
+                .iter()
+                .map(|h| Cell::from(*h)),
             )
             .style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
             let rows = v
@@ -1431,10 +1503,14 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
                         Cell::from(jstr(g, "version")).style(Style::default().fg(TURQUOISE)),
                         Cell::from(phase.clone()).style(phase_style(&phase)),
                         Cell::from(
-                            jint(g, "pid").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                            jint(g, "pid")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "-".into()),
                         ),
                         Cell::from(
-                            jint(g, "port").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                            jint(g, "port")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "-".into()),
                         ),
                         Cell::from(
                             jint(g, "in_flight")
@@ -1705,7 +1781,10 @@ mod tests {
     #[test]
     fn wrap_text_basics() {
         assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
-        assert_eq!(wrap_text("hello world again", 11), vec!["hello world", "again"]);
+        assert_eq!(
+            wrap_text("hello world again", 11),
+            vec!["hello world", "again"]
+        );
         assert_eq!(wrap_text("a\n\nb", 10), vec!["a", "", "b"]);
         let long = "x".repeat(25);
         assert_eq!(
