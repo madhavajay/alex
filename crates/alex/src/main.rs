@@ -99,6 +99,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read or set provider routing reserve percentages
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
+    },
     /// Manage the OS user service (launchd on macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
@@ -367,6 +372,28 @@ enum AuthCommand {
     },
     /// List vault accounts
     List,
+}
+
+#[derive(Subcommand)]
+enum RoutingCommand {
+    /// Show a provider's effective reserve policy and per-account overrides
+    Get {
+        /// Provider: claude|codex|grok|gemini|amp (aliases accepted)
+        provider: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a provider-wide reserve or one account's override
+    Set {
+        /// Provider: claude|codex|grok|gemini|amp (aliases accepted)
+        provider: String,
+        /// Reserve percentage, from 0 (never block) through 100
+        #[arg(long)]
+        reserve_pct: u8,
+        /// Account name or id; omit to set the provider-wide reserve
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -789,6 +816,7 @@ fn open_vault(config: &Config) -> Result<Vault> {
             "codex" | "openai" | "chatgpt" => alex_core::Provider::Openai,
             "grok" | "xai" => alex_core::Provider::Xai,
             "gemini" | "google" => alex_core::Provider::Gemini,
+            "amp" | "ampcode" => alex_core::Provider::Amp,
             _ => continue,
         };
         policies.push((p, v.clone()));
@@ -812,6 +840,7 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
         "codex" | "openai" | "chatgpt" => alex_core::Provider::Openai,
         "grok" | "xai" => alex_core::Provider::Xai,
         "gemini" | "google" => alex_core::Provider::Gemini,
+        "amp" | "ampcode" => alex_core::Provider::Amp,
         other => anyhow::bail!("unknown provider '{other}'"),
     })
 }
@@ -2005,6 +2034,74 @@ async fn main() -> Result<()> {
             } else {
                 print_limits(&snap);
                 print_dario_update_notice();
+            }
+        }
+        Command::Routing { command } => {
+            let vault = open_vault(&config)?;
+            match command {
+                RoutingCommand::Get { provider, json } => {
+                    let provider = provider_from_cli(&provider)?;
+                    let policy = vault.policy(provider);
+                    let body = serde_json::json!({
+                        "provider": provider.as_str(),
+                        "reserve_pct": policy.reserve_pct.unwrap_or(10).min(100),
+                        "account_reserve_pct": policy.account_reserve_pct,
+                    });
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&body)?);
+                    } else {
+                        println!("{} reserve: {}%", provider.as_str(), body["reserve_pct"]);
+                        let overrides = body["account_reserve_pct"].as_object().unwrap();
+                        if overrides.is_empty() {
+                            println!("per-account overrides: none");
+                        } else {
+                            for (account, reserve_pct) in overrides {
+                                println!("{account}: {reserve_pct}%");
+                            }
+                        }
+                    }
+                }
+                RoutingCommand::Set {
+                    provider,
+                    reserve_pct,
+                    account,
+                } => {
+                    if reserve_pct > 100 {
+                        anyhow::bail!("reserve_pct must be between 0 and 100");
+                    }
+                    let provider = provider_from_cli(&provider)?;
+                    let mut policy = vault.policy(provider);
+                    if let Some(account) = account {
+                        let account = vault
+                            .list()
+                            .await
+                            .into_iter()
+                            .find(|candidate| {
+                                candidate.provider == provider
+                                    && (candidate.name == account || candidate.id == account)
+                            })
+                            .with_context(|| {
+                                format!(
+                                    "unknown {} account '{account}'",
+                                    provider.as_str()
+                                )
+                            })?;
+                        policy
+                            .account_reserve_pct
+                            .insert(account.name.clone(), reserve_pct);
+                        vault.set_policy_persisted(provider, policy).await?;
+                        println!(
+                            "{} / {} reserve: {}%",
+                            provider.as_str(),
+                            account.name,
+                            reserve_pct
+                        );
+                    } else {
+                        policy.reserve_pct = Some(reserve_pct);
+                        vault.set_policy_persisted(provider, policy).await?;
+                        println!("{} reserve: {}%", provider.as_str(), reserve_pct);
+                    }
+                }
             }
         }
         Command::Status { json } => {

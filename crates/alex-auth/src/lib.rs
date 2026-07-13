@@ -217,19 +217,25 @@ fn utilization_pct(account: &Account) -> Option<u8> {
         .map(|v| v.min(100) as u8)
 }
 
-fn codex_limit_snapshot(account: &Account) -> Option<&Value> {
-    account.account_meta.get("codex_limits")
+/// The normalized quota snapshot used by provider routing. `codex_limits` is
+/// retained as a read fallback so existing OpenAI account files keep exactly
+/// the same routing behaviour after the routing machinery became generic.
+fn routing_limit_snapshot(account: &Account) -> Option<&Value> {
+    account
+        .account_meta
+        .get("routing_limits")
+        .or_else(|| account.account_meta.get("codex_limits"))
 }
 
-fn codex_window_values(account: &Account) -> impl Iterator<Item = &Value> {
-    codex_limit_snapshot(account)
+fn routing_window_values(account: &Account) -> impl Iterator<Item = &Value> {
+    routing_limit_snapshot(account)
         .and_then(|snapshot| snapshot.get("windows"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
 }
 
-pub fn codex_reserve_pct(account: &Account, policy: &AccountPolicy) -> u8 {
+pub fn routing_reserve_pct(account: &Account, policy: &AccountPolicy) -> u8 {
     policy
         .account_reserve_pct
         .get(&account.name)
@@ -240,11 +246,11 @@ pub fn codex_reserve_pct(account: &Account, policy: &AccountPolicy) -> u8 {
         .min(100)
 }
 
-pub fn codex_reserve_blocked(account: &Account, reserve_pct: u8, now_s: i64) -> bool {
+pub fn routing_reserve_blocked(account: &Account, reserve_pct: u8, now_s: i64) -> bool {
     if reserve_pct == 0 {
         return false;
     }
-    codex_window_values(account).any(|window| {
+    routing_window_values(account).any(|window| {
         let future_window = window
             .get("resets_at_s")
             .and_then(Value::as_i64)
@@ -258,9 +264,9 @@ pub fn codex_reserve_blocked(account: &Account, reserve_pct: u8, now_s: i64) -> 
 /// The binding quota window is the active window closest to exhaustion.
 /// Ties use the earlier reset. This avoids always picking the short window
 /// when a weekly/monthly window is the actual constraint.
-pub fn codex_reset_selection(account: &Account, now_s: i64) -> Option<Value> {
+pub fn routing_reset_selection(account: &Account, now_s: i64) -> Option<Value> {
     let mut selected: Option<(f64, i64, Option<String>)> = None;
-    for window in codex_window_values(account) {
+    for window in routing_window_values(account) {
         let Some(used_pct) = window.get("used_pct").and_then(Value::as_f64) else {
             continue;
         };
@@ -287,8 +293,8 @@ pub fn codex_reset_selection(account: &Account, now_s: i64) -> Option<Value> {
     })
 }
 
-fn codex_binding_reset(account: &Account, now_s: i64) -> Option<i64> {
-    codex_reset_selection(account, now_s)?["resets_at_s"].as_i64()
+fn routing_binding_reset(account: &Account, now_s: i64) -> Option<i64> {
+    routing_reset_selection(account, now_s)?["resets_at_s"].as_i64()
 }
 
 fn account_proxy_eligible(account: &Account, policy: &AccountPolicy) -> bool {
@@ -302,7 +308,7 @@ fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oa
             let _ = rr;
             accounts.sort_by_key(|a| (
                 oauth_rank(a, prefer_oauth),
-                codex_reserve_blocked(a, codex_reserve_pct(a, policy), now_s),
+                routing_reserve_blocked(a, routing_reserve_pct(a, policy), now_s),
                 policy_rank(policy, &a.name),
                 a.name.clone(),
                 a.id.clone(),
@@ -318,7 +324,7 @@ fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oa
         AccountPolicyMode::Priority => {
             accounts.sort_by_key(|a| (
                 oauth_rank(a, prefer_oauth),
-                codex_reserve_blocked(a, codex_reserve_pct(a, policy), now_s),
+                routing_reserve_blocked(a, routing_reserve_pct(a, policy), now_s),
                 policy_rank(policy, &a.name),
                 a.name.clone(),
                 a.id.clone(),
@@ -327,8 +333,8 @@ fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oa
         AccountPolicyMode::ResetFirst => {
             accounts.sort_by_key(|a| (
                 oauth_rank(a, prefer_oauth),
-                codex_reserve_blocked(a, codex_reserve_pct(a, policy), now_s),
-                codex_binding_reset(a, now_s).unwrap_or(i64::MAX),
+                routing_reserve_blocked(a, routing_reserve_pct(a, policy), now_s),
+                routing_binding_reset(a, now_s).unwrap_or(i64::MAX),
                 policy_rank(policy, &a.name),
                 a.name.clone(),
                 a.id.clone(),
@@ -502,7 +508,7 @@ impl Vault {
         write_routing_policies(&self.dir, &policies)
     }
 
-    pub async fn record_codex_limits(&self, id: &str, mut snapshot: Value) -> Result<()> {
+    pub async fn record_routing_limits(&self, id: &str, mut snapshot: Value) -> Result<()> {
         let now = now_ms();
         let mut account = self
             .accounts
@@ -511,12 +517,10 @@ impl Vault {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        if account.provider != Provider::Openai {
-            bail!("account {id} is not an OpenAI account");
-        }
         if account
             .account_meta
-            .get("codex_limits")
+            .get("routing_limits")
+            .or_else(|| account.account_meta.get("codex_limits"))
             .and_then(|value| value.get("observed_at_ms"))
             .and_then(Value::as_i64)
             .map(|observed| now - observed < 30_000)
@@ -534,7 +538,7 @@ impl Vault {
             .account_meta
             .as_object_mut()
             .expect("account_meta initialized as object")
-            .insert("codex_limits".into(), snapshot);
+            .insert("routing_limits".into(), snapshot);
         self.upsert(account).await
     }
 
@@ -686,9 +690,9 @@ impl Vault {
                     .iter()
                     .copied()
                     .filter(|account| {
-                        !codex_reserve_blocked(
+                        !routing_reserve_blocked(
                             account,
-                            codex_reserve_pct(account, &policy),
+                            routing_reserve_pct(account, &policy),
                             now / 1000,
                         )
                     })
@@ -1425,6 +1429,78 @@ mod tests {
         }
     }
 
+    fn routing_limits(used_pct: f64, resets_at_s: i64) -> Value {
+        json!({
+            "routing_limits": {
+                "windows": [{
+                    "window": "5h",
+                    "used_pct": used_pct,
+                    "resets_at_s": resets_at_s,
+                }],
+            }
+        })
+    }
+
+    #[test]
+    fn routing_reserve_resolution_uses_name_then_id_then_policy_then_default() {
+        let mut account = api_key_account("anthropic-oauth-account-id", Provider::Anthropic);
+        account.name = "work".into();
+        let mut policy = AccountPolicy {
+            reserve_pct: Some(17),
+            account_reserve_pct: HashMap::from([
+                ("work".into(), 23),
+                (account.id.clone(), 31),
+            ]),
+            ..AccountPolicy::default()
+        };
+        assert_eq!(routing_reserve_pct(&account, &policy), 23);
+        policy.account_reserve_pct.remove("work");
+        assert_eq!(routing_reserve_pct(&account, &policy), 31);
+        policy.account_reserve_pct.clear();
+        assert_eq!(routing_reserve_pct(&account, &policy), 17);
+        policy.reserve_pct = None;
+        assert_eq!(routing_reserve_pct(&account, &policy), 10);
+    }
+
+    #[test]
+    fn routing_reserve_zero_never_blocks_and_blocks_at_the_boundary() {
+        let now_s = now_ms() / 1000;
+        let mut account = api_key_account("anthropic-oauth-work", Provider::Anthropic);
+        account.account_meta = routing_limits(90.0, now_s + 60);
+        assert!(!routing_reserve_blocked(&account, 0, now_s));
+        assert!(routing_reserve_blocked(&account, 10, now_s));
+        account.account_meta["routing_limits"]["windows"][0]["used_pct"] = json!(89.999);
+        assert!(!routing_reserve_blocked(&account, 10, now_s));
+    }
+
+    #[tokio::test]
+    async fn routing_policy_applies_identically_to_non_codex_accounts() {
+        let dir = temp_dir("provider-neutral-routing");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let now_s = now_ms() / 1000;
+        for provider in [Provider::Openai, Provider::Anthropic] {
+            let mut blocked = api_key_account(&format!("{}-api_key-blocked", provider.as_str()), provider);
+            blocked.name = "blocked".into();
+            blocked.account_meta = routing_limits(90.0, now_s + 60);
+            let mut available = api_key_account(&format!("{}-api_key-available", provider.as_str()), provider);
+            available.name = "available".into();
+            available.account_meta = routing_limits(20.0, now_s + 60);
+            vault.upsert(blocked).await.unwrap();
+            vault.upsert(available).await.unwrap();
+            vault.set_policies(vec![(
+                provider,
+                AccountPolicy {
+                    mode: AccountPolicyMode::Priority,
+                    order: vec!["blocked".into(), "available".into()],
+                    reserve_pct: Some(10),
+                    ..AccountPolicy::default()
+                },
+            )]).await;
+            assert_eq!(vault.account_for(provider, false).await.unwrap().name, "available");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rfc3339_parse() {
         assert_eq!(rfc3339_to_ms("1970-01-01T00:00:01Z"), Some(1000));
@@ -1812,12 +1888,12 @@ mod tests {
                 {"window": "7d", "used_pct": 70.0, "resets_at_s": now_s + 500_000}
             ]}
         });
-        let selected = codex_reset_selection(&account, now_s).unwrap();
+        let selected = routing_reset_selection(&account, now_s).unwrap();
         assert_eq!(selected["window"], "7d");
         assert_eq!(selected["used_pct"], 70.0);
 
         account.account_meta["codex_limits"]["windows"][0]["used_pct"] = json!(70.0);
-        let tie = codex_reset_selection(&account, now_s).unwrap();
+        let tie = routing_reset_selection(&account, now_s).unwrap();
         assert_eq!(tie["window"], "5h");
     }
 
@@ -1906,7 +1982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_policy_and_codex_limits_survive_reopen() {
+    async fn routing_policy_and_limits_survive_reopen() {
         let dir = temp_dir("routing-persist");
         {
             let vault = Vault::open(dir.clone()).unwrap();
@@ -1928,7 +2004,7 @@ mod tests {
                 .await
                 .unwrap();
             vault
-                .record_codex_limits(
+                .record_routing_limits(
                     "openai-api_key-work",
                     json!({
                         "plan": "plus",
@@ -1952,10 +2028,10 @@ mod tests {
             .find(|account| account.name == "work")
             .unwrap();
         assert_eq!(
-            account.account_meta["codex_limits"]["windows"][0]["used_pct"],
+            account.account_meta["routing_limits"]["windows"][0]["used_pct"],
             42.0
         );
-        assert!(account.account_meta["codex_limits"]["observed_at_ms"].is_i64());
+        assert!(account.account_meta["routing_limits"]["observed_at_ms"].is_i64());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
