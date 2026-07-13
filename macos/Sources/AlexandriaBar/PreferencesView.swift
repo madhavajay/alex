@@ -26,6 +26,8 @@ struct PreferencesView: View {
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
     @AppStorage("menuIconStyle") private var menuIconStyle = "logo"
+    @AppStorage(UpdateChannelSetting.defaultsKey) private var updateChannel =
+        UpdateChannelSetting.stable.rawValue
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
 
@@ -77,6 +79,22 @@ struct PreferencesView: View {
                 Text("80%").tag(80.0)
                 Text("90%").tag(90.0)
                 Text("95%").tag(95.0)
+            }
+        }
+        Section("Updates") {
+            Picker("Release channel", selection: $updateChannel) {
+                ForEach(UpdateChannelSetting.allCases, id: \.rawValue) { channel in
+                    Text(channel.label).tag(channel.rawValue)
+                }
+            }
+            .onChange(of: updateChannel) {
+                NotificationCenter.default.post(
+                    name: UpdateChannelSetting.changedNotification, object: nil)
+            }
+            if UpdateChannelSetting.from(updateChannel) == .beta {
+                Text("Beta builds are pre-release test versions. When the matching final release ships, the app updates to it automatically. The daemon channel is set separately: alex update --set-channel beta.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
         }
         Section("Terminal") {

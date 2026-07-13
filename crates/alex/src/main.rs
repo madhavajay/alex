@@ -126,6 +126,12 @@ enum Command {
         /// Proceed even when the install looks brew- or cargo-managed
         #[arg(long)]
         force: bool,
+        /// Use this release channel for this run only (stable or beta)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Persist the release channel in config.toml, then use it (stable or beta)
+        #[arg(long, value_name = "CHANNEL")]
+        set_channel: Option<String>,
     },
     /// Play the Pharos of Alexandria in your terminal (truecolor blocks)
     Light {
@@ -581,6 +587,8 @@ struct Config {
     trace_row_retention_days: u64,
     #[serde(default = "default_update_check_hours")]
     update_check_hours: u64,
+    #[serde(default = "default_update_channel")]
+    update_channel: String,
     #[serde(default)]
     harness_overrides: BTreeMap<String, HarnessOverride>,
     #[serde(default)]
@@ -627,6 +635,10 @@ fn default_trace_body_retention_days() -> u64 {
 
 fn default_update_check_hours() -> u64 {
     24
+}
+
+fn default_update_channel() -> String {
+    "stable".into()
 }
 
 fn default_ping_anthropic() -> String {
@@ -681,6 +693,13 @@ impl Config {
 
     fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
+    }
+
+    fn update_channel(&self) -> selfupdate::UpdateChannel {
+        selfupdate::UpdateChannel::parse(&self.update_channel).unwrap_or_else(|e| {
+            eprintln!("warning: {e}; using stable");
+            selfupdate::UpdateChannel::Stable
+        })
     }
 }
 
@@ -745,6 +764,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         trace_body_retention_days: default_trace_body_retention_days(),
         trace_row_retention_days: 0,
         update_check_hours: default_update_check_hours(),
+        update_channel: default_update_channel(),
         harness_overrides: BTreeMap::new(),
         account_policy: BTreeMap::new(),
     };
@@ -1456,10 +1476,11 @@ async fn main() -> Result<()> {
             if config.update_check_hours > 0 {
                 let update_status = state.update_status.clone();
                 let hours = config.update_check_hours;
+                let update_channel = config.update_channel();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     loop {
-                        match selfupdate::daemon_update_status_value().await {
+                        match selfupdate::daemon_update_status_value(update_channel).await {
                             Ok(status) => {
                                 *update_status.write().await = Some(status);
                             }
@@ -2019,8 +2040,25 @@ async fn main() -> Result<()> {
             no_restart,
             json,
             force,
+            channel,
+            set_channel,
         } => {
-            selfupdate::run_update(&config, check, yes, no_restart, json, force).await?;
+            let mut config = config;
+            let update_channel = if let Some(value) = set_channel {
+                let parsed = selfupdate::UpdateChannel::parse(&value)?;
+                if config.update_channel != parsed.as_str() {
+                    config.update_channel = parsed.as_str().to_string();
+                    save_config(&config)?;
+                }
+                println!("update channel set to {} in config.toml", parsed.as_str());
+                parsed
+            } else if let Some(value) = channel {
+                selfupdate::UpdateChannel::parse(&value)?
+            } else {
+                config.update_channel()
+            };
+            selfupdate::run_update(&config, check, yes, no_restart, json, force, update_channel)
+                .await?;
         }
         Command::Dario { command } => {
             let http = reqwest::Client::new();
@@ -6485,6 +6523,7 @@ mod tests {
             trace_body_retention_days: default_trace_body_retention_days(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
+            update_channel: default_update_channel(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
@@ -6597,6 +6636,7 @@ mod tests {
             trace_body_retention_days: default_trace_body_retention_days(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
+            update_channel: default_update_channel(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         };

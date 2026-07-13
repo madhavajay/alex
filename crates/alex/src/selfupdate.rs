@@ -15,6 +15,8 @@ use crate::{alexandria_home, current_uid, detect_service_state, Config, ServiceS
 
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/madhavajay/alex/releases/latest/download/manifest.json";
+const DEFAULT_RELEASES_URL: &str =
+    "https://api.github.com/repos/madhavajay/alex/releases?per_page=30";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -29,6 +31,30 @@ impl Channel {
             Channel::Brew => "brew",
             Channel::Cargo => "cargo",
             Channel::Standalone => "standalone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateChannel::Stable => "stable",
+            UpdateChannel::Beta => "beta",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "stable" => Ok(UpdateChannel::Stable),
+            "beta" => Ok(UpdateChannel::Beta),
+            other => anyhow::bail!("unknown update channel '{other}' (expected stable or beta)"),
         }
     }
 }
@@ -78,6 +104,7 @@ pub struct UpdateCheck {
     pub update_available: bool,
     pub notes_url: Option<String>,
     pub channel: Channel,
+    pub update_channel: UpdateChannel,
     pub asset: PlatformAsset,
 }
 
@@ -115,43 +142,113 @@ pub fn platform_key() -> Result<&'static str> {
     }
 }
 
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+/// Parsed version ordered so that a stable release ranks above any of its
+/// betas: `0.1.24-beta.2` < `0.1.24`, and `0.1.23` < `0.1.24-beta.1`.
+/// The fourth component is `(1, 0)` for stable and `(0, n)` for `-beta.n`.
+fn parse_version(version: &str) -> Option<(u64, u64, u64, (u8, u64))> {
     let trimmed = version.trim().strip_prefix('v').unwrap_or(version.trim());
-    let mut parts = trimmed.split('.');
+    let (base, pre) = match trimmed.split_once('-') {
+        Some((base, pre)) => (base, Some(pre)),
+        None => (trimmed, None),
+    };
+    let mut parts = base.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch))
+    let rank = match pre {
+        None => (1, 0),
+        Some(pre) => {
+            let n = pre.strip_prefix("beta.")?.parse().ok()?;
+            (0, n)
+        }
+    };
+    Some((major, minor, patch, rank))
 }
 
 fn compare_versions(current: &str, latest: &str) -> Option<Ordering> {
     Some(parse_version(latest)?.cmp(&parse_version(current)?))
 }
 
-async fn load_manifest() -> Result<Manifest> {
-    let source =
-        std::env::var("ALEX_UPDATE_MANIFEST_URL").unwrap_or_else(|_| DEFAULT_MANIFEST_URL.into());
-    let path = PathBuf::from(&source);
-    let raw = if path.exists() {
-        tokio::fs::read_to_string(&path)
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// Pick the newest release (stable or beta) that carries a manifest.json,
+/// so a beta user is offered the final release once it ships.
+fn select_release_manifest_url(releases: &[GithubRelease]) -> Option<(String, String)> {
+    releases
+        .iter()
+        .filter(|r| !r.draft)
+        .filter_map(|r| {
+            let version = parse_version(&r.tag_name)?;
+            let manifest = r.assets.iter().find(|a| a.name == "manifest.json")?;
+            Some((version, r.tag_name.clone(), manifest.browser_download_url.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, tag, url)| (tag, url))
+}
+
+async fn fetch_text(url: &str) -> Result<String> {
+    let path = PathBuf::from(url);
+    if path.exists() {
+        return tokio::fs::read_to_string(&path)
             .await
-            .with_context(|| format!("reading update manifest {}", path.display()))?
-    } else {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?
-            .get(&source)
-            .send()
-            .await
-            .with_context(|| format!("fetching update manifest {source}"))?
-            .error_for_status()
-            .with_context(|| format!("fetching update manifest {source}"))?
-            .text()
-            .await?
-    };
+            .with_context(|| format!("reading {}", path.display()));
+    }
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .user_agent(concat!("alex-update/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching {url}"))?
+        .text()
+        .await?)
+}
+
+async fn manifest_source(update_channel: UpdateChannel) -> Result<String> {
+    if let Ok(explicit) = std::env::var("ALEX_UPDATE_MANIFEST_URL") {
+        return Ok(explicit);
+    }
+    match update_channel {
+        UpdateChannel::Stable => Ok(DEFAULT_MANIFEST_URL.into()),
+        UpdateChannel::Beta => {
+            let releases_url = std::env::var("ALEX_UPDATE_RELEASES_URL")
+                .unwrap_or_else(|_| DEFAULT_RELEASES_URL.into());
+            let raw = fetch_text(&releases_url).await?;
+            let releases: Vec<GithubRelease> =
+                serde_json::from_str(&raw).context("parsing GitHub releases list")?;
+            let (tag, url) = select_release_manifest_url(&releases).with_context(|| {
+                format!("no release with a manifest.json found via {releases_url}")
+            })?;
+            tracing::debug!("beta channel resolved release {tag}");
+            Ok(url)
+        }
+    }
+}
+
+async fn load_manifest(update_channel: UpdateChannel) -> Result<Manifest> {
+    let source = manifest_source(update_channel).await?;
+    let raw = fetch_text(&source)
+        .await
+        .context("loading update manifest")?;
     let manifest: Manifest = serde_json::from_str(&raw).context("parsing update manifest")?;
     if manifest.schema_version != 1 {
         anyhow::bail!(
@@ -162,8 +259,8 @@ async fn load_manifest() -> Result<Manifest> {
     Ok(manifest)
 }
 
-pub async fn check(channel: Channel) -> Result<UpdateCheck> {
-    let manifest = load_manifest().await?;
+pub async fn check(channel: Channel, update_channel: UpdateChannel) -> Result<UpdateCheck> {
+    let manifest = load_manifest(update_channel).await?;
     let key = platform_key()?;
     let asset = manifest
         .components
@@ -202,23 +299,25 @@ pub async fn check(channel: Channel) -> Result<UpdateCheck> {
         update_available,
         notes_url: manifest.components.cli.notes_url,
         channel,
+        update_channel,
         asset,
     })
 }
 
-pub async fn daemon_update_status_value() -> Result<serde_json::Value> {
+pub async fn daemon_update_status_value(update_channel: UpdateChannel) -> Result<serde_json::Value> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let channel = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok())
         .map(|p| install_channel(&p, &home))
         .unwrap_or(Channel::Standalone);
-    let update = check(channel).await?;
+    let update = check(channel, update_channel).await?;
     Ok(json!({
         "current": update.current,
         "latest": update.latest,
         "update_available": update.update_available,
         "notes_url": update.notes_url,
+        "update_channel": update.update_channel.as_str(),
         "checked_at_ms": now_ms(),
     }))
 }
@@ -243,6 +342,7 @@ fn update_body(update: &UpdateCheck, applying: bool) -> serde_json::Value {
         "latest": update.latest,
         "update_available": update.update_available,
         "notes_url": update.notes_url,
+        "update_channel": update.update_channel.as_str(),
     })
 }
 
@@ -260,7 +360,7 @@ pub(crate) async fn daemon_apply_update(
         .context("no home directory")
         .map_err(DaemonUpdateApplyError::Failed)?;
     let channel = install_channel(&exe, &home);
-    let update = check(channel)
+    let update = check(channel, config.update_channel())
         .await
         .map_err(DaemonUpdateApplyError::Failed)?;
 
@@ -312,6 +412,7 @@ pub async fn run_update(
     no_restart: bool,
     json_output: bool,
     force: bool,
+    update_channel: UpdateChannel,
 ) -> Result<()> {
     let exe = std::env::current_exe()
         .context("resolving current executable")?
@@ -319,7 +420,7 @@ pub async fn run_update(
         .context("canonicalizing current executable")?;
     let home = dirs::home_dir().context("no home directory")?;
     let channel = install_channel(&exe, &home);
-    let update = check(channel).await?;
+    let update = check(channel, update_channel).await?;
 
     if check_only {
         print_check(&update, json_output)?;
@@ -380,19 +481,29 @@ fn print_check(update: &UpdateCheck, json_output: bool) -> Result<()> {
                 "update_available": update.update_available,
                 "notes_url": update.notes_url,
                 "channel": update.channel.as_str(),
+                "update_channel": update.update_channel.as_str(),
             }))?
         );
-    } else if update.update_available {
-        if let Some(notes) = &update.notes_url {
-            println!(
-                "alex {} → {} available (notes: {notes})",
-                update.current, update.latest
-            );
-        } else {
-            println!("alex {} → {} available", update.current, update.latest);
-        }
     } else {
-        println!("alex {} is up to date", update.current);
+        let suffix = match update.update_channel {
+            UpdateChannel::Stable => "",
+            UpdateChannel::Beta => " [beta channel]",
+        };
+        if update.update_available {
+            if let Some(notes) = &update.notes_url {
+                println!(
+                    "alex {} → {} available{suffix} (notes: {notes})",
+                    update.current, update.latest
+                );
+            } else {
+                println!(
+                    "alex {} → {} available{suffix}",
+                    update.current, update.latest
+                );
+            }
+        } else {
+            println!("alex {} is up to date{suffix}", update.current);
+        }
     }
     Ok(())
 }
@@ -726,6 +837,79 @@ mod tests {
             Some(Ordering::Greater)
         );
         assert_eq!(compare_versions("0.1.15", "garbage"), None);
+    }
+
+    #[test]
+    fn version_compare_beta_cases() {
+        // beta of the next version is newer than the current stable
+        assert_eq!(
+            compare_versions("0.1.23", "0.1.24-beta.1"),
+            Some(Ordering::Greater)
+        );
+        // final release is newer than any of its betas
+        assert_eq!(
+            compare_versions("0.1.24-beta.2", "0.1.24"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.1.24", "0.1.24-beta.2"),
+            Some(Ordering::Less)
+        );
+        // later beta wins
+        assert_eq!(
+            compare_versions("0.1.24-beta.1", "0.1.24-beta.2"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.1.24-beta.2", "v0.1.24-beta.2"),
+            Some(Ordering::Equal)
+        );
+        // unknown prerelease labels are rejected, treated as unparseable
+        assert_eq!(compare_versions("0.1.24", "0.1.25-rc.1"), None);
+        assert_eq!(compare_versions("0.1.24", "0.1.25-beta"), None);
+    }
+
+    #[test]
+    fn update_channel_parse_cases() {
+        assert_eq!(UpdateChannel::parse("stable").unwrap(), UpdateChannel::Stable);
+        assert_eq!(UpdateChannel::parse("").unwrap(), UpdateChannel::Stable);
+        assert_eq!(UpdateChannel::parse("Beta").unwrap(), UpdateChannel::Beta);
+        assert!(UpdateChannel::parse("nightly").is_err());
+    }
+
+    #[test]
+    fn beta_release_selection_prefers_newest_including_stable() {
+        let releases: Vec<GithubRelease> = serde_json::from_str(
+            r#"[
+              {"tag_name": "v0.1.24-beta.1", "draft": false, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/beta1/manifest.json"}]},
+              {"tag_name": "v0.1.24-beta.2", "draft": false, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/beta2/manifest.json"}]},
+              {"tag_name": "v0.1.23", "draft": false, "prerelease": false,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/stable/manifest.json"}]},
+              {"tag_name": "v0.1.25-beta.1", "draft": true, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/draft/manifest.json"}]},
+              {"tag_name": "v0.1.26-beta.1", "draft": false, "prerelease": true, "assets": []}
+            ]"#,
+        )
+        .unwrap();
+        let (tag, url) = select_release_manifest_url(&releases).unwrap();
+        // beta.2 wins: drafts are skipped, releases without manifest.json are skipped
+        assert_eq!(tag, "v0.1.24-beta.2");
+        assert_eq!(url, "https://example.test/beta2/manifest.json");
+
+        let with_final: Vec<GithubRelease> = serde_json::from_str(
+            r#"[
+              {"tag_name": "v0.1.24-beta.2", "draft": false, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/beta2/manifest.json"}]},
+              {"tag_name": "v0.1.24", "draft": false, "prerelease": false,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/final/manifest.json"}]}
+            ]"#,
+        )
+        .unwrap();
+        let (tag, url) = select_release_manifest_url(&with_final).unwrap();
+        assert_eq!(tag, "v0.1.24");
+        assert_eq!(url, "https://example.test/final/manifest.json");
     }
 
     #[test]

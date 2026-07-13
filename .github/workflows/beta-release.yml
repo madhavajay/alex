@@ -1,0 +1,412 @@
+name: Beta Release
+
+# Beta builds are cut from any commit by pushing a vX.Y.Z-beta.N tag.
+# They build from source (never crates.io), publish a GitHub *prerelease*
+# with manifest.json, and feed the beta update channels:
+#   - CLI:  alex update --set-channel beta (resolves prereleases via API)
+#   - App:  Preferences -> Updates -> Beta (Sparkle appcast-beta.xml)
+# The stable channel is untouched: releases/latest never points at a
+# prerelease, and appcast.xml is not modified here.
+
+on:
+  push:
+    tags:
+      - "v*-beta.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing beta tag (vX.Y.Z-beta.N)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: beta-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Validate tag
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            echo "tag '$tag' is not a beta tag (expected vX.Y.Z-beta.N)" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  create-prerelease:
+    needs: [meta, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "prerelease $tag already exists"
+          else
+            gh release create "$tag" \
+              --prerelease \
+              --latest=false \
+              --verify-tag \
+              --title "Alexandria $tag (beta)" \
+              --notes "Beta build ${{ needs.meta.outputs.version }}. Pre-release test version — install via the beta update channel."
+          fi
+
+  linux-asset:
+    needs: [meta, create-prerelease]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and package CLI
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          ./scripts/stamp-version.sh "$version"
+          cargo build --release -p alex --bins
+          mkdir -p dist
+          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+          tar -C target/release -czf "dist/$asset" alex alexandria
+          shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
+      - name: Upload to prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
+
+  windows-asset:
+    needs: [meta, create-prerelease]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and package CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          ./scripts/stamp-version.sh "$version"
+          cargo build --release -p alex --bins
+          mkdir -p dist
+          asset="alex-cli-${version}-windows-x86_64.zip"
+          7z a "dist/$asset" ./target/release/alex.exe ./target/release/alexandria.exe
+          sha256sum "dist/$asset" > "dist/$asset.sha256"
+      - name: Upload to prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
+
+  macos-cli-asset:
+    needs: [meta, create-prerelease]
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI binaries
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          ./scripts/stamp-version.sh "$version"
+          cargo build --release -p alex --bins
+          cargo build --release -p alex --bins --target x86_64-apple-darwin
+
+      - name: Check CLI signing secrets
+        id: cli_signing
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in \
+            APPLE_SIGNING_IDENTITY \
+            SIGNING_CERTIFICATE_P12_DATA \
+            SIGNING_CERTIFICATE_PASSWORD
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            printf 'Skipping macOS CLI codesign; missing secret(s): %s\n' "${missing[*]}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign CLI binaries
+        if: steps.cli_signing.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          keychain_password="$(uuidgen)"
+          keychain="$RUNNER_TEMP/alex-cli-signing.keychain-db"
+          p12="$RUNNER_TEMP/alex-cli-signing.p12"
+          original_default_keychain="$(security default-keychain | tr -d '"')"
+
+          cleanup() {
+            security default-keychain -s "$original_default_keychain" >/dev/null 2>&1 || true
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$p12"
+          }
+          trap cleanup EXIT
+
+          if ! printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 --decode > "$p12" 2>/dev/null; then
+            printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 -D > "$p12"
+          fi
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security default-keychain -s "$keychain"
+          existing_keychains="$(security list-keychains -d user | tr -d '"')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$keychain" $existing_keychains
+          security import "$p12" -k "$keychain" \
+            -P "$SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null 2>&1 || true
+
+          identity_list="$(security find-identity -p codesigning -v "$keychain" || true)"
+          codesign_identity=""
+          if [[ "${APPLE_SIGNING_IDENTITY:-}" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+            codesign_identity="$APPLE_SIGNING_IDENTITY"
+          elif [[ -n "${APPLE_TEAM_ID:-}" ]]; then
+            codesign_identity="$(awk -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($0, team) { print $2; exit }' <<<"$identity_list")"
+          fi
+          if [[ -z "$codesign_identity" ]]; then
+            codesign_identity="$(awk '/Developer ID Application/ { print $2; exit }' <<<"$identity_list")"
+          fi
+          if [[ -z "$codesign_identity" ]]; then
+            echo "no Developer ID Application identity found after import:" >&2
+            printf '%s\n' "$identity_list" >&2
+            exit 1
+          fi
+
+          for bin in \
+            target/release/alex \
+            target/release/alexandria \
+            target/x86_64-apple-darwin/release/alex \
+            target/x86_64-apple-darwin/release/alexandria
+          do
+            codesign --force --options runtime --timestamp --sign "$codesign_identity" "$bin"
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+
+      - name: Package CLI binaries
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          mkdir -p dist
+          arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
+          intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
+          tar -C target/release -czf "dist/$arm_asset" alex alexandria
+          tar -C target/x86_64-apple-darwin/release -czf "dist/$intel_asset" alex alexandria
+          shasum -a 256 "dist/$arm_asset" > "dist/$arm_asset.sha256"
+          shasum -a 256 "dist/$intel_asset" > "dist/$intel_asset.sha256"
+
+      - name: Upload to prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
+
+  manifest:
+    needs: [meta, linux-asset, windows-asset, macos-cli-asset]
+    if: ${{ !cancelled() && needs.linux-asset.result == 'success' && needs.macos-cli-asset.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: Generate and upload manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          rm -rf dist/manifest-assets
+          mkdir -p dist/manifest-assets
+          gh release download "$tag" --dir dist/manifest-assets --clobber
+          find dist/manifest-assets -type f -name '*.sha256' -delete
+          python3 scripts/gen-manifest.py \
+            --tag "$tag" \
+            --repo "${{ github.repository }}" \
+            --assets-dir dist/manifest-assets \
+            --out manifest.json
+          cat manifest.json
+          gh release upload "$tag" manifest.json --clobber
+
+  beta-app:
+    needs: [meta, manifest]
+    if: ${{ !cancelled() && needs.manifest.result == 'success' }}
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      BUNDLE_ID: com.madhavajay.alexandria-macos
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Check app signing secrets
+        id: app_signing
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            APPLE_SIGNING_IDENTITY \
+            SIGNING_CERTIFICATE_P12_DATA \
+            SIGNING_CERTIFICATE_PASSWORD
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            printf 'Skipping beta DMG; missing secret(s): %s\n' "${missing[*]}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build signed DMG
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
+          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
+          ./build-signed.sh --clean --notarize
+          ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Upload DMG and refresh manifest
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          dmg="$(ls -t macos/dist/*.dmg | head -1)"
+          gh release upload "$tag" "$dmg" --clobber
+
+          rm -rf dist/app-manifest-assets
+          mkdir -p dist/app-manifest-assets
+          gh release download "$tag" --pattern manifest.json --dir dist/app-manifest-assets --clobber
+          cp "$dmg" dist/app-manifest-assets/
+          python3 scripts/gen-manifest.py \
+            --tag "$tag" \
+            --repo "${{ github.repository }}" \
+            --assets-dir dist/app-manifest-assets \
+            --merge-existing dist/app-manifest-assets/manifest.json \
+            --out manifest.json
+          cat manifest.json
+          gh release upload "$tag" manifest.json --clobber
+
+      - name: Check Sparkle signing key
+        id: sparkle_key
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
+            echo "Skipping beta appcast; SPARKLE_ED_PRIVATE_KEY is not configured."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate beta appcast
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          rm -rf sparkle updates appcast-beta.xml
+          mkdir -p sparkle updates
+          curl -fsSL \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
+            -o sparkle.tar.xz
+          tar -xJf sparkle.tar.xz -C sparkle
+          generate_appcast="$(find sparkle -path '*/bin/generate_appcast' -type f | head -1)"
+          if [[ -z "$generate_appcast" ]]; then
+            echo "Unable to locate generate_appcast in Sparkle 2.9.4 archive." >&2
+            exit 1
+          fi
+          chmod +x "$generate_appcast"
+          cp macos/dist/*.dmg updates/
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/madhavajay/alex/releases/download/${tag}/" \
+            -o appcast-beta.xml \
+            updates/
+
+      - name: Publish beta appcast to GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          cp appcast-beta.xml site/appcast-beta.xml
+
+      - name: Deploy GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ github.token }}
+          publish_branch: gh-pages
+          publish_dir: ./site
+          keep_files: true

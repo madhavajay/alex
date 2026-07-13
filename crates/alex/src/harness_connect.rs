@@ -1337,6 +1337,7 @@ mod tests {
             trace_body_retention_days: crate::default_trace_body_retention_days(),
             trace_row_retention_days: 0,
             update_check_hours: crate::default_update_check_hours(),
+            update_channel: crate::default_update_channel(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
