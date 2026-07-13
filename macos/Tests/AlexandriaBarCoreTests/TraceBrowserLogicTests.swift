@@ -447,6 +447,11 @@ import Testing
         let bNewer = makeSession(
             id: "s2", models: nil, harness: nil, runId: nil, lastStatus: nil, lastTsMs: 300)
         #expect(TraceFingerprint.sessions([a, b]) != TraceFingerprint.sessions([a, bNewer]))
+        let bWithUsage = makeSession(
+            id: "s2", models: nil, harness: nil, runId: nil, lastStatus: nil,
+            lastTsMs: 200, traceCount: 2, totalInputTokens: 12, totalOutputTokens: 34,
+            totalCostUsd: 0.001, errors: 1)
+        #expect(TraceFingerprint.sessions([a, b]) != TraceFingerprint.sessions([a, bWithUsage]))
     }
 
     @Test func turnsFingerprintSkip() throws {
@@ -459,25 +464,43 @@ import Testing
         #expect(TraceFingerprint.turns([]) != TraceFingerprint.turns(turns))
         #expect(TraceFingerprint.turns([]) == TraceFingerprint.turns([]))
         #expect(TraceFingerprint.turns([turns[0]]) != TraceFingerprint.turns([turns[1]]))
+
+        let changedContentJson = #"""
+        {"session_id":"auto-1","turns":[{"assistant":"creds ok, now complete","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"status":200,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
+        """#
+        let changedContent = try decode(changedContentJson, as: TranscriptResponse.self).turns
+        #expect(TraceFingerprint.turns(turns) != TraceFingerprint.turns(changedContent))
+
+        let changedToolsJson = #"""
+        {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"status":200,"tool_calls":[{"name":"Shell","arguments":"{\"command\":\"git status\"}"}],"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
+        """#
+        let changedTools = try decode(changedToolsJson, as: TranscriptResponse.self).turns
+        #expect(TraceFingerprint.turns(turns) != TraceFingerprint.turns(changedTools))
     }
 
     private func makeSession(
         id: String, models: [String]?, harness: String?, runId: String?, lastStatus: Int?,
         tags: [String: String]? = nil, firstTsMs: Int64 = 0, lastTsMs: Int64 = 0,
-        efforts: [String]? = nil, accountIds: [String]? = nil
+        efforts: [String]? = nil, accountIds: [String]? = nil, traceCount: Int = 1,
+        totalInputTokens: Int64? = nil, totalOutputTokens: Int64? = nil,
+        totalCostUsd: Double? = nil, errors: Int64? = nil
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
             "run_id": runId as Any,
             "first_ts_ms": firstTsMs,
             "last_ts_ms": lastTsMs,
-            "trace_count": 1,
+            "trace_count": traceCount,
             "models": models as Any,
             "harness": harness as Any,
             "last_status": lastStatus as Any,
             "tags": tags as Any,
             "efforts": efforts as Any,
             "account_ids": accountIds as Any,
+            "total_input_tokens": totalInputTokens as Any,
+            "total_output_tokens": totalOutputTokens as Any,
+            "total_cost_usd": totalCostUsd as Any,
+            "errors": errors as Any,
         ]
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(TraceSession.self, from: data)

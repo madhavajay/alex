@@ -11,13 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    fetch_provider_email, import_grok, jwt_exp_ms, named_account_id, normalize_email, now_ms,
-    persist_account_email, Account, Vault, ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL,
-    OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
+    fetch_provider_email, import_amp, import_grok, jwt_exp_ms, named_account_id, normalize_email,
+    now_ms, persist_account_email, save_amp_api_key, Account, Vault, ANTHROPIC_CLIENT_ID,
+    ANTHROPIC_TOKEN_URL, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
 use alex_core::Provider;
 
-pub const PROVIDERS: &[&str] = &["claude", "codex", "grok", "gemini"];
+pub const PROVIDERS: &[&str] = &["claude", "codex", "grok", "gemini", "amp"];
 
 pub const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const ANTHROPIC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
@@ -324,15 +324,18 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
         "codex" | "openai" | "chatgpt" => Provider::Openai,
         "grok" | "xai" => Provider::Xai,
         "gemini" | "google" => Provider::Gemini,
-        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
+        "amp" | "ampcode" => Provider::Amp,
+        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp)"),
     };
     validate_account_name(name)?;
-    if !force && vault.has_account_name(p, name).await { bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+    // Amp login is an idempotent key import/upsert, not a fresh OAuth account.
+    if !force && p != Provider::Amp && vault.has_account_name(p, name).await { bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
     match provider {
         "claude" | "anthropic" => login_claude(vault).await,
         "codex" | "openai" | "chatgpt" => login_codex(vault, name).await,
         "grok" | "xai" => login_grok(vault).await,
         "gemini" | "google" => login_gemini(vault).await,
+        "amp" | "ampcode" => login_amp(vault).await,
         _ => unreachable!(),
     }
 }
@@ -361,6 +364,43 @@ async fn save_named_login_account(
     let id = account.id.clone();
     vault.upsert(account).await?;
     Ok(id)
+}
+
+/// Amp auth: prefer importing CLI secrets, else AMP_API_KEY env, else paste prompt.
+async fn login_amp(vault: &Vault) -> Result<String> {
+    let imported = import_amp(vault).await;
+    if !imported.imported.is_empty() {
+        println!(
+            "imported amp credentials from ~/.local/share/amp/secrets.json ({})",
+            imported.imported.join(", ")
+        );
+        return Ok(imported.imported[0].clone());
+    }
+    if let Ok(key) = std::env::var("AMP_API_KEY") {
+        if !key.trim().is_empty() {
+            let id = save_amp_api_key(vault, &key).await?;
+            println!("saved amp API key from AMP_API_KEY env");
+            return Ok(id);
+        }
+    }
+    println!(
+        "Amp login options:\n\
+          1. Run `amp login` in another terminal, then re-run `alex auth login amp`\n\
+          2. Create an access token at https://ampcode.com/settings and paste it below\n\
+          3. Set AMP_API_KEY and re-run\n"
+    );
+    if imported.note.is_some() {
+        println!("(import note: {})", imported.note.unwrap());
+    }
+    print!("amp access token (empty to cancel): ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let key = line.trim();
+    if key.is_empty() {
+        bail!("cancelled — no amp credentials saved");
+    }
+    save_amp_api_key(vault, key).await
 }
 
 pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Result<String> {
@@ -1406,7 +1446,11 @@ mod tests {
     #[test]
     fn browser_command_per_platform() {
         let cmd = browser_open_command("https://example.com/auth?x=1");
-        if cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")) {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             let (program, args) = cmd.expect("major platforms have a browser opener");
             let expected = if cfg!(target_os = "macos") {
                 "open"

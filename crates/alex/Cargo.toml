@@ -20,6 +20,7 @@ alex-core = { workspace = true }
 alex-auth = { workspace = true }
 alex-store = { workspace = true }
 alex-proxy = { workspace = true }
+alex-wrap = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

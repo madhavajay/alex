@@ -762,6 +762,9 @@ impl Vault {
                 self.refresh_xai(&rt, &client_id).await
             }
             (Provider::Gemini, Some(rt)) => self.refresh_gemini(&rt).await,
+            (Provider::Amp, _) => Err(anyhow!(
+                "amp accounts use a long-lived API key; re-run `alex auth import amp` or `alex auth amp-key`"
+            )),
             (_, None) => Err(anyhow!("account {id} has no refresh token")),
         };
         let refreshed = match result {
@@ -805,10 +808,21 @@ impl Vault {
 
     async fn reimport_native(&self, stale: &Account) -> Option<Account> {
         match stale.provider {
-            Provider::Anthropic => import_claude(self).await,
-            Provider::Openai => import_codex(self).await,
-            Provider::Gemini => import_gemini(self).await,
-            Provider::Xai => import_grok(self).await,
+            Provider::Anthropic => {
+                let _ = import_claude(self).await;
+            }
+            Provider::Openai => {
+                let _ = import_codex(self).await;
+            }
+            Provider::Gemini => {
+                let _ = import_gemini(self).await;
+            }
+            Provider::Xai => {
+                let _ = import_grok(self).await;
+            }
+            Provider::Amp => {
+                let _ = import_amp(self).await;
+            }
         };
         let fresh = self.accounts.read().await.get(&stale.id).cloned()?;
         let changed = fresh.access_token != stale.access_token;
@@ -986,8 +1000,11 @@ pub async fn import_all(vault: &Vault, source: &str) -> Result<Vec<ImportOutcome
     if source == "all" || source == "grok" || source == "xai" {
         outcomes.push(import_grok(vault).await);
     }
+    if source == "all" || source == "amp" || source == "ampcode" {
+        outcomes.push(import_amp(vault).await);
+    }
     if outcomes.is_empty() {
-        bail!("unknown source '{source}' (expected claude|codex|gemini|grok|xai|all)");
+        bail!("unknown source '{source}' (expected claude|codex|gemini|grok|xai|amp|all)");
     }
     Ok(outcomes)
 }
@@ -1195,6 +1212,106 @@ async fn import_gemini(vault: &Vault) -> ImportOutcome {
     outcome
 }
 
+/// Import Amp API key from `~/.local/share/amp/secrets.json` (CLI login material).
+pub async fn import_amp(vault: &Vault) -> ImportOutcome {
+    let mut outcome = ImportOutcome {
+        source: "amp".into(),
+        imported: vec![],
+        note: None,
+    };
+    let path = home().join(".local/share/amp/secrets.json");
+    if !path.exists() {
+        outcome.note = Some(
+            "no ~/.local/share/amp/secrets.json — run `amp login` or `alex auth amp-key <KEY>`"
+                .into(),
+        );
+        return outcome;
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        outcome.note = Some("could not read amp secrets.json".into());
+        return outcome;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        outcome.note = Some("could not parse amp secrets.json".into());
+        return outcome;
+    };
+    let Some(obj) = v.as_object() else {
+        outcome.note = Some("amp secrets.json is not an object".into());
+        return outcome;
+    };
+    let mut key: Option<(String, String)> = None; // (url, key)
+    for (k, val) in obj {
+        if let Some(url) = k.strip_prefix("apiKey@") {
+            if let Some(s) = val.as_str() {
+                if !s.is_empty() {
+                    key = Some((url.to_string(), s.to_string()));
+                    // Prefer ampcode.com if multiple
+                    if url.contains("ampcode.com") {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let Some((amp_url, api_key)) = key else {
+        outcome.note = Some("no apiKey@… entry in amp secrets.json".into());
+        return outcome;
+    };
+    let account = Account {
+        id: "amp-api-key".into(),
+        provider: Provider::Amp,
+        kind: "api_key".into(),
+        name: default_account_name(),
+        description: None,
+        paused: false,
+        label: Some(format!("amp ({amp_url})")),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(api_key),
+        expires_at_ms: None,
+        last_refresh_ms: Some(now_ms()),
+        account_meta: json!({ "amp_url": amp_url }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: None,
+    };
+    match vault.upsert(account).await {
+        Ok(()) => outcome.imported.push("amp-api-key".into()),
+        Err(e) => outcome.note = Some(format!("failed to save: {e}")),
+    }
+    outcome
+}
+
+/// Save an Amp API key provided by the user (settings token / AMP_API_KEY).
+pub async fn save_amp_api_key(vault: &Vault, api_key: &str) -> Result<String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        bail!("empty amp api key");
+    }
+    let account = Account {
+        id: "amp-api-key".into(),
+        provider: Provider::Amp,
+        kind: "api_key".into(),
+        name: default_account_name(),
+        description: None,
+        paused: false,
+        label: Some("amp (api key)".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(key.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: Some(now_ms()),
+        account_meta: json!({ "amp_url": "https://ampcode.com/" }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: None,
+    };
+    vault.upsert(account).await?;
+    Ok("amp-api-key".into())
+}
+
 async fn import_grok(vault: &Vault) -> ImportOutcome {
     let mut outcome = ImportOutcome {
         source: "grok".into(),
@@ -1280,7 +1397,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("alexandria-auth-{name}-{nanos}-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "alexandria-auth-{name}-{nanos}-{}",
+            std::process::id()
+        ))
     }
 
     fn api_key_account(id: &str, provider: Provider) -> Account {

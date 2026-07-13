@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          for crate in alex-core alex-auth alex-store alex-proxy alex; do
+          for crate in alex-core alex-auth alex-store alex-proxy alex-wrap alex; do
             echo "::group::publish ${crate} ${version}"
             status=$(curl -s -o /dev/null -w "%{http_code}" \
               -A "alex-release-workflow" \

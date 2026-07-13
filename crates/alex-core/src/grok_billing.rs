@@ -33,7 +33,10 @@ impl std::fmt::Display for GrokWebBillingError {
             Self::EmptyResponse => write!(f, "Grok web billing returned no protobuf payload"),
             Self::ParseFailed => write!(f, "Could not parse Grok web billing usage"),
             Self::RpcFailed { status, message } => {
-                write!(f, "Grok web billing RPC failed with status {status}: {message}")
+                write!(
+                    f,
+                    "Grok web billing RPC failed with status {status}: {message}"
+                )
             }
         }
     }
@@ -87,16 +90,9 @@ pub fn parse_grpc_web_response(
         .fixed32_fields
         .iter()
         .filter(|f| {
-            f.path.last() == Some(&1)
-                && f.value.is_finite()
-                && (0.0..=100.0).contains(&f.value)
+            f.path.last() == Some(&1) && f.value.is_finite() && (0.0..=100.0).contains(&f.value)
         })
-        .min_by(|a, b| {
-            a.path
-                .len()
-                .cmp(&b.path.len())
-                .then(a.order.cmp(&b.order))
-        })
+        .min_by(|a, b| a.path.len().cmp(&b.path.len()).then(a.order.cmp(&b.order)))
         .map(|f| f.value as f64);
 
     let reset_fields: Vec<(Vec<u64>, i64)> = scan
@@ -128,8 +124,10 @@ pub fn parse_grpc_web_response(
         f.path.starts_with(&[1, 6])
             || (f.path.as_slice() == [1, 8, 1] && (f.value == 1 || f.value == 2))
     });
-    let no_usage_yet =
-        parsed_percent.is_none() && scan.fixed32_fields.is_empty() && reset.is_some() && has_usage_period;
+    let no_usage_yet = parsed_percent.is_none()
+        && scan.fixed32_fields.is_empty()
+        && reset.is_some()
+        && has_usage_period;
 
     let percent = match parsed_percent {
         Some(p) => p,
@@ -206,10 +204,7 @@ fn validate_grpc_web_trailers(data: &[u8]) -> Result<(), GrokWebBillingError> {
     if let Some(raw) = fields.get("grpc-status") {
         if let Ok(status) = raw.parse::<i32>() {
             if status != 0 {
-                let message = fields
-                    .get("grpc-message")
-                    .cloned()
-                    .unwrap_or_default();
+                let message = fields.get("grpc-message").cloned().unwrap_or_default();
                 return Err(GrokWebBillingError::RpcFailed { status, message });
             }
         }
@@ -307,12 +302,7 @@ impl ProtobufScan {
     }
 }
 
-fn scan_protobuf(
-    data: &[u8],
-    depth: usize,
-    path: &[u64],
-    order: usize,
-) -> (ProtobufScan, usize) {
+fn scan_protobuf(data: &[u8], depth: usize, path: &[u64], order: usize) -> (ProtobufScan, usize) {
     let mut scan = ProtobufScan::default();
     let mut index = 0;
     let mut next_order = order;
@@ -579,7 +569,10 @@ mod tests {
 
     #[test]
     fn trailer_rpc_failure_is_detected() {
-        let body = grpc_frame(b"grpc-status: 16\r\ngrpc-message: token%20expired\r\n", 0x80);
+        let body = grpc_frame(
+            b"grpc-status: 16\r\ngrpc-message: token%20expired\r\n",
+            0x80,
+        );
         let fields = grpc_web_trailer_fields(&body);
         assert_eq!(fields.get("grpc-status").map(String::as_str), Some("16"));
         assert_eq!(

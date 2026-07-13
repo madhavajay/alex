@@ -251,7 +251,10 @@ pub(crate) async fn daemon_apply_update(
 ) -> std::result::Result<serde_json::Value, DaemonUpdateApplyError> {
     let exe = std::env::current_exe()
         .context("resolving current executable")
-        .and_then(|p| p.canonicalize().context("canonicalizing current executable"))
+        .and_then(|p| {
+            p.canonicalize()
+                .context("canonicalizing current executable")
+        })
         .map_err(DaemonUpdateApplyError::Failed)?;
     let home = dirs::home_dir()
         .context("no home directory")

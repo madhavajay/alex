@@ -85,7 +85,37 @@ impl LoginManager {
             "codex" | "openai" | "chatgpt" => self.start_codex(&id, vault.clone(), account_name).await?,
             "grok" | "xai" => self.start_grok(&id, vault.clone(), account_name).await?,
             "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
-            other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini)"),
+            "amp" | "ampcode" => {
+                // Amp uses CLI secrets / API key, not OAuth paste. Import now.
+                let imported = crate::import_amp(&vault).await;
+                let mut session = LoginSession {
+                    id: id.clone(),
+                    provider: "amp".into(),
+                    mode: "import",
+                    authorize_url: Some("https://ampcode.com/settings".into()),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
+                    created_ms: now_ms(),
+                    expires_at_ms: now_ms() + SESSION_TTL_MS,
+                    account_name: account_name.to_string(),
+                    verifier: None,
+                    phase: if let Some(aid) = imported.imported.first() {
+                        LoginPhase::Done {
+                            account_id: aid.clone(),
+                        }
+                    } else {
+                        LoginPhase::Failed {
+                            error: imported.note.unwrap_or_else(|| {
+                                "run `amp login` then retry, or `alex auth amp-key <KEY>`".into()
+                            }),
+                        }
+                    },
+                };
+                let _ = &mut session;
+                Arc::new(Mutex::new(session))
+            }
+            other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp)"),
         };
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
@@ -129,7 +159,10 @@ impl LoginManager {
         if session.phase != LoginPhase::Pending {
             return Ok(session.snapshot());
         }
-        let verifier = session.verifier.clone().context("session has no verifier")?;
+        let verifier = session
+            .verifier
+            .clone()
+            .context("session has no verifier")?;
         match claude_exchange(&vault, &verifier, input).await {
             Ok(account_id) => match rename_login_account(&vault, &account_id, &session.account_name).await {
                 Ok(account_id) => session.phase = LoginPhase::Done { account_id },
@@ -270,7 +303,10 @@ impl LoginManager {
 
     async fn start_gemini(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
         let (listener, port) = crate::login::bind_loopback().await?;
-        let redirect_uri = format!("http://localhost:{port}{}", crate::login::GEMINI_CALLBACK_PATH);
+        let redirect_uri = format!(
+            "http://localhost:{port}{}",
+            crate::login::GEMINI_CALLBACK_PATH
+        );
         let pkce = generate_pkce();
         let state = random_id();
         let url = crate::login::gemini_authorize_url(&pkce.challenge, &state, &redirect_uri);
@@ -315,7 +351,9 @@ impl LoginManager {
                         Err(e) => LoginPhase::Failed { error: e.to_string() },
                     }
                 }
-                Ok(Err(e)) => LoginPhase::Failed { error: e.to_string() },
+                Ok(Err(e)) => LoginPhase::Failed {
+                    error: e.to_string(),
+                },
                 Err(_) => LoginPhase::Failed {
                     error: "timed out waiting for the browser callback".into(),
                 },
@@ -463,7 +501,10 @@ mod tests {
         let id = snap["login_id"].as_str().unwrap();
         let status = mgr.status(id).await.unwrap();
         assert_eq!(status["state"], "pending");
-        let bad = mgr.complete(vault.clone(), id, "code#wrong-state").await.unwrap();
+        let bad = mgr
+            .complete(vault.clone(), id, "code#wrong-state")
+            .await
+            .unwrap();
         assert_eq!(bad["state"], "failed");
         assert!(bad["error"].as_str().unwrap().contains("state mismatch"));
         assert!(mgr.status("nope").await.is_none());

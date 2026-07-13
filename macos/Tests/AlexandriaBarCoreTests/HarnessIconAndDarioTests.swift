@@ -48,6 +48,10 @@ import Testing
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "kimi"]) == "kimi-code.jpg")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "droid"]) == "droid-cli.svg")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "cursor"]) == "cursor-cli.png")
+        #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "agent"]) == "cursor-cli.png")
+        #expect(
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "cursor-agent"])
+                == "cursor-cli.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "amp"]) == "amp-code.svg")
         #expect(
             HarnessIcon.assetName(harness: nil, tags: ["harness": "opensage"])
@@ -104,6 +108,9 @@ import Testing
         #expect(ModelProvider.provider(forModel: "o3-mini") == "openai")
         #expect(ModelProvider.provider(forModel: "grok-code-fast-1") == "xai")
         #expect(ModelProvider.provider(forModel: "gemini-2.5-pro") == "gemini")
+        #expect(ModelProvider.provider(forModel: "cursor-agent") == "cursor")
+        #expect(ModelProvider.provider(forModel: "composer-2.5") == "cursor")
+        #expect(ModelProvider.provider(forModel: "amp-code") == "amp")
         #expect(ModelProvider.provider(forModel: "opencode") == nil)
         #expect(ModelProvider.provider(forModel: "llama-3") == nil)
         #expect(ModelProvider.provider(forModel: "") == nil)

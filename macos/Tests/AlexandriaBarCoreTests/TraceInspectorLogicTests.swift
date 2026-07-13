@@ -84,6 +84,25 @@ import Testing
         #expect(raw.contains(#"{"path":"/a","old":"x"}"#))
     }
 
+    @Test func documentPreservesOrderedAssistantBlocks() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"cursor-agent","provider":"cursor","status":200,"user":"what files are here?","assistant":"Listing.\n\nHere are the files.","tool_calls":[{"name":"Shell","arguments":"{\"command\":\"ls -la\"}"}],"assistant_blocks":[{"type":"text","text":"Listing."},{"type":"tool_call","name":"Shell","arguments":"{\"command\":\"ls -la\"}"},{"type":"text","text":"Here are the files."}]}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let text = TranscriptRender.document(turns: turns).string as NSString
+        let progress = text.range(of: "Listing.").location
+        let tool = text.range(of: "⚙ Shell").location
+        let answer = text.range(of: "Here are the files.").location
+        #expect(progress < tool)
+        #expect(tool < answer)
+
+        let original = TranscriptRender.state(for: turns)
+        let changed = json.replacingOccurrences(of: "Listing.", with: "Checking")
+        let changedTurns = try JSONDecoder().decode(
+            TranscriptResponse.self, from: Data(changed.utf8)).turns
+        #expect(TranscriptRender.plan(previous: original, turns: changedTurns) == .rebuild)
+    }
+
     @Test func jsonHighlightSpans() {
         let json = #"{"a": "b", "n": -1.5, "t": true, "f": false, "x": null}"#
         let tokens = JsonHighlight.spans(json).map { span -> (String, JsonHighlight.Kind) in
@@ -415,6 +434,8 @@ import Testing
         #expect(ModelProvider.initial(for: "openai") == "O")
         #expect(ModelProvider.initial(for: "xai") == "X")
         #expect(ModelProvider.initial(for: "gemini") == "G")
+        #expect(ModelProvider.initial(for: "cursor") == "C")
+        #expect(ModelProvider.initial(for: "amp") == "A")
         #expect(ModelProvider.initial(for: "Mistral") == "M")
         #expect(ModelProvider.initial(for: "") == "?")
     }
