@@ -379,6 +379,10 @@ pub struct TraceRecord {
     pub resp_headers_json: Option<String>,
     pub error: Option<String>,
     pub account_id: Option<String>,
+    /// Durable upstream subscription identity. Unlike `account_id`, this must
+    /// not be derived from the user-editable local account nickname.
+    #[serde(default)]
+    pub subscription_identity: Option<String>,
     pub run_id: Option<String>,
     pub tags: Option<String>,
     pub client_ip: Option<String>,

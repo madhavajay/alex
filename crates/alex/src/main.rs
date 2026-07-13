@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
-use alex_store::Store;
+use alex_store::{KnownAccount, Store};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rand::Rng;
@@ -429,6 +429,20 @@ enum TracesCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// List legacy orphan groups, or attach one group after explicit confirmation (offline)
+    Reattach {
+        /// The old, now-unresolvable account id shown by the listing
+        #[arg(long)]
+        orphan_account_id: Option<String>,
+        /// Existing account id to adopt the orphaned history
+        #[arg(long)]
+        to_account_id: Option<String>,
+        /// Apply the displayed plan. Without this flag this command is always a no-op.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print data dir, sqlite path, and artifact paths for a run (offline)
     Path {
         #[arg(long)]
@@ -497,6 +511,9 @@ struct TraceFilterArgs {
     model: Option<String>,
     #[arg(long)]
     provider: Option<String>,
+    /// Account id from `GET /traces/accounts`; includes removed-account history
+    #[arg(long)]
+    account_id: Option<String>,
     #[arg(long)]
     path: Option<String>,
     #[arg(long)]
@@ -521,6 +538,7 @@ impl TraceFilterArgs {
             ("session", &self.session),
             ("model", &self.model),
             ("provider", &self.provider),
+            ("account_id", &self.account_id),
             ("path", &self.path),
             ("harness", &self.harness),
             ("key_fingerprint", &self.key_fingerprint),
@@ -1812,6 +1830,9 @@ async fn main() -> Result<()> {
             }) => {
                 traces_export_cmd(&config, &filter, bodies, out).await?;
             }
+            Some(TracesCommand::Reattach { orphan_account_id, to_account_id, yes, json }) => {
+                traces_reattach_cmd(&config, orphan_account_id.as_deref(), to_account_id.as_deref(), yes, json).await?;
+            }
             Some(TracesCommand::Path { run_id }) => {
                 traces_path_cmd(&config, &run_id)?;
             }
@@ -2914,6 +2935,7 @@ impl AmpWsTraceState {
             }).to_string()),
             error,
             account_id: None,
+            subscription_identity: None,
             run_id: Some(self.run_id.clone()),
             tags: Some(self.tags.clone()),
             client_ip: None,
@@ -3392,6 +3414,7 @@ fn trace_ingest_payload_from_store(
         resp_headers_json: string("resp_headers_json"),
         error: string("error"),
         account_id: string("account_id"),
+        subscription_identity: string("subscription_identity"),
         run_id: string("run_id"),
         tags: string("tags_json"),
         client_ip: string("client_ip"),
@@ -3552,6 +3575,7 @@ fn reconcile_agent_turn(
         resp_headers_json: Some(serde_json::json!({"x-alexandria-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
         error: None,
         account_id: None,
+        subscription_identity: None,
         run_id: Some(run_id.to_string()),
         tags: Some(tags),
         client_ip: None,
@@ -4107,6 +4131,68 @@ async fn traces_search_cmd(config: &Config, filter: &TraceFilterArgs, json: bool
         render_traces_table(&rows);
     }
     Ok(())
+}
+
+fn known_account(account: &alex_auth::Account) -> KnownAccount {
+    KnownAccount::new(
+        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
+        account.subscription_identity(), account.email(),
+    )
+}
+
+async fn traces_reattach_cmd(
+    config: &Config,
+    orphan_account_id: Option<&str>,
+    to_account_id: Option<&str>,
+    confirmed: bool,
+    json: bool,
+) -> Result<()> {
+    let store = Store::open(config.data_dir.clone())?;
+    // The command is offline, so make current vault accounts visible to the
+    // catalogue before resolving the requested target.
+    let vault = open_vault(config)?;
+    let accounts = vault.list().await;
+    for account in &accounts { store.upsert_known_account(&known_account(account))?; }
+    let groups = store.orphaned_trace_groups()?;
+    let display_time = |value: &serde_json::Value| {
+        value.as_i64()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    match (orphan_account_id, to_account_id) {
+        (None, None) => {
+            if json { println!("{}", serde_json::to_string_pretty(&groups)?); }
+            else if groups.is_empty() { println!("no orphaned legacy trace groups"); }
+            else { for group in groups { println!("{}  provider={}  models={}  {} traces  {}..{}",
+                group["account_id"].as_str().unwrap_or("unknown"), group["provider"].as_str().unwrap_or("unknown"),
+                group["models"].as_str().unwrap_or("unknown"), group["count"], display_time(&group["first_ts_ms"]), display_time(&group["last_ts_ms"])); } }
+            Ok(())
+        }
+        (Some(orphan), Some(target_id)) => {
+            let group = groups.iter().find(|g| g["account_id"].as_str() == Some(orphan))
+                .context("orphan group not found (only untagged, unresolved legacy traces can be reattached)")?;
+            let target = accounts.into_iter().find(|a| a.id == target_id)
+                .context("target must be an existing vault account")?;
+            let target = known_account(&target);
+            let identity = target.subscription_identity.clone()
+                .context("target account has no durable subscription identity")?;
+            let plan = serde_json::json!({"orphan_account_id": orphan, "trace_count": group["count"],
+                "to_account_id": target.account_id, "subscription_identity": identity, "confirmed": confirmed});
+            // Always render the plan before mutation. This also makes --yes
+            // auditable in shell logs.
+            if json { println!("{}", serde_json::to_string_pretty(&plan)?); }
+            else { println!("would attach {} traces from {} to {} ({})", group["count"], orphan, target.account_id, identity); }
+            if !confirmed {
+                if !json { println!("no changes made; rerun with --yes to apply"); }
+                return Ok(());
+            }
+            let changed = store.reattach_orphaned_traces(orphan, &target, true)?;
+            if !json { println!("reattached {changed} traces"); }
+            Ok(())
+        }
+        _ => anyhow::bail!("use both --orphan-account-id and --to-account-id, or neither to list"),
+    }
 }
 
 async fn traces_export_cmd(
@@ -5724,6 +5810,32 @@ mod tests {
             .map(|line| serde_json::to_string(&line).unwrap())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn traces_reattach_command_is_a_noop_without_yes() {
+        let dir = tmpdir("traces-reattach-no-yes");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "host": "127.0.0.1", "port": 0, "data_dir": dir, "local_key": "test-key"
+        })).unwrap();
+        let store = Store::open(config.data_dir.clone()).unwrap();
+        store.insert_trace(&alex_core::TraceRecord {
+            id: "legacy-orphan".into(), ts_request_ms: 100,
+            account_id: Some("openai-oauth-old".into()),
+            upstream_provider: Some("openai".into()), routed_model: Some("gpt-5".into()),
+            ..Default::default()
+        }).unwrap();
+        let vault = open_vault(&config).unwrap();
+        vault.upsert(alex_auth::Account {
+            id: "openai-oauth-new".into(), provider: alex_core::Provider::Openai,
+            kind: "oauth".into(), name: "new".into(), description: None, paused: false,
+            label: None, access_token: None, refresh_token: None, id_token: None, api_key: None,
+            expires_at_ms: None, last_refresh_ms: None,
+            account_meta: serde_json::json!({"account_id": "acct_456", "email": "new@example.com"}),
+            cooldown_until_ms: None, status: "active".into(), path: None,
+        }).await.unwrap();
+        traces_reattach_cmd(&config, Some("openai-oauth-old"), Some("openai-oauth-new"), false, true).await.unwrap();
+        assert!(store.search_traces(&alex_store::TraceFilter::default()).unwrap()[0]["subscription_identity"].is_null());
     }
 
     #[test]
