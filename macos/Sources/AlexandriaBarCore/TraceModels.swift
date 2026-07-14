@@ -26,6 +26,12 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let tags: [String: String]?
     public let efforts: [String]?
     public let accountIds: [String]?
+    public let parentSessionId: String?
+    public let lineageTurnId: String?
+    public let agentType: String?
+    public let subagentStartedMs: Int64?
+    public let subagentStoppedMs: Int64?
+    public let childCount: Int?
 
     public var id: String { sessionId }
 
@@ -45,6 +51,12 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         case totalCostUsd = "total_cost_usd"
         case lastStatus = "last_status"
         case accountIds = "account_ids"
+        case parentSessionId = "parent_session_id"
+        case lineageTurnId = "lineage_turn_id"
+        case agentType = "agent_type"
+        case subagentStartedMs = "subagent_started_ms"
+        case subagentStoppedMs = "subagent_stopped_ms"
+        case childCount = "child_count"
     }
 }
 
@@ -731,6 +743,10 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public let tagsSummary: String
     public let kindBadge: String?
     public let iconAsset: String?
+    public let parentSessionId: String?
+    public let agentType: String?
+    public var lineageDepth: Int
+    public var childCount: Int
 
     public var isPingOrTest: Bool { kindBadge != nil }
 
@@ -771,6 +787,10 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         kindBadge = SessionKind.badge(
             sessionId: session.sessionId, harness: session.harness, tags: session.tags)
         iconAsset = HarnessIcon.assetName(harness: session.harness, tags: session.tags)
+        parentSessionId = session.parentSessionId
+        agentType = session.agentType
+        lineageDepth = 0
+        childCount = session.childCount ?? 0
     }
 
     static func shortId(_ id: String, maxLength: Int = 22) -> String {
@@ -805,7 +825,9 @@ public enum SessionTable {
         showPings: Bool,
         query: OmniQuery,
         serverMatches: Set<String>?,
-        sortOrder: [KeyPathComparator<SessionRow>]
+        sortOrder: [KeyPathComparator<SessionRow>],
+        nestSubagents: Bool = false,
+        collapsedRoots: Set<String> = []
     ) -> [SessionRow] {
         var rows: [SessionRow] = []
         for session in sessions {
@@ -813,7 +835,47 @@ public enum SessionTable {
             guard query.isVisible(session, serverMatches: serverMatches) else { continue }
             rows.append(rowsById[session.sessionId] ?? SessionRow(session: session))
         }
-        return rows.sorted(using: sortOrder)
+        guard nestSubagents else { return rows.sorted(using: sortOrder) }
+
+        let visibleIds = Set(rows.map(\.id))
+        var children: [String: [SessionRow]] = [:]
+        var roots: [SessionRow] = []
+        for row in rows {
+            if let parent = row.parentSessionId, visibleIds.contains(parent), parent != row.id {
+                children[parent, default: []].append(row)
+            } else {
+                roots.append(row)
+            }
+        }
+        var result: [SessionRow] = []
+        var visited = Set<String>()
+        func hideDescendants(of parentId: String) {
+            for child in children[parentId] ?? [] where visited.insert(child.id).inserted {
+                hideDescendants(of: child.id)
+            }
+        }
+        func appendTree(_ source: SessionRow, depth: Int) {
+            guard visited.insert(source.id).inserted else { return }
+            var row = source
+            row.lineageDepth = depth
+            result.append(row)
+            if collapsedRoots.contains(source.id) {
+                hideDescendants(of: source.id)
+                return
+            }
+            for child in (children[source.id] ?? []).sorted(using: sortOrder) {
+                appendTree(child, depth: depth + 1)
+            }
+        }
+        for root in roots.sorted(using: sortOrder) {
+            appendTree(root, depth: 0)
+        }
+        // Defensive cycle handling: no session should disappear if malformed
+        // lineage data forms a loop.
+        for row in rows.sorted(using: sortOrder) where !visited.contains(row.id) {
+            appendTree(row, depth: 0)
+        }
+        return result
     }
 }
 
@@ -1370,6 +1432,12 @@ public enum TraceFingerprint {
             hasher.combine(session.lastStatus)
             hasher.combine(session.efforts)
             hasher.combine(session.accountIds)
+            hasher.combine(session.parentSessionId)
+            hasher.combine(session.lineageTurnId)
+            hasher.combine(session.agentType)
+            hasher.combine(session.subagentStartedMs)
+            hasher.combine(session.subagentStoppedMs)
+            hasher.combine(session.childCount)
             for (key, value) in (session.tags ?? [:]).sorted(by: { $0.key < $1.key }) {
                 hasher.combine(key)
                 hasher.combine(value)

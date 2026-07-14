@@ -323,6 +323,13 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(HarnessConfigWriteResponse.self, from: data)
     }
 
+    public func setCodexDefaultRoute(_ route: String) async throws -> CodexDefaultRouteResponse {
+        let data = try await request(
+            "admin/harnesses/codex/default-route", method: "PUT",
+            body: body(["route": route]))
+        return try JSONDecoder().decode(CodexDefaultRouteResponse.self, from: data)
+    }
+
     public func setHarnessOverride(_ name: String, binary: String?, configDir: String?) async throws -> Harness {
         let encoded = encodedPathComponent(name)
         let data = try await request(

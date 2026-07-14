@@ -34,6 +34,7 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 toml = "0.8"
+toml_edit = "0.22"
 flate2 = "1"
 tar = "0.4"
 jpeg-decoder = { version = "0.3", default-features = false }

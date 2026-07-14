@@ -208,6 +208,34 @@ import Testing
         #expect(response.baseUrl == "http://127.0.0.1:4100")
     }
 
+    @Test func codexDefaultRoutePutsSelectionAndDecodesRestartRequirement() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/harnesses/codex/default-route")
+            #expect(request.httpMethod == "PUT")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let body = try requestBody(request)
+            let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            #expect(json["route"] as? String == "openai")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (
+                response,
+                Data(#"{"default_route":"openai","restart_required":true}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let session = URLSession(configuration: cfg)
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: session)
+
+        let response = try await client.setCodexDefaultRoute("openai")
+        #expect(response.defaultRoute == "openai")
+        #expect(response.restartRequired)
+    }
+
     @Test func connectHarnessPostsAndDecodesRichSummary() async throws {
         let payload = #"""
         {"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-opus-4-8"],"removed":[],"unchanged":0,"key":"minted","base_url":"http://127.0.0.1:4100","key_id":"rk-deadbeef"}

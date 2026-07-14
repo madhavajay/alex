@@ -100,6 +100,22 @@ CREATE TABLE IF NOT EXISTS run_keys (
   use_count INTEGER DEFAULT 0,
   last_used_ms INTEGER
 );
+
+-- Verified parent/child session edges reported by harness lifecycle hooks.
+-- The child id is also the request-side session key for current Codex
+-- subagents, so this table joins lifecycle data to ordinary trace rows.
+CREATE TABLE IF NOT EXISTS session_lineage (
+  harness TEXT NOT NULL,
+  child_session_id TEXT NOT NULL,
+  parent_session_id TEXT NOT NULL,
+  turn_id TEXT,
+  agent_type TEXT,
+  started_ms INTEGER NOT NULL,
+  stopped_ms INTEGER,
+  PRIMARY KEY (harness, child_session_id)
+);
+CREATE INDEX IF NOT EXISTS session_lineage_parent
+  ON session_lineage(harness, parent_session_id);
 "#;
 
 const RUN_KEY_COLS: &str =
@@ -710,7 +726,120 @@ impl Store {
                 "account_ids": account_ids,
             }))
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut rows: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+        for row in &mut rows {
+            let Some(session_id) = row["session_id"].as_str().map(String::from) else {
+                continue;
+            };
+            let harness = row["harness"].as_str().map(String::from);
+            let lineage = conn
+                .query_row(
+                    "SELECT parent_session_id, turn_id, agent_type, started_ms, stopped_ms
+                     FROM session_lineage
+                     WHERE child_session_id = ?1 AND (?2 IS NULL OR harness = ?2)
+                     ORDER BY started_ms DESC LIMIT 1",
+                    params![session_id, harness],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((parent, turn_id, agent_type, started_ms, stopped_ms)) = lineage {
+                row["parent_session_id"] = json!(parent);
+                row["lineage_turn_id"] = json!(turn_id);
+                row["agent_type"] = json!(agent_type);
+                row["subagent_started_ms"] = json!(started_ms);
+                row["subagent_stopped_ms"] = json!(stopped_ms);
+            }
+            let child_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_lineage
+                 WHERE parent_session_id = ?1 AND (?2 IS NULL OR harness = ?2)",
+                params![session_id, harness],
+                |r| r.get(0),
+            )?;
+            row["child_count"] = json!(child_count);
+        }
+        Ok(rows)
+    }
+
+    /// Record a normalized lifecycle event. Returns true when it created or
+    /// updated a durable parent/child edge.
+    pub fn record_harness_event(
+        &self,
+        harness: &str,
+        event: &Value,
+        received_ms: i64,
+    ) -> Result<bool> {
+        let event_name = event["hook_event_name"]
+            .as_str()
+            .or_else(|| event["hookEventName"].as_str())
+            .unwrap_or_default();
+        if !matches!(event_name, "SubagentStart" | "SubagentStop") {
+            return Ok(false);
+        }
+        let Some(parent) = event["session_id"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        let Some(child) = event["agent_id"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        let turn_id = event["turn_id"].as_str();
+        let agent_type = event["agent_type"].as_str();
+        let stopped_ms = (event_name == "SubagentStop").then_some(received_ms);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_lineage
+                (harness, child_session_id, parent_session_id, turn_id, agent_type,
+                 started_ms, stopped_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(harness, child_session_id) DO UPDATE SET
+                parent_session_id = excluded.parent_session_id,
+                turn_id = COALESCE(excluded.turn_id, session_lineage.turn_id),
+                agent_type = COALESCE(excluded.agent_type, session_lineage.agent_type),
+                started_ms = MIN(session_lineage.started_ms, excluded.started_ms),
+                stopped_ms = COALESCE(excluded.stopped_ms, session_lineage.stopped_ms)",
+            params![
+                harness,
+                child,
+                parent,
+                turn_id,
+                agent_type,
+                received_ms,
+                stopped_ms
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Resolve a session to the root of its verified harness lineage. Cycles
+    /// and pathological depth are bounded defensively.
+    pub fn session_lineage_root(&self, harness: &str, session_id: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut current = session_id.to_string();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            if !seen.insert(current.clone()) {
+                break;
+            }
+            let parent = conn
+                .query_row(
+                    "SELECT parent_session_id FROM session_lineage
+                     WHERE harness = ?1 AND child_session_id = ?2",
+                    params![harness, current],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(parent) = parent else { break };
+            current = parent;
+        }
+        Ok(current)
     }
 
     pub fn session_traces(&self, session_id: &str, since_ms: Option<i64>) -> Result<Vec<Value>> {
@@ -1523,6 +1652,79 @@ mod tests {
         assert_eq!(recent[0]["session_id"], "ses_2");
         let limited = store.sessions(None, 1).unwrap();
         assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn harness_events_persist_session_lineage_and_annotate_sessions() {
+        let store = Store::open(tmpdir("session-lineage")).unwrap();
+        for (id, session_id, ts) in [
+            ("root-trace", "root-session", 1000),
+            ("child-trace", "child-session", 2000),
+            ("grandchild-trace", "grandchild-session", 3000),
+        ] {
+            let mut row = trace(id, ts, None);
+            row.session_id = Some(session_id.into());
+            row.harness = Some("codex".into());
+            store.insert_trace(&row).unwrap();
+        }
+        assert!(store
+            .record_harness_event(
+                "codex",
+                &json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": "root-session",
+                    "turn_id": "turn-1",
+                    "agent_id": "child-session",
+                    "agent_type": "default",
+                }),
+                1500,
+            )
+            .unwrap());
+        assert!(store
+            .record_harness_event(
+                "codex",
+                &json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": "child-session",
+                    "turn_id": "turn-2",
+                    "agent_id": "grandchild-session",
+                }),
+                2500,
+            )
+            .unwrap());
+        assert!(store
+            .record_harness_event(
+                "codex",
+                &json!({
+                    "hook_event_name": "SubagentStop",
+                    "session_id": "root-session",
+                    "agent_id": "child-session",
+                }),
+                3500,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .session_lineage_root("codex", "grandchild-session")
+                .unwrap(),
+            "root-session"
+        );
+        let sessions = store.sessions(None, 0).unwrap();
+        let root = sessions
+            .iter()
+            .find(|row| row["session_id"] == "root-session")
+            .unwrap();
+        assert_eq!(root["child_count"], 1);
+        let child = sessions
+            .iter()
+            .find(|row| row["session_id"] == "child-session")
+            .unwrap();
+        assert_eq!(child["parent_session_id"], "root-session");
+        assert_eq!(child["lineage_turn_id"], "turn-1");
+        assert_eq!(child["agent_type"], "default");
+        assert_eq!(child["subagent_started_ms"], 1500);
+        assert_eq!(child["subagent_stopped_ms"], 3500);
+        assert_eq!(child["child_count"], 1);
     }
 
     #[test]

@@ -15,7 +15,7 @@ import Testing
 
     @Test func rowFromFullJSON() throws {
         let json = #"""
-        {"account_ids":["openai-oauth-a"],"errors":2,"first_ts_ms":1783484392318,"harness":"codex","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1","claude-4"],"run_id":"run-77","session_id":"auto-36237cced1dcc659-extra","tags":{"task":"sparql","job":"j1","empty":""},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}
+        {"account_ids":["openai-oauth-a"],"agent_type":"default","child_count":0,"errors":2,"first_ts_ms":1783484392318,"harness":"codex","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1","claude-4"],"parent_session_id":"parent-session","run_id":"run-77","session_id":"auto-36237cced1dcc659-extra","tags":{"task":"sparql","job":"j1","empty":""},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}
         """#
         let decoded = try JSONDecoder().decode(TraceSession.self, from: Data(json.utf8))
         let row = SessionRow(session: decoded)
@@ -40,6 +40,10 @@ import Testing
         #expect(row.kindBadge == nil)
         #expect(!row.isPingOrTest)
         #expect(row.iconAsset == "codex.png")
+        #expect(row.parentSessionId == "parent-session")
+        #expect(row.agentType == "default")
+        #expect(row.lineageDepth == 0)
+        #expect(row.childCount == 0)
     }
 
     @Test func rowFromSparseJSON() {
@@ -157,6 +161,35 @@ import Testing
             query: OmniQuery(), serverMatches: nil,
             sortOrder: SessionTable.defaultSortOrder())
         #expect(missingRows.map(\.id) == ["new-pricey", "mid-free", "old-cheap"])
+    }
+
+    @Test func nestedSubagentsFollowTheirParentAndCanCollapse() {
+        let sessions = [
+            session(["session_id": "root", "last_ts_ms": 100, "child_count": 2]),
+            session([
+                "session_id": "child-new", "last_ts_ms": 300,
+                "parent_session_id": "root", "agent_type": "default",
+            ]),
+            session([
+                "session_id": "child-old", "last_ts_ms": 200,
+                "parent_session_id": "root", "agent_type": "explorer",
+            ]),
+            session(["session_id": "other", "last_ts_ms": 400]),
+        ]
+        let rowsById = SessionTable.rowsById(sessions)
+        let nested = SessionTable.visibleRows(
+            sessions: sessions, rowsById: rowsById, showPings: false,
+            query: OmniQuery(), serverMatches: nil,
+            sortOrder: SessionTable.defaultSortOrder(), nestSubagents: true)
+        #expect(nested.map(\.id) == ["other", "root", "child-new", "child-old"])
+        #expect(nested.map(\.lineageDepth) == [0, 0, 1, 1])
+
+        let collapsed = SessionTable.visibleRows(
+            sessions: sessions, rowsById: rowsById, showPings: false,
+            query: OmniQuery(), serverMatches: nil,
+            sortOrder: SessionTable.defaultSortOrder(), nestSubagents: true,
+            collapsedRoots: ["root"])
+        #expect(collapsed.map(\.id) == ["other", "root"])
     }
 
     @Test func numberFormatting() {

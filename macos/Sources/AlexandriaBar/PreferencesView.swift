@@ -1061,6 +1061,7 @@ private struct HarnessRowView: View {
     @State private var error: String?
     @State private var showOverride = false
     @State private var actionModel: HarnessActionSheetModel?
+    @State private var routeUpdating = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1088,6 +1089,19 @@ private struct HarnessRowView: View {
                         .truncationMode(.middle)
                 }
                 Spacer()
+                if harness.name == "codex", harness.connected {
+                    Toggle(
+                        "Alexandria default",
+                        isOn: Binding(
+                            get: { harness.defaultRoute == "alex" },
+                            set: { setCodexDefaultRoute($0 ? "alex" : "openai") }))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(routeUpdating || actionModel != nil)
+                        .help(
+                            "Plain `codex` follows this setting. Explicit --profile openai and --profile alex commands always remain available."
+                        )
+                }
                 if harness.supportsConnect {
                     if harness.connected {
                         Button(HarnessActionKind.refresh.label) {
@@ -1151,6 +1165,21 @@ private struct HarnessRowView: View {
         let model = HarnessActionSheetModel(store: store, harness: harness, kind: kind)
         actionModel = model
         model.start()
+    }
+
+    private func setCodexDefaultRoute(_ route: String) {
+        guard let config = store.config else { return }
+        routeUpdating = true
+        error = nil
+        Task {
+            do {
+                _ = try await AlexandriaClient(config: config).setCodexDefaultRoute(route)
+                await store.refresh()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            routeUpdating = false
+        }
     }
 }
 
