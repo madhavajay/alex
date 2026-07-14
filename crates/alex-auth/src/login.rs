@@ -30,8 +30,7 @@ pub(crate) const OPENAI_CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const OPENAI_DEVICE_USER_CODE_URL: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
-pub const OPENAI_DEVICE_TOKEN_URL: &str =
-    "https://auth.openai.com/api/accounts/deviceauth/token";
+pub const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub const OPENAI_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 pub const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const OPENAI_JWT_CLAIM: &str = "https://api.openai.com/auth";
@@ -149,12 +148,18 @@ pub fn chatgpt_account_id(token: &str) -> Option<String> {
 }
 
 fn jwt_email(token: &str) -> Option<String> {
-    jwt_payload(token)
-        .and_then(|payload| payload.get("email").and_then(Value::as_str).and_then(normalize_email))
+    jwt_payload(token).and_then(|payload| {
+        payload
+            .get("email")
+            .and_then(Value::as_str)
+            .and_then(normalize_email)
+    })
 }
 
 fn token_email(id_token: Option<&str>, access_token: &str) -> Option<String> {
-    id_token.and_then(jwt_email).or_else(|| jwt_email(access_token))
+    id_token
+        .and_then(jwt_email)
+        .or_else(|| jwt_email(access_token))
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,7 +334,12 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
     };
     validate_account_name(name)?;
     // Amp login is an idempotent key import/upsert, not a fresh OAuth account.
-    if !force && p != Provider::Amp && vault.has_account_name(p, name).await { bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+    if !force && p != Provider::Amp && vault.has_account_name(p, name).await {
+        bail!(
+            "{} account '{name}' already exists (use --force to replace)",
+            p.as_str()
+        );
+    }
     match provider {
         "claude" | "anthropic" => login_claude(vault).await,
         "codex" | "openai" | "chatgpt" => login_codex(vault, name).await,
@@ -431,16 +441,13 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
     let access_token = tokens.access_token;
-    let email = match fetch_provider_email(
-        &reqwest::Client::new(),
-        Provider::Anthropic,
-        &access_token,
-    )
-    .await
-    {
-        Some(email) => Some(email),
-        None => token_email(tokens.id_token.as_deref(), &access_token),
-    };
+    let email =
+        match fetch_provider_email(&reqwest::Client::new(), Provider::Anthropic, &access_token)
+            .await
+        {
+            Some(email) => Some(email),
+            None => token_email(tokens.id_token.as_deref(), &access_token),
+        };
     let mut account = Account {
         id: named_account_id(Provider::Anthropic, "oauth", "default"),
         provider: Provider::Anthropic,
@@ -448,7 +455,12 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
         name: "default".into(),
         description: email.clone(),
         paused: false,
-        label: Some(email.as_ref().map(|email| format!("claude ({email})")).unwrap_or_else(|| "claude (oauth login)".into())),
+        label: Some(
+            email
+                .as_ref()
+                .map(|email| format!("claude ({email})"))
+                .unwrap_or_else(|| "claude (oauth login)".into()),
+        ),
         access_token: Some(access_token),
         refresh_token: tokens.refresh_token,
         id_token: tokens.id_token,
@@ -613,7 +625,9 @@ pub fn parse_codex_device_poll(status: u16, body: &str) -> CodexDevicePoll {
     };
     if let Some(expected_challenge) = raw.get("code_challenge").and_then(Value::as_str) {
         if pkce_challenge(code_verifier) != expected_challenge {
-            return CodexDevicePoll::Failed("device login returned an invalid PKCE verifier".into());
+            return CodexDevicePoll::Failed(
+                "device login returned an invalid PKCE verifier".into(),
+            );
         }
     }
     CodexDevicePoll::Done {
@@ -718,9 +732,7 @@ fn codex_usage_snapshot(raw: &Value) -> Option<Value> {
         let Some(used_pct) = window.get("used_percent").and_then(Value::as_f64) else {
             continue;
         };
-        let seconds = window
-            .get("limit_window_seconds")
-            .and_then(Value::as_i64);
+        let seconds = window.get("limit_window_seconds").and_then(Value::as_i64);
         let label = match seconds {
             Some(18_000) => "5h".to_string(),
             Some(86_400) => "1d".to_string(),
@@ -823,7 +835,10 @@ async fn save_auto_codex_account(vault: &Vault, mut account: Account) -> Result<
         account.path = existing.path;
     } else {
         let digest = Sha256::digest(identity.as_bytes());
-        let suffix: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+        let suffix: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         account.name = format!("acct-{suffix}");
         account.id = named_account_id(Provider::Openai, &account.kind, &account.name);
         account.description = email;
@@ -1030,12 +1045,8 @@ pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> 
 pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result<String> {
     // Prefer xAI's HTTPS OIDC userinfo response over locally decoded JWT
     // claims. The latter are not signature-verified here.
-    let email = fetch_provider_email(
-        &reqwest::Client::new(),
-        Provider::Xai,
-        &tokens.access_token,
-    )
-    .await;
+    let email =
+        fetch_provider_email(&reqwest::Client::new(), Provider::Xai, &tokens.access_token).await;
     let label = match &email {
         Some(e) => format!("grok ({e})"),
         None => "grok (device login)".into(),
@@ -1154,21 +1165,26 @@ mod tests {
             now_ms()
         ));
         let vault = Vault::open(dir.clone()).unwrap();
-        vault.upsert(test_codex_account("default-token")).await.unwrap();
+        vault
+            .upsert(test_codex_account("default-token"))
+            .await
+            .unwrap();
 
-        let named_id = save_named_login_account(
-            &vault,
-            test_codex_account("second-token"),
-            "work",
-        )
-        .await
-        .unwrap();
+        let named_id = save_named_login_account(&vault, test_codex_account("second-token"), "work")
+            .await
+            .unwrap();
 
         assert_eq!(named_id, "openai-oauth-work");
         let accounts = vault.list().await;
         assert_eq!(accounts.len(), 2);
-        let default = accounts.iter().find(|account| account.name == "default").unwrap();
-        let work = accounts.iter().find(|account| account.name == "work").unwrap();
+        let default = accounts
+            .iter()
+            .find(|account| account.name == "default")
+            .unwrap();
+        let work = accounts
+            .iter()
+            .find(|account| account.name == "work")
+            .unwrap();
         assert_eq!(default.access_token.as_deref(), Some("default-token"));
         assert_eq!(work.access_token.as_deref(), Some("second-token"));
         assert!(dir.join("openai-oauth.json").exists());
@@ -1219,11 +1235,7 @@ mod tests {
 
         let second_id = save_auto_codex_account(
             &vault,
-            identified_codex_account(
-                "second-token",
-                "workspace-second",
-                "second@example.com",
-            ),
+            identified_codex_account("second-token", "workspace-second", "second@example.com"),
         )
         .await
         .unwrap();
@@ -1256,11 +1268,7 @@ mod tests {
 
         let third_id = save_auto_codex_account(
             &vault,
-            identified_codex_account(
-                "third-token",
-                "workspace-third",
-                "second@example.com",
-            ),
+            identified_codex_account("third-token", "workspace-third", "second@example.com"),
         )
         .await
         .unwrap();

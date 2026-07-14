@@ -119,9 +119,16 @@ This table summarizes the integrations in `repos/herdr/src/integration` and the 
 | Kilo | JavaScript plugin | Session/event API | Similar to OpenCode, with less child-specific handling |
 | Hermes | Python plugin | Registered pre/post LLM, tool, approval, and session hooks | Direct in-process lifecycle callbacks |
 
-Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. For those harnesses, Alexandria should start with provider/base-URL configuration, static harness headers if supported, body-derived session discovery, and an optional wrapper run ID. Add a native plugin or hook only when the harness exposes a documented lifecycle API.
+Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. That describes the checked-in Herdr integrations, not the current capabilities of those products. Grok now documents custom models and trusted command hooks, which Alexandria uses below. For other unimplemented harnesses, Alexandria should start with provider/base-URL configuration, static harness headers if supported, body-derived session discovery, and an optional wrapper run ID. Add a native plugin or hook only when the harness exposes a documented lifecycle API.
 
 ## Alexandria's current integrations
+
+Managed harness catalogs are generated from Alexandria's live `/v1/models`
+response. Provider-native IDs remain bare, while OpenRouter discovery IDs use
+`openrouter/<provider>/<model>` and appear in harnesses as
+`alex/openrouter/<provider>/<model>`. Users do not need to enumerate individual
+OpenRouter models in `config.toml`; an active OpenRouter account is sufficient
+for the daemon to refresh the catalog.
 
 ### Pi
 
@@ -165,6 +172,72 @@ Disconnect removes only Alexandria-managed provider, catalog, credential, and
 hook entries. It restores the exact pre-connect top-level selection and any
 pre-existing `openai` or `alex` profile files. The readable original-config
 backup and captured event log are preserved for manual recovery and debugging.
+
+### Claude Code
+
+`Harnesses → Claude → Connect` leaves `~/.claude/settings.json` untouched and
+creates an opt-in profile at `~/.claude/alexandria-settings.json`. Start the
+proxied profile with:
+
+```sh
+claude --settings ~/.claude/alexandria-settings.json
+```
+
+Plain `claude` continues to use the user's normal configuration and
+authentication. The profile configures Alexandria as an LLM gateway, enables
+gateway model discovery, displays its models as `alex/*`, and reads a 0600
+harness credential through Claude's `apiKeyHelper`. A reference copy of the
+original settings is kept at `~/.claude/alexandria-original-settings.json`.
+
+Claude sends native `x-claude-code-session-id`, `x-claude-code-agent-id`, and
+`x-claude-code-parent-agent-id` headers to an LLM gateway. Alexandria uses
+those request-level identifiers for exact parent/child trace nesting. The
+installed `SessionStart`, `SubagentStart`, and `SubagentStop` hooks supplement
+the request graph with lifecycle timing and agent metadata. Alexandria removes
+its own harness metadata before forwarding the model request upstream.
+
+Disconnect removes only the managed profile, credential, catalog, and hook
+files. The normal settings, reference backup, and local event log remain.
+
+### Grok
+
+`Harnesses → Grok → Connect` preserves Grok's built-in models and current
+default while adding `[model."alex/*"]` entries to `~/.grok/config.toml`.
+Those entries use Alexandria's OpenAI-compatible Chat Completions endpoint and
+carry static harness/version headers. Built-in models continue to use Grok's
+normal authentication; select an Alexandria model with Grok's model picker or
+start one directly, for example:
+
+```sh
+grok --model alex/gpt-5.5
+```
+
+Grok does not currently offer a command-backed custom-model credential, so the
+local harness key is stored in its config; Alexandria rewrites that file with
+0600 permissions. The exact pre-connect config is also saved at
+`~/.grok/alexandria-original-config.toml` for manual recovery.
+
+A trusted global Grok hook reports `SessionStart`, `SubagentStart`, and
+`SubagentStop` events. Alexandria normalizes Grok's camelCase and snake_case
+payload variants before recording lineage. The lifecycle graph is exact when
+Grok supplies parent and child IDs, while joining an individual model request
+to that graph remains best-effort until Grok exposes a dynamic request-header
+callback or a native session header.
+
+Disconnect removes only Alexandria-managed `alex/*` model entries and restores
+any hook registration that previously occupied Alexandria's hook file. Native
+models, the selected default, unrelated config, the backup, and the event log
+are preserved.
+
+### Amp boundary
+
+Amp's documented `AMP_URL` setting changes the entire Amp service/control-plane
+endpoint; it is not a custom model-provider base URL. Current Amp therefore
+cannot be redirected to Alexandria using the same small provider override as
+Pi, Codex, Claude Code, or Grok. Alexandria can continue to observe Amp through
+its transcript wrapper. Model-call proxying would require an Amp Enterprise
+model connection or emulating Amp's proprietary service API, both of which are
+materially different integrations.
 
 ## Sub-agent tracing experiments
 

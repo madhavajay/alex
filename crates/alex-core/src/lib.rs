@@ -101,7 +101,10 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("openrouter/", Provider::Openrouter),
 ];
 
-const PASSTHROUGH: &[&str] = &["cove/", "alexandria/", "alex/"];
+// Claude Code gateway discovery only accepts model ids beginning with
+// `claude` or `anthropic`. Alexandria publishes `claude-alex/<model>` aliases
+// to that client and removes the compatibility prefix before normal routing.
+const PASSTHROUGH: &[&str] = &["claude-alex/", "cove/", "alexandria/", "alex/"];
 
 const ALIASES: &[(&str, &str)] = &[
     ("opus-4.8", "claude-opus-4-8"),
@@ -549,6 +552,14 @@ mod tests {
 
     #[test]
     fn routes_passthrough_prefixes() {
+        assert_eq!(
+            route_model("claude-alex/gpt-5.5"),
+            (Some(Provider::Openai), "gpt-5.5".to_string())
+        );
+        assert_eq!(
+            route_model("claude-alex/grok-4.5"),
+            (Some(Provider::Xai), "grok-4.5".to_string())
+        );
         assert_eq!(
             route_model("alexandria/gpt-5.5"),
             (Some(Provider::Openai), "gpt-5.5".to_string())

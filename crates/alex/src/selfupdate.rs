@@ -196,7 +196,11 @@ fn select_release_manifest_url(releases: &[GithubRelease]) -> Option<(String, St
         .filter_map(|r| {
             let version = parse_version(&r.tag_name)?;
             let manifest = r.assets.iter().find(|a| a.name == "manifest.json")?;
-            Some((version, r.tag_name.clone(), manifest.browser_download_url.clone()))
+            Some((
+                version,
+                r.tag_name.clone(),
+                manifest.browser_download_url.clone(),
+            ))
         })
         .max_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, tag, url)| (tag, url))
@@ -304,7 +308,9 @@ pub async fn check(channel: Channel, update_channel: UpdateChannel) -> Result<Up
     })
 }
 
-pub async fn daemon_update_status_value(update_channel: UpdateChannel) -> Result<serde_json::Value> {
+pub async fn daemon_update_status_value(
+    update_channel: UpdateChannel,
+) -> Result<serde_json::Value> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let channel = std::env::current_exe()
         .ok()
@@ -871,7 +877,10 @@ mod tests {
 
     #[test]
     fn update_channel_parse_cases() {
-        assert_eq!(UpdateChannel::parse("stable").unwrap(), UpdateChannel::Stable);
+        assert_eq!(
+            UpdateChannel::parse("stable").unwrap(),
+            UpdateChannel::Stable
+        );
         assert_eq!(UpdateChannel::parse("").unwrap(), UpdateChannel::Stable);
         assert_eq!(UpdateChannel::parse("Beta").unwrap(), UpdateChannel::Beta);
         assert!(UpdateChannel::parse("nightly").is_err());

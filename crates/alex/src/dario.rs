@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, ensure, Context, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 
@@ -36,6 +38,46 @@ pub struct DarioSettings {
     pub probe_seconds: u64,
     pub probe_failures: u32,
     pub probe_model: String,
+    pub validate_subscription: bool,
+}
+
+#[derive(Clone, Debug)]
+struct JavascriptRuntime {
+    bin: PathBuf,
+    version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageManagerKind {
+    Npm,
+    Pnpm,
+    Bun,
+}
+
+impl PackageManagerKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Bun => "bun",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackageManager {
+    kind: PackageManagerKind,
+    bin: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BootstrapResult {
+    pub version: String,
+    pub runtime: String,
+    pub runtime_version: String,
+    pub package_manager: String,
+    pub entrypoint: PathBuf,
+    pub already_installed: bool,
 }
 
 struct RuntimeShims {
@@ -291,6 +333,7 @@ impl Drop for InFlightGuard {
 
 pub struct DarioSupervisor {
     settings: DarioSettings,
+    runtime: JavascriptRuntime,
     active: RwLock<Option<Arc<Generation>>>,
     generations: Mutex<Vec<Arc<Generation>>>,
     http: reqwest::Client,
@@ -300,6 +343,229 @@ pub struct DarioSupervisor {
     last_version: Mutex<Option<String>>,
     respawn_in_flight: AtomicBool,
     respawn_next_at: AtomicI64,
+}
+
+pub async fn bootstrap(
+    install_root: PathBuf,
+    version_pin: Option<String>,
+) -> Result<BootstrapResult> {
+    let runtime = find_node_runtime().await?;
+    tokio::fs::create_dir_all(&install_root)
+        .await
+        .with_context(|| format!("creating {install_root:?}"))?;
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("building Dario bootstrap HTTP client")?;
+    let version = if let Some(pin) = version_pin {
+        pin
+    } else {
+        match registry_latest(&http).await {
+            Ok(version) => version,
+            Err(error) => latest_installed_version(&install_root).ok_or_else(|| {
+                error.context("fetching the Dario version and no installed fallback was found")
+            })?,
+        }
+    };
+    let installed = install_version(&install_root, &version).await?;
+    Ok(BootstrapResult {
+        version,
+        runtime: "node".into(),
+        runtime_version: runtime.version,
+        package_manager: installed.package_manager,
+        entrypoint: installed.entrypoint,
+        already_installed: installed.already_installed,
+    })
+}
+
+struct InstallResult {
+    package_manager: String,
+    entrypoint: PathBuf,
+    already_installed: bool,
+}
+
+async fn install_version(install_root: &Path, version: &str) -> Result<InstallResult> {
+    let prefix = install_root.join(version);
+    let entrypoint = dario_entrypoint(&prefix);
+    if entrypoint.exists() {
+        return Ok(InstallResult {
+            package_manager: "existing".into(),
+            entrypoint,
+            already_installed: true,
+        });
+    }
+    tokio::fs::create_dir_all(&prefix)
+        .await
+        .with_context(|| format!("creating Dario install prefix {prefix:?}"))?;
+    let package_json = prefix.join("package.json");
+    if !package_json.exists() {
+        tokio::fs::write(&package_json, b"{\n  \"private\": true\n}\n")
+            .await
+            .with_context(|| format!("writing {package_json:?}"))?;
+    }
+
+    let managers = package_managers();
+    ensure!(
+        !managers.is_empty(),
+        "Dario needs a JavaScript package manager; install npm, pnpm, or Bun"
+    );
+    let spec = format!("{NPM_PACKAGE}@{version}");
+    let mut failures = Vec::new();
+    for manager in managers {
+        let mut command = Command::new(&manager.bin);
+        command.args(package_manager_args(manager.kind, &prefix, &spec));
+        let output = match command.stdin(Stdio::null()).output().await {
+            Ok(output) => output,
+            Err(error) => {
+                failures.push(format!("{}: {error}", manager.kind.name()));
+                continue;
+            }
+        };
+        if output.status.success() && entrypoint.exists() {
+            return Ok(InstallResult {
+                package_manager: manager.kind.name().into(),
+                entrypoint,
+                already_installed: false,
+            });
+        }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        failures.push(format!(
+            "{}: {}",
+            manager.kind.name(),
+            if detail.is_empty() {
+                format!("exited with {}", output.status)
+            } else {
+                detail
+            }
+        ));
+    }
+    Err(anyhow!(
+        "failed to install {spec} with the available package managers: {}",
+        failures.join("; ")
+    ))
+}
+
+fn package_manager_args(kind: PackageManagerKind, prefix: &Path, spec: &str) -> Vec<OsString> {
+    match kind {
+        PackageManagerKind::Npm => vec![
+            "install".into(),
+            spec.into(),
+            "--prefix".into(),
+            prefix.as_os_str().into(),
+            "--omit=dev".into(),
+            "--no-audit".into(),
+            "--no-fund".into(),
+        ],
+        PackageManagerKind::Pnpm => vec![
+            "--dir".into(),
+            prefix.as_os_str().into(),
+            "add".into(),
+            "--prod".into(),
+            "--save-exact".into(),
+            spec.into(),
+        ],
+        PackageManagerKind::Bun => vec![
+            "add".into(),
+            "--cwd".into(),
+            prefix.as_os_str().into(),
+            "--production".into(),
+            "--exact".into(),
+            spec.into(),
+        ],
+    }
+}
+
+fn dario_entrypoint(prefix: &Path) -> PathBuf {
+    prefix
+        .join("node_modules")
+        .join("@askalf")
+        .join("dario")
+        .join("dist")
+        .join("cli.js")
+}
+
+fn package_managers() -> Vec<PackageManager> {
+    [
+        (PackageManagerKind::Npm, "npm"),
+        (PackageManagerKind::Pnpm, "pnpm"),
+        (PackageManagerKind::Bun, "bun"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, name)| find_on_path(name).map(|bin| PackageManager { kind, bin }))
+    .collect()
+}
+
+async fn find_node_runtime() -> Result<JavascriptRuntime> {
+    let bin = find_on_path("node").ok_or_else(|| {
+        anyhow!(
+            "Dario requires Node.js 18 or newer at runtime; install Node.js (npm, pnpm, or Bun may be used to install the package)"
+        )
+    })?;
+    let output = Command::new(&bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("checking Node.js runtime {bin:?}"))?;
+    ensure!(output.status.success(), "{bin:?} --version failed");
+    let version = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("could not parse Node.js version {version:?} from {bin:?}"))?;
+    ensure!(
+        major >= 18,
+        "Dario requires Node.js 18 or newer; found {version} at {bin:?}"
+    );
+    Ok(JavascriptRuntime { bin, version })
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn latest_installed_version(install_root: &Path) -> Option<String> {
+    let mut versions = std::fs::read_dir(install_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir() && dario_entrypoint(&entry.path()).exists())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter_map(|version| version_key(&version).map(|key| (key, version)))
+        .collect::<Vec<_>>();
+    versions.sort_by(|a, b| a.0.cmp(&b.0));
+    versions.pop().map(|(_, version)| version)
+}
+
+fn version_key(version: &str) -> Option<Vec<u64>> {
+    version
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()
+}
+
+async fn registry_latest(http: &reqwest::Client) -> Result<String> {
+    let body: Value = http
+        .get(REGISTRY_LATEST_URL)
+        .send()
+        .await
+        .context("fetching npm registry latest")?
+        .error_for_status()
+        .context("npm registry latest status")?
+        .json()
+        .await
+        .context("parsing npm registry response")?;
+    body["version"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("npm registry response missing version"))
 }
 
 impl DarioSupervisor {
@@ -314,8 +580,10 @@ impl DarioSupervisor {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("building http client")?;
+        let runtime = find_node_runtime().await?;
         let supervisor = Arc::new(Self {
             settings,
+            runtime,
             active: RwLock::new(None),
             generations: Mutex::new(Vec::new()),
             http,
@@ -328,10 +596,7 @@ impl DarioSupervisor {
         });
         let _ = supervisor.weak_self.set(Arc::downgrade(&supervisor));
         supervisor.reap_orphans();
-        let version = match &supervisor.settings.version_pin {
-            Some(pin) => pin.clone(),
-            None => supervisor.npm_latest().await?,
-        };
+        let version = supervisor.resolve_version().await?;
         supervisor
             .roll(&version)
             .await
@@ -340,7 +605,7 @@ impl DarioSupervisor {
         if supervisor.settings.update_check_minutes > 0 {
             supervisor.spawn_update_loop();
         }
-        if supervisor.settings.probe_seconds > 0 {
+        if supervisor.settings.validate_subscription && supervisor.settings.probe_seconds > 0 {
             supervisor.spawn_probe_loop();
         }
         Ok(supervisor)
@@ -402,6 +667,10 @@ impl DarioSupervisor {
         };
         let gens = self.generations.lock().unwrap().clone();
         json!({
+            "available": active_id.is_some(),
+            "runtime": "node",
+            "runtime_version": self.runtime.version,
+            "runtime_path": self.runtime.bin,
             "active_generation_id": active_id,
             "generations": gens.iter().map(|g| g.status_json()).collect::<Vec<_>>(),
         })
@@ -549,46 +818,25 @@ impl DarioSupervisor {
     }
 
     async fn ensure_installed(&self, version: &str) -> Result<PathBuf> {
-        let prefix = self.settings.install_root.join(version);
-        let bin = prefix.join("node_modules").join(".bin").join("dario");
-        if bin.exists() {
-            return Ok(bin);
-        }
-        tokio::fs::create_dir_all(&prefix).await?;
-        let output = Command::new("npm")
-            .arg("install")
-            .arg(format!("{NPM_PACKAGE}@{version}"))
-            .arg("--prefix")
-            .arg(&prefix)
-            .stdin(Stdio::null())
-            .output()
+        install_version(&self.settings.install_root, version)
             .await
-            .context("running npm install")?;
-        ensure!(
-            output.status.success(),
-            "npm install {NPM_PACKAGE}@{version} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        ensure!(bin.exists(), "npm install succeeded but {bin:?} is missing");
-        Ok(bin)
+            .map(|result| result.entrypoint)
+    }
+
+    async fn resolve_version(&self) -> Result<String> {
+        if let Some(pin) = &self.settings.version_pin {
+            return Ok(pin.clone());
+        }
+        match self.npm_latest().await {
+            Ok(version) => Ok(version),
+            Err(error) => latest_installed_version(&self.settings.install_root).ok_or_else(|| {
+                error.context("fetching the Dario version and no installed fallback was found")
+            }),
+        }
     }
 
     async fn npm_latest(&self) -> Result<String> {
-        let body: Value = self
-            .http
-            .get(REGISTRY_LATEST_URL)
-            .send()
-            .await
-            .context("fetching npm registry latest")?
-            .error_for_status()
-            .context("npm registry latest status")?
-            .json()
-            .await
-            .context("parsing npm registry response")?;
-        body["version"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("npm registry response missing version"))
+        registry_latest(&self.http).await
     }
 
     fn pids_path(&self) -> PathBuf {
@@ -688,8 +936,9 @@ impl DarioSupervisor {
         quarantine_fable_live_cache();
         let shims = self.prepare_runtime_shims()?;
         let node_options = node_options_with_require(&shims.fetch_capture_preload);
-        let mut child_cmd = Command::new(bin);
+        let mut child_cmd = Command::new(&self.runtime.bin);
         child_cmd
+            .arg(bin)
             .arg("proxy")
             .arg("--host=127.0.0.1")
             .arg(format!("--port={port}"))
@@ -754,6 +1003,9 @@ impl DarioSupervisor {
                 ));
             }
             tokio::time::sleep(Duration::from_millis(HEALTH_POLL_MS)).await;
+        }
+        if !self.settings.validate_subscription {
+            return Ok(());
         }
         let base_url = format!("http://127.0.0.1:{}", gen.port);
         let (outcome, latency_ms) = probe_messages(
@@ -1877,6 +2129,68 @@ mod tests {
     #[test]
     fn generation_id_format() {
         assert_eq!(generation_id("4.8.139", 5555), "gen-4.8.139-5555");
+    }
+
+    #[test]
+    fn version_keys_are_numeric_and_reject_tags() {
+        assert_eq!(version_key("4.8.139"), Some(vec![4, 8, 139]));
+        assert_eq!(version_key("4.10.2"), Some(vec![4, 10, 2]));
+        assert_eq!(version_key("latest"), None);
+        assert_eq!(version_key("4.8.139-beta.1"), None);
+    }
+
+    #[test]
+    fn dario_entrypoint_is_package_manager_independent() {
+        assert_eq!(
+            dario_entrypoint(Path::new("/tmp/dario/4.8.139")),
+            PathBuf::from("/tmp/dario/4.8.139/node_modules/@askalf/dario/dist/cli.js")
+        );
+    }
+
+    #[test]
+    fn package_manager_commands_target_the_private_prefix() {
+        let prefix = Path::new("/tmp/alex dario/4.8.139");
+        let spec = "@askalf/dario@4.8.139";
+        let strings = |kind| {
+            package_manager_args(kind, prefix, spec)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strings(PackageManagerKind::Npm),
+            vec![
+                "install",
+                spec,
+                "--prefix",
+                "/tmp/alex dario/4.8.139",
+                "--omit=dev",
+                "--no-audit",
+                "--no-fund"
+            ]
+        );
+        assert_eq!(
+            strings(PackageManagerKind::Pnpm),
+            vec![
+                "--dir",
+                "/tmp/alex dario/4.8.139",
+                "add",
+                "--prod",
+                "--save-exact",
+                spec
+            ]
+        );
+        assert_eq!(
+            strings(PackageManagerKind::Bun),
+            vec![
+                "add",
+                "--cwd",
+                "/tmp/alex dario/4.8.139",
+                "--production",
+                "--exact",
+                spec
+            ]
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **Trace Browser & TUI** — a two-pane live trace browser in the menu bar app, `alex tui` in the terminal, `alex traces --json` for scripts
 - **Limits & health** — subscription plan windows (5h/7d) with utilization and reset times, per-provider heartbeats, `alex ping`, `alex status`
 - **Cost analytics** — per-model requests/tokens/cost with subscription-vs-API billing buckets (`/admin/analytics`)
-- **Dario mode** — optional generational supervisor for the `@askalf/dario` Anthropic upstream with health probes, npm auto-update, and rolling restarts
+- **Dario mode** — an always-prepared generational supervisor for the `@askalf/dario` Anthropic upstream with health probes, automatic updates, and rolling restarts; routing remains an explicit toggle
 - **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
 - **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
 - **Self-updating, zero downtime** — `alex update` fetches the release manifest, sha256-verifies the binary, swaps it atomically, and blue-greens the daemon on a shared port (SO_REUSEPORT) so in-flight traffic never drops; the menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item that rides the same blue-green handover
@@ -53,6 +53,12 @@ cargo install alex        # installs the `alex` and `alexandria` binaries
 ./install.sh              # release build → /usr/local/bin/alex (+ alexandria symlink)
 ./install.sh --service    # also run at login (launchd/systemd)
 ```
+
+Alexandria prepares Dario during installation and again when the daemon starts.
+Dario requires Node.js 18 or newer; the package install automatically tries npm,
+pnpm, then Bun. `alex dario enable` routes non-Claude-Code Anthropic traffic
+through the warm Dario generation after Alexandria is restarted, while
+`alex dario disable` keeps it ready but returns that traffic to direct routing.
 
 ### Beta channel
 

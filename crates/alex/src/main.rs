@@ -63,11 +63,11 @@ enum Command {
     },
     /// Print env exports for pointing harnesses at the daemon
     Env,
-    /// Connect an installed AI harness to this daemon (pi)
+    /// Connect an installed AI harness to this daemon
     Connect {
         /// Harness name; omit to show detection status
         harness: Option<String>,
-        /// Override the harness config dir (default: ~/.pi/agent for pi)
+        /// Override the harness config dir
         #[arg(long)]
         config_dir: Option<PathBuf>,
         #[arg(long)]
@@ -89,7 +89,7 @@ enum Command {
         #[command(subcommand)]
         command: HarnessCommand,
     },
-    /// Inspect or control the dario generational proxy (requires a running daemon)
+    /// Install, configure, inspect, or control the Dario generational proxy
     Dario {
         #[command(subcommand)]
         command: DarioCommand,
@@ -214,8 +214,17 @@ enum ServiceCommand {
     Status,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone, Copy)]
 enum DarioCommand {
+    /// Install Dario using npm, pnpm, or Bun (Node.js 18+ is required at runtime)
+    Bootstrap {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route non-Claude-Code Anthropic requests through Dario
+    Enable,
+    /// Keep Dario ready but route Anthropic requests directly
+    Disable,
     /// Show generations and their states
     Status,
     /// Roll to a fresh generation of the same version
@@ -869,7 +878,12 @@ fn open_vault(config: &Config) -> Result<Vault> {
 }
 
 fn validate_account_name(name: &str) -> Result<()> {
-    if name.len() > 32 || name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+    if name.len() > 32
+        || name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
         anyhow::bail!("account name must match [a-z0-9_-]{{1,32}}");
     }
     Ok(())
@@ -887,11 +901,18 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
     })
 }
 
-struct DarioGlue(Arc<dario::DarioSupervisor>);
+struct DarioGlue {
+    supervisor: Arc<dario::DarioSupervisor>,
+    route_enabled: bool,
+}
 
 impl alex_proxy::DarioRouter for DarioGlue {
+    fn routes_requests(&self) -> bool {
+        self.route_enabled
+    }
+
     fn active(&self) -> Option<alex_proxy::DarioActive> {
-        self.0.active().map(|a| alex_proxy::DarioActive {
+        self.supervisor.active().map(|a| alex_proxy::DarioActive {
             generation_id: a.generation_id,
             base_url: a.base_url,
             api_key: a.api_key,
@@ -899,23 +920,32 @@ impl alex_proxy::DarioRouter for DarioGlue {
     }
 
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
-        self.0
+        self.supervisor
             .begin_request(generation_id)
             .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
     }
 
     fn status(&self) -> serde_json::Value {
-        self.0.status()
+        let mut status = self.supervisor.status();
+        status["route_enabled"] = serde_json::json!(self.route_enabled);
+        status
     }
 
     fn suspect(&self, generation_id: &str) {
-        self.0.suspect(generation_id);
+        self.supervisor.suspect(generation_id);
     }
 }
 
-struct DarioUnavailable(String);
+struct DarioUnavailable {
+    error: String,
+    route_enabled: bool,
+}
 
 impl alex_proxy::DarioRouter for DarioUnavailable {
+    fn routes_requests(&self) -> bool {
+        self.route_enabled
+    }
+
     fn active(&self) -> Option<alex_proxy::DarioActive> {
         None
     }
@@ -928,7 +958,10 @@ impl alex_proxy::DarioRouter for DarioUnavailable {
         serde_json::json!({
             "configured": true,
             "available": false,
-            "error": self.0,
+            "route_enabled": self.route_enabled,
+            "active_generation_id": null,
+            "generations": [],
+            "error": self.error,
         })
     }
 
@@ -1177,18 +1210,25 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         Ok((id, key))
     }
 
-    fn backfill_codex_lineage(state: &alex_proxy::AppState, config_dir: &std::path::Path) {
+    fn backfill_harness_lineage(
+        state: &alex_proxy::AppState,
+        harness: &str,
+        config_dir: &std::path::Path,
+    ) {
         let received_ms = now_ms();
-        for (index, event) in harness_connect::read_codex_hook_events(config_dir)
-            .iter()
-            .enumerate()
-        {
+        let events = match harness {
+            "claude" => harness_connect::read_claude_hook_events(config_dir),
+            "codex" => harness_connect::read_codex_hook_events(config_dir),
+            "grok" => harness_connect::read_grok_hook_events(config_dir),
+            _ => Vec::new(),
+        };
+        for (index, event) in events.iter().enumerate() {
             if let Err(error) = state.store.record_harness_event(
-                "codex",
+                harness,
                 event,
                 received_ms.saturating_add(index as i64),
             ) {
-                tracing::warn!(%error, "could not backfill a Codex lineage hook event");
+                tracing::warn!(%error, %harness, "could not backfill a harness lineage hook event");
             }
         }
     }
@@ -1264,13 +1304,19 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         if !config_dir.is_dir() {
             return error(
                 axum::http::StatusCode::BAD_REQUEST,
-                format!("{name} config dir does not exist at {}", config_dir.display()),
+                format!(
+                    "{name} config dir does not exist at {}",
+                    config_dir.display()
+                ),
             );
         }
         let models = state_models(&state);
         let codex_catalog = if name == "codex" {
             let Some(binary) = status.binary.as_deref() else {
-                return error(axum::http::StatusCode::BAD_REQUEST, "codex is not installed");
+                return error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "codex is not installed",
+                );
             };
             match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models) {
                 Ok(catalog) => Some(catalog),
@@ -1295,6 +1341,10 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                     .map(Vec::len)
                     .unwrap_or(models.len());
                 harness_connect::plan_codex_connect(&config_dir, model_count, &keys)
+            } else if name == "claude" {
+                harness_connect::plan_claude_connect(&config_dir, models.len(), &keys)
+            } else if name == "grok" {
+                harness_connect::plan_grok_connect(&config_dir, models.len(), &keys)
             } else {
                 harness_connect::plan_connect(&config_dir, models.len(), &keys)
             };
@@ -1307,7 +1357,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let lineage_config_dir = (name == "codex").then(|| config_dir.clone());
+        let lineage_config_dir =
+            matches!(name.as_str(), "claude" | "codex" | "grok").then(|| config_dir.clone());
         let result = match name.as_str() {
             "pi" => harness_connect::write_pi_connection(
                 config_dir,
@@ -1325,12 +1376,28 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 codex_catalog.expect("Codex catalog prepared"),
                 status.version,
             ),
+            "claude" => harness_connect::write_claude_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                key,
+                models,
+                status.version,
+            ),
+            "grok" => harness_connect::write_grok_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                key,
+                models,
+                status.version,
+            ),
             _ => unreachable!("connect-capable harness must have a writer"),
         };
         match result {
             Ok(summary) => {
                 if let Some(config_dir) = lineage_config_dir.as_deref() {
-                    backfill_codex_lineage(&state, config_dir);
+                    backfill_harness_lineage(&state, &name, config_dir);
                 }
                 axum::Json(harness_connect::config_write_json(&summary, "minted", None))
                     .into_response()
@@ -1371,25 +1438,32 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             };
             let plan = if name == "codex" {
                 harness_connect::plan_codex_disconnect(&config_dir, &keys)
+            } else if name == "claude" {
+                harness_connect::plan_claude_disconnect(&config_dir, &keys)
+            } else if name == "grok" {
+                harness_connect::plan_grok_disconnect(&config_dir, &keys)
             } else {
                 harness_connect::plan_disconnect(&config_dir, &keys)
             };
             return axum::Json(plan).into_response();
         }
-        let config_path = if name == "codex" {
-            config_dir.join("config.toml")
-        } else {
-            config_dir.join("models.json")
+        let config_path = match name.as_str() {
+            "claude" => config_dir.join("alexandria-settings.json"),
+            "codex" => config_dir.join("config.toml"),
+            "grok" => config_dir.join("config.toml"),
+            _ => config_dir.join("models.json"),
         };
-        let previous_models = if name == "codex" {
-            harness_connect::read_codex_model_ids(&config_dir)
-        } else {
-            harness_connect::read_pi_model_ids(&config_dir)
+        let previous_models = match name.as_str() {
+            "claude" => harness_connect::read_claude_model_ids(&config_dir),
+            "codex" => harness_connect::read_codex_model_ids(&config_dir),
+            "grok" => harness_connect::read_grok_model_ids(&config_dir),
+            _ => harness_connect::read_pi_model_ids(&config_dir),
         };
-        let disconnected = if name == "codex" {
-            harness_connect::disconnect_codex_config(&config_dir)
-        } else {
-            harness_connect::disconnect_pi_config(&config_dir)
+        let disconnected = match name.as_str() {
+            "claude" => harness_connect::disconnect_claude_config(&config_dir),
+            "codex" => harness_connect::disconnect_codex_config(&config_dir),
+            "grok" => harness_connect::disconnect_grok_config(&config_dir),
+            _ => harness_connect::disconnect_pi_config(&config_dir),
         };
         let was_connected = match disconnected {
             Ok(v) => v,
@@ -1436,13 +1510,17 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         if !config_dir.is_dir() {
             return error(
                 axum::http::StatusCode::BAD_REQUEST,
-                format!("{name} config dir does not exist at {}", config_dir.display()),
+                format!(
+                    "{name} config dir does not exist at {}",
+                    config_dir.display()
+                ),
             );
         }
-        let existing_key = if name == "codex" {
-            harness_connect::read_codex_api_key(&config_dir)
-        } else {
-            harness_connect::read_pi_api_key(&config_dir)
+        let existing_key = match name.as_str() {
+            "claude" => harness_connect::read_claude_api_key(&config_dir),
+            "codex" => harness_connect::read_codex_api_key(&config_dir),
+            "grok" => harness_connect::read_grok_api_key(&config_dir),
+            _ => harness_connect::read_pi_api_key(&config_dir),
         };
         let (key_status, key_id, api_key) = if let Some(key) = existing_key {
             ("reused", String::new(), key)
@@ -1459,26 +1537,46 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
             Ok(status) => status,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let lineage_config_dir = (name == "codex").then(|| config_dir.clone());
+        let lineage_config_dir =
+            matches!(name.as_str(), "claude" | "codex" | "grok").then(|| config_dir.clone());
         let result = if name == "codex" {
             let Some(binary) = status.binary.as_deref() else {
-                return error(axum::http::StatusCode::BAD_REQUEST, "codex is not installed");
+                return error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "codex is not installed",
+                );
             };
-            let catalog = match harness_connect::codex_model_catalog(
-                std::path::Path::new(binary),
-                &models,
-            ) {
-                Ok(catalog) => catalog,
-                Err(e) => {
-                    return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                }
-            };
+            let catalog =
+                match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models) {
+                    Ok(catalog) => catalog,
+                    Err(e) => {
+                        return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    }
+                };
             harness_connect::write_codex_connection(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 api_key,
                 catalog,
+                status.version,
+            )
+        } else if name == "claude" {
+            harness_connect::write_claude_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                api_key,
+                models,
+                status.version,
+            )
+        } else if name == "grok" {
+            harness_connect::write_grok_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                api_key,
+                models,
                 status.version,
             )
         } else {
@@ -1494,7 +1592,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         match result {
             Ok(summary) => {
                 if let Some(config_dir) = lineage_config_dir.as_deref() {
-                    backfill_codex_lineage(&state, config_dir);
+                    backfill_harness_lineage(&state, &name, config_dir);
                 }
                 axum::Json(harness_connect::config_write_json(
                     &summary,
@@ -1567,10 +1665,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                 "restart_required": true,
             }))
             .into_response(),
-            Err(error_value) => error(
-                axum::http::StatusCode::BAD_REQUEST,
-                error_value.to_string(),
-            ),
+            Err(error_value) => error(axum::http::StatusCode::BAD_REQUEST, error_value.to_string()),
         }
     }
 
@@ -1578,7 +1673,10 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         .route("/admin/harnesses", get(list))
         .route("/admin/harnesses/{name}/connect", post(connect))
         .route("/admin/harnesses/{name}/disconnect", post(disconnect))
-        .route("/admin/harnesses/{name}/refresh-config", post(refresh_config))
+        .route(
+            "/admin/harnesses/{name}/refresh-config",
+            post(refresh_config),
+        )
         .route("/admin/harnesses/{name}/override", put(put_override))
         .route(
             "/admin/harnesses/codex/default-route",
@@ -1653,50 +1751,65 @@ async fn main() -> Result<()> {
                     )
                     .await;
             }
-            let mut dario_router: Option<Arc<dyn alex_proxy::DarioRouter>> = None;
-            let mut supervisor: Option<Arc<dario::DarioSupervisor>> = None;
-            if config.dario_enabled() {
-                if config.dario_api_key.is_empty() {
-                    config.dario_api_key = random_key("dario");
-                    save_config(&config)?;
-                    eprintln!("generated dario_api_key and saved it to config.toml");
-                }
-                let settings = dario::DarioSettings {
-                    install_root: config.data_dir.join("dario"),
-                    log_root: config.data_dir.join("dario").join("logs"),
-                    capture_root: config.data_dir.join("bodies"),
-                    prompt_cache_root: config.data_dir.join("dario-prompt-cache"),
-                    api_key: config.dario_api_key.clone(),
-                    update_check_minutes: config.dario_update_check_minutes,
-                    version_pin: config.dario_version.clone(),
-                    probe_seconds: config.dario_probe_seconds,
-                    probe_failures: config.dario_probe_failures,
-                    probe_model: config.dario_probe_model.clone(),
-                };
-                match dario::DarioSupervisor::start(settings).await {
-                    Ok(sup) => {
-                        eprintln!(
-                            "dario: active generation {}",
-                            sup.active()
-                                .map(|a| a.generation_id)
-                                .unwrap_or_else(|| "-".into())
-                        );
-                        dario_router =
-                            Some(Arc::new(DarioGlue(sup.clone()))
-                                as Arc<dyn alex_proxy::DarioRouter>);
-                        supervisor = Some(sup);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "dario: failed to start ({e}); Claude Code remains direct, other Anthropic traffic will fail closed"
-                        );
-                        dario_router = Some(
-                            Arc::new(DarioUnavailable(e.to_string()))
-                                as Arc<dyn alex_proxy::DarioRouter>,
-                        );
-                    }
-                }
+            if config.dario_api_key.is_empty() {
+                config.dario_api_key = random_key("dario");
+                save_config(&config)?;
+                eprintln!("generated dario_api_key and saved it to config.toml");
             }
+            let dario_route_enabled = config.dario_enabled();
+            let settings = dario::DarioSettings {
+                install_root: config.data_dir.join("dario"),
+                log_root: config.data_dir.join("dario").join("logs"),
+                capture_root: config.data_dir.join("bodies"),
+                prompt_cache_root: config.data_dir.join("dario-prompt-cache"),
+                api_key: config.dario_api_key.clone(),
+                update_check_minutes: config.dario_update_check_minutes,
+                version_pin: config.dario_version.clone(),
+                probe_seconds: config.dario_probe_seconds,
+                probe_failures: config.dario_probe_failures,
+                probe_model: config.dario_probe_model.clone(),
+                validate_subscription: dario_route_enabled,
+            };
+            let (dario_router, supervisor) = match dario::DarioSupervisor::start(settings).await {
+                Ok(sup) => {
+                    eprintln!(
+                        "dario: ready generation {} (routing {})",
+                        sup.active()
+                            .map(|a| a.generation_id)
+                            .unwrap_or_else(|| "-".into()),
+                        if dario_route_enabled {
+                            "enabled"
+                        } else {
+                            "direct"
+                        }
+                    );
+                    (
+                        Some(Arc::new(DarioGlue {
+                            supervisor: sup.clone(),
+                            route_enabled: dario_route_enabled,
+                        })
+                            as Arc<dyn alex_proxy::DarioRouter>),
+                        Some(sup),
+                    )
+                }
+                Err(e) => {
+                    if dario_route_enabled {
+                        eprintln!(
+                            "dario: failed to start ({e}); non-Claude-Code Anthropic traffic will fail closed"
+                        );
+                    } else {
+                        eprintln!("dario: unavailable ({e}); Anthropic traffic remains direct");
+                    }
+                    (
+                        Some(Arc::new(DarioUnavailable {
+                            error: e.to_string(),
+                            route_enabled: dario_route_enabled,
+                        })
+                            as Arc<dyn alex_proxy::DarioRouter>),
+                        None,
+                    )
+                }
+            };
             let state = alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
@@ -1860,20 +1973,39 @@ async fn main() -> Result<()> {
             }
         }
         Command::Auth { command } => match command {
-            AuthCommand::Import { source, name, force } => {
+            AuthCommand::Import {
+                source,
+                name,
+                force,
+            } => {
                 validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
-                let provider = if source != "all" { Some(provider_from_cli(&source)?) } else { None };
+                let provider = if source != "all" {
+                    Some(provider_from_cli(&source)?)
+                } else {
+                    None
+                };
                 if !force {
                     if let Some(p) = provider {
-                        if vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+                        if vault.has_account_name(p, &name).await {
+                            anyhow::bail!(
+                                "{} account '{name}' already exists (use --force to replace)",
+                                p.as_str()
+                            );
+                        }
                     } else if name != "default" {
-                        anyhow::bail!("--name with source=all is ambiguous; import one provider at a time");
+                        anyhow::bail!(
+                            "--name with source=all is ambiguous; import one provider at a time"
+                        );
                     }
                 }
                 let pre_default = if name != "default" {
                     if let Some(p) = provider {
-                        vault.list().await.into_iter().find(|a| a.id == named_account_id(p, "oauth", "default"))
+                        vault
+                            .list()
+                            .await
+                            .into_iter()
+                            .find(|a| a.id == named_account_id(p, "oauth", "default"))
                     } else {
                         None
                     }
@@ -1882,7 +2014,8 @@ async fn main() -> Result<()> {
                 };
                 let mut outcomes = import_all(&vault, &source).await?;
                 if name != "default" {
-                    let imported: Vec<String> = outcomes.iter().flat_map(|o| o.imported.clone()).collect();
+                    let imported: Vec<String> =
+                        outcomes.iter().flat_map(|o| o.imported.clone()).collect();
                     for id in imported {
                         if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
                             a.name = name.clone();
@@ -1893,7 +2026,11 @@ async fn main() -> Result<()> {
                     }
                     for o in &mut outcomes {
                         for id in &mut o.imported {
-                            if let Some(a) = vault.list().await.into_iter().find(|a| a.name == name && a.provider.as_str() == provider.map(|p| p.as_str()).unwrap_or("")) {
+                            if let Some(a) = vault.list().await.into_iter().find(|a| {
+                                a.name == name
+                                    && a.provider.as_str()
+                                        == provider.map(|p| p.as_str()).unwrap_or("")
+                            }) {
                                 *id = a.id;
                             }
                         }
@@ -1901,7 +2038,9 @@ async fn main() -> Result<()> {
                     if let Some(a) = pre_default {
                         vault.upsert(a).await?;
                     } else if let Some(p) = provider {
-                        let _ = vault.remove(&named_account_id(p, "oauth", "default")).await?;
+                        let _ = vault
+                            .remove(&named_account_id(p, "oauth", "default"))
+                            .await?;
                     }
                 }
                 for outcome in outcomes {
@@ -1920,7 +2059,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            AuthCommand::Login { provider, name, force } => {
+            AuthCommand::Login {
+                provider,
+                name,
+                force,
+            } => {
                 use std::io::IsTerminal;
                 validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
@@ -1939,13 +2082,22 @@ async fn main() -> Result<()> {
                     ),
                 };
                 let p = provider_from_cli(&provider)?;
-                if !force && vault.has_account_name(p, &name).await { anyhow::bail!("{} account '{name}' already exists (use --force to replace)", p.as_str()); }
+                if !force && vault.has_account_name(p, &name).await {
+                    anyhow::bail!(
+                        "{} account '{name}' already exists (use --force to replace)",
+                        p.as_str()
+                    );
+                }
                 if p == alex_core::Provider::Openai {
                     let id = alex_auth::login::login_named(&vault, &provider, &name, force).await?;
                     println!("saved account: {id}");
                 } else {
                     let default_id = named_account_id(p, "oauth", "default");
-                    let pre_default = if name != "default" { vault.list().await.into_iter().find(|a| a.id == default_id) } else { None };
+                    let pre_default = if name != "default" {
+                        vault.list().await.into_iter().find(|a| a.id == default_id)
+                    } else {
+                        None
+                    };
                     let id = alex_auth::login::login(&vault, &provider).await?;
                     if name != "default" {
                         if let Some(mut a) = vault.list().await.into_iter().find(|a| a.id == id) {
@@ -1960,19 +2112,30 @@ async fn main() -> Result<()> {
                             let _ = vault.remove(&default_id).await?;
                         }
                     }
-                    println!("saved account: {}", if name == "default" { id } else { named_account_id(p, "oauth", &name) });
+                    println!(
+                        "saved account: {}",
+                        if name == "default" {
+                            id
+                        } else {
+                            named_account_id(p, "oauth", &name)
+                        }
+                    );
                 }
             }
             AuthCommand::Pause { provider, name } => {
                 validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
-                vault.pause(provider_from_cli(&provider)?, &name, true).await?;
+                vault
+                    .pause(provider_from_cli(&provider)?, &name, true)
+                    .await?;
                 println!("paused {provider}/{name}");
             }
             AuthCommand::Resume { provider, name } => {
                 validate_account_name(&name)?;
                 let vault = open_vault(&config)?;
-                vault.pause(provider_from_cli(&provider)?, &name, false).await?;
+                vault
+                    .pause(provider_from_cli(&provider)?, &name, false)
+                    .await?;
                 println!("resumed {provider}/{name}");
             }
             AuthCommand::GeminiKey { key } => {
@@ -2031,7 +2194,9 @@ async fn main() -> Result<()> {
                 let vault = open_vault(&config)?;
                 if remove {
                     if key.is_some() || referer.is_some() || title.is_some() {
-                        anyhow::bail!("--remove cannot be combined with a key, --referer, or --title");
+                        anyhow::bail!(
+                            "--remove cannot be combined with a key, --referer, or --title"
+                        );
                     }
                     if vault.remove("openrouter-api-key").await? {
                         println!("{} removed openrouter-api-key", ui::green(ui::dot()));
@@ -2073,7 +2238,10 @@ async fn main() -> Result<()> {
                         ui::pad_right(&a.kind, 8),
                         ui::pad_right(if a.paused { "paused" } else { &a.status }, 10),
                         ui::pad_right(&expiry, 20),
-                        a.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                        a.path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -2106,8 +2274,20 @@ async fn main() -> Result<()> {
             }) => {
                 traces_export_cmd(&config, &filter, bodies, out).await?;
             }
-            Some(TracesCommand::Reattach { orphan_account_id, to_account_id, yes, json }) => {
-                traces_reattach_cmd(&config, orphan_account_id.as_deref(), to_account_id.as_deref(), yes, json).await?;
+            Some(TracesCommand::Reattach {
+                orphan_account_id,
+                to_account_id,
+                yes,
+                json,
+            }) => {
+                traces_reattach_cmd(
+                    &config,
+                    orphan_account_id.as_deref(),
+                    to_account_id.as_deref(),
+                    yes,
+                    json,
+                )
+                .await?;
             }
             Some(TracesCommand::Path { run_id }) => {
                 traces_path_cmd(&config, &run_id)?;
@@ -2327,10 +2507,7 @@ async fn main() -> Result<()> {
                                     && (candidate.name == account || candidate.id == account)
                             })
                             .with_context(|| {
-                                format!(
-                                    "unknown {} account '{account}'",
-                                    provider.as_str()
-                                )
+                                format!("unknown {} account '{account}'", provider.as_str())
                             })?;
                         policy
                             .account_reserve_pct
@@ -2407,6 +2584,41 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Command::Dario { command } => {
+            match command {
+                DarioCommand::Bootstrap { json } => {
+                    let result = dario::bootstrap(
+                        config.data_dir.join("dario"),
+                        config.dario_version.clone(),
+                    )
+                    .await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if result.already_installed {
+                        println!(
+                            "Dario {} is ready (Node {}, existing install)",
+                            result.version, result.runtime_version
+                        );
+                    } else {
+                        println!(
+                            "installed Dario {} with {} (Node {})",
+                            result.version, result.package_manager, result.runtime_version
+                        );
+                    }
+                    return Ok(());
+                }
+                DarioCommand::Enable | DarioCommand::Disable => {
+                    let enabled = matches!(command, DarioCommand::Enable);
+                    let mut config = config;
+                    config.anthropic_upstream = if enabled { "dario" } else { "direct" }.into();
+                    save_config(&config)?;
+                    println!(
+                        "Dario routing {} in config.toml; restart Alexandria to apply",
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                    return Ok(());
+                }
+                DarioCommand::Status | DarioCommand::Restart | DarioCommand::Update => {}
+            }
             let http = reqwest::Client::new();
             let base = config.base_url();
             let is_status = matches!(command, DarioCommand::Status);
@@ -2429,6 +2641,9 @@ async fn main() -> Result<()> {
                         .header("x-api-key", key)
                         .send()
                         .await
+                }
+                DarioCommand::Bootstrap { .. } | DarioCommand::Enable | DarioCommand::Disable => {
+                    unreachable!()
                 }
             };
             let resp = result.with_context(|| {
@@ -2731,10 +2946,8 @@ impl RemoteTraceWorker {
                         Ok(response) => {
                             let status = response.status();
                             let detail = response.text().unwrap_or_default();
-                            last_error = format!(
-                                "rejected with {status}: {}",
-                                ui::truncate(&detail, 300)
-                            );
+                            last_error =
+                                format!("rejected with {status}: {}", ui::truncate(&detail, 300));
                             break;
                         }
                         Err(error) => last_error = error.to_string(),
@@ -3069,9 +3282,7 @@ impl AmpWsTraceState {
             "message_added" => self.ingest_message_added(&msg, outer["ts"].as_str()),
             "plugin_message" => self.ingest_plugin_message(&msg, outer["ts"].as_str()),
             "error_set" => {
-                self.active_error = msg["params"]["error"]["message"]
-                    .as_str()
-                    .map(String::from);
+                self.active_error = msg["params"]["error"]["message"].as_str().map(String::from);
                 Ok(())
             }
             "error_cleared" => {
@@ -3145,14 +3356,7 @@ impl AmpWsTraceState {
         }
         if let Some((id, text)) = assistant {
             if !id.is_empty() && !text.is_empty() {
-                self.insert_amp_trace(
-                    thread_id,
-                    &id,
-                    &text,
-                    &serde_json::Value::Null,
-                    ts,
-                    None,
-                )?;
+                self.insert_amp_trace(thread_id, &id, &text, &serde_json::Value::Null, ts, None)?;
             }
         } else if event["status"].as_str() == Some("error") {
             let user_id = self
@@ -3974,7 +4178,10 @@ fn validate_agent_transcript_id(id: &str) -> Result<()> {
 fn traces_repair_amp_cmd(config: &Config, run_id: Option<&str>, json_out: bool) -> Result<()> {
     let capture_path = alex_wrap::capture_dir_for(&config.data_dir, "amp").join("ws.jsonl");
     if !capture_path.exists() {
-        anyhow::bail!("Amp websocket capture not found: {}", capture_path.display());
+        anyhow::bail!(
+            "Amp websocket capture not found: {}",
+            capture_path.display()
+        );
     }
     let run_id = run_id
         .map(String::from)
@@ -4498,8 +4705,12 @@ async fn traces_search_cmd(config: &Config, filter: &TraceFilterArgs, json: bool
 
 fn known_account(account: &alex_auth::Account) -> KnownAccount {
     KnownAccount::new(
-        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
-        account.subscription_identity(), account.email(),
+        account.id.clone(),
+        account.provider.as_str(),
+        account.name.clone(),
+        account.kind.clone(),
+        account.subscription_identity(),
+        account.email(),
     )
 }
 
@@ -4515,43 +4726,72 @@ async fn traces_reattach_cmd(
     // catalogue before resolving the requested target.
     let vault = open_vault(config)?;
     let accounts = vault.list().await;
-    for account in &accounts { store.upsert_known_account(&known_account(account))?; }
+    for account in &accounts {
+        store.upsert_known_account(&known_account(account))?;
+    }
     let groups = store.orphaned_trace_groups()?;
     let display_time = |value: &serde_json::Value| {
-        value.as_i64()
+        value
+            .as_i64()
             .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
             .map(|time| time.to_rfc3339())
             .unwrap_or_else(|| "unknown".into())
     };
     match (orphan_account_id, to_account_id) {
         (None, None) => {
-            if json { println!("{}", serde_json::to_string_pretty(&groups)?); }
-            else if groups.is_empty() { println!("no orphaned legacy trace groups"); }
-            else { for group in groups { println!("{}  provider={}  models={}  {} traces  {}..{}",
-                group["account_id"].as_str().unwrap_or("unknown"), group["provider"].as_str().unwrap_or("unknown"),
-                group["models"].as_str().unwrap_or("unknown"), group["count"], display_time(&group["first_ts_ms"]), display_time(&group["last_ts_ms"])); } }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+            } else if groups.is_empty() {
+                println!("no orphaned legacy trace groups");
+            } else {
+                for group in groups {
+                    println!(
+                        "{}  provider={}  models={}  {} traces  {}..{}",
+                        group["account_id"].as_str().unwrap_or("unknown"),
+                        group["provider"].as_str().unwrap_or("unknown"),
+                        group["models"].as_str().unwrap_or("unknown"),
+                        group["count"],
+                        display_time(&group["first_ts_ms"]),
+                        display_time(&group["last_ts_ms"])
+                    );
+                }
+            }
             Ok(())
         }
         (Some(orphan), Some(target_id)) => {
             let group = groups.iter().find(|g| g["account_id"].as_str() == Some(orphan))
                 .context("orphan group not found (only untagged, unresolved legacy traces can be reattached)")?;
-            let target = accounts.into_iter().find(|a| a.id == target_id)
+            let target = accounts
+                .into_iter()
+                .find(|a| a.id == target_id)
                 .context("target must be an existing vault account")?;
             let target = known_account(&target);
-            let identity = target.subscription_identity.clone()
+            let identity = target
+                .subscription_identity
+                .clone()
                 .context("target account has no durable subscription identity")?;
             let plan = serde_json::json!({"orphan_account_id": orphan, "trace_count": group["count"],
                 "to_account_id": target.account_id, "subscription_identity": identity, "confirmed": confirmed});
             // Always render the plan before mutation. This also makes --yes
             // auditable in shell logs.
-            if json { println!("{}", serde_json::to_string_pretty(&plan)?); }
-            else { println!("would attach {} traces from {} to {} ({})", group["count"], orphan, target.account_id, identity); }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                println!(
+                    "would attach {} traces from {} to {} ({})",
+                    group["count"], orphan, target.account_id, identity
+                );
+            }
             if !confirmed {
-                if !json { println!("no changes made; rerun with --yes to apply"); }
+                if !json {
+                    println!("no changes made; rerun with --yes to apply");
+                }
                 return Ok(());
             }
             let changed = store.reattach_orphaned_traces(orphan, &target, true)?;
-            if !json { println!("reattached {changed} traces"); }
+            if !json {
+                println!("reattached {changed} traces");
+            }
             Ok(())
         }
         _ => anyhow::bail!("use both --orphan-account-id and --to-account-id, or neither to list"),
@@ -5069,6 +5309,26 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
         return Ok(());
     };
     println!("{}", ui::section("dario generations"));
+    let available = body["available"].as_bool().unwrap_or(false);
+    let route_enabled = body["route_enabled"].as_bool().unwrap_or(false);
+    println!(
+        "available: {}  routing: {}",
+        if available {
+            ui::green("yes")
+        } else {
+            ui::red("no")
+        },
+        if route_enabled {
+            ui::green("dario")
+        } else {
+            ui::dim("direct")
+        }
+    );
+    if let (Some(runtime), Some(version)) =
+        (body["runtime"].as_str(), body["runtime_version"].as_str())
+    {
+        println!("runtime: {runtime} {version}");
+    }
     let active = body["active_generation_id"].as_str().unwrap_or("-");
     println!("active: {}", ui::bold(&ui::turquoise(active)));
     if gens.is_empty() {
@@ -6574,14 +6834,19 @@ mod tests {
         let dir = tmpdir("traces-reattach-no-yes");
         let config: Config = serde_json::from_value(serde_json::json!({
             "host": "127.0.0.1", "port": 0, "data_dir": dir, "local_key": "test-key"
-        })).unwrap();
+        }))
+        .unwrap();
         let store = Store::open(config.data_dir.clone()).unwrap();
-        store.insert_trace(&alex_core::TraceRecord {
-            id: "legacy-orphan".into(), ts_request_ms: 100,
-            account_id: Some("openai-oauth-old".into()),
-            upstream_provider: Some("openai".into()), routed_model: Some("gpt-5".into()),
-            ..Default::default()
-        }).unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "legacy-orphan".into(),
+                ts_request_ms: 100,
+                account_id: Some("openai-oauth-old".into()),
+                upstream_provider: Some("openai".into()),
+                routed_model: Some("gpt-5".into()),
+                ..Default::default()
+            })
+            .unwrap();
         let vault = open_vault(&config).unwrap();
         vault.upsert(alex_auth::Account {
             id: "openai-oauth-new".into(), provider: alex_core::Provider::Openai,
@@ -6591,8 +6856,19 @@ mod tests {
             account_meta: serde_json::json!({"account_id": "acct_456", "email": "new@example.com"}),
             cooldown_until_ms: None, status: "active".into(), path: None,
         }).await.unwrap();
-        traces_reattach_cmd(&config, Some("openai-oauth-old"), Some("openai-oauth-new"), false, true).await.unwrap();
-        assert!(store.search_traces(&alex_store::TraceFilter::default()).unwrap()[0]["subscription_identity"].is_null());
+        traces_reattach_cmd(
+            &config,
+            Some("openai-oauth-old"),
+            Some("openai-oauth-new"),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(store
+            .search_traces(&alex_store::TraceFilter::default())
+            .unwrap()[0]["subscription_identity"]
+            .is_null());
     }
 
     #[test]
@@ -7018,8 +7294,7 @@ mod tests {
         state.ingest_new(&path, &mut offset).unwrap();
         assert_eq!(offset as usize, line.len() + 1);
         assert_eq!(
-            state.user_by_thread["thread-1"].text,
-            "hello",
+            state.user_by_thread["thread-1"].text, "hello",
             "the completed record is parsed on the next poll"
         );
     }
@@ -7679,7 +7954,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn harness_router_lists_and_rejects_non_pi_connect() {
+    async fn harness_router_lists_and_rejects_unsupported_connect() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("router-list");
         std::env::set_var("ALEXANDRIA_HOME", &home);
@@ -7695,7 +7970,7 @@ mod tests {
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));
 
         let (status, body) =
-            router_json(app, Method::POST, "/admin/harnesses/claude/connect", None).await;
+            router_json(app, Method::POST, "/admin/harnesses/gemini/connect", None).await;
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]
@@ -7792,8 +8067,13 @@ mod tests {
         assert!(!models_path.exists());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
 
-        let (status, body) =
-            router_json(app.clone(), Method::POST, "/admin/harnesses/pi/connect", None).await;
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/pi/connect",
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
         assert_eq!(body["key"], "minted");
@@ -7815,8 +8095,14 @@ mod tests {
             .unwrap();
         let written_ids: Vec<&str> = generated.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(written_ids.iter().all(|id| id.starts_with("alex/")));
-        assert!(written_ids.iter().any(|id| *id == "alex/claude-fable-5" || id.ends_with("claude-opus-4-8")));
-        for id in ["alex/gpt-5.6-sol", "alex/gpt-5.6-terra", "alex/gpt-5.6-luna"] {
+        assert!(written_ids
+            .iter()
+            .any(|id| *id == "alex/claude-fable-5" || id.ends_with("claude-opus-4-8")));
+        for id in [
+            "alex/gpt-5.6-sol",
+            "alex/gpt-5.6-terra",
+            "alex/gpt-5.6-luna",
+        ] {
             assert!(generated.iter().any(|model| model["id"] == id));
         }
         let sol = generated
@@ -7846,12 +8132,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let dplan = body["plan"].as_array().unwrap();
-        assert!(dplan.iter().any(|s| s["detail"].as_str() == Some("remove provider block")));
+        assert!(dplan
+            .iter()
+            .any(|s| s["detail"].as_str() == Some("remove provider block")));
         assert!(dplan.iter().any(|s| s["detail"]
             .as_str()
             .unwrap_or("")
             .starts_with("revoke harness key")));
-        assert_eq!(std::fs::read_to_string(&models_path).unwrap(), before_disconnect);
+        assert_eq!(
+            std::fs::read_to_string(&models_path).unwrap(),
+            before_disconnect
+        );
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
 
         let (status, body) = router_json(
@@ -7874,7 +8165,9 @@ mod tests {
         let refreshed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
         assert_eq!(
-            refreshed["providers"]["alexandria"]["apiKey"].as_str().unwrap(),
+            refreshed["providers"]["alexandria"]["apiKey"]
+                .as_str()
+                .unwrap(),
             saved_key
         );
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
@@ -7907,13 +8200,116 @@ mod tests {
         let (status, body) = router_json(
             app,
             Method::POST,
-            "/admin/harnesses/claude/refresh-config",
+            "/admin/harnesses/gemini/refresh-config",
             None,
         )
         .await;
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("does not support connect"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not support connect"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_connect_claude_writes_opt_in_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-connect-claude");
+        let bin_dir = tmpdir("router-connect-claude-bin");
+        let binary = fake_executable(&bin_dir, "claude", "echo claude-code 2.1.202");
+        let config_dir = home.join("claude-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let normal_settings = "{\"theme\":\"dark\"}\n";
+        std::fs::write(config_dir.join("settings.json"), normal_settings).unwrap();
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.harness_overrides.insert(
+            "claude".into(),
+            HarnessOverride {
+                binary: Some(binary),
+                config_dir: Some(config_dir.clone()),
+            },
+        );
+        save_config(&config).unwrap();
+        let state = test_state("router-connect-claude-state");
+        let app = harness_admin_router(state.clone(), "alx-local".into());
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/claude/connect?dry_run=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plain `claude`")));
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/claude/connect",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["key"], "minted");
+        assert!(body["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("alexandria-settings.json"));
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("plain `claude`"));
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("settings.json")).unwrap(),
+            normal_settings
+        );
+        let profile: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config_dir.join("alexandria-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(profile["model"]
+            .as_str()
+            .unwrap()
+            .starts_with("claude-alex/"));
+        assert_eq!(
+            profile["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+        assert!(config_dir
+            .join("alexandria-original-settings.json")
+            .exists());
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
+
+        let (status, body) = router_json(
+            app,
+            Method::POST,
+            "/admin/harnesses/claude/disconnect",
+            None,
+        )
+        .await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["was_connected"], true);
+        assert!(!config_dir.join("alexandria-settings.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("settings.json")).unwrap(),
+            normal_settings
+        );
+        assert!(config_dir
+            .join("alexandria-original-settings.json")
+            .exists());
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
     }
 
     #[cfg(unix)]
@@ -7959,10 +8355,14 @@ fi"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["plan"].as_array().unwrap().iter().any(|step| step["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sub-agent lineage")));
+        assert!(body["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sub-agent lineage")));
         assert!(body["plan"].as_array().unwrap().iter().any(|step| {
             step["action"] == "about"
                 && step["detail"]
@@ -8039,13 +8439,8 @@ fi"#,
             Some("openai")
         );
 
-        let (status, body) = router_json(
-            app,
-            Method::POST,
-            "/admin/harnesses/codex/disconnect",
-            None,
-        )
-        .await;
+        let (status, body) =
+            router_json(app, Method::POST, "/admin/harnesses/codex/disconnect", None).await;
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["was_connected"], true);
