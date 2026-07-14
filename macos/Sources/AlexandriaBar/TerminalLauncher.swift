@@ -43,6 +43,13 @@ enum TerminalLauncher {
         if setting != "auto", let app = TerminalApp(rawValue: setting), app.isInstalled {
             return app
         }
+        // Auto: prefer Ghostty when it is installed, then any other installed
+        // terminal, then Terminal.app. (Launching into a running Ghostty is handled
+        // by launchGhostty, which falls back to Terminal when Ghostty can't take a
+        // command.)
+        if TerminalApp.ghostty.isInstalled {
+            return .ghostty
+        }
         return installedApps.first ?? .terminal
     }
 
