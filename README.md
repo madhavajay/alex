@@ -61,8 +61,15 @@ is that the channel setting lives *inside* the beta build, so a stable install h
 no way to ask for one. This installer is the way in:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-beta.sh | sh
+curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-beta.sh -o /tmp/install-beta.sh
+sh /tmp/install-beta.sh
 ```
+
+Download it, then run it — don't pipe it straight to `sh`. Piped, the script *is*
+the shell's stdin, so the shell and any child process it spawns are both reading
+the same pipe; the shell can stop reading before `curl` has finished writing, and
+a slow enough connection would leave it executing a truncated script. Running it
+from a file is deterministic.
 
 It resolves the newest **prerelease** (GitHub's `releases/latest` never points at
 one, which is why the normal installer can't reach a beta), SHA-256 verifies and
