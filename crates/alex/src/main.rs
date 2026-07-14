@@ -232,7 +232,11 @@ enum ServiceCommand {
     /// Install the OS user service pointing at this binary
     Install,
     /// Safely replace the loaded launchd service when it has no routed requests in flight
-    Restart,
+    Restart {
+        /// Replace even when routed requests are in flight (those requests will be interrupted)
+        #[arg(long)]
+        force: bool,
+    },
     /// Stop + remove the OS user service
     Uninstall,
     /// Show service state
@@ -677,6 +681,10 @@ struct Config {
     update_check_hours: u64,
     #[serde(default = "default_update_channel")]
     update_channel: String,
+    /// Maximum quiet period between upstream streaming chunks. This is not a
+    /// request deadline; any received chunk resets the timer.
+    #[serde(default = "default_upstream_stream_idle_timeout_seconds")]
+    upstream_stream_idle_timeout_seconds: u64,
     #[serde(default)]
     harness_overrides: BTreeMap<String, HarnessOverride>,
     #[serde(default)]
@@ -727,6 +735,12 @@ fn default_update_check_hours() -> u64 {
 
 fn default_update_channel() -> String {
     "stable".into()
+}
+
+fn default_upstream_stream_idle_timeout_seconds() -> u64 {
+    // Long reasoning stretches are normal. Fifteen minutes only catches a
+    // connection that has actually stopped producing output.
+    15 * 60
 }
 
 fn default_ping_anthropic() -> String {
@@ -794,6 +808,7 @@ impl Config {
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
+            upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
@@ -835,6 +850,10 @@ impl Config {
             eprintln!("warning: {e}; using stable");
             selfupdate::UpdateChannel::Stable
         })
+    }
+
+    fn upstream_stream_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.upstream_stream_idle_timeout_seconds.max(1))
     }
 }
 
@@ -1765,6 +1784,7 @@ async fn main() -> Result<()> {
                 store,
                 dario_router,
                 format!("http://{host}:{port}"),
+                config.upstream_stream_idle_timeout(),
             );
             alex_proxy::set_daemon_updater(
                 &state,
@@ -2226,6 +2246,7 @@ async fn main() -> Result<()> {
                 store,
                 None,
                 config.base_url(),
+                config.upstream_stream_idle_timeout(),
             );
             let models = config.ping_models();
             let providers: Vec<alex_core::Provider> = if target == "all" {
@@ -2333,6 +2354,7 @@ async fn main() -> Result<()> {
                 store,
                 None,
                 config.base_url(),
+                config.upstream_stream_idle_timeout(),
             );
             let snap = alex_proxy::limits_snapshot(&state).await;
             if json {
@@ -2434,7 +2456,7 @@ async fn main() -> Result<()> {
         }
         Command::Service { command } => match command {
             ServiceCommand::Install => service_install(&config)?,
-            ServiceCommand::Restart => service_restart(&config)?,
+            ServiceCommand::Restart { force } => service_restart(&config, force)?,
             ServiceCommand::Uninstall => service_uninstall()?,
             ServiceCommand::Status => {
                 println!("{}", service_state_label(&detect_service_state()));
@@ -5472,7 +5494,7 @@ fn launchd_install_mode(loaded: bool) -> LaunchdInstallMode {
 #[derive(Debug, PartialEq)]
 enum LaunchdRestartOutcome {
     Replaced,
-    RefusedInFlight { count: i64 },
+    RefusedInFlight { status: InFlightStatus },
     RolledBack { cause: String },
     Failed { cause: String },
 }
@@ -5484,8 +5506,22 @@ trait LaunchctlControl {
 }
 
 trait LaunchdHealthProbe {
-    fn in_flight(&mut self) -> Result<i64>;
+    fn in_flight(&mut self) -> Result<InFlightStatus>;
     fn wait_until_healthy(&mut self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct InFlightRequestSummary {
+    age_s: i64,
+    model: String,
+    session_id: Option<String>,
+    harness: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlightStatus {
+    count: i64,
+    requests: Vec<InFlightRequestSummary>,
 }
 
 trait LaunchdPlistRollback {
@@ -5571,16 +5607,23 @@ impl LocalLaunchdHealthProbe {
 }
 
 impl LaunchdHealthProbe for LocalLaunchdHealthProbe {
-    fn in_flight(&mut self) -> Result<i64> {
-        let count = self
-            .health()?
+    fn in_flight(&mut self) -> Result<InFlightStatus> {
+        let health = self.health()?;
+        let count = health
             .get("in_flight")
             .and_then(serde_json::Value::as_i64)
             .context("daemon /health did not include an in_flight count")?;
         if count < 0 {
             anyhow::bail!("daemon /health returned an invalid in_flight count ({count})");
         }
-        Ok(count)
+        let requests = serde_json::from_value(
+            health
+                .get("in_flight_requests")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        )
+        .context("daemon /health returned invalid in-flight request details")?;
+        Ok(InFlightStatus { count, requests })
     }
 
     fn wait_until_healthy(&mut self) -> bool {
@@ -5627,6 +5670,8 @@ fn replace_loaded_launchd_service<C, H, F>(
     health: &mut H,
     rollback: &mut F,
     plist: &Path,
+    force: bool,
+    mut force_warning: Option<&mut dyn FnMut(&InFlightStatus)>,
 ) -> LaunchdRestartOutcome
 where
     C: LaunchctlControl,
@@ -5634,15 +5679,20 @@ where
     F: LaunchdPlistRollback,
 {
     let in_flight = match health.in_flight() {
-        Ok(count) => count,
+        Ok(status) => status,
         Err(error) => {
             return LaunchdRestartOutcome::Failed {
                 cause: format!("could not determine in-flight routed requests: {error:#}"),
             }
         }
     };
-    if in_flight > 0 {
-        return LaunchdRestartOutcome::RefusedInFlight { count: in_flight };
+    if in_flight.count > 0 && !force {
+        return LaunchdRestartOutcome::RefusedInFlight { status: in_flight };
+    }
+    if in_flight.count > 0 {
+        if let Some(warn) = force_warning.as_mut() {
+            warn(&in_flight);
+        }
     }
 
     if let Err(error) = launchctl.bootout(plist) {
@@ -5888,7 +5938,7 @@ fn service_install(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn service_restart(config: &Config) -> Result<()> {
+fn service_restart(config: &Config, force: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("service restart supports macOS launchd only");
     }
@@ -5910,7 +5960,22 @@ fn service_restart(config: &Config) -> Result<()> {
         destination: &plist,
         previous: &previous,
     };
-    match replace_loaded_launchd_service(&mut launchctl, &mut health, &mut rollback, &plist) {
+    let mut force_warning = |status: &InFlightStatus| {
+        eprintln!(
+            "WARNING: forcing restart will interrupt {} routed request(s).",
+            status.count
+        );
+        print_in_flight_requests(status);
+    };
+    let force_warning = force.then_some(&mut force_warning as &mut dyn FnMut(&InFlightStatus));
+    match replace_loaded_launchd_service(
+        &mut launchctl,
+        &mut health,
+        &mut rollback,
+        &plist,
+        force,
+        force_warning,
+    ) {
         LaunchdRestartOutcome::Replaced => {
             std::fs::remove_file(&previous).with_context(|| {
                 format!(
@@ -5925,11 +5990,14 @@ fn service_restart(config: &Config) -> Result<()> {
             );
             Ok(())
         }
-        LaunchdRestartOutcome::RefusedInFlight { count } => {
+        LaunchdRestartOutcome::RefusedInFlight { status } => {
             eprintln!(
-                "launchd service was not replaced: {count} routed request(s) are still in flight."
+                "launchd service was not replaced: {} routed request(s) are still in flight.",
+                status.count
             );
+            print_in_flight_requests(&status);
             eprintln!("  Wait for them to finish, then run: alex service restart");
+            eprintln!("  To interrupt them and restart anyway: alex service restart --force");
             anyhow::bail!("refused to interrupt in-flight routed requests (exit 1)");
         }
         LaunchdRestartOutcome::RolledBack { cause } => {
@@ -5944,6 +6012,23 @@ fn service_restart(config: &Config) -> Result<()> {
             eprintln!("  Cause: {cause}");
             anyhow::bail!("launchd service restart failed (exit 1)");
         }
+    }
+}
+
+fn print_in_flight_requests(status: &InFlightStatus) {
+    for request in &status.requests {
+        let session = request.session_id.as_deref().unwrap_or("unknown");
+        let harness = request.harness.as_deref().unwrap_or("unknown");
+        eprintln!(
+            "  - age {}s · model {} · session {} · harness {}",
+            request.age_s, request.model, session, harness
+        );
+    }
+    if status.count > status.requests.len() as i64 {
+        eprintln!(
+            "  - {} request detail(s) unavailable from this daemon",
+            status.count - status.requests.len() as i64
+        );
     }
 }
 
@@ -7445,6 +7530,7 @@ mod tests {
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
+            upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
@@ -7469,6 +7555,7 @@ mod tests {
             store,
             None,
             "http://127.0.0.1:4100".into(),
+            std::time::Duration::from_secs(15 * 60),
         )
     }
 
@@ -7514,6 +7601,7 @@ mod tests {
             Arc::new(Store::open(home.clone()).unwrap()),
             None,
             config.base_url(),
+            config.upstream_stream_idle_timeout(),
         );
         alex_proxy::set_reset_handler(&state, Arc::new(reset::DaemonResetHandler));
         let app = alex_proxy::router(state);
@@ -7586,8 +7674,11 @@ mod tests {
     }
 
     impl LaunchdHealthProbe for FakeHealth {
-        fn in_flight(&mut self) -> Result<i64> {
-            Ok(self.in_flight)
+        fn in_flight(&mut self) -> Result<InFlightStatus> {
+            Ok(InFlightStatus {
+                count: self.in_flight,
+                requests: Vec::new(),
+            })
         }
 
         fn wait_until_healthy(&mut self) -> bool {
@@ -7642,10 +7733,43 @@ mod tests {
                 &mut health,
                 &mut rollback,
                 Path::new("daemon.plist"),
+                false,
+                None,
             ),
-            LaunchdRestartOutcome::RefusedInFlight { count: 2 }
+            LaunchdRestartOutcome::RefusedInFlight {
+                status: InFlightStatus {
+                    count: 2,
+                    requests: Vec::new(),
+                },
+            }
         );
         assert!(launchctl.calls.is_empty());
+        assert!(!rollback.restored);
+    }
+
+    #[test]
+    fn launchd_restart_force_replaces_while_routed_requests_are_in_flight() {
+        let mut launchctl = FakeLaunchctl::succeeds();
+        let mut health = FakeHealth {
+            in_flight: 2,
+            healthy_results: [true].into(),
+        };
+        let mut rollback = FakeRollback::default();
+        let mut interrupted = None;
+        let mut warning = |status: &InFlightStatus| interrupted = Some(status.count);
+        assert_eq!(
+            replace_loaded_launchd_service(
+                &mut launchctl,
+                &mut health,
+                &mut rollback,
+                Path::new("daemon.plist"),
+                true,
+                Some(&mut warning),
+            ),
+            LaunchdRestartOutcome::Replaced
+        );
+        assert_eq!(interrupted, Some(2));
+        assert_eq!(launchctl.calls, ["bootout", "bootstrap"]);
         assert!(!rollback.restored);
     }
 
@@ -7663,6 +7787,8 @@ mod tests {
                 &mut health,
                 &mut rollback,
                 Path::new("daemon.plist"),
+                false,
+                None,
             ),
             LaunchdRestartOutcome::Replaced
         );
@@ -7687,6 +7813,8 @@ mod tests {
             &mut health,
             &mut rollback,
             Path::new("daemon.plist"),
+            false,
+            None,
         );
         assert!(matches!(outcome, LaunchdRestartOutcome::RolledBack { .. }));
         assert_eq!(
@@ -7746,6 +7874,7 @@ mod tests {
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
+            upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         };

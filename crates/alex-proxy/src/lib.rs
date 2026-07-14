@@ -158,6 +158,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
+    in_flight_requests: std::sync::Mutex<HashMap<String, InFlightRequest>>,
+    upstream_stream_idle_timeout: Duration,
     pub started_ms: i64,
     pub base_url: String,
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
@@ -290,23 +292,81 @@ fn bind_codex_account(state: &AppState, session_id: Option<&str>, account: &Acco
     }
 }
 
-struct InFlight(Arc<AppState>);
+#[derive(Debug, Clone)]
+struct InFlightRequest {
+    started_ms: i64,
+    model: String,
+    session_id: Option<String>,
+    harness: Option<String>,
+}
+
+struct InFlight {
+    state: Arc<AppState>,
+    id: String,
+}
 
 impl InFlight {
-    fn new(state: &Arc<AppState>) -> Self {
+    fn new(
+        state: &Arc<AppState>,
+        model: String,
+        session_id: Option<String>,
+        harness: Option<String>,
+    ) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .in_flight_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                id.clone(),
+                InFlightRequest {
+                    started_ms: now_ms(),
+                    model,
+                    session_id,
+                    harness,
+                },
+            );
         state
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(state.clone())
+        Self {
+            state: state.clone(),
+            id,
+        }
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0
+        self.state
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.state
+            .in_flight_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
     }
+}
+
+fn in_flight_requests(state: &AppState) -> Vec<Value> {
+    let now = now_ms();
+    let mut requests: Vec<_> = state
+        .in_flight_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .map(|request| {
+            json!({
+                "age_s": (now.saturating_sub(request.started_ms)) / 1000,
+                "model": request.model,
+                "session_id": request.session_id,
+                "harness": request.harness,
+            })
+        })
+        .collect();
+    requests.sort_by_key(|request| request["age_s"].as_i64().unwrap_or_default());
+    requests
 }
 
 pub fn build_state(
@@ -315,6 +375,7 @@ pub fn build_state(
     store: Arc<Store>,
     dario: Option<Arc<dyn DarioRouter>>,
     base_url: String,
+    upstream_stream_idle_timeout: Duration,
 ) -> Arc<AppState> {
     // Import sidecars written by Vault::remove so a daemon restarted after a
     // terminal-side removal still exposes removed history to the Trace Browser.
@@ -339,6 +400,8 @@ pub fn build_state(
         http,
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
+        in_flight_requests: std::sync::Mutex::new(HashMap::new()),
+        upstream_stream_idle_timeout,
         started_ms: now_ms(),
         base_url,
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
@@ -786,6 +849,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "service": "alexandria",
         "version": env!("CARGO_PKG_VERSION"),
         "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        "in_flight_requests": in_flight_requests(&state),
         "uptime_s": (now_ms() - state.started_ms) / 1000,
         "dario": state.dario.is_some(),
     }))
@@ -4498,7 +4562,6 @@ async fn proxy(
         }
     };
 
-    let in_flight = InFlight::new(&state);
     let trace_id = uuid::Uuid::new_v4().to_string();
     let mut trace = TraceRecord {
         id: trace_id.clone(),
@@ -4578,6 +4641,12 @@ async fn proxy(
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
+    let in_flight = InFlight::new(
+        &state,
+        routed_model.clone(),
+        trace.session_id.clone(),
+        trace.harness.clone(),
+    );
 
     // Codex emits SubagentStart before the child's first request. Resolve that
     // child to the lineage root so every descendant prefers the same upstream
@@ -5012,29 +5081,19 @@ async fn proxy(
         let _dario_guard = dario_guard;
         let _in_flight = in_flight;
         let mut buf: Vec<u8> = Vec::new();
-        let mut stream_error: Option<String> = None;
         let mut sse_error_observer = is_sse.then(|| SseErrorObserver::new(plan.upstream_format));
-        while let Some(chunk) = upstream_stream.next().await {
-            match chunk {
-                Ok(b) => {
-                    buf.extend_from_slice(&b);
-                    if let Some(observer) = sse_error_observer.as_mut() {
-                        observer.observe(&b);
-                    }
-                    let _ = tx.send(Ok(b)).await;
+        let stream_error = forward_upstream_stream(
+            &mut upstream_stream,
+            &tx,
+            state2.upstream_stream_idle_timeout,
+            |chunk| {
+                buf.extend_from_slice(chunk);
+                if let Some(observer) = sse_error_observer.as_mut() {
+                    observer.observe(chunk);
                 }
-                Err(e) => {
-                    stream_error = Some(format!("upstream stream error: {e}"));
-                    let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )))
-                        .await;
-                    break;
-                }
-            }
-        }
+            },
+        )
+        .await;
         drop(tx);
         trace.ts_response_ms = Some(now_ms());
         if trace.error.is_none() {
@@ -5087,6 +5146,50 @@ async fn proxy(
     response
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+/// Forward an upstream response while enforcing a maximum quiet period between
+/// chunks.  A disconnected downstream client deliberately stops the upstream:
+/// there is no recipient for further output, and retaining a detached drain can
+/// otherwise hold an in-flight guard forever.
+async fn forward_upstream_stream<S, E, F>(
+    upstream_stream: &mut S,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    idle_timeout: Duration,
+    mut observe: F,
+) -> Option<String>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+    F: FnMut(&Bytes),
+{
+    loop {
+        match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                observe(&chunk);
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return Some("client disconnected before upstream stream completed".into());
+                }
+            }
+            Ok(Some(Err(error))) => {
+                let message = error.to_string();
+                let _ = tx
+                    .send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        message.clone(),
+                    )))
+                    .await;
+                return Some(format!("upstream stream error: {message}"));
+            }
+            Ok(None) => return None,
+            Err(_) => {
+                return Some(format!(
+                    "upstream stream idle timeout after {} seconds",
+                    idle_timeout.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is_sse: bool) {
@@ -5397,7 +5500,98 @@ mod tests {
             store,
             dario,
             "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
         )
+    }
+
+    #[tokio::test]
+    async fn health_reports_in_flight_age_model_session_and_harness() {
+        let state = test_state("in-flight-registry");
+        let _guard = InFlight::new(
+            &state,
+            "gpt-5.5".into(),
+            Some("session-123".into()),
+            Some("codex".into()),
+        );
+        state
+            .in_flight_requests
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .started_ms = now_ms() - 61_000;
+
+        let response = health(State(state.clone())).await.into_response();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["in_flight"], 1);
+        assert!(body["in_flight_requests"][0]["age_s"].as_i64().unwrap() >= 61);
+        assert_eq!(body["in_flight_requests"][0]["model"], "gpt-5.5");
+        assert_eq!(body["in_flight_requests"][0]["session_id"], "session-123");
+        assert_eq!(body["in_flight_requests"][0]["harness"], "codex");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_upstream_releases_the_in_flight_guard_after_idle_timeout() {
+        let state = test_state("in-flight-idle-timeout");
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _in_flight = guard;
+            let mut stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            task.await.unwrap(),
+            Some("upstream stream idle timeout after 5 seconds".into())
+        );
+        assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(in_flight_requests(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_guard_is_released_when_the_stream_task_panics() {
+        let state = test_state("in-flight-panic");
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let task = tokio::spawn(async move {
+            let _in_flight = guard;
+            panic!("fake streaming task panic");
+        });
+
+        assert!(task.await.is_err());
+        assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(in_flight_requests(&state).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_but_progressing_upstream_does_not_hit_idle_timeout() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = futures_util::stream::unfold(0, |index| async move {
+            if index == 2 {
+                None
+            } else {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Some((Ok::<_, std::io::Error>(Bytes::from_static(b"token")), index + 1))
+            }
+        })
+        .boxed();
+        let task = tokio::spawn(async move {
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from_static(b"token"));
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from_static(b"token"));
+        assert_eq!(task.await.unwrap(), None);
     }
 
     fn anthropic_account() -> Account {
