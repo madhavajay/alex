@@ -43,18 +43,29 @@ sha256_file() {
   fi
 }
 
-# GitHub's releases/latest never points at a prerelease, so resolve the newest
-# prerelease from the releases list instead. tag_name precedes prerelease within
-# each release object, so remember the tag and print it when the flag turns true.
+# GitHub's releases/latest never points at a prerelease, so resolve from the full
+# releases list. The list is NOT reliably newest-first -- GitHub orders it by the
+# tagged commit's date, so v0.1.26-beta.10 can appear BELOW beta.9. Taking the first
+# prerelease therefore installs an older build. Parse every non-draft prerelease into
+# a numeric key (major, minor, patch, beta) and pick the maximum, so beta.10 > beta.9.
 resolve_beta_tag() {
   if [ -n "${ALEX_BETA_TAG:-}" ]; then
     printf '%s\n' "$ALEX_BETA_TAG"
     return 0
   fi
-  curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" </dev/null | awk -F'"' '
-    /"tag_name":/ { tag = $4 }
-    /"draft":[[:space:]]*true/ { tag = "" }
-    /"prerelease":[[:space:]]*true/ { if (tag != "") { print tag; exit } }
+  curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=50" </dev/null | awk '
+    /"tag_name":/  { if (match($0, /v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?/)) tag = substr($0, RSTART, RLENGTH); else tag = "" }
+    /"draft":[[:space:]]*true/       { tag = "" }
+    /"prerelease":[[:space:]]*true/  {
+      if (tag != "" && tag ~ /-beta\./) {
+        v = tag; sub(/^v/, "", v)
+        n = split(v, part, /[.-]/)     # e.g. 0 1 26 beta 10  ->  part[1..3], part[5]
+        key = (part[1]*1000000) + (part[2]*1000) + part[3] + (part[5]/100000)
+        if (key > best) { best = key; besttag = tag }
+      }
+      tag = ""
+    }
+    END { if (besttag != "") print besttag }
   '
 }
 

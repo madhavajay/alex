@@ -919,6 +919,21 @@ mod tests {
         let (tag, url) = select_release_manifest_url(&with_final).unwrap();
         assert_eq!(tag, "v0.1.24");
         assert_eq!(url, "https://example.test/final/manifest.json");
+
+        // Two-digit prerelease vs single-digit: beta.10 must beat beta.9. A string
+        // compare would pick beta.9, and GitHub does not return the list newest-first,
+        // so order cannot be trusted -- this is exactly what bit the installer.
+        let double_digit: Vec<GithubRelease> = serde_json::from_str(
+            r#"[
+              {"tag_name": "v0.1.26-beta.10", "draft": false, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/b10/manifest.json"}]},
+              {"tag_name": "v0.1.26-beta.9", "draft": false, "prerelease": true,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/b9/manifest.json"}]}
+            ]"#,
+        )
+        .unwrap();
+        let (tag, _) = select_release_manifest_url(&double_digit).unwrap();
+        assert_eq!(tag, "v0.1.26-beta.10");
     }
 
     #[test]
