@@ -54,9 +54,10 @@ public struct AccountLimits: Codable, Sendable {
     public let requests: CountPair?
     public let tokens: CountPair?
     public let observedAtMs: Int64?
+    public let quota: QuotaState?
 
     enum CodingKeys: String, CodingKey {
-        case plan, source, error, windows, requests, tokens
+        case plan, source, error, windows, requests, tokens, quota
         case observedAtMs = "observed_at_ms"
     }
 }
@@ -107,11 +108,32 @@ public struct ProviderLimits: Codable, Sendable {
     public let requests: CountPair?
     public let tokens: CountPair?
     public let observedAtMs: Int64?
+    /// The daemon-selected binding quota. Clients must not infer this from windows.
+    public let quota: QuotaState?
 
     enum CodingKeys: String, CodingKey {
-        case provider, plan, source, error, windows, requests, tokens
+        case provider, plan, source, error, windows, requests, tokens, quota
         case observedAtMs = "observed_at_ms"
     }
+}
+
+/// The daemon's single source of truth for the quota users should act on first.
+public struct QuotaState: Codable, Sendable {
+    public let kind: String
+    public let label: String
+    public let balance: String?
+    public let usedPct: Double?
+    public let remainingPct: Double?
+    public let topUpURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, label, balance
+        case usedPct = "used_pct"
+        case remainingPct = "remaining_pct"
+        case topUpURL = "top_up_url"
+    }
+
+    public var isCreditPrimary: Bool { kind != "rate_window" }
 }
 
 public struct CountPair: Codable, Sendable {

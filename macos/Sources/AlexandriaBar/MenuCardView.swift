@@ -63,11 +63,14 @@ struct LimitsCardView: View {
                     .lineLimit(2)
             }
             providerIdentities(provider.provider)
+            quotaRow(provider.quota)
             ForEach(provider.windows ?? [], id: \.window) { window in
-                if window.window == "credits" || window.window.hasPrefix("ws:") {
+                if shouldHide(window, for: provider.quota) {
+                    EmptyView()
+                } else if window.window == "credits" || window.window.hasPrefix("ws:") {
                     ampBalanceRow(window)
                 } else {
-                    windowRow(window)
+                    windowRow(window, label: secondaryLabel(window, quota: provider.quota))
                 }
             }
             if provider.windows?.isEmpty != false, let requests = provider.requests {
@@ -109,6 +112,7 @@ struct LimitsCardView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(2)
             }
+            quotaRow(accountLimits?.quota)
             let windows = accountLimits?.windows ?? []
             if windows.isEmpty {
                 Text("Waiting for quota data from this account")
@@ -116,7 +120,9 @@ struct LimitsCardView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(windows, id: \.window) { window in
-                    windowRow(window)
+                    if !shouldHide(window, for: accountLimits?.quota) {
+                        windowRow(window, label: secondaryLabel(window, quota: accountLimits?.quota))
+                    }
                 }
             }
             if windows.isEmpty, let requests = accountLimits?.requests {
@@ -147,10 +153,10 @@ struct LimitsCardView: View {
     }
 
     @ViewBuilder
-    private func windowRow(_ window: LimitWindow) -> some View {
+    private func windowRow(_ window: LimitWindow, label: String? = nil) -> some View {
         let remaining = window.remainingPct
         HStack(spacing: 8) {
-            Text(window.window)
+            Text(label ?? window.window)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .frame(width: 28, alignment: .leading)
@@ -173,6 +179,72 @@ struct LimitsCardView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 52, alignment: .trailing)
         }
+    }
+
+    @ViewBuilder
+    private func quotaRow(_ quota: QuotaState?) -> some View {
+        if let quota, quota.isCreditPrimary {
+            switch quota.kind {
+            case "out_of_credits":
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("OUT OF CREDITS")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.red)
+                    if let url = quota.topUpURL, !url.isEmpty {
+                        Text("Top up: \(url)")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            case "unlimited":
+                Text("Unlimited credits")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.green)
+            case "balance":
+                Text("Credit balance: \(quota.balance ?? "—")")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.green)
+            case "credit_window":
+                quotaBar(label: quota.label, remaining: quota.remainingPct ?? 0)
+            default:
+                EmptyView()
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func quotaBar(label: String, remaining: Double) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 78, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.12))
+                    Capsule().fill(remaining == 0 ? .red : .green)
+                        .frame(width: max(3, geo.size.width * remaining / 100))
+                }
+            }
+            .frame(height: 6)
+            Text("\(Int(remaining.rounded()))% left")
+                .font(.system(size: 10, design: .monospaced))
+                .frame(width: 62, alignment: .trailing)
+        }
+    }
+
+    private func shouldHide(_ window: LimitWindow, for quota: QuotaState?) -> Bool {
+        guard let quota, quota.isCreditPrimary else { return false }
+        return quota.kind == "credit_window" || window.window == "credits"
+    }
+
+    private func secondaryLabel(_ window: LimitWindow, quota: QuotaState?) -> String? {
+        quota?.isCreditPrimary == true && !window.window.hasPrefix("ws:")
+            ? "rate \(window.window)"
+            : nil
     }
 
     @ViewBuilder

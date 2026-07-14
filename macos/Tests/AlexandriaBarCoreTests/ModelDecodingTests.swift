@@ -50,7 +50,7 @@ import Testing
         {"providers":[
           {"extra_usage":{"is_enabled":false},"plan":"claude-code (max)","provider":"anthropic","source":"oauth usage endpoint","windows":[{"resets_at":"2026-07-08T03:40:00.730958+00:00","used_pct":7.0,"window":"5h"},{"resets_at":"2026-07-13T17:00:00.730976+00:00","used_pct":22.0,"window":"7d"}]},
           {"active_limit":"premium","credits":{"balance":"","has_credits":"False","unlimited":"False"},"observed_at_ms":1783477280438,"plan":"pro","provider":"openai","source":"captured response headers","windows":[{"resets_at_s":1783477712,"used_pct":6.0,"window":"5h"},{"resets_at_s":1783667025,"used_pct":82.0,"window":"7d"}]},
-          {"observed_at_ms":1783477015654,"provider":"xai","requests":{"limit":120,"remaining":120},"source":"captured response headers","tokens":{"limit":5000000,"remaining":5000000}}
+          {"observed_at_ms":1783477015654,"provider":"xai","quota":{"kind":"out_of_credits","label":"Out of credits","top_up_url":"https://grok.com/settings/billing"},"requests":{"limit":120,"remaining":120},"source":"captured response headers","tokens":{"limit":5000000,"remaining":5000000}}
         ]}
         """#
         let providers = try decode(json, as: LimitsResponse.self).providers
@@ -62,6 +62,8 @@ import Testing
         #expect(providers[2].windows == nil)
         #expect(providers[2].requests?.limit == 120)
         #expect(providers[2].tokens?.remaining == 5_000_000)
+        #expect(providers[2].quota?.kind == "out_of_credits")
+        #expect(providers[2].quota?.topUpURL == "https://grok.com/settings/billing")
     }
 
     @Test func codexAccountRoutingAndLimitWindows() throws {

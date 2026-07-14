@@ -5686,6 +5686,32 @@ fn print_limits(snap: &serde_json::Value) {
             println!("   {}", ui::red(err));
             continue;
         }
+        let quota = &p["quota"];
+        let quota_kind = quota["kind"].as_str().unwrap_or("rate_window");
+        let credit_primary = quota_kind != "rate_window";
+        match quota_kind {
+            "out_of_credits" => {
+                println!("   {}", ui::red("OUT OF CREDITS"));
+                if let Some(url) = quota["top_up_url"].as_str().filter(|url| !url.is_empty()) {
+                    println!("   {}", ui::sand(&format!("top up: {url}")));
+                }
+            }
+            "unlimited" => println!("   {}", ui::green("Unlimited credits")),
+            "balance" => {
+                let balance = quota["balance"].as_str().unwrap_or("-");
+                println!("   {}", ui::green(&format!("Credit balance: {balance}")));
+            }
+            "credit_window" => {
+                let remaining = quota["remaining_pct"].as_f64().unwrap_or(0.0);
+                println!(
+                    "   {}  {}  {:>3.0}% remaining",
+                    quota["label"].as_str().unwrap_or("Credit quota"),
+                    ui::gauge(100.0 - remaining, 24),
+                    remaining,
+                );
+            }
+            _ => {}
+        }
         let windows = p["windows"].as_array().cloned().unwrap_or_default();
         let label_width = windows
             .iter()
@@ -5696,9 +5722,16 @@ fn print_limits(snap: &serde_json::Value) {
             .max(2);
         let mut printed = false;
         for w in &windows {
+            let raw_label = w["window"].as_str().unwrap_or("-");
+            // The Grok billing window is already printed as the primary credit
+            // quota. Amp's paid balances are likewise represented above.
+            if quota_kind == "credit_window" || (credit_primary && raw_label == "credits")
+            {
+                continue;
+            }
             // Amp paid balances: show dollars remaining instead of an empty % bar.
             if let Some(usd) = w["remaining_usd"].as_f64() {
-                let label = w["window"].as_str().unwrap_or("credits");
+                let label = raw_label;
                 if label == "credits" || label.starts_with("ws:") {
                     println!(
                         "   {}  {}",
@@ -5728,7 +5761,14 @@ fn print_limits(snap: &serde_json::Value) {
                 .unwrap_or_default();
             println!(
                 "   {}  {}  {}   resets {}{}",
-                ui::pad_right(w["window"].as_str().unwrap_or("-"), label_width),
+                ui::pad_right(
+                    &if credit_primary && !raw_label.starts_with("ws:") {
+                        format!("rate {raw_label}")
+                    } else {
+                        raw_label.into()
+                    },
+                    label_width + usize::from(credit_primary && !raw_label.starts_with("ws:")) * 5,
+                ),
                 bar,
                 used,
                 reset,

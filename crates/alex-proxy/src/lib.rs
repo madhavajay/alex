@@ -15,7 +15,7 @@ use alex_auth::{
 };
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
-    parse_trace_tags, parse_usage_api_response, route_model, usage_from_json,
+    parse_trace_tags, parse_usage_api_response, quota_state, route_model, usage_from_json,
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
@@ -1388,6 +1388,11 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                         "source": "grok web billing",
                         "plan": account.label,
                         "windows": [window],
+                        "credits": {
+                            "has_credits": snap.used_percent < 100.0,
+                            "unlimited": false,
+                            "used_pct": snap.used_percent,
+                        },
                     });
                     let mut cache = state.xai_usage.lock().unwrap();
                     cache.fetched_at_ms = now_ms();
@@ -1479,6 +1484,14 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
             o.insert("source".into(), json!("captured response headers"));
             o.insert("observed_at_ms".into(), json!(ts_ms));
             providers.push(parsed);
+        }
+    }
+    for entry in &mut providers {
+        if let Some(provider) = entry["provider"].as_str().and_then(Provider::from_str_loose) {
+            let quota = quota_state(provider, entry);
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("quota".into(), quota);
+            }
         }
     }
     providers.sort_by_key(|p| p["provider"].as_str().unwrap_or("").to_string());
@@ -2434,12 +2447,16 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "reserve_blocked": routing_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
                 "reset_selection": routing_reset_selection(&a, now_ms() / 1000),
             });
-            let limits = a
+            let mut limits = a
                 .account_meta
                 .get("routing_limits")
                 .or_else(|| a.account_meta.get("codex_limits"))
                 .cloned()
                 .unwrap_or(Value::Null);
+            let quota = quota_state(a.provider, &limits);
+            if let Some(object) = limits.as_object_mut() {
+                object.insert("quota".into(), quota);
+            }
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -2502,12 +2519,16 @@ async fn routing_snapshot(state: &Arc<AppState>, provider: Provider) -> Value {
                 .iter()
                 .position(|name| name == &account.name)
                 .unwrap_or(fallback_priority);
-            let limits = account
+            let mut limits = account
                 .account_meta
                 .get("routing_limits")
                 .or_else(|| account.account_meta.get("codex_limits"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let quota = quota_state(provider, &limits);
+            if let Some(object) = limits.as_object_mut() {
+                object.insert("quota".into(), quota);
+            }
             let reserve_pct = routing_reserve_pct(&account, &policy);
             let reset_selection = routing_reset_selection(&account, now_ms() / 1000);
             json!({
@@ -2522,6 +2543,7 @@ async fn routing_snapshot(state: &Arc<AppState>, provider: Provider) -> Value {
                 "active_limit": limits.get("active_limit"),
                 "windows": limits.get("windows").cloned().unwrap_or_else(|| json!([])),
                 "credits": limits.get("credits").cloned().unwrap_or(Value::Null),
+                "quota": limits.get("quota").cloned().unwrap_or_else(|| quota_state(provider, &limits)),
             })
         })
         .collect();

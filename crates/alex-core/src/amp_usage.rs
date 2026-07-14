@@ -168,10 +168,39 @@ pub fn usage_to_limits_entry(snap: &AmpUsageSnapshot, plan: Option<&str>) -> Val
         }));
     }
 
+    // Any funded individual, workspace, or free balance can serve an Amp
+    // request. Do not call an account exhausted merely because its individual
+    // balance is zero while a workspace still has credit.
+    let workspace_available = snap.workspace_balances.iter().any(|ws| ws.remaining > 0.0);
+    let free_available = snap.free_remaining.is_some_and(|credits| credits > 0.0);
+    let has_credit_evidence = snap.individual_credits.is_some()
+        || !snap.workspace_balances.is_empty()
+        || snap.free_remaining.is_some();
+    let has_credits = has_credit_evidence.then_some(
+        snap.individual_credits.is_some_and(|credits| credits > 0.0)
+            || workspace_available
+            || free_available,
+    );
+    let credit_balance = snap
+        .individual_credits
+        .filter(|credits| *credits > 0.0)
+        .or_else(|| {
+            snap.workspace_balances
+                .iter()
+                .map(|ws| ws.remaining)
+                .find(|credits| *credits > 0.0)
+        })
+        .or_else(|| snap.free_remaining.filter(|credits| *credits > 0.0))
+        .map(|credits| format!("${credits:.2}"));
     let mut entry = serde_json::json!({
         "provider": "amp",
         "source": "amp usage API",
         "windows": windows,
+        "credits": {
+            "balance": credit_balance,
+            "has_credits": has_credits,
+            "unlimited": false,
+        },
         "individual_credits_usd": snap.individual_credits,
         "workspace_balances": snap.workspace_balances,
         "account_email": snap.account_email,

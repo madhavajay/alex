@@ -1,6 +1,7 @@
 pub mod amp_usage;
 pub mod grok_billing;
 pub mod openrouter_catalog;
+pub mod quota;
 pub mod translate;
 
 pub use amp_usage::{
@@ -12,6 +13,7 @@ pub use grok_billing::{
     GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
 pub use openrouter_catalog::parse_models_response as parse_openrouter_models_response;
+pub use quota::quota_state;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

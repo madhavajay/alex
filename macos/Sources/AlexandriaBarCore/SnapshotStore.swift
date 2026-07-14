@@ -237,10 +237,25 @@ public final class SnapshotStore {
             return out
         }
 
-        out += Self.authAndHealthAlerts(accounts: accounts, healthAccounts: healthAccounts)
+        let outOfCreditsProviders = Set(limits.compactMap { provider in
+            provider.quota?.kind == "out_of_credits" ? provider.provider : nil
+        })
+        out += Self.authAndHealthAlerts(
+            accounts: accounts,
+            healthAccounts: healthAccounts,
+            suppressHeartbeatProviders: outOfCreditsProviders)
 
         for provider in limits {
+            if provider.quota?.kind == "out_of_credits" {
+                let topUp = provider.quota?.topUpURL.map { " Top up: \($0)" } ?? ""
+                out.append(StoreAlert(
+                    id: "credits-\(provider.provider)", severity: .critical,
+                    title: "\(ProviderInfo.displayName(provider.provider)) out of credits",
+                    body: "This account cannot serve requests.\(topUp)", provider: provider.provider))
+                continue
+            }
             for window in provider.windows ?? [] {
+                if provider.quota?.isCreditPrimary == true { continue }
                 if let pct = window.usedPct, pct >= limitWarnPct {
                     let resets = window.resetsDate.map { " · resets in \(Format.countdown(to: $0))" } ?? ""
                     out.append(StoreAlert(
@@ -272,7 +287,8 @@ public final class SnapshotStore {
     /// Account IDs are shared by `/admin/accounts` and `/admin/health`; merge auth and
     /// heartbeat evidence for one account instead of presenting two symptoms of one failure.
     static func authAndHealthAlerts(
-        accounts: [Account], healthAccounts: [HealthAccount]
+        accounts: [Account], healthAccounts: [HealthAccount],
+        suppressHeartbeatProviders: Set<String> = []
     ) -> [StoreAlert] {
         let failedHeartbeatIDs = Set(healthAccounts.compactMap { account in
             account.lastHeartbeat?.ok == false ? account.id : nil
@@ -314,6 +330,7 @@ public final class SnapshotStore {
 
         for account in healthAccounts {
             guard !authAlertIDs.contains(account.id),
+                  !suppressHeartbeatProviders.contains(account.provider),
                   let hb = account.lastHeartbeat, !hb.ok
             else { continue }
             alerts.append(StoreAlert(
