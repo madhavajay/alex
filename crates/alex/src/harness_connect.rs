@@ -513,36 +513,55 @@ async fn disconnect_pi(config: &Config, config_dir: Option<PathBuf>) -> Result<(
         return Ok(());
     }
 
-    let mut revoked = 0usize;
+    let revoked;
     if daemon_health(config).await {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
-        match revoke_harness_keys(config, &client, "pi").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local pi config, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
+        revoked = match revoke_harness_keys(config, &client, "pi").await {
+            Ok(count) => count,
+            Err(e) => {
+                // A reachable daemon may still belong to a different local
+                // profile/key (notably reset's isolated config). The local
+                // store is authoritative for the config we just removed, so
+                // revoke its scoped Pi keys instead of leaving a credential
+                // alive merely because that best-effort admin request failed.
+                eprintln!(
+                    "{}",
+                    ui::amber(&format!(
+                        "daemon key revocation failed ({e}); revoking local pi harness keys"
+                    ))
+                );
+                revoke_local_harness_keys(config, "pi")?
+            }
+        };
     } else {
         // Keep the CLI disconnect path complete even while the daemon is
         // stopped. This is also what lets `alex reset --harnesses --yes`
         // safely rotate local_key afterwards.
-        let store = alex_store::Store::open(config.data_dir.clone())?;
-        let rows = store.list_run_keys(true)?;
-        for id in rows.iter().filter(|row| {
-            row["kind"].as_str() == Some("harness") && row["label"].as_str() == Some("pi")
-        }).filter_map(|row| row["id"].as_str()) {
-            if store.revoke_run_key(id)? {
-                revoked += 1;
-            }
-        }
+        revoked = revoke_local_harness_keys(config, "pi")?;
     }
     println!("disconnected pi; revoked {revoked} harness key(s)");
     Ok(())
+}
+
+fn revoke_local_harness_keys(config: &Config, harness: &str) -> Result<usize> {
+    let store = alex_store::Store::open(config.data_dir.clone())?;
+    let rows = store.list_run_keys(true)?;
+    let mut revoked = 0;
+    for id in rows
+        .iter()
+        .filter(|row| {
+            row["kind"].as_str() == Some("harness")
+                && row["label"].as_str() == Some(harness)
+        })
+        .filter_map(|row| row["id"].as_str())
+    {
+        if store.revoke_run_key(id)? {
+            revoked += 1;
+        }
+    }
+    Ok(revoked)
 }
 
 async fn connect_claude(
