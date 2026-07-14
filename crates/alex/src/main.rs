@@ -8056,7 +8056,7 @@ fi"#,
         );
         save_config(&config).unwrap();
         let state = test_state("router-connect-codex-state");
-        let app = harness_admin_router(state.clone(), "alx-local".into());
+        let app = harness_admin_router(state.clone());
 
         let (status, body) = router_json(
             app.clone(),
