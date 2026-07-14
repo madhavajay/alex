@@ -12,7 +12,8 @@ use base64::Engine;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinSet;
 use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -26,6 +27,7 @@ pub struct ReverseWrap {
     pub upstream: String,
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<tokio::task::JoinHandle<()>>,
+    clients: Arc<Mutex<JoinSet<()>>>,
 }
 
 #[derive(Clone)]
@@ -122,6 +124,8 @@ impl ReverseWrap {
         let (tx, mut rx) = oneshot::channel::<()>();
         let log_c = log.clone();
         let upstream_display = target.display.clone();
+        let clients = Arc::new(Mutex::new(JoinSet::new()));
+        let clients_c = clients.clone();
         let join = tokio::spawn(async move {
             let tls = if target.tls {
                 Some(Arc::new(build_tls_connector()))
@@ -139,7 +143,8 @@ impl ReverseWrap {
                                 let target = target.clone();
                                 let tls = tls.clone();
                                 let inject = inject.clone();
-                                tokio::spawn(async move {
+                                let clients = clients_c.clone();
+                                clients.lock().await.spawn(async move {
                                     if let Err(e) =
                                         handle_client(stream, target.clone(), tls, log.clone(), inject).await
                                     {
@@ -175,6 +180,7 @@ impl ReverseWrap {
             upstream: upstream_display,
             shutdown: Some(tx),
             join: Some(join),
+            clients,
         })
     }
 
@@ -188,6 +194,24 @@ impl ReverseWrap {
         }
         if let Some(join) = self.join.take() {
             let _ = join.await;
+        }
+        // A CLI can exit just after writing final telemetry. Drain handlers
+        // briefly so their already-framed responses are captured; never let a
+        // dead upstream make shutdown wait indefinitely.
+        let clients = self.clients.clone();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            loop {
+                let next = { clients.lock().await.join_next().await };
+                if next.is_none() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            let mut clients = self.clients.lock().await;
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
         }
     }
 }
@@ -214,46 +238,84 @@ fn build_tls_connector() -> TlsConnector {
 }
 
 async fn handle_client(
-    mut client: TcpStream,
+    client: TcpStream,
     target: UpstreamTarget,
     tls: Option<Arc<TlsConnector>>,
     log: CaptureLog,
     inject: Option<WrapReverseInject>,
 ) -> Result<()> {
     client.set_nodelay(true).ok();
+    let mut client = HttpReader::new(client);
 
     // Read the first request *before* dialing upstream so a slow/blocked
     // upstream connect does not strand an unread client socket (CLOSE_WAIT).
-    let first = match read_http_headers(&mut client).await? {
+    let first = match client.read_headers().await? {
         Some(h) => h,
         None => return Ok(()),
     };
 
-    let tcp = dial_upstream(&target).await?;
-    tcp.set_nodelay(true).ok();
+    proxy_http_cycles(client, &target, tls, &log, inject.as_ref(), Some(first)).await
+}
 
-    if let Some(connector) = tls {
-        let server_name = ServerName::try_from(target.host.clone())
-            .map_err(|_| anyhow!("invalid TLS server name {}", target.host))?;
-        let peer = tcp.peer_addr().ok();
-        let up = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            connector.connect(server_name, tcp),
-        )
-        .await
-        .with_context(|| format!("timeout TLS handshake to upstream {peer:?}"))?
-        .with_context(|| format!("TLS handshake to upstream {peer:?}"))?;
-        proxy_http_cycles(&mut client, up, &target, &log, inject.as_ref(), Some(first)).await
-    } else {
-        proxy_http_cycles(
-            &mut client,
-            tcp,
-            &target,
-            &log,
-            inject.as_ref(),
-            Some(first),
-        )
-        .await
+trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncIo for T {}
+type DynUpstream = Box<dyn AsyncIo>;
+
+/// A read buffer that retains bytes past an HTTP message boundary. A single TCP
+/// read may contain the next pipelined request, which must never be discarded.
+struct HttpReader<R> {
+    inner: R,
+    buffered: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> HttpReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, buffered: Vec::new() }
+    }
+
+    async fn read_headers(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(end) = self.buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(Some(self.buffered.drain(..end + 4).collect()));
+            }
+            let mut tmp = [0u8; 2048];
+            let n = self.inner.read(&mut tmp).await?;
+            if n == 0 {
+                return if self.buffered.is_empty() { Ok(None) } else { bail!("incomplete HTTP headers") };
+            }
+            self.buffered.extend_from_slice(&tmp[..n]);
+            if self.buffered.len() > 1024 * 1024 {
+                bail!("headers too large");
+            }
+        }
+    }
+
+    async fn read_some(&mut self, out: &mut [u8]) -> Result<usize> {
+        if !self.buffered.is_empty() {
+            let n = out.len().min(self.buffered.len());
+            out[..n].copy_from_slice(&self.buffered[..n]);
+            self.buffered.drain(..n);
+            return Ok(n);
+        }
+        Ok(self.inner.read(out).await?)
+    }
+
+    async fn read_exact_bytes(&mut self, out: &mut [u8]) -> Result<()> {
+        let mut offset = 0;
+        while offset < out.len() {
+            let n = self.read_some(&mut out[offset..]).await?;
+            if n == 0 {
+                bail!("unexpected EOF reading body ({} left)", out.len() - offset);
+            }
+            offset += n;
+        }
+        Ok(())
+    }
+}
+
+impl<R> HttpReader<R> {
+    fn into_parts(self) -> (R, Vec<u8>) {
+        (self.inner, self.buffered)
     }
 }
 
@@ -262,22 +324,19 @@ async fn handle_client(
 ///
 /// `prefetched` is the first request head already read before dialing upstream
 /// (avoids head-of-line hang when upstream is slow).
-async fn proxy_http_cycles<U>(
-    client: &mut TcpStream,
-    mut up: U,
+async fn proxy_http_cycles(
+    mut client: HttpReader<TcpStream>,
     target: &UpstreamTarget,
+    tls: Option<Arc<TlsConnector>>,
     log: &CaptureLog,
     inject: Option<&WrapReverseInject>,
     mut prefetched: Option<Vec<u8>>,
-) -> Result<()>
-where
-    U: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<()> {
     loop {
         let head = if let Some(h) = prefetched.take() {
             h
         } else {
-            match read_http_headers(client).await? {
+            match client.read_headers().await? {
                 Some(h) => h,
                 None => return Ok(()), // client closed
             }
@@ -300,6 +359,9 @@ where
         let is_chunked = header_text
             .to_ascii_lowercase()
             .contains("transfer-encoding: chunked");
+        let client_close = header_text
+            .to_ascii_lowercase()
+            .contains("connection: close");
 
         log.push(CaptureEvent {
             seq: 0,
@@ -320,35 +382,20 @@ where
             dump_headers(&method, &path, &head);
         }
 
-        // rewrite includes any body bytes that arrived with the header packet
+        let up = connect_upstream(target, tls.as_ref()).await?;
+        let mut up = HttpReader::new(up);
+
+        // The buffered reader returns only the current headers, retaining any
+        // body or next pipelined request for the matching reader below.
         let rewritten =
             rewrite_request_headers(&head, &target.host, target.port, target.tls, inject)?;
-        up.write_all(&rewritten).await?;
+        up.inner.write_all(&rewritten).await?;
 
-        // Remaining body still on the client stream (not yet in `head`)
-        let already = head.len().saturating_sub(body_start);
         let mut req_capture = Vec::new();
-        capture_extend(&mut req_capture, &head[body_start..]);
         if is_chunked {
-            if already == 0 {
-                copy_chunked_body_capture(client, &mut up, &mut req_capture).await?;
-            } else {
-                copy_chunked_body_remaining_capture(
-                    client,
-                    &mut up,
-                    &head[body_start..],
-                    &mut req_capture,
-                )
-                .await?;
-            }
+            copy_chunked_body_capture(&mut client, &mut up.inner, &mut req_capture).await?;
         } else if let Some(cl) = content_length {
-            copy_fixed_body_capture(
-                client,
-                &mut up,
-                cl.saturating_sub(already),
-                &mut req_capture,
-            )
-            .await?;
+            copy_fixed_body_capture(&mut client, &mut up.inner, cl, &mut req_capture).await?;
         }
         append_http_body_capture(
             log,
@@ -356,14 +403,15 @@ where
             &method,
             &path,
             &req_capture,
-            already,
+            req_capture.len(),
             is_chunked,
         );
-        up.flush().await.ok();
+        up.inner.flush().await.ok();
 
         if is_upgrade {
             // After 101, raw tunnel both ways for the rest of the connection.
-            let resp_head = read_http_headers(&mut up)
+            let resp_head = up
+                .read_headers()
                 .await?
                 .ok_or_else(|| anyhow!("upstream closed during upgrade"))?;
             let status = parse_status_from_headers(&resp_head);
@@ -377,19 +425,15 @@ where
                 body_len: None,
                 note: Some("websocket upgrade".into()),
             });
-            client.write_all(&resp_head).await?;
-            // Any body after 101 headers is already part of the tunnel stream —
-            // resp_head includes only headers; remainder stays in up buffer if any.
-            if let Some(end) = resp_head.windows(4).position(|w| w == b"\r\n\r\n") {
-                if end + 4 < resp_head.len() {
-                    // already included in write_all of resp_head
-                }
-            }
-            return raw_tunnel(client, up, log).await;
+            client.inner.write_all(&resp_head).await?;
+            let (client, client_pending) = client.into_parts();
+            let (up, up_pending) = up.into_parts();
+            return raw_tunnel_with_prefetched(client, up, client_pending, up_pending, log).await;
         }
 
         // Normal response: copy headers + body, then loop for keep-alive.
-        let resp_head = read_http_headers(&mut up)
+        let resp_head = up
+            .read_headers()
             .await?
             .ok_or_else(|| anyhow!("upstream closed before response"))?;
         let status = parse_status_from_headers(&resp_head);
@@ -405,7 +449,9 @@ where
             .to_ascii_lowercase()
             .contains("transfer-encoding: chunked");
         let resp_close = resp_text.to_ascii_lowercase().contains("connection: close");
-
+        let response_close_delimited =
+            resp_cl.is_none() && !resp_chunked && !response_is_bodyless(status, &method);
+        let close_client = client_close || response_close_delimited;
         log.push(CaptureEvent {
             seq: 0,
             kind: "http_resp".into(),
@@ -417,47 +463,37 @@ where
             note: None,
         });
 
-        client.write_all(&resp_head).await?;
-        // body_start: byte offset after \r\n\r\n in resp_head
-        let resp_body_start = resp_head
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|p| p + 4)
-            .unwrap_or(resp_head.len());
-        let already = resp_head.len().saturating_sub(resp_body_start);
+        // Upstream close is deliberately hidden from the client; this request
+        // has a separately framed body and its upstream socket is dropped below.
+        client
+            .inner
+            .write_all(&rewrite_response_connection(&resp_head, resp_close && !close_client)?)
+            .await?;
         let mut resp_capture = Vec::new();
-        capture_extend(&mut resp_capture, &resp_head[resp_body_start..]);
 
         if resp_chunked {
-            if already == 0 {
-                copy_chunked_body_capture(&mut up, client, &mut resp_capture).await?;
-            } else {
-                copy_chunked_body_remaining_capture(
-                    &mut up,
-                    client,
-                    &resp_head[resp_body_start..],
-                    &mut resp_capture,
-                )
-                .await?;
-            }
+            copy_chunked_body_capture(&mut up, &mut client.inner, &mut resp_capture).await?;
         } else if let Some(cl) = resp_cl {
-            copy_fixed_body_capture(
-                &mut up,
-                client,
-                cl.saturating_sub(already),
-                &mut resp_capture,
-            )
-            .await?;
-        } else if resp_close {
-            // read until EOF
+            copy_fixed_body_capture(&mut up, &mut client.inner, cl, &mut resp_capture).await?;
+        } else if resp_close || !response_is_bodyless(status, &method) {
+            // No Content-Length and not chunked. Per RFC 7230 3.3.3, unless this
+            // is a genuinely bodyless response (HEAD / 1xx / 204 / 304), the body
+            // is delimited by the connection closing -- read to EOF and close.
+            //
+            // The old code fell through to the keep-alive loop here, treating a
+            // real close-delimited body as "no body" and then writing the next
+            // request onto a connection that still had undrained response bytes.
+            // Upstream desynced and closed -> the `early eof` that hung
+            // `alex wrap agent` on Cursor's Connect-RPC calls (AvailableModels,
+            // GetCliDownloadUrl, GetGlobalCommands). Also covers Connection: close.
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                let n = up.read(&mut buf).await?;
+                let n = up.read_some(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
                 capture_extend(&mut resp_capture, &buf[..n]);
-                client.write_all(&buf[..n]).await?;
+                client.inner.write_all(&buf[..n]).await?;
             }
             append_http_body_capture(
                 log,
@@ -468,7 +504,9 @@ where
                 resp_capture.len(),
                 resp_chunked,
             );
-            return Ok(());
+            if close_client {
+                return Ok(());
+            }
         }
         append_http_body_capture(
             log,
@@ -479,12 +517,82 @@ where
             resp_capture.len(),
             resp_chunked,
         );
-        // else: no body (or unknown) — continue keep-alive loop
-        client.flush().await.ok();
-        if resp_close {
+        // `up` is now dropped even if it advertised keep-alive. This makes the
+        // client lifecycle independent of Cursor's per-response closes.
+        client.inner.flush().await.ok();
+        if close_client {
             return Ok(());
         }
     }
+}
+
+async fn connect_upstream(
+    target: &UpstreamTarget,
+    tls: Option<&Arc<TlsConnector>>,
+) -> Result<DynUpstream> {
+    let tcp = dial_upstream(target).await?;
+    tcp.set_nodelay(true).ok();
+    if let Some(connector) = tls {
+        let server_name = ServerName::try_from(target.host.clone())
+            .map_err(|_| anyhow!("invalid TLS server name {}", target.host))?;
+        let peer = tcp.peer_addr().ok();
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .with_context(|| format!("timeout TLS handshake to upstream {peer:?}"))?
+        .with_context(|| format!("TLS handshake to upstream {peer:?}"))?;
+        Ok(Box::new(up))
+    } else {
+        Ok(Box::new(tcp))
+    }
+}
+
+/// Do not expose a disposable upstream connection to a persistent client.
+fn rewrite_response_connection(head: &[u8], resp_close: bool) -> Result<Vec<u8>> {
+    if !resp_close {
+        return Ok(head.to_vec());
+    }
+    let end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("incomplete response headers"))?;
+    let text = std::str::from_utf8(&head[..end]).context("response headers are not utf-8")?;
+    let mut lines = text.split("\r\n");
+    let status = lines.next().ok_or_else(|| anyhow!("empty response"))?;
+    let mut out = String::from(status);
+    for line in lines {
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("connection"))
+        {
+            continue;
+        }
+        out.push_str("\r\n");
+        out.push_str(line);
+    }
+    out.push_str("\r\nConnection: keep-alive\r\n\r\n");
+    Ok(out.into_bytes())
+}
+
+async fn raw_tunnel_with_prefetched<U>(
+    mut client: TcpStream,
+    mut up: U,
+    client_pending: Vec<u8>,
+    up_pending: Vec<u8>,
+    log: &CaptureLog,
+) -> Result<()>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    if !client_pending.is_empty() {
+        up.write_all(&client_pending).await?;
+    }
+    if !up_pending.is_empty() {
+        client.write_all(&up_pending).await?;
+    }
+    raw_tunnel(&mut client, up, log).await
 }
 
 async fn raw_tunnel<U>(client: &mut TcpStream, mut up: U, log: &CaptureLog) -> Result<()>
@@ -781,29 +889,6 @@ async fn dial_upstream(target: &UpstreamTarget) -> Result<TcpStream> {
     Err(last_err.unwrap_or_else(|| anyhow!("connect {host_port} failed")))
 }
 
-async fn read_http_headers<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 2048];
-    loop {
-        let n = r.read(&mut tmp).await?;
-        if n == 0 {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                // incomplete
-                Ok(Some(buf))
-            };
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(Some(buf));
-        }
-        if buf.len() > 1024 * 1024 {
-            bail!("headers too large");
-        }
-    }
-}
-
 const HTTP_BODY_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 fn capture_extend(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -865,7 +950,7 @@ fn append_http_body_capture(
 }
 
 async fn copy_fixed_body_capture<R, W>(
-    r: &mut R,
+    r: &mut HttpReader<R>,
     w: &mut W,
     mut remaining: usize,
     capture: &mut Vec<u8>,
@@ -877,7 +962,7 @@ where
     let mut buf = vec![0u8; 64 * 1024];
     while remaining > 0 {
         let to_read = remaining.min(buf.len());
-        let n = r.read(&mut buf[..to_read]).await?;
+        let n = r.read_some(&mut buf[..to_read]).await?;
         if n == 0 {
             bail!("unexpected EOF reading body ({remaining} left)");
         }
@@ -889,7 +974,7 @@ where
 }
 
 /// Copy HTTP/1.1 chunked body including terminating 0-chunk.
-async fn copy_chunked_body_capture<R, W>(r: &mut R, w: &mut W, capture: &mut Vec<u8>) -> Result<()>
+async fn copy_chunked_body_capture<R, W>(r: &mut HttpReader<R>, w: &mut W, capture: &mut Vec<u8>) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -907,16 +992,9 @@ where
             .next()
             .unwrap_or("0");
         let size = usize::from_str_radix(hex.trim(), 16).unwrap_or(0);
-        if size > 0 {
-            copy_fixed_body_capture(r, w, size, capture).await?;
-        }
-        // trailing CRLF after chunk data
-        let mut crlf = [0u8; 2];
-        r.read_exact(&mut crlf).await?;
-        capture_extend(capture, &crlf);
-        w.write_all(&crlf).await?;
         if size == 0 {
-            // optional trailers until blank line
+            // A zero chunk has no chunk-data CRLF. It is followed directly by
+            // optional trailers and their terminating blank line.
             loop {
                 line.clear();
                 read_until_crlf(r, &mut line).await?;
@@ -928,96 +1006,23 @@ where
             }
             break;
         }
+        copy_fixed_body_capture(r, w, size, capture).await?;
+        // Trailing CRLF after non-empty chunk data.
+        let mut crlf = [0u8; 2];
+        r.read_exact_bytes(&mut crlf).await?;
+        capture_extend(capture, &crlf);
+        w.write_all(&crlf).await?;
     }
     Ok(())
 }
 
-/// Continue parsing/copying a chunked body when some body bytes were already
-/// read together with the request headers and already forwarded by the header
-/// rewrite path.
-async fn copy_chunked_body_remaining_capture<R, W>(
-    r: &mut R,
-    w: &mut W,
-    initial: &[u8],
-    capture: &mut Vec<u8>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = initial.to_vec();
-    let mut pos = 0usize;
-    loop {
-        let line_start = pos;
-        loop {
-            if let Some(rel) = buf[pos..].windows(2).position(|x| x == b"\r\n") {
-                pos += rel + 2;
-                break;
-            }
-            read_more_forward_capture(r, w, &mut buf, capture).await?;
-        }
-        let line = &buf[line_start..pos];
-        let hex = std::str::from_utf8(line)
-            .unwrap_or("")
-            .trim()
-            .split(';')
-            .next()
-            .unwrap_or("0");
-        let size = usize::from_str_radix(hex.trim(), 16).unwrap_or(0);
-        while buf.len().saturating_sub(pos) < size + 2 {
-            read_more_forward_capture(r, w, &mut buf, capture).await?;
-        }
-        pos += size + 2;
-        if size == 0 {
-            if pos >= 4 && &buf[pos - 4..pos] == b"\r\n\r\n" {
-                return Ok(());
-            }
-            loop {
-                let trailer_start = pos;
-                loop {
-                    if let Some(rel) = buf[pos..].windows(2).position(|x| x == b"\r\n") {
-                        pos += rel + 2;
-                        break;
-                    }
-                    read_more_forward_capture(r, w, &mut buf, capture).await?;
-                }
-                if &buf[trailer_start..pos] == b"\r\n" {
-                    return Ok(());
-                }
-            }
-        }
-        if pos > 1024 * 1024 {
-            buf.drain(..pos);
-            pos = 0;
-        }
-    }
-}
-
-async fn read_more_forward_capture<R, W>(
-    r: &mut R,
-    w: &mut W,
-    buf: &mut Vec<u8>,
-    capture: &mut Vec<u8>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut tmp = [0u8; 8192];
-    let n = r.read(&mut tmp).await?;
-    if n == 0 {
-        bail!("unexpected EOF reading chunked body");
-    }
-    capture_extend(capture, &tmp[..n]);
-    w.write_all(&tmp[..n]).await?;
-    buf.extend_from_slice(&tmp[..n]);
-    Ok(())
-}
-
-async fn read_until_crlf<R: AsyncRead + Unpin>(r: &mut R, out: &mut Vec<u8>) -> Result<()> {
+async fn read_until_crlf<R: AsyncRead + Unpin>(
+    r: &mut HttpReader<R>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let mut b = [0u8; 1];
     loop {
-        r.read_exact(&mut b).await?;
+        r.read_exact_bytes(&mut b).await?;
         out.push(b[0]);
         if out.len() >= 2 && out[out.len() - 2..] == *b"\r\n" {
             return Ok(());
@@ -1043,6 +1048,17 @@ fn parse_status_from_headers(head: &[u8]) -> Option<u16> {
     let text = std::str::from_utf8(head).ok()?;
     let line = text.lines().next()?;
     line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A response that carries no message body regardless of headers (RFC 7230 3.3.3
+/// rule 1): a response to HEAD, and any 1xx / 204 / 304 status. Such a response
+/// may keep the connection alive with no framing. Every other response that lacks
+/// Content-Length and chunked framing is delimited by connection close.
+fn response_is_bodyless(status: Option<u16>, method: &str) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") {
+        return true;
+    }
+    matches!(status, Some(s) if (100..200).contains(&s) || s == 204 || s == 304)
 }
 
 fn rewrite_request_headers(
@@ -1238,6 +1254,22 @@ mod tests {
     }
 
     #[test]
+    fn bodyless_response_classification() {
+        // No body regardless of framing -> keep-alive is safe.
+        assert!(response_is_bodyless(Some(204), "GET"));
+        assert!(response_is_bodyless(Some(304), "GET"));
+        assert!(response_is_bodyless(Some(100), "GET"));
+        assert!(response_is_bodyless(Some(200), "HEAD"));
+        assert!(response_is_bodyless(Some(200), "head"));
+        // A body-bearing response with no Content-Length and no chunked framing is
+        // close-delimited, NOT empty -- treating it as empty desynced the keep-alive
+        // connection and hung `alex wrap agent` on Cursor's Connect-RPC calls.
+        assert!(!response_is_bodyless(Some(200), "POST"));
+        assert!(!response_is_bodyless(Some(200), "GET"));
+        assert!(!response_is_bodyless(None, "POST"));
+    }
+
+    #[test]
     fn rewrite_host() {
         let raw = b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n";
         let out = rewrite_request_headers(raw, "ampcode.com", 443, true, None).unwrap();
@@ -1343,8 +1375,8 @@ mod tests {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = upstream.local_addr().unwrap();
         let up_task = tokio::spawn(async move {
-            let (mut sock, _) = upstream.accept().await.unwrap();
             for _ in 0..2 {
+                let (mut sock, _) = upstream.accept().await.unwrap();
                 let mut buf = vec![0u8; 8192];
                 // read until headers complete
                 let mut n = 0;
@@ -1403,6 +1435,52 @@ mod tests {
         let paths = log.paths();
         assert!(paths.iter().any(|p| p.contains("/api/a")), "{paths:?}");
         assert!(paths.iter().any(|p| p.contains("/api/b")), "{paths:?}");
+
+        wrap.shutdown().await;
+        up_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_wrap_preserves_pipelined_requests_across_upstream_closes() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let up_task = tokio::spawn(async move {
+            for expected_path in ["/api/one", "/api/two"] {
+                let (mut sock, _) = upstream.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                assert!(request.starts_with(&format!("GET {expected_path} ")), "{request}");
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let wrap = ReverseWrap::start_http_to_http(
+            "127.0.0.1:0".parse().unwrap(),
+            up_addr,
+            CaptureLog::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(wrap.listen_addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /api/one HTTP/1.1\r\nHost: localhost\r\n\r\nGET /api/two HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert_eq!(response.matches("HTTP/1.1 200 OK").count(), 2, "{response}");
+        assert_eq!(response.matches("\r\nok").count(), 2, "{response}");
+        assert!(!response.contains("Connection: close"), "{response}");
 
         wrap.shutdown().await;
         up_task.await.unwrap();
