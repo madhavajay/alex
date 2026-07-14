@@ -285,10 +285,11 @@ import Testing
                 versionWarning: nil, configDir: nil, configDirExists: false,
                 connected: false, supportsConnect: true, override: nil, daemonReachable: true),
         ])
-        #expect(Array(rows.map(\.name).prefix(6)) == ["pi", "claude", "codex", "gemini", "grok", "opencode"])
+        #expect(Array(rows.map(\.name).prefix(7)) == ["pi", "claude", "codex", "grok", "amp", "gemini", "opencode"])
         #expect(rows[2].installed)
         #expect(!rows[0].installed)
         #expect(HarnessCatalog.displayName("opencode") == "OpenCode")
+        #expect(HarnessCatalog.displayName("amp") == "Amp")
     }
 
     @Test func harnessRefreshTargetsFiltersConnectedSupport() {
@@ -327,6 +328,13 @@ import Testing
         #expect(config == DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "alx-abc123"))
         #expect(config?.baseURL.absoluteString == "http://127.0.0.1:4100")
         #expect(DaemonDiscovery.parse(toml: "port = 4100") == nil)
+
+        let lan = DaemonConfig(host: "0.0.0.0", port: 4100, localKey: "alx-lan")
+        #expect(lan.lanEnabled)
+        #expect(lan.baseURL.absoluteString == "http://127.0.0.1:4100")
+        let ipv6 = DaemonConfig(host: "::1", port: 4100, localKey: "alx-v6")
+        #expect(!ipv6.lanEnabled)
+        #expect(ipv6.baseURL.absoluteString == "http://[::1]:4100")
     }
 
     @Test func daemonBoundToTailscaleStillConnectsLocallyOverLoopback() {

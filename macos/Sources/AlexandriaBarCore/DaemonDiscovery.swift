@@ -16,7 +16,13 @@ public struct DaemonConfig: Sendable, Equatable {
         }
     }
 
-    public var baseURL: URL { URL(string: "http://\(connectHost):\(port)")! }
+    public var baseURL: URL {
+        let renderedHost = connectHost.contains(":") ? "[\(connectHost)]" : connectHost
+        return URL(string: "http://\(renderedHost):\(port)")!
+    }
+    public var lanEnabled: Bool {
+        !["127.0.0.1", "::1", "localhost"].contains(host.lowercased())
+    }
     public var darioEnabled: Bool { anthropicUpstream == "dario" }
 
     public init(host: String, port: Int, localKey: String, anthropicUpstream: String = "direct") {

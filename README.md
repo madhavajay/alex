@@ -110,6 +110,20 @@ alex status               # accounts, limits, health at a glance
 eval "$(alex env)"        # point ANTHROPIC_/OPENAI_/XAI_ env at the proxy
 ```
 
+The default listener is loopback-only. To make the authenticated proxy
+reachable on both loopback and the local network, persist a wildcard bind and
+restart the daemon:
+
+```bash
+alex config host 0.0.0.0
+# restart the Alexandria daemon or menu-bar app service
+```
+
+The menu-bar app exposes the same opt-in under Settings → General → Daemon.
+LAN mode exposes port 4100 to other devices on the network; keep the generated
+credentials private and use host firewall rules on untrusted networks. Restore
+local-only access with `alex config host 127.0.0.1` and another restart.
+
 Re-auth a subscription any time with `alex auth login claude|codex|grok`, watch live traffic with `alex tui`, and check window utilization with `alex limits`.
 
 ## Format translation

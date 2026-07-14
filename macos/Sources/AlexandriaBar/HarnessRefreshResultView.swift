@@ -352,7 +352,7 @@ struct HarnessConfigWriteSummaryView: View {
                 modelList(title: "Removed", ids: result.removed, tint: .orange)
             }
             if result.added.isEmpty && result.removed.isEmpty {
-                Text("Model list unchanged.")
+                Text(result.modelsTotal == 0 ? "No model catalog changes." : "Model list unchanged.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -360,10 +360,10 @@ struct HarnessConfigWriteSummaryView: View {
     }
 
     private var summaryLine: String {
-        var parts = ["\(result.modelsTotal) models"]
+        var parts = result.modelsTotal == 0 ? ["Lifecycle integration"] : ["\(result.modelsTotal) models"]
         if !result.added.isEmpty { parts.append("\(result.added.count) added") }
         if !result.removed.isEmpty { parts.append("\(result.removed.count) removed") }
-        parts.append("\(result.unchanged) unchanged")
+        if result.modelsTotal > 0 { parts.append("\(result.unchanged) unchanged") }
         if !result.baseUrl.isEmpty { parts.append(result.baseUrl) }
         return parts.joined(separator: " · ")
     }
@@ -420,7 +420,7 @@ struct HarnessDisconnectSummaryView: View {
             }
             labeled("Summary") {
                 let parts = [
-                    result.wasConnected ? "Provider removed" : "Already removed",
+                    result.wasConnected ? "Harness integration removed" : "Already removed",
                     "\(result.revoked) key(s) revoked",
                 ]
                 Text(parts.joined(separator: " · "))

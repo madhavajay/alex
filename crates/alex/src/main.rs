@@ -101,6 +101,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read or update persistent daemon settings
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Read or set provider routing reserve percentages
     Routing {
         #[command(subcommand)]
@@ -247,6 +252,12 @@ enum ServiceCommand {
     Uninstall,
     /// Show service state
     Status,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Set the daemon bind IP (`127.0.0.1` for local only, `0.0.0.0` for LAN + local)
+    Host { address: String },
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -872,15 +883,7 @@ impl Config {
     /// clients can always use loopback. Remote clients are given an explicit address
     /// by whoever configures them -- never by this function.
     fn base_url(&self) -> String {
-        format!("http://{}:{}", self.local_host(), self.port)
-    }
-
-    /// Loopback unless the daemon is deliberately bound to a loopback alias.
-    fn local_host(&self) -> &str {
-        match self.host.as_str() {
-            "localhost" | "127.0.0.1" | "::1" | "[::1]" => self.host.as_str(),
-            _ => "127.0.0.1",
-        }
+        daemon_connect_base_url(&self.host, self.port)
     }
 
     fn update_channel(&self) -> selfupdate::UpdateChannel {
@@ -963,6 +966,34 @@ fn requires_explicit_loopback_listener(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The host a *local* client (a harness on this machine) should connect to.
+///
+/// `bind_host` is a BIND address and must never reach a client as-is. Handling only
+/// the wildcards is not enough: binding to a SPECIFIC non-loopback address -- a LAN
+/// or Tailscale IP, so another machine can reach the daemon -- would otherwise write
+/// that address into the LOCAL harness configs too. Local traffic would then leave
+/// the loopback interface and break outright whenever that network was down or the
+/// DHCP lease changed.
+///
+/// A daemon bound to any non-loopback address still serves loopback, so local clients
+/// can always use it. Remote clients are configured explicitly by whoever configures
+/// them -- never derived from the bind address.
+fn daemon_connect_host(bind_host: &str) -> &str {
+    match bind_host {
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" => bind_host,
+        _ => "127.0.0.1",
+    }
+}
+
+fn daemon_connect_base_url(bind_host: &str, port: u16) -> String {
+    let host = daemon_connect_host(bind_host);
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
 fn random_key(prefix: &str) -> String {
     let mut rng = rand::thread_rng();
     let bytes: [u8; 24] = rng.gen();
@@ -985,6 +1016,19 @@ fn save_config_at(config: &Config, path: &Path) -> Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+fn set_daemon_host(config: &mut Config, address: &str) -> Result<bool> {
+    let address = address.trim();
+    address
+        .parse::<std::net::IpAddr>()
+        .with_context(|| format!("daemon host must be an IPv4 or IPv6 bind address: {address}"))?;
+    if config.host == address {
+        return Ok(false);
+    }
+    config.host = address.to_string();
+    save_config(config)?;
+    Ok(true)
 }
 
 fn alexandria_home() -> PathBuf {
@@ -1401,6 +1445,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::read_claude_hook_events(config_dir),
             "codex" => harness_connect::read_codex_hook_events(config_dir),
             "grok" => harness_connect::read_grok_hook_events(config_dir),
+            "amp" => harness_connect::read_amp_hook_events(config_dir),
             _ => Vec::new(),
         };
         for (index, event) in events.iter().enumerate() {
@@ -1526,6 +1571,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 harness_connect::plan_claude_connect(&config_dir, models.len(), &keys)
             } else if name == "grok" {
                 harness_connect::plan_grok_connect(&config_dir, models.len(), &keys)
+            } else if name == "amp" {
+                harness_connect::plan_amp_connect(&config_dir, &keys)
             } else {
                 harness_connect::plan_connect(&config_dir, models.len(), &keys)
             };
@@ -1538,8 +1585,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             Ok(v) => v,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let lineage_config_dir =
-            matches!(name.as_str(), "claude" | "codex" | "grok").then(|| config_dir.clone());
+        let lineage_config_dir = matches!(name.as_str(), "claude" | "codex" | "grok" | "amp")
+            .then(|| config_dir.clone());
         let result = match name.as_str() {
             "pi" => harness_connect::write_pi_connection_with_capture(
                 config_dir,
@@ -1572,6 +1619,13 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 key_id,
                 key,
                 models,
+                status.version,
+            ),
+            "amp" => harness_connect::write_amp_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                key,
                 status.version,
             ),
             _ => unreachable!("connect-capable harness must have a writer"),
@@ -1624,6 +1678,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 harness_connect::plan_claude_disconnect(&config_dir, &keys)
             } else if name == "grok" {
                 harness_connect::plan_grok_disconnect(&config_dir, &keys)
+            } else if name == "amp" {
+                harness_connect::plan_amp_disconnect(&config_dir, &keys)
             } else {
                 harness_connect::plan_disconnect(&config_dir, &keys)
             };
@@ -1633,18 +1689,21 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => config_dir.join("alexandria-settings.json"),
             "codex" => config_dir.join("config.toml"),
             "grok" => config_dir.join("config.toml"),
+            "amp" => config_dir.join("plugins").join("alexandria.ts"),
             _ => config_dir.join("models.json"),
         };
         let previous_models = match name.as_str() {
             "claude" => harness_connect::read_claude_model_ids(&config_dir),
             "codex" => harness_connect::read_codex_model_ids(&config_dir),
             "grok" => harness_connect::read_grok_model_ids(&config_dir),
+            "amp" => Vec::new(),
             _ => harness_connect::read_pi_model_ids(&config_dir),
         };
         let disconnected = match name.as_str() {
             "claude" => harness_connect::disconnect_claude_config(&config_dir),
             "codex" => harness_connect::disconnect_codex_config(&config_dir),
             "grok" => harness_connect::disconnect_grok_config(&config_dir),
+            "amp" => harness_connect::disconnect_amp_config(&config_dir),
             _ => harness_connect::disconnect_pi_config(&config_dir),
         };
         let was_connected = match disconnected {
@@ -1702,6 +1761,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::read_claude_api_key(&config_dir),
             "codex" => harness_connect::read_codex_api_key(&config_dir),
             "grok" => harness_connect::read_grok_api_key(&config_dir),
+            "amp" => harness_connect::read_amp_api_key(&config_dir),
             _ => harness_connect::read_pi_api_key(&config_dir),
         };
         let (key_status, key_id, api_key) = if let Some(key) = existing_key {
@@ -1719,8 +1779,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             Ok(status) => status,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let lineage_config_dir =
-            matches!(name.as_str(), "claude" | "codex" | "grok").then(|| config_dir.clone());
+        let lineage_config_dir = matches!(name.as_str(), "claude" | "codex" | "grok" | "amp")
+            .then(|| config_dir.clone());
         let result = if name == "codex" {
             let Some(binary) = status.binary.as_deref() else {
                 return error(
@@ -1759,6 +1819,14 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 key_id,
                 api_key,
                 models,
+                status.version,
+            )
+        } else if name == "amp" {
+            harness_connect::write_amp_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                api_key,
                 status.version,
             )
         } else {
@@ -2063,7 +2131,7 @@ async fn main() -> Result<()> {
                 vault,
                 store,
                 dario_router,
-                format!("http://{host}:{port}"),
+                daemon_connect_base_url(&host, port),
                 config.upstream_stream_idle_timeout(),
             );
             alex_proxy::set_daemon_updater(
@@ -2830,6 +2898,18 @@ async fn main() -> Result<()> {
                 print!("{exports}");
             }
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Host { address } => {
+                let mut config = config;
+                let changed = set_daemon_host(&mut config, &address)?;
+                if changed {
+                    println!("daemon host saved as {}", config.host);
+                    println!("restart the Alexandria daemon to apply the new listener");
+                } else {
+                    println!("daemon host is already {}", config.host);
+                }
+            }
+        },
         Command::Service { command } => match command {
             ServiceCommand::Install => service_install(&config)?,
             ServiceCommand::Bind { target } => service_set_bind(&config, &target)?,
@@ -5723,45 +5803,41 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
 }
 
 fn print_banner(host: &str, port: u16, local_key: &str) {
+    let base = daemon_connect_base_url(host, port);
     eprintln!("{}", ui::divider("alexandria"));
     eprintln!(
         "daemon listening on {}",
         ui::bold(&ui::lapis(&format!("http://{host}:{port}")))
     );
-    eprintln!(
-        "  health:   {}",
-        ui::lapis(&format!("http://{host}:{port}/health"))
-    );
-    eprintln!(
-        "  traces:   {}",
-        ui::lapis(&format!("http://{host}:{port}/admin/traces"))
-    );
+    eprintln!("  health:   {}", ui::lapis(&format!("{base}/health")));
+    eprintln!("  traces:   {}", ui::lapis(&format!("{base}/admin/traces")));
     eprintln!(
         "  accounts: {}",
-        ui::lapis(&format!("http://{host}:{port}/admin/accounts"))
+        ui::lapis(&format!("{base}/admin/accounts"))
     );
     eprintln!();
     print_env(host, port, local_key);
 }
 
 fn print_env(host: &str, port: u16, local_key: &str) {
+    let base = daemon_connect_base_url(host, port);
     eprintln!(
         "{}",
         ui::dim("# anthropic-format harnesses (claude-code, …)")
     );
-    eprintln!("export ANTHROPIC_BASE_URL=http://{host}:{port}");
+    eprintln!("export ANTHROPIC_BASE_URL={base}");
     eprintln!("export ANTHROPIC_API_KEY={local_key}");
     eprintln!("{}", ui::dim("# openai-format harnesses (codex, pi, …)"));
-    eprintln!("export OPENAI_BASE_URL=http://{host}:{port}/v1");
+    eprintln!("export OPENAI_BASE_URL={base}/v1");
     eprintln!("export OPENAI_API_KEY={local_key}");
     eprintln!("{}", ui::dim("# xai/grok harnesses"));
     eprintln!("export XAI_API_KEY={local_key}");
-    eprintln!("export GROK_MODELS_BASE_URL=http://{host}:{port}/v1");
+    eprintln!("export GROK_MODELS_BASE_URL={base}/v1");
     eprintln!(
         "{}",
         ui::dim("# gemini-cli (needs security.auth.selectedType=gemini-api-key)")
     );
-    eprintln!("export GOOGLE_GEMINI_BASE_URL=http://{host}:{port}");
+    eprintln!("export GOOGLE_GEMINI_BASE_URL={base}");
     eprintln!("export GOOGLE_GENAI_API_VERSION=v1beta");
     eprintln!("export GEMINI_API_KEY={local_key}");
     eprintln!("export GEMINI_API_KEY_AUTH_MECHANISM=bearer");
@@ -6720,7 +6796,7 @@ async fn daemon_background(
     host_arg: Option<String>,
     port_arg: Option<u16>,
 ) -> Result<()> {
-    let base = format!("http://{host}:{port}");
+    let base = daemon_connect_base_url(host, port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
@@ -8460,6 +8536,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn daemon_host_setting_persists_wildcard_and_rejects_non_ip_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("config-host");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        save_config(&config).unwrap();
+
+        assert!(set_daemon_host(&mut config, "0.0.0.0").unwrap());
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.base_url(), "http://127.0.0.1:4100");
+        assert!(!set_daemon_host(&mut config, "0.0.0.0").unwrap());
+        assert!(set_daemon_host(&mut config, "192.168.1.20").unwrap());
+        let (loaded, _) = load_or_create_config().unwrap();
+        assert_eq!(loaded.host, "192.168.1.20");
+        assert!(set_daemon_host(&mut config, "example.com")
+            .unwrap_err()
+            .to_string()
+            .contains("IPv4 or IPv6"));
+        std::env::remove_var("ALEXANDRIA_HOME");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn harness_router_lists_and_rejects_unsupported_connect() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -8471,7 +8569,7 @@ mod tests {
         let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
-        assert_eq!(harnesses.len(), 6);
+        assert_eq!(harnesses.len(), 7);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));
@@ -8816,6 +8914,92 @@ mod tests {
         assert!(config_dir
             .join("alexandria-original-settings.json")
             .exists());
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_connect_amp_installs_refreshes_and_removes_plugin() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-connect-amp");
+        let bin_dir = tmpdir("router-connect-amp-bin");
+        let binary = fake_executable(&bin_dir, "amp", "echo 0.0.1784018462-g51e7e3");
+        let config_dir = home.join("amp-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.harness_overrides.insert(
+            "amp".into(),
+            HarnessOverride {
+                binary: Some(binary),
+                config_dir: Some(config_dir.clone()),
+            },
+        );
+        save_config(&config).unwrap();
+        let state = test_state("router-connect-amp-state");
+        let app = harness_admin_router(state.clone());
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/amp/connect?dry_run=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["plan"].as_array().unwrap().iter().any(|step| {
+            step["action"] == "about"
+                && step["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("alex wrap amp")
+        }));
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/amp/connect",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["key"], "minted");
+        assert_eq!(body["models_total"], 0);
+        assert!(body["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("plugins/alexandria.ts"));
+        let plugin_path = config_dir.join("plugins/alexandria.ts");
+        let plugin = std::fs::read_to_string(&plugin_path).unwrap();
+        assert!(plugin.contains("Generated by Alexandria for Amp"));
+        assert!(plugin.contains("amp.on('tool.call'"));
+        assert!(harness_connect::amp_config_connected(&config_dir).unwrap());
+        assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
+        assert_eq!(state.store.list_run_keys(false).unwrap()[0]["label"], "amp");
+
+        let saved_key = harness_connect::read_amp_api_key(&config_dir).unwrap();
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/amp/refresh-config",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["key"], "reused");
+        assert_eq!(body["models_total"], 0);
+        assert_eq!(
+            harness_connect::read_amp_api_key(&config_dir).as_deref(),
+            Some(saved_key.as_str())
+        );
+
+        let (status, body) =
+            router_json(app, Method::POST, "/admin/harnesses/amp/disconnect", None).await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["was_connected"], true);
+        assert_eq!(body["revoked"], 1);
+        assert!(!plugin_path.exists());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
     }
 
