@@ -11,12 +11,15 @@ set -eu
 # Unlike install-release.sh, this does not use Homebrew: there is no beta cask.
 # It installs the CLI, replaces the running daemon, and installs the signed app.
 #
-# Everything lives inside main(), called on the last line. When this script is
-# piped to `sh`, the script *is* stdin -- so the shell must parse through to the
-# end of main() before running anything, which consumes the whole script off the
-# pipe first. Without that, any child process that reads stdin eats the rest of
-# the script and the shell then executes garbage. Every subprocess also gets
-# </dev/null so it cannot reach for stdin at all.
+# Keep this file ASCII-only. macOS /bin/sh (bash 3.2) swallowed the bytes of a
+# UTF-8 ellipsis into the preceding variable name -- "$APP_PROCESS…" parsed as a
+# name ending in those bytes, which under `set -u` aborted with "unbound
+# variable" right before the app install. Linux bash parses it fine, so it only
+# ever failed on the machine that mattered. Brace every expansion.
+#
+# main() is called on the last line, and every subprocess gets </dev/null: piped
+# to `sh` this script *is* stdin, so a child that reads stdin would eat the rest
+# of it. Defensive, not the cause of the bug above.
 
 REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
@@ -74,7 +77,7 @@ platform_asset() {
 }
 
 install_cli() {
-  say "Installing Alexandria beta $1 ($2)…"
+  say "Installing Alexandria beta $1 ($2)..."
   curl -fsSL "$4/$3" -o "$5/$3" </dev/null
   curl -fsSL "$4/$3.sha256" -o "$5/$3.sha256" </dev/null
 
@@ -110,7 +113,7 @@ replace_daemon() {
 # AlexandriaBar keeps reporting the old version in the menu bar.
 quit_app() {
   if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-    say "Quitting the running $APP_PROCESS…"
+    say "Quitting the running ${APP_PROCESS}..."
     osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 </dev/null || true
     waited=0
     while pgrep -x "$APP_PROCESS" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
@@ -131,7 +134,7 @@ install_app() {
     exit 1
   fi
 
-  say "Downloading the signed menu-bar app…"
+  say "Downloading the signed menu-bar app..."
   curl -fsSL "$dmg_url" -o "$2/AlexandriaBar-beta.dmg" </dev/null
 
   quit_app
