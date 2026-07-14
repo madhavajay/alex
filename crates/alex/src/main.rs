@@ -818,6 +818,19 @@ fn default_dario_probe_model() -> String {
 }
 
 impl Config {
+    /// Repair values that a stale config on disk would otherwise keep forever,
+    /// since serde defaults only fill MISSING keys. Changing a default does not
+    /// help an existing user whose config already has the old value written.
+    fn heal(&mut self) {
+        // OpenRouter removed anthropic/claude-3.5-sonnet, so the old ping default
+        // now 404s "No endpoints found" on every health check. Move to the free
+        // model. Only rewrite the known-dead value -- never override a user's own
+        // choice of a working model.
+        if self.ping_openrouter_model == "anthropic/claude-3.5-sonnet" {
+            self.ping_openrouter_model = default_ping_openrouter();
+        }
+    }
+
     fn defaults_for(data_dir: PathBuf) -> Self {
         Self {
             host: "127.0.0.1".into(),
@@ -1048,7 +1061,8 @@ fn load_or_create_config() -> Result<(Config, bool)> {
     let path = home.join("config.toml");
     if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
+        let mut config: Config = toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
+        config.heal();
         let upgraded = toml::to_string_pretty(&config)?;
         if upgraded != raw {
             std::fs::write(&path, upgraded)?;
