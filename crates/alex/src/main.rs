@@ -813,8 +813,21 @@ impl Config {
         self.anthropic_upstream == "dario"
     }
 
+    /// The URL a *client* should connect to.
+    ///
+    /// `host` is a BIND address: `0.0.0.0` (or `::`) means "listen on every
+    /// interface". It is not a connect address. Handing it to a harness produced
+    /// `http://0.0.0.0:4100/v1`, which macOS usually tolerates by routing to
+    /// loopback -- and sometimes does not, giving intermittent
+    /// "stream disconnected before completion" errors. Normalise it here, at the
+    /// single source, rather than patching it per call site (which is how the hook
+    /// URL got fixed while the provider URL the harness actually calls did not).
     fn base_url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        let host = match self.host.as_str() {
+            "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+            other => other,
+        };
+        format!("http://{host}:{}", self.port)
     }
 
     fn update_channel(&self) -> selfupdate::UpdateChannel {
