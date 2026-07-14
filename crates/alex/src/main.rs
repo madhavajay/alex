@@ -696,6 +696,10 @@ struct Config {
     upstream_stream_idle_timeout_seconds: u64,
     #[serde(default)]
     harness_overrides: BTreeMap<String, HarnessOverride>,
+    /// Tool capture is an explicit per-harness consent setting. It defaults
+    /// off because command arguments and outputs can be sensitive.
+    #[serde(default)]
+    harness_tool_capture: BTreeMap<String, bool>,
     #[serde(default)]
     account_policy: BTreeMap<String, AccountPolicy>,
 }
@@ -819,6 +823,7 @@ impl Config {
             update_channel: default_update_channel(),
             upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
+            harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
     }
@@ -1190,6 +1195,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         route: String,
     }
 
+    #[derive(Deserialize)]
+    struct ToolCaptureBody { enabled: bool }
+
     fn parse_dry_run(q: &std::collections::HashMap<String, String>) -> bool {
         q.get("dry_run")
             .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
@@ -1459,13 +1467,14 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         let lineage_config_dir =
             matches!(name.as_str(), "claude" | "codex" | "grok").then(|| config_dir.clone());
         let result = match name.as_str() {
-            "pi" => harness_connect::write_pi_connection(
+            "pi" => harness_connect::write_pi_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 key,
                 models,
                 status.version,
+                config.harness_tool_capture.get("pi").copied().unwrap_or(false),
             ),
             "codex" => harness_connect::write_codex_connection(
                 config_dir,
@@ -1679,13 +1688,14 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 status.version,
             )
         } else {
-            harness_connect::write_pi_connection(
+            harness_connect::write_pi_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 api_key,
                 models,
                 status.version,
+                config.harness_tool_capture.get("pi").copied().unwrap_or(false),
             )
         };
         match result {
@@ -1768,6 +1778,23 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         }
     }
 
+    async fn put_tool_capture(
+        State(state): State<Arc<alex_proxy::AppState>>,
+        AxPath(name): AxPath<String>,
+        axum::Json(body): axum::Json<ToolCaptureBody>,
+    ) -> axum::response::Response {
+        let Some(spec) = harness_connect::spec_by_name(&name) else { return error(axum::http::StatusCode::NOT_FOUND, "unknown harness"); };
+        let (mut config, _) = match load_or_create_config() { Ok(value) => value, Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) };
+        if name != "pi" { return error(axum::http::StatusCode::BAD_REQUEST, "tool capture is currently supported only by Pi"); }
+        let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
+        if let Err(e) = harness_connect::set_pi_tool_capture(&config_dir, &state.base_url, body.enabled) {
+            return error(axum::http::StatusCode::BAD_REQUEST, e.to_string());
+        }
+        config.harness_tool_capture.insert(name, body.enabled);
+        if let Err(e) = save_config(&config) { return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()); }
+        axum::Json(serde_json::json!({"tool_capture_enabled": body.enabled})).into_response()
+    }
+
     axum::Router::new()
         .route("/admin/harnesses", get(list))
         .route("/admin/harnesses/{name}/connect", post(connect))
@@ -1777,6 +1804,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             post(refresh_config),
         )
         .route("/admin/harnesses/{name}/override", put(put_override))
+        .route("/admin/harnesses/{name}/tool-capture", put(put_tool_capture))
         .route(
             "/admin/harnesses/codex/default-route",
             put(put_codex_default_route),
@@ -7825,6 +7853,7 @@ mod tests {
             update_channel: default_update_channel(),
             upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
+            harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
     }
@@ -8169,6 +8198,7 @@ mod tests {
             update_channel: default_update_channel(),
             upstream_stream_idle_timeout_seconds: default_upstream_stream_idle_timeout_seconds(),
             harness_overrides: BTreeMap::new(),
+            harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&config).unwrap();

@@ -116,6 +116,28 @@ CREATE TABLE IF NOT EXISTS session_lineage (
 );
 CREATE INDEX IF NOT EXISTS session_lineage_parent
   ON session_lineage(harness, parent_session_id);
+
+-- Tool activity is deliberately separate from model traces: Pi reports it
+-- asynchronously, and a model turn can have zero or many tool calls.
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id                 TEXT PRIMARY KEY,
+  harness            TEXT NOT NULL,
+  session_id         TEXT NOT NULL,
+  turn_id            TEXT,
+  tool_call_id       TEXT NOT NULL,
+  trace_id           TEXT,
+  tool_name          TEXT NOT NULL,
+  ts_start_ms        INTEGER NOT NULL,
+  ts_end_ms          INTEGER,
+  is_error           INTEGER,
+  exit_status        INTEGER,
+  args_body_path     TEXT,
+  result_body_path   TEXT,
+  UNIQUE(harness, session_id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS tool_calls_session_turn
+  ON tool_calls(session_id, turn_id, ts_start_ms);
+CREATE INDEX IF NOT EXISTS tool_calls_trace ON tool_calls(trace_id);
 "#;
 
 const RUN_KEY_COLS: &str =
@@ -323,6 +345,26 @@ pub struct TraceFilter {
     pub limit: usize,
 }
 
+/// Normalized harness tool activity. Payload bytes live in `bodies/`, just as
+/// trace request and response bytes do, so all existing retention and reset
+/// operations apply to tools too.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub harness: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub tool_call_id: String,
+    pub trace_id: Option<String>,
+    pub tool_name: String,
+    pub ts_start_ms: i64,
+    pub ts_end_ms: Option<i64>,
+    pub is_error: Option<bool>,
+    pub exit_status: Option<i64>,
+    pub args_body_path: Option<String>,
+    pub result_body_path: Option<String>,
+}
+
 impl Default for TraceFilter {
     fn default() -> Self {
         Self {
@@ -497,7 +539,7 @@ impl Store {
             std::fs::remove_dir_all(&bodies)
                 .with_context(|| format!("removing captured bodies at {}", bodies.display()))?;
         }
-        conn.execute_batch("DELETE FROM traces; DELETE FROM heartbeats;")?;
+        conn.execute_batch("DELETE FROM tool_calls; DELETE FROM traces; DELETE FROM heartbeats;")?;
         Ok(())
     }
 
@@ -1013,6 +1055,57 @@ impl Store {
         Ok([req, upstream, resp].into_iter().flatten().collect())
     }
 
+    pub fn upsert_tool_call(&self, tool: &ToolCallRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls (id, harness, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms, ts_end_ms, is_error, exit_status, args_body_path, result_body_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(harness, session_id, tool_call_id) DO UPDATE SET
+               turn_id=COALESCE(excluded.turn_id, tool_calls.turn_id),
+               trace_id=COALESCE(excluded.trace_id, tool_calls.trace_id),
+               tool_name=excluded.tool_name,
+               ts_start_ms=MIN(tool_calls.ts_start_ms, excluded.ts_start_ms),
+               ts_end_ms=COALESCE(excluded.ts_end_ms, tool_calls.ts_end_ms),
+               is_error=COALESCE(excluded.is_error, tool_calls.is_error),
+               exit_status=COALESCE(excluded.exit_status, tool_calls.exit_status),
+               args_body_path=COALESCE(excluded.args_body_path, tool_calls.args_body_path),
+               result_body_path=COALESCE(excluded.result_body_path, tool_calls.result_body_path)",
+            params![tool.id, tool.harness, tool.session_id, tool.turn_id, tool.tool_call_id,
+                tool.trace_id, tool.tool_name, tool.ts_start_ms, tool.ts_end_ms,
+                tool.is_error.map(|v| v as i64), tool.exit_status, tool.args_body_path,
+                tool.result_body_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_tool_calls(&self, session_id: &str) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms,
+                    ts_end_ms, is_error, exit_status, args_body_path, result_body_path
+             FROM tool_calls WHERE session_id=?1 ORDER BY ts_start_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| Ok(json!({
+            "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
+            "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
+            "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
+            "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
+            "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+            "exit_status": r.get::<_, Option<i64>>(9)?,
+            "args_body_path": r.get::<_, Option<String>>(10)?,
+            "result_body_path": r.get::<_, Option<String>>(11)?,
+        })))?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn get_tool_call(&self, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, args_body_path, result_body_path FROM tool_calls WHERE id=?1", params![id],
+            |r| Ok(json!({"id": r.get::<_, String>(0)?, "args_body_path": r.get::<_, Option<String>>(1)?, "result_body_path": r.get::<_, Option<String>>(2)?})),
+        ).optional().map_err(Into::into)
+    }
+
     pub fn run_summary(&self, run_id: &str) -> Result<Value> {
         let conn = self.conn.lock().unwrap();
         #[allow(clippy::type_complexity)]
@@ -1396,6 +1489,31 @@ impl Store {
         dry_run: bool,
     ) -> Result<PruneReport> {
         let mut report = PruneReport::default();
+        // Tool payloads share `bodies/`, so include them in the existing
+        // retention pass rather than creating a parallel retention policy.
+        let tool_rows: Vec<(String, Option<String>, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, args_body_path, result_body_path FROM tool_calls
+                 WHERE ts_start_ms < ?1 AND (args_body_path IS NOT NULL OR result_body_path IS NOT NULL)",
+            )?;
+            let rows = stmt.query_map(params![older_than_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .filter_map(|r| r.ok()).collect();
+            rows
+        };
+        for (id, args, result) in tool_rows {
+            for path in [args, result].into_iter().flatten() {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    report.bytes_freed += meta.len(); report.bodies_deleted += 1;
+                    if !dry_run { std::fs::remove_file(&path).with_context(|| format!("deleting body file {path}"))?; }
+                }
+            }
+            if !dry_run {
+                self.conn.lock().unwrap().execute(
+                    "UPDATE tool_calls SET args_body_path=NULL, result_body_path=NULL WHERE id=?1", params![id])?;
+            }
+            report.rows_affected += 1;
+        }
         let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
@@ -1449,6 +1567,8 @@ impl Store {
                     "DELETE FROM traces WHERE ts_request_ms < ?1",
                     params![older_than_ms],
                 )? as u64;
+                report.rows_deleted += conn.execute(
+                    "DELETE FROM tool_calls WHERE ts_start_ms < ?1", params![older_than_ms])? as u64;
                 if report.rows_deleted > 0 {
                     if let Err(e) = conn.execute_batch("VACUUM") {
                         tracing::warn!("prune: VACUUM skipped: {e}");
@@ -1878,6 +1998,26 @@ mod tests {
         assert_eq!(windowed.len(), 2);
         assert_eq!(windowed[0]["id"], "c");
         assert!(store.session_traces("nope", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_calls_join_sessions_and_share_reset_body_accounting() {
+        let store = Store::open(tmpdir("tool-calls")).unwrap();
+        let args = store.write_body("tool-session-call", "tool-args.json", br#"{"argv":["echo","ok"]}"#).unwrap();
+        let result = store.write_body("tool-session-call", "tool-result.json", b"large output").unwrap();
+        store.upsert_tool_call(&ToolCallRecord {
+            id: "tool-session-call".into(), harness: "pi".into(), session_id: "session".into(),
+            turn_id: Some("2".into()), tool_call_id: "call".into(), trace_id: Some("trace".into()),
+            tool_name: "bash".into(), ts_start_ms: 10, ts_end_ms: Some(20), is_error: Some(false),
+            exit_status: Some(0), args_body_path: Some(args), result_body_path: Some(result),
+        }).unwrap();
+        let calls = store.session_tool_calls("session").unwrap();
+        assert_eq!(calls[0]["trace_id"], "trace");
+        assert_eq!(calls[0]["turn_id"], "2");
+        assert!(store.reset_counts().unwrap().body_files >= 2);
+        store.clear_traces_and_bodies().unwrap();
+        assert!(store.session_tool_calls("session").unwrap().is_empty());
+        assert_eq!(store.reset_counts().unwrap().body_files, 0);
     }
 
     #[test]

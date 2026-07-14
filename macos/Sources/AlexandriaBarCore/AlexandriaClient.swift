@@ -366,6 +366,13 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(CodexDefaultRouteResponse.self, from: data)
     }
 
+    public func setHarnessToolCapture(_ name: String, enabled: Bool) async throws {
+        let encoded = encodedPathComponent(name)
+        _ = try await request(
+            "admin/harnesses/\(encoded)/tool-capture", method: "PUT",
+            body: body(["enabled": enabled]))
+    }
+
     public func setHarnessOverride(_ name: String, binary: String?, configDir: String?) async throws -> Harness {
         let encoded = encodedPathComponent(name)
         let data = try await request(
@@ -437,6 +444,17 @@ public struct AlexandriaClient: Sendable {
         return TraceBodyContent(
             text: String(data: data, encoding: .utf8) ?? "",
             diskPath: http?.value(forHTTPHeaderField: "x-alexandria-body-path"))
+    }
+
+    public func toolBody(id: String, kind: String) async throws -> TraceBodyContent {
+        var req = URLRequest(url: url("tools/\(id)/body/\(kind)"))
+        req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
+        let (data, response) = try await session.data(for: req)
+        let http = response as? HTTPURLResponse
+        guard (http?.statusCode ?? -1) < 400 else {
+            throw ClientError.http(http?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
+        }
+        return TraceBodyContent(text: String(data: data, encoding: .utf8) ?? "", diskPath: nil)
     }
 
     public func traceReplyMarkdown(traceId: String) async throws -> String {

@@ -5,6 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod plugins;
+pub use plugins::{PluginManager, PluginManifest};
+
 use anyhow::Result;
 use alex_auth::{
     now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
@@ -16,7 +19,7 @@ use alex_core::{
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
-use alex_store::{KnownAccount, Store, TraceFilter};
+use alex_store::{KnownAccount, Store, ToolCallRecord, TraceFilter};
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -175,6 +178,7 @@ pub struct AppState {
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
     pub reset_handler: std::sync::RwLock<Option<Arc<dyn ResetHandler>>>,
+    pub plugins: Arc<PluginManager>,
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -419,6 +423,7 @@ pub fn build_state(
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
         reset_handler: std::sync::RwLock::new(None),
+        plugins: Arc::new(PluginManager::empty()),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
     })
@@ -545,6 +550,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/{id}/body/{kind}", get(trace_body))
+        .route("/tools/{id}/body/{kind}", get(tool_body))
         .route("/traces/runs/{run_id}", get(traces_run_summary))
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
         .route(
@@ -575,6 +581,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_harness_event_key,
         ));
+    // Pi's authoritative extension hooks use the same harness capability as
+    // lifecycle events. Authentication happens before JSON buffering.
+    let tool_events = Router::new()
+        .route("/tool-events", post(tool_event))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_harness_event_key,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -588,6 +602,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models/{model_action}", post(gemini_generate))
         .merge(ingest)
         .merge(harness_events)
+        .merge(tool_events)
         .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
@@ -2026,17 +2041,34 @@ async fn traces_session_transcript(
         Ok(rows) => rows,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    let tools = match state.store.session_tool_calls(&session_id) {
+        Ok(rows) => rows,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut previous_codex_user_history: Option<String> = None;
     let turns: Vec<Value> = rows
         .iter()
         .take(limit)
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let signature = codex_user_history_signature(row);
             let replayed_user = signature.is_some() && signature == previous_codex_user_history;
             if signature.is_some() {
                 previous_codex_user_history = signature;
             }
             let mut turn = transcript_turn(row);
+            // Pi emits a tool start after the model response that requested it
+            // and before the next provider request. Associate by explicit
+            // trace_id when available, otherwise by that session-local time
+            // interval. `turn_id` remains on each tool row for Pi-level joins.
+            let next_request = rows.get(index + 1).and_then(|next| next["ts_request_ms"].as_i64());
+            let trace_id = row["id"].as_str();
+            let started = row["ts_request_ms"].as_i64().unwrap_or_default();
+            let executed: Vec<Value> = tools.iter().filter(|tool| {
+                tool["trace_id"].as_str() == trace_id || (tool["trace_id"].is_null()
+                    && tool["ts_start_ms"].as_i64().is_some_and(|ts| ts >= started && next_request.is_none_or(|next| ts < next)))
+            }).cloned().collect();
+            turn["executed_tools"] = json!(executed);
             if replayed_user {
                 turn["user"] = Value::Null;
             }
@@ -2161,6 +2193,25 @@ async fn trace_body(
             StatusCode::NOT_FOUND,
             &format!("no {kind} body stored for trace '{id}'"),
         ),
+    }
+}
+
+async fn tool_body(State(state): State<Arc<AppState>>, Path((id, kind)): Path<(String, String)>) -> Response {
+    let row = match state.store.get_tool_call(&id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'")),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let path = match kind.as_str() {
+        "args" => row["args_body_path"].as_str(),
+        "result" => row["result_body_path"].as_str(),
+        _ => return error_response(StatusCode::BAD_REQUEST, "kind must be args or result"),
+    };
+    match read_gz_text(path) {
+        Some(text) => Response::builder().status(StatusCode::OK)
+            .header("content-type", "application/json; charset=utf-8")
+            .body(Body::from(text)).unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        None => error_response(StatusCode::NOT_FOUND, &format!("no {kind} body stored for tool call '{id}'")),
     }
 }
 
@@ -4422,6 +4473,89 @@ fn normalize_harness_event(event: &mut Value) {
     }
 }
 
+fn redact_tool_value(value: &mut Value) {
+    const SECRET_KEYS: &[&str] = &["authorization", "token", "secret", "password", "api_key", "apikey", "cookie", "env", "environment"];
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if SECRET_KEYS.iter().any(|needle| lower.contains(needle)) {
+                    *value = Value::String("<redacted>".into());
+                } else { redact_tool_value(value); }
+            }
+        }
+        Value::Array(values) => {
+            let mut redact_next = false;
+            for value in values {
+                if redact_next { *value = Value::String("<redacted>".into()); redact_next = false; continue; }
+                if let Some(argument) = value.as_str() {
+                    let lower = argument.to_ascii_lowercase();
+                    redact_next = ["--token", "--api-key", "--apikey", "--password", "--secret"]
+                        .iter().any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")));
+                    if lower.starts_with("--token=") || lower.starts_with("--api-key=") || lower.starts_with("--password=") || lower.starts_with("--secret=") {
+                        *value = Value::String(format!("{}<redacted>", argument.split_once('=').map(|(k, _)| format!("{k}=")).unwrap_or_default()));
+                    }
+                } else { redact_tool_value(value); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_event_body(value: Option<Value>) -> Option<Vec<u8>> {
+    value.map(|mut value| { redact_tool_value(&mut value); serde_json::to_vec(&value).unwrap_or_default() })
+}
+
+async fn tool_event(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(event): axum::Json<Value>,
+) -> Response {
+    let (key_hash, key) = match authenticate_harness_event(&state, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    if let Err(error) = state.store.touch_run_key(&key_hash, now_ms()) { tracing::warn!(%error, "failed to touch harness key"); }
+    let harness = key.label.as_deref().unwrap_or_default();
+    let phase = event["phase"].as_str().unwrap_or_default();
+    if !matches!(phase, "start" | "end" | "turn_start" | "turn_end" | "agent_start" | "agent_end") { return error_response(StatusCode::BAD_REQUEST, "tool event phase is unsupported"); }
+    let session_id = match event["session_id"].as_str().filter(|id| valid_ingest_trace_id(id)) {
+        Some(id) => id.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires safe session_id"),
+    };
+    // Pi 0.80.6's AgentStartEvent and AgentEndEvent have no parent/child id;
+    // acknowledge them without fabricating a session_lineage edge.
+    if matches!(phase, "turn_start" | "turn_end" | "agent_start" | "agent_end") {
+        return axum::Json(json!({"ok": true, "session_id": session_id, "lineage_updated": false})).into_response();
+    }
+    let tool_call_id = match event["tool_call_id"].as_str().filter(|id| valid_ingest_trace_id(id)) {
+        Some(id) => id.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires safe tool_call_id"),
+    };
+    let tool_name = match event["tool_name"].as_str().filter(|name| !name.is_empty() && name.len() <= 200) {
+        Some(name) => name.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires tool_name"),
+    };
+    let ts_ms = event["timestamp_ms"].as_i64().filter(|ts| *ts > 0).unwrap_or_else(now_ms);
+    let id = format!("tool-{}-{}", session_id, tool_call_id).replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_', "_");
+    let args_body_path = match tool_event_body(event.get("args").cloned()) {
+        Some(bytes) => match state.store.write_body(&id, "tool-args.json", &bytes) { Ok(path) => Some(path), Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) },
+        None => None,
+    };
+    let result_body_path = match tool_event_body(event.get("result").cloned()) {
+        Some(bytes) => match state.store.write_body(&id, "tool-result.json", &bytes) { Ok(path) => Some(path), Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) },
+        None => None,
+    };
+    let record = ToolCallRecord {
+        id, harness: harness.to_string(), session_id, turn_id: event["turn_id"].as_str().map(String::from),
+        tool_call_id, trace_id: event["trace_id"].as_str().map(String::from), tool_name,
+        ts_start_ms: if phase == "start" { ts_ms } else { event["started_ms"].as_i64().unwrap_or(ts_ms) },
+        ts_end_ms: (phase == "end").then_some(ts_ms), is_error: event["is_error"].as_bool(),
+        exit_status: event["exit_status"].as_i64(), args_body_path, result_body_path,
+    };
+    match state.store.upsert_tool_call(&record) {
+        Ok(()) => axum::Json(json!({"ok": true})).into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
 fn touch_trace_ingest_key(state: &AppState, key: Option<&CachedRunKey>, headers: &HeaderMap) {
     if key.is_none() {
         return;
@@ -4731,6 +4865,11 @@ async fn proxy(
             return error_response(StatusCode::BAD_REQUEST, &format!("body is not JSON: {e}"))
         }
     };
+    let plugin_headers: serde_json::Map<String, Value> = headers.iter().filter_map(|(name, value)|
+        value.to_str().ok().map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
+    ).collect();
+    let plugin_request = state.plugins.invoke("on_request", json!({"headers": plugin_headers, "body": body_json}));
+    if let Some(mutated) = plugin_request.get("body").filter(|value| value.is_object()) { body_json = mutated.clone(); }
     let (reasoning_effort, thinking_budget) = trace_reasoning_fields(&body_json);
     trace.reasoning_effort = reasoning_effort;
     trace.thinking_budget = thinking_budget;
@@ -5632,6 +5771,7 @@ fn finalize_trace(
     if let Err(e) = store.insert_trace(&trace) {
         tracing::error!("failed to insert trace {}: {e}", trace.id);
     } else {
+        let _ = state.plugins.invoke("on_trace", serde_json::to_value(&trace).unwrap_or(Value::Null));
         tracing::info!(
             trace_id = %trace.id,
             status = trace.status,
@@ -5705,6 +5845,32 @@ mod tests {
         assert_eq!(body["in_flight_requests"][0]["model"], "gpt-5.5");
         assert_eq!(body["in_flight_requests"][0]["session_id"], "session-123");
         assert_eq!(body["in_flight_requests"][0]["harness"], "codex");
+    }
+
+    #[test]
+    fn tool_payload_redacts_argv_and_environment_secrets() {
+        let bytes = tool_event_body(Some(json!({
+            "argv": ["curl", "--token", "super-secret"],
+            "env": {"API_KEY": "also-secret"}
+        }))).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["argv"][2], "<redacted>");
+        assert_eq!(value["env"], "<redacted>");
+    }
+
+    #[tokio::test]
+    async fn tool_ingest_requires_harness_key_and_persists_a_session_join() {
+        let state = test_state("tool-ingest");
+        let key = "tool-harness-key";
+        state.store.insert_run_key("rk-tool", &key_hash_hex(key), "harness", None, None, Some("pi"), now_ms(), None).unwrap();
+        let event = json!({"phase":"end", "session_id":"session", "turn_id":"1", "tool_call_id":"call", "tool_name":"bash", "args":{"command":"echo hi"}, "result":{"content":"hi"}, "is_error":false, "exit_status":0, "timestamp_ms":100});
+        let mut headers = HeaderMap::new(); headers.insert("x-api-key", HeaderValue::from_static(key));
+        let response = tool_event(State(state.clone()), headers, axum::Json(event)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows = state.store.session_tool_calls("session").unwrap();
+        assert_eq!(rows.len(), 1); assert_eq!(rows[0]["turn_id"], "1");
+        let response = tool_event(State(state), HeaderMap::new(), axum::Json(json!({}))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test(start_paused = true)]
