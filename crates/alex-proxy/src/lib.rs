@@ -56,8 +56,46 @@ pub trait DarioRouter: Send + Sync {
     }
     fn active(&self) -> Option<DarioActive>;
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>>;
+    fn prepare_model(&self, _model: &str) -> DarioPrepareFuture {
+        Box::pin(async { DarioPrepare::ServeThroughDario })
+    }
+    fn probe(&self, _model: &str) -> DarioProbeFuture {
+        Box::pin(async { Err("through-Dario probe is not implemented".into()) })
+    }
     fn status(&self) -> Value;
     fn suspect(&self, generation_id: &str);
+}
+
+pub type DarioPrepareFuture = Pin<Box<dyn Future<Output = DarioPrepare> + Send + 'static>>;
+pub type DarioProbeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DarioPrepare {
+    ServeThroughDario,
+    DirectFallback { reason: String },
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DarioHealthState {
+    NotApplicable,
+    Down,
+    Healthy,
+}
+
+pub fn dario_health_state(
+    anthropic_credentials_present: bool,
+    generation_ready: bool,
+    through_dario_probe_succeeds: bool,
+) -> DarioHealthState {
+    if !anthropic_credentials_present {
+        DarioHealthState::NotApplicable
+    } else if generation_ready && through_dario_probe_succeeds {
+        DarioHealthState::Healthy
+    } else {
+        DarioHealthState::Down
+    }
 }
 
 pub type UpdateApplyFuture =
@@ -527,6 +565,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/limits", get(admin_limits))
         .route("/admin/update", get(admin_update).post(admin_update_apply))
         .route("/admin/dario", get(admin_dario))
+        .route("/admin/dario/ping", post(admin_dario_ping))
         .route("/admin/dario/prompt-caches", get(admin_dario_prompt_caches))
         .route(
             "/admin/dario/prompt-caches/{key}",
@@ -1501,13 +1540,59 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
     match &state.dario {
         Some(d) => {
             let mut status = d.status();
+            let anthropic_credentials_present = state
+                .vault
+                .list()
+                .await
+                .into_iter()
+                .any(|account| account.provider == Provider::Anthropic && account.status == "active");
+            let generation_ready = d.active().is_some();
+            let probe_succeeds = status["generations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|generation| {
+                    generation["id"].as_str() == status["active_generation_id"].as_str()
+                        && generation["last_probe"]["ok"].as_bool() == Some(true)
+                });
             if let Some(obj) = status.as_object_mut() {
                 obj.insert("prompt_caches".into(), json!(dario_prompt_caches(&state)));
+                obj.insert(
+                    "health".into(),
+                    json!(dario_health_state(
+                        anthropic_credentials_present,
+                        generation_ready,
+                        probe_succeeds,
+                    )),
+                );
+                obj.insert(
+                    "anthropic_credentials_present".into(),
+                    json!(anthropic_credentials_present),
+                );
+                obj.insert("ping_path".into(), json!("/admin/dario/ping"));
             }
             axum::Json(status).into_response()
         }
         None => error_response(StatusCode::NOT_FOUND, "dario mode is not enabled"),
     }
+}
+
+async fn admin_dario_ping(State(state): State<Arc<AppState>>) -> Response {
+    let (health, ping) = ping_dario(&state, "claude-haiku-4-5").await;
+    let status = if health == DarioHealthState::Down {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(json!({
+            "health": health,
+            "generation_ready": state.dario.as_ref().and_then(|dario| dario.active()).is_some(),
+            "through_dario": ping,
+        })),
+    )
+        .into_response()
 }
 
 fn dario_prompt_cache_dir(state: &AppState) -> PathBuf {
@@ -2784,6 +2869,56 @@ pub async fn ping_provider(
     }
 }
 
+/// Probe the local Dario generation with a tiny Haiku completion.  The vault
+/// check is deliberately first: without Anthropic credentials Dario is not an
+/// applicable health target, rather than a failed one.
+pub async fn ping_dario(state: &Arc<AppState>, model: &str) -> (DarioHealthState, PingResult) {
+    let start = now_ms();
+    let account_id = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.provider == Provider::Anthropic && account.status == "active")
+        .map(|account| account.id);
+    let Some(account_id) = account_id else {
+        return (
+            dario_health_state(false, false, false),
+            PingResult {
+                provider: "dario",
+                account_id: None,
+                ok: true,
+                status: None,
+                latency_ms: now_ms() - start,
+                message: "not applicable: no Anthropic credentials".into(),
+            },
+        );
+    };
+    let generation_ready = state.dario.as_ref().and_then(|dario| dario.active()).is_some();
+    let result = match &state.dario {
+        Some(dario) if generation_ready => dario.probe(model).await,
+        Some(_) => Err("no healthy Dario generation".into()),
+        None => Err("Dario mode is not enabled".into()),
+    };
+    let probe_ok = result.is_ok();
+    let health = dario_health_state(true, generation_ready, probe_ok);
+    let message = match result {
+        Ok(()) => "through-Dario probe succeeded".into(),
+        Err(error) => error,
+    };
+    (
+        health,
+        PingResult {
+            provider: "dario",
+            account_id: Some(account_id),
+            ok: health == DarioHealthState::Healthy,
+            status: generation_ready.then_some(if probe_ok { 200 } else { 502 }),
+            latency_ms: now_ms() - start,
+            message,
+        },
+    )
+}
+
 fn extract_reply(text: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
         if let Some(t) = v["content"][0]["text"].as_str() {
@@ -3077,6 +3212,7 @@ struct UpstreamPlan {
     client_stream: bool,
     extra_headers: Vec<(String, String)>,
     dario_guard: Option<Box<dyn std::any::Any + Send>>,
+    dario_fallback_reason: Option<String>,
 }
 
 fn dario_account(active: &DarioActive) -> Account {
@@ -3098,6 +3234,46 @@ fn dario_account(active: &DarioActive) -> Account {
         cooldown_until_ms: None,
         status: "active".into(),
         path: None,
+    }
+}
+
+fn direct_anthropic_plan(
+    account: Account,
+    body_json: &mut Value,
+    original_body: &[u8],
+    routed_model: &str,
+    converted: Option<(Value, RespondAs)>,
+    client_stream: bool,
+    dario_fallback_reason: String,
+) -> UpstreamPlan {
+    let (body, respond_as) = match converted {
+        None => {
+            body_json["model"] = json!(routed_model);
+            (
+                serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec()),
+                None,
+            )
+        }
+        Some((mut converted, respond_as)) => {
+            converted["model"] = json!(routed_model);
+            converted["stream"] = json!(false);
+            (
+                serde_json::to_vec(&converted).unwrap_or_else(|_| original_body.to_vec()),
+                Some(respond_as),
+            )
+        }
+    };
+    UpstreamPlan {
+        url: format!("{ANTHROPIC_BASE}/v1/messages"),
+        account,
+        body,
+        upstream_format: "anthropic",
+        destream: false,
+        respond_as,
+        client_stream,
+        extra_headers: vec![],
+        dario_guard: None,
+        dario_fallback_reason: Some(dario_fallback_reason),
     }
 }
 
@@ -3258,13 +3434,13 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let (base, account, dario_guard, dario_capture) = if genuine_claude_code {
+            let (base, account, dario_guard, dario_capture, dario_fallback_reason) = if genuine_claude_code {
                 let account = state
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
                     .await
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                (ANTHROPIC_BASE.to_string(), account, None, false)
+                (ANTHROPIC_BASE.to_string(), account, None, false, None)
             } else {
                 let route_via_dario = state
                     .dario
@@ -3277,11 +3453,33 @@ async fn plan_upstream(
                         .account_for_excluding(provider, true, excluded_accounts)
                         .await
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None, false)
+                    (ANTHROPIC_BASE.to_string(), account, None, false, None)
                 } else {
                     let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
                     match (&state.dario, dario_active) {
                         (Some(dario), Some(active)) => {
+                            match dario.prepare_model(routed_model).await {
+                                DarioPrepare::ServeThroughDario => {}
+                                DarioPrepare::DirectFallback { reason } => {
+                                    let account = state
+                                        .vault
+                                        .account_for_excluding(provider, true, excluded_accounts)
+                                        .await
+                                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                                    return Ok(direct_anthropic_plan(
+                                        account,
+                                        body_json,
+                                        original_body,
+                                        routed_model,
+                                        converted,
+                                        client_stream,
+                                        reason,
+                                    ));
+                                }
+                                DarioPrepare::Unavailable { reason } => {
+                                    return Err((StatusCode::SERVICE_UNAVAILABLE, reason));
+                                }
+                            }
                             let guard = dario.begin(&active.generation_id).ok_or_else(|| {
                                 (
                                     StatusCode::SERVICE_UNAVAILABLE,
@@ -3294,6 +3492,7 @@ async fn plan_upstream(
                                 dario_account(&active),
                                 Some(guard),
                                 true,
+                                None,
                             )
                         }
                         (Some(_), None) => {
@@ -3344,6 +3543,7 @@ async fn plan_upstream(
                     vec![]
                 },
                 dario_guard,
+                dario_fallback_reason,
             })
         }
         Provider::Openai => {
@@ -3389,6 +3589,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::OpenaiChat => {
@@ -3408,6 +3609,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::OpenaiResponses => {
@@ -3434,6 +3636,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3458,6 +3661,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::GeminiGenerate => {
@@ -3483,6 +3687,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
             }
@@ -3512,6 +3717,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers,
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3532,6 +3738,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers,
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
@@ -3562,6 +3769,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3580,6 +3788,7 @@ async fn plan_upstream(
                         client_stream,
                         extra_headers: vec![],
                         dario_guard: None,
+                        dario_fallback_reason: None,
                     })
                 }
                 ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
@@ -3670,6 +3879,7 @@ async fn plan_upstream(
                 client_stream,
                 extra_headers: vec![],
                 dario_guard: None,
+                dario_fallback_reason: None,
             })
         }
     }
@@ -4132,6 +4342,16 @@ fn merge_run_key_tags(key_tags: Option<&str>, header_tags: Option<&str>) -> Opti
     } else {
         serde_json::to_string(&Value::Object(merged)).ok()
     }
+}
+
+fn merge_trace_note(tags: Option<String>, key: &str, value: &str) -> Option<String> {
+    let mut object = tags
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(key.to_string(), Value::String(value.to_string()));
+    serde_json::to_string(&Value::Object(object)).ok()
 }
 
 fn run_key_entry(state: &AppState, key_hash: &str) -> Option<CachedRunKey> {
@@ -5019,6 +5239,9 @@ async fn proxy(
         }
     };
     trace.upstream_format = Some(plan.upstream_format.into());
+    if let Some(reason) = &plan.dario_fallback_reason {
+        trace.tags = merge_trace_note(trace.tags.take(), "dario_fallback", reason);
+    }
     bind_trace_account(&state.store, &mut trace, &plan.account);
     trace.billing_bucket = Some(
         if plan.account.kind == "oauth" || plan.account.kind == "dario" {
@@ -5845,6 +6068,24 @@ mod tests {
         assert_eq!(body["in_flight_requests"][0]["model"], "gpt-5.5");
         assert_eq!(body["in_flight_requests"][0]["session_id"], "session-123");
         assert_eq!(body["in_flight_requests"][0]["harness"], "codex");
+    }
+
+    #[test]
+    fn dario_health_state_follows_credentials_generation_and_probe() {
+        assert_eq!(
+            dario_health_state(false, true, true),
+            DarioHealthState::NotApplicable
+        );
+        assert_eq!(dario_health_state(true, false, true), DarioHealthState::Down);
+        assert_eq!(dario_health_state(true, true, false), DarioHealthState::Down);
+        assert_eq!(dario_health_state(true, true, true), DarioHealthState::Healthy);
+    }
+
+    #[test]
+    fn dario_direct_fallback_reason_is_retained_in_trace_tags() {
+        let tags = merge_trace_note(None, "dario_fallback", "warm timed out").unwrap();
+        let value: Value = serde_json::from_str(&tags).unwrap();
+        assert_eq!(value["dario_fallback"], "warm timed out");
     }
 
     #[test]

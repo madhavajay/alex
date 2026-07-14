@@ -250,7 +250,10 @@ mod tests {
 
     async fn fixture(name: &str) -> (Config, PathBuf, Vault, Store) {
         let home = tmpdir(name);
-        let config = Config::defaults_for(home.clone());
+        let mut config = Config::defaults_for(home.clone());
+        // Reset tests exercise offline cleanup.  Never accidentally talk to a
+        // developer's daemon on the default port while doing so.
+        config.port = 0;
         let config_path = home.join("config.toml");
         save_config_at(&config, &config_path).unwrap();
         let vault = Vault::open(home.join("accounts")).unwrap();

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use alex_core::{Pricing, TraceRecord};
+use alex_core::{route_model, Pricing, Provider, TraceRecord};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use flate2::write::GzEncoder;
@@ -12,6 +12,25 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 static BODY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Anthropic models are derived from the same embedded pricing catalogue used
+/// to seed the store.  Keeping this here prevents Dario (or any other caller)
+/// from growing a second, eventually-stale Claude list.
+pub fn anthropic_catalog_models() -> Vec<String> {
+    let models: Vec<Value> = serde_json::from_str(include_str!("models.json"))
+        .expect("embedded models.json must be valid");
+    let mut result: Vec<String> = models
+        .into_iter()
+        .filter_map(|entry| entry["model"].as_str().map(str::to_string))
+        .filter_map(|model| {
+            let (provider, routed) = route_model(&model);
+            (provider == Some(Provider::Anthropic)).then_some(routed)
+        })
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS traces (
@@ -2542,4 +2561,27 @@ fn seed_pricing(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_models_follow_the_shared_catalogue() {
+        let catalogue: Vec<Value> = serde_json::from_str(include_str!("models.json")).unwrap();
+        let expected: Vec<String> = catalogue
+            .into_iter()
+            .filter_map(|entry| entry["model"].as_str().map(str::to_string))
+            .filter_map(|model| {
+                let (provider, routed) = route_model(&model);
+                (provider == Some(Provider::Anthropic)).then_some(routed)
+            })
+            .collect();
+        let actual = anthropic_catalog_models();
+        for model in expected {
+            assert!(actual.contains(&model), "missing catalogue model {model}");
+        }
+        assert!(actual.contains(&"claude-fable-5".to_string()));
+    }
 }

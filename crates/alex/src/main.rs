@@ -1149,6 +1149,23 @@ impl alex_proxy::DarioRouter for DarioGlue {
             .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
     }
 
+    fn prepare_model(&self, model: &str) -> alex_proxy::DarioPrepareFuture {
+        let supervisor = self.supervisor.clone();
+        let model = model.to_string();
+        Box::pin(async move {
+            match supervisor.prepare_model(&model).await {
+                Some(reason) => alex_proxy::DarioPrepare::DirectFallback { reason },
+                None => alex_proxy::DarioPrepare::ServeThroughDario,
+            }
+        })
+    }
+
+    fn probe(&self, model: &str) -> alex_proxy::DarioProbeFuture {
+        let supervisor = self.supervisor.clone();
+        let model = model.to_string();
+        Box::pin(async move { supervisor.through_dario_probe(&model).await })
+    }
+
     fn status(&self) -> serde_json::Value {
         let mut status = self.supervisor.status();
         status["route_enabled"] = serde_json::json!(self.route_enabled);
@@ -1176,6 +1193,16 @@ impl alex_proxy::DarioRouter for DarioUnavailable {
 
     fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
         None
+    }
+
+    fn prepare_model(&self, _model: &str) -> alex_proxy::DarioPrepareFuture {
+        let error = self.error.clone();
+        Box::pin(async move { alex_proxy::DarioPrepare::Unavailable { reason: error } })
+    }
+
+    fn probe(&self, _model: &str) -> alex_proxy::DarioProbeFuture {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
     }
 
     fn status(&self) -> serde_json::Value {
@@ -2714,6 +2741,7 @@ async fn main() -> Result<()> {
                 config.upstream_stream_idle_timeout(),
             );
             let models = config.ping_models();
+            let wants_dario = target == "all" || target == "dario";
             let providers: Vec<alex_core::Provider> = if target == "all" {
                 let mut seen = Vec::new();
                 for a in state.vault.list().await {
@@ -2732,18 +2760,29 @@ async fn main() -> Result<()> {
                     }
                 }
                 seen
+            } else if target == "dario" {
+                vec![]
             } else {
                 vec![
                     alex_core::Provider::from_str_loose(&target).with_context(|| {
-                        format!("unknown target '{target}' (anthropic|openai|grok|openrouter|all)")
+                        format!("unknown target '{target}' (anthropic|openai|grok|openrouter|dario|all)")
                     })?,
                 ]
             };
-            if providers.is_empty() {
+            if providers.is_empty() && !wants_dario {
                 println!("no pingable accounts — run `alexandria auth import`");
                 return Ok(());
             }
-            let results = run_pings(&state, &models, &providers).await;
+            let mut results = if providers.is_empty() {
+                vec![]
+            } else {
+                run_pings(&state, &models, &providers).await
+            };
+            if wants_dario {
+                let dario = ping_dario_daemon(&config).await;
+                println!("{}", ping_done_line(&dario));
+                results.push(dario);
+            }
             let ok = results.iter().filter(|r| r.ok).count();
             let summary = format!("{ok}/{} providers healthy", results.len());
             if ok == results.len() {
@@ -5928,6 +5967,67 @@ fn ping_done_line(r: &alex_proxy::PingResult) -> String {
         ui::pad_left(&ui::sand(&format!("{}ms", r.latency_ms)), 7),
         ui::dim(&flat)
     )
+}
+
+async fn ping_dario_daemon(config: &Config) -> alex_proxy::PingResult {
+    let started = now_ms();
+    let endpoint = format!("{}/admin/dario/ping", config.base_url().trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return alex_proxy::PingResult {
+                provider: "dario",
+                account_id: None,
+                ok: false,
+                status: None,
+                latency_ms: now_ms() - started,
+                message: error.to_string(),
+            }
+        }
+    };
+    match client
+        .post(endpoint)
+        .header("x-api-key", &config.local_key)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.bytes().await.unwrap_or_default();
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.get("through_dario").cloned())
+                .and_then(|value| {
+                    Some(alex_proxy::PingResult {
+                        provider: "dario",
+                        account_id: value["account_id"].as_str().map(String::from),
+                        ok: value["ok"].as_bool()?,
+                        status: value["status"].as_u64().map(|status| status as u16),
+                        latency_ms: value["latency_ms"].as_i64()?,
+                        message: value["message"].as_str()?.to_string(),
+                    })
+                })
+                .unwrap_or_else(|| alex_proxy::PingResult {
+                    provider: "dario",
+                    account_id: None,
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: now_ms() - started,
+                    message: String::from_utf8_lossy(&body).chars().take(200).collect(),
+                })
+        }
+        Err(error) => alex_proxy::PingResult {
+            provider: "dario",
+            account_id: None,
+            ok: false,
+            status: None,
+            latency_ms: now_ms() - started,
+            message: format!("dario ping could not reach daemon: {error}"),
+        },
+    }
 }
 
 async fn run_pings(

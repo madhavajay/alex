@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 
 const NPM_PACKAGE: &str = "@askalf/dario";
@@ -27,6 +28,54 @@ const PROBE_TOTAL_TIMEOUT_MS: u64 = 30_000;
 const PROBE_BODY_SNIPPET_MAX: usize = 256;
 const SUSPECT_DEBOUNCE_MS: i64 = 5_000;
 const RESPAWN_RETRY_MS: i64 = 10_000;
+const CACHE_WARM_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptCacheState {
+    Warm,
+    Cold,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CacheWarmResult {
+    Ready,
+    TimedOut,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DarioRequestDecision {
+    ServeThroughDario,
+    DirectFallback { reason: String },
+}
+
+/// Deliberately pure: callers can choose their I/O seam while this policy is
+/// tested without Node, Claude, or Anthropic credentials.
+fn dario_request_decision(
+    cache: PromptCacheState,
+    warm: Option<CacheWarmResult>,
+) -> DarioRequestDecision {
+    match (cache, warm) {
+        (PromptCacheState::Warm, _) | (PromptCacheState::Cold, Some(CacheWarmResult::Ready)) => {
+            DarioRequestDecision::ServeThroughDario
+        }
+        (PromptCacheState::Cold, Some(CacheWarmResult::TimedOut)) => {
+            DarioRequestDecision::DirectFallback {
+                reason: format!("dario prompt-cache warm timed out after {CACHE_WARM_TIMEOUT_MS}ms"),
+            }
+        }
+        (PromptCacheState::Cold, Some(CacheWarmResult::Failed(error))) => {
+            DarioRequestDecision::DirectFallback {
+                reason: format!("dario prompt-cache warm failed: {error}"),
+            }
+        }
+        // A cold cache must never be served before the warm attempt completes.
+        (PromptCacheState::Cold, None) => DarioRequestDecision::DirectFallback {
+            reason: "dario prompt-cache warm was not attempted".into(),
+        },
+    }
+}
+
 pub struct DarioSettings {
     pub install_root: PathBuf,
     pub log_root: PathBuf,
@@ -668,12 +717,89 @@ impl DarioSupervisor {
         let gens = self.generations.lock().unwrap().clone();
         json!({
             "available": active_id.is_some(),
+            "known_models": alex_store::anthropic_catalog_models(),
             "runtime": "node",
             "runtime_version": self.runtime.version,
             "runtime_path": self.runtime.bin,
             "active_generation_id": active_id,
             "generations": gens.iter().map(|g| g.status_json()).collect::<Vec<_>>(),
         })
+    }
+
+    /// Ensure Dario has captured the model-specific Claude prompt before a
+    /// client request is allowed through it.  `Some(reason)` means the caller
+    /// must use its direct-Anthropic fallback and retain this reason on trace.
+    pub async fn prepare_model(&self, model: &str) -> Option<String> {
+        let cache = if prompt_cache_is_warm(&self.settings.prompt_cache_root, model) {
+            PromptCacheState::Warm
+        } else {
+            PromptCacheState::Cold
+        };
+        let warm = match cache {
+            PromptCacheState::Warm => None,
+            PromptCacheState::Cold => Some(self.warm_prompt_cache(model).await),
+        };
+        match dario_request_decision(cache, warm) {
+            DarioRequestDecision::ServeThroughDario => None,
+            DarioRequestDecision::DirectFallback { reason } => Some(reason),
+        }
+    }
+
+    /// A tiny completion sent to the active local Dario listener.  This is
+    /// intentionally separate from `/health`: it verifies Dario's real
+    /// Anthropic path, not merely that Node has a listening socket.
+    pub async fn through_dario_probe(&self, model: &str) -> Result<(), String> {
+        let active = self
+            .active()
+            .ok_or_else(|| "no healthy Dario generation".to_string())?;
+        let (outcome, _) = probe_messages(
+            &active.base_url,
+            &active.api_key,
+            model,
+            Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS),
+            Duration::from_millis(PROBE_TOTAL_TIMEOUT_MS),
+        )
+        .await;
+        outcome.is_ready().then_some(()).ok_or_else(|| outcome.summary())
+    }
+
+    async fn warm_prompt_cache(&self, model: &str) -> CacheWarmResult {
+        let Some(active) = self.active() else {
+            return CacheWarmResult::Failed("no healthy Dario generation".into());
+        };
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS))
+            .timeout(Duration::from_millis(CACHE_WARM_TIMEOUT_MS))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => return CacheWarmResult::Failed(error.to_string()),
+        };
+        let request = client
+            .post(format!("{}/v1/messages", active.base_url))
+            .header("x-api-key", active.api_key)
+            .header("x-dario-capture-id", format!("dario-warm-{}", prompt_cache_key(model)))
+            .header("x-dario-capture-model", model)
+            .json(&json!({
+                "model": model,
+                "max_tokens": 1,
+                "stream": false,
+                "messages": [{"role": "user", "content": "Reply: ok"}],
+            }));
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                if prompt_cache_is_warm(&self.settings.prompt_cache_root, model) {
+                    CacheWarmResult::Ready
+                } else {
+                    CacheWarmResult::Failed(
+                        "Dario completed the warm request without writing a prompt cache".into(),
+                    )
+                }
+            }
+            Ok(response) => CacheWarmResult::Failed(format!("Dario warm request returned {}", response.status())),
+            Err(error) if error.is_timeout() => CacheWarmResult::TimedOut,
+            Err(error) => CacheWarmResult::Failed(error.to_string()),
+        }
     }
 
     fn write_update_state(&self, latest: &str, active_version: Option<&str>) {
@@ -948,6 +1074,11 @@ impl DarioSupervisor {
             .env(
                 "ALEXANDRIA_DARIO_PROMPT_CACHE_DIR",
                 &self.settings.prompt_cache_root,
+            )
+            .env(
+                "ALEXANDRIA_DARIO_KNOWN_MODELS",
+                serde_json::to_string(&alex_store::anthropic_catalog_models())
+                    .expect("catalogue model names serialize"),
             )
             .env("ALEXANDRIA_DARIO_WORK_DIR", &work_dir)
             .env("NODE_OPTIONS", node_options)
@@ -1323,6 +1454,41 @@ fn snippet(text: &str) -> String {
     text[..end].to_string()
 }
 
+fn prompt_cache_key(model: &str) -> String {
+    let slug = model
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let slug = if slug.is_empty() { "model" } else { &slug };
+    let digest = Sha256::digest(model.as_bytes());
+    let hash = digest.iter().take(6).map(|b| format!("{b:02x}")).collect::<String>();
+    format!("{slug}-{hash}")
+}
+
+fn prompt_cache_is_warm(root: &Path, model: &str) -> bool {
+    let path = root.join(format!("{}.json", prompt_cache_key(model)));
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let Ok(entry) = serde_json::from_str::<Value>(&raw) else { return false };
+    if entry["model"].as_str() != Some(model)
+        || entry["system_prompt"].as_str().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let Some(captured_at) = entry["captured_at"].as_str() else { return false };
+    let Ok(captured) = captured_at.parse::<chrono::DateTime<chrono::Utc>>() else {
+        return false;
+    };
+    chrono::Utc::now()
+        .signed_duration_since(captured)
+        .num_milliseconds()
+        < 24 * 60 * 60 * 1000
+}
+
 fn should_probe(now: i64, last_probe_at: i64, probe_in_flight: bool) -> bool {
     !probe_in_flight && now - last_probe_at >= SUSPECT_DEBOUNCE_MS
 }
@@ -1465,6 +1631,12 @@ const { syncBuiltinESMExports } = require('node:module');
 
 const captureDir = process.env.ALEXANDRIA_DARIO_CAPTURE_DIR || '';
 const promptCacheDir = process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_DIR || '';
+// Rust supplies this from alex-store/models.json.  It is intentionally data,
+// not a second hand-maintained list: every catalogue Claude model is eligible
+// for capture and a new model is visible to this generation immediately.
+const knownModels = new Set((() => {
+  try { return JSON.parse(process.env.ALEXANDRIA_DARIO_KNOWN_MODELS || '[]'); } catch { return []; }
+})());
 const idPattern = /^[A-Za-z0-9._-]{1,128}$/;
 const modelPattern = /^[A-Za-z0-9._:[\]-]{1,160}$/;
 const promptCacheTtlMs = 24 * 60 * 60 * 1000;
@@ -1591,6 +1763,7 @@ function promptCacheMeta(entry, file, status, applied, error) {
     last_used_at: entry?.last_used_at,
     system_prompt_chars: entry?.system_prompt_chars,
     agent_identity_chars: entry?.agent_identity_chars,
+    known_model: entry?.model ? knownModels.has(entry.model) : undefined,
     claude_version: entry?.claude_version,
     error: error ? String(error) : undefined,
   };
@@ -2503,4 +2676,41 @@ mod tests {
             probe_messages(&base, "key", "model", Duration::from_millis(500), FAST).await;
         assert!(matches!(outcome, ProbeOutcome::Wedged { .. }));
     }
+
+    #[test]
+    fn dario_model_set_comes_from_the_shared_catalogue() {
+        let models = alex_store::anthropic_catalog_models();
+        assert!(models.contains(&"claude-opus-4-8".to_string()));
+        assert!(models.contains(&"claude-sonnet-5".to_string()));
+        assert!(models.contains(&"claude-haiku-4-5".to_string()));
+        assert!(models.contains(&"claude-fable-5".to_string()));
+    }
+
+    #[test]
+    fn cold_cache_is_warmed_before_serving() {
+        assert_eq!(
+            dario_request_decision(PromptCacheState::Cold, Some(CacheWarmResult::Ready)),
+            DarioRequestDecision::ServeThroughDario
+        );
+        assert_eq!(
+            dario_request_decision(PromptCacheState::Warm, None),
+            DarioRequestDecision::ServeThroughDario
+        );
+    }
+
+    #[test]
+    fn warm_timeout_falls_back_with_a_traceable_reason() {
+        let decision = dario_request_decision(
+            PromptCacheState::Cold,
+            Some(CacheWarmResult::TimedOut),
+        );
+        match decision {
+            DarioRequestDecision::DirectFallback { reason } => {
+                assert!(reason.contains("timed out"));
+                assert!(reason.contains(&CACHE_WARM_TIMEOUT_MS.to_string()));
+            }
+            other => panic!("expected direct fallback, got {other:?}"),
+        }
+    }
+
 }
