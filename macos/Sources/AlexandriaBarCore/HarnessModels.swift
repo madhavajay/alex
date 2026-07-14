@@ -16,6 +16,8 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
     public let supportsConnect: Bool
     public let override: HarnessOverride?
     public let daemonReachable: Bool
+    public let defaultRoute: String?
+    public let backupPath: String?
 
     public var id: String { name }
 
@@ -30,7 +32,9 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         connected: Bool,
         supportsConnect: Bool,
         override: HarnessOverride?,
-        daemonReachable: Bool
+        daemonReachable: Bool,
+        defaultRoute: String? = nil,
+        backupPath: String? = nil
     ) {
         self.name = name
         self.installed = installed
@@ -43,6 +47,8 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         self.supportsConnect = supportsConnect
         self.override = override
         self.daemonReachable = daemonReachable
+        self.defaultRoute = defaultRoute
+        self.backupPath = backupPath
     }
 
     enum CodingKeys: String, CodingKey {
@@ -52,6 +58,8 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         case configDirExists = "config_dir_exists"
         case supportsConnect = "supports_connect"
         case daemonReachable = "daemon_reachable"
+        case defaultRoute = "default_route"
+        case backupPath = "backup_path"
     }
 
     public static func missing(name: String) -> Harness {
@@ -88,6 +96,7 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
     public let key: String
     public let baseUrl: String
     public let keyId: String?
+    public let description: String?
 
     public init(
         refreshed: Bool? = nil,
@@ -98,7 +107,8 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
         unchanged: Int,
         key: String,
         baseUrl: String,
-        keyId: String? = nil
+        keyId: String? = nil,
+        description: String? = nil
     ) {
         self.refreshed = refreshed
         self.path = path
@@ -109,10 +119,11 @@ public struct HarnessConfigWriteResponse: Codable, Sendable, Equatable {
         self.key = key
         self.baseUrl = baseUrl
         self.keyId = keyId
+        self.description = description
     }
 
     enum CodingKeys: String, CodingKey {
-        case refreshed, path, added, removed, unchanged, key
+        case refreshed, path, added, removed, unchanged, key, description
         case modelsTotal = "models_total"
         case baseUrl = "base_url"
         case keyId = "key_id"
@@ -187,6 +198,16 @@ public struct HarnessPlanResponse: Codable, Sendable, Equatable {
 
     public init(plan: [HarnessPlanStep]) {
         self.plan = plan
+    }
+}
+
+public struct CodexDefaultRouteResponse: Codable, Sendable, Equatable {
+    public let defaultRoute: String
+    public let restartRequired: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case defaultRoute = "default_route"
+        case restartRequired = "restart_required"
     }
 }
 

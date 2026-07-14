@@ -326,10 +326,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildHarnesses() {
         guard store.harnessesSupported == true else { return }
-        // Keep the menu-bar surface limited to the user-tested Pi workflow.
-        // Settings and the daemon catalog still retain every supported harness.
+        // Only show harnesses with a complete connect/update/disconnect workflow.
         let installed = HarnessCatalog.rows(store.harnesses).filter {
-            $0.installed && $0.name.caseInsensitiveCompare("pi") == .orderedSame
+            $0.installed && $0.supportsConnect
         }
         guard !installed.isEmpty else { return }
         let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
@@ -376,6 +375,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let configDir = harness.configDir, !configDir.isEmpty {
             info(configDir)
         }
+        if harness.name == "codex", harness.connected {
+            info("Profiles: codex --profile openai · codex --profile alex")
+            if let backupPath = harness.backupPath, !backupPath.isEmpty {
+                info("Backup: \(backupPath)")
+            }
+        }
         sub.addItem(.separator())
         if harness.supportsConnect, !harness.connected {
             action(HarnessActionKind.connect.label, symbol: "arrow.down.circle") { [weak self] in
@@ -387,6 +392,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             self?.openPreferences(section: .harnesses)
         }
         if harness.connected {
+            if harness.name == "codex" {
+                let useAlex = harness.defaultRoute == "alex"
+                let toggle = NSMenuItem(
+                    title: "Use Alexandria by Default",
+                    action: #selector(runHandler(_:)), keyEquivalent: "")
+                toggle.target = self
+                toggle.state = useAlex ? .on : .off
+                toggle.image = NSImage(
+                    systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)
+                toggle.representedObject = MenuHandler { [weak self] in
+                    self?.setCodexDefaultRoute(useAlex ? "openai" : "alex")
+                }
+                sub.addItem(toggle)
+            }
             action(HarnessActionKind.refresh.label, symbol: "arrow.triangle.2.circlepath") {
                 [weak self] in
                 guard let self else { return }
@@ -401,6 +420,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             self?.openTraceBrowser(harness: harness.name)
         }
         return sub
+    }
+
+    private func setCodexDefaultRoute(_ route: String) {
+        guard let config = store.config else { return }
+        Task { [weak self] in
+            do {
+                _ = try await AlexandriaClient(config: config).setCodexDefaultRoute(route)
+                await self?.store.refresh()
+                self?.notify(
+                    title: "Codex default updated",
+                    body: route == "alex"
+                        ? "New Codex sessions use Alexandria."
+                        : "New Codex sessions use normal OpenAI authentication.")
+            } catch {
+                self?.notify(title: "Could not update Codex default", body: error.localizedDescription)
+            }
+        }
     }
 
     private func buildAnalytics() {

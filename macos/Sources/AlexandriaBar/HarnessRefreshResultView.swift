@@ -222,29 +222,43 @@ struct HarnessActionResultView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 ForEach(steps) { step in
-                    HStack(alignment: .top, spacing: 8) {
-                        planMarkView(mark)
-                            .frame(width: 14, height: 14)
-                            .padding(.top, 2)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(step.action.uppercased())
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(actionTint(step.action))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(actionTint(step.action).opacity(0.12), in: Capsule())
-                                Text(step.detail)
-                                    .font(.system(size: 11))
-                                    .lineLimit(2)
-                            }
-                            Text(step.path)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                    if step.action == "about" {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(Color.accentColor)
+                                .padding(.top, 1)
+                            Text(step.detail)
+                                .font(.system(size: 11))
+                                .fixedSize(horizontal: false, vertical: true)
                                 .textSelection(.enabled)
-                                .help(step.path)
+                        }
+                        .padding(10)
+                        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    } else {
+                        HStack(alignment: .top, spacing: 8) {
+                            planMarkView(mark)
+                                .frame(width: 14, height: 14)
+                                .padding(.top, 2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(step.action.uppercased())
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(actionTint(step.action))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(actionTint(step.action).opacity(0.12), in: Capsule())
+                                    Text(step.detail)
+                                        .font(.system(size: 11))
+                                        .lineLimit(2)
+                                }
+                                Text(step.path)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                                    .help(step.path)
+                            }
                         }
                     }
                 }
@@ -299,6 +313,20 @@ struct HarnessConfigWriteSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let description = result.description, !description.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                    Text(description)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .padding(10)
+                .background(
+                    Color.accentColor.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 8))
+            }
             labeled("Path") {
                 Text(result.path)
                     .font(.system(size: 11, design: .monospaced))

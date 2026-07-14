@@ -206,7 +206,7 @@ import Testing
         let json = #"""
         {"harnesses":[
           {"name":"pi","installed":true,"binary":"/opt/alex/pi","version":"0.80.3","version_warning":null,"config_dir":"/Users/x/.pi/agent","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":null,"config_dir":null},"daemon_reachable":true,"extra":"ignored"},
-          {"name":"codex","installed":false,"binary":null,"version":null,"version_warning":"install codex >= 1.2","config_dir":null,"config_dir_exists":false,"connected":false,"supports_connect":true,"override":{"binary":"/tmp/codex","config_dir":null},"daemon_reachable":true}
+          {"name":"codex","installed":true,"binary":"/opt/alex/codex","version":"0.144.3","version_warning":null,"config_dir":"/Users/x/.codex","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":"/tmp/codex","config_dir":null},"daemon_reachable":true,"default_route":"alex","backup_path":"/Users/x/.codex/alexandria-original-config.toml"}
         ],"extra":"ignored"}
         """#
         let harnesses = try decode(json, as: HarnessesResponse.self).harnesses
@@ -215,14 +215,16 @@ import Testing
         #expect(harnesses[0].versionWarning == nil)
         #expect(harnesses[0].override?.binary == nil)
         #expect(harnesses[0].connected)
-        #expect(harnesses[1].versionWarning == "install codex >= 1.2")
+        #expect(harnesses[1].versionWarning == nil)
         #expect(harnesses[1].override?.binary == "/tmp/codex")
-        #expect(!harnesses[1].configDirExists)
+        #expect(harnesses[1].configDirExists)
+        #expect(harnesses[1].defaultRoute == "alex")
+        #expect(harnesses[1].backupPath?.hasSuffix("alexandria-original-config.toml") == true)
     }
 
     @Test func harnessRefreshConfigResponse() throws {
         let json = #"""
-        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100"}
+        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100","description":"Alexandria adds alex/* models."}
         """#
         let response = try decode(json, as: HarnessConfigWriteResponse.self)
         #expect(response.refreshed == true)
@@ -234,6 +236,7 @@ import Testing
         #expect(response.key == "reused")
         #expect(response.path.hasSuffix("models.json"))
         #expect(response.baseUrl == "http://127.0.0.1:4100")
+        #expect(response.description == "Alexandria adds alex/* models.")
     }
 
     @Test func harnessConnectConfigWriteResponse() throws {

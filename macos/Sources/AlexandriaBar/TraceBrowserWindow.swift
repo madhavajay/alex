@@ -19,6 +19,7 @@ final class TraceBrowserModel {
     private var sessionsFingerprint = ""
     private var turnsFingerprint = ""
     private var rowsById: [String: SessionRow] = [:]
+    private var collapsedLineageRoots = Set<String>()
     private var allTurns: [TranscriptTurn] = []
     private var selectionState = SessionSelection()
 
@@ -28,6 +29,9 @@ final class TraceBrowserModel {
         didSet { recomputeVisible() }
     }
     var showPings = false {
+        didSet { recomputeVisible() }
+    }
+    var nestSubagents = true {
         didSet { recomputeVisible() }
     }
     var queryText = "" {
@@ -223,8 +227,20 @@ final class TraceBrowserModel {
         BarLog.measure(.browser, label: "filter sessions=\(sessions.count)") {
             visibleRows = SessionTable.visibleRows(
                 sessions: sessions, rowsById: rowsById, showPings: showPings,
-                query: query, serverMatches: searchSessionIds, sortOrder: sortOrder)
+                query: query, serverMatches: searchSessionIds, sortOrder: sortOrder,
+                nestSubagents: nestSubagents, collapsedRoots: collapsedLineageRoots)
         }
+    }
+
+    func isLineageCollapsed(_ sessionId: String) -> Bool {
+        collapsedLineageRoots.contains(sessionId)
+    }
+
+    func toggleLineage(_ sessionId: String) {
+        if !collapsedLineageRoots.insert(sessionId).inserted {
+            collapsedLineageRoots.remove(sessionId)
+        }
+        recomputeVisible()
     }
 
     private var newestVisibleRow: SessionRow? {
@@ -796,6 +812,9 @@ struct TraceBrowserView: View {
                 .help("The selected transcript refreshes automatically")
             Toggle("Show pings", isOn: $model.showPings)
                 .controlSize(.small)
+            Toggle("Nest sub-agents", isOn: $model.nestSubagents)
+                .controlSize(.small)
+                .help("Group Codex sub-agent sessions under their parent session")
             Toggle("Details", isOn: detailsBinding)
                 .toggleStyle(.switch)
                 .controlSize(.small)
@@ -1035,7 +1054,10 @@ private struct SessionListView: View {
                 pinned: model.pinned && row.id == model.selectedSessionId,
                 showPingBadge: model.showPings && row.isPingOrTest,
                 accountName: model.accountNames(row.accountIds),
-                accountIdentity: model.accountIdentity(row.accountIds))
+                accountIdentity: model.accountIdentity(row.accountIds),
+                nestSubagents: model.nestSubagents,
+                lineageCollapsed: model.isLineageCollapsed(row.id),
+                toggleLineage: { model.toggleLineage(row.id) })
         }
         .width(min: 240)
         .customizationID("session")
@@ -1180,9 +1202,29 @@ private struct SessionCellView: View {
     let showPingBadge: Bool
     let accountName: String?
     let accountIdentity: String?
+    let nestSubagents: Bool
+    let lineageCollapsed: Bool
+    let toggleLineage: () -> Void
 
     var body: some View {
         HStack(spacing: 5) {
+            if nestSubagents, row.lineageDepth > 0 {
+                Spacer().frame(width: CGFloat(row.lineageDepth * 18))
+            }
+            if nestSubagents, row.childCount > 0 {
+                Button(action: toggleLineage) {
+                    Image(systemName: lineageCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .frame(width: 10)
+                }
+                .buttonStyle(.plain)
+                .help(lineageCollapsed ? "Show sub-agents" : "Hide sub-agents")
+            } else if nestSubagents, row.lineageDepth > 0 {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 10)
+            }
             HarnessIconView(harness: row.harnessRaw, tags: row.tags, size: 16)
             if !row.providers.isEmpty {
                 HStack(spacing: 3) {
@@ -1195,6 +1237,18 @@ private struct SessionCellView: View {
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if nestSubagents, row.childCount > 0 {
+                Text("\(row.childCount) agent\(row.childCount == 1 ? "" : "s")")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+            } else if nestSubagents, row.lineageDepth > 0 {
+                Text(row.agentType ?? "sub-agent")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.purple)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.purple.opacity(0.12)))
+            }
             if let accountName {
                 Text(accountName)
                     .font(.system(size: 9, weight: .medium))

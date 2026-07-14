@@ -178,6 +178,7 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 pub struct CachedRunKey {
     pub kind: String,
+    pub label: Option<String>,
     pub run_id: Option<String>,
     pub tags_json: Option<String>,
     pub expires_ms: Option<i64>,
@@ -395,6 +396,17 @@ async fn require_trace_ingest_key(
     }
 }
 
+async fn require_harness_event_key(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match authenticate_harness_event(&state, req.headers()) {
+        Ok(_) => next.run(req).await,
+        Err(response) => response,
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     // Control-plane + report routes: gated by the local key (sent as
     // `x-api-key: <key>` or `Authorization: Bearer <key>`) so a LAN/0.0.0.0
@@ -487,6 +499,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_trace_ingest_key,
         ));
+    // Harness hooks are authenticated before their JSON body is parsed. A
+    // harness key is scoped to its label, which becomes the lineage namespace.
+    let harness_events = Router::new()
+        .route("/harness-events", post(harness_event))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_harness_event_key,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -499,6 +519,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(openai_responses))
         .route("/v1beta/models/{model_action}", post(gemini_generate))
         .merge(ingest)
+        .merge(harness_events)
         .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
@@ -1834,6 +1855,30 @@ fn transcript_turn(row: &Value) -> Value {
     })
 }
 
+fn openai_responses_user_history_signature(request: &Value) -> Option<String> {
+    let history = request["input"]
+        .as_array()?
+        .iter()
+        .filter(|item| {
+            item["type"].as_str().unwrap_or("message") == "message"
+                && item["role"].as_str() == Some("user")
+        })
+        .map(|item| item["content"].clone())
+        .collect::<Vec<_>>();
+    (!history.is_empty())
+        .then(|| serde_json::to_string(&history).ok())
+        .flatten()
+}
+
+fn codex_user_history_signature(row: &Value) -> Option<String> {
+    if row["harness"].as_str() != Some("codex")
+        || row["client_format"].as_str() != Some("openai-responses")
+    {
+        return None;
+    }
+    openai_responses_user_history_signature(&read_gz_json(row["req_body_path"].as_str())?)
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -1848,7 +1893,23 @@ async fn traces_session_transcript(
         Ok(rows) => rows,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let turns: Vec<Value> = rows.iter().take(limit).map(transcript_turn).collect();
+    let mut previous_codex_user_history: Option<String> = None;
+    let turns: Vec<Value> = rows
+        .iter()
+        .take(limit)
+        .map(|row| {
+            let signature = codex_user_history_signature(row);
+            let replayed_user = signature.is_some() && signature == previous_codex_user_history;
+            if signature.is_some() {
+                previous_codex_user_history = signature;
+            }
+            let mut turn = transcript_turn(row);
+            if replayed_user {
+                turn["user"] = Value::Null;
+            }
+            turn
+        })
+        .collect();
     axum::Json(json!({"session_id": session_id, "turns": turns})).into_response()
 }
 
@@ -3417,8 +3478,9 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        session_from_metadata, trace_extras, trace_harness, trace_reasoning_fields,
-        transcript_assistant_blocks, transcript_turn, truncate_chars,
+        openai_responses_user_history_signature, session_from_metadata, trace_extras,
+        trace_harness, trace_reasoning_fields, transcript_assistant_blocks, transcript_turn,
+        truncate_chars,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
@@ -3533,6 +3595,26 @@ mod trace_api_tests {
         assert_eq!(blocks[1]["name"], "Shell");
         assert_eq!(blocks[2]["type"], "text");
         assert_eq!(blocks[2]["text"], "Here are the files.");
+    }
+
+    #[test]
+    fn responses_user_history_signature_changes_only_for_a_new_user_message() {
+        let request = |extra: Option<&str>| {
+            let mut input = vec![
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "context"}]}),
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "help me"}]}),
+                json!({"type": "custom_tool_call_output", "call_id": "call-1", "output": "done"}),
+            ];
+            if let Some(text) = extra {
+                input.push(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}));
+            }
+            json!({"input": input})
+        };
+        let first = openai_responses_user_history_signature(&request(None)).unwrap();
+        let tool_loop = openai_responses_user_history_signature(&request(None)).unwrap();
+        let next = openai_responses_user_history_signature(&request(Some("again"))).unwrap();
+        assert_eq!(first, tool_loop);
+        assert_ne!(first, next);
     }
 }
 
@@ -3868,6 +3950,7 @@ fn run_key_entry(state: &AppState, key_hash: &str) -> Option<CachedRunKey> {
     let row = state.store.lookup_run_key(key_hash, now).ok().flatten()?;
     let entry = CachedRunKey {
         kind: row["kind"].as_str().unwrap_or("run").to_string(),
+        label: row["label"].as_str().map(String::from),
         run_id: row["run_id"].as_str().map(String::from),
         tags_json: row["tags"]
             .as_object()
@@ -4049,6 +4132,90 @@ fn authenticate_trace_ingest(
         ));
     }
     Ok((key_hash.chars().take(16).collect(), Some(entry), false))
+}
+
+fn authenticate_harness_event(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, CachedRunKey), Response> {
+    let Some(key) = client_key(headers) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "harness events require an Alexandria harness key",
+        ));
+    };
+    let key_hash = key_hash_hex(&key);
+    let Some(entry) = run_key_entry(state, &key_hash) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "harness key expired, revoked, or unknown",
+        ));
+    };
+    if entry.kind != "harness" {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "harness events require a key minted with --kind harness",
+        ));
+    }
+    if entry.label.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "harness key is missing its harness label",
+        ));
+    }
+    Ok((key_hash, entry))
+}
+
+async fn harness_event(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(event): axum::Json<Value>,
+) -> Response {
+    let (key_hash, key) = match authenticate_harness_event(&state, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    if let Err(error) = state.store.touch_run_key(&key_hash, now_ms()) {
+        tracing::warn!("failed to touch harness key: {error}");
+    }
+    let harness = key.label.as_deref().unwrap_or_default();
+    let event_name = event["hook_event_name"]
+        .as_str()
+        .or_else(|| event["hookEventName"].as_str())
+        .unwrap_or_default();
+    if !matches!(
+        event_name,
+        "SessionStart" | "SubagentStart" | "SubagentStop" | "Stop"
+    ) {
+        return error_response(StatusCode::BAD_REQUEST, "unsupported harness hook event");
+    }
+    for field in ["session_id", "turn_id", "agent_id"] {
+        if let Some(id) = event[field].as_str() {
+            if !valid_ingest_trace_id(id) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("'{field}' must be a safe 1-200 character identifier"),
+                );
+            }
+        }
+    }
+    if matches!(event_name, "SubagentStart" | "SubagentStop")
+        && (event["session_id"].as_str().is_none() || event["agent_id"].as_str().is_none())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "subagent events require session_id and agent_id",
+        );
+    }
+    match state.store.record_harness_event(harness, &event, now_ms()) {
+        Ok(lineage_updated) => axum::Json(json!({
+            "ok": true,
+            "harness": harness,
+            "lineage_updated": lineage_updated,
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 fn touch_trace_ingest_key(state: &AppState, key: Option<&CachedRunKey>, headers: &HeaderMap) {
@@ -4412,11 +4579,28 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
 
+    // Codex emits SubagentStart before the child's first request. Resolve that
+    // child to the lineage root so every descendant prefers the same upstream
+    // account while retaining its own session id in traces.
+    let affinity_session_id = trace.session_id.as_ref().map(|session_id| {
+        if trace.harness.as_deref() == Some("codex") {
+            state
+                .store
+                .session_lineage_root("codex", session_id)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, %session_id, "could not resolve Codex session lineage");
+                    session_id.clone()
+                })
+        } else {
+            session_id.clone()
+        }
+    });
+
     // Capture this before planning binds a brand-new session. The policy only
     // suppresses failover for a thread that arrived with an existing affinity;
     // an unaffined first request may still fail over and then pin its winner.
     let codex_thread_was_affined = provider == Provider::Openai
-        && preferred_codex_account(&state, trace.session_id.as_deref()).is_some();
+        && preferred_codex_account(&state, affinity_session_id.as_deref()).is_some();
     let allow_mid_thread_failover = state
         .vault
         .policy(Provider::Openai)
@@ -4433,7 +4617,7 @@ async fn proxy(
         &body,
         &trace_id,
         &attempted_accounts,
-        trace.session_id.as_deref(),
+        affinity_session_id.as_deref(),
         &headers,
     )
     .await
@@ -4586,7 +4770,7 @@ async fn proxy(
                     &body,
                     &trace_id,
                     &attempted_accounts,
-                    trace.session_id.as_deref(),
+                    affinity_session_id.as_deref(),
                     &headers,
                 )
                 .await
@@ -6119,6 +6303,7 @@ mod tests {
 
         let entry = run_key_entry(&state, &hash).unwrap();
         assert_eq!(entry.expires_ms, None);
+        assert_eq!(entry.label.as_deref(), Some("pi"));
         assert_eq!(entry.tags_json.as_deref(), Some(r#"{"harness":"pi"}"#));
 
         let (_status, listed) =
@@ -6155,6 +6340,54 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]["message"].as_str().unwrap().contains("label"));
+    }
+
+    #[tokio::test]
+    async fn codex_harness_event_records_authenticated_lineage() {
+        let state = test_state("codex-harness-event");
+        let (status, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({"kind": "harness", "label": "codex"}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "Bearer {}",
+                created["key"].as_str().unwrap()
+            ))
+            .unwrap(),
+        );
+        let (status, body) = response_json(
+            harness_event(
+                State(state.clone()),
+                headers,
+                axum::Json(json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": "parent-session",
+                    "turn_id": "turn-1",
+                    "agent_id": "child-session",
+                    "agent_type": "default",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["harness"], "codex");
+        assert_eq!(body["lineage_updated"], true);
+        assert_eq!(
+            state
+                .store
+                .session_lineage_root("codex", "child-session")
+                .unwrap(),
+            "parent-session"
+        );
     }
 
     #[tokio::test]
