@@ -157,9 +157,10 @@ struct TranscriptTextPane: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
             let url = link as? URL ?? (link as? String).flatMap(URL.init(string:))
-            guard let url, let traceId = TraceLink.traceId(from: url) else { return false }
-            model?.openInspector(traceId: traceId)
-            return true
+            guard let url else { return false }
+            if let traceId = TraceLink.traceId(from: url) { model?.openInspector(traceId: traceId); return true }
+            if let target = ToolLink.target(from: url) { model?.openToolBody(id: target.id, kind: target.kind); return true }
+            return false
         }
 
         private weak var scroll: NSScrollView?

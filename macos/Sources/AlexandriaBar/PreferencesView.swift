@@ -1386,6 +1386,7 @@ private struct HarnessRowView: View {
     @State private var showOverride = false
     @State private var actionModel: HarnessActionSheetModel?
     @State private var routeUpdating = false
+    @State private var toolCaptureUpdating = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1425,6 +1426,14 @@ private struct HarnessRowView: View {
                         .help(
                             "Plain `codex` follows this setting. Explicit --profile openai and --profile alex commands always remain available."
                         )
+                }
+                if harness.name == "pi", harness.connected {
+                    Toggle("Capture tools", isOn: Binding(
+                        get: { harness.toolCaptureEnabled ?? false },
+                        set: { setToolCapture($0) }))
+                        .toggleStyle(.switch).controlSize(.small)
+                        .disabled(toolCaptureUpdating || actionModel != nil)
+                        .help("Opt in to storing Pi tool arguments and results locally. Secrets are redacted before storage.")
                 }
                 if harness.supportsConnect {
                     if harness.connected {
@@ -1503,6 +1512,16 @@ private struct HarnessRowView: View {
                 self.error = error.localizedDescription
             }
             routeUpdating = false
+        }
+    }
+
+    private func setToolCapture(_ enabled: Bool) {
+        guard let config = store.config else { return }
+        toolCaptureUpdating = true; error = nil
+        Task {
+            do { try await AlexandriaClient(config: config).setHarnessToolCapture(harness.name, enabled: enabled); await store.refresh() }
+            catch { self.error = error.localizedDescription }
+            toolCaptureUpdating = false
         }
     }
 }

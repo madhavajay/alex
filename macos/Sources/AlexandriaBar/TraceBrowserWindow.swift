@@ -110,6 +110,14 @@ final class TraceBrowserModel {
         return content
     }
 
+    func openToolBody(id: String, kind: String) {
+        Task {
+            guard let client = client(), let body = try? await client.toolBody(id: id, kind: kind) else { return }
+            let alert = NSAlert(); alert.messageText = "Tool \(kind)"; alert.informativeText = BodyPretty.display(body.text).text
+            alert.addButton(withTitle: "Close"); alert.runModal()
+        }
+    }
+
     var firstRequestHeaders: [HeaderPair] {
         TraceHeaders.sortedPairs(firstTraceDetail?.trace.reqHeadersJson)
     }

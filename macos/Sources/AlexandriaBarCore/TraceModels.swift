@@ -88,6 +88,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let assistant: String?
     public let toolCalls: [ToolCall]?
     public let assistantBlocks: [AssistantBlock]?
+    public let executedTools: [ExecutedTool]?
 
     public var id: String { traceId }
 
@@ -104,7 +105,34 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case accountId = "account_id"
         case toolCalls = "tool_calls"
         case assistantBlocks = "assistant_blocks"
+        case executedTools = "executed_tools"
     }
+}
+
+public struct ExecutedTool: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let toolName: String
+    public let turnId: String?
+    public let tsStartMs: Int64
+    public let tsEndMs: Int64?
+    public let isError: Bool?
+    public let exitStatus: Int?
+    public let argsBodyPath: String?
+    public let resultBodyPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case toolName = "tool_name"
+        case turnId = "turn_id"
+        case tsStartMs = "ts_start_ms"
+        case tsEndMs = "ts_end_ms"
+        case isError = "is_error"
+        case exitStatus = "exit_status"
+        case argsBodyPath = "args_body_path"
+        case resultBodyPath = "result_body_path"
+    }
+
+    public var duration: String? { TurnHeader.duration(requestMs: tsStartMs, responseMs: tsEndMs) }
 }
 
 public struct AssistantBlock: Codable, Sendable, Equatable {
@@ -403,6 +431,19 @@ public enum TraceLink {
         let raw = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
         let id = raw.removingPercentEncoding ?? raw
         return id.isEmpty ? nil : id
+    }
+}
+
+public enum ToolLink {
+    public static func url(id: String, kind: String) -> URL? {
+        var components = URLComponents(); components.scheme = "alexandria"; components.host = "tool"
+        components.path = "/\(id)/\(kind)"; return components.url
+    }
+    public static func target(from url: URL) -> (id: String, kind: String)? {
+        guard url.scheme == "alexandria", url.host == "tool" else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard parts.count == 2, ["args", "result"].contains(parts[1]) else { return nil }
+        return (parts[0], parts[1])
     }
 }
 
@@ -1973,6 +2014,19 @@ public enum TranscriptRender {
                 appendNice(arguments, to: out, keyAttrs: toolKey, valueAttrs: tool)
             }
         }
+        func appendExecutedTool(_ execution: ExecutedTool) {
+            var facts = [execution.toolName]
+            if let exit = execution.exitStatus { facts.append("exit \(exit)") }
+            if execution.isError == true { facts.append("error") }
+            if let duration = execution.duration { facts.append(duration) }
+            out.append(NSAttributedString(string: "⚙ \(facts.joined(separator: " · "))\n", attributes: toolLabel))
+            if execution.argsBodyPath != nil { out.append(NSAttributedString(string: "arguments captured\n", attributes: tool)) }
+            if execution.resultBodyPath != nil {
+                var attrs = tool
+                if let url = ToolLink.url(id: execution.id, kind: "result") { attrs[.link] = url }
+                out.append(NSAttributedString(string: "output captured — view output\n", attributes: attrs))
+            }
+        }
         var ranges: [TurnRange] = []
         for (index, turn) in turns.enumerated() {
             let turnStart = out.length
@@ -2060,6 +2114,7 @@ public enum TranscriptRender {
                     appendTool(name: call.name, arguments: call.arguments)
                 }
             }
+            for execution in turn.executedTools ?? [] { appendExecutedTool(execution) }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }

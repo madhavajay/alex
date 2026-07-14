@@ -13,6 +13,7 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
     public let configDir: String?
     public let configDirExists: Bool
     public let connected: Bool
+    public let toolCaptureEnabled: Bool?
     public let supportsConnect: Bool
     public let override: HarnessOverride?
     public let daemonReachable: Bool
@@ -30,6 +31,7 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         configDir: String?,
         configDirExists: Bool,
         connected: Bool,
+        toolCaptureEnabled: Bool = false,
         supportsConnect: Bool,
         override: HarnessOverride?,
         daemonReachable: Bool,
@@ -44,6 +46,7 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         self.configDir = configDir
         self.configDirExists = configDirExists
         self.connected = connected
+        self.toolCaptureEnabled = toolCaptureEnabled
         self.supportsConnect = supportsConnect
         self.override = override
         self.daemonReachable = daemonReachable
@@ -57,6 +60,7 @@ public struct Harness: Codable, Sendable, Identifiable, Equatable {
         case configDir = "config_dir"
         case configDirExists = "config_dir_exists"
         case supportsConnect = "supports_connect"
+        case toolCaptureEnabled = "tool_capture_enabled"
         case daemonReachable = "daemon_reachable"
         case defaultRoute = "default_route"
         case backupPath = "backup_path"
