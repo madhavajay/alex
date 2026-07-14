@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 public enum BarLog {
     public enum Category: String, CaseIterable, Sendable {
@@ -64,10 +66,12 @@ public enum BarLog {
         fileBytes > limit
     }
 
+    #if canImport(os)
     private static let subsystem = "com.alexandria.bar"
     private static let netLogger = Logger(subsystem: subsystem, category: "net")
     private static let browserLogger = Logger(subsystem: subsystem, category: "browser")
     private static let uiLogger = Logger(subsystem: subsystem, category: "ui")
+    #endif
 
     private static let queue = DispatchQueue(label: "com.alexandria.bar.log")
     nonisolated(unsafe) private static var handle: FileHandle?
@@ -78,6 +82,7 @@ public enum BarLog {
         return f
     }()
 
+    #if canImport(os)
     private static func logger(_ category: Category) -> Logger {
         switch category {
         case .net: netLogger
@@ -85,14 +90,17 @@ public enum BarLog {
         case .ui: uiLogger
         }
     }
+    #endif
 
     private static func log(_ level: Level, _ category: Category, _ message: String) {
+        #if canImport(os)
         let logger = logger(category)
         switch level {
         case .info: logger.info("\(message, privacy: .public)")
         case .warn: logger.warning("\(message, privacy: .public)")
         case .error: logger.error("\(message, privacy: .public)")
         }
+        #endif
         let line = formatLine(timestamp: Date(), level: level, category: category, message: message)
         queue.async { appendLocked(line + "\n") }
     }

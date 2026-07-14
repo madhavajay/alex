@@ -206,6 +206,7 @@ import Testing
         #expect(TranscriptRender.plan(previous: pendingState, turns: [a, done, c]) == .rebuild)
     }
 
+    #if canImport(AppKit)
     @Test func documentContents() {
         let turns = [
             makeTurn(
@@ -245,6 +246,8 @@ import Testing
         #expect(doc.length > 500 * 8000)
         #expect(elapsed < .seconds(10))
     }
+
+    #endif
 
     @Test func windowStartIndex() {
         let small = (0..<10).map { makeTurn(id: "t\($0)", assistant: "x") }

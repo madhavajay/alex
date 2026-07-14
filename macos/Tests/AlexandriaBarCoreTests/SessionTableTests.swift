@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(SwiftUI)
 import SwiftUI
+#endif
 import Testing
 @testable import AlexandriaBarCore
 
@@ -218,6 +220,7 @@ import Testing
         #expect(!machine.pinned)
     }
 
+    #if canImport(SwiftUI)
     @Test func customizationRoundtrip() throws {
         var customization = TableColumnCustomization<SessionRow>()
         customization[visibility: "errors"] = .visible
@@ -229,4 +232,5 @@ import Testing
         #expect(decoded[visibility: "harness"] == .hidden)
         #expect(decoded[visibility: "tags"] == .automatic)
     }
+    #endif
 }
