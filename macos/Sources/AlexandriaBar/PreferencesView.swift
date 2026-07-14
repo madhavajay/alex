@@ -30,6 +30,7 @@ struct PreferencesView: View {
         UpdateChannelSetting.stable.rawValue
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
+    @State private var showingResetSheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,6 +58,9 @@ struct PreferencesView: View {
             }
         }
         .frame(width: 780, height: 680)
+        .sheet(isPresented: $showingResetSheet) {
+            ResetSettingsSheet(store: store)
+        }
     }
 
     @ViewBuilder
@@ -122,6 +126,15 @@ struct PreferencesView: View {
                     .foregroundStyle(.secondary)
                 .textSelection(.enabled)
             }
+        }
+        Section("Reset Alexandria") {
+            Text("Remove selected Alexandria data after reviewing a real-count dry run.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Button("Reset…", role: .destructive) {
+                showingResetSheet = true
+            }
+            .disabled(store.config == nil)
         }
         Section("Proxy credentials") {
             Text("Copy credentials for generic API clients, or a ready-to-edit command that mints a tagged run key. Both use the currently loaded local daemon settings.")
@@ -352,6 +365,145 @@ private struct ProviderPreferencesDetail: View {
         }
 
         ProviderRoutingPreferencesSection(store: store, provider: provider, accounts: accounts, routing: routing)
+    }
+}
+
+private struct ResetSettingsSheet: View {
+    let store: SnapshotStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var selection = ResetSelection()
+    @State private var plan: ResetResponse?
+    @State private var busy = false
+    @State private var error: String?
+    @State private var confirmed = false
+    @State private var applied = false
+
+    private var hasSelection: Bool {
+        selection.credentials || selection.settings || selection.traces
+            || selection.harnesses || selection.cache
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Reset Alexandria")
+                .font(.title2.weight(.semibold))
+            Text("Choose the data to remove. Alexandria first runs a dry run with real counts; you can only apply the reset after reviewing it.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Provider logins & credentials", isOn: $selection.credentials)
+                Toggle("Settings", isOn: $selection.settings)
+                Toggle("Trace history", isOn: $selection.traces)
+                Toggle("Uninstall from all harnesses", isOn: $selection.harnesses)
+                Text("This is the only option that edits files outside Alexandria (in ~/.claude, ~/.codex, and ~/.pi).")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 22)
+                Toggle("Cached data", isOn: $selection.cache)
+            }
+
+            Text("Your update channel is preserved, so beta users stay on beta.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            if let plan {
+                counts(plan.counts)
+                Toggle(
+                    "I understand the selected data will be permanently removed.",
+                    isOn: $confirmed)
+                    .font(.system(size: 11))
+            } else {
+                Text("Run the dry run to see the scale of this reset before it can be applied.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            if let error {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+            if applied {
+                Text("Reset complete.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.green)
+            }
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .disabled(busy)
+                Spacer()
+                Button(plan == nil ? "Run dry run" : "Run dry run again") {
+                    runDryRun()
+                }
+                .disabled(!hasSelection || busy || applied)
+                if plan != nil {
+                    Button("Reset now", role: .destructive) {
+                        applyReset()
+                    }
+                    .disabled(!confirmed || busy || applied)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 540)
+        .onChange(of: selection) {
+            plan = nil
+            confirmed = false
+            error = nil
+        }
+    }
+
+    @ViewBuilder
+    private func counts(_ counts: ResetCounts) -> some View {
+        GroupBox("Dry-run counts") {
+            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 5) {
+                GridRow { Text("Accounts"); Text("\(counts.accounts)") }
+                GridRow { Text("Traces"); Text("\(counts.traces)") }
+                GridRow {
+                    Text("Cached body data")
+                    Text("\(counts.bodies.bytes.formatted()) bytes (\(ByteCountFormatter.string(fromByteCount: counts.bodies.bytes, countStyle: .file)))")
+                }
+                GridRow { Text("Connected harnesses"); Text("\(counts.connectedHarnesses)") }
+            }
+            .font(.system(size: 11))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func runDryRun() {
+        guard let config = store.config else { return }
+        busy = true
+        error = nil
+        confirmed = false
+        Task {
+            do {
+                plan = try await AlexandriaClient(config: config).resetPlan(selection)
+            } catch {
+                self.error = "Could not get reset counts: \(error.localizedDescription)"
+            }
+            busy = false
+        }
+    }
+
+    private func applyReset() {
+        guard let config = store.config, plan != nil, confirmed else { return }
+        busy = true
+        error = nil
+        Task {
+            do {
+                _ = try await AlexandriaClient(config: config).reset(selection)
+                if selection.settings {
+                    AppSettingsReset.clear()
+                }
+                applied = true
+                await store.refresh()
+            } catch {
+                self.error = "Could not apply reset: \(error.localizedDescription)"
+            }
+            busy = false
+        }
     }
 }
 

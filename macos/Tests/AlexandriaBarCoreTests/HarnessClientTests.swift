@@ -422,6 +422,54 @@ import Testing
         #expect(result.removed == ["alex/claude-opus-4-8"])
         #expect(result.path.hasSuffix("models.json"))
     }
+
+    @Test func resetPostsAllCategoriesForDryRunAndApplyAndDecodesPlan() async throws {
+        var requests = 0
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/reset")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            #expect(request.value(forHTTPHeaderField: "content-type") == "application/json")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["credentials"] as? Bool == true)
+            #expect(json["settings"] as? Bool == false)
+            #expect(json["traces"] as? Bool == true)
+            #expect(json["harnesses"] as? Bool == true)
+            #expect(json["cache"] as? Bool == false)
+            let dryRun = try #require(json["dry_run"] as? Bool)
+            #expect(dryRun == (requests == 0))
+            requests += 1
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"""
+            {"dry_run":\#(dryRun),"applied":\#(!dryRun),"selected":["credentials","traces","harnesses"],"counts":{"accounts":2,"run_keys":4,"traces":12,"heartbeats":3,"bodies":{"files":5,"bytes":123456},"connected_harnesses":2,"pricing":8,"dario_prompt_cache":{"files":1,"bytes":44}},"harnesses":["claude","codex"],"actions":{"credentials":"remove account JSON; retain removed-accounts tombstones and known_accounts; revoke active run keys","settings":null,"traces":"delete traces and heartbeats; remove data_dir/bodies recursively","harnesses":"disconnect each connected harness through alex harness disconnect","cache":null},"settings":{"preserves_update_channel":false,"preserves_local_key":false,"rotates_local_key":false}}
+            """#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        let selection = ResetSelection(credentials: true, traces: true, harnesses: true)
+
+        let plan = try await client.resetPlan(selection)
+        #expect(plan.dryRun)
+        #expect(!plan.applied)
+        #expect(plan.counts.accounts == 2)
+        #expect(plan.counts.traces == 12)
+        #expect(plan.counts.bodies.bytes == 123_456)
+        #expect(plan.counts.connectedHarnesses == 2)
+        #expect(plan.harnesses == ["claude", "codex"])
+
+        let result = try await client.reset(selection)
+        #expect(!result.dryRun)
+        #expect(result.applied)
+        #expect(requests == 2)
+    }
 }
 
 private func requestBody(_ request: URLRequest) throws -> Data {

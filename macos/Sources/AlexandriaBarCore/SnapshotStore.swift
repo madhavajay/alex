@@ -237,33 +237,7 @@ public final class SnapshotStore {
             return out
         }
 
-        for account in accounts {
-            let name = ProviderInfo.displayName(account.provider)
-            if account.status != "active" {
-                out.append(StoreAlert(
-                    id: "acct-\(account.id)-status", severity: .critical,
-                    title: "\(name) account \(account.status)",
-                    body: "\(account.id) needs re-auth", provider: account.provider))
-            } else if account.isExpired, account.kind == "oauth" {
-                let hint = account.provider == "xai"
-                    ? "Run the grok CLI to refresh, then re-import"
-                    : "Token expired — re-auth if requests fail"
-                out.append(StoreAlert(
-                    id: "acct-\(account.id)-expired", severity: .warning,
-                    title: "\(name) token expired",
-                    body: hint, provider: account.provider))
-            }
-        }
-
-        for account in healthAccounts {
-            if let hb = account.lastHeartbeat, !hb.ok {
-                out.append(StoreAlert(
-                    id: "hb-\(account.id)", severity: .critical,
-                    title: "\(ProviderInfo.displayName(account.provider)) failing health checks",
-                    body: hb.message ?? "heartbeat failed (status \(hb.status.map(String.init) ?? "?"))",
-                    provider: account.provider))
-            }
-        }
+        out += Self.authAndHealthAlerts(accounts: accounts, healthAccounts: healthAccounts)
 
         for provider in limits {
             for window in provider.windows ?? [] {
@@ -293,5 +267,61 @@ public final class SnapshotStore {
         }
 
         return out
+    }
+
+    /// Account IDs are shared by `/admin/accounts` and `/admin/health`; merge auth and
+    /// heartbeat evidence for one account instead of presenting two symptoms of one failure.
+    static func authAndHealthAlerts(
+        accounts: [Account], healthAccounts: [HealthAccount]
+    ) -> [StoreAlert] {
+        let failedHeartbeatIDs = Set(healthAccounts.compactMap { account in
+            account.lastHeartbeat?.ok == false ? account.id : nil
+        })
+        var authAlertIDs: Set<String> = []
+        var alerts: [StoreAlert] = []
+
+        for account in accounts {
+            let heartbeatFailed = failedHeartbeatIDs.contains(account.id)
+            let name = ProviderInfo.displayName(account.provider)
+            if account.status != "active" {
+                authAlertIDs.insert(account.id)
+                alerts.append(StoreAlert(
+                    id: "acct-\(account.id)-status", severity: .critical,
+                    title: "\(name) account \(account.status)",
+                    body: heartbeatFailed
+                        ? "Requests are failing — re-authentication is required."
+                        : "\(account.id) needs re-auth",
+                    provider: account.provider))
+            } else if account.isExpired, account.kind == "oauth" {
+                authAlertIDs.insert(account.id)
+                let hint: String
+                if heartbeatFailed {
+                    hint = account.provider == "xai"
+                        ? "Requests are failing — re-authentication is required. Run the grok CLI to refresh, then re-import."
+                        : "Requests are failing — re-authentication is required."
+                } else {
+                    hint = account.provider == "xai"
+                        ? "Run the grok CLI to refresh, then re-import"
+                        : "Token expired — re-auth if requests fail"
+                }
+                alerts.append(StoreAlert(
+                    id: "acct-\(account.id)-expired",
+                    severity: heartbeatFailed ? .critical : .warning,
+                    title: "\(name) token expired",
+                    body: hint, provider: account.provider))
+            }
+        }
+
+        for account in healthAccounts {
+            guard !authAlertIDs.contains(account.id),
+                  let hb = account.lastHeartbeat, !hb.ok
+            else { continue }
+            alerts.append(StoreAlert(
+                id: "hb-\(account.id)", severity: .critical,
+                title: "\(ProviderInfo.displayName(account.provider)) failing health checks",
+                body: hb.message ?? "heartbeat failed (status \(hb.status.map(String.init) ?? "?"))",
+                provider: account.provider))
+        }
+        return alerts
     }
 }
