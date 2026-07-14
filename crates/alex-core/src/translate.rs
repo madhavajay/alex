@@ -515,9 +515,7 @@ pub fn openai_chat_response_to_anthropic(resp: &Value, model: &str) -> Value {
         .as_i64()
         .unwrap_or(0);
     let id = resp["id"].as_str().unwrap_or("");
-    let msg_id = id
-        .strip_prefix("chatcmpl-")
-        .unwrap_or(id);
+    let msg_id = id.strip_prefix("chatcmpl-").unwrap_or(id);
     json!({
         "id": if msg_id.is_empty() { "msg_chat".to_string() } else { format!("msg_{msg_id}") },
         "type": "message",
@@ -862,7 +860,10 @@ pub fn parse_openai_chat_sse_final(sse: &str) -> Option<Value> {
                     tool_calls.push((
                         tc["id"].as_str().unwrap_or("").to_string(),
                         tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                        tc["function"]["arguments"].as_str().unwrap_or("").to_string(),
+                        tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
                     ));
                 }
             }
@@ -2036,8 +2037,6 @@ mod tests {
         );
     }
 
-    use super::*;
-
     #[test]
     fn chat_to_anthropic_basic() {
         let req = json!({
@@ -2204,7 +2203,10 @@ mod tests {
         });
         let out = anthropic_to_openai_chat(&req);
         assert_eq!(out["model"], "grok-4");
-        assert_eq!(out["messages"][0], json!({"role": "system", "content": "be brief"}));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "system", "content": "be brief"})
+        );
         assert_eq!(out["messages"][1], json!({"role": "user", "content": "hi"}));
         assert_eq!(out["max_tokens"], 512);
         assert_eq!(out["temperature"], 0.5);
@@ -2248,7 +2250,10 @@ mod tests {
         assert_eq!(asst["content"], "checking");
         assert_eq!(asst["tool_calls"][0]["id"], "call_1");
         assert_eq!(asst["tool_calls"][0]["function"]["name"], "get_weather");
-        assert_eq!(asst["tool_calls"][0]["function"]["arguments"], "{\"city\":\"SF\"}");
+        assert_eq!(
+            asst["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"SF\"}"
+        );
         let tool = &out["messages"][3];
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["tool_call_id"], "call_1");
@@ -2269,7 +2274,10 @@ mod tests {
         let back = openai_chat_to_anthropic(&out);
         assert_eq!(back["messages"][1]["content"][1]["type"], "tool_use");
         assert_eq!(back["messages"][1]["content"][1]["id"], "call_1");
-        assert_eq!(back["messages"][1]["content"][1]["input"], json!({"city": "SF"}));
+        assert_eq!(
+            back["messages"][1]["content"][1]["input"],
+            json!({"city": "SF"})
+        );
         assert_eq!(back["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(back["messages"][2]["content"][0]["tool_use_id"], "call_1");
     }
@@ -2353,7 +2361,10 @@ mod tests {
         assert_eq!(out["type"], "message");
         assert_eq!(out["role"], "assistant");
         assert_eq!(out["model"], "grok-4");
-        assert_eq!(out["content"][0], json!({"type": "text", "text": "hi there"}));
+        assert_eq!(
+            out["content"][0],
+            json!({"type": "text", "text": "hi there"})
+        );
         assert_eq!(out["content"][1]["type"], "tool_use");
         assert_eq!(out["content"][1]["id"], "t1");
         assert_eq!(out["content"][1]["name"], "f");

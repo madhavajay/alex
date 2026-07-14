@@ -6,11 +6,11 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
-    codex_device_poll_once, codex_device_start, codex_exchange_named, generate_pkce,
-    openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
-    xai_upsert_from_tokens, CodexDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
-    OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
+    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto, codex_device_poll_once,
+    codex_device_start, codex_exchange_named, generate_pkce, openai_authorize_url,
+    wait_for_openai_callback, xai_device_poll_once, xai_device_start, xai_upsert_from_tokens,
+    CodexDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL,
+    OPENAI_REDIRECT_URI,
 };
 use crate::{named_account_id, now_ms, Vault};
 
@@ -76,13 +76,20 @@ fn random_id() -> String {
 }
 
 impl LoginManager {
-    pub async fn start(&self, vault: Arc<Vault>, provider: &str, account_name: &str) -> Result<Value> {
+    pub async fn start(
+        &self,
+        vault: Arc<Vault>,
+        provider: &str,
+        account_name: &str,
+    ) -> Result<Value> {
         self.prune().await;
         validate_account_name(account_name)?;
         let id = random_id();
         let shared = match provider {
             "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, account_name))),
-            "codex" | "openai" | "chatgpt" => self.start_codex(&id, vault.clone(), account_name).await?,
+            "codex" | "openai" | "chatgpt" => {
+                self.start_codex(&id, vault.clone(), account_name).await?
+            }
             "grok" | "xai" => self.start_grok(&id, vault.clone(), account_name).await?,
             "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
             "amp" | "ampcode" => {
@@ -164,11 +171,21 @@ impl LoginManager {
             .clone()
             .context("session has no verifier")?;
         match claude_exchange(&vault, &verifier, input).await {
-            Ok(account_id) => match rename_login_account(&vault, &account_id, &session.account_name).await {
-                Ok(account_id) => session.phase = LoginPhase::Done { account_id },
-                Err(e) => session.phase = LoginPhase::Failed { error: e.to_string() },
-            },
-            Err(e) => session.phase = LoginPhase::Failed { error: e.to_string() },
+            Ok(account_id) => {
+                match rename_login_account(&vault, &account_id, &session.account_name).await {
+                    Ok(account_id) => session.phase = LoginPhase::Done { account_id },
+                    Err(e) => {
+                        session.phase = LoginPhase::Failed {
+                            error: e.to_string(),
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                session.phase = LoginPhase::Failed {
+                    error: e.to_string(),
+                }
+            }
         }
         Ok(session.snapshot())
     }
@@ -192,7 +209,12 @@ impl LoginManager {
         }
     }
 
-    async fn start_codex(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
+    async fn start_codex(
+        &self,
+        id: &str,
+        vault: Arc<Vault>,
+        account_name: &str,
+    ) -> Result<SharedSession> {
         let listener = tokio::net::TcpListener::bind(OPENAI_CALLBACK_ADDR)
             .await
             .with_context(|| {
@@ -221,21 +243,25 @@ impl LoginManager {
         let account_name = account_name.to_string();
         tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
-            let phase = match tokio::time::timeout(
-                deadline,
-                wait_for_openai_callback(&listener, &state),
-            )
-            .await
-            {
-                Ok(Ok(code)) => match codex_exchange_named(&vault, &verifier, &code, &account_name).await {
-                    Ok(account_id) => LoginPhase::Done { account_id },
-                    Err(e) => LoginPhase::Failed { error: e.to_string() },
-                },
-                Ok(Err(e)) => LoginPhase::Failed { error: e.to_string() },
-                Err(_) => LoginPhase::Failed {
-                    error: "timed out waiting for the browser callback".into(),
-                },
-            };
+            let phase =
+                match tokio::time::timeout(deadline, wait_for_openai_callback(&listener, &state))
+                    .await
+                {
+                    Ok(Ok(code)) => {
+                        match codex_exchange_named(&vault, &verifier, &code, &account_name).await {
+                            Ok(account_id) => LoginPhase::Done { account_id },
+                            Err(e) => LoginPhase::Failed {
+                                error: e.to_string(),
+                            },
+                        }
+                    }
+                    Ok(Err(e)) => LoginPhase::Failed {
+                        error: e.to_string(),
+                    },
+                    Err(_) => LoginPhase::Failed {
+                        error: "timed out waiting for the browser callback".into(),
+                    },
+                };
             worker.lock().await.phase = phase;
         });
         Ok(shared)
@@ -291,9 +317,7 @@ impl LoginManager {
                             },
                         }
                     }
-                    CodexDevicePoll::Failed(error) => {
-                        break LoginPhase::Failed { error }
-                    }
+                    CodexDevicePoll::Failed(error) => break LoginPhase::Failed { error },
                 }
             };
             worker.lock().await.phase = phase;
@@ -301,7 +325,12 @@ impl LoginManager {
         Ok(shared)
     }
 
-    async fn start_gemini(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
+    async fn start_gemini(
+        &self,
+        id: &str,
+        vault: Arc<Vault>,
+        account_name: &str,
+    ) -> Result<SharedSession> {
         let (listener, port) = crate::login::bind_loopback().await?;
         let redirect_uri = format!(
             "http://localhost:{port}{}",
@@ -344,11 +373,17 @@ impl LoginManager {
                     match crate::login::gemini_exchange(&vault, &verifier, &redirect_uri, &code)
                         .await
                     {
-                        Ok(account_id) => match rename_login_account(&vault, &account_id, &account_name).await {
-                            Ok(account_id) => LoginPhase::Done { account_id },
-                            Err(e) => LoginPhase::Failed { error: e.to_string() },
+                        Ok(account_id) => {
+                            match rename_login_account(&vault, &account_id, &account_name).await {
+                                Ok(account_id) => LoginPhase::Done { account_id },
+                                Err(e) => LoginPhase::Failed {
+                                    error: e.to_string(),
+                                },
+                            }
+                        }
+                        Err(e) => LoginPhase::Failed {
+                            error: e.to_string(),
                         },
-                        Err(e) => LoginPhase::Failed { error: e.to_string() },
                     }
                 }
                 Ok(Err(e)) => LoginPhase::Failed {
@@ -363,7 +398,12 @@ impl LoginManager {
         Ok(shared)
     }
 
-    async fn start_grok(&self, id: &str, vault: Arc<Vault>, account_name: &str) -> Result<SharedSession> {
+    async fn start_grok(
+        &self,
+        id: &str,
+        vault: Arc<Vault>,
+        account_name: &str,
+    ) -> Result<SharedSession> {
         let http = reqwest::Client::new();
         let start = xai_device_start(&http).await?;
         let session = LoginSession {
@@ -404,11 +444,18 @@ impl LoginManager {
                     }
                     XaiDevicePoll::Done(tokens) => {
                         break match xai_upsert_from_tokens(&vault, &tokens).await {
-                            Ok(account_id) => match rename_login_account(&vault, &account_id, &account_name).await {
-                                Ok(account_id) => LoginPhase::Done { account_id },
-                                Err(e) => LoginPhase::Failed { error: e.to_string() },
+                            Ok(account_id) => {
+                                match rename_login_account(&vault, &account_id, &account_name).await
+                                {
+                                    Ok(account_id) => LoginPhase::Done { account_id },
+                                    Err(e) => LoginPhase::Failed {
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            Err(e) => LoginPhase::Failed {
+                                error: e.to_string(),
                             },
-                            Err(e) => LoginPhase::Failed { error: e.to_string() },
                         };
                     }
                     XaiDevicePoll::Failed(e) => break LoginPhase::Failed { error: e },
@@ -432,13 +479,22 @@ impl LoginManager {
 }
 
 fn validate_account_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 32 || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
         bail!("account name must match [a-z0-9_-]{{1,32}}");
     }
     Ok(())
 }
 
-async fn rename_login_account(vault: &Vault, account_id: &str, account_name: &str) -> Result<String> {
+async fn rename_login_account(
+    vault: &Vault,
+    account_id: &str,
+    account_name: &str,
+) -> Result<String> {
     if account_name == "default" {
         return Ok(account_id.to_string());
     }
@@ -449,7 +505,10 @@ async fn rename_login_account(vault: &Vault, account_id: &str, account_name: &st
         .find(|account| account.id == account_id)
         .context("login completed but the saved account could not be found")?;
     if vault.has_account_name(account.provider, account_name).await {
-        bail!("{} account '{account_name}' already exists", account.provider.as_str());
+        bail!(
+            "{} account '{account_name}' already exists",
+            account.provider.as_str()
+        );
     }
     let default_id = named_account_id(account.provider, &account.kind, "default");
     let previous_default = vault

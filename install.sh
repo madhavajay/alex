@@ -109,6 +109,11 @@ case ":$PATH:" in
   *) echo "note: $PREFIX is not on your PATH" ;;
 esac
 
+say "☥ preparing Dario runtime…"
+if ! "$BIN" dario bootstrap; then
+  echo "warning: Dario could not be prepared; install Node.js 18+ and npm, pnpm, or Bun, then run: $BIN dario bootstrap" >&2
+fi
+
 CONFIG="$HOME/.alexandria/config.toml"
 PORT=4100
 HOST=127.0.0.1

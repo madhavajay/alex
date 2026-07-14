@@ -333,12 +333,32 @@ where
             if already == 0 {
                 copy_chunked_body_capture(client, &mut up, &mut req_capture).await?;
             } else {
-                copy_chunked_body_remaining_capture(client, &mut up, &head[body_start..], &mut req_capture).await?;
+                copy_chunked_body_remaining_capture(
+                    client,
+                    &mut up,
+                    &head[body_start..],
+                    &mut req_capture,
+                )
+                .await?;
             }
         } else if let Some(cl) = content_length {
-            copy_fixed_body_capture(client, &mut up, cl.saturating_sub(already), &mut req_capture).await?;
+            copy_fixed_body_capture(
+                client,
+                &mut up,
+                cl.saturating_sub(already),
+                &mut req_capture,
+            )
+            .await?;
         }
-        append_http_body_capture(log, "http_req_body", &method, &path, &req_capture, already, is_chunked);
+        append_http_body_capture(
+            log,
+            "http_req_body",
+            &method,
+            &path,
+            &req_capture,
+            already,
+            is_chunked,
+        );
         up.flush().await.ok();
 
         if is_upgrade {
@@ -412,10 +432,22 @@ where
             if already == 0 {
                 copy_chunked_body_capture(&mut up, client, &mut resp_capture).await?;
             } else {
-                copy_chunked_body_remaining_capture(&mut up, client, &resp_head[resp_body_start..], &mut resp_capture).await?;
+                copy_chunked_body_remaining_capture(
+                    &mut up,
+                    client,
+                    &resp_head[resp_body_start..],
+                    &mut resp_capture,
+                )
+                .await?;
             }
         } else if let Some(cl) = resp_cl {
-            copy_fixed_body_capture(&mut up, client, cl.saturating_sub(already), &mut resp_capture).await?;
+            copy_fixed_body_capture(
+                &mut up,
+                client,
+                cl.saturating_sub(already),
+                &mut resp_capture,
+            )
+            .await?;
         } else if resp_close {
             // read until EOF
             let mut buf = vec![0u8; 64 * 1024];
@@ -427,10 +459,26 @@ where
                 capture_extend(&mut resp_capture, &buf[..n]);
                 client.write_all(&buf[..n]).await?;
             }
-            append_http_body_capture(log, "http_resp_body", &method, &path, &resp_capture, resp_capture.len(), resp_chunked);
+            append_http_body_capture(
+                log,
+                "http_resp_body",
+                &method,
+                &path,
+                &resp_capture,
+                resp_capture.len(),
+                resp_chunked,
+            );
             return Ok(());
         }
-        append_http_body_capture(log, "http_resp_body", &method, &path, &resp_capture, resp_capture.len(), resp_chunked);
+        append_http_body_capture(
+            log,
+            "http_resp_body",
+            &method,
+            &path,
+            &resp_capture,
+            resp_capture.len(),
+            resp_chunked,
+        );
         // else: no body (or unknown) — continue keep-alive loop
         client.flush().await.ok();
         if resp_close {
@@ -680,7 +728,10 @@ fn socket_ip_is_public(addr: &std::net::SocketAddr) -> bool {
                 || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 0b0100_0000))
         }
         std::net::IpAddr::V6(ip) => {
-            !(ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local())
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local())
         }
     }
 }
@@ -803,7 +854,11 @@ fn append_http_body_capture(
         // can contain opaque credentials and cannot be reliably redacted.
         obj["binary"] = serde_json::Value::Bool(true);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dest) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dest)
+    {
         use std::io::Write;
         let _ = writeln!(f, "{}", obj);
     }
@@ -1001,7 +1056,8 @@ fn rewrite_request_headers(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| anyhow!("incomplete headers"))?;
-    let header_block = std::str::from_utf8(&head[..end]).context("request headers are not utf-8")?;
+    let header_block =
+        std::str::from_utf8(&head[..end]).context("request headers are not utf-8")?;
     let body = &head[end + 4..];
 
     let lines: Vec<&str> = header_block.split("\r\n").collect();

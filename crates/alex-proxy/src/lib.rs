@@ -48,6 +48,9 @@ pub struct DarioActive {
 }
 
 pub trait DarioRouter: Send + Sync {
+    fn routes_requests(&self) -> bool {
+        true
+    }
     fn active(&self) -> Option<DarioActive>;
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>>;
     fn status(&self) -> Value;
@@ -380,7 +383,9 @@ pub fn build_state(
     // Import sidecars written by Vault::remove so a daemon restarted after a
     // terminal-side removal still exposes removed history to the Trace Browser.
     for removed in vault.removed_accounts() {
-        if let Err(e) = store.tombstone_known_account(&known_removed_account(&removed), removed.removed_ms) {
+        if let Err(e) =
+            store.tombstone_known_account(&known_removed_account(&removed), removed.removed_ms)
+        {
             tracing::warn!(account = %removed.id, "failed to import account tombstone: {e}");
         }
     }
@@ -648,9 +653,15 @@ async fn admin_account_remove(
     let Some(account) = account else {
         return error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'"));
     };
-    if let Err(e) = state.store.tombstone_known_account(&known_account(&account), now_ms()) {
+    if let Err(e) = state
+        .store
+        .tombstone_known_account(&known_account(&account), now_ms())
+    {
         // Do not remove credentials if we could not first preserve attribution.
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not preserve removed account history: {e}"));
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not preserve removed account history: {e}"),
+        );
     }
     match state.vault.remove(&id).await {
         Ok(true) => axum::Json(json!({"removed": id})).into_response(),
@@ -661,15 +672,23 @@ async fn admin_account_remove(
 
 fn known_account(account: &Account) -> KnownAccount {
     KnownAccount::new(
-        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
-        account.subscription_identity(), account.email(),
+        account.id.clone(),
+        account.provider.as_str(),
+        account.name.clone(),
+        account.kind.clone(),
+        account.subscription_identity(),
+        account.email(),
     )
 }
 
 fn known_removed_account(account: &RemovedAccount) -> KnownAccount {
     KnownAccount::new(
-        account.id.clone(), account.provider.as_str(), account.name.clone(), account.kind.clone(),
-        account.subscription_identity.clone(), account.email.clone(),
+        account.id.clone(),
+        account.provider.as_str(),
+        account.name.clone(),
+        account.kind.clone(),
+        account.subscription_identity.clone(),
+        account.email.clone(),
     )
 }
 
@@ -814,7 +833,11 @@ async fn admin_auth_login_start(
         };
     }
     let name = body.0["name"].as_str().unwrap_or("default");
-    match state.logins.start(state.vault.clone(), provider, name).await {
+    match state
+        .logins
+        .start(state.vault.clone(), provider, name)
+        .await
+    {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
@@ -851,7 +874,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
         "in_flight_requests": in_flight_requests(&state),
         "uptime_s": (now_ms() - state.started_ms) / 1000,
-        "dario": state.dario.is_some(),
+        "dario": state.dario.as_ref().and_then(|dario| dario.active()).is_some(),
     }))
 }
 
@@ -947,7 +970,7 @@ async fn refresh_openrouter_models(state: &AppState) {
     }
 }
 
-async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // OpenRouter is the sole dynamic provider catalog. Refresh only on an
     // explicit model-list request; Alexandria has no catalog refresh worker.
     refresh_openrouter_models(&state).await;
@@ -958,12 +981,37 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
-    for id in ids.clone() {
-        ids.push(format!("alexandria/{id}"));
+    let claude_gateway = headers
+        .get_all("x-alexandria-harness")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "claude" | "claude-code"
+            )
+        });
+    if !claude_gateway {
+        for id in ids.clone() {
+            ids.push(format!("alexandria/{id}"));
+        }
     }
+    let mut seen = HashSet::new();
     let data: Vec<Value> = ids
         .into_iter()
-        .map(|m| json!({"id": m, "object": "model", "owned_by": "alexandria"}))
+        .filter(|id| seen.insert(id.clone()))
+        .map(|m| {
+            if claude_gateway {
+                json!({
+                    "id": format!("claude-alex/{m}"),
+                    "display_name": format!("alex/{m}"),
+                    "object": "model",
+                    "owned_by": "alexandria",
+                })
+            } else {
+                json!({"id": m, "object": "model", "owned_by": "alexandria"})
+            }
+        })
         .collect();
     axum::Json(json!({"object": "list", "data": data}))
 }
@@ -1607,7 +1655,16 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
         model: q.get("model").cloned(),
         provider: q.get("provider").cloned(),
         account_id: q.get("account_id").cloned(),
-        account_ids: q.get("account_ids").map(|ids| ids.split(',').map(str::trim).filter(|id| !id.is_empty()).map(String::from).collect()).unwrap_or_default(),
+        account_ids: q
+            .get("account_ids")
+            .map(|ids| {
+                ids.split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         path: q.get("path").cloned(),
         harness: q.get("harness").cloned(),
         status: q.get("status").and_then(|s| s.parse().ok()),
@@ -2229,7 +2286,8 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "reserve_blocked": routing_reserve_blocked(&a, reserve_pct, now_ms() / 1000),
                 "reset_selection": routing_reset_selection(&a, now_ms() / 1000),
             });
-            let limits = a.account_meta
+            let limits = a
+                .account_meta
                 .get("routing_limits")
                 .or_else(|| a.account_meta.get("codex_limits"))
                 .cloned()
@@ -2329,11 +2387,7 @@ async fn routing_snapshot(state: &Arc<AppState>, provider: Provider) -> Value {
     })
 }
 
-async fn update_routing(
-    state: Arc<AppState>,
-    provider: Provider,
-    body: Value,
-) -> Response {
+async fn update_routing(state: Arc<AppState>, provider: Provider, body: Value) -> Response {
     let current_policy = state.vault.policy(provider);
     let mode = match body.get("strategy").and_then(Value::as_str) {
         Some("reset_first") => AccountPolicyMode::ResetFirst,
@@ -2349,20 +2403,27 @@ async fn update_routing(
     let reserve_pct = match body.get("reserve_pct") {
         Some(value) => match value.as_u64() {
             Some(value) => value,
-            None => return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer"),
+            None => {
+                return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be an integer")
+            }
         },
         None => current_policy.reserve_pct.unwrap_or(10) as u64,
     };
     if reserve_pct > 100 {
-        return error_response(StatusCode::BAD_REQUEST, "reserve_pct must be between 0 and 100");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "reserve_pct must be between 0 and 100",
+        );
     }
     let allow_mid_thread_failover = match body.get("allow_mid_thread_failover") {
         Some(value) => match value.as_bool() {
             Some(value) => value,
-            None => return error_response(
-                StatusCode::BAD_REQUEST,
-                "allow_mid_thread_failover must be boolean",
-            ),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "allow_mid_thread_failover must be boolean",
+                )
+            }
         },
         None => current_policy.allow_mid_thread_failover,
     };
@@ -2387,22 +2448,32 @@ async fn update_routing(
             return error_response(StatusCode::BAD_REQUEST, "each account needs account_id");
         };
         let Some(eligible) = item.get("eligible").and_then(Value::as_bool) else {
-            return error_response(StatusCode::BAD_REQUEST, "each account needs boolean eligible");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "each account needs boolean eligible",
+            );
         };
         let Some(priority) = item.get("priority").and_then(Value::as_u64) else {
-            return error_response(StatusCode::BAD_REQUEST, "each account needs integer priority");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "each account needs integer priority",
+            );
         };
         let account_reserve_pct = match item.get("reserve_pct") {
             Some(value) => match value.as_u64() {
                 Some(value) if value <= 100 => value as u8,
-                Some(_) => return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "account reserve_pct must be between 0 and 100",
-                ),
-                None => return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "account reserve_pct must be an integer",
-                ),
+                Some(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "account reserve_pct must be between 0 and 100",
+                    )
+                }
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "account reserve_pct must be an integer",
+                    )
+                }
             },
             None => reserve_pct as u8,
         };
@@ -2443,11 +2514,7 @@ async fn update_routing(
             .map(|(_, name, _, _)| name.clone())
             .collect(),
     };
-    match state
-        .vault
-        .set_policy_persisted(provider, policy)
-        .await
-    {
+    match state.vault.set_policy_persisted(provider, policy).await {
         Ok(()) => axum::Json(routing_snapshot(&state, provider).await).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
@@ -2874,6 +2941,8 @@ const CLAUDE_CODE_PASSTHROUGH_HEADERS: &[&str] = &[
     "accept",
     "x-app",
     "x-claude-code-session-id",
+    "x-claude-code-agent-id",
+    "x-claude-code-parent-agent-id",
     "x-stainless-arch",
     "x-stainless-lang",
     "x-stainless-os",
@@ -2885,11 +2954,7 @@ const CLAUDE_CODE_PASSTHROUGH_HEADERS: &[&str] = &[
     "anthropic-dangerous-direct-browser-access",
 ];
 
-fn is_genuine_claude_code_request(
-    format: ClientFormat,
-    headers: &HeaderMap,
-    body: &Value,
-) -> bool {
+fn is_genuine_claude_code_request(format: ClientFormat, headers: &HeaderMap, body: &Value) -> bool {
     if format != ClientFormat::AnthropicMessages {
         return false;
     }
@@ -3124,8 +3189,7 @@ async fn plan_upstream(
 ) -> Result<UpstreamPlan, (StatusCode, String)> {
     use alex_core::translate;
     let client_stream = body_json["stream"].as_bool().unwrap_or(false);
-    let genuine_claude_code =
-        is_genuine_claude_code_request(format, client_headers, body_json);
+    let genuine_claude_code = is_genuine_claude_code_request(format, client_headers, body_json);
     match provider {
         Provider::Anthropic => {
             let converted = match format {
@@ -3151,39 +3215,48 @@ async fn plan_upstream(
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                 (ANTHROPIC_BASE.to_string(), account, None, false)
             } else {
-                let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
-                match (&state.dario, dario_active) {
-                    (Some(dario), Some(active)) => {
-                        let guard = dario.begin(&active.generation_id).ok_or_else(|| {
+                let route_via_dario = state
+                    .dario
+                    .as_ref()
+                    .map(|dario| dario.routes_requests())
+                    .unwrap_or(false);
+                if !route_via_dario {
+                    let account = state
+                        .vault
+                        .account_for_excluding(provider, true, excluded_accounts)
+                        .await
+                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    (ANTHROPIC_BASE.to_string(), account, None, false)
+                } else {
+                    let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
+                    match (&state.dario, dario_active) {
+                        (Some(dario), Some(active)) => {
+                            let guard = dario.begin(&active.generation_id).ok_or_else(|| {
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "Dario became unavailable while routing the Anthropic request"
+                                        .to_string(),
+                                )
+                            })?;
                             (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "Dario became unavailable while routing the Anthropic request"
-                                    .to_string(),
+                                active.base_url.trim_end_matches('/').to_string(),
+                                dario_account(&active),
+                                Some(guard),
+                                true,
                             )
-                        })?;
-                        (
-                            active.base_url.trim_end_matches('/').to_string(),
-                            dario_account(&active),
-                            Some(guard),
-                            true,
-                        )
+                        }
+                        (Some(_), None) => {
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Dario is configured but no healthy generation is available"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, None) => unreachable!("Dario routing requires a Dario router"),
+                        (None, Some(_)) => {
+                            unreachable!("Dario cannot be active when it is disabled")
+                        }
                     }
-                    (Some(_), None) => {
-                        return Err((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Dario is configured but no healthy generation is available"
-                                .to_string(),
-                        ));
-                    }
-                    (None, None) => {
-                        let account = state
-                            .vault
-                            .account_for_excluding(provider, true, excluded_accounts)
-                            .await
-                            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                        (ANTHROPIC_BASE.to_string(), account, None, false)
-                    }
-                    (None, Some(_)) => unreachable!("Dario cannot be active when it is disabled"),
                 }
             };
             let (body, respond_as) = match converted {
@@ -3583,11 +3656,11 @@ mod trace_api_tests {
             "user-agent",
             HeaderValue::from_static("Anthropic/JS 0.91.1"),
         );
-        assert_eq!(trace_harness(&headers).as_deref(), Some("Anthropic/JS 0.91.1"));
-        headers.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_static("pi"),
+        assert_eq!(
+            trace_harness(&headers).as_deref(),
+            Some("Anthropic/JS 0.91.1")
         );
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
         assert_eq!(trace_harness(&headers).as_deref(), Some("pi"));
     }
 
@@ -3946,10 +4019,7 @@ fn openrouter_auth_headers(
         HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
     );
-    for (meta_key, header_name) in [
-        ("http_referer", "http-referer"),
-        ("x_title", "x-title"),
-    ] {
+    for (meta_key, header_name) in [("http_referer", "http-referer"), ("x_title", "x-title")] {
         if let Some(value) = account.account_meta.get(meta_key).and_then(Value::as_str) {
             headers.insert(
                 header_name,
@@ -4245,7 +4315,7 @@ fn authenticate_harness_event(
 async fn harness_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::Json(event): axum::Json<Value>,
+    axum::Json(mut event): axum::Json<Value>,
 ) -> Response {
     let (key_hash, key) = match authenticate_harness_event(&state, &headers) {
         Ok(auth) => auth,
@@ -4255,10 +4325,8 @@ async fn harness_event(
         tracing::warn!("failed to touch harness key: {error}");
     }
     let harness = key.label.as_deref().unwrap_or_default();
-    let event_name = event["hook_event_name"]
-        .as_str()
-        .or_else(|| event["hookEventName"].as_str())
-        .unwrap_or_default();
+    normalize_harness_event(&mut event);
+    let event_name = event["hook_event_name"].as_str().unwrap_or_default();
     if !matches!(
         event_name,
         "SessionStart" | "SubagentStart" | "SubagentStop" | "Stop"
@@ -4291,6 +4359,66 @@ async fn harness_event(
         }))
         .into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+fn normalize_harness_event(event: &mut Value) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+    let raw_event = object
+        .get("hook_event_name")
+        .or_else(|| object.get("hookEventName"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let compact = raw_event
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let canonical = match compact.as_str() {
+        "sessionstart" => Some("SessionStart"),
+        "subagentstart" => Some("SubagentStart"),
+        "subagentstop" | "subagentend" => Some("SubagentStop"),
+        "stop" | "sessionend" => Some("Stop"),
+        _ => None,
+    };
+    if let Some(canonical) = canonical {
+        object.insert("hook_event_name".into(), Value::String(canonical.into()));
+    }
+
+    for (canonical, aliases) in [
+        (
+            "session_id",
+            &["sessionId", "conversation_id", "conversationId"][..],
+        ),
+        ("turn_id", &["turnId"][..]),
+        (
+            "agent_id",
+            &[
+                "agentId",
+                "subagent_id",
+                "subagentId",
+                "subagent_session_id",
+                "subagentSessionId",
+                "child_session_id",
+                "childSessionId",
+            ][..],
+        ),
+        (
+            "agent_type",
+            &["agentType", "subagent_type", "subagentType"][..],
+        ),
+    ] {
+        if object.get(canonical).and_then(Value::as_str).is_some() {
+            continue;
+        }
+        if let Some(value) = aliases
+            .iter()
+            .find_map(|alias| object.get(*alias).and_then(Value::as_str))
+        {
+            object.insert(canonical.into(), Value::String(value.to_string()));
+        }
     }
 }
 
@@ -4608,22 +4736,55 @@ async fn proxy(
     trace.thinking_budget = thinking_budget;
     let genuine_claude_code = is_genuine_claude_code_request(format, &headers, &body_json);
 
-    trace.session_id = headers
-        .get("x-session-id")
+    let claude_root_session = headers
+        .get("x-claude-code-session-id")
         .and_then(|v| v.to_str().ok())
-        .map(String::from)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    let claude_agent_id = headers
+        .get("x-claude-code-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    if trace.harness.as_deref().is_some_and(|harness| {
+        matches!(
+            harness.to_ascii_lowercase().as_str(),
+            "claude" | "claude-code"
+        )
+    }) {
+        if let (Some(agent_id), Some(parent_id)) = (
+            claude_agent_id.as_deref(),
+            headers
+                .get("x-claude-code-parent-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .or(claude_root_session.as_deref()),
+        ) {
+            let event = json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": parent_id,
+                "agent_id": agent_id,
+            });
+            if let Err(error) = state.store.record_harness_event("claude", &event, now_ms()) {
+                tracing::warn!(%error, %agent_id, %parent_id, "could not record Claude request lineage");
+            }
+        }
+    }
+
+    trace.session_id = claude_agent_id
+        .or_else(|| {
+            headers
+                .get("x-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
         .or_else(|| {
             headers
                 .get("session_id")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from)
         })
-        .or_else(|| {
-            headers
-                .get("x-claude-code-session-id")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-        })
+        .or(claude_root_session)
         .or_else(|| session_from_metadata(&body_json))
         .or_else(|| {
             body_json
@@ -4660,16 +4821,23 @@ async fn proxy(
         trace.harness.clone(),
     );
 
-    // Codex emits SubagentStart before the child's first request. Resolve that
-    // child to the lineage root so every descendant prefers the same upstream
-    // account while retaining its own session id in traces.
+    // Resolve verified Codex/Claude children to the lineage root so every
+    // descendant prefers the same upstream account while retaining its own
+    // session id in traces.
     let affinity_session_id = trace.session_id.as_ref().map(|session_id| {
-        if trace.harness.as_deref() == Some("codex") {
+        if trace.harness.as_deref().is_some_and(|harness| {
+            matches!(harness, "codex" | "claude" | "claude-code")
+        }) {
+            let lineage_harness = if trace.harness.as_deref() == Some("codex") {
+                "codex"
+            } else {
+                "claude"
+            };
             state
                 .store
-                .session_lineage_root("codex", session_id)
+                .session_lineage_root(lineage_harness, session_id)
                 .unwrap_or_else(|error| {
-                    tracing::warn!(%error, %session_id, "could not resolve Codex session lineage");
+                    tracing::warn!(%error, %session_id, %lineage_harness, "could not resolve harness session lineage");
                     session_id.clone()
                 })
         } else {
@@ -4742,8 +4910,7 @@ async fn proxy(
 
         let mut forced_oauth_refresh = false;
         loop {
-            let mut up_headers =
-                match upstream_headers(&account, &headers, genuine_claude_code) {
+            let mut up_headers = match upstream_headers(&account, &headers, genuine_claude_code) {
                 Ok(h) => h,
                 Err((status, msg)) => {
                     trace.status = Some(status.as_u16() as i64);
@@ -4780,7 +4947,9 @@ async fn proxy(
             };
 
             if account.kind == "oauth" {
-                if let Some(snapshot) = routing_limits_from_headers(account.provider, resp.headers()) {
+                if let Some(snapshot) =
+                    routing_limits_from_headers(account.provider, resp.headers())
+                {
                     if let Err(error) = state
                         .vault
                         .record_routing_limits(&account.id, snapshot)
@@ -5317,11 +5486,8 @@ impl SseErrorObserver {
         if self.error.is_none() && !self.event_data.is_empty() && self.event_may_be_an_error() {
             let data = self.event_data.join("\n");
             if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                self.error = upstream_sse_error(
-                    self.upstream_format,
-                    self.event_name.as_deref(),
-                    &value,
-                );
+                self.error =
+                    upstream_sse_error(self.upstream_format, self.event_name.as_deref(), &value);
             }
         }
         self.event_name = None;
@@ -5499,10 +5665,7 @@ mod tests {
         test_state_with_dario(name, None)
     }
 
-    fn test_state_with_dario(
-        name: &str,
-        dario: Option<Arc<dyn DarioRouter>>,
-    ) -> Arc<AppState> {
+    fn test_state_with_dario(name: &str, dario: Option<Arc<dyn DarioRouter>>) -> Arc<AppState> {
         let dir = tmpdir(name);
         let store = Arc::new(Store::open(dir.join("store")).unwrap());
         let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
@@ -5656,9 +5819,14 @@ mod tests {
     struct FakeDario {
         active: Option<DarioActive>,
         begin_succeeds: bool,
+        routes_requests: bool,
     }
 
     impl DarioRouter for FakeDario {
+        fn routes_requests(&self) -> bool {
+            self.routes_requests
+        }
+
         fn active(&self) -> Option<DarioActive> {
             self.active.clone()
         }
@@ -5683,6 +5851,7 @@ mod tests {
                 api_key: "dario-key".into(),
             }),
             begin_succeeds: true,
+            routes_requests: true,
         })
     }
 
@@ -5723,11 +5892,7 @@ mod tests {
             let mut missing = headers.clone();
             missing.remove(required);
             assert!(
-                !is_genuine_claude_code_request(
-                    ClientFormat::AnthropicMessages,
-                    &missing,
-                    &body
-                ),
+                !is_genuine_claude_code_request(ClientFormat::AnthropicMessages, &missing, &body),
                 "request without {required} must not bypass Dario"
             );
         }
@@ -5741,10 +5906,7 @@ mod tests {
         ));
 
         let mut explicit_other_harness = headers;
-        explicit_other_harness.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_static("pi"),
-        );
+        explicit_other_harness.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
         assert!(!is_genuine_claude_code_request(
             ClientFormat::AnthropicMessages,
             &explicit_other_harness,
@@ -5756,10 +5918,7 @@ mod tests {
             "x-alexandria-harness",
             HeaderValue::from_static("claude-code"),
         );
-        conflicting_harness.append(
-            "x-alexandria-harness",
-            HeaderValue::from_static("codex"),
-        );
+        conflicting_harness.append("x-alexandria-harness", HeaderValue::from_static("codex"));
         assert!(!is_genuine_claude_code_request(
             ClientFormat::AnthropicMessages,
             &conflicting_harness,
@@ -5830,12 +5989,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_dario_can_remain_passive_while_direct_routing_is_selected() {
+        let state = test_state_with_dario(
+            "dario-passive",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "warm-generation".into(),
+                    base_url: "http://127.0.0.1:9191".into(),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: true,
+                routes_requests: false,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (_, mut request) = claude_code_request();
+        let original = serde_json::to_vec(&request).unwrap();
+        let plan = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            &mut request,
+            &original,
+            "trace-passive",
+            &HashSet::new(),
+            None,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(plan.account.id, "anthropic:test");
+        assert!(plan.dario_guard.is_none());
+    }
+
+    #[tokio::test]
     async fn configured_dario_fails_closed_when_unhealthy() {
         let state = test_state_with_dario(
             "dario-unhealthy",
             Some(Arc::new(FakeDario {
                 active: None,
                 begin_succeeds: false,
+                routes_requests: true,
             })),
         );
         state.vault.upsert(anthropic_account()).await.unwrap();
@@ -5877,6 +6073,7 @@ mod tests {
                     api_key: "dario-key".into(),
                 }),
                 begin_succeeds: false,
+                routes_requests: true,
             })),
         );
         let (_, mut request) = claude_code_request();
@@ -5921,14 +6118,8 @@ mod tests {
         client_headers.insert("content-length", HeaderValue::from_static("999"));
         client_headers.insert("connection", HeaderValue::from_static("close"));
         client_headers.insert("accept-encoding", HeaderValue::from_static("br"));
-        client_headers.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_static("claude"),
-        );
-        client_headers.insert(
-            "x-dario-capture-id",
-            HeaderValue::from_static("spoofed"),
-        );
+        client_headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        client_headers.insert("x-dario-capture-id", HeaderValue::from_static("spoofed"));
 
         let direct = upstream_headers(&anthropic_account(), &client_headers, true).unwrap();
         for name in CLAUDE_CODE_PASSTHROUGH_HEADERS {
@@ -5956,7 +6147,10 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer caller-secret"),
         );
-        client_headers.insert("x-api-key", HeaderValue::from_static("another-provider-key"));
+        client_headers.insert(
+            "x-api-key",
+            HeaderValue::from_static("another-provider-key"),
+        );
         client_headers.insert(
             "http-referer",
             HeaderValue::from_static("https://caller.example"),
@@ -6140,13 +6334,22 @@ mod tests {
         };
         cache.bind("session-a", "account-a", 0);
         cache.bind("session-b", "account-b", 10);
-        assert_eq!(cache.preferred("session-a", 20).as_deref(), Some("account-a"));
+        assert_eq!(
+            cache.preferred("session-a", 20).as_deref(),
+            Some("account-a")
+        );
 
         // session-a's lookup extends its expiry, so session-b is oldest.
         cache.bind("session-c", "account-c", 30);
         assert!(cache.preferred("session-b", 30).is_none());
-        assert_eq!(cache.preferred("session-a", 30).as_deref(), Some("account-a"));
-        assert_eq!(cache.preferred("session-c", 30).as_deref(), Some("account-c"));
+        assert_eq!(
+            cache.preferred("session-a", 30).as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            cache.preferred("session-c", 30).as_deref(),
+            Some("account-c")
+        );
         assert!(cache.preferred("session-a", 131).is_none());
     }
 
@@ -6214,10 +6417,7 @@ mod tests {
         assert_eq!(body["accounts"][1]["eligible"], false);
         assert_eq!(body["accounts"][1]["reserve_pct"], 15);
         assert_eq!(
-            state
-                .vault
-                .policy(Provider::Openai)
-                .account_reserve_pct["work"],
+            state.vault.policy(Provider::Openai).account_reserve_pct["work"],
             22
         );
         assert_eq!(
@@ -6264,7 +6464,10 @@ mod tests {
         assert_eq!(body["strategy"], "round_robin");
         assert_eq!(body["reserve_pct"], 7);
         assert_eq!(body["accounts"][0]["reserve_pct"], 3);
-        assert_eq!(state.vault.policy(Provider::Anthropic).account_reserve_pct["work"], 3);
+        assert_eq!(
+            state.vault.policy(Provider::Anthropic).account_reserve_pct["work"],
+            3
+        );
     }
 
     #[tokio::test]
@@ -6373,7 +6576,11 @@ mod tests {
     #[tokio::test]
     async fn codex_routing_endpoint_keeps_the_legacy_shape() {
         let state = test_state("codex-routing-compatibility");
-        state.vault.upsert(test_openai_account("default")).await.unwrap();
+        state
+            .vault
+            .upsert(test_openai_account("default"))
+            .await
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -6425,7 +6632,10 @@ mod tests {
             "windows",
             "credits",
         ] {
-            assert!(account.contains_key(field), "missing legacy account field {field}");
+            assert!(
+                account.contains_key(field),
+                "missing legacy account field {field}"
+            );
         }
     }
 
@@ -6549,6 +6759,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_gateway_model_catalog_uses_discoverable_alex_aliases() {
+        let state = test_state("claude-gateway-models");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        let (status, body) =
+            response_json(models(State(state), headers).await.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["data"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("claude-alex/"))));
+        assert!(rows.iter().all(|row| row["display_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("alex/"))));
+        assert!(rows.iter().any(|row| {
+            row["id"]
+                .as_str()
+                .is_some_and(|id| id.contains("gpt-") || id.contains("grok-"))
+        }));
+    }
+
+    #[test]
+    fn harness_event_normalization_accepts_grok_camel_and_snake_case() {
+        let mut event = json!({
+            "hookEventName": "subagent_start",
+            "sessionId": "root-session",
+            "subagentId": "child-agent",
+            "agentType": "explore",
+            "turnId": "turn-1",
+        });
+        normalize_harness_event(&mut event);
+        assert_eq!(event["hook_event_name"], "SubagentStart");
+        assert_eq!(event["session_id"], "root-session");
+        assert_eq!(event["agent_id"], "child-agent");
+        assert_eq!(event["agent_type"], "explore");
+        assert_eq!(event["turn_id"], "turn-1");
+
+        let mut stop = json!({"hook_event_name": "SubagentEnd"});
+        normalize_harness_event(&mut stop);
+        assert_eq!(stop["hook_event_name"], "SubagentStop");
+    }
+
+    #[tokio::test]
     async fn codex_harness_event_records_authenticated_lineage() {
         let state = test_state("codex-harness-event");
         let (status, created) = response_json(
@@ -6563,11 +6817,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            HeaderValue::from_str(&format!(
-                "Bearer {}",
-                created["key"].as_str().unwrap()
-            ))
-            .unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", created["key"].as_str().unwrap())).unwrap(),
         );
         let (status, body) = response_json(
             harness_event(
@@ -6940,16 +7190,8 @@ mod tests {
     #[tokio::test]
     async fn codex_sessions_stay_affined_and_failover_rebinds() {
         let state = test_state("codex-session-affinity");
-        state
-            .vault
-            .upsert(test_openai_account("a"))
-            .await
-            .unwrap();
-        state
-            .vault
-            .upsert(test_openai_account("b"))
-            .await
-            .unwrap();
+        state.vault.upsert(test_openai_account("a")).await.unwrap();
+        state.vault.upsert(test_openai_account("b")).await.unwrap();
         state
             .vault
             .set_policies(vec![(

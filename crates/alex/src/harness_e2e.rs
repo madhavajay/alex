@@ -293,8 +293,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         .or_else(|| catalog_harness.default_model.clone())
         .unwrap_or_else(|| spec.default_model.to_string());
     let (routed_provider, routed_model) = route_model(&model);
-    let anthropic_route =
-        expected_dario_route(routed_provider, spec.kind, opts.dario_enabled);
+    let anthropic_route = expected_dario_route(routed_provider, spec.kind, opts.dario_enabled);
     let prompt = opts.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
     let started_ms = now_ms();
     let nonce: u32 = rand::Rng::gen(&mut rand::thread_rng());

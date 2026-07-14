@@ -214,7 +214,9 @@ fn annotate_trace_accounts(conn: &Connection, rows: &mut [Value]) -> Result<()> 
                 [id], account_json_row,
             ).optional().ok().flatten())
         });
-        if let Some(account) = account { row["account"] = account; }
+        if let Some(account) = account {
+            row["account"] = account;
+        }
     }
     Ok(())
 }
@@ -271,10 +273,21 @@ pub struct KnownAccount {
 
 impl KnownAccount {
     pub fn new(
-        account_id: impl Into<String>, provider: impl Into<String>, name: impl Into<String>,
-        kind: impl Into<String>, subscription_identity: Option<String>, email: Option<String>,
+        account_id: impl Into<String>,
+        provider: impl Into<String>,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        subscription_identity: Option<String>,
+        email: Option<String>,
     ) -> Self {
-        Self { account_id: account_id.into(), provider: provider.into(), name: name.into(), kind: kind.into(), subscription_identity, email }
+        Self {
+            account_id: account_id.into(),
+            provider: provider.into(),
+            name: name.into(),
+            kind: kind.into(),
+            subscription_identity,
+            email,
+        }
     }
 }
 
@@ -647,18 +660,27 @@ impl Store {
                AND NOT EXISTS (SELECT 1 FROM known_accounts a WHERE a.account_id=t.account_id AND a.removed_ms IS NULL)
              GROUP BY t.account_id ORDER BY MAX(t.ts_request_ms) DESC",
         )?;
-        let rows = stmt.query_map([], |r| Ok(json!({
-            "account_id": r.get::<_, String>(0)?, "provider": r.get::<_, Option<String>>(1)?,
-            "models": r.get::<_, Option<String>>(2)?, "first_ts_ms": r.get::<_, i64>(3)?,
-            "last_ts_ms": r.get::<_, i64>(4)?, "count": r.get::<_, i64>(5)?,
-        })))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(json!({
+                "account_id": r.get::<_, String>(0)?, "provider": r.get::<_, Option<String>>(1)?,
+                "models": r.get::<_, Option<String>>(2)?, "first_ts_ms": r.get::<_, i64>(3)?,
+                "last_ts_ms": r.get::<_, i64>(4)?, "count": r.get::<_, i64>(5)?,
+            }))
+        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Attach only untagged legacy traces to a selected account identity. The
     /// caller must present the plan first; `confirmed=false` is a strict no-op.
-    pub fn reattach_orphaned_traces(&self, orphan_account_id: &str, target: &KnownAccount, confirmed: bool) -> Result<u64> {
-        if !confirmed { return Ok(0); }
+    pub fn reattach_orphaned_traces(
+        &self,
+        orphan_account_id: &str,
+        target: &KnownAccount,
+        confirmed: bool,
+    ) -> Result<u64> {
+        if !confirmed {
+            return Ok(0);
+        }
         let Some(identity) = target.subscription_identity.as_deref() else {
             anyhow::bail!("target account has no durable subscription identity");
         };
@@ -719,7 +741,10 @@ impl Store {
             args.push(account_id.clone());
         }
         if !f.account_ids.is_empty() {
-            let placeholders = std::iter::repeat("?").take(f.account_ids.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat("?")
+                .take(f.account_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
             sql.push_str(&format!(" AND (account_id IN ({placeholders}) OR subscription_identity IN (SELECT subscription_identity FROM known_accounts WHERE account_id IN ({placeholders})))"));
             args.extend(f.account_ids.iter().cloned());
             args.extend(f.account_ids.iter().cloned());
@@ -1290,7 +1315,9 @@ impl Store {
             })?
             .filter_map(|r| r.ok())
             .collect();
-        Ok(json!({"since_ms": since_ms, "bucket_ms": bucket_ms.max(60_000), "by_account": by_account, "series": series}))
+        Ok(
+            json!({"since_ms": since_ms, "bucket_ms": bucket_ms.max(60_000), "by_account": by_account, "series": series}),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2235,8 +2262,10 @@ mod tests {
         // This is the pre-change traces schema as written by the current
         // released binary (all of its then-current trace columns, but no new
         // subscription_identity column).
-        Connection::open(&db_path).unwrap().execute_batch(
-            "CREATE TABLE traces (id TEXT PRIMARY KEY, ts_request_ms INTEGER NOT NULL,
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE traces (id TEXT PRIMARY KEY, ts_request_ms INTEGER NOT NULL,
               ts_response_ms INTEGER, session_id TEXT, harness TEXT, client_format TEXT,
               upstream_provider TEXT, upstream_format TEXT, requested_model TEXT, routed_model TEXT,
               method TEXT, path TEXT, status INTEGER, streamed INTEGER, input_tokens INTEGER,
@@ -2246,11 +2275,18 @@ mod tests {
               resp_headers_json TEXT, error TEXT, account_id TEXT, run_id TEXT, tags_json TEXT,
               client_ip TEXT, key_fingerprint TEXT, reasoning_effort TEXT, thinking_budget INTEGER);
              INSERT INTO traces (id, ts_request_ms, upstream_provider, routed_model, account_id)
-              VALUES ('historic', 100, 'openai', 'gpt-5', 'openai-oauth-old');"
-        ).unwrap();
+              VALUES ('historic', 100, 'openai', 'gpt-5', 'openai-oauth-old');",
+            )
+            .unwrap();
         let store = Store::open(dir.clone()).unwrap();
-        let old = KnownAccount::new("openai-oauth-old", "openai", "old", "oauth",
-            Some("openai:chatgpt-account:acct_123".into()), Some("madhava@example.com".into()));
+        let old = KnownAccount::new(
+            "openai-oauth-old",
+            "openai",
+            "old",
+            "oauth",
+            Some("openai:chatgpt-account:acct_123".into()),
+            Some("madhava@example.com".into()),
+        );
         store.tombstone_known_account(&old, 200).unwrap();
         let rows = store.search_traces(&TraceFilter::default()).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2263,14 +2299,24 @@ mod tests {
         let identity_cols: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('traces') WHERE name='subscription_identity'", [], |r| r.get(0)
         ).unwrap();
-        assert_eq!(identity_cols, 1, "reopening must not alter the schema again");
+        assert_eq!(
+            identity_cols, 1,
+            "reopening must not alter the schema again"
+        );
     }
 
     #[test]
     fn removed_account_trace_reattaches_when_readded_under_a_new_nickname() {
         let store = Store::open(tmpdir("readd-identity")).unwrap();
         let identity = Some("openai:chatgpt-account:acct_123".into());
-        let old = KnownAccount::new("openai-oauth-personal", "openai", "personal", "oauth", identity.clone(), Some("madhava@example.com".into()));
+        let old = KnownAccount::new(
+            "openai-oauth-personal",
+            "openai",
+            "personal",
+            "oauth",
+            identity.clone(),
+            Some("madhava@example.com".into()),
+        );
         store.upsert_known_account(&old).unwrap();
         let mut historic = trace("historic", 100, None);
         historic.account_id = Some(old.account_id.clone());
@@ -2280,14 +2326,23 @@ mod tests {
         let removed = store.search_traces(&TraceFilter::default()).unwrap();
         assert_eq!(removed[0]["account"]["name"], "personal");
         assert_eq!(removed[0]["account"]["removed"], true);
-        let readded = KnownAccount::new("openai-api_key-work", "openai", "work", "api_key", identity, Some("madhava@example.com".into()));
+        let readded = KnownAccount::new(
+            "openai-api_key-work",
+            "openai",
+            "work",
+            "api_key",
+            identity,
+            Some("madhava@example.com".into()),
+        );
         store.upsert_known_account(&readded).unwrap();
         let rows = store.search_traces(&TraceFilter::default()).unwrap();
         assert_eq!(rows[0]["account"]["id"], "openai-api_key-work");
         assert_eq!(rows[0]["account"]["name"], "work");
         assert_eq!(rows[0]["account"]["removed"], false);
         let accounts = store.list_known_accounts().unwrap();
-        assert!(accounts.iter().any(|a| a["id"] == "openai-oauth-personal" && a["removed"] == true));
+        assert!(accounts
+            .iter()
+            .any(|a| a["id"] == "openai-oauth-personal" && a["removed"] == true));
     }
 
     #[test]
@@ -2296,13 +2351,38 @@ mod tests {
         let mut orphan = trace("orphan", 100, None);
         orphan.account_id = Some("openai-oauth-removed".into());
         store.insert_trace(&orphan).unwrap();
-        let target = KnownAccount::new("openai-oauth-new", "openai", "new", "oauth",
-            Some("openai:chatgpt-account:acct_456".into()), Some("new@example.com".into()));
-        assert_eq!(store.orphaned_trace_groups().unwrap()[0]["account_id"], "openai-oauth-removed");
-        assert_eq!(store.reattach_orphaned_traces("openai-oauth-removed", &target, false).unwrap(), 0);
-        assert!(store.search_traces(&TraceFilter::default()).unwrap()[0]["subscription_identity"].is_null());
-        assert_eq!(store.reattach_orphaned_traces("openai-oauth-removed", &target, true).unwrap(), 1);
-        assert_eq!(store.search_traces(&TraceFilter::default()).unwrap()[0]["account"]["id"], "openai-oauth-new");
+        let target = KnownAccount::new(
+            "openai-oauth-new",
+            "openai",
+            "new",
+            "oauth",
+            Some("openai:chatgpt-account:acct_456".into()),
+            Some("new@example.com".into()),
+        );
+        assert_eq!(
+            store.orphaned_trace_groups().unwrap()[0]["account_id"],
+            "openai-oauth-removed"
+        );
+        assert_eq!(
+            store
+                .reattach_orphaned_traces("openai-oauth-removed", &target, false)
+                .unwrap(),
+            0
+        );
+        assert!(
+            store.search_traces(&TraceFilter::default()).unwrap()[0]["subscription_identity"]
+                .is_null()
+        );
+        assert_eq!(
+            store
+                .reattach_orphaned_traces("openai-oauth-removed", &target, true)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.search_traces(&TraceFilter::default()).unwrap()[0]["account"]["id"],
+            "openai-oauth-new"
+        );
     }
 }
 
