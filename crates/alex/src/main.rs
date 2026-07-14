@@ -13,6 +13,7 @@ mod dario;
 mod harness_connect;
 mod harness_e2e;
 mod light;
+mod reset;
 mod selfupdate;
 mod tui;
 mod ui;
@@ -166,6 +167,30 @@ enum Command {
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
+    },
+    /// Selectively remove local Alexandria data (dry-run unless --yes is supplied)
+    Reset {
+        /// Remove vault account JSON and revoke run keys; retain account tombstones
+        #[arg(long)]
+        credentials: bool,
+        /// Restore config.toml defaults while preserving update_channel
+        #[arg(long)]
+        settings: bool,
+        /// Remove trace rows, heartbeats, and captured request/response bodies
+        #[arg(long)]
+        traces: bool,
+        /// Disconnect every connected harness using the normal disconnect path
+        #[arg(long)]
+        harnesses: bool,
+        /// Remove derived pricing and other cached data
+        #[arg(long)]
+        cache: bool,
+        /// Select every reset category
+        #[arg(long)]
+        all: bool,
+        /// Apply the selected deletions. Without this flag, print the plan only.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Live dashboard: traces, limits, accounts, dario generations
     Tui,
@@ -745,6 +770,35 @@ fn default_dario_probe_model() -> String {
 }
 
 impl Config {
+    fn defaults_for(data_dir: PathBuf) -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 4100,
+            data_dir,
+            local_key: random_key("alx"),
+            ping_gemini_model: default_ping_gemini(),
+            ping_openrouter_model: default_ping_openrouter(),
+            gemini_project: String::new(),
+            heartbeat_minutes: default_heartbeat_minutes(),
+            ping_anthropic_model: default_ping_anthropic(),
+            ping_openai_model: default_ping_openai(),
+            ping_xai_model: default_ping_xai(),
+            anthropic_upstream: default_anthropic_upstream(),
+            dario_api_key: String::new(),
+            dario_update_check_minutes: default_dario_update_minutes(),
+            dario_version: None,
+            dario_probe_seconds: default_dario_probe_seconds(),
+            dario_probe_failures: default_dario_probe_failures(),
+            dario_probe_model: default_dario_probe_model(),
+            trace_body_retention_days: default_trace_body_retention_days(),
+            trace_row_retention_days: 0,
+            update_check_hours: default_update_check_hours(),
+            update_channel: default_update_channel(),
+            harness_overrides: BTreeMap::new(),
+            account_policy: BTreeMap::new(),
+        }
+    }
+
     fn ping_models(&self) -> alex_proxy::PingModels {
         alex_proxy::PingModels {
             anthropic: self.ping_anthropic_model.clone(),
@@ -782,6 +836,10 @@ fn random_key(prefix: &str) -> String {
 
 fn save_config(config: &Config) -> Result<()> {
     let path = alexandria_home().join("config.toml");
+    save_config_at(config, &path)
+}
+
+fn save_config_at(config: &Config, path: &Path) -> Result<()> {
     std::fs::write(&path, toml::to_string_pretty(config)?)?;
     #[cfg(unix)]
     {
@@ -811,32 +869,7 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         }
         return Ok((config, false));
     }
-    let config = Config {
-        host: "127.0.0.1".into(),
-        port: 4100,
-        data_dir: home.clone(),
-        local_key: random_key("alx"),
-        ping_gemini_model: default_ping_gemini(),
-        ping_openrouter_model: default_ping_openrouter(),
-        gemini_project: String::new(),
-        heartbeat_minutes: default_heartbeat_minutes(),
-        ping_anthropic_model: default_ping_anthropic(),
-        ping_openai_model: default_ping_openai(),
-        ping_xai_model: default_ping_xai(),
-        anthropic_upstream: default_anthropic_upstream(),
-        dario_api_key: String::new(),
-        dario_update_check_minutes: default_dario_update_minutes(),
-        dario_version: None,
-        dario_probe_seconds: default_dario_probe_seconds(),
-        dario_probe_failures: default_dario_probe_failures(),
-        dario_probe_model: default_dario_probe_model(),
-        trace_body_retention_days: default_trace_body_retention_days(),
-        trace_row_retention_days: 0,
-        update_check_hours: default_update_check_hours(),
-        update_channel: default_update_channel(),
-        harness_overrides: BTreeMap::new(),
-        account_policy: BTreeMap::new(),
-    };
+    let config = Config::defaults_for(home.clone());
     std::fs::write(&path, toml::to_string_pretty(&config)?)?;
     #[cfg(unix)]
     {
@@ -935,13 +968,16 @@ impl alex_proxy::DarioRouter for DarioUnavailable {
     fn suspect(&self, _generation_id: &str) {}
 }
 
-fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> axum::Router {
+fn dario_admin_router(
+    sup: Arc<dario::DarioSupervisor>,
+    local_key: Arc<std::sync::RwLock<String>>,
+) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
 
     async fn require_local_key(
-        State(key): State<String>,
+        State(key): State<Arc<std::sync::RwLock<String>>>,
         req: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
@@ -957,7 +993,13 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> ax
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .map(str::to_string)
             });
-        if presented.as_deref() != Some(key.as_str()) {
+        if presented.as_deref()
+            != key
+                .read()
+                .ok()
+                .as_deref()
+                .map(String::as_str)
+        {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(
@@ -1049,7 +1091,7 @@ fn dario_admin_router(sup: Arc<dario::DarioSupervisor>, local_key: String) -> ax
         .with_state(sup)
 }
 
-fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> axum::Router {
+fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
     use axum::routing::{get, post, put};
@@ -1085,7 +1127,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
     }
 
     async fn require_local_key(
-        State(key): State<String>,
+        State(state): State<Arc<alex_proxy::AppState>>,
         req: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
@@ -1101,7 +1143,14 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .map(str::to_string)
             });
-        if presented.as_deref() != Some(key.as_str()) {
+        if presented.as_deref()
+            != state
+                .local_key
+                .read()
+                .ok()
+                .as_deref()
+                .map(String::as_str)
+        {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(
@@ -1421,7 +1470,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>, local_key: String) -> 
         .route("/admin/harnesses/{name}/refresh-config", post(refresh_config))
         .route("/admin/harnesses/{name}/override", put(put_override))
         .route_layer(axum::middleware::from_fn_with_state(
-            local_key,
+            state.clone(),
             require_local_key,
         ))
         .with_state(state)
@@ -1546,6 +1595,7 @@ async fn main() -> Result<()> {
                     config: config.clone(),
                 }),
             );
+            alex_proxy::set_reset_handler(&state, Arc::new(reset::DaemonResetHandler));
             if config.update_check_hours > 0 {
                 let update_status = state.update_status.clone();
                 let hours = config.update_check_hours;
@@ -1646,12 +1696,9 @@ async fn main() -> Result<()> {
                 );
             }
             let mut app = alex_proxy::router(state.clone());
-            app = app.merge(harness_admin_router(
-                state.clone(),
-                config.local_key.clone(),
-            ));
+            app = app.merge(harness_admin_router(state.clone()));
             if let Some(sup) = supervisor.clone() {
-                app = app.merge(dario_admin_router(sup, config.local_key.clone()));
+                app = app.merge(dario_admin_router(sup, state.local_key.clone()));
             }
             let addr: std::net::SocketAddr = format!("{host}:{port}")
                 .parse()
@@ -2303,6 +2350,35 @@ async fn main() -> Result<()> {
                 keys_revoke_cmd(&config, &id).await?;
             }
         },
+        Command::Reset {
+            credentials,
+            settings,
+            traces,
+            harnesses,
+            cache,
+            all,
+            yes,
+        } => {
+            let selection = reset::Selection {
+                credentials: credentials || all,
+                settings: settings || all,
+                traces: traces || all,
+                harnesses: harnesses || all,
+                cache: cache || all,
+            };
+            let vault = open_vault(&config)?;
+            let store = Store::open(config.data_dir.clone())?;
+            let plan = reset::execute(
+                &config,
+                &alexandria_home().join("config.toml"),
+                &vault,
+                &store,
+                selection,
+                !yes,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
         Command::Tui => {
             tui::run(&config.base_url(), &config.local_key).await?;
         }
@@ -7247,6 +7323,37 @@ mod tests {
         (status, value)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn admin_reset_is_authenticated_and_returns_the_shared_dry_run_plan() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("admin-reset");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.data_dir = home.clone();
+        save_config(&config).unwrap();
+        let state = alex_proxy::build_state(
+            config.local_key.clone(),
+            Arc::new(Vault::open(home.join("accounts")).unwrap()),
+            Arc::new(Store::open(home.clone()).unwrap()),
+            None,
+            config.base_url(),
+        );
+        alex_proxy::set_reset_handler(&state, Arc::new(reset::DaemonResetHandler));
+        let app = alex_proxy::router(state);
+        let (status, body) = router_json(
+            app,
+            Method::POST,
+            "/admin/reset",
+            Some(serde_json::json!({"traces": true, "dry_run": true})),
+        )
+        .await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["selected"], serde_json::json!(["traces"]));
+        assert!(body["counts"]["bodies"]["bytes"].is_u64());
+    }
+
     #[test]
     fn launchctl_pid_parsing() {
         let out =
@@ -7520,7 +7627,7 @@ mod tests {
         let home = tmpdir("router-list");
         std::env::set_var("ALEXANDRIA_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
-        let app = harness_admin_router(test_state("router-list-state"), "alx-local".into());
+        let app = harness_admin_router(test_state("router-list-state"));
 
         let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -7551,7 +7658,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::env::set_var("ALEXANDRIA_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
-        let app = harness_admin_router(test_state("router-override-state"), "alx-local".into());
+        let app = harness_admin_router(test_state("router-override-state"));
 
         let (status, body) = router_json(
             app.clone(),
@@ -7603,7 +7710,7 @@ mod tests {
         );
         save_config(&config).unwrap();
         let state = test_state("router-connect-state");
-        let app = harness_admin_router(state.clone(), "alx-local".into());
+        let app = harness_admin_router(state.clone());
 
         let models_path = config_dir.join("models.json");
         assert!(!models_path.exists());

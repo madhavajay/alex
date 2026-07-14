@@ -393,10 +393,18 @@ async fn disconnect_pi(config: &Config, config_dir: Option<PathBuf>) -> Result<(
             ),
         }
     } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local pi config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
+        // Keep the CLI disconnect path complete even while the daemon is
+        // stopped. This is also what lets `alex reset --harnesses --yes`
+        // safely rotate local_key afterwards.
+        let store = alex_store::Store::open(config.data_dir.clone())?;
+        let rows = store.list_run_keys(true)?;
+        for id in rows.iter().filter(|row| {
+            row["kind"].as_str() == Some("harness") && row["label"].as_str() == Some("pi")
+        }).filter_map(|row| row["id"].as_str()) {
+            if store.revoke_run_key(id)? {
+                revoked += 1;
+            }
+        }
     }
     println!("disconnected pi; revoked {revoked} harness key(s)");
     Ok(())
