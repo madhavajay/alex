@@ -30,6 +30,8 @@ struct PreferencesView: View {
         UpdateChannelSetting.stable.rawValue
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
+    @State private var daemonBindChanging = false
+    @State private var daemonBindStatus: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -119,6 +121,31 @@ struct PreferencesView: View {
                     .foregroundStyle(.secondary)
                 .textSelection(.enabled)
             }
+            if let config = store.config {
+                LabeledContent("Listener") {
+                    Text("\(config.host):\(config.port)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                Button {
+                    setDaemonHost(config.lanEnabled ? "127.0.0.1" : "0.0.0.0")
+                } label: {
+                    Label(
+                        config.lanEnabled
+                            ? "Use loopback only" : "Allow LAN connections",
+                        systemImage: config.lanEnabled ? "lock" : "network")
+                }
+                .disabled(daemonBindChanging)
+                Text("LAN mode listens on every IPv4 interface. Alexandria credentials are still required, but other devices on this network can reach the proxy port. Restart the daemon after changing it.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            if daemonBindChanging { ProgressView().controlSize(.small) }
+            if let daemonBindStatus {
+                Text(daemonBindStatus)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
         }
         Section("Proxy credentials") {
             Text("Copy credentials for generic API clients, or a ready-to-edit command that mints a tagged run key. Both use the currently loaded local daemon settings.")
@@ -184,6 +211,24 @@ struct PreferencesView: View {
                 credentialCopyStatus = "Could not load credentials from the local daemon."
             }
             copyingCredentials = false
+        }
+    }
+
+    private func setDaemonHost(_ host: String) {
+        daemonBindChanging = true
+        daemonBindStatus = nil
+        Task {
+            let result = await DaemonController.setDaemonHost(host)
+            if result.ok {
+                await store.refresh()
+                daemonBindStatus = host == "0.0.0.0"
+                    ? "LAN binding saved. Restart the daemon to listen on LAN and loopback."
+                    : "Loopback-only binding saved. Restart the daemon to apply it."
+            } else {
+                NSSound.beep()
+                daemonBindStatus = String(result.combined.suffix(240))
+            }
+            daemonBindChanging = false
         }
     }
 

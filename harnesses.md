@@ -118,6 +118,7 @@ This table summarizes the integrations in `repos/herdr/src/integration` and the 
 | OpenCode | JavaScript plugin | Session/event API and `parentID` child detection | Explicitly filters child sessions from root state |
 | Kilo | JavaScript plugin | Session/event API | Similar to OpenCode, with less child-specific handling |
 | Hermes | Python plugin | Registered pre/post LLM, tool, approval, and session hooks | Direct in-process lifecycle callbacks |
+| Amp | Terminal-state manifest only in this Herdr checkout | Screen-state detection for working/blocked/idle | Herdr does not install an Amp plugin; Alexandria uses Amp's documented plugin API directly |
 
 Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. That describes the checked-in Herdr integrations, not the current capabilities of those products. Grok now documents custom models and trusted command hooks, which Alexandria uses below. For other unimplemented harnesses, Alexandria should start with provider/base-URL configuration, static harness headers if supported, body-derived session discovery, and an optional wrapper run ID. Add a native plugin or hook only when the harness exposes a documented lifecycle API.
 
@@ -229,15 +230,43 @@ any hook registration that previously occupied Alexandria's hook file. Native
 models, the selected default, unrelated config, the backup, and the event log
 are preserved.
 
-### Amp boundary
+### Amp
 
-Amp's documented `AMP_URL` setting changes the entire Amp service/control-plane
-endpoint; it is not a custom model-provider base URL. Current Amp therefore
-cannot be redirected to Alexandria using the same small provider override as
-Pi, Codex, Claude Code, or Grok. Alexandria can continue to observe Amp through
-its transcript wrapper. Model-call proxying would require an Amp Enterprise
-model connection or emulating Amp's proprietary service API, both of which are
-materially different integrations.
+`Harnesses → Amp → Connect` installs a system plugin at
+`~/.config/amp/plugins/alexandria.ts`, a 0600 lifecycle credential, and
+reversible managed state. If a file already occupies that exact plugin path,
+Alexandria stores its contents and restores it on disconnect. The local event
+log is preserved for trace repair and debugging.
+
+The plugin observes Amp's documented `session.start`, `agent.start`,
+`agent.end`, `tool.call`, and `tool.result` events. It records only event names,
+native `T-*` thread IDs, turn/tool-use IDs, tool names, and outcome status; it
+does not record prompts, tool inputs, or tool outputs. Its `tool.call` hook
+always returns `allow`, so it does not change permissions or execution. A
+command-palette action named `Alexandria: Status` checks the local daemon and
+shows the active thread ID.
+
+Amp's built-in `Task`, `finder`, `librarian`, `oracle`, and `painter` tools are
+treated as possible sub-agents. When their documented tool event contains an
+actual child `T-*` ID, the plugin reports an exact parent/child edge. It does
+not invent an edge when Amp omits that ID. Both plugin lifecycle records and
+wrapped model traffic use Amp's native thread ID, so their join is exact rather
+than timestamp-based.
+
+Traffic capture remains a wrapper integration:
+
+```sh
+alex wrap amp
+```
+
+The Harnesses fly-out can launch that command after Amp is connected. Amp's
+documented `AMP_URL` changes the whole Amp service/control-plane endpoint, not
+an individual model-provider base URL. Its public plugin agent API accepts only
+Amp's published providers and model catalogue. Alexandria therefore does not
+install a misleading custom model or mode: Amp keeps its normal models and
+authentication, while the wrapper captures traffic and the plugin supplies
+lifecycle identity. Redirecting Amp's underlying model calls would require an
+Amp Enterprise model connection or emulating Amp's proprietary service API.
 
 ## Sub-agent tracing experiments
 

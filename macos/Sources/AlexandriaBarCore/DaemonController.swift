@@ -162,6 +162,10 @@ public enum DaemonController {
         await run(args: ["daemon", "--background", "--nosplash"], timeout: 30)
     }
 
+    public static func setDaemonHost(_ host: String) async -> CommandResult {
+        await run(args: ["config", "host", host], timeout: 30)
+    }
+
     public static func ping(_ target: String) async -> CommandResult {
         await run(args: ["ping", target], timeout: 60)
     }

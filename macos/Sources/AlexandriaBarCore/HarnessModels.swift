@@ -212,7 +212,7 @@ public struct CodexDefaultRouteResponse: Codable, Sendable, Equatable {
 }
 
 public enum HarnessCatalog {
-    public static let names = ["pi", "claude", "codex", "gemini", "grok", "opencode"]
+    public static let names = ["pi", "claude", "codex", "grok", "amp", "gemini", "opencode"]
 
     public static func displayName(_ name: String) -> String {
         switch name {
@@ -221,6 +221,7 @@ public enum HarnessCatalog {
         case "codex": "Codex"
         case "gemini": "Gemini"
         case "grok": "Grok"
+        case "amp": "Amp"
         case "opencode": "OpenCode"
         default: name.capitalized
         }

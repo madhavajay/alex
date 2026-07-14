@@ -381,6 +381,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 info("Backup: \(backupPath)")
             }
         }
+        if harness.name == "amp", harness.connected {
+            info("Lifecycle: native Amp T-* thread IDs")
+            info("Traffic capture: alex wrap amp")
+        }
         sub.addItem(.separator())
         if harness.supportsConnect, !harness.connected {
             action(HarnessActionKind.connect.label, symbol: "arrow.down.circle") { [weak self] in
@@ -392,6 +396,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             self?.openPreferences(section: .harnesses)
         }
         if harness.connected {
+            if harness.name == "amp" {
+                action("Launch Wrapped Amp", symbol: "terminal") {
+                    let bin = DaemonController.findBinary() ?? "alex"
+                    let quoted = "'" + bin.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                    TerminalLauncher.launch(command: "\(quoted) wrap amp")
+                }
+            }
             if harness.name == "codex" {
                 let useAlex = harness.defaultRoute == "alex"
                 let toggle = NSMenuItem(
