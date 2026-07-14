@@ -31,6 +31,11 @@ struct PreferencesView: View {
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
     @State private var showingResetSheet = false
+    @State private var networkExposure = "loopback"
+    @State private var selectedInterfaceAddress = ""
+    @State private var networkInterfaces: [NetworkInterfaceAddress] = []
+    @State private var savingNetworkExposure = false
+    @State private var networkExposureStatus: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -61,6 +66,8 @@ struct PreferencesView: View {
         .sheet(isPresented: $showingResetSheet) {
             ResetSettingsSheet(store: store)
         }
+        .onAppear { loadNetworkExposure() }
+        .onChange(of: store.config?.host) { loadNetworkExposure() }
     }
 
     @ViewBuilder
@@ -127,6 +134,7 @@ struct PreferencesView: View {
                 .textSelection(.enabled)
             }
         }
+        networkExposureSection
         Section("Reset Alexandria") {
             Text("Remove selected Alexandria data after reviewing a real-count dry run.")
                 .font(.system(size: 10))
@@ -177,6 +185,128 @@ struct PreferencesView: View {
             }
             LabeledContent("Message me on X") {
                 Link("@madhavajay", destination: Self.authorXURL)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var networkExposureSection: some View {
+        Section("Network exposure") {
+            Picker("Listen on", selection: $networkExposure) {
+                Text("Loopback only (recommended)").tag("loopback")
+                Text("A specific interface").tag("interface")
+                Text("All interfaces").tag("all")
+            }
+            .onChange(of: networkExposure) { saveNetworkExposure() }
+
+            if networkExposure == "interface" {
+                if networkInterfaces.isEmpty {
+                    Text("No non-loopback interface addresses are available.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Interface", selection: $selectedInterfaceAddress) {
+                        ForEach(networkInterfaces) { interface in
+                            Text(interface.displayName).tag(interface.address)
+                        }
+                    }
+                    .onChange(of: selectedInterfaceAddress) { saveNetworkExposure() }
+                    Text("A LAN address can change under DHCP. If the saved address is unavailable at startup, Alexandria reports it loudly and falls back to loopback.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if networkExposure != "loopback" {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Remote admin access enabled", systemImage: "exclamationmark.triangle.fill")
+                        .fontWeight(.bold)
+                        .foregroundStyle(.red)
+                    (Text("This exposes Alexandria's admin API — your credential vault, key minting, and data reset — to that network. Anyone who can reach this port ")
+                        + Text("and has your local key").bold()
+                        + Text(" can control Alexandria and delete your data. Rotate your local key when enabling this."))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.red)
+                }
+                .padding(10)
+                .background(.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if savingNetworkExposure {
+                ProgressView("Saving network exposure…").controlSize(.small)
+            }
+            if let networkExposureStatus {
+                Text(networkExposureStatus)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            if networkExposure != "loopback" {
+                Button("Restart daemon service to apply") {
+                    restartDaemonService()
+                }
+                .disabled(savingNetworkExposure)
+                .help("Network exposure is not live until alex service restart completes.")
+            }
+        }
+    }
+
+    private func loadNetworkExposure() {
+        networkInterfaces = NetworkInterfaces.addresses()
+        guard let host = store.config?.host else { return }
+        switch host {
+        case "127.0.0.1", "localhost", "::1", "[::1]", "":
+            networkExposure = "loopback"
+        case "0.0.0.0", "::", "*":
+            networkExposure = "all"
+        default:
+            networkExposure = "interface"
+            selectedInterfaceAddress = host
+        }
+        if selectedInterfaceAddress.isEmpty {
+            selectedInterfaceAddress = networkInterfaces.first?.address ?? ""
+        }
+    }
+
+    private func saveNetworkExposure() {
+        let target: String
+        switch networkExposure {
+        case "all": target = "all"
+        case "interface":
+            guard !selectedInterfaceAddress.isEmpty else { return }
+            target = selectedInterfaceAddress
+        default: target = "loopback"
+        }
+        savingNetworkExposure = true
+        networkExposureStatus = nil
+        Task {
+            let result = await DaemonController.run(args: ["service", "bind", target])
+            savingNetworkExposure = false
+            if result.ok {
+                networkExposureStatus = "Saved. Restart the daemon service to apply this network exposure."
+                await store.refresh()
+            } else {
+                NSSound.beep()
+                networkExposureStatus = result.combined.isEmpty
+                    ? "Could not save network exposure."
+                    : result.combined
+            }
+        }
+    }
+
+    private func restartDaemonService() {
+        savingNetworkExposure = true
+        networkExposureStatus = "Restarting daemon service…"
+        Task {
+            let result = await DaemonController.run(args: ["service", "restart"])
+            savingNetworkExposure = false
+            if result.ok {
+                networkExposureStatus = "Daemon service restarted with the saved network exposure."
+                await store.refresh()
+            } else {
+                NSSound.beep()
+                networkExposureStatus = result.combined.isEmpty
+                    ? "Could not restart the daemon service."
+                    : result.combined
             }
         }
     }

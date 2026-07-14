@@ -329,6 +329,13 @@ import Testing
         #expect(DaemonDiscovery.parse(toml: "port = 4100") == nil)
     }
 
+    @Test func daemonBoundToTailscaleStillConnectsLocallyOverLoopback() {
+        let config = DaemonConfig(host: "100.101.102.103", port: 4100, localKey: "alx-abc123")
+        #expect(config.connectHost == "127.0.0.1")
+        #expect(config.baseURL.absoluteString == "http://127.0.0.1:4100")
+        #expect(NetworkInterfaces.friendlyName("utun4", address: "100.101.102.103") == "Tailscale")
+    }
+
     @Test func providerMapping() {
         #expect(ProviderInfo.displayName("anthropic") == "Claude")
         #expect(ProviderInfo.loginArg("xai") == "grok")

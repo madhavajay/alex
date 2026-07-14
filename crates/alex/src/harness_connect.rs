@@ -2824,12 +2824,7 @@ async fn daemon_health(config: &Config) -> bool {
 }
 
 fn normalized_base_url(config: &Config) -> String {
-    let host = if config.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        config.host.as_str()
-    };
-    format!("http://{host}:{}", config.port)
+    config.base_url()
 }
 
 pub(crate) fn pi_spec() -> &'static HarnessSpec {
@@ -3501,6 +3496,30 @@ mod tests {
             "!pi --version"
         );
         assert_eq!(provider["models"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tailscale_bind_writes_loopback_into_local_harness_config() {
+        let dir = tmpdir("tailscale-local-base-url");
+        let mut config = test_config();
+        config.host = "100.101.102.103".into();
+        let base_url = normalized_base_url(&config);
+        write_pi_connection(
+            dir.clone(),
+            base_url,
+            "rk-test".into(),
+            "alxk-test".into(),
+            model_ids(),
+            None,
+        )
+        .unwrap();
+        let models: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            models["providers"]["alexandria"]["baseUrl"],
+            "http://127.0.0.1:4100"
+        );
     }
 
     #[test]

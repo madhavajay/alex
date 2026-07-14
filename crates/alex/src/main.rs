@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -231,6 +232,11 @@ enum KeysCommand {
 enum ServiceCommand {
     /// Install the OS user service pointing at this binary
     Install,
+    /// Persist the daemon network exposure (loopback, all, or an interface IP)
+    Bind {
+        /// loopback (127.0.0.1), all (0.0.0.0), or a detected interface address
+        target: String,
+    },
     /// Safely replace the loaded launchd service when it has no routed requests in flight
     Restart {
         /// Replace even when routed requests are in flight (those requests will be interrupted)
@@ -882,6 +888,74 @@ impl Config {
     fn upstream_stream_idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.upstream_stream_idle_timeout_seconds.max(1))
     }
+}
+
+/// The intentionally small set of network-exposure choices presented by the
+/// CLI and app. `host` remains the persisted config field for compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BindTarget {
+    Loopback,
+    All,
+    Interface(IpAddr),
+}
+
+impl BindTarget {
+    fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        match value.to_ascii_lowercase().as_str() {
+            "loopback" | "127.0.0.1" => Ok(Self::Loopback),
+            "all" | "0.0.0.0" => Ok(Self::All),
+            _ => {
+                let ip = value
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .with_context(|| {
+                        format!(
+                            "invalid bind target {value:?}; use loopback, all, or an interface IP address"
+                        )
+                    })?;
+                if ip.is_loopback() {
+                    Ok(Self::Loopback)
+                } else if ip.is_unspecified() {
+                    Ok(Self::All)
+                } else {
+                    Ok(Self::Interface(ip))
+                }
+            }
+        }
+    }
+
+    fn host(&self) -> String {
+        match self {
+            Self::Loopback => "127.0.0.1".into(),
+            Self::All => "0.0.0.0".into(),
+            Self::Interface(ip) => ip.to_string(),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Loopback => "loopback only (127.0.0.1)".into(),
+            Self::All => "all interfaces (0.0.0.0)".into(),
+            Self::Interface(ip) => format!("specific interface ({ip})"),
+        }
+    }
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(matches!(host, "localhost"))
+}
+
+/// Binding a concrete LAN/VPN address does not also bind 127.0.0.1. Keep the
+/// local listener explicit so harness config can always remain loopback-only.
+fn requires_explicit_loopback_listener(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .map(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        .unwrap_or(false)
 }
 
 fn random_key(prefix: &str) -> String {
@@ -1788,6 +1862,52 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         .with_state(state)
 }
 
+fn parse_bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("parsing bind address {host}:{port}"))
+}
+
+async fn bind_daemon_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    let addr = parse_bind_socket_addr(host, port)?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(unix)]
+    socket.set_reuseport(true)?;
+    socket
+        .bind(addr)
+        .with_context(|| format!("binding {addr}"))?;
+    socket.listen(1024).context("listening for daemon connections")
+}
+
+/// Bind the configured listener, preserving a local daemon if a selected
+/// DHCP/VPN interface disappeared since it was saved. The saved setting is not
+/// changed: it remains visible for the user to correct, while this process is
+/// safely reachable through loopback.
+async fn bind_daemon_listener_with_fallback(
+    host: &str,
+    port: u16,
+    allow_loopback_fallback: bool,
+) -> Result<(tokio::net::TcpListener, String, Option<String>)> {
+    match bind_daemon_listener(host, port).await {
+        Ok(listener) => Ok((listener, host.to_string(), None)),
+        Err(error) if allow_loopback_fallback => {
+            let listener = bind_daemon_listener("127.0.0.1", port)
+                .await
+                .context("configured bind failed and loopback fallback also failed")?;
+            Ok((listener, "127.0.0.1".into(), Some(format!("{error:#}"))))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1822,6 +1942,7 @@ async fn main() -> Result<()> {
             nosplash,
         } => {
             let mut config = config.clone();
+            let host_was_overridden = host.is_some();
             let host_val = host.clone().unwrap_or_else(|| config.host.clone());
             let port_val = port.unwrap_or(config.port);
             if background {
@@ -2028,27 +2149,35 @@ async fn main() -> Result<()> {
             if let Some(sup) = supervisor.clone() {
                 app = app.merge(dario_admin_router(sup, state.local_key.clone()));
             }
-            let addr: std::net::SocketAddr = format!("{host}:{port}")
-                .parse()
-                .with_context(|| format!("parsing bind address {host}:{port}"))?;
-            let socket = if addr.is_ipv4() {
-                tokio::net::TcpSocket::new_v4()?
-            } else {
-                tokio::net::TcpSocket::new_v6()?
-            };
-            socket.set_reuseaddr(true)?;
-            #[cfg(unix)]
-            socket.set_reuseport(true)?;
-            socket
-                .bind(addr)
-                .with_context(|| format!("binding {addr}"))?;
-            let listener = socket.listen(1024)?;
-            print_banner(&host, port, &config.local_key);
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            let (listener, bound_host, fallback_reason) = bind_daemon_listener_with_fallback(
+                &host,
+                port,
+                // An explicit `daemon --host` is a one-shot override and should
+                // report its error. Only a persisted interface setting gets the
+                // availability fallback promised by the settings UI.
+                !host_was_overridden && !is_loopback_bind_host(&host),
             )
-            .with_graceful_shutdown(async {
+            .await?;
+            if let Some(reason) = fallback_reason {
+                eprintln!("\nWARNING: Alexandria could not bind its configured address {host}:{port}: {reason}");
+                eprintln!("WARNING: Falling back to loopback (127.0.0.1) so the daemon remains available locally.");
+                eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
+            }
+            let local_listener = if requires_explicit_loopback_listener(&bound_host) {
+                Some(bind_daemon_listener("127.0.0.1", port).await.with_context(|| {
+                    format!(
+                        "binding loopback alongside the selected interface {bound_host}:{port}"
+                    )
+                })?)
+            } else {
+                None
+            };
+            print_banner(&bound_host, port, &config.local_key);
+            if local_listener.is_some() {
+                eprintln!("local clients and harnesses remain available at http://127.0.0.1:{port}");
+            }
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let shutdown_task = tokio::spawn(async move {
                 #[cfg(unix)]
                 {
                     let mut term =
@@ -2064,8 +2193,32 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                 }
                 eprintln!("\ndraining in-flight connections, then shutting down");
-            })
-            .await?;
+                let _ = shutdown_tx.send(true);
+            });
+            let shutdown = || {
+                let mut receiver = shutdown_rx.clone();
+                async move {
+                    let _ = receiver.changed().await;
+                }
+            };
+            let primary = axum::serve(
+                listener,
+                app.clone()
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown());
+            let serve_result = if let Some(local_listener) = local_listener {
+                let local = axum::serve(
+                    local_listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown());
+                tokio::try_join!(primary, local).map(|_| ())
+            } else {
+                primary.await
+            };
+            shutdown_task.abort();
+            serve_result?;
             if let Some(sup) = supervisor {
                 sup.shutdown().await;
             }
@@ -2651,6 +2804,7 @@ async fn main() -> Result<()> {
         }
         Command::Service { command } => match command {
             ServiceCommand::Install => service_install(&config)?,
+            ServiceCommand::Bind { target } => service_set_bind(&config, &target)?,
             ServiceCommand::Restart { force } => service_restart(&config, force)?,
             ServiceCommand::Uninstall => service_uninstall()?,
             ServiceCommand::Status => {
@@ -6216,6 +6370,32 @@ fn service_install(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn service_set_bind(config: &Config, target: &str) -> Result<()> {
+    let target = BindTarget::parse(target)?;
+    let mut updated = config.clone();
+    let previous_host = updated.host.clone();
+    updated.host = target.host();
+    save_config(&updated)?;
+
+    println!(
+        "Daemon network exposure saved: {} (host = {}).",
+        target.description(),
+        updated.host
+    );
+    // This changes only `host`: local_key and all harness configuration are
+    // deliberately untouched. Local harnesses continue to use loopback via
+    // Config::base_url().
+    if service_managed(&detect_service_state()) {
+        eprintln!(
+            "The loaded daemon is still bound to {previous_host}; restart required to apply this setting."
+        );
+        eprintln!("  Run: alex service restart");
+    } else {
+        eprintln!("The setting will apply the next time the daemon starts.");
+    }
+    Ok(())
+}
+
 fn service_restart(config: &Config, force: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("service restart supports macOS launchd only");
@@ -7827,6 +8007,36 @@ mod tests {
             harness_overrides: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn bind_target_presets_map_to_persisted_host() {
+        assert_eq!(BindTarget::parse("loopback").unwrap().host(), "127.0.0.1");
+        assert_eq!(BindTarget::parse("all").unwrap().host(), "0.0.0.0");
+        assert_eq!(
+            BindTarget::parse("100.101.102.103").unwrap().host(),
+            "100.101.102.103"
+        );
+        assert!(BindTarget::parse("not-an-address").is_err());
+    }
+
+    #[test]
+    fn tailscale_bind_keeps_local_harness_base_url_on_loopback() {
+        let mut config = test_config(tmpdir("tailscale-local-base-url"));
+        config.host = "100.101.102.103".into();
+        assert_eq!(config.base_url(), "http://127.0.0.1:4100");
+    }
+
+    #[tokio::test]
+    async fn unavailable_configured_bind_falls_back_to_loopback() {
+        // RFC 5737 TEST-NET-1 is never a locally assigned interface address.
+        let (listener, host, reason) =
+            bind_daemon_listener_with_fallback("192.0.2.1", 0, true)
+                .await
+                .unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert!(reason.is_some());
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
     #[cfg(unix)]
