@@ -1,4 +1,6 @@
+#if canImport(AppKit)
 import AppKit
+#endif
 import Foundation
 import Testing
 @testable import AlexandriaBarCore
@@ -66,6 +68,7 @@ import Testing
         #expect(ToolCall(name: "bash", arguments: nil).argumentSummary == "")
     }
 
+    #if canImport(AppKit)
     @Test func documentRendersToolCalls() {
         let json = #"""
         {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":null,"assistant":null,"tool_calls":[{"name":"bash","arguments":"{\"command\":\"ls -l /app\",\"intent\":\"look\"}"},{"name":"str_replace","arguments":"{\"path\":\"/a\",\"old\":\"x\"}"}]}]}
@@ -103,6 +106,8 @@ import Testing
         #expect(TranscriptRender.plan(previous: original, turns: changedTurns) == .rebuild)
     }
 
+    #endif
+
     @Test func jsonHighlightSpans() {
         let json = #"{"a": "b", "n": -1.5, "t": true, "f": false, "x": null}"#
         let tokens = JsonHighlight.spans(json).map { span -> (String, JsonHighlight.Kind) in
@@ -120,6 +125,7 @@ import Testing
         #expect(escaped[1].kind == .string)
     }
 
+    #if canImport(AppKit)
     @Test func jsonHighlightAttributes() {
         let pretty = "{\n  \"name\" : \"bash\",\n  \"count\" : 3\n}"
         let attributed = JsonHighlight.attributed(
@@ -138,6 +144,8 @@ import Testing
         #expect(color(numberAt) == colors.number)
         #expect(color(braceAt) == colors.punctuation)
     }
+
+    #endif
 
     @Test func jsonNiceBlocks() {
         let bashResult = #"{"returncode":0,"output":"total 12\n-rw-r--r-- 1"}"#
@@ -172,6 +180,7 @@ import Testing
         #expect(TranscriptRender.plan(previous: raw, turns: turns, rawMode: false) == .rebuild)
     }
 
+    #if canImport(AppKit)
     @Test func toolResultNiceVersusRaw() throws {
         let json = #"""
         {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"[tool result] {\"returncode\":0,\"output\":\"line1\\nline2\"}","assistant":null}]}
@@ -241,6 +250,8 @@ import Testing
         #expect(TurnHitTest.traceId(at: 5, in: []) == nil)
     }
 
+    #endif
+
     @Test func inspectorSelectionRetargetsToCurrentOrLastTurn() {
         let ids = ["t1", "t2", "t3"]
         #expect(TraceInspectorSelection.target(currentTraceId: "t2", in: ids) == "t2")
@@ -309,6 +320,7 @@ import Testing
         #expect(decodedAbsent.extras?.systemPrompt == nil)
     }
 
+    #if canImport(AppKit)
     @Test func turnRangeBookkeeping() throws {
         let json = #"""
         {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"more","assistant":"text"},{"trace_id":"t3","ts_request_ms":4,"ts_response_ms":null,"model":null,"status":429,"user":null,"assistant":null,"error":"boom"}]}
@@ -329,6 +341,8 @@ import Testing
         #expect(shifted[2].range.length == built.turnRanges[2].range.length)
         #expect(shifted.map(\.traceId) == ["t1", "t2", "t3"])
     }
+
+    #endif
 
     @Test func toolResultBodyStripping() {
         #expect(TurnHeader.toolResultBody("[tool result] file contents here")
@@ -460,6 +474,7 @@ import Testing
         #expect(decoded.extras?.reasoningEffort == nil)
     }
 
+    #if canImport(AppKit)
     @Test func documentTurnNumbersAndLinks() {
         let json = #"""
         {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2800,"model":"m","status":200,"user":"hi","assistant":"yo"},{"trace_id":"t2","ts_request_ms":3000,"ts_response_ms":null,"model":"m","status":null,"user":"[tool result] grep output","assistant":null}]}
@@ -483,4 +498,5 @@ import Testing
         #expect(foundLinks.map(\.absoluteString)
             == ["alexandria://trace/t1", "alexandria://trace/t2"])
     }
+    #endif
 }

@@ -1,5 +1,9 @@
-import AppKit
 import Foundation
+import CoreFoundation
+
+#if canImport(AppKit)
+import AppKit
+#endif
 
 public struct TraceSessionsResponse: Codable, Sendable {
     public let sessions: [TraceSession]
@@ -436,6 +440,7 @@ public enum TurnHeader {
     }
 }
 
+#if canImport(AppKit)
 public struct TranscriptIcons: @unchecked Sendable {
     public let harness: NSImage?
     public let providers: [String: NSImage]
@@ -447,6 +452,7 @@ public struct TranscriptIcons: @unchecked Sendable {
 
     public static let none = TranscriptIcons()
 }
+#endif
 
 public enum BodyPretty {
     public static let displayCap = 200_000
@@ -483,6 +489,7 @@ public enum BodyPretty {
 }
 
 public enum JsonHighlight {
+#if canImport(AppKit)
     public struct Colors: @unchecked Sendable {
         public let key: NSColor
         public let string: NSColor
@@ -505,11 +512,13 @@ public enum JsonHighlight {
             key: .systemBlue, string: .systemOrange, number: .systemPurple,
             keyword: .systemTeal, punctuation: .secondaryLabelColor)
     }
+#endif
 
     public enum Kind: Equatable, Sendable {
         case key, string, number, keyword
     }
 
+#if canImport(AppKit)
     public static func attributed(
         _ text: String, font: NSFont, colors: Colors = .standard,
         cap: Int = BodyPretty.displayCap
@@ -531,6 +540,7 @@ public enum JsonHighlight {
         }
         return out
     }
+#endif
 
     public static func spans(_ text: String) -> [(range: Range<Int>, kind: Kind)] {
         let units = Array(text.utf16)
@@ -1671,6 +1681,7 @@ public enum TurnExport {
     }
 }
 
+#if canImport(AppKit)
 public struct TranscriptDocument: @unchecked Sendable {
     public let text: NSAttributedString
     public let turnRanges: [TurnRange]
@@ -1680,6 +1691,7 @@ public struct TranscriptDocument: @unchecked Sendable {
         self.turnRanges = turnRanges
     }
 }
+#endif
 
 public enum TranscriptRender {
     public struct State: Equatable, Sendable {
@@ -1761,6 +1773,7 @@ public enum TranscriptRender {
         return String(hasher.finalize())
     }
 
+    #if canImport(AppKit)
     public static func document(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
         icons: TranscriptIcons = .none, rawMode: Bool = false,
@@ -2054,6 +2067,7 @@ public enum TranscriptRender {
     static func tokens(_ count: Int64?) -> String { TraceNumberFormat.tokens(count) }
 
     static func cost(_ usd: Double) -> String { TraceNumberFormat.cost(usd) }
+    #endif
 }
 
 public struct DarioAdminStatus: Codable, Sendable {
