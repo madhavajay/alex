@@ -12,7 +12,7 @@ set -eu
 # It installs the CLI, replaces the running daemon, and installs the signed app.
 #
 # Keep this file ASCII-only. macOS /bin/sh (bash 3.2) swallowed the bytes of a
-# UTF-8 ellipsis into the preceding variable name -- "$APP_PROCESS…" parsed as a
+# UTF-8 ellipsis into the preceding variable name -- "$APP_PROCESS..." parsed as a
 # name ending in those bytes, which under `set -u` aborted with "unbound
 # variable" right before the app install. Linux bash parses it fine, so it only
 # ever failed on the machine that mattered. Brace every expansion.
