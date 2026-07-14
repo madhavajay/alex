@@ -790,7 +790,11 @@ fn default_ping_gemini() -> String {
 }
 
 fn default_ping_openrouter() -> String {
-    "anthropic/claude-3.5-sonnet".into()
+    // A health check should be near-free. This is one of OpenRouter's `:free`
+    // models (verified live 2026-07-14: returns 200) rather than the previous
+    // paid anthropic/claude-3.5-sonnet, which billed real credits on every ping.
+    // Bare id: the ping path has already resolved the provider to OpenRouter.
+    "google/gemma-4-26b-a4b-it:free".into()
 }
 
 fn default_anthropic_upstream() -> String {
