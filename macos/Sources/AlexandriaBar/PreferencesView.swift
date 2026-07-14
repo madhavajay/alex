@@ -431,18 +431,24 @@ private struct ResetSettingsSheet: View {
             }
 
             HStack {
-                Button("Cancel") { dismiss() }
+                // Once the reset has been applied there is nothing left to cancel, and
+                // labelling the only way out "Cancel" reads as "undo" -- so nobody dares
+                // click it and the sheet looks frozen.
+                Button(applied ? "Done" : "Cancel") { dismiss() }
                     .disabled(busy)
-                Spacer()
-                Button(plan == nil ? "Run dry run" : "Run dry run again") {
-                    runDryRun()
-                }
-                .disabled(!hasSelection || busy || applied)
-                if plan != nil {
-                    Button("Reset now", role: .destructive) {
-                        applyReset()
+                    .keyboardShortcut(applied ? .defaultAction : .cancelAction)
+                if !applied {
+                    Spacer()
+                    Button(plan == nil ? "Run dry run" : "Run dry run again") {
+                        runDryRun()
                     }
-                    .disabled(!confirmed || busy || applied)
+                    .disabled(!hasSelection || busy)
+                    if plan != nil {
+                        Button("Reset now", role: .destructive) {
+                            applyReset()
+                        }
+                        .disabled(!confirmed || busy)
+                    }
                 }
             }
         }
@@ -456,16 +462,33 @@ private struct ResetSettingsSheet: View {
     }
 
     @ViewBuilder
+    // Show ONLY what the current selection will actually destroy. The daemon's plan
+    // reports a full inventory (it does not know what is ticked), so listing all of
+    // it here put untouched data -- an entire trace history -- on a destructive
+    // confirmation screen. A confirm dialog that lists data it will not delete is
+    // indistinguishable from one that will.
     private func counts(_ counts: ResetCounts) -> some View {
-        GroupBox("Dry-run counts") {
+        GroupBox("Will be permanently deleted") {
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 5) {
-                GridRow { Text("Accounts"); Text("\(counts.accounts)") }
-                GridRow { Text("Traces"); Text("\(counts.traces)") }
-                GridRow {
-                    Text("Cached body data")
-                    Text("\(counts.bodies.bytes.formatted()) bytes (\(ByteCountFormatter.string(fromByteCount: counts.bodies.bytes, countStyle: .file)))")
+                if selection.credentials {
+                    GridRow { Text("Accounts"); Text("\(counts.accounts)") }
                 }
-                GridRow { Text("Connected harnesses"); Text("\(counts.connectedHarnesses)") }
+                if selection.traces {
+                    GridRow { Text("Traces"); Text("\(counts.traces)") }
+                    GridRow {
+                        Text("Trace body data")
+                        Text("\(ByteCountFormatter.string(fromByteCount: counts.bodies.bytes, countStyle: .file)) in \(counts.bodies.files) file\(counts.bodies.files == 1 ? "" : "s")")
+                    }
+                }
+                if selection.harnesses {
+                    GridRow { Text("Harnesses to disconnect"); Text("\(counts.connectedHarnesses)") }
+                }
+                if selection.settings {
+                    GridRow { Text("Settings"); Text("restored to defaults") }
+                }
+                if selection.cache {
+                    GridRow { Text("Cached data"); Text("pricing + prompt cache (rebuilt automatically)") }
+                }
             }
             .font(.system(size: 11))
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -17,7 +17,15 @@ APP_NAME="AlexandriaBar"
 BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alexandria-macos}"
 VERSION="${VERSION:-0.1.0}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://madhavajay.github.io/alex/appcast.xml}"
-SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+
+# The Sparkle EdDSA *public* key. This is not a secret -- a copy ships inside the
+# Info.plist of every DMG we publish, so anyone can already read it. Defaulting it
+# here matters: without SUPublicEDKey the app has nothing to validate an update
+# against, so EVERY update fails with "improperly signed" and the build is a
+# dead end -- it can never update itself back to an official release. This used to
+# default to empty and the key was then silently omitted, which is exactly how a
+# local dev build ended up unable to escape itself.
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-WifIRZCxYKIrh/Jb40HOtNapTS5ZCXpXrv7LdDWHlCw=}"
 DIST="dist"
 APP="$DIST/$APP_NAME.app"
 
@@ -73,6 +81,12 @@ SPARKLE_PUBLIC_ED_KEY_PLIST=""
 if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
   SPARKLE_PUBLIC_ED_KEY_ESCAPED="$(plist_escape "$SPARKLE_PUBLIC_ED_KEY")"
   SPARKLE_PUBLIC_ED_KEY_PLIST="    <key>SUPublicEDKey</key><string>$SPARKLE_PUBLIC_ED_KEY_ESCAPED</string>"
+else
+  # Never omit it silently: the resulting app rejects every update as "improperly
+  # signed" and can never replace itself with an official build.
+  echo "WARNING: SPARKLE_PUBLIC_ED_KEY is empty." >&2
+  echo "  This app will REJECT every update ('improperly signed') and cannot update itself." >&2
+  echo "  Unset the variable to use the default public key, or pass the correct one." >&2
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
