@@ -846,12 +846,30 @@ impl Config {
     /// "stream disconnected before completion" errors. Normalise it here, at the
     /// single source, rather than patching it per call site (which is how the hook
     /// URL got fixed while the provider URL the harness actually calls did not).
+    /// The URL a *local* client (a harness on this machine) should connect to.
+    ///
+    /// `host` is a BIND address and must never be handed to a client as-is. It is
+    /// not just `0.0.0.0` ("listen everywhere", which macOS sometimes refuses to
+    /// route and which produced intermittent "stream disconnected" errors): binding
+    /// to a specific non-loopback address -- a LAN or Tailscale IP, so another
+    /// machine can reach the daemon -- would otherwise tell the LOCAL harnesses to
+    /// talk to that address too. Local traffic would then leave the loopback
+    /// interface, and would break outright whenever that network is down.
+    ///
+    /// A daemon bound to any non-loopback address is also listening on loopback
+    /// (0.0.0.0/:: bind all; a specific IP still leaves 127.0.0.1 serving), so local
+    /// clients can always use loopback. Remote clients are given an explicit address
+    /// by whoever configures them -- never by this function.
     fn base_url(&self) -> String {
-        let host = match self.host.as_str() {
-            "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
-            other => other,
-        };
-        format!("http://{host}:{}", self.port)
+        format!("http://{}:{}", self.local_host(), self.port)
+    }
+
+    /// Loopback unless the daemon is deliberately bound to a loopback alias.
+    fn local_host(&self) -> &str {
+        match self.host.as_str() {
+            "localhost" | "127.0.0.1" | "::1" | "[::1]" => self.host.as_str(),
+            _ => "127.0.0.1",
+        }
     }
 
     fn update_channel(&self) -> selfupdate::UpdateChannel {
@@ -8483,7 +8501,7 @@ mod tests {
         );
         save_config(&config).unwrap();
         let state = test_state("router-connect-claude-state");
-        let app = harness_admin_router(state.clone(), "alx-local".into());
+        let app = harness_admin_router(state.clone());
 
         let (status, body) = router_json(
             app.clone(),
