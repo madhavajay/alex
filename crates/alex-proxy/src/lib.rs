@@ -1650,6 +1650,18 @@ async fn admin_traces(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    // Keep the small `/admin/traces` fixture endpoint useful to harness
+    // certification: a scoped run key gives every request a unique run id.
+    // `list_traces` predates run keys, so delegate only run-id queries to the
+    // richer filter API while retaining its established response shape.
+    if q.contains_key("run_id") {
+        let mut filter = filter_from_query(&q);
+        filter.limit = limit;
+        return match state.store.search_traces(&filter) {
+            Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    }
     match state.store.list_traces(
         limit,
         q.get("session").map(|s| s.as_str()),
@@ -5845,6 +5857,29 @@ mod tests {
         assert_eq!(body["in_flight_requests"][0]["model"], "gpt-5.5");
         assert_eq!(body["in_flight_requests"][0]["session_id"], "session-123");
         assert_eq!(body["in_flight_requests"][0]["harness"], "codex");
+    }
+
+    #[tokio::test]
+    async fn admin_traces_filters_by_scoped_run_id() {
+        let state = test_state("admin-traces-run-id");
+        for (id, run_id) in [("trace-in-run", "hreg-1"), ("trace-other", "hreg-2")] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: now_ms(),
+                    run_id: Some(run_id.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut query = HashMap::new();
+        query.insert("run_id".into(), "hreg-1".into());
+        let (status, body) = response_json(admin_traces(State(state), Query(query)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(body["traces"][0]["id"], "trace-in-run");
+        assert_eq!(body["traces"][0]["run_id"], "hreg-1");
     }
 
     #[test]

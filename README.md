@@ -25,6 +25,7 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **Dario mode** — an always-prepared generational supervisor for the `@askalf/dario` Anthropic upstream with health probes, automatic updates, and rolling restarts; routing remains an explicit toggle
 - **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
 - **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
+- **Harness regression lane** — `scripts/harness-regression.sh` uses per-cell scoped keys and verifies persisted trace API data, rather than trusting a harness exit code
 - **Self-updating, zero downtime** — `alex update` fetches the release manifest, sha256-verifies the binary, swaps it atomically, and blue-greens the daemon on a shared port (SO_REUSEPORT) so in-flight traffic never drops; the menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item that rides the same blue-green handover
 - **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
 
@@ -289,6 +290,7 @@ When a subscription expires you get a notification and a one-click fix. Each pro
 ```bash
 ./alex daemon             # dev shim (cargo run)
 ./test.sh                 # tiered tests: unit | wire | harness | dario
+./scripts/harness-regression.sh  # real Docker harnesses + host-side trace assertions
 cd macos && swift test    # menu bar app tests
 ```
 

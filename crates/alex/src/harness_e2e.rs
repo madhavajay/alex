@@ -88,6 +88,7 @@ pub struct RunOptions {
     pub no_trace_check: bool,
     pub dario_enabled: bool,
     pub local_key: String,
+    pub run_id: Option<String>,
     pub data_dir: PathBuf,
 }
 
@@ -130,6 +131,7 @@ pub struct RunSummary {
     pub routed_model: String,
     pub docker_image: String,
     pub container_base_url: String,
+    pub run_id: Option<String>,
     pub session_dir: String,
     pub command: Vec<String>,
     pub status: Option<i32>,
@@ -424,6 +426,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         routed_model,
         docker_image: opts.docker_image,
         container_base_url: opts.container_base_url,
+        run_id: opts.run_id,
         session_dir: session_dir.to_string_lossy().to_string(),
         command: redact_command(&command),
         status: outcome.status.code(),
@@ -521,6 +524,10 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
                 ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
                 ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
                 ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
+                // This is a normal Claude gateway setting and makes the
+                // harness tag deterministic rather than depending on a
+                // version-specific user-agent string.
+                ("ANTHROPIC_CUSTOM_HEADERS", "x-alexandria-harness: claude".to_string()),
                 ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
                 ("IS_SANDBOX", "1".to_string()),
@@ -585,6 +592,7 @@ env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+http_headers = {{ x-alexandria-harness = "codex" }}
 EOF
 codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model {escaped_model} --json -- "$ALEXANDRIA_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#

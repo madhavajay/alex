@@ -124,6 +124,50 @@ Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. Tha
 
 ## Alexandria's current integrations
 
+## Lightweight harness regression suite
+
+Run `./scripts/harness-regression.sh` after starting a local daemon. The
+default Docker cells are `I1` (Codex via `gpt-5.6-luna`) and `I2` (Claude Code
+via `claude-haiku-4-5`). Each cell mints a `kind=harness` run key with a unique
+`run_id`, passes only that key into the container, and revokes it afterward.
+The host uses the local key only to read the results.
+
+The runner requires Docker plus an active account for the relevant upstream;
+missing Docker, account, or unavailable credits result in `SKIP`. A harness
+failure unrelated to those prerequisites remains `FAIL`. It asserts
+`/admin/traces?run_id=<id>` has a row with the exact harness tag,
+`upstream_provider`, `routed_model`, subscription billing bucket, numeric
+input/output tokens and cost, session id, and persisted request/response body
+paths. It then reads both bodies through `/traces/{trace_id}/body/{kind}`.
+
+`I3` takes `ALEX_INTEGRATION_PI_IMAGE` and
+`ALEX_INTEGRATION_PI_COMMAND`; the image must contain Pi with Alexandria's
+session extension and tool capture enabled. `I4` similarly takes
+`ALEX_INTEGRATION_CODEX_SUBAGENT_IMAGE` and
+`ALEX_INTEGRATION_CODEX_SUBAGENT_COMMAND`; its image must contain trusted
+Alexandria lifecycle hooks and the command must force one subagent. Both
+receive only the scoped key and proxy environment. `I5A` and `I5B` reserve the
+native Amp and Cursor-Agent wrap fixtures, respectively, and skip without
+those logged-in harnesses.
+`I6` runs the Fable-through-Dario check only when `/admin/dario` reports an
+active generation. Missing images, harnesses, accounts, or credits are clean
+SKIPs, never local-key fallbacks.
+
+`I7` and `I8` are the Grok and Gemini gateway fixtures. Supply their image and
+command as `ALEX_INTEGRATION_GROK_IMAGE`/`_COMMAND` or
+`ALEX_INTEGRATION_GEMINI_IMAGE`/`_COMMAND`; the fixture must configure the
+appropriate native base-URL variables and static `x-alexandria-harness` tag.
+
+The lineage shape consumed by the future UI is the object returned in each
+`/traces/sessions` row: `session_id`, `parent_session_id`, `lineage_turn_id`,
+`agent_type`, `child_count`, `subagent_started_ms`, and
+`subagent_stopped_ms`. A child session must have its parent id and timing;
+the parent reports `child_count`. Tool rows are exposed as
+`turns[].executed_tools` from `/traces/sessions/{session_id}/transcript`, with
+`id`, `session_id`, `turn_id`, `trace_id`, `tool_call_id`, `tool_name`,
+`exit_status`, `args_body_path`, and `result_body_path`; their body endpoints
+are `/tools/{id}/body/args` and `/tools/{id}/body/result`.
+
 Managed harness catalogs are generated from Alexandria's live `/v1/models`
 response. Provider-native IDs remain bare, while OpenRouter discovery IDs use
 `openrouter/<provider>/<model>` and appear in harnesses as

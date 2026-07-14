@@ -497,6 +497,13 @@ enum HarnessCommand {
         /// Skip SQLite/body capture verification
         #[arg(long)]
         no_trace_check: bool,
+        /// Read a scoped run or harness key from this file instead of giving
+        /// the container the daemon's local admin key.
+        #[arg(long)]
+        run_key_file: Option<PathBuf>,
+        /// Expected run id for a scoped run key (reported in the JSON summary).
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -2769,8 +2776,16 @@ async fn main() -> Result<()> {
                 container_base_url,
                 timeout_secs,
                 no_trace_check,
+                run_key_file,
+                run_id,
                 json,
             } => {
+                let run_key = run_key_file
+                    .as_deref()
+                    .map(std::fs::read_to_string)
+                    .transpose()?
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty());
                 let summary = harness_e2e::run_harness(harness_e2e::RunOptions {
                     harness,
                     model,
@@ -2784,7 +2799,8 @@ async fn main() -> Result<()> {
                     timeout_secs: timeout_secs.unwrap_or_else(harness_e2e::default_timeout_secs),
                     no_trace_check,
                     dario_enabled: config.dario_enabled(),
-                    local_key: config.local_key.clone(),
+                    local_key: run_key.unwrap_or_else(|| config.local_key.clone()),
+                    run_id,
                     data_dir: config.data_dir.clone(),
                 })?;
                 harness_e2e::print_run_summary(&summary, json)?;
