@@ -35,6 +35,7 @@ public final class SnapshotStore {
     public private(set) var analytics: Analytics?
     public private(set) var accountAnalytics: AccountAnalyticsResponse?
     public private(set) var codexRouting: CodexRoutingResponse?
+    public private(set) var routingByProvider: [String: ProviderRoutingResponse] = [:]
     public private(set) var dario: DarioStatus?
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
@@ -99,6 +100,7 @@ public final class SnapshotStore {
             harnessesSupported = nil
             daemonUpdate = nil
             codexRouting = nil
+            routingByProvider = [:]
             lastError = "no config at ~/.alexandria/config.toml"
             return
         }
@@ -117,6 +119,7 @@ public final class SnapshotStore {
             harnessesSupported = nil
             daemonUpdate = nil
             codexRouting = nil
+            routingByProvider = [:]
             lastError = error.localizedDescription
             return
         }
@@ -126,7 +129,6 @@ public final class SnapshotStore {
         async let limitsR = try? client.limits()
         async let analyticsR = try? client.analytics(sinceMinutes: 60)
         async let accountAnalyticsR = try? client.accountAnalytics()
-        async let codexRoutingR = try? client.codexRouting()
         async let darioR = try? client.dario()
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnesses()
@@ -137,7 +139,22 @@ public final class SnapshotStore {
         limits = await limitsR ?? []
         analytics = await analyticsR
         accountAnalytics = await accountAnalyticsR
-        codexRouting = await codexRoutingR
+        let providerIDs = Set(accounts.map(\.provider)).union(ProviderInfo.supportedProviders)
+        let routings = await withTaskGroup(
+            of: (String, ProviderRoutingResponse?).self,
+            returning: [String: ProviderRoutingResponse].self
+        ) { group in
+            for provider in providerIDs {
+                group.addTask { (provider, try? await client.routing(provider: provider)) }
+            }
+            var values: [String: ProviderRoutingResponse] = [:]
+            for await (provider, routing) in group {
+                if let routing { values[provider] = routing }
+            }
+            return values
+        }
+        routingByProvider = routings
+        codexRouting = routings["openai"]
         dario = await darioR ?? nil
         daemonUpdate = await daemonUpdateR
         do {

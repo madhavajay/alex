@@ -35,6 +35,61 @@ import Testing
         #expect(login.userCode == "ABCD-EFGH")
     }
 
+    @Test func openRouterKeyPostsSecretAndAttributionInJSONBody() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/openrouter-key")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            #expect(request.value(forHTTPHeaderField: "content-type") == "application/json")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["key"] as? String == "or-secret")
+            #expect(json["http_referer"] as? String == "https://alexandria.example")
+            #expect(json["x_title"] as? String == "Alexandria")
+            #expect(json["remove"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"saved":"openrouter-api-key"}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        try await client.setOpenRouterKey(
+            "or-secret",
+            httpReferer: "https://alexandria.example",
+            xTitle: "Alexandria")
+    }
+
+    @Test func openRouterKeyRemovalPostsNoSecret() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/openrouter-key")
+            #expect(request.httpMethod == "POST")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["remove"] as? Bool == true)
+            #expect(json["key"] == nil)
+            #expect(json["http_referer"] == nil)
+            #expect(json["x_title"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"removed":"openrouter-api-key"}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        try await client.removeOpenRouterKey()
+    }
+
     @Test func codexRoutingGetsPolicyAndPerAccountWindows() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/accounts/routing/openai")
@@ -106,6 +161,63 @@ import Testing
             ])
 
         try await client.updateCodexRouting(update)
+    }
+
+    @Test func providerRoutingUsesGeneralizedEndpointAndDecodesReserve() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/routing/openrouter")
+            #expect(request.httpMethod == "GET")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"""
+            {"provider":"openrouter","strategy":"round_robin","reserve_pct":0,"allow_mid_thread_failover":true,"accounts":[{"account_id":"openrouter-api-key","eligible":true,"priority":0,"reserve_pct":0,"reserve_blocked":false,"windows":[]}]}
+            """#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let routing = try await client.routing(provider: "openrouter")
+        #expect(routing.provider == "openrouter")
+        #expect(routing.strategy == .roundRobin)
+        #expect(routing.reservePct == 0)
+        #expect(routing.accounts[0].reservePct == 0)
+    }
+
+    @Test func providerRoutingPutsCompleteProviderPolicy() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/routing/anthropic")
+            #expect(request.httpMethod == "PUT")
+            let json = try #require(JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["strategy"] as? String == "priority")
+            #expect(json["reserve_pct"] as? Double == 25)
+            let accounts = try #require(json["accounts"] as? [[String: Any]])
+            #expect(accounts.count == 1)
+            #expect(accounts[0]["account_id"] as? String == "anthropic:work")
+            #expect(accounts[0]["eligible"] as? Bool == true)
+            #expect(accounts[0]["priority"] as? Int == 0)
+            #expect(accounts[0]["reserve_pct"] as? Double == 0)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        try await client.updateRouting(provider: "anthropic", ProviderRoutingUpdate(
+            strategy: .priority, reservePct: 25,
+            accounts: [ProviderRoutingAccountUpdate(
+                accountId: "anthropic:work", eligible: true, priority: 0, reservePct: 0)]))
     }
 
     @Test func harnesses404MapsToUnsupported() async throws {

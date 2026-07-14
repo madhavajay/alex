@@ -1433,6 +1433,13 @@ pub async fn save_openrouter_api_key(
     Ok("openrouter-api-key".into())
 }
 
+/// Remove the single OpenRouter API-key account. Both the CLI and admin API
+/// use this helper so the account identity and idempotent removal semantics
+/// stay aligned.
+pub async fn remove_openrouter_api_key(vault: &Vault) -> Result<bool> {
+    vault.remove("openrouter-api-key").await
+}
+
 async fn import_grok(vault: &Vault) -> ImportOutcome {
     let mut outcome = ImportOutcome {
         source: "grok".into(),

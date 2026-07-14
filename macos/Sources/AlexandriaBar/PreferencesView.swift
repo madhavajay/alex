@@ -6,7 +6,7 @@ import AlexandriaBarCore
 
 enum PreferencesSection: String, CaseIterable, Hashable {
     case general = "General"
-    case subscriptions = "Subscriptions"
+    case providers = "Providers"
     case harnesses = "Harnesses"
 }
 
@@ -41,19 +41,22 @@ struct PreferencesView: View {
             .pickerStyle(.segmented)
             .padding([.horizontal, .top], 16)
 
-            Form {
-                switch state.section {
-                case .general:
+            switch state.section {
+            case .general:
+                Form {
                     generalSections
-                case .subscriptions:
-                    SubscriptionsPreferencesSection(store: store, onAuthenticate: onAuthenticate)
-                case .harnesses:
+                }
+                .formStyle(.grouped)
+            case .providers:
+                ProvidersPreferencesSection(store: store, onAuthenticate: onAuthenticate)
+            case .harnesses:
+                Form {
                     HarnessesPreferencesSection(store: store)
                 }
+                .formStyle(.grouped)
             }
-            .formStyle(.grouped)
         }
-        .frame(width: 620, height: 680)
+        .frame(width: 780, height: 680)
     }
 
     @ViewBuilder
@@ -212,88 +215,62 @@ struct PreferencesView: View {
     }
 }
 
-private struct SubscriptionsPreferencesSection: View {
+private struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool) -> Void
     @State private var providerToAdd: String?
+    @State private var selectedProvider: String? = "openai"
 
-    private let providers = ["anthropic", "openai", "gemini", "xai"]
+    private var providers: [String] {
+        Array(Set(["anthropic", "openai", "gemini", "xai", "openrouter"] + store.accounts.map(\.provider))).sorted {
+            ProviderInfo.displayName($0) < ProviderInfo.displayName($1)
+        }
+    }
 
     private var usageByAccount: [String: AccountUsage] {
         Dictionary(uniqueKeysWithValues: (store.accountAnalytics?.byAccount ?? []).map { ($0.accountId, $0) })
     }
 
-    private var codexAccounts: [Account] {
-        store.accounts.filter { $0.provider == "openai" }
-    }
-
-    private var routingByAccount: [String: CodexRoutingAccount] {
-        Dictionary(uniqueKeysWithValues: (store.codexRouting?.accounts ?? []).map { ($0.accountId, $0) })
-    }
-
     var body: some View {
-        Section("Subscriptions") {
-            Text("Each account is a separate subscription or API credential. Account pause and proxy selection are controlled separately.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-
-            if store.accounts.isEmpty {
-                Text("No accounts found. Add an account to start routing requests.")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(store.accounts) { account in
-                    SubscriptionAccountRow(
-                        account: account,
-                        usage: usageByAccount[account.id],
-                        routing: routingByAccount[account.id],
-                        reservePct: store.codexRouting?.reservePct ?? 10,
-                        warnUsedPct: store.limitWarnPct,
-                        store: store
-                    ) {
-                        onAuthenticate(account.provider, account.name, false)
+        HStack(spacing: 0) {
+            List(selection: $selectedProvider) {
+                Section("Providers") {
+                    ForEach(providers, id: \.self) { provider in
+                        HStack {
+                            Label(ProviderInfo.displayName(provider), systemImage: "network")
+                            Spacer()
+                            Text("\(store.accounts.filter { $0.provider == provider }.count)")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                            Button {
+                                addAccount(provider)
+                            } label: {
+                                Image(systemName: "plus.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Add \(ProviderInfo.displayName(provider)) account")
+                        }
+                        .tag(Optional(provider))
                     }
                 }
             }
+            .listStyle(.sidebar)
+            .frame(minWidth: 190, idealWidth: 210, maxWidth: 230)
 
-            Button {
-                onAuthenticate("openai", nil, true)
-            } label: {
-                Label("Add another Codex account", systemImage: "person.badge.plus")
-            }
-        }
+            Divider()
 
-
-        CodexRoutingPreferencesSection(
-            store: store,
-            accounts: codexAccounts,
-            routing: store.codexRouting)
-
-        if let analytics = store.accountAnalytics {
-            Section("Usage · last 24 hours") {
-                SubscriptionUsageChart(usages: analytics.byAccount)
-                SubscriptionTokenTimeline(series: analytics.series, accounts: store.accounts)
-                ForEach(analytics.byAccount) { usage in
-                    HStack {
-                        Text(usage.accountId)
-                            .font(.system(size: 10, design: .monospaced))
-                            .lineLimit(1)
-                        Spacer()
-                        Text(usageSummary(usage))
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
+            Form {
+                if let provider = selectedProvider {
+                    ProviderPreferencesDetail(
+                        provider: provider,
+                        store: store,
+                        usageByAccount: usageByAccount,
+                        onAuthenticate: onAuthenticate)
+                } else {
+                    ContentUnavailableView("Choose a provider", systemImage: "network")
                 }
             }
-        }
-
-        Section("Add subscription") {
-            ForEach(providers.filter { $0 != "openai" }, id: \.self) { provider in
-                Button {
-                    providerToAdd = provider
-                } label: {
-                    Label("Add another \(ProviderInfo.displayName(provider)) account", systemImage: "person.badge.plus")
-                }
-            }
+            .formStyle(.grouped)
         }
         .sheet(
             isPresented: Binding(
@@ -302,31 +279,85 @@ private struct SubscriptionsPreferencesSection: View {
             )
         ) {
             if let provider = providerToAdd {
-                SubscriptionNameSheet(provider: provider) { name in
-                    providerToAdd = nil
-                    onAuthenticate(provider, name, false)
-                } onCancel: {
-                    providerToAdd = nil
+                if ProviderInfo.usesAPIKeySheet(provider) {
+                    ProviderAPIKeySheet(provider: provider, store: store) {
+                        providerToAdd = nil
+                    }
+                } else {
+                    SubscriptionNameSheet(provider: provider) { name in
+                        providerToAdd = nil
+                        onAuthenticate(provider, name, provider == "openai")
+                    } onCancel: {
+                        providerToAdd = nil
+                    }
                 }
             }
         }
     }
 
-    private func usageSummary(_ usage: AccountUsage) -> String {
-        var pieces = [
-            "\(usage.requests) requests",
-            "\(TraceFormat.tokens(usage.inputTokens + usage.outputTokens)) tokens",
-            String(format: "$%.4f", usage.costUsd),
-        ]
-        if let errors = usage.errors, errors > 0 {
-            pieces.append("\(errors) errors")
+    private func addAccount(_ provider: String) {
+        if provider == "openai" {
+            // Codex is the one OAuth flow which obtains its identity itself.
+            onAuthenticate(provider, nil, true)
+        } else {
+            providerToAdd = provider
         }
-        return pieces.joined(separator: " · ")
     }
 }
 
-private struct CodexRoutingPreferencesSection: View {
+private struct ProviderPreferencesDetail: View {
+    let provider: String
     let store: SnapshotStore
+    let usageByAccount: [String: AccountUsage]
+    let onAuthenticate: (String, String?, Bool) -> Void
+
+    private var accounts: [Account] { store.accounts.filter { $0.provider == provider } }
+    private var routing: ProviderRoutingResponse? { store.routingByProvider[provider] }
+    private var routingByAccount: [String: ProviderRoutingAccount] {
+        Dictionary(uniqueKeysWithValues: (routing?.accounts ?? []).map { ($0.accountId, $0) })
+    }
+
+    var body: some View {
+        if let analytics = store.accountAnalytics {
+            Section("Usage · last 24 hours") {
+                SubscriptionUsageChart(usages: analytics.byAccount.filter { usage in
+                    accounts.contains { $0.id == usage.accountId }
+                })
+                SubscriptionTokenTimeline(series: analytics.series.filter { point in
+                    accounts.contains { $0.id == point.accountId }
+                }, accounts: accounts)
+            }
+        }
+
+        Section(ProviderInfo.displayName(provider)) {
+            Text("Accounts are separate credentials. Pause and routing eligibility are controlled independently.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            if accounts.isEmpty {
+                Text("No accounts yet. Use the + button beside this provider in the sidebar.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(accounts) { account in
+                SubscriptionAccountRow(
+                    account: account,
+                    usage: usageByAccount[account.id],
+                    routing: routingByAccount[account.id],
+                    reservePct: routing?.reservePct ?? 10,
+                    warnUsedPct: store.limitWarnPct,
+                    store: store
+                ) {
+                    onAuthenticate(account.provider, account.name, false)
+                }
+            }
+        }
+
+        ProviderRoutingPreferencesSection(store: store, provider: provider, accounts: accounts, routing: routing)
+    }
+}
+
+private struct ProviderRoutingPreferencesSection: View {
+    let store: SnapshotStore
+    let provider: String
     let accounts: [Account]
     let routing: CodexRoutingResponse?
     @State private var strategy = CodexRoutingStrategy.resetFirst
@@ -357,23 +388,25 @@ private struct CodexRoutingPreferencesSection: View {
     }
 
     var body: some View {
-        Section("Codex proxy routing") {
-            if accounts.isEmpty {
-                Text("Add a Codex account above to configure proxy routing.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            } else if routing == nil {
+        Section("\(ProviderInfo.displayName(provider)) routing") {
+            if routing == nil {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
-                    Text("The running daemon does not expose per-account Codex routing yet. Update and restart alex to configure it here.")
+                    Text("The running daemon does not expose per-account routing yet. Update and restart alex to configure it here.")
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             } else {
-                Text("Choose which connected accounts may receive Codex requests. Pausing an account disables it more broadly and always overrides this setting.")
+                Text("Choose which connected accounts may receive requests. Pausing an account disables it more broadly and always overrides this setting.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+
+                if accounts.isEmpty {
+                    Text("This provider has no accounts yet. Its policy will apply when you add one.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
 
                 Picker("Selection mode", selection: $strategy) {
                     ForEach(CodexRoutingStrategy.allCases, id: \.self) { value in
@@ -386,26 +419,40 @@ private struct CodexRoutingPreferencesSection: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 
+                Stepper(value: $fallbackReservePct, in: 0...100, step: 5) {
+                    LabeledContent("Provider-wide reserve") {
+                        Text(RoutingReserve.display(fallbackReservePct))
+                            .font(.system(size: 10, design: .monospaced))
+                            .monospacedDigit()
+                    }
+                }
+                .controlSize(.small)
+                .help("Headroom applied when an account has no separate reserve. 0% means reserve never blocks an account.")
+
+                Text("Changing this updates accounts still using the previous provider value; change an account below to give it its own reserve.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
                 Toggle(
-                    "Allow mid-thread subscription failover",
+                    "Allow mid-thread account failover",
                     isOn: $allowMidThreadFailover)
                     .help(
-                        "Retry an active thread on a different eligible Codex subscription when its assigned account is unavailable")
+                        "Retry an active thread on a different eligible account when its assigned account is unavailable")
 
                 Text(allowMidThreadFailover
-                    ? "If the assigned subscription hits an auth, rate-limit, or server failure, Alexandria may move that thread to another eligible subscription. This keeps work moving but can reduce prompt-cache reuse."
-                    : "Auth, rate-limit, and server failures stay on the thread’s assigned subscription instead of retrying another one. Explicitly pausing, disabling, or removing that account can still reassign the thread.")
+                    ? "If the assigned account hits an auth, rate-limit, or server failure, Alexandria may move that thread to another eligible account. This keeps work moving but can reduce prompt-cache reuse."
+                    : "Auth, rate-limit, and server failures stay on the thread’s assigned account instead of retrying another one. Explicitly pausing, disabling, or removing that account can still reassign the thread.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 
                 ForEach(Array(displayedAccounts.enumerated()), id: \.element.accountId) { index, draft in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
-                            Toggle("Use for Codex requests", isOn: eligibleBinding(accountId: draft.accountId))
+                            Toggle("Use for requests", isOn: eligibleBinding(accountId: draft.accountId))
                                 .toggleStyle(.switch)
                                 .controlSize(.small)
                                 .disabled(account(draft.accountId)?.paused == true || busy)
-                                .help("Include this subscription in Codex request routing and failover")
+                                .help("Include this account in routing and failover")
                             Spacer()
                             Text(accountName(draft.accountId))
                                 .font(.system(size: 11))
@@ -417,14 +464,14 @@ private struct CodexRoutingPreferencesSection: View {
                             in: 0...100, step: 5
                         ) {
                             LabeledContent("Keep unused for this account") {
-                                Text("\(Int(draftReserve(draft.accountId)))% remaining")
+                                Text(RoutingReserve.display(draftReserve(draft.accountId)))
                                     .font(.system(size: 10, design: .monospaced))
                                     .monospacedDigit()
                             }
                         }
                         .controlSize(.small)
                         .help(
-                            "Prefer another eligible Codex subscription once this account reaches its remaining-quota reserve")
+                            "Prefer another eligible account once this account reaches its remaining-quota reserve. 0% never blocks it.")
                         if account(draft.accountId)?.paused == true {
                             Text("This account is paused, so it cannot receive proxy traffic even while selected here.")
                                 .font(.system(size: 10))
@@ -436,14 +483,14 @@ private struct CodexRoutingPreferencesSection: View {
 
                 if !draftAccounts.contains(where: \.eligible) {
                     Label(
-                        "No Codex account is selected. Codex proxy requests will fail until at least one account is enabled.",
+                        "No account is selected. Requests for this provider will fail until at least one account is enabled.",
                         systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.red)
                 }
 
                 HStack {
-                    Button("Save proxy routing") { save() }
+                    Button("Save routing") { save() }
                         .disabled(busy || !isDirty)
                     if busy { ProgressView().controlSize(.small) }
                     if !busy && !isDirty && error == nil {
@@ -463,13 +510,25 @@ private struct CodexRoutingPreferencesSection: View {
         .task(id: routingKey) {
             loadRouting()
         }
+        .onChange(of: fallbackReservePct) { oldValue, newValue in
+            // The daemon snapshot exposes effective values, not an override bit.
+            // Treat values equal to the former provider reserve as inherited.
+            draftAccounts = draftAccounts.map { account in
+                guard account.reservePct == oldValue else { return account }
+                return CodexRoutingAccountUpdate(
+                    accountId: account.accountId,
+                    eligible: account.eligible,
+                    priority: account.priority,
+                    reservePct: newValue)
+            }
+        }
     }
 
     private var currentSignature: String {
         let accountKey = draftAccounts.enumerated().map { index, account in
             "\(account.accountId):\(account.eligible):\(index):\(account.reservePct ?? fallbackReservePct)"
         }.joined(separator: "|")
-        return "\(strategy.rawValue)|\(allowMidThreadFailover)|\(accountKey)"
+        return "\(strategy.rawValue)|\(fallbackReservePct)|\(allowMidThreadFailover)|\(accountKey)"
     }
 
     private var displayedAccounts: [CodexRoutingAccountUpdate] {
@@ -634,7 +693,7 @@ private struct CodexRoutingPreferencesSection: View {
 
     private func resetHelp(_ accountId: String) -> String {
         guard let selection = resetSelections[accountId] else {
-            return "Waiting for this subscription's Codex reset data"
+            return "Waiting for this account's reset data"
         }
         return "Backend selected the \(selection.window ?? "active") window at \(selection.usedPct.formatted(.number.precision(.fractionLength(0))))% used; exact reset: \(selection.resetsDate.formatted(date: .abbreviated, time: .standard))"
     }
@@ -643,14 +702,14 @@ private struct CodexRoutingPreferencesSection: View {
         guard let config = store.config else { return }
         busy = true
         error = nil
-        let update = CodexRoutingUpdate(
+        let update = ProviderRoutingUpdate(
             strategy: strategy,
             reservePct: fallbackReservePct,
             allowMidThreadFailover: allowMidThreadFailover,
             accounts: normalized(draftAccounts))
         Task {
             do {
-                try await AlexandriaClient(config: config).updateCodexRouting(update)
+                try await AlexandriaClient(config: config).updateRouting(provider: provider, update)
                 await store.refresh()
             } catch {
                 self.error = error.localizedDescription
@@ -792,8 +851,14 @@ private struct SubscriptionAccountRow: View {
                 Button(account.paused ? "Resume account" : "Pause account") { setPaused(!account.paused) }
                     .controlSize(.small)
                     .disabled(busy)
-                Button("Re-authenticate") { reauthenticate() }
-                    .controlSize(.small)
+                if account.provider == "openrouter" {
+                    Text("Use the sidebar + to replace the API key")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Re-authenticate") { reauthenticate() }
+                        .controlSize(.small)
+                }
                 Button("Remove", role: .destructive) { deleting = true }
                     .controlSize(.small)
                     .disabled(busy)
@@ -968,6 +1033,72 @@ private struct SubscriptionNameSheet: View {
         }
         .padding(20)
         .frame(width: 420)
+    }
+}
+
+private struct ProviderAPIKeySheet: View {
+    let provider: String
+    let store: SnapshotStore
+    let onDone: () -> Void
+    @State private var key = ""
+    @State private var httpReferer = ""
+    @State private var xTitle = ""
+    @State private var saving = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Add \(ProviderInfo.displayName(provider)) API key")
+                .font(.title3.bold())
+            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alexandria daemon for encrypted vault storage.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            SecureField("API key", text: $key)
+                .textFieldStyle(.roundedBorder)
+            TextField("HTTP-Referer (optional)", text: $httpReferer)
+                .textFieldStyle(.roundedBorder)
+            TextField("X-Title (optional)", text: $xTitle)
+                .textFieldStyle(.roundedBorder)
+            if let error {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onDone)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+                Button("Save key") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(saving || key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if saving { ProgressView().controlSize(.small) }
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+
+    private func save() {
+        guard let config = store.config else { return }
+        saving = true
+        error = nil
+        let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanReferer = httpReferer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTitle = xTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            do {
+                try await AlexandriaClient(config: config).setOpenRouterKey(
+                    cleanKey,
+                    httpReferer: cleanReferer.isEmpty ? nil : cleanReferer,
+                    xTitle: cleanTitle.isEmpty ? nil : cleanTitle)
+                await store.refresh()
+                onDone()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            saving = false
+        }
     }
 }
 

@@ -1869,7 +1869,7 @@ async fn main() -> Result<()> {
                     if key.is_some() || referer.is_some() || title.is_some() {
                         anyhow::bail!("--remove cannot be combined with a key, --referer, or --title");
                     }
-                    if vault.remove("openrouter-api-key").await? {
+                    if alex_auth::remove_openrouter_api_key(&vault).await? {
                         println!("{} removed openrouter-api-key", ui::green(ui::dot()));
                     } else {
                         println!("no OpenRouter API key was stored");

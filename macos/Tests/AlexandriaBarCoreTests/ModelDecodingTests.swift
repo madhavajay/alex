@@ -334,6 +334,21 @@ import Testing
         #expect(ProviderInfo.pingArg("unknown") == nil)
     }
 
+    @Test func openRouterProviderMetadata() {
+        #expect(ProviderInfo.displayName("openrouter") == "OpenRouter")
+        #expect(ProviderInfo.loginArg("openrouter") == "openrouter")
+        #expect(ProviderInfo.pingArg("openrouter") == "openrouter")
+        #expect(ProviderInfo.usesAPIKeySheet("openrouter"))
+    }
+
+    @Test func routingReserveResolutionAndDisplay() {
+        #expect(RoutingReserve.resolved(account: nil, provider: 10) == 10)
+        #expect(RoutingReserve.resolved(account: 25, provider: 10) == 25)
+        #expect(RoutingReserve.resolved(account: -1, provider: 10) == 0)
+        #expect(RoutingReserve.display(0) == "0% (never block)")
+        #expect(RoutingReserve.display(15) == "15% remaining")
+    }
+
     @Test func formatDuration() {
         #expect(Format.duration(27538) == "7h 38m")
         #expect(Format.duration(-37906) == "10h 31m")

@@ -393,6 +393,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(admin_account_remove).put(admin_account_update),
         )
         .route("/admin/auth/gemini-key", post(admin_auth_gemini_key))
+        .route(
+            "/admin/auth/openrouter-key",
+            post(admin_auth_openrouter_key),
+        )
         .route("/admin/health", get(admin_health))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
@@ -578,6 +582,72 @@ async fn admin_auth_gemini_key(
     match state.vault.upsert(account).await {
         Ok(()) => axum::Json(json!({"saved": "gemini-api-key"})).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_auth_openrouter_key(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let remove = match body.0.get("remove") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return error_response(StatusCode::BAD_REQUEST, "'remove' must be boolean")
+            }
+        },
+        None => false,
+    };
+    if remove {
+        let has_configuration = ["key", "http_referer", "x_title"]
+            .iter()
+            .any(|field| body.0.get(*field).is_some_and(|value| !value.is_null()));
+        if has_configuration {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "'remove' cannot be combined with 'key', 'http_referer', or 'x_title'",
+            );
+        }
+        return match alex_auth::remove_openrouter_api_key(&state.vault).await {
+            Ok(removed) => axum::Json(json!({
+                "removed": removed.then_some("openrouter-api-key")
+            }))
+            .into_response(),
+            Err(error) => {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+    }
+
+    let Some(key) = body.0["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'key'");
+    };
+    for field in ["http_referer", "x_title"] {
+        if body
+            .0
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("'{field}' must be a string"),
+            );
+        }
+    }
+    match alex_auth::save_openrouter_api_key(
+        &state.vault,
+        key,
+        body.0["http_referer"].as_str(),
+        body.0["x_title"].as_str(),
+    )
+    .await
+    {
+        Ok(id) => axum::Json(json!({"saved": id})).into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -5739,6 +5809,109 @@ mod tests {
         assert_eq!(body["reserve_pct"], 7);
         assert_eq!(body["accounts"][0]["reserve_pct"], 3);
         assert_eq!(state.vault.policy(Provider::Anthropic).account_reserve_pct["work"], 3);
+    }
+
+    #[tokio::test]
+    async fn openrouter_key_endpoint_sets_attribution_removes_and_validates() {
+        let state = test_state("admin-openrouter-key");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{address}/admin/auth/openrouter-key");
+
+        let unauthorized = client
+            .post(&endpoint)
+            .json(&json!({"key": "or-secret"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let missing = client
+            .post(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing_body: Value = missing.json().await.unwrap();
+        assert_eq!(missing_body["error"]["type"], "alexandria");
+        assert_eq!(missing_body["error"]["message"], "missing 'key'");
+
+        let saved: Value = client
+            .post(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({"key": "  or-secret  "}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved["saved"], "openrouter-api-key");
+        let account = state
+            .vault
+            .account_for(Provider::Openrouter, false)
+            .await
+            .unwrap();
+        assert_eq!(account.api_key.as_deref(), Some("or-secret"));
+
+        let attributed: Value = client
+            .post(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({
+                "key": "or-secret",
+                "http_referer": " https://alexandria.example ",
+                "x_title": " Alexandria "
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(attributed["saved"], "openrouter-api-key");
+        let account = state
+            .vault
+            .account_for(Provider::Openrouter, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            account.account_meta["http_referer"],
+            "https://alexandria.example"
+        );
+        assert_eq!(account.account_meta["x_title"], "Alexandria");
+
+        let removed: Value = client
+            .post(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({"remove": true}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], "openrouter-api-key");
+        assert!(state
+            .vault
+            .list()
+            .await
+            .iter()
+            .all(|account| account.provider != Provider::Openrouter));
+
+        server.abort();
     }
 
     #[tokio::test]

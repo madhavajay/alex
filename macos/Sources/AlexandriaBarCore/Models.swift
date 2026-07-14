@@ -221,6 +221,10 @@ public enum CodexRoutingStrategy: String, Codable, Sendable, CaseIterable, Hasha
     case roundRobin = "round_robin"
 }
 
+/// The routing policy is provider-neutral.  The Codex names below remain as
+/// source-compatible aliases for clients released before `/admin/routing`.
+public typealias ProviderRoutingStrategy = CodexRoutingStrategy
+
 public struct CodexRoutingResponse: Codable, Sendable {
     public let provider: String
     public let strategy: CodexRoutingStrategy
@@ -244,6 +248,8 @@ public struct CodexRoutingResponse: Codable, Sendable {
         accounts = try values.decode([CodexRoutingAccount].self, forKey: .accounts)
     }
 }
+
+public typealias ProviderRoutingResponse = CodexRoutingResponse
 
 public struct CodexRoutingAccount: Codable, Sendable, Identifiable {
     public let accountId: String
@@ -300,6 +306,8 @@ public struct CodexRoutingAccount: Codable, Sendable, Identifiable {
     }
 }
 
+public typealias ProviderRoutingAccount = CodexRoutingAccount
+
 public struct CodexResetSelection: Codable, Sendable, Equatable {
     public let window: String?
     public let usedPct: Double
@@ -341,6 +349,8 @@ public struct CodexRoutingUpdate: Codable, Sendable {
     }
 }
 
+public typealias ProviderRoutingUpdate = CodexRoutingUpdate
+
 public struct CodexRoutingAccountUpdate: Codable, Sendable {
     public let accountId: String
     public let eligible: Bool
@@ -360,6 +370,23 @@ public struct CodexRoutingAccountUpdate: Codable, Sendable {
         self.eligible = eligible
         self.priority = priority
         self.reservePct = reservePct
+    }
+}
+
+public typealias ProviderRoutingAccountUpdate = CodexRoutingAccountUpdate
+
+public enum RoutingReserve {
+    /// A response from an older daemon can omit the per-account value; it then
+    /// inherits the provider-wide reserve.
+    public static func resolved(account: Double?, provider: Double) -> Double {
+        min(100, max(0, account ?? provider))
+    }
+
+    /// Keep the important zero case explicit: it means quota never blocks an
+    /// otherwise eligible account.
+    public static func display(_ reservePct: Double) -> String {
+        let value = Int(resolved(account: reservePct, provider: reservePct))
+        return value == 0 ? "0% (never block)" : "\(value)% remaining"
     }
 }
 
@@ -533,6 +560,7 @@ public enum ProviderInfo {
         case "xai": "Grok"
         case "gemini": "Gemini"
         case "amp": "Amp"
+        case "openrouter": "OpenRouter"
         default: provider.capitalized
         }
     }
@@ -549,10 +577,18 @@ public enum ProviderInfo {
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai", "gemini", "amp": provider
+        case "anthropic", "openai", "gemini", "amp", "openrouter": provider
         case "xai": "grok"
         default: nil
         }
+    }
+
+    public static var supportedProviders: [String] {
+        ["anthropic", "openai", "gemini", "xai", "openrouter", "amp"]
+    }
+
+    public static func usesAPIKeySheet(_ provider: String) -> Bool {
+        provider == "openrouter"
     }
 }
 

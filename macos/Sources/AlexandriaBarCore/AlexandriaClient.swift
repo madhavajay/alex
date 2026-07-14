@@ -14,6 +14,19 @@ private struct AuthLoginStartBody: Encodable {
     }
 }
 
+private struct OpenRouterKeyBody: Encodable {
+    let key: String?
+    let httpReferer: String?
+    let xTitle: String?
+    let remove: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case key, remove
+        case httpReferer = "http_referer"
+        case xTitle = "x_title"
+    }
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -171,17 +184,27 @@ public struct AlexandriaClient: Sendable {
             as: AccountAnalyticsResponse.self)
     }
 
-    public func codexRouting() async throws -> CodexRoutingResponse {
+    public func routing(provider: String) async throws -> ProviderRoutingResponse {
         try await get(
-            "admin/accounts/routing/openai",
-            as: CodexRoutingResponse.self)
+            "admin/routing/\(encodedPathComponent(provider))",
+            as: ProviderRoutingResponse.self)
+    }
+
+    public func updateRouting(provider: String, _ update: ProviderRoutingUpdate) async throws {
+        _ = try await request(
+            "admin/routing/\(encodedPathComponent(provider))",
+            method: "PUT",
+            body: body(update))
+    }
+
+    /// Compatibility entry points for app versions which only exposed Codex.
+    public func codexRouting() async throws -> CodexRoutingResponse {
+        try await get("admin/accounts/routing/openai", as: CodexRoutingResponse.self)
     }
 
     public func updateCodexRouting(_ update: CodexRoutingUpdate) async throws {
         _ = try await request(
-            "admin/accounts/routing/openai",
-            method: "PUT",
-            body: body(update))
+            "admin/accounts/routing/openai", method: "PUT", body: body(update))
     }
 
     public func dario() async throws -> DarioStatus? {
@@ -418,5 +441,23 @@ public struct AlexandriaClient: Sendable {
 
     public func setGeminiKey(_ key: String) async throws {
         _ = try await request("admin/auth/gemini-key", method: "POST", body: body(["key": key]))
+    }
+
+    public func setOpenRouterKey(
+        _ key: String, httpReferer: String? = nil, xTitle: String? = nil
+    ) async throws {
+        _ = try await request(
+            "admin/auth/openrouter-key",
+            method: "POST",
+            body: body(OpenRouterKeyBody(
+                key: key, httpReferer: httpReferer, xTitle: xTitle, remove: nil)))
+    }
+
+    public func removeOpenRouterKey() async throws {
+        _ = try await request(
+            "admin/auth/openrouter-key",
+            method: "POST",
+            body: body(OpenRouterKeyBody(
+                key: nil, httpReferer: nil, xTitle: nil, remove: true)))
     }
 }
