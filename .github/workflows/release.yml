@@ -2,22 +2,42 @@ name: Release to crates.io
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing stable tag (vX.Y.Z)"
+        required: true
   push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'macos/**'
-      - '.github/workflows/build-signed-macos.yml'
+    tags:
+      - 'v*'
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  meta:
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-beta.') }}
     runs-on: ubuntu-latest
-    if: "!startsWith(github.event.head_commit.message, 'release: v')"
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Validate stable tag
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag '$tag' is not a stable tag (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: meta
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.meta.result == 'success' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     permissions:
@@ -26,35 +46,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.meta.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo test --workspace
-
-      - name: Bump version if current one is already published
+      - name: Stamp version from tag
         id: version
         run: |
           set -euo pipefail
-          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          status=$(curl -s -o /dev/null -w "%{http_code}" \
-            -A "alex-release-workflow" \
-            "https://crates.io/api/v1/crates/alex/${current}")
-          if [ "$status" = "200" ]; then
-            IFS=. read -r major minor patch <<<"$current"
-            next="${major}.${minor}.$((patch + 1))"
-            echo "bumping ${current} -> ${next}"
-            sed -i "s/^version = \"${current}\"/version = \"${next}\"/" Cargo.toml
-            sed -i "s/version = \"${current}\" }/version = \"${next}\" }/" Cargo.toml
-            cargo update --workspace
-            version="$next"
-            bumped=1
-          else
-            echo "version ${current} not on crates.io yet; publishing as-is"
-            version="$current"
-            bumped=0
-          fi
+          version="${{ needs.meta.outputs.version }}"
+          ./scripts/stamp-version.sh "$version"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "bumped=${bumped}" >> "$GITHUB_OUTPUT"
+
+      - run: cargo test --workspace
 
       - name: Publish crates in dependency order
         env:
@@ -74,28 +78,6 @@ jobs:
             fi
             echo "::endgroup::"
           done
-
-      - name: Commit bump and tag
-        if: steps.version.outputs.bumped == '1'
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "release: v${version}"
-          git tag "v${version}"
-          git push origin HEAD:main "v${version}"
-
-      - name: Tag initial release
-        if: steps.version.outputs.bumped == '0'
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f "v${version}"
-          git push origin "v${version}" || true
 
       - name: Build CLI binary from crates.io
         run: |
@@ -147,7 +129,8 @@ jobs:
           fi
 
   windows-asset:
-    needs: publish
+    needs: [meta, publish]
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -185,7 +168,8 @@ jobs:
           gh release upload "v${{ needs.publish.outputs.version }}" dist/* --clobber -R "${{ github.repository }}"
 
   macos-asset:
-    needs: publish
+    needs: [meta, publish]
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
     runs-on: macos-15
     permissions:
       contents: write
@@ -331,10 +315,11 @@ jobs:
 
   manifest:
     needs:
+      - meta
       - publish
       - windows-asset
       - macos-asset
-    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.macos-asset.result == 'success' }}
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' && needs.macos-asset.result == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -342,6 +327,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
 
       - name: Set manifest metadata
         id: version
@@ -383,9 +370,143 @@ jobs:
           set -euo pipefail
           gh release upload "v${{ needs.publish.outputs.version }}" manifest.json --clobber -R "${{ github.repository }}"
 
+  stable-app:
+    needs: [meta, manifest]
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
+    runs-on: macos-15
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      BUNDLE_ID: com.madhavajay.alexandria-macos
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Check app signing secrets
+        id: app_signing
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            APPLE_SIGNING_IDENTITY \
+            SIGNING_CERTIFICATE_P12_DATA \
+            SIGNING_CERTIFICATE_PASSWORD
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            printf 'Skipping stable DMG; missing secret(s): %s\n' "${missing[*]}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build signed DMG
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
+          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
+          ./build-signed.sh --clean --notarize
+          ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Upload DMG and refresh manifest
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          dmg="$(ls -t macos/dist/*.dmg | head -1)"
+          gh release upload "$tag" "$dmg" --clobber
+
+          rm -rf dist/app-manifest-assets
+          mkdir -p dist/app-manifest-assets
+          gh release download "$tag" --pattern manifest.json --dir dist/app-manifest-assets --clobber
+          cp "$dmg" dist/app-manifest-assets/
+          python3 scripts/gen-manifest.py \
+            --tag "$tag" \
+            --repo "${{ github.repository }}" \
+            --assets-dir dist/app-manifest-assets \
+            --merge-existing dist/app-manifest-assets/manifest.json \
+            --out manifest.json
+          cat manifest.json
+          gh release upload "$tag" manifest.json --clobber
+
+      - name: Check Sparkle signing key
+        id: sparkle_key
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
+            echo "Skipping stable appcast; SPARKLE_ED_PRIVATE_KEY is not configured."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate stable appcast
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          rm -rf sparkle updates appcast.xml
+          mkdir -p sparkle updates
+          curl -fsSL \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
+            -o sparkle.tar.xz
+          tar -xJf sparkle.tar.xz -C sparkle
+          generate_appcast="$(find sparkle -path '*/bin/generate_appcast' -type f | head -1)"
+          if [[ -z "$generate_appcast" ]]; then
+            echo "Unable to locate generate_appcast in Sparkle 2.9.4 archive." >&2
+            exit 1
+          fi
+          chmod +x "$generate_appcast"
+          cp macos/dist/*.dmg updates/
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/madhavajay/alex/releases/download/${tag}/" \
+            -o appcast.xml \
+            updates/
+
+      - name: Publish stable appcast to GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          cp appcast.xml site/appcast.xml
+
+      - name: Deploy GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ github.token }}
+          publish_branch: gh-pages
+          publish_dir: ./site
+          keep_files: true
+
   tap-formula:
     needs: manifest
-    if: ${{ !cancelled() && needs.manifest.result == 'success' }}
+    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
     runs-on: ubuntu-latest
     env:
       TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
