@@ -35,6 +35,8 @@ final class AuthFlowModel {
 
     var providerName: String { ProviderInfo.displayName(provider) }
 
+    var isAddingAccount: Bool { accountName == nil || autoIdentity }
+
     var authorizeUrl: String? { session?.authorizeUrl }
 
     func begin() {
@@ -126,7 +128,7 @@ struct AuthFlowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(model.autoIdentity
+            Text(model.isAddingAccount
                 ? "Add \(model.providerName) Account"
                 : "Re-authenticate \(model.providerName)")
                 .font(.title2.bold())
@@ -288,7 +290,10 @@ final class AuthWindowController {
         store: SnapshotStore,
         onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
     ) {
-        let key = autoIdentity ? "\(provider):add" : "\(provider):reauth:\(accountName ?? "default")"
+        let isAddingAccount = accountName == nil || autoIdentity
+        let key = isAddingAccount
+            ? "\(provider):add"
+            : "\(provider):reauth:\(accountName ?? "default")"
         if let window = windows[key] {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
@@ -303,7 +308,7 @@ final class AuthWindowController {
         }
         let host = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: host)
-        window.title = autoIdentity
+        window.title = isAddingAccount
             ? "Add \(ProviderInfo.displayName(provider)) Account"
             : "Re-authenticate \(ProviderInfo.displayName(provider))"
         window.styleMask = [.titled, .closable]

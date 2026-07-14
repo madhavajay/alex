@@ -13,7 +13,8 @@ struct LimitsCardView: View {
                     ForEach(codexAccounts) { account in
                         accountSection(account)
                     }
-                } else if let provider = limits.first(where: { $0.provider == providerName }) {
+                } else if let provider = ProviderPresentation.visibleLimits(limits, for: accounts)
+                    .first(where: { $0.provider == providerName }) {
                     providerSection(provider)
                 }
             }
@@ -26,7 +27,7 @@ struct LimitsCardView: View {
     /// Keep the provider card's stable order while ensuring Codex accounts are
     /// visible even before a provider-wide response-header snapshot exists.
     private var displayProviders: [String] {
-        var providers = Set(limits.map(\.provider))
+        var providers = Set(ProviderPresentation.visibleLimits(limits, for: accounts).map(\.provider))
         if !codexAccounts.isEmpty { providers.insert("openai") }
         return providers.sorted()
     }
