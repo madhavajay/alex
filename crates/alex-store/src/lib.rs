@@ -338,6 +338,18 @@ pub struct Store {
     pub data_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ResetCounts {
+    pub traces: u64,
+    pub heartbeats: u64,
+    pub run_keys: u64,
+    pub pricing: u64,
+    pub body_files: u64,
+    pub body_bytes: u64,
+    pub dario_prompt_cache_files: u64,
+    pub dario_prompt_cache_bytes: u64,
+}
+
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
@@ -392,6 +404,89 @@ impl Store {
         stmt.query_map([], |r| r.get::<_, String>(0))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    /// Counts the data owned by resettable store categories.  This deliberately
+    /// does not include `known_accounts`: trace attribution survives resets.
+    pub fn reset_counts(&self) -> Result<ResetCounts> {
+        fn body_usage(path: &std::path::Path) -> Result<(u64, u64)> {
+            let mut files = 0;
+            let mut bytes = 0;
+            if !path.exists() {
+                return Ok((files, bytes));
+            }
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    let (nested_files, nested_bytes) = body_usage(&entry.path())?;
+                    files += nested_files;
+                    bytes += nested_bytes;
+                } else if ty.is_file() {
+                    files += 1;
+                    bytes += entry.metadata()?.len();
+                }
+            }
+            Ok((files, bytes))
+        }
+
+        let (body_files, body_bytes) = body_usage(&self.data_dir.join("bodies"))?;
+        let (dario_prompt_cache_files, dario_prompt_cache_bytes) =
+            body_usage(&self.data_dir.join("dario-prompt-cache"))?;
+        let conn = self.conn.lock().unwrap();
+        let count = |table: &str| -> Result<u64> {
+            Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+        };
+        Ok(ResetCounts {
+            traces: count("traces")?,
+            heartbeats: count("heartbeats")?,
+            run_keys: conn.query_row(
+                "SELECT COUNT(*) FROM run_keys WHERE revoked = 0",
+                [],
+                |r| r.get(0),
+            )?,
+            pricing: count("pricing")?,
+            body_files,
+            body_bytes,
+            dario_prompt_cache_files,
+            dario_prompt_cache_bytes,
+        })
+    }
+
+    /// Revokes every still-active key without deleting the audit rows.
+    pub fn revoke_all_run_keys(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE run_keys SET revoked = 1 WHERE revoked = 0", [])? as u64)
+    }
+
+    /// Deletes trace rows and heartbeats and removes every captured body file.
+    /// `known_accounts` is intentionally not touched.
+    pub fn clear_traces_and_bodies(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let bodies = self.data_dir.join("bodies");
+        if bodies.exists() {
+            std::fs::remove_dir_all(&bodies)
+                .with_context(|| format!("removing captured bodies at {}", bodies.display()))?;
+        }
+        conn.execute_batch("DELETE FROM traces; DELETE FROM heartbeats;")?;
+        Ok(())
+    }
+
+    /// Clears derived price data only. It is seeded/refreshed again on a
+    /// subsequent store open or catalog refresh.
+    pub fn clear_pricing(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM pricing", [])? as u64)
+    }
+
+    /// Clears all derived caches currently persisted by the local store.
+    pub fn clear_derived_cache(&self) -> Result<u64> {
+        let prompt_cache = self.data_dir.join("dario-prompt-cache");
+        if prompt_cache.exists() {
+            std::fs::remove_dir_all(&prompt_cache)
+                .with_context(|| format!("removing dario prompt cache at {}", prompt_cache.display()))?;
+        }
+        self.clear_pricing()
     }
 
     pub fn insert_trace(&self, t: &TraceRecord) -> Result<()> {

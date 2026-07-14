@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use alex_auth::{
     now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
     AccountPolicy, AccountPolicyMode, RemovedAccount, Vault,
@@ -66,6 +67,36 @@ pub trait DaemonUpdater: Send + Sync {
     fn apply(&self) -> UpdateApplyFuture;
 }
 
+/// Shared request shape for the destructive reset control-plane operation.
+/// Omitted booleans are false; omitted `dry_run` is true.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct ResetRequest {
+    #[serde(default)]
+    pub credentials: bool,
+    #[serde(default)]
+    pub settings: bool,
+    #[serde(default)]
+    pub traces: bool,
+    #[serde(default)]
+    pub harnesses: bool,
+    #[serde(default)]
+    pub cache: bool,
+    #[serde(default = "reset_dry_run_default")]
+    pub dry_run: bool,
+}
+
+fn reset_dry_run_default() -> bool {
+    true
+}
+
+pub type ResetFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+
+/// The executable owns configuration and harness-specific cleanup; the proxy
+/// owns HTTP authentication and delegates reset execution through this hook.
+pub trait ResetHandler: Send + Sync {
+    fn reset(&self, state: Arc<AppState>, request: ResetRequest) -> ResetFuture;
+}
+
 fn suspect_dario(state: &AppState, account: &Account) {
     if account.kind != "dario" {
         return;
@@ -121,7 +152,7 @@ fn routing_limits_from_headers(
 }
 
 pub struct AppState {
-    pub local_key: String,
+    pub local_key: Arc<std::sync::RwLock<String>>,
     pub vault: Arc<Vault>,
     pub store: Arc<Store>,
     pub http: reqwest::Client,
@@ -138,6 +169,7 @@ pub struct AppState {
     trace_ingest_lock: tokio::sync::Mutex<()>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
+    pub reset_handler: std::sync::RwLock<Option<Arc<dyn ResetHandler>>>,
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -300,7 +332,7 @@ pub fn build_state(
         .build()
         .expect("reqwest client");
     Arc::new(AppState {
-        local_key,
+        local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
         store,
         http,
@@ -317,6 +349,7 @@ pub fn build_state(
         trace_ingest_lock: tokio::sync::Mutex::new(()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
+        reset_handler: std::sync::RwLock::new(None),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
     })
@@ -328,13 +361,19 @@ pub fn set_daemon_updater(state: &Arc<AppState>, updater: Arc<dyn DaemonUpdater>
     }
 }
 
+pub fn set_reset_handler(state: &Arc<AppState>, handler: Arc<dyn ResetHandler>) {
+    if let Ok(mut slot) = state.reset_handler.write() {
+        *slot = Some(handler);
+    }
+}
+
 async fn require_local_key(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let ok = client_key(req.headers())
-        .map(|k| k == state.local_key)
+        .map(|k| state.local_key.read().map(|key| k == *key).unwrap_or(false))
         .unwrap_or(false);
     if !ok {
         return error_response(
@@ -372,6 +411,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/storage", get(admin_storage))
         .route("/admin/storage/prune", post(admin_storage_prune))
+        .route("/admin/reset", post(admin_reset))
         .route("/admin/traces", get(admin_traces))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/accounts/analytics", get(admin_account_analytics))
@@ -462,6 +502,31 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+async fn admin_reset(
+    State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<ResetRequest>>,
+) -> Response {
+    let request = body.map(|body| body.0).unwrap_or_default();
+    let in_flight = state.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    if !request.dry_run && in_flight > 0 {
+        return error_response(
+            StatusCode::CONFLICT,
+            "cannot reset while routed requests are in flight; retry after they complete",
+        );
+    }
+    let handler = state.reset_handler.read().ok().and_then(|slot| slot.clone());
+    let Some(handler) = handler else {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "reset is not configured by this daemon",
+        );
+    };
+    match handler.reset(state, request).await {
+        Ok(plan) => axum::Json(plan).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 async fn admin_auth_import(
@@ -756,7 +821,8 @@ async fn connect_info(
         Some(host) if !host.is_empty() => rewrite_host(&state.base_url, host),
         _ => state.base_url.clone(),
     };
-    let (payload, exports) = connect_payload(&base, &state.local_key);
+    let local_key = state.local_key.read().unwrap().clone();
+    let (payload, exports) = connect_payload(&base, &local_key);
     if q.get("format").map(|f| f == "env").unwrap_or(false) {
         return Response::builder()
             .status(StatusCode::OK)
@@ -2435,7 +2501,7 @@ pub async fn ping_provider(
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-api-key",
-        HeaderValue::from_str(&state.local_key).expect("key header"),
+        HeaderValue::from_str(&state.local_key.read().unwrap()).expect("key header"),
     );
     headers.insert("user-agent", HeaderValue::from_static("alexandria-ping"));
     let resp = proxy(
@@ -3966,7 +4032,7 @@ fn authenticate_trace_ingest(
             "trace ingest requires an Alexandria wrap key",
         ));
     };
-    if key == state.local_key {
+    if state.local_key.read().map(|local| key == *local).unwrap_or(false) {
         return Ok((key_fingerprint(&key), None, true));
     }
     let key_hash = key_hash_hex(&key);
@@ -4229,7 +4295,7 @@ async fn proxy(
 ) -> Response {
     let mut run_key: Option<CachedRunKey> = None;
     let client_fingerprint = match client_key(&headers) {
-        Some(k) if k == state.local_key => key_fingerprint(&k),
+        Some(k) if state.local_key.read().map(|local| k == *local).unwrap_or(false) => key_fingerprint(&k),
         Some(k) => {
             let key_hash = key_hash_hex(&k);
             match run_key_entry(&state, &key_hash) {
