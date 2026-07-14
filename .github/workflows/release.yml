@@ -17,7 +17,7 @@ concurrency:
 jobs:
   meta:
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-beta.') }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-medium
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -36,7 +36,7 @@ jobs:
 
   publish:
     needs: meta
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-medium
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.meta.result == 'success' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -131,7 +131,7 @@ jobs:
   windows-asset:
     needs: [meta, publish]
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
-    runs-on: windows-latest
+    runs-on: namespace-profile-windows-medium
     permissions:
       contents: write
     steps:
@@ -170,7 +170,7 @@ jobs:
   macos-asset:
     needs: [meta, publish]
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
-    runs-on: macos-15
+    runs-on: namespace-profile-mac-medium
     permissions:
       contents: write
     env:
@@ -320,7 +320,7 @@ jobs:
       - windows-asset
       - macos-asset
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' && needs.macos-asset.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-medium
     outputs:
       version: ${{ steps.version.outputs.version }}
     permissions:
@@ -373,7 +373,7 @@ jobs:
   stable-app:
     needs: [meta, manifest]
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
-    runs-on: macos-15
+    runs-on: namespace-profile-mac-medium
     timeout-minutes: 40
     permissions:
       contents: write
@@ -507,7 +507,7 @@ jobs:
   tap-formula:
     needs: manifest
     if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-medium
     env:
       TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
     steps:
