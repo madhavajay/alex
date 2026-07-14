@@ -25,7 +25,6 @@ struct PreferencesView: View {
     @AppStorage("notifyEnabled") private var notifyEnabled = true
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
-    @AppStorage("menuIconStyle") private var menuIconStyle = "logo"
     @AppStorage(UpdateChannelSetting.defaultsKey) private var updateChannel =
         UpdateChannelSetting.stable.rawValue
     @State private var copyingCredentials = false
@@ -78,12 +77,6 @@ struct PreferencesView: View {
                 Text("1 minute").tag(60.0)
                 Text("5 minutes").tag(300.0)
                 Text("15 minutes").tag(900.0)
-            }
-        }
-        Section("Menu Bar") {
-            Picker("Icon", selection: $menuIconStyle) {
-                Text("Alexandria logo").tag("logo")
-                Text("Hieroglyph (𓂀)").tag("glyph")
             }
         }
         Section("Alerts") {
