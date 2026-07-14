@@ -47,8 +47,13 @@ const PI_MIN_VERSION: Version = Version {
     minor: 80,
     patch: 0,
 };
+// Only used when the daemon's real catalog (the `pricing` table, seeded from
+// alex-store/src/models.json) is unreachable. Keep it in step with that seed:
+// claude-fable-5 was missing here, so any fallback silently dropped Fable from
+// every harness even though routing supported it.
 const FALLBACK_MODELS: &[&str] = &[
     "claude-opus-4-8",
+    "claude-fable-5",
     "claude-sonnet-5",
     "claude-haiku-4-5",
     "gpt-5.6-sol",

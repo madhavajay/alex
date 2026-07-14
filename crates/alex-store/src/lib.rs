@@ -488,11 +488,19 @@ impl Store {
         Ok(())
     }
 
-    /// Clears derived price data only. It is seeded/refreshed again on a
-    /// subsequent store open or catalog refresh.
+    /// Clears learned price data and immediately re-seeds the bundled catalog.
+    ///
+    /// Re-seeding is not optional. `pricing` is also the model catalog that
+    /// `/v1/models` serves and that the harness config writer installs into each
+    /// harness. Seeding otherwise only happens on store open, so clearing this on
+    /// a *running* daemon left the catalog empty until the next restart -- the
+    /// harness injection then silently fell back to a stale hardcoded list and
+    /// models such as claude-fable-5 vanished from the harnesses.
     pub fn clear_pricing(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM pricing", [])? as u64)
+        let removed = conn.execute("DELETE FROM pricing", [])? as u64;
+        seed_pricing(&conn)?;
+        Ok(removed)
     }
 
     /// Clears all derived caches currently persisted by the local store.

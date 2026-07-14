@@ -413,7 +413,15 @@ mod tests {
         .await
         .unwrap();
         let counts = store.reset_counts().unwrap();
-        assert_eq!(counts.pricing, 0);
+        // A cache reset drops LEARNED prices and restores the bundled catalog -- it
+        // must not leave `pricing` empty. That table is also the model catalog served
+        // by /v1/models and written into every harness, so an empty one silently
+        // dropped models (claude-fable-5) out of the harnesses until the daemon was
+        // restarted. Asserting 0 here is what encoded that bug.
+        assert!(
+            counts.pricing > 0,
+            "cache reset must re-seed the model catalog, not empty it"
+        );
         assert_eq!(counts.dario_prompt_cache_files, 0);
         assert_eq!(counts.traces, 1);
         assert_eq!(vault.list().await.len(), 1);
