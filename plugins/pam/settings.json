@@ -1,0 +1,63 @@
+{
+  "low": {
+    "agent": {
+      "model": "alex/openrouter/z-ai/glm-5.2",
+      "thinking": "medium"
+    },
+    "oracle": {
+      "model": "alex/gpt-5.6-sol",
+      "fallbacks": [
+        "alex/openrouter/openai/gpt-5.6-sol"
+      ],
+      "thinking": "high"
+    }
+  },
+  "medium": {
+    "agent": {
+      "model": "alex/gpt-5.6-sol",
+      "fallbacks": [
+        "alex/openrouter/openai/gpt-5.6-sol"
+      ],
+      "thinking": "medium"
+    },
+    "oracle": {
+      "model": "alex/gpt-5.6-sol",
+      "fallbacks": [
+        "alex/openrouter/openai/gpt-5.6-sol"
+      ],
+      "thinking": "high"
+    }
+  },
+  "high": {
+    "agent": {
+      "model": "alex/gpt-5.6-sol",
+      "fallbacks": [
+        "alex/openrouter/openai/gpt-5.6-sol"
+      ],
+      "thinking": "xhigh"
+    },
+    "oracle": {
+      "model": "alex/claude-fable-5",
+      "fallbacks": [
+        "alex/openrouter/anthropic/claude-fable-5"
+      ],
+      "thinking": "high"
+    }
+  },
+  "ultra": {
+    "agent": {
+      "model": "alex/claude-fable-5",
+      "fallbacks": [
+        "alex/openrouter/anthropic/claude-fable-5"
+      ],
+      "thinking": "high"
+    },
+    "oracle": {
+      "model": "alex/gpt-5.6-sol",
+      "fallbacks": [
+        "alex/openrouter/openai/gpt-5.6-sol"
+      ],
+      "thinking": "high"
+    }
+  }
+}
