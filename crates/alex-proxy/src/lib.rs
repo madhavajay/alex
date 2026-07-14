@@ -1282,9 +1282,21 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
     if let Some(entry) = amp_usage_entry(state).await {
         providers.push(entry);
     }
+    // Captured response headers outlive their credential. Do not turn that
+    // historical data into a current provider card after the account is gone.
+    let account_providers: HashSet<String> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .map(|account| account.provider.as_str().to_string())
+        .collect();
     for (provider_str, ts_ms, headers_json) in
         state.store.latest_provider_headers().unwrap_or_default()
     {
+        if !account_providers.contains(&provider_str) {
+            continue;
+        }
         if providers
             .iter()
             .any(|p| p["provider"].as_str() == Some(&provider_str))

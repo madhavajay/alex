@@ -79,6 +79,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         buildHeader()
         buildIssues()
         if store.daemonUp {
+            buildProviderEmptyState()
             buildLimits()
             buildAccounts()
             buildHarnesses()
@@ -153,7 +154,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func buildLimits() {
-        guard !store.limits.isEmpty || store.accounts.contains(where: { $0.provider == "openai" }) else {
+        guard ProviderPresentation.shouldShowLimitsCard(
+            limits: store.limits, accounts: store.accounts
+        ) else {
             return
         }
         let item = NSMenuItem()
@@ -165,6 +168,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
         item.view = host
         menu.addItem(item)
+        menu.addItem(.separator())
+    }
+
+    private func buildProviderEmptyState() {
+        guard ProviderPresentation.hasNoAccounts(store.accounts) else { return }
+        addInfo("No token providers connected")
+        addAction("Connect a Token Provider", symbol: "plus.circle") { [weak self] in
+            self?.openPreferences(section: .providers)
+        }
         menu.addItem(.separator())
     }
 
@@ -263,9 +275,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self?.confirmStartCodexWindow()
             }
         }
-        sub.addItem(.separator())
-        action("Add another \(name) account…", symbol: "person.badge.plus") { [weak self] in
-            self?.addAnotherAccount(provider: account.provider)
+        if account.provider == "openai" {
+            sub.addItem(.separator())
+            action("Add another \(name) account…", symbol: "person.badge.plus") { [weak self] in
+                self?.addAnotherAccount(provider: account.provider)
+            }
         }
         sub.addItem(.separator())
         action("Remove Account", symbol: "trash") { [weak self] in
@@ -564,28 +578,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func addAnotherAccount(provider: String) {
-        if provider == "openai" {
-            openAuth(provider: provider, accountName: nil, autoIdentity: true)
-            return
-        }
-        let providerName = ProviderInfo.displayName(provider)
-        let alert = NSAlert()
-        alert.messageText = "Add another \(providerName) account"
-        alert.informativeText = "Choose a short local name (letters, numbers, _ and -)."
-        let field = NSTextField(string: "")
-        field.placeholderString = "e.g. personal or work"
-        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard name.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil else {
-            notify(title: "Invalid account name", body: "Use 1–32 lowercase letters, numbers, _ or -.")
-            return
-        }
-        openAuth(provider: provider, accountName: name)
+        guard provider == "openai" else { return }
+        openAuth(provider: provider, accountName: nil, autoIdentity: true)
     }
 
     private func pingAfterAuth(provider: String) {

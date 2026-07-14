@@ -244,46 +244,75 @@ private struct ProvidersPreferencesSection: View {
         Dictionary(uniqueKeysWithValues: (store.accountAnalytics?.byAccount ?? []).map { ($0.accountId, $0) })
     }
 
+    /// OAuth without a supplied local name uses the compatible `default`
+    /// account id. Codex is the exception: its automatic identity flow gives
+    /// each upstream account a distinct generated local id.
+    private var addableProviders: [String] {
+        providers.filter {
+            $0 == "openai" || !ProviderPresentation.hasAccount(for: $0, in: store.accounts)
+        }
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            List(selection: $selectedProvider) {
-                Section("Providers") {
-                    ForEach(providers, id: \.self) { provider in
-                        HStack {
-                            Label(ProviderInfo.displayName(provider), systemImage: "network")
-                            Spacer()
-                            Text("\(store.accounts.filter { $0.provider == provider }.count)")
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                            Button {
-                                addAccount(provider)
-                            } label: {
-                                Image(systemName: "plus.circle")
+        VStack(spacing: 0) {
+            if ProviderPresentation.hasNoAccounts(store.accounts) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Connect a Token Provider")
+                            .font(.headline)
+                        Text("Connect an account to see its usage and routing settings.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    addProviderMenu(label: "Connect a Token Provider")
+                }
+                .padding(16)
+                Divider()
+            }
+
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("Providers")
+                            .font(.headline)
+                        Spacer()
+                        addProviderMenu()
+                    }
+                    .padding(12)
+
+                    List(selection: $selectedProvider) {
+                        ForEach(providers, id: \.self) { provider in
+                            HStack {
+                                Label(ProviderInfo.displayName(provider), systemImage: "network")
+                                Spacer()
+                                Text("\(store.accounts.filter { $0.provider == provider }.count)")
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
                             }
-                            .buttonStyle(.borderless)
-                            .help("Add \(ProviderInfo.displayName(provider)) account")
+                            .tag(Optional(provider))
                         }
-                        .tag(Optional(provider))
+                    }
+                    .listStyle(.sidebar)
+                }
+                .frame(minWidth: 190, idealWidth: 210, maxWidth: 230)
+
+                Divider()
+
+                Form {
+                    if let provider = selectedProvider {
+                        ProviderPreferencesDetail(
+                            provider: provider,
+                            store: store,
+                            usageByAccount: usageByAccount,
+                            onConnect: addAccount,
+                            onAuthenticate: onAuthenticate)
+                    } else {
+                        ContentUnavailableView("Choose a provider", systemImage: "network")
                     }
                 }
+                .formStyle(.grouped)
             }
-            .listStyle(.sidebar)
-            .frame(minWidth: 190, idealWidth: 210, maxWidth: 230)
-
-            Divider()
-
-            Form {
-                if let provider = selectedProvider {
-                    ProviderPreferencesDetail(
-                        provider: provider,
-                        store: store,
-                        usageByAccount: usageByAccount,
-                        onAuthenticate: onAuthenticate)
-                } else {
-                    ContentUnavailableView("Choose a provider", systemImage: "network")
-                }
-            }
-            .formStyle(.grouped)
         }
         .sheet(
             isPresented: Binding(
@@ -296,24 +325,36 @@ private struct ProvidersPreferencesSection: View {
                     ProviderAPIKeySheet(provider: provider, store: store) {
                         providerToAdd = nil
                     }
-                } else {
-                    SubscriptionNameSheet(provider: provider) { name in
-                        providerToAdd = nil
-                        onAuthenticate(provider, name, provider == "openai")
-                    } onCancel: {
-                        providerToAdd = nil
-                    }
                 }
             }
         }
     }
 
+    @ViewBuilder
+    private func addProviderMenu(label: String? = nil) -> some View {
+        Menu {
+            ForEach(addableProviders, id: \.self) { provider in
+                Button("Add \(ProviderInfo.displayName(provider))") {
+                    addAccount(provider)
+                }
+            }
+        } label: {
+            if let label {
+                Label(label, systemImage: "plus.circle")
+            } else {
+                Image(systemName: "plus.circle")
+            }
+        }
+        .help("Add a token provider")
+    }
+
     private func addAccount(_ provider: String) {
-        if provider == "openai" {
-            // Codex is the one OAuth flow which obtains its identity itself.
-            onAuthenticate(provider, nil, true)
-        } else {
+        if ProviderInfo.usesAPIKeySheet(provider) {
             providerToAdd = provider
+        } else {
+            // OAuth providers capture their account email during login. The
+            // local account name remains the compatible default identifier.
+            onAuthenticate(provider, nil, provider == "openai")
         }
     }
 }
@@ -322,6 +363,7 @@ private struct ProviderPreferencesDetail: View {
     let provider: String
     let store: SnapshotStore
     let usageByAccount: [String: AccountUsage]
+    let onConnect: (String) -> Void
     let onAuthenticate: (String, String?, Bool) -> Void
 
     private var accounts: [Account] { store.accounts.filter { $0.provider == provider } }
@@ -331,40 +373,50 @@ private struct ProviderPreferencesDetail: View {
     }
 
     var body: some View {
-        if let analytics = store.accountAnalytics {
-            Section("Usage · last 24 hours") {
-                SubscriptionUsageChart(usages: analytics.byAccount.filter { usage in
-                    accounts.contains { $0.id == usage.accountId }
-                })
-                SubscriptionTokenTimeline(series: analytics.series.filter { point in
-                    accounts.contains { $0.id == point.accountId }
-                }, accounts: accounts)
-            }
-        }
-
-        Section(ProviderInfo.displayName(provider)) {
-            Text("Accounts are separate credentials. Pause and routing eligibility are controlled independently.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            if accounts.isEmpty {
-                Text("No accounts yet. Use the + button beside this provider in the sidebar.")
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(accounts) { account in
-                SubscriptionAccountRow(
-                    account: account,
-                    usage: usageByAccount[account.id],
-                    routing: routingByAccount[account.id],
-                    reservePct: routing?.reservePct ?? 10,
-                    warnUsedPct: store.limitWarnPct,
-                    store: store
-                ) {
-                    onAuthenticate(account.provider, account.name, false)
+        switch ProviderPresentation.paneState(for: provider, accounts: accounts) {
+        case .connectAccount:
+            Section(ProviderInfo.displayName(provider)) {
+                ContentUnavailableView(
+                    "Connect \(ProviderInfo.displayName(provider))",
+                    systemImage: "plus.circle",
+                    description: Text("Usage and routing settings appear after this account is connected."))
+                Button("Connect \(ProviderInfo.displayName(provider))") {
+                    onConnect(provider)
                 }
             }
-        }
+        case .connected:
+            if let analytics = store.accountAnalytics {
+                Section("Usage · last 24 hours") {
+                    SubscriptionUsageChart(usages: analytics.byAccount.filter { usage in
+                        accounts.contains { $0.id == usage.accountId }
+                    })
+                    SubscriptionTokenTimeline(series: analytics.series.filter { point in
+                        accounts.contains { $0.id == point.accountId }
+                    }, accounts: accounts)
+                }
+            }
 
-        ProviderRoutingPreferencesSection(store: store, provider: provider, accounts: accounts, routing: routing)
+            Section(ProviderInfo.displayName(provider)) {
+                Text("Accounts are separate credentials. Pause and routing eligibility are controlled independently.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                ForEach(accounts) { account in
+                    SubscriptionAccountRow(
+                        account: account,
+                        usage: usageByAccount[account.id],
+                        routing: routingByAccount[account.id],
+                        reservePct: routing?.reservePct ?? 10,
+                        warnUsedPct: store.limitWarnPct,
+                        store: store
+                    ) {
+                        onAuthenticate(account.provider, account.name, false)
+                    }
+                }
+            }
+
+            ProviderRoutingPreferencesSection(
+                store: store, provider: provider, accounts: accounts, routing: routing)
+        }
     }
 }
 
@@ -1174,40 +1226,6 @@ private struct SubscriptionUsageChart: View {
 
     private func color(_ index: Int) -> Color {
         [.blue, .green, .orange, .purple, .pink, .teal][index % 6]
-    }
-}
-
-private struct SubscriptionNameSheet: View {
-    let provider: String
-    let onContinue: (String) -> Void
-    let onCancel: () -> Void
-    @State private var name = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Add \(ProviderInfo.displayName(provider)) account")
-                .font(.title3.bold())
-            Text("Give this subscription a local name so you can choose, pause, and order it later.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            TextField("Name, e.g. personal", text: $name)
-                .textFieldStyle(.roundedBorder)
-            Text("Lowercase letters, numbers, _ and - only.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Continue") {
-                    onContinue(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(name.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) == nil)
-            }
-        }
-        .padding(20)
-        .frame(width: 420)
     }
 }
 
