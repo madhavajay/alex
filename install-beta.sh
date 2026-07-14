@@ -26,6 +26,7 @@ INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
 APP_DIR="${ALEX_APP_DIR:-/Applications}"
 APP_NAME="AlexandriaBar.app"
 APP_PROCESS="AlexandriaBar"
+APP_BUNDLE_ID="${ALEX_APP_BUNDLE_ID:-com.madhavajay.alexandria-macos}"
 
 say() {
   printf '%s\n' "$*"
@@ -159,6 +160,14 @@ install_app() {
   rmdir "$mount_point" 2>/dev/null || true
 
   say "Installed $APP_NAME to $APP_DIR."
+
+  # The app's Sparkle channel is a separate setting from the daemon's, and it
+  # defaults to stable -- so a freshly installed beta app would otherwise offer to
+  # "update" the user DOWN to the current stable release. Set it before launching.
+  # Do this while the app is quit: it reads UserDefaults at startup.
+  defaults write "$APP_BUNDLE_ID" updateChannel -string beta >/dev/null 2>&1 </dev/null || \
+    say "Could not set the app's release channel; set it in Settings > General > Updates."
+
   open -a "$APP_DIR/$APP_NAME" </dev/null || say "Launch $APP_NAME manually from $APP_DIR."
 }
 
