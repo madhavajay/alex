@@ -106,18 +106,31 @@ install_cli() {
   install -m 0755 "$5/alexandria" "$INSTALL_DIR/alexandria"
 }
 
-# `service install` deliberately refuses to hot-swap a daemon that is already
-# loaded -- replacing it is `service restart`, which waits for in-flight routed
-# requests rather than cutting a live session off mid-response. So a non-zero
-# exit here is the expected path, not a failure; keep its noise off the terminal.
+# Point launchd at the newly installed binary and (re)start the daemon.
+#
+# The launchd plist pins an ABSOLUTE binary path (current_exe at install time).
+# A daemon first installed from a dev build stays pinned to that old binary, and
+# neither `service install` (refuses while loaded) nor `service restart`
+# (re-launches the SAME pinned path) re-points it -- so the daemon would stay on
+# the old version forever while the app updates. When a daemon is already loaded
+# we therefore uninstall and reinstall to force the plist to re-pin to THIS
+# binary, rather than relying on restart.
 replace_daemon() {
   if "$INSTALL_DIR/alex" service install >/dev/null 2>&1 </dev/null; then
     say "Daemon service registered."
-  elif "$INSTALL_DIR/alex" service restart </dev/null; then
-    say "Running daemon replaced with the beta build."
+    return
+  fi
+  # A daemon is already loaded (possibly pinned to an older binary). Re-pin it.
+  "$INSTALL_DIR/alex" service uninstall >/dev/null 2>&1 </dev/null || true
+  if "$INSTALL_DIR/alex" service install >/dev/null 2>&1 </dev/null; then
+    say "Daemon re-pointed to the new build and restarted."
+    return
+  fi
+  # Fall back to the graceful in-place restart (same path) if the re-pin failed.
+  if "$INSTALL_DIR/alex" service restart </dev/null; then
+    say "Running daemon restarted."
   else
-    say "The running daemon was not replaced (routed requests may still be in flight)."
-    say "Re-run when idle: alex service restart"
+    say "The daemon was not replaced. Run manually: alex service uninstall && alex service install"
   fi
 }
 
