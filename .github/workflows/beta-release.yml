@@ -105,6 +105,45 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
 
+  linux-musl-asset:
+    needs: [meta, create-prerelease]
+    runs-on: namespace-profile-linux-medium
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: Build fully static musl binaries (x86_64 + aarch64) + checksums
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          ./scripts/stamp-version.sh "$version"
+          # Static musl (no glibc floor, no dynamic OpenSSL) so the CLI runs in
+          # any Linux container. TLS is rustls, so nothing links libssl.
+          docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
+            set -euo pipefail
+            rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            cargo zigbuild -p alex --bin alex --release \
+              --target x86_64-unknown-linux-musl \
+              --target aarch64-unknown-linux-musl
+            mkdir -p dist
+            cp target/x86_64-unknown-linux-musl/release/alex  dist/alex-x86_64-unknown-linux-musl
+            cp target/aarch64-unknown-linux-musl/release/alex dist/alex-aarch64-unknown-linux-musl
+            file dist/alex-x86_64-unknown-linux-musl  | grep -q "statically linked"
+            file dist/alex-aarch64-unknown-linux-musl | grep -q "statically linked"
+            ( cd dist && sha256sum alex-x86_64-unknown-linux-musl alex-aarch64-unknown-linux-musl > checksums.txt )
+            chmod -R a+rX dist
+          '
+          cat dist/checksums.txt
+      - name: Upload to prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.meta.outputs.tag }}" \
+            dist/alex-x86_64-unknown-linux-musl \
+            dist/alex-aarch64-unknown-linux-musl \
+            dist/checksums.txt --clobber
+
   windows-asset:
     needs: [meta, create-prerelease]
     runs-on: namespace-profile-windows-medium
