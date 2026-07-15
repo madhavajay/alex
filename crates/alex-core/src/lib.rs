@@ -395,6 +395,14 @@ pub struct TraceRecord {
     /// not be derived from the user-editable local account nickname.
     #[serde(default)]
     pub subscription_identity: Option<String>,
+    /// True when the request's connection was brokered by a Dario generation.
+    /// This is operational metadata only; account attribution remains the
+    /// underlying provider account.
+    #[serde(default)]
+    pub via_dario: bool,
+    /// The Dario generation that brokered this request, if any.
+    #[serde(default)]
+    pub dario_generation: Option<String>,
     pub run_id: Option<String>,
     pub tags: Option<String>,
     pub client_ip: Option<String>,

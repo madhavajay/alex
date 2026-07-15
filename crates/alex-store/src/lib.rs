@@ -68,7 +68,9 @@ CREATE TABLE IF NOT EXISTS traces (
   key_fingerprint   TEXT,
   reasoning_effort  TEXT,
   thinking_budget   INTEGER,
-  subscription_identity TEXT
+  subscription_identity TEXT,
+  via_dario         INTEGER NOT NULL DEFAULT 0,
+  dario_generation  TEXT
 );
 CREATE INDEX IF NOT EXISTS traces_session ON traces(session_id);
 CREATE INDEX IF NOT EXISTS traces_ts ON traces(ts_request_ms);
@@ -191,7 +193,7 @@ const TRACE_COLS: &str =
      cost_usd, billing_bucket, error, session_id, resp_body_path,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
      account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
-     method, path, subscription_identity";
+     method, path, subscription_identity, via_dario, dario_generation";
 
 fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let ts_request_ms = r.get::<_, i64>(1)?;
@@ -232,6 +234,8 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "method": r.get::<_, Option<String>>(32)?,
         "path": r.get::<_, Option<String>>(33)?,
         "subscription_identity": r.get::<_, Option<String>>(34)?,
+        "via_dario": r.get::<_, i64>(35)? != 0,
+        "dario_generation": r.get::<_, Option<String>>(36)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
     }))
 }
@@ -291,6 +295,8 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
         "reasoning_effort TEXT",
         "thinking_budget INTEGER",
         "subscription_identity TEXT",
+        "via_dario INTEGER NOT NULL DEFAULT 0",
+        "dario_generation TEXT",
     ] {
         if let Err(e) = conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {col}")) {
             if !e.to_string().contains("duplicate column name") {
@@ -613,8 +619,8 @@ impl Store {
                 req_body_path, upstream_req_body_path, resp_body_path,
                 req_headers_json, resp_headers_json, error, account_id,
                 run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
-                subscription_identity
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"#,
+                subscription_identity, via_dario, dario_generation
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)"#,
             params![
                 t.id,
                 t.ts_request_ms,
@@ -651,6 +657,8 @@ impl Store {
                 t.reasoning_effort,
                 t.thinking_budget,
                 subscription_identity,
+                t.via_dario as i64,
+                t.dario_generation,
             ],
         )?;
         Ok(())

@@ -83,6 +83,8 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let thinkingBudget: Int64?
     public let costUsd: Double?
     public let accountId: String?
+    public let viaDario: Bool?
+    public let darioGeneration: String?
     public let error: String?
     public let user: String?
     public let assistant: String?
@@ -103,6 +105,8 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
         case accountId = "account_id"
+        case viaDario = "via_dario"
+        case darioGeneration = "dario_generation"
         case toolCalls = "tool_calls"
         case assistantBlocks = "assistant_blocks"
         case executedTools = "executed_tools"

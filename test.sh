@@ -624,7 +624,7 @@ run_harness_cells() {
 }
 
 dario_field() {
-  curl -sS --max-time 5 -o "$TMP/dario-field.json" "$BASE/admin/dario" 2>/dev/null || true
+  curl -sS --max-time 5 -H "x-api-key: $KEY" -o "$TMP/dario-field.json" "$BASE/admin/dario" 2>/dev/null || true
   python3 - "$1" "$TMP/dario-field.json" <<'PY'
 import json, sys
 try:
@@ -648,7 +648,7 @@ PY
 }
 
 run_dario_tier() {
-  in_only DARIO || { run_dario_probe_cell; run_dario_recover_cell; return 0; }
+  in_only DARIO || { run_dario_probe_cell; run_dario_recover_cell; run_dario_cc_direct_cell; run_dario_serve_noncc_cell; return 0; }
   log "== dario =="
   if dario_active; then
     write_result DARIO PASS 0 "active generation reported by /admin/dario"
@@ -660,6 +660,43 @@ run_dario_tier() {
   fi
   run_dario_probe_cell
   run_dario_recover_cell
+  run_dario_cc_direct_cell
+  run_dario_serve_noncc_cell
+}
+
+run_dario_cc_direct_cell() {
+  in_only DARIO-CC-DIRECT || return 0
+  if ! command -v claude >/dev/null 2>&1; then write_result DARIO-CC-DIRECT SKIP 0 "claude is not on host PATH"; return 0; fi
+  if ! dario_active; then write_result DARIO-CC-DIRECT SKIP 0 "dario unavailable"; return 0; fi
+  local t0 t1 marker all selected sess msg
+  t0=$(now_ms); marker="alexandria-dario-cc-$t0-$$"
+  ANTHROPIC_BASE_URL="$BASE" ANTHROPIC_API_KEY="$KEY" claude --model claude-haiku-4-5 -p "$marker" >"$TMP/dario-cc.out" 2>"$TMP/dario-cc.err" || { t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "claude failed: $(tail -c 180 "$TMP/dario-cc.err")"; return 0; }
+  all="$TMP/dario-cc.all.json"; selected="$TMP/dario-cc.traces.json"
+  curl -sS --max-time 10 -H "x-api-key: $KEY" -o "$all" "$BASE/admin/traces?limit=200" 2>/dev/null || true
+  sess=$(python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])).get("traces",[]); rows=[r for r in rows if (r.get("harness") or "").startswith("claude-cli/") and (r.get("ts_request_ms") or 0)>=int(sys.argv[3])]; assert rows; r=max(rows,key=lambda x:x.get("ts_request_ms",0)); json.dump({"traces":[r]},open(sys.argv[2],"w")); print(r.get("session_id") or "")' "$all" "$selected" "$t0" 2>/dev/null) || { t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "no Claude Code trace after request"; return 0; }
+  if [ -z "$sess" ]; then t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "Claude Code trace missing session"; return 0; fi
+  if msg=$(python3 "$ROOT/scripts/test-assert.py" --traces "$selected" --session "$sess" --base "$BASE" --key "$KEY" --reject-via-dario 2>&1); then t1=$(now_ms); write_result DARIO-CC-DIRECT PASS "$((t1-t0))" "$msg"; else t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "$msg"; fi
+}
+
+run_dario_serve_noncc_cell() {
+  in_only DARIO-SERVE-NONCC || return 0
+  if ! dario_active; then write_result DARIO-SERVE-NONCC SKIP 0 "dario unavailable"; return 0; fi
+  local model=claude-haiku-4-5 t0 t1 sess i msg code
+  t0=$(now_ms)
+  curl -sS --max-time "$WIRE_TIMEOUT" -o "$TMP/dario-warm.body" -w '%{http_code}' -H "x-api-key: $KEY" -H 'content-type: application/json' -H "x-session-id: tsh-dario-warm-$$-$t0" -d "$(build_body anthropic "$model" 0 1)" "$BASE/v1/messages" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 40 ]; do
+    curl -sS --max-time 5 -H "x-api-key: $KEY" -o "$TMP/dario-caches.json" "$BASE/admin/dario" 2>/dev/null || true
+    if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert any(x.get("model")==sys.argv[2] for x in d.get("prompt_caches",[]))' "$TMP/dario-caches.json" "$model" 2>/dev/null; then break; fi
+    sleep 1; i=$((i+1))
+  done
+  if [ "$i" -eq 40 ]; then t1=$(now_ms); write_result DARIO-SERVE-NONCC SKIP "$((t1-t0))" "dario prompt cache did not warm — claude binary reachable?"; return 0; fi
+  sess="tsh-dario-serve-$$-$(now_ms)"
+  code=$(curl -sS --max-time "$WIRE_TIMEOUT" -o "$TMP/dario-serve.body" -w '%{http_code}' -H "x-api-key: $KEY" -H 'content-type: application/json' -H "x-session-id: $sess" -d "$(build_body anthropic "$model" 0)" "$BASE/v1/messages" 2>/dev/null || echo 000)
+  if [ "$code" != 200 ]; then t1=$(now_ms); write_result DARIO-SERVE-NONCC FAIL "$((t1-t0))" "http $code"; return 0; fi
+  sleep 1
+  curl -sS --max-time 10 -H "x-api-key: $KEY" -o "$TMP/cell.DARIO-SERVE-NONCC.traces.json" "$BASE/admin/traces?session=$sess&limit=5" 2>/dev/null || true
+  if msg=$(python3 "$ROOT/scripts/test-assert.py" --traces "$TMP/cell.DARIO-SERVE-NONCC.traces.json" --session "$sess" --base "$BASE" --key "$KEY" --expect-via-dario 2>&1); then t1=$(now_ms); write_result DARIO-SERVE-NONCC PASS "$((t1-t0))" "$msg"; else t1=$(now_ms); write_result DARIO-SERVE-NONCC FAIL "$((t1-t0))" "$msg"; fi
 }
 
 run_dario_probe_cell() {

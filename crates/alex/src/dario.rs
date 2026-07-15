@@ -88,6 +88,9 @@ pub struct DarioSettings {
     pub probe_failures: u32,
     pub probe_model: String,
     pub validate_subscription: bool,
+    /// Resolved by the daemon before it starts the child. This avoids relying
+    /// on a service manager's deliberately minimal PATH.
+    pub claude_bin: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +395,7 @@ pub struct DarioSupervisor {
     last_version: Mutex<Option<String>>,
     respawn_in_flight: AtomicBool,
     respawn_next_at: AtomicI64,
+    prompt_cache_issue: Mutex<Option<String>>,
 }
 
 pub async fn bootstrap(
@@ -642,6 +646,7 @@ impl DarioSupervisor {
             last_version: Mutex::new(None),
             respawn_in_flight: AtomicBool::new(false),
             respawn_next_at: AtomicI64::new(0),
+            prompt_cache_issue: Mutex::new(None),
         });
         let _ = supervisor.weak_self.set(Arc::downgrade(&supervisor));
         supervisor.reap_orphans();
@@ -715,6 +720,7 @@ impl DarioSupervisor {
             guard.as_ref().map(|g| g.id.clone())
         };
         let gens = self.generations.lock().unwrap().clone();
+        let prompt_cache_issue = self.prompt_cache_issue.lock().unwrap().clone();
         json!({
             "available": active_id.is_some(),
             "known_models": alex_store::anthropic_catalog_models(),
@@ -722,6 +728,9 @@ impl DarioSupervisor {
             "runtime_version": self.runtime.version,
             "runtime_path": self.runtime.bin,
             "active_generation_id": active_id,
+            "health": if prompt_cache_issue.is_some() { "degraded" } else { "healthy" },
+            "health_reason": prompt_cache_issue,
+            "claude_bin": self.settings.claude_bin.as_ref(),
             "generations": gens.iter().map(|g| g.status_json()).collect::<Vec<_>>(),
         })
     }
@@ -737,11 +746,39 @@ impl DarioSupervisor {
         };
         let warm = match cache {
             PromptCacheState::Warm => None,
+            PromptCacheState::Cold if self.settings.claude_bin.is_none() => Some(CacheWarmResult::Failed(
+                "claude binary not found (set dario_claude_bin or install claude in ~/.local/bin, /opt/homebrew/bin, or /usr/local/bin)".into(),
+            )),
             PromptCacheState::Cold => Some(self.warm_prompt_cache(model).await),
         };
         match dario_request_decision(cache, warm) {
-            DarioRequestDecision::ServeThroughDario => None,
-            DarioRequestDecision::DirectFallback { reason } => Some(reason),
+            DarioRequestDecision::ServeThroughDario => {
+                *self.prompt_cache_issue.lock().unwrap() = None;
+                None
+            }
+            DarioRequestDecision::DirectFallback { reason } => {
+                *self.prompt_cache_issue.lock().unwrap() = Some(format!("cannot warm prompt cache: {reason}"));
+                Some(reason)
+            }
+        }
+    }
+
+    /// Repair a missing generation in the request path. The timeout is shared
+    /// with prompt warming so an unavailable supervisor never holds a client
+    /// indefinitely.
+    pub async fn ensure_active(&self) -> Result<ActiveDario, String> {
+        if let Some(active) = self.active() {
+            return Ok(active);
+        }
+        let last_version = { self.last_version.lock().unwrap().clone() };
+        let version = match last_version {
+            Some(version) => Ok(version),
+            None => self.resolve_version().await.map_err(|e| e.to_string()),
+        }?;
+        match tokio::time::timeout(Duration::from_millis(CACHE_WARM_TIMEOUT_MS), self.roll(&version)).await {
+            Ok(Ok(_)) => self.active().ok_or_else(|| "Dario roll completed without an active generation".into()),
+            Ok(Err(error)) => Err(format!("Dario on-demand repair failed: {error}")),
+            Err(_) => Err(format!("Dario on-demand repair timed out after {CACHE_WARM_TIMEOUT_MS}ms")),
         }
     }
 
@@ -1089,7 +1126,7 @@ impl DarioSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
-        if let Some(real) = std::env::var_os("DARIO_CLAUDE_BIN") {
+        if let Some(real) = &self.settings.claude_bin {
             child_cmd.env("ALEXANDRIA_REAL_CLAUDE_BIN", real);
         }
         let child = child_cmd
@@ -1815,7 +1852,7 @@ function findRealClaude() {
       } catch {}
     }
   }
-  return 'claude';
+  return null;
 }
 
 function pickTextBlock(block) {
@@ -1843,6 +1880,7 @@ async function capturePromptForModel(model, traceId) {
   const key = promptCacheKey(model);
   const file = promptCachePath(model);
   const claudeBin = findRealClaude();
+  if (!claudeBin) throw new Error('claude binary not found');
   const captured = await new Promise((resolve) => {
     let child;
     let done = false;

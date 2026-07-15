@@ -61,6 +61,8 @@ struct SessionInfoCard: View {
         InfoRow(label: "client ip", value: trace.clientIp)
         InfoRow(label: "key fingerprint", value: trace.keyFingerprint)
         InfoRow(label: "billing type", value: trace.billingBucket)
+        InfoRow(label: "via dario", value: trace.viaDario.map { $0 ? "yes" : "no" })
+        InfoRow(label: "dario generation", value: trace.darioGeneration)
         InfoRow(
             label: "subscription account",
             value: model.accountIdentity(trace.accountId))

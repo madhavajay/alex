@@ -55,6 +55,12 @@ pub trait DarioRouter: Send + Sync {
         true
     }
     fn active(&self) -> Option<DarioActive>;
+    /// Repair a missing generation before a request is sent. Implementations
+    /// must return promptly with an error rather than leaving clients waiting.
+    fn ensure_active(&self) -> DarioEnsureFuture {
+        let active = self.active();
+        Box::pin(async move { active.ok_or_else(|| "no healthy Dario generation".into()) })
+    }
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>>;
     fn prepare_model(&self, _model: &str) -> DarioPrepareFuture {
         Box::pin(async { DarioPrepare::ServeThroughDario })
@@ -67,6 +73,7 @@ pub trait DarioRouter: Send + Sync {
 }
 
 pub type DarioPrepareFuture = Pin<Box<dyn Future<Output = DarioPrepare> + Send + 'static>>;
+pub type DarioEnsureFuture = Pin<Box<dyn Future<Output = Result<DarioActive, String>> + Send + 'static>>;
 pub type DarioProbeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1568,16 +1575,21 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                     generation["id"].as_str() == status["active_generation_id"].as_str()
                         && generation["last_probe"]["ok"].as_bool() == Some(true)
                 });
+            let prompt_cache_degraded = !status["health_reason"].is_null();
             if let Some(obj) = status.as_object_mut() {
                 obj.insert("prompt_caches".into(), json!(dario_prompt_caches(&state)));
-                obj.insert(
-                    "health".into(),
-                    json!(dario_health_state(
-                        anthropic_credentials_present,
-                        generation_ready,
-                        probe_succeeds,
-                    )),
+                let generation_health = dario_health_state(
+                    anthropic_credentials_present,
+                    generation_ready,
+                    probe_succeeds,
                 );
+                // A failed prompt capture is actionable even if the child
+                // socket/probe remains healthy; do not overwrite it with the
+                // coarser connection health state.
+                if !prompt_cache_degraded {
+                    obj.insert("health".into(), json!(generation_health));
+                }
+                obj.insert("generation_health".into(), json!(generation_health));
                 obj.insert(
                     "anthropic_credentials_present".into(),
                     json!(anthropic_credentials_present),
@@ -1958,10 +1970,7 @@ fn dario_capture_suffix(kind: &str) -> Option<&'static str> {
 }
 
 fn is_dario_trace(row: &Value) -> bool {
-    row["account_id"]
-        .as_str()
-        .map(|id| id.starts_with("dario:"))
-        .unwrap_or(false)
+    row["via_dario"].as_bool().unwrap_or(false)
 }
 
 fn find_dario_capture_path(state: &AppState, row: &Value, kind: &str) -> Option<String> {
@@ -3238,7 +3247,12 @@ enum RespondAs {
 
 struct UpstreamPlan {
     url: String,
+    /// The account displayed and aggregated in traces. For Dario this is the
+    /// real Anthropic subscription, never the synthetic local Dario key.
     account: Account,
+    /// Credentials used to make the HTTP connection when they differ from
+    /// trace attribution (the Dario child key).
+    connection_account: Option<Account>,
     body: Vec<u8>,
     upstream_format: &'static str,
     destream: bool,
@@ -3247,6 +3261,8 @@ struct UpstreamPlan {
     extra_headers: Vec<(String, String)>,
     dario_guard: Option<Box<dyn std::any::Any + Send>>,
     dario_fallback_reason: Option<String>,
+    via_dario: bool,
+    dario_generation: Option<String>,
 }
 
 fn dario_account(active: &DarioActive) -> Account {
@@ -3300,6 +3316,7 @@ fn direct_anthropic_plan(
     UpstreamPlan {
         url: format!("{ANTHROPIC_BASE}/v1/messages"),
         account,
+        connection_account: None,
         body,
         upstream_format: "anthropic",
         destream: false,
@@ -3308,6 +3325,8 @@ fn direct_anthropic_plan(
         extra_headers: vec![],
         dario_guard: None,
         dario_fallback_reason: Some(dario_fallback_reason),
+        via_dario: false,
+        dario_generation: None,
     }
 }
 
@@ -3468,13 +3487,13 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let (base, account, dario_guard, dario_capture, dario_fallback_reason) = if genuine_claude_code {
+            let (base, account, connection_account, dario_guard, dario_capture, dario_fallback_reason, via_dario, dario_generation) = if genuine_claude_code {
                 let account = state
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
                     .await
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                (ANTHROPIC_BASE.to_string(), account, None, false, None)
+                (ANTHROPIC_BASE.to_string(), account, None, None, false, None, false, None)
             } else {
                 let route_via_dario = state
                     .dario
@@ -3487,9 +3506,29 @@ async fn plan_upstream(
                         .account_for_excluding(provider, true, excluded_accounts)
                         .await
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None, false, None)
+                    (ANTHROPIC_BASE.to_string(), account, None, None, false, None, false, None)
                 } else {
-                    let dario_active = state.dario.as_ref().and_then(|dario| dario.active());
+                    let dario_active = match state.dario.as_ref() {
+                        Some(dario) => match dario.active() {
+                            Some(active) => Some(active),
+                            None => match dario.ensure_active().await {
+                                Ok(active) => Some(active),
+                                Err(reason) => {
+                                    let account = state
+                                        .vault
+                                        .account_for_excluding(provider, true, excluded_accounts)
+                                        .await
+                                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                                    tracing::warn!(%reason, "Dario unavailable after on-demand repair; using direct Anthropic fallback");
+                                    return Ok(direct_anthropic_plan(
+                                        account, body_json, original_body, routed_model, converted,
+                                        client_stream, format!("dario repair failed: {reason}"),
+                                    ));
+                                }
+                            },
+                        },
+                        None => None,
+                    };
                     match (&state.dario, dario_active) {
                         (Some(dario), Some(active)) => {
                             match dario.prepare_model(routed_model).await {
@@ -3514,27 +3553,35 @@ async fn plan_upstream(
                                     return Err((StatusCode::SERVICE_UNAVAILABLE, reason));
                                 }
                             }
-                            let guard = dario.begin(&active.generation_id).ok_or_else(|| {
-                                (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "Dario became unavailable while routing the Anthropic request"
-                                        .to_string(),
-                                )
-                            })?;
+                            let Some(guard) = dario.begin(&active.generation_id) else {
+                                let account = state.vault.account_for_excluding(provider, true, excluded_accounts).await
+                                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                                let reason = "Dario became unavailable while routing the Anthropic request".to_string();
+                                tracing::warn!(%reason, "using direct Anthropic fallback");
+                                return Ok(direct_anthropic_plan(account, body_json, original_body, routed_model, converted, client_stream, reason));
+                            };
+                            let attribution_account = state
+                                .vault
+                                .account_for_excluding(provider, true, excluded_accounts)
+                                .await
+                                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                             (
                                 active.base_url.trim_end_matches('/').to_string(),
-                                dario_account(&active),
+                                attribution_account,
+                                Some(dario_account(&active)),
                                 Some(guard),
                                 true,
                                 None,
+                                true,
+                                Some(active.generation_id),
                             )
                         }
                         (Some(_), None) => {
-                            return Err((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "Dario is configured but no healthy generation is available"
-                                    .to_string(),
-                            ));
+                            let account = state.vault.account_for_excluding(provider, true, excluded_accounts).await
+                                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                            let reason = "Dario has no healthy generation after on-demand repair".to_string();
+                            tracing::warn!(%reason, "using direct Anthropic fallback");
+                            return Ok(direct_anthropic_plan(account, body_json, original_body, routed_model, converted, client_stream, reason));
                         }
                         (None, None) => unreachable!("Dario routing requires a Dario router"),
                         (None, Some(_)) => {
@@ -3563,6 +3610,7 @@ async fn plan_upstream(
             Ok(UpstreamPlan {
                 url: format!("{base}/v1/messages"),
                 account,
+                connection_account,
                 body,
                 upstream_format: "anthropic",
                 destream: false,
@@ -3578,6 +3626,8 @@ async fn plan_upstream(
                 },
                 dario_guard,
                 dario_fallback_reason,
+                via_dario,
+                dario_generation,
             })
         }
         Provider::Openai => {
@@ -3616,6 +3666,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{OPENAI_BASE}/v1/chat/completions"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-chat",
                         destream: false,
@@ -3624,6 +3675,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::OpenaiChat => {
@@ -3636,6 +3689,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{CODEX_BASE}/responses"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-responses",
                         destream: false,
@@ -3644,6 +3698,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::OpenaiResponses => {
@@ -3663,6 +3719,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url,
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-responses",
                         destream,
@@ -3671,6 +3728,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3688,6 +3747,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url,
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-responses",
                         destream: false,
@@ -3696,6 +3756,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::GeminiGenerate => {
@@ -3714,6 +3776,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url,
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-responses",
                         destream: false,
@@ -3722,6 +3785,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
             }
@@ -3744,6 +3809,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{XAI_BASE}/chat/completions"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-chat",
                         destream: false,
@@ -3752,6 +3818,8 @@ async fn plan_upstream(
                         extra_headers,
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3765,6 +3833,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{XAI_BASE}/chat/completions"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-chat",
                         destream: false,
@@ -3773,6 +3842,8 @@ async fn plan_upstream(
                         extra_headers,
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
@@ -3796,6 +3867,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{OPENROUTER_BASE}/chat/completions"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-chat",
                         destream: false,
@@ -3804,6 +3876,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::AnthropicMessages => {
@@ -3815,6 +3889,7 @@ async fn plan_upstream(
                     Ok(UpstreamPlan {
                         url: format!("{OPENROUTER_BASE}/chat/completions"),
                         account,
+                        connection_account: None,
                         body,
                         upstream_format: "openai-chat",
                         destream: false,
@@ -3823,6 +3898,8 @@ async fn plan_upstream(
                         extra_headers: vec![],
                         dario_guard: None,
                         dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
                     })
                 }
                 ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
@@ -3906,6 +3983,7 @@ async fn plan_upstream(
             Ok(UpstreamPlan {
                 url,
                 account,
+                connection_account: None,
                 body,
                 upstream_format: "gemini",
                 destream: false,
@@ -3914,6 +3992,8 @@ async fn plan_upstream(
                 extra_headers: vec![],
                 dario_guard: None,
                 dario_fallback_reason: None,
+                via_dario: false,
+                dario_generation: None,
             })
         }
     }
@@ -5273,6 +5353,8 @@ async fn proxy(
         }
     };
     trace.upstream_format = Some(plan.upstream_format.into());
+    trace.via_dario = plan.via_dario;
+    trace.dario_generation = plan.dario_generation.clone();
     if let Some(reason) = &plan.dario_fallback_reason {
         trace.tags = merge_trace_note(trace.tags.take(), "dario_fallback", reason);
     }
@@ -5296,7 +5378,12 @@ async fn proxy(
         "proxying request"
     );
 
-    let mut account = plan.account.clone();
+    // Dario's child key is deliberately connection-only. Trace attribution,
+    // known-account upserts, and billing continue to use plan.account.
+    let mut account = plan
+        .connection_account
+        .clone()
+        .unwrap_or_else(|| plan.account.clone());
     let mut upstream_resp = None;
     'accounts: loop {
         if !attempted_accounts.insert(account.id.clone()) {
@@ -5423,9 +5510,14 @@ async fn proxy(
                 {
                     Ok(next_plan) if !attempted_accounts.contains(&next_plan.account.id) => {
                         plan = next_plan;
-                        account = plan.account.clone();
-                        bind_trace_account(&state.store, &mut trace, &account);
+                        account = plan
+                            .connection_account
+                            .clone()
+                            .unwrap_or_else(|| plan.account.clone());
+                        bind_trace_account(&state.store, &mut trace, &plan.account);
                         trace.upstream_format = Some(plan.upstream_format.into());
+                        trace.via_dario = plan.via_dario;
+                        trace.dario_generation = plan.dario_generation.clone();
                         trace.billing_bucket = Some(
                             if account.kind == "oauth" || account.kind == "dario" {
                                 "subscription"
@@ -5461,7 +5553,7 @@ async fn proxy(
         }
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
-    bind_trace_account(&state.store, &mut trace, &account);
+    bind_trace_account(&state.store, &mut trace, &plan.account);
 
     let status = upstream_resp.status();
     trace.status = Some(status.as_u16() as i64);
@@ -6446,7 +6538,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dario.url, "http://127.0.0.1:9191/v1/messages");
-        assert_eq!(dario.account.kind, "dario");
+        assert_eq!(dario.account.id, "anthropic:test");
+        assert_eq!(dario.connection_account.as_ref().unwrap().kind, "dario");
+        assert!(dario.via_dario);
+        assert_eq!(dario.dario_generation.as_deref(), Some("test-generation"));
         assert!(dario
             .extra_headers
             .contains(&("x-dario-capture-id".into(), "trace-dario".into())));
@@ -6489,7 +6584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_dario_fails_closed_when_unhealthy() {
+    async fn configured_dario_falls_back_direct_when_repair_is_unavailable() {
         let state = test_state_with_dario(
             "dario-unhealthy",
             Some(Arc::new(FakeDario {
@@ -6517,13 +6612,10 @@ mod tests {
             &client_headers,
         )
         .await;
-        match result {
-            Err((status, message)) => {
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-                assert!(message.contains("no healthy generation"));
-            }
-            Ok(_) => panic!("an unhealthy configured Dario must not fall back to direct traffic"),
-        }
+        let plan = result.unwrap();
+        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
+        assert!(!plan.via_dario);
+        assert!(plan.dario_fallback_reason.unwrap().contains("repair failed"));
     }
 
     #[tokio::test]
@@ -6540,6 +6632,7 @@ mod tests {
                 routes_requests: true,
             })),
         );
+        state.vault.upsert(anthropic_account()).await.unwrap();
         let (_, mut request) = claude_code_request();
         let original = serde_json::to_vec(&request).unwrap();
         let client_headers = HeaderMap::new();
@@ -6558,13 +6651,10 @@ mod tests {
             &client_headers,
         )
         .await;
-        match result {
-            Err((status, message)) => {
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-                assert!(message.contains("became unavailable"));
-            }
-            Ok(_) => panic!("a vanished Dario generation must not fall back to direct traffic"),
-        }
+        let plan = result.unwrap();
+        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
+        assert!(!plan.via_dario);
+        assert!(plan.dario_fallback_reason.unwrap().contains("became unavailable"));
     }
 
     #[test]
