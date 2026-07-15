@@ -274,6 +274,7 @@ private enum DarioStyle {
 
 struct DarioView: View {
     @Bindable var model: DarioModel
+    @State private var showingWhatIsDario = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -334,7 +335,7 @@ struct DarioView: View {
                         .foregroundStyle(AlexTheme.Colors.primary))
                 .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Alexandria — Dario")
+                Text("Alex UI — Dario")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(AlexTheme.Colors.foreground)
                 Text(headerSubtitle)
@@ -357,6 +358,14 @@ struct DarioView: View {
                             : AlexTheme.Colors.textSecondary)
                     .lineLimit(1)
             }
+            PanelIconButton(
+                systemImage: "questionmark.circle", help: "What is Dario?"
+            ) {
+                showingWhatIsDario = true
+            }
+            .popover(isPresented: $showingWhatIsDario, arrowEdge: .bottom) {
+                whatIsDarioPopover
+            }
             PillButton(
                 title: "Restart", variant: .bordered,
                 isEnabled: !model.actionInFlight
@@ -375,6 +384,24 @@ struct DarioView: View {
         .overlay(alignment: .bottom) {
             Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
         }
+    }
+
+    private var whatIsDarioPopover: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("What is Dario?", systemImage: "questionmark.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("Dario mode — an always-prepared generational supervisor for the @askalf/dario Anthropic upstream with health probes, automatic updates, and rolling restarts; routing remains an explicit toggle.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Link(destination: URL(string: "https://github.com/askalf/dario")!) {
+                Label("Open Dario on GitHub", systemImage: "arrow.up.right.square")
+                    .font(.system(size: 11, weight: .medium))
+            }
+        }
+        .padding(16)
+        .frame(width: 320, alignment: .leading)
     }
 
     private var headerSubtitle: String {
@@ -686,7 +713,7 @@ final class DarioWindowController: NSObject, NSWindowDelegate {
             self.model = model
             let host = NSHostingController(rootView: DarioView(model: model))
             let win = NSWindow(contentViewController: host)
-            win.title = "Alexandria — Dario"
+            win.title = "Alex UI — Dario"
             win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             win.isReleasedWhenClosed = false
             win.delegate = self

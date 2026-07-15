@@ -65,7 +65,7 @@ struct MenuHeaderView: View {
     var body: some View {
         VStack(spacing: 2) {
             HStack {
-                Text("Alexandria")
+                Text("Alex UI")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AlexTheme.Colors.foreground)
                 Spacer()
@@ -116,14 +116,18 @@ struct MenuStatsBarView: View {
 
 // MARK: - Update banner
 
-/// Orange update band (mock App.tsx:596-638). Only the daemon row has a data
-/// source today; the app (Sparkle) row needs updater-state plumbing.
+/// Orange update band (mock App.tsx:592-635, `UpdateSection`). Shows an "App"
+/// row (Sparkle), a "Daemon" row, or both — with a single trailing button
+/// that reads "Update" for either alone or "Update Both" when both are
+/// pending, matching the mock's `both ? "Update Both" : "Update"`.
 struct MenuUpdateBannerView: View {
-    let daemonVersion: String
+    var appVersion: String?
+    var daemonVersion: String?
     var onUpdate: () -> Void
     var onLater: () -> Void
 
     private var orange: Color { AlexTheme.Colors.warningOrange }
+    private var both: Bool { appVersion != nil && daemonVersion != nil }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -132,20 +136,17 @@ struct MenuUpdateBannerView: View {
                     .font(.system(size: 11, weight: .bold))
                     .tracking(0.55)
                     .foregroundStyle(orange)
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text("Daemon")
-                        .font(.system(size: 11))
-                        .foregroundStyle(orange.opacity(0.5))
-                        .frame(width: 44, alignment: .leading)
-                    Text(daemonVersion)
-                        .font(AlexTheme.Fonts.mono(12, weight: .semibold))
-                        .foregroundStyle(orange)
+                if let appVersion {
+                    versionRow(label: "App", version: appVersion)
+                }
+                if let daemonVersion {
+                    versionRow(label: "Daemon", version: daemonVersion)
                 }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 8) {
                 LaterButton(tint: orange, action: onLater)
-                UpdateButton(tint: orange, action: onUpdate)
+                UpdateButton(tint: orange, label: both ? "Update Both" : "Update", action: onUpdate)
             }
         }
         .padding(.horizontal, MenuMetrics.inset)
@@ -154,6 +155,18 @@ struct MenuUpdateBannerView: View {
         .background(orange.opacity(0.06))
         .overlay(alignment: .top) { Rectangle().fill(orange.opacity(0.15)).frame(height: 1) }
         .overlay(alignment: .bottom) { Rectangle().fill(orange.opacity(0.15)).frame(height: 1) }
+    }
+
+    private func versionRow(label: String, version: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(orange.opacity(0.5))
+                .frame(width: 44, alignment: .leading)
+            Text(version)
+                .font(AlexTheme.Fonts.mono(12, weight: .semibold))
+                .foregroundStyle(orange)
+        }
     }
 
     private struct LaterButton: View {
@@ -176,12 +189,13 @@ struct MenuUpdateBannerView: View {
 
     private struct UpdateButton: View {
         let tint: Color
+        var label: String = "Update"
         let action: () -> Void
         @State private var hovering = false
 
         var body: some View {
             Button(action: action) {
-                Text("Update")
+                Text(label)
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(AlexTheme.Colors.background)
                     .padding(.horizontal, 11)
@@ -212,6 +226,181 @@ struct MenuSectionLabelView: View {
         .padding(.top, 9)
         .padding(.bottom, 3)
         .frame(width: MenuMetrics.width, alignment: .leading)
+    }
+}
+
+/// Recent daemon sessions in the mock's compact Traces section
+/// (App.tsx:543-588), with the browser affordance kept outside the footer.
+struct MenuTracesSectionView: View {
+    let sessions: [TraceSession]
+    let onOpen: () -> Void
+    let onOpenSession: (String) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SectionLabel(text: "Traces", style: .menu) {
+                MenuMiniButton(
+                    label: "Open Browser", systemImage: "scope", action: onOpen)
+            }
+            .padding(.horizontal, MenuMetrics.inset)
+            .padding(.top, 9)
+            .padding(.bottom, 4)
+
+            if sessions.isEmpty {
+                Text("No recent traces")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, MenuMetrics.inset)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(sessions.prefix(4)) { session in
+                    MenuTraceRowView(session: session) {
+                        onOpenSession(session.sessionId)
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 6)
+        .frame(width: MenuMetrics.width)
+    }
+}
+
+private struct MenuTraceRowView: View {
+    let session: TraceSession
+    let onOpen: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 7) {
+                StatusDot(
+                    tint: (session.errors ?? 0) > 0
+                        ? AlexTheme.Colors.destructive : AlexTheme.Colors.success,
+                    size: 5)
+                Text(label)
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                providerIcon
+                Text(duration)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                    .frame(width: 38, alignment: .trailing)
+                Text(age)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                    .frame(width: 26, alignment: .trailing)
+            }
+            .padding(.horizontal, MenuMetrics.inset)
+            .padding(.vertical, 5)
+            .background(hovering ? AlexTheme.Colors.surfaceHover : .clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    @ViewBuilder
+    private var providerIcon: some View {
+        if let provider = primaryProvider {
+            if let alias = ProviderMenuIcon.harnessAlias[provider],
+               HarnessIconLoader.image(harness: alias, tags: nil) != nil
+            {
+                HarnessIconView(
+                    harness: alias, tags: nil, size: 17,
+                    background: ProviderMenuIcon.background[provider], cornerRadius: 3)
+            } else {
+                ProviderBadgeView(provider: provider, size: 17, style: .tinted)
+            }
+        } else {
+            HarnessIconView(
+                harness: session.harness, tags: session.tags,
+                size: 17, showsFallback: true)
+        }
+    }
+
+    private var primaryProvider: String? {
+        let providers = session.providers?.isEmpty == false
+            ? session.providers ?? []
+            : ModelProvider.providers(in: session.models)
+        return SessionIdentity.primaryProvider(
+            providers: providers, harness: session.harness, tags: session.tags)
+    }
+
+    private var label: String {
+        if let task = session.tags?["task"]?.trimmingCharacters(
+            in: .whitespacesAndNewlines), !task.isEmpty
+        {
+            return task
+        }
+        let harness = HarnessName.display(harness: session.harness, tags: session.tags)
+        return "\(harness) · \(shortSessionID)"
+    }
+
+    private var shortSessionID: String {
+        let id = session.sessionId
+        guard id.count > 22 else { return id }
+        return "\(id.prefix(10))…\(id.suffix(8))"
+    }
+
+    private var duration: String {
+        let milliseconds = max(0, session.lastTsMs - session.firstTsMs)
+        if milliseconds < 60_000 {
+            return String(format: "%.1fs", Double(milliseconds) / 1_000)
+        }
+        return SessionDuration.format(ms: milliseconds)
+    }
+
+    private var age: String {
+        let seconds = max(
+            0, Int64(Date().timeIntervalSince1970) - session.lastTsMs / 1_000)
+        if seconds < 10 { return "now" }
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h" }
+        return "\(seconds / 86_400)d"
+    }
+}
+
+/// Collapsible native-row section header. The controller owns persistence and
+/// rebuilds the menu after this hosted button toggles.
+struct MenuCollapsibleSectionHeaderView: View {
+    let title: String
+    let itemCount: Int
+    let singularItemName: String
+    let isExpanded: Bool
+    let onToggle: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onToggle) {
+            SectionLabel(text: title, style: .menu) {
+                HStack(spacing: 5) {
+                    if !isExpanded {
+                        Text("\(itemCount) \(itemName)")
+                            .font(.system(size: 10))
+                    }
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .foregroundStyle(
+                    hovering ? AlexTheme.Colors.textTertiary : AlexTheme.Colors.textFaint)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .padding(.horizontal, MenuMetrics.inset)
+        .padding(.top, 9)
+        .padding(.bottom, 3)
+        .frame(width: MenuMetrics.width)
+    }
+
+    private var itemName: String {
+        itemCount == 1 ? singularItemName : "\(singularItemName)s"
     }
 }
 
@@ -246,6 +435,84 @@ struct MenuMiniButton: View {
     }
 }
 
+/// Async refresh control with the same short-lived confirmation pattern as
+/// `CopyButton`: spinner while awaiting the snapshot, then success/failure
+/// feedback for two seconds before returning to its idle label.
+struct MenuRefreshButton: View {
+    private enum Phase: Equatable {
+        case idle
+        case refreshing
+        case refreshed
+        case failed
+    }
+
+    let action: @MainActor () async -> Bool
+    @State private var phase: Phase = .idle
+    @State private var hovering = false
+    @State private var refreshTask: Task<Void, Never>?
+
+    var body: some View {
+        Button(action: refresh) {
+            HStack(spacing: 4) {
+                switch phase {
+                case .idle:
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9, weight: .medium))
+                    Text("Refresh")
+                case .refreshing:
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Refreshing…")
+                case .refreshed:
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text("Refreshed")
+                case .failed:
+                    Image(systemName: "exclamationmark")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text("Refresh failed")
+                }
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(hovering ? AlexTheme.Colors.overlay(0.08) : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(phase == .refreshing)
+        .onHover { hovering = $0 }
+        .onDisappear { refreshTask?.cancel() }
+    }
+
+    private var foreground: Color {
+        switch phase {
+        case .refreshed: AlexTheme.Colors.success
+        case .failed: AlexTheme.Colors.destructive
+        case .idle, .refreshing: AlexTheme.Colors.textTertiary
+        }
+    }
+
+    private func refresh() {
+        guard phase != .refreshing else { return }
+        refreshTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.15)) { phase = .refreshing }
+        refreshTask = Task {
+            let succeeded = await action()
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.15)) {
+                phase = succeeded ? .refreshed : .failed
+            }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.15)) { phase = .idle }
+        }
+    }
+}
+
 // MARK: - Providers card
 
 /// The Providers section of the status menu (mock App.tsx:710-744):
@@ -259,8 +526,10 @@ struct LimitsCardView: View {
     var heartbeats: [String: Heartbeat] = [:]
     var routing: [String: ProviderRoutingResponse] = [:]
     var dario: DarioStatus? = nil
-    var onRefresh: (() -> Void)? = nil
+    var onRefresh: (@MainActor () async -> Bool)? = nil
     var onPing: (() -> Void)? = nil
+    var onOpenDario: (() -> Void)? = nil
+    @State private var darioHovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -286,7 +555,7 @@ struct LimitsCardView: View {
     private var headerRow: some View {
         SectionLabel(text: "Providers", style: .menu) {
             if let onRefresh {
-                MenuMiniButton(label: "Refresh", systemImage: "arrow.clockwise", action: onRefresh)
+                MenuRefreshButton(action: onRefresh)
                     .help("Refresh Now ⌘R")
             }
             if onRefresh != nil, onPing != nil {
@@ -529,28 +798,36 @@ struct LimitsCardView: View {
         if let dario,
            let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
         {
-            let tint = agentTint(active)
-            HStack(spacing: 6) {
-                StatusDot(tint: tint, size: 5)
-                Text("Dario")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(AlexTheme.Colors.textSecondary)
-                Text("v\(active.version)")
-                    .font(AlexTheme.Fonts.mono(10))
-                    .foregroundStyle(AlexTheme.Colors.textFaint)
-                Spacer()
-                Text(agentStatusText(active))
-                    .font(.system(size: 9))
-                    .foregroundStyle(tint)
+            Button(action: { onOpenDario?() }) {
+                let tint = agentTint(active)
+                HStack(spacing: 6) {
+                    StatusDot(tint: tint, size: 5)
+                    Text("Dario")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    Text("v\(active.version)")
+                        .font(AlexTheme.Fonts.mono(10))
+                        .foregroundStyle(AlexTheme.Colors.textFaint)
+                    Spacer()
+                    Text(agentStatusText(active))
+                        .font(.system(size: 9))
+                        .foregroundStyle(tint)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(AlexTheme.Colors.warningOrange.opacity(
+                            darioHovering ? 0.13 : 0.07)))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(AlexTheme.Colors.warningOrange.opacity(
+                            darioHovering ? 0.22 : 0.12)))
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(AlexTheme.Colors.warningOrange.opacity(0.07)))
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(AlexTheme.Colors.warningOrange.opacity(0.12)))
+            .buttonStyle(.plain)
+            .disabled(onOpenDario == nil)
+            .onHover { darioHovering = $0 }
             .padding(.leading, 21)
         }
     }

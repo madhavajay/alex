@@ -19,7 +19,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var daemonUpdateTarget: String?
     private var daemonUpdateMessage: String?
     private var daemonUpdateDismissedVersion: String?
+    private var appUpdateDismissedVersion: String?
     private weak var updateBannerItem: NSMenuItem?
+    private static let accountsExpandedDefaultsKey = "MenuAccountsExpanded"
+    private static let harnessesExpandedDefaultsKey = "MenuHarnessesExpanded"
 
     init(store: SnapshotStore) {
         self.store = store
@@ -38,6 +41,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             MainActor.assumeIsolated {
                 self?.updateIcon()
             }
+        }
+        updaterController.onAppUpdateStateChanged = { [weak self] in
+            self?.reconcileAppUpdateState()
+            self?.updateIcon()
         }
     }
 
@@ -81,13 +88,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // Section order follows the system-menu mock (ui/Design macOS system
     // menu App.tsx:665-795): header · update banner · stats · providers ·
-    // accounts · harnesses · footer actions.
+    // accounts · harnesses · Dario · traces · footer actions.
     private func rebuildMenu() {
         menu.removeAllItems()
         buildHeader()
         buildIssues()
+        // The app (Sparkle) update is independent of daemon health, so this
+        // stays outside the `daemonUp` gate — unlike the daemon row, it can
+        // still render "Update Alex UI" while the daemon itself is down.
+        buildUpdateBanner()
         if store.daemonUp {
-            buildUpdateBanner()
             buildStats()
             buildProviderEmptyState()
             buildLimits()
@@ -95,14 +105,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             buildHarnesses()
             buildDario()
         }
+        buildTraces()
         buildActions()
     }
 
     /// Adds a hosted SwiftUI view as a (non-highlighting) menu item.
     @discardableResult
-    private func addHostedView<Content: View>(_ view: Content) -> NSMenuItem {
+    private func addHostedView<Content: View>(
+        _ view: Content, edgeToEdge: Bool = false
+    ) -> NSMenuItem {
         let item = NSMenuItem()
         let host = NSHostingView(rootView: view)
+        if edgeToEdge {
+            // Custom NSMenuItem hosting views inherit the menu's safe-area
+            // inset. The update tint must meet the adjacent separator.
+            host.safeAreaRegions = []
+        }
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
         item.view = host
         menu.addItem(item)
@@ -169,7 +187,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 uptimeS: health.uptimeS,
                 inFlight: health.inFlight))
         } else if store.lastRefresh == nil {
-            addInfo("Alexandria — connecting…")
+            addInfo("Alex UI — connecting…")
         } else {
             addInfo("Alexandria daemon is not running")
             if let err = store.lastError {
@@ -182,28 +200,69 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
     }
 
-    /// Daemon-update banner (mock App.tsx:596-638). The mock's app (Sparkle)
-    /// row needs updater-state plumbing, so only the daemon row renders. The
-    /// native "Update daemon to…" action in the footer stays as a fallback.
+    /// Update banner (mock App.tsx:592-635, `UpdateSection`): an "App" row
+    /// (Sparkle, via `UpdaterController.availableAppUpdateVersion`), a
+    /// "Daemon" row (via `store.daemonUpdate`), or both — with a single
+    /// button that reads "Update Both" when both are pending.
     private func buildUpdateBanner() {
-        guard !daemonUpdateApplying,
-              let update = store.daemonUpdate, update.updateAvailable,
-              let latest = update.latest, latest != daemonUpdateDismissedVersion
-        else { return }
+        let appVersion = pendingAppUpdateVersion
+        let daemonVersion = !daemonUpdateApplying ? pendingDaemonUpdateVersion : nil
+        guard appVersion != nil || daemonVersion != nil else { return }
         let banner = MenuUpdateBannerView(
-            daemonVersion: latest,
+            appVersion: appVersion,
+            daemonVersion: daemonVersion,
             onUpdate: { [weak self] in
                 self?.menu.cancelTrackingWithoutAnimation()
-                self?.applyDaemonUpdate(latest: latest)
+                self?.applyPendingUpdates(appVersion: appVersion, daemonVersion: daemonVersion)
             },
             onLater: { [weak self] in
                 guard let self else { return }
-                self.daemonUpdateDismissedVersion = latest
+                if appVersion != nil { self.appUpdateDismissedVersion = appVersion }
+                if daemonVersion != nil { self.daemonUpdateDismissedVersion = daemonVersion }
                 if let item = self.updateBannerItem, self.menu.items.contains(item) {
                     self.menu.removeItem(item)
                 }
             })
-        updateBannerItem = addHostedView(banner)
+        updateBannerItem = addHostedView(banner, edgeToEdge: true)
+    }
+
+    /// Debug-only manual preview hook: `defaults write
+    /// com.madhavajay.alexandria-macos DebugFakeUpdateBanner app|daemon|both`
+    /// (see UpdaterController.applyDebugFakeUpdateOverride for the app half).
+    /// This covers the daemon half, since daemon-update state normally comes
+    /// from the live daemon's `/admin/update/status` response.
+    private var debugFakeUpdateBannerMode: String? {
+        UserDefaults.standard.string(forKey: UpdaterController.debugFakeUpdateBannerKey)
+    }
+
+    private var pendingAppUpdateVersion: String? {
+        guard let version = updaterController.availableAppUpdateVersion,
+              version != appUpdateDismissedVersion
+        else { return nil }
+        return version
+    }
+
+    private var pendingDaemonUpdateVersion: String? {
+        if let mode = debugFakeUpdateBannerMode, mode == "daemon" || mode == "both" {
+            let fake = "0.1.99-debug"
+            return fake != daemonUpdateDismissedVersion ? fake : nil
+        }
+        guard let update = store.daemonUpdate, update.updateAvailable,
+              let latest = update.latest, latest != daemonUpdateDismissedVersion
+        else { return nil }
+        return latest
+    }
+
+    /// "Update Both" per the mock: the daemon update first since applying it
+    /// doesn't restart this app, then hand off to Sparkle's own install flow
+    /// (which does restart the app, so it must go last).
+    private func applyPendingUpdates(appVersion: String?, daemonVersion: String?) {
+        if let daemonVersion {
+            applyDaemonUpdate(latest: daemonVersion)
+        }
+        if appVersion != nil {
+            updaterController.checkForUpdates()
+        }
     }
 
     /// Requests / cost / errors stats bar (mock App.tsx:696-708).
@@ -233,11 +292,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             routing: store.routingByProvider,
             dario: store.dario,
             onRefresh: { [weak self] in
-                Task { await self?.store.refresh() }
+                guard let self else { return false }
+                await self.store.refresh()
+                // menuWillOpen may already have started the coalesced store
+                // refresh. In that case refresh() returns immediately, so
+                // keep the hosted spinner up until that in-flight work ends.
+                while self.store.refreshing {
+                    guard !Task.isCancelled else { return false }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                return self.store.lastError == nil
             },
             onPing: { [weak self] in
                 self?.menu.cancelTrackingWithoutAnimation()
                 self?.runPing(target: "all", name: "All providers")
+            },
+            onOpenDario: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openDario()
             })
         addHostedView(card)
         menu.addItem(.separator())
@@ -254,7 +327,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildAccounts() {
         guard !store.accounts.isEmpty else { return }
-        addSectionLabel("Accounts")
+        let expanded = UserDefaults.standard.bool(
+            forKey: Self.accountsExpandedDefaultsKey)
+        addHostedView(MenuCollapsibleSectionHeaderView(
+            title: "Accounts",
+            itemCount: store.accounts.count,
+            singularItemName: "account",
+            isExpanded: expanded,
+            onToggle: { [weak self] in self?.toggleAccountsExpanded() }))
+        guard expanded else {
+            menu.addItem(.separator())
+            return
+        }
         let heartbeats = heartbeatsById
         for account in store.accounts {
             let heartbeat = heartbeats[account.id]
@@ -267,6 +351,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+    }
+
+    /// NSMenu supports changing its items while tracking. Defer the rebuild
+    /// until the hosted button's click has unwound so its NSHostingView is not
+    /// removed in the middle of dispatching the action.
+    private func toggleAccountsExpanded() {
+        let defaults = UserDefaults.standard
+        let expanded = defaults.bool(forKey: Self.accountsExpandedDefaultsKey)
+        defaults.set(!expanded, forKey: Self.accountsExpandedDefaultsKey)
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildMenu()
+        }
     }
 
     private func accountTitle(_ account: Account) -> String {
@@ -396,32 +492,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 title += " · \(ms)ms"
             }
         }
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        let nodeInfo = NSMenuItem(
-            title: store.nodePath.map { "Node: \($0)" } ?? "Node.js not found — install it for dario",
-            action: nil, keyEquivalent: "")
-        nodeInfo.isEnabled = false
-        sub.addItem(nodeInfo)
-        sub.addItem(.separator())
-        let restart = NSMenuItem(title: "Restart Dario", action: #selector(runHandler(_:)), keyEquivalent: "")
-        restart.target = self
-        restart.representedObject = MenuHandler { [weak self] in self?.darioAction(update: false) }
-        sub.addItem(restart)
-        let update = NSMenuItem(title: "Check for Update", action: #selector(runHandler(_:)), keyEquivalent: "")
-        update.target = self
-        update.representedObject = MenuHandler { [weak self] in self?.darioAction(update: true) }
-        sub.addItem(update)
-        sub.addItem(.separator())
-        let about = NSMenuItem(title: "What is Dario?", action: #selector(runHandler(_:)), keyEquivalent: "")
-        about.target = self
-        about.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil)
-        about.representedObject = MenuHandler {
-            NSWorkspace.shared.open(URL(string: "https://github.com/askalf/dario")!)
-        }
-        sub.addItem(about)
-        item.submenu = sub
+        let item = NSMenuItem(
+            title: title, action: #selector(runHandler(_:)), keyEquivalent: "")
+        item.target = self
+        item.image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil)
+        item.representedObject = MenuHandler { [weak self] in self?.openDario() }
         menu.addItem(item)
+        menu.addItem(.separator())
+    }
+
+    /// The mock places Trace Browser access in a Traces section immediately
+    /// above the footer, rather than among footer commands.
+    private func buildTraces() {
+        addHostedView(MenuTracesSectionView(
+            sessions: store.recentSessions,
+            onOpen: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openTraceBrowser()
+            },
+            onOpenSession: { [weak self] id in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openTraceBrowser(selectSessionId: id)
+            }))
         menu.addItem(.separator())
     }
 
@@ -435,7 +529,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             $0.installed && $0.supportsConnect
         }
         guard !installed.isEmpty else { return }
-        addSectionLabel("Harnesses")
+        let expanded = UserDefaults.standard.bool(
+            forKey: Self.harnessesExpandedDefaultsKey)
+        addHostedView(MenuCollapsibleSectionHeaderView(
+            title: "Harnesses",
+            itemCount: installed.count,
+            singularItemName: "harness",
+            isExpanded: expanded,
+            onToggle: { [weak self] in self?.toggleHarnessesExpanded() }))
+        guard expanded else {
+            menu.addItem(.separator())
+            return
+        }
         for harness in installed {
             let item = NSMenuItem(
                 title: HarnessCatalog.displayName(harness.name), action: nil, keyEquivalent: "")
@@ -447,6 +552,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+    }
+
+    private func toggleHarnessesExpanded() {
+        let defaults = UserDefaults.standard
+        let expanded = defaults.bool(forKey: Self.harnessesExpandedDefaultsKey)
+        defaults.set(!expanded, forKey: Self.harnessesExpandedDefaultsKey)
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildMenu()
+        }
     }
 
     private func harnessRowTitle(_ harness: Harness) -> NSAttributedString {
@@ -578,47 +692,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func buildActions() {
-        addAction("Run Ping Checks", symbol: "dot.radiowaves.left.and.right") { [weak self] in
-            self?.runPing(target: "all", name: "All providers")
-        }
-        addAction("Re-auth Subscriptions…", symbol: "key") { }
-        if let last = menu.items.last {
-            let sub = NSMenu()
-            for provider in ["anthropic", "openai", "xai", "gemini"] {
-                let item = NSMenuItem(
-                    title: ProviderInfo.displayName(provider),
-                    action: #selector(runHandler(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = MenuHandler { [weak self] in
-                    self?.openAuth(provider: provider)
-                }
-                sub.addItem(item)
-            }
-            sub.addItem(.separator())
-            let importItem = NSMenuItem(title: "Re-import All Credentials", action: #selector(runHandler(_:)), keyEquivalent: "")
-            importItem.target = self
-            importItem.representedObject = MenuHandler { [weak self] in self?.importCredentials() }
-            sub.addItem(importItem)
-            last.submenu = sub
-        }
-        addAction("Refresh Now", symbol: "arrow.clockwise", key: "r") { [weak self] in
-            Task { await self?.store.refresh() }
-        }
-        addAction("Trace Browser…", symbol: "list.bullet.rectangle") { [weak self] in
-            self?.openTraceBrowser()
-        }
-        addAction("Dario…", symbol: "server.rack") { [weak self] in
-            self?.openDario()
-        }
-        addAction("Reveal Log File", symbol: "doc.text.magnifyingglass") {
-            NSWorkspace.shared.activateFileViewerSelecting([BarLog.fileURL])
-        }
-        addAction("Open TUI in Terminal", symbol: "terminal") {
-            let bin = DaemonController.findBinary() ?? "alexandria"
-            TerminalLauncher.launch(command: "\(bin) tui")
-        }
-        menu.addItem(.separator())
-        addAction("Report a Bug or Request a Feature…", symbol: "exclamationmark.bubble") {
+        addAction("Report a Bug or Feature…", symbol: "exclamationmark.bubble") {
             NSWorkspace.shared.open(PreferencesView.issuesURL)
         }
         addAction("Settings…", symbol: "gearshape", key: ",") { [weak self] in
@@ -627,42 +701,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addAction("Star GitHub Project", symbol: "star") {
             NSWorkspace.shared.open(URL(string: "https://github.com/madhavajay/alex")!)
         }
-        buildDaemonUpdateAction()
-        let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(runHandler(_:)), keyEquivalent: "")
-        updateItem.target = self
-        updateItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
-        updateItem.isEnabled = updaterController.canCheckForUpdates
-        updateItem.representedObject = MenuHandler { [weak self] in
-            self?.updaterController.checkForUpdates()
-        }
-        menu.addItem(updateItem)
         if LaunchAtLogin.available {
-            let item = NSMenuItem(title: "Launch at Login", action: #selector(runHandler(_:)), keyEquivalent: "")
+            let item = NSMenuItem(
+                title: "Launch at Login", action: #selector(runHandler(_:)), keyEquivalent: "")
             item.target = self
             item.state = LaunchAtLogin.isEnabled ? .on : .off
             item.representedObject = MenuHandler { LaunchAtLogin.toggle() }
             menu.addItem(item)
         }
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit AlexandriaBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(
+            title: "Quit Alex UI", action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
-    }
-
-    private func buildDaemonUpdateAction() {
-        if daemonUpdateApplying {
-            let target = daemonUpdateTarget ?? store.daemonUpdate?.latest ?? "latest"
-            addInfo("Updating daemon to \(target)…")
-            return
-        }
-        if let update = store.daemonUpdate, update.updateAvailable, let latest = update.latest {
-            addAction("Update daemon to \(latest)…", symbol: "arrow.down.circle") { [weak self] in
-                self?.applyDaemonUpdate(latest: latest)
-            }
-        }
-        if let message = daemonUpdateMessage {
-            addInfo(String(message.prefix(70)))
-        }
     }
 
     private func startDaemon() {
@@ -745,24 +796,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func darioAction(update: Bool) {
-        guard let config = store.config else { return }
-        let client = AlexandriaClient(config: config)
-        Task { [weak self] in
-            do {
-                if update {
-                    try await client.darioUpdate()
-                } else {
-                    try await client.darioRestart()
-                }
-                await self?.store.refresh()
-                self?.notify(title: update ? "Dario update triggered" : "Dario restart triggered", body: "")
-            } catch {
-                self?.notify(title: "Dario action failed", body: error.localizedDescription)
-            }
-        }
-    }
-
     private func applyDaemonUpdate(latest: String) {
         guard let config = store.config else { return }
         let client = AlexandriaClient(config: config)
@@ -797,6 +830,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Mirrors `reconcileDaemonUpdateState`'s dismissal-reset for the app row:
+    /// once Sparkle no longer has a pending update, clear the stale dismissal
+    /// so a later update isn't accidentally hidden.
+    private func reconcileAppUpdateState() {
+        if updaterController.availableAppUpdateVersion == nil {
+            appUpdateDismissedVersion = nil
+        }
+    }
+
     private func reconcileDaemonUpdateState() {
         if store.daemonUpdate?.updateAvailable == false {
             daemonUpdateMessage = nil
@@ -824,11 +866,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
     }
 
-    private func openTraceBrowser(harness: String? = nil) {
+    private func openTraceBrowser(harness: String? = nil, selectSessionId: String? = nil) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show(harness: harness)
+        traceBrowser?.show(harness: harness, selectSessionId: selectSessionId)
     }
 
     private func openDario() {
