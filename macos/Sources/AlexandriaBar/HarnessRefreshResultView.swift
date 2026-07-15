@@ -84,27 +84,33 @@ struct HarnessActionResultView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+            PanelHeader {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.headline)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .lineLimit(1)
                     if !harnessDisplayName.isEmpty {
                         Text(harnessDisplayName)
                             .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                            .lineLimit(1)
                     }
+                }
+            } right: {
+                phaseChip
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
                     content
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(18)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
-            Divider()
             footer
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity)
-                .background(.bar)
         }
+        .background(AlexTheme.Colors.background)
         .frame(
             minWidth: Self.minSize.width,
             idealWidth: Self.idealSize.width,
@@ -127,28 +133,43 @@ struct HarnessActionResultView: View {
         }
     }
 
+    private var phaseChip: StatusChip {
+        switch phase {
+        case .loading:
+            StatusChip(status: .pending, text: "planning")
+        case .plan:
+            StatusChip(status: .pending, text: "awaiting approval")
+        case .executing:
+            StatusChip(status: .running, text: "running")
+        case .successConfig, .successDisconnect:
+            StatusChip(status: .success, text: "done")
+        case .failure:
+            StatusChip(status: .error, text: "failed")
+        }
+    }
+
     @ViewBuilder
     private var content: some View {
         switch phase {
         case .loading:
             busyRow(message: loadingMessage)
         case .plan(let steps):
-            planBody(steps, mark: .none, heading: "This will:")
+            planBody(steps, mark: .none, heading: "This will")
         case .executing(let steps):
             VStack(alignment: .leading, spacing: 10) {
                 busyRow(message: executingMessage)
-                planBody(steps, mark: .spinning, heading: "In progress:")
+                planBody(steps, mark: .spinning, heading: "In progress")
             }
         case .successConfig(let steps, let result):
             VStack(alignment: .leading, spacing: 12) {
                 if !steps.isEmpty {
-                    planBody(steps, mark: .ok, heading: "Completed:")
+                    planBody(steps, mark: .ok, heading: "Completed")
                 }
                 configSuccessBody(result)
                 if let captureWarning {
                     Text(captureWarning)
                         .font(.system(size: 11))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(AlexTheme.Colors.warningOrange)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -156,18 +177,18 @@ struct HarnessActionResultView: View {
         case .successDisconnect(let steps, let result):
             VStack(alignment: .leading, spacing: 12) {
                 if !steps.isEmpty {
-                    planBody(steps, mark: .ok, heading: "Completed:")
+                    planBody(steps, mark: .ok, heading: "Completed")
                 }
                 disconnectSuccessBody(result)
             }
         case .failure(let steps, let message):
             VStack(alignment: .leading, spacing: 10) {
                 if !steps.isEmpty {
-                    planBody(steps, mark: .error, heading: "Failed:")
+                    planBody(steps, mark: .error, heading: "Failed")
                 }
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(AlexTheme.Colors.destructive)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -197,27 +218,50 @@ struct HarnessActionResultView: View {
 
     @ViewBuilder
     private var footer: some View {
-        HStack {
+        HStack(spacing: AlexTheme.Spacing.md) {
             if let toolCapture {
-                Toggle("Capture tool calls", isOn: toolCapture)
-                    .controlSize(.small)
-                    .disabled(isSettled)
-                    .help("Opt in to storing this harness's tool arguments and results locally. Secrets are redacted before storage.")
+                Toggle(isOn: toolCapture) {
+                    Text("Capture tool calls")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .disabled(isSettled)
+                .help("Opt in to storing this harness's tool arguments and results locally. Secrets are redacted before storage.")
             }
             Spacer()
             switch phase {
             case .plan:
-                Button("Cancel") { onCancel?() ?? onClose() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Approve") { onApprove?() }
-                    .keyboardShortcut(.defaultAction)
+                PillButton(
+                    title: "Cancel", variant: .standard,
+                    horizontalPadding: 12, verticalPadding: 5, cornerRadius: 6,
+                    keyboardShortcut: .cancelAction
+                ) {
+                    onCancel?() ?? onClose()
+                }
+                PillButton(
+                    title: "Approve", variant: .solidAccent,
+                    keyboardShortcut: .defaultAction
+                ) {
+                    onApprove?()
+                }
             case .loading, .executing:
-                Button("Done") { onClose() }
-                    .disabled(true)
+                PillButton(title: "Done", variant: .solidAccent, isEnabled: false) {}
             case .successConfig, .successDisconnect, .failure:
-                Button("Done") { onClose() }
-                    .keyboardShortcut(.defaultAction)
+                PillButton(
+                    title: "Done", variant: .solidAccent,
+                    keyboardShortcut: .defaultAction
+                ) {
+                    onClose()
+                }
             }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
+        .overlay(alignment: .top) {
+            Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
         }
     }
 
@@ -227,7 +271,8 @@ struct HarnessActionResultView: View {
             ProgressView()
                 .controlSize(.small)
             Text(message)
-                .foregroundStyle(.secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(AlexTheme.Colors.textSecondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
@@ -236,27 +281,26 @@ struct HarnessActionResultView: View {
     @ViewBuilder
     private func planBody(_ steps: [HarnessPlanStep], mark: PlanLineMark, heading: String) -> some View {
         if steps.isEmpty {
-            Text("Nothing to change.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            EmptyStateView(message: "Nothing to change")
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Text(heading)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                SectionLabel(text: heading, style: .prominent)
                 ForEach(steps) { step in
                     if step.action == "about" {
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: "info.circle.fill")
-                                .foregroundStyle(Color.accentColor)
+                                .foregroundStyle(AlexTheme.Colors.primary)
                                 .padding(.top, 1)
                             Text(step.detail)
                                 .font(.system(size: 11))
+                                .foregroundStyle(AlexTheme.Colors.foreground)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .textSelection(.enabled)
                         }
                         .padding(10)
-                        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                        .background(
+                            AlexTheme.Colors.primary.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: AlexTheme.Radius.md))
                     } else {
                         HStack(alignment: .top, spacing: 8) {
                             planMarkView(mark)
@@ -264,19 +308,18 @@ struct HarnessActionResultView: View {
                                 .padding(.top, 2)
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
-                                    Text(step.action.uppercased())
-                                        .font(.system(size: 9, weight: .bold))
-                                        .foregroundStyle(actionTint(step.action))
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(actionTint(step.action).opacity(0.12), in: Capsule())
+                                    StatusChip(
+                                        tint: actionTint(step.action),
+                                        text: step.action.uppercased(),
+                                        style: .mini)
                                     Text(step.detail)
                                         .font(.system(size: 11))
+                                        .foregroundStyle(AlexTheme.Colors.foreground)
                                         .lineLimit(2)
                                 }
                                 Text(step.path)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                    .font(AlexTheme.Fonts.metaMicro)
+                                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                     .textSelection(.enabled)
@@ -295,26 +338,26 @@ struct HarnessActionResultView: View {
         case .none:
             Image(systemName: "circle")
                 .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(AlexTheme.Colors.textFaint)
         case .spinning:
             ProgressView()
                 .controlSize(.mini)
         case .ok:
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 12))
-                .foregroundStyle(.green)
+                .foregroundStyle(AlexTheme.Colors.success)
         case .error:
             Image(systemName: "xmark.circle.fill")
                 .font(.system(size: 12))
-                .foregroundStyle(.red)
+                .foregroundStyle(AlexTheme.Colors.destructive)
         }
     }
 
     private func actionTint(_ action: String) -> Color {
         switch action.lowercased() {
-        case "create": .green
-        case "delete": .orange
-        default: .accentColor
+        case "create": AlexTheme.Colors.success
+        case "delete": AlexTheme.Colors.warningOrange
+        default: AlexTheme.Colors.primary
         }
     }
 
@@ -339,53 +382,76 @@ struct HarnessConfigWriteSummaryView: View {
             if let description = result.description, !description.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle.fill")
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(AlexTheme.Colors.primary)
+                        .padding(.top, 1)
                     Text(description)
                         .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
                 .padding(10)
                 .background(
-                    Color.accentColor.opacity(0.08),
-                    in: RoundedRectangle(cornerRadius: 8))
+                    AlexTheme.Colors.primary.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: AlexTheme.Radius.md))
             }
-            labeled("Path") {
-                Text(result.path)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                    .help(result.path)
-            }
-            labeled("Summary") {
+            HStack(spacing: AlexTheme.Spacing.sm) {
+                if !result.added.isEmpty {
+                    StatusChip(
+                        tint: AlexTheme.Colors.success,
+                        text: "+\(result.added.count) added")
+                }
+                if !result.removed.isEmpty {
+                    StatusChip(
+                        tint: AlexTheme.Colors.warningOrange,
+                        text: "−\(result.removed.count) removed")
+                }
                 Text(summaryLine)
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .textSelection(.enabled)
             }
-            labeled("Key") {
-                Text(keyLabel(result.key))
-                    .font(.system(size: 11))
-            }
-            if !result.added.isEmpty {
-                modelList(title: "Added", ids: result.added, tint: .green)
-            }
-            if !result.removed.isEmpty {
-                modelList(title: "Removed", ids: result.removed, tint: .orange)
-            }
-            if result.added.isEmpty && result.removed.isEmpty {
-                Text(result.modelsTotal == 0 ? "No model catalog changes." : "Model list unchanged.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+            CollapsibleSection(title: "Config Summary", defaultOpen: true) {
+                VStack(alignment: .leading, spacing: 8) {
+                    labeled("Path") {
+                        Text(result.path)
+                            .font(AlexTheme.Fonts.metaLabel)
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(result.path)
+                    }
+                    labeled("Key") {
+                        Text(keyLabel(result.key))
+                            .font(.system(size: 11))
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    if !result.added.isEmpty {
+                        modelList(
+                            title: "Added", ids: result.added,
+                            tint: AlexTheme.Colors.success)
+                    }
+                    if !result.removed.isEmpty {
+                        modelList(
+                            title: "Removed", ids: result.removed,
+                            tint: AlexTheme.Colors.warningOrange)
+                    }
+                    if result.added.isEmpty && result.removed.isEmpty {
+                        Text(result.modelsTotal == 0 ? "No model catalog changes." : "Model list unchanged.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
             }
         }
     }
 
     private var summaryLine: String {
         var parts = result.modelsTotal == 0 ? ["Lifecycle integration"] : ["\(result.modelsTotal) models"]
-        if !result.added.isEmpty { parts.append("\(result.added.count) added") }
-        if !result.removed.isEmpty { parts.append("\(result.removed.count) removed") }
         if result.modelsTotal > 0 { parts.append("\(result.unchanged) unchanged") }
         if !result.baseUrl.isEmpty { parts.append(result.baseUrl) }
         return parts.joined(separator: " · ")
@@ -404,9 +470,7 @@ struct HarnessConfigWriteSummaryView: View {
     @ViewBuilder
     private func labeled(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
+            SectionLabel(text: title)
             content()
         }
     }
@@ -414,15 +478,18 @@ struct HarnessConfigWriteSummaryView: View {
     @ViewBuilder
     private func modelList(title: String, ids: [String], tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("\(title) (\(ids.count))")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(tint)
+            SectionLabel(text: "\(title) (\(ids.count))")
             ForEach(ids, id: \.self) { id in
-                Text(id)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+                HStack(alignment: .firstTextBaseline, spacing: AlexTheme.Spacing.sm) {
+                    StatusDot(tint: tint, size: 5)
+                        .padding(.top, 1)
+                    Text(id)
+                        .font(AlexTheme.Fonts.metaLabel)
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
             }
         }
     }
@@ -433,45 +500,56 @@ struct HarnessDisconnectSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            labeled("Path") {
-                Text(result.path)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                    .help(result.path)
-            }
-            labeled("Summary") {
-                let parts = [
-                    result.wasConnected ? "Harness integration removed" : "Already removed",
-                    "\(result.revoked) key(s) revoked",
-                ]
-                Text(parts.joined(separator: " · "))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            if !result.removed.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Removed (\(result.removed.count))")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.orange)
-                    ForEach(result.removed, id: \.self) { id in
-                        Text(id)
-                            .font(.system(size: 11, design: .monospaced))
+            Text(summaryLine)
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .textSelection(.enabled)
+            CollapsibleSection(title: "Removal Summary", defaultOpen: true) {
+                VStack(alignment: .leading, spacing: 8) {
+                    labeled("Path") {
+                        Text(result.path)
+                            .font(AlexTheme.Fonts.metaLabel)
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(result.path)
+                    }
+                    if !result.removed.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            SectionLabel(text: "Removed (\(result.removed.count))")
+                            ForEach(result.removed, id: \.self) { id in
+                                HStack(alignment: .firstTextBaseline, spacing: AlexTheme.Spacing.sm) {
+                                    StatusDot(tint: AlexTheme.Colors.warningOrange, size: 5)
+                                        .padding(.top, 1)
+                                    Text(id)
+                                        .font(AlexTheme.Fonts.metaLabel)
+                                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                            }
+                        }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
             }
         }
+    }
+
+    private var summaryLine: String {
+        [
+            result.wasConnected ? "Harness integration removed" : "Already removed",
+            "\(result.revoked) key(s) revoked",
+        ].joined(separator: " · ")
     }
 
     @ViewBuilder
     private func labeled(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
+            SectionLabel(text: title)
             content()
         }
     }
@@ -778,20 +856,29 @@ struct MultiHarnessRefreshResultView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PanelHeader {
+                Text("Update All Harnesses")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                if !items.isEmpty {
+                    PanelCountBadge(count: items.count)
+                }
+            } right: {
+                overallChip
+            }
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Update All Harnesses")
-                        .font(.headline)
+                VStack(alignment: .leading, spacing: 12) {
                     if items.isEmpty {
                         if finished {
-                            Text("No connected harnesses support config updates.")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
+                            EmptyStateView(
+                                message: "No connected harnesses support config updates",
+                                style: .card)
                         } else {
                             HStack(spacing: 10) {
                                 ProgressView().controlSize(.small)
                                 Text("Looking for connected harnesses…")
-                                    .foregroundStyle(.secondary)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(AlexTheme.Colors.textSecondary)
                             }
                         }
                     } else {
@@ -799,27 +886,34 @@ struct MultiHarnessRefreshResultView: View {
                             multiSection(item)
                         }
                     }
-                    if finished {
+                    if finished, !items.isEmpty {
                         Text(totalsLine)
                             .font(.system(size: 12, weight: .semibold))
-                            .padding(.top, 4)
+                            .foregroundStyle(AlexTheme.Colors.foreground)
+                            .padding(.top, 2)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(18)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
-            Divider()
             HStack {
                 Spacer()
-                Button("Done") { onClose() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!finished)
+                PillButton(
+                    title: "Done", variant: .solidAccent, isEnabled: finished,
+                    keyboardShortcut: .defaultAction
+                ) {
+                    onClose()
+                }
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
-            .background(.bar)
+            .overlay(alignment: .top) {
+                Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+            }
         }
+        .background(AlexTheme.Colors.background)
         .frame(
             minWidth: HarnessActionResultView.minSize.width,
             idealWidth: HarnessActionResultView.idealSize.width,
@@ -830,58 +924,63 @@ struct MultiHarnessRefreshResultView: View {
         .background(HarnessActionWindowSizer())
     }
 
+    private var overallChip: StatusChip {
+        if !finished {
+            return StatusChip(status: .running, text: "updating")
+        }
+        let failed = items.reduce(0) {
+            if case .failure = $1.status { return $0 + 1 }
+            return $0
+        }
+        return failed > 0
+            ? StatusChip(status: .error, text: "\(failed) failed")
+            : StatusChip(status: .success, text: "done")
+    }
+
     @ViewBuilder
     private func multiSection(_ item: MultiHarnessRefreshItem) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                statusIcon(item.status)
+            HStack(spacing: AlexTheme.Spacing.md) {
+                HarnessIconView(harness: item.name, tags: nil, size: 17, showsFallback: true)
                 Text(item.displayName)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                Spacer()
+                itemChip(item.status)
             }
             switch item.status {
             case .pending:
                 Text("Waiting…")
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
             case .running:
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("\(HarnessActionKind.refresh.label)…")
                         .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
                 }
             case .success(let result):
                 HarnessConfigWriteSummaryView(result: result)
             case .failure(let message):
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(AlexTheme.Colors.destructive)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.vertical, 4)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .alexCard(radius: AlexTheme.Radius.lg)
     }
 
-    @ViewBuilder
-    private func statusIcon(_ status: MultiHarnessItemStatus) -> some View {
+    private func itemChip(_ status: MultiHarnessItemStatus) -> StatusChip {
         switch status {
-        case .pending:
-            Image(systemName: "circle")
-                .font(.system(size: 12))
-                .foregroundStyle(.tertiary)
-        case .running:
-            ProgressView()
-                .controlSize(.mini)
-                .frame(width: 14, height: 14)
-        case .success:
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.green)
-        case .failure:
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.red)
+        case .pending: StatusChip(status: .pending)
+        case .running: StatusChip(status: .running)
+        case .success: StatusChip(status: .success, text: "updated")
+        case .failure: StatusChip(status: .error, text: "failed")
         }
     }
 }

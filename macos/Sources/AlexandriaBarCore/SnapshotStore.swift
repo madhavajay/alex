@@ -40,6 +40,7 @@ public final class SnapshotStore {
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
     public private(set) var harnessesSupported: Bool?
+    public private(set) var recentSessions: [TraceSession] = []
     public private(set) var alerts: [StoreAlert] = []
     public private(set) var lastRefresh: Date?
     public private(set) var lastError: String?
@@ -52,6 +53,9 @@ public final class SnapshotStore {
     private var pollTask: Task<Void, Never>?
     private var boundaryTask: Task<Void, Never>?
     private var attemptedBoundaries: Set<Int64> = []
+    private var accountAnalyticsSinceMinutes = 24 * 60
+    private var accountAnalyticsBucketMinutes = 60
+    private var accountAnalyticsRequestGeneration = 0
 
     public init() {}
 
@@ -98,6 +102,7 @@ public final class SnapshotStore {
             daemonUp = false
             harnesses = []
             harnessesSupported = nil
+            recentSessions = []
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
@@ -117,6 +122,7 @@ public final class SnapshotStore {
             health = nil
             harnesses = []
             harnessesSupported = nil
+            recentSessions = []
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
@@ -124,21 +130,32 @@ public final class SnapshotStore {
             return
         }
 
+        let accountAnalyticsSinceMinutes = self.accountAnalyticsSinceMinutes
+        let accountAnalyticsBucketMinutes = self.accountAnalyticsBucketMinutes
+        let accountAnalyticsRequestGeneration = self.accountAnalyticsRequestGeneration
+
         async let accountsR = try? client.accounts()
         async let healthR = try? client.accountHealth()
         async let limitsR = try? client.limits()
         async let analyticsR = try? client.analytics(sinceMinutes: 60)
-        async let accountAnalyticsR = try? client.accountAnalytics()
+        async let accountAnalyticsR = try? client.accountAnalytics(
+            sinceMinutes: accountAnalyticsSinceMinutes,
+            bucketMinutes: accountAnalyticsBucketMinutes)
         async let darioR = try? client.dario()
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnesses()
+        async let recentSessionsR = try? client.traceSessions(since: "24h", limit: 12)
 
         accounts = await accountsR ?? []
         healthAccounts = await healthR ?? []
         let oldLimits = limits
         limits = await limitsR ?? []
         analytics = await analyticsR
-        accountAnalytics = await accountAnalyticsR
+        if accountAnalyticsRequestGeneration == self.accountAnalyticsRequestGeneration,
+           let fetchedAccountAnalytics = await accountAnalyticsR
+        {
+            accountAnalytics = fetchedAccountAnalytics
+        }
         let providerIDs = Set(accounts.map(\.provider)).union(ProviderInfo.supportedProviders)
         let routings = await withTaskGroup(
             of: (String, ProviderRoutingResponse?).self,
@@ -157,6 +174,11 @@ public final class SnapshotStore {
         codexRouting = routings["openai"]
         dario = await darioR ?? nil
         daemonUpdate = await daemonUpdateR
+        recentSessions = Array(
+            (await recentSessionsR ?? [])
+                .filter { !$0.isPingOrTest }
+                .sorted { $0.lastTsMs > $1.lastTsMs }
+                .prefix(4))
         do {
             if let fetched = try await harnessesR {
                 harnesses = fetched
@@ -171,6 +193,34 @@ public final class SnapshotStore {
         }
         detectWindowResets(old: oldLimits, new: limits)
         scheduleBoundaryRefresh()
+    }
+
+    /// Refreshes only the per-account chart data and leaves the rest of the
+    /// snapshot untouched. The selected range is retained for later polling
+    /// refreshes so a full snapshot cannot silently switch the chart to 24h.
+    public func refreshAccountAnalytics(
+        sinceMinutes: Int = 24 * 60,
+        bucketMinutes: Int = 60
+    ) async {
+        accountAnalyticsSinceMinutes = sinceMinutes
+        accountAnalyticsBucketMinutes = bucketMinutes
+        accountAnalyticsRequestGeneration += 1
+        let requestGeneration = accountAnalyticsRequestGeneration
+
+        guard let config else { return }
+        let client = AlexandriaClient(config: config)
+        do {
+            let fetched = try await client.accountAnalytics(
+                sinceMinutes: sinceMinutes,
+                bucketMinutes: bucketMinutes)
+            guard !Task.isCancelled,
+                  requestGeneration == accountAnalyticsRequestGeneration
+            else { return }
+            accountAnalytics = fetched
+        } catch {
+            // Keep the prior chart visible on cancellation or a transient
+            // range-fetch failure. The client already records network errors.
+        }
     }
 
     private func detectWindowResets(old: [ProviderLimits], new: [ProviderLimits]) {

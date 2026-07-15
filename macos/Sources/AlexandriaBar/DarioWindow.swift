@@ -198,161 +198,392 @@ final class DarioModel {
     }
 }
 
+/// Local styling helpers for the Dario window (mock: ui/Dario/src/app/App.tsx).
+private enum DarioStyle {
+    static func phaseTint(_ phase: String) -> Color {
+        switch phase {
+        case "ready": AlexTheme.Colors.success
+        case "starting": AlexTheme.Colors.warningOrange
+        case "unhealthy": AlexTheme.Colors.destructive
+        case "draining": AlexTheme.Colors.warning
+        case "dead": AlexTheme.Colors.textTertiary
+        default: AlexTheme.Colors.textSecondary
+        }
+    }
+
+    static func phaseStatus(_ phase: String) -> DisplayStatus {
+        switch phase {
+        case "ready": .success
+        case "unhealthy": .error
+        case "starting", "draining": .running
+        default: .pending
+        }
+    }
+
+    static func cacheStatusTint(_ status: String) -> Color {
+        switch status.lowercased() {
+        case "hit", "ready", "ok", "cached": AlexTheme.Colors.success
+        case "miss", "stale": AlexTheme.Colors.warningOrange
+        case "error", "failed": AlexTheme.Colors.destructive
+        default: AlexTheme.Colors.textSecondary
+        }
+    }
+
+    /// Per-line console tinting (mock STDOUT_LINES / STDERR_LINES palette).
+    static func lineColor(_ line: String) -> Color {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let lower = trimmed.lowercased()
+        if trimmed.isEmpty { return AlexTheme.Colors.foreground }
+        if lower.hasPrefix("[warn]") || lower.hasPrefix("warn") {
+            return AlexTheme.Colors.warningOrange
+        }
+        if lower.hasPrefix("[error]") || lower.contains("error:")
+            || lower.hasPrefix("failed") {
+            return AlexTheme.Colors.destructive
+        }
+        if trimmed.contains("http://") || trimmed.contains("https://") {
+            return AlexTheme.Colors.primary
+        }
+        if lower.contains("healthy") || lower.contains("is now an api")
+            || trimmed.hasPrefix("✓") {
+            return AlexTheme.Colors.success
+        }
+        if lower.hasPrefix("dario |") {
+            return AlexTheme.Colors.mutedForeground
+        }
+        if line.hasPrefix("  ") || lower.hasPrefix("usage:") {
+            return AlexTheme.Colors.textSecondary
+        }
+        return AlexTheme.Colors.foreground
+    }
+
+    static func styledLog(_ text: String) -> AttributedString {
+        var result = AttributedString()
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        for (index, sub) in lines.enumerated() {
+            var attr = AttributedString(String(sub))
+            attr.foregroundColor = lineColor(String(sub))
+            result += attr
+            if index < lines.count - 1 {
+                result += AttributedString("\n")
+            }
+        }
+        return result
+    }
+}
+
 struct DarioView: View {
     @Bindable var model: DarioModel
+    @State private var showingWhatIsDario = false
 
     var body: some View {
         VStack(spacing: 0) {
             if model.daemonDown {
-                banner
-                Divider()
+                daemonBanner
             }
             if model.disabled {
-                Text("dario mode disabled")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                EmptyStateView(message: "dario mode disabled", style: .panel(icon: "cpu"))
             } else {
                 header
-                Divider()
+                helpBand
+                statStrip
                 VSplitView {
-                    VStack(spacing: 0) {
-                        GenerationTable(model: model)
-                            .frame(minHeight: 110, idealHeight: 160)
-                        Divider()
-                        PromptCacheTable(model: model)
-                            .frame(minHeight: 92, idealHeight: 120)
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            GenerationSection(model: model)
+                            PromptCacheSection(model: model)
+                        }
                     }
-                    LogPane(model: model)
+                    .frame(minHeight: 180, idealHeight: 280)
+                    LogSection(model: model)
                         .frame(minHeight: 160, maxHeight: .infinity)
                 }
             }
         }
+        .background(AlexTheme.Colors.background)
         .frame(minWidth: 760, minHeight: 420)
     }
 
-    private var banner: some View {
-        HStack(spacing: 6) {
+    private var daemonBanner: some View {
+        HStack(spacing: AlexTheme.Spacing.sm) {
             Image(systemName: "bolt.slash")
             Text("daemon not running — retrying…")
             Spacer()
         }
         .font(.system(size: 11))
-        .foregroundStyle(.orange)
+        .foregroundStyle(AlexTheme.Colors.warningOrange)
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
-        .background(.orange.opacity(0.12))
+        .background(AlexTheme.Colors.warningOrange.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+        }
     }
 
+    // Mock Header: 48px band — 30×30 cpu tile, title over dim subtitle,
+    // bordered Restart / Check Update pills (Dario App.tsx:320-352).
     private var header: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 10) {
-                Text(headerTitle)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.primary.opacity(0.15))
+                .overlay(
+                    RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                        .strokeBorder(AlexTheme.Colors.primary.opacity(0.22)))
+                .overlay(
+                    Image(systemName: "cpu")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.primary))
+                .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Alex UI — Dario")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                Text(headerSubtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer()
-                if let result = model.actionResult {
-                    Text(result)
-                        .font(.system(size: 11))
-                        .foregroundStyle(result.hasPrefix("failed") ? .red : .secondary)
-                        .lineLimit(1)
-                }
-                Button("Restart") { model.confirmAction(update: false) }
-                    .controlSize(.small)
-                    .disabled(model.actionInFlight)
-                Button("Check Update") { model.confirmAction(update: true) }
-                    .controlSize(.small)
-                    .disabled(model.actionInFlight)
             }
-            Text("Process/generation health + logs. Dario-routed traffic shows up in the Trace Browser under account dario:<generation>.")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+            if let active = model.activeGeneration {
+                StatusChip(
+                    tint: DarioStyle.phaseTint(active.phase), text: active.phase)
+            }
+            Spacer()
+            if let result = model.actionResult {
+                Text(result)
+                    .font(.system(size: 11))
+                    .foregroundStyle(
+                        result.hasPrefix("failed")
+                            ? AlexTheme.Colors.destructive
+                            : AlexTheme.Colors.textSecondary)
+                    .lineLimit(1)
+            }
+            PanelIconButton(
+                systemImage: "questionmark.circle", help: "What is Dario?"
+            ) {
+                showingWhatIsDario = true
+            }
+            .popover(isPresented: $showingWhatIsDario, arrowEdge: .bottom) {
+                whatIsDarioPopover
+            }
+            PillButton(
+                title: "Restart", variant: .bordered,
+                isEnabled: !model.actionInFlight
+            ) {
+                model.confirmAction(update: false)
+            }
+            PillButton(
+                title: "Check Update", variant: .bordered,
+                isEnabled: !model.actionInFlight
+            ) {
+                model.confirmAction(update: true)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 20)
+        .frame(height: AlexTheme.Metrics.panelHeaderHeight)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+        }
     }
 
-    private var headerTitle: String {
-        guard let active = model.activeGeneration else { return "dario — no active generation" }
-        return "dario \(active.version) · active \(active.id)"
+    private var whatIsDarioPopover: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("What is Dario?", systemImage: "questionmark.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("Dario mode — an always-prepared generational supervisor for the @askalf/dario Anthropic upstream with health probes, automatic updates, and rolling restarts; routing remains an explicit toggle.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Link(destination: URL(string: "https://github.com/askalf/dario")!) {
+                Label("Open Dario on GitHub", systemImage: "arrow.up.right.square")
+                    .font(.system(size: 11, weight: .medium))
+            }
+        }
+        .padding(16)
+        .frame(width: 320, alignment: .leading)
+    }
+
+    private var headerSubtitle: String {
+        guard let active = model.activeGeneration else {
+            return "Dario — no active generation"
+        }
+        return "Dario \(active.version) — active \(active.id)"
+    }
+
+    // Mock SubtitleHelp: #141414 band, mono dim copy with accent span
+    // (Dario App.tsx:570-582).
+    private var helpBand: some View {
+        (Text("Process/generation health + logs. Dario-routed traffic shows up in the Trace Browser under account ")
+            .foregroundColor(AlexTheme.Colors.textTertiary)
+            + Text("dario:<generation>")
+            .foregroundColor(AlexTheme.Colors.primary))
+            .font(AlexTheme.Fonts.mono(10.5))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+            .background(AlexTheme.Colors.surfaceSunken)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+            }
+    }
+
+    private var statStrip: some View {
+        StatTilesRow(
+            items: [
+                StatTileData(
+                    label: "Generations",
+                    value: "\(model.generations.count)",
+                    valueTint: unhealthyCount > 0 ? AlexTheme.Colors.destructive : nil),
+                StatTileData(
+                    label: "In flight",
+                    value: "\(inFlightTotal)"),
+                StatTileData(
+                    label: "Prompt caches",
+                    value: "\(model.promptCaches.count)"),
+            ],
+            style: .bordered)
+    }
+
+    private var unhealthyCount: Int {
+        model.generations.filter { $0.phase == "unhealthy" }.count
+    }
+
+    private var inFlightTotal: Int {
+        model.generations.compactMap(\.inFlight).reduce(0, +)
     }
 }
 
-private struct PromptCacheTable: View {
+// MARK: - Generation table
+
+private struct GenerationSection: View {
+    @Bindable var model: DarioModel
+
+    private static let columns: [MiniTableColumn] = [
+        MiniTableColumn(title: "generation"),
+        MiniTableColumn(title: "version", width: 60),
+        MiniTableColumn(title: "phase", width: 80),
+        MiniTableColumn(title: "port", width: 60),
+        MiniTableColumn(title: "pid", width: 60),
+        MiniTableColumn(title: "busy", width: 40),
+        MiniTableColumn(title: "probe", width: 110),
+        MiniTableColumn(title: "age", width: 60, alignment: .trailing),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
+            SectionLabel(text: "Generation", style: .prominent)
+            MiniTable(
+                columns: Self.columns, rows: rows,
+                emptyMessage: "No generations")
+        }
+        .padding(16)
+    }
+
+    private var rows: [MiniTableRow] {
+        model.generations.map { generation in
+            let isActive = generation.id == model.status?.activeGenerationId
+            return MiniTableRow(
+                id: generation.id,
+                cells: [
+                    .text(generation.id,
+                          tint: isActive ? AlexTheme.Colors.primary : nil,
+                          bold: isActive, truncation: .middle),
+                    .text(generation.version, bold: isActive),
+                    .text(generation.phase,
+                          tint: DarioStyle.phaseTint(generation.phase),
+                          bold: generation.phase == "ready"),
+                    .text(generation.port.map(String.init) ?? "–"),
+                    .text(generation.pid.map(String.init) ?? "–"),
+                    .text(generation.inFlight.map(String.init) ?? "–"),
+                    probeCell(generation),
+                    .text(age(generation)),
+                ],
+                isActive: isActive,
+                isSelected: generation.id == model.selectedGenerationId,
+                onSelect: { [weak model] in
+                    model?.selectedGenerationId = generation.id
+                },
+                contextMenu: [
+                    MiniTableMenuItem(title: "Copy Generation ID") { [weak model] in
+                        model?.copyGenerationId(generation)
+                    },
+                    MiniTableMenuItem(title: "Reveal Log in Finder") { [weak model] in
+                        model?.revealLog(generation)
+                    },
+                ])
+        }
+    }
+
+    private func probeCell(_ generation: DarioGenerationDetail) -> MiniTableCell {
+        guard let probe = generation.lastProbe else {
+            return .text("–", tint: AlexTheme.Colors.textTertiary)
+        }
+        if probe.ok {
+            return .text(
+                "✓ \(probe.latencyMs.map { "\($0)ms" } ?? "ok")",
+                tint: AlexTheme.Colors.success)
+        }
+        return .text(
+            "✗ \(probe.error ?? "failed")",
+            tint: AlexTheme.Colors.destructive,
+            help: probe.error ?? "probe failed")
+    }
+
+    private func age(_ generation: DarioGenerationDetail) -> String {
+        guard let started = generation.startedAt else { return "–" }
+        let delta = Int64(Date().timeIntervalSince1970) - started / 1000
+        return Format.duration(max(0, delta))
+    }
+}
+
+// MARK: - Prompt cache table
+
+private struct PromptCacheSection: View {
     @Bindable var model: DarioModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            headerRow
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 1) {
-                    ForEach(model.promptCaches) { cache in
-                        PromptCacheRow(cache: cache, actionInFlight: model.actionInFlight) {
-                            model.clearPromptCache(cache)
-                        }
-                    }
-                    if model.promptCaches.isEmpty {
-                        Text("No prompt caches yet")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 14)
-                    }
-                }
-                .padding(4)
+        VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
+            SectionLabel(text: "Prompt Cache", style: .prominent)
+            if model.promptCaches.isEmpty {
+                EmptyStateView(message: "No prompt caches yet")
+                    .frame(maxWidth: .infinity)
+            } else {
+                MiniTable(columns: Self.columns, rows: rows)
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
     }
 
-    private var headerRow: some View {
-        HStack(spacing: 0) {
-            GenerationRow.cell("prompt cache", width: nil, alignment: .leading)
-            GenerationRow.cell("status", width: 80)
-            GenerationRow.cell("chars", width: 72)
-            GenerationRow.cell("version", width: 80)
-            GenerationRow.cell("last used", width: 92)
-            GenerationRow.cell("", width: 54)
-        }
-        .font(.system(size: 10, weight: .semibold))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-    }
-}
+    private static let columns: [MiniTableColumn] = [
+        MiniTableColumn(title: "cache"),
+        MiniTableColumn(title: "status", width: 60),
+        MiniTableColumn(title: "chars", width: 64),
+        MiniTableColumn(title: "version", width: 70),
+        MiniTableColumn(title: "last used", width: 80),
+        MiniTableColumn(title: "action", width: 60, alignment: .trailing),
+    ]
 
-private struct PromptCacheRow: View {
-    let cache: DarioPromptCacheSummary
-    let actionInFlight: Bool
-    let clear: () -> Void
-
-    var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(cache.model ?? cache.key)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let path = cache.path {
-                    Text(path)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            GenerationRow.cell(cache.runs?.first?.status ?? "cached", width: 80)
-            GenerationRow.cell(cache.systemPromptChars.map(String.init) ?? "-", width: 72)
-            GenerationRow.cell(cache.claudeVersion ?? "-", width: 80)
-            GenerationRow.cell(relative(cache.lastUsedAt ?? cache.capturedAt), width: 92)
-            Button("Clear", action: clear)
-                .controlSize(.mini)
-                .disabled(actionInFlight)
-                .frame(width: 54)
+    private var rows: [MiniTableRow] {
+        model.promptCaches.map { cache in
+            let status = cache.runs?.first?.status ?? "cached"
+            return MiniTableRow(
+                id: cache.key,
+                cells: [
+                    .stacked(cache.model ?? cache.key, cache.path ?? "–"),
+                    .text(status, tint: DarioStyle.cacheStatusTint(status)),
+                    .text(cache.systemPromptChars.map { "\($0)" } ?? "-"),
+                    .text(cache.claudeVersion ?? "-"),
+                    .text(
+                        relative(cache.lastUsedAt ?? cache.capturedAt),
+                        tint: AlexTheme.Colors.textTertiary),
+                    .button("Clear", isEnabled: !model.actionInFlight, { [weak model] in
+                        model?.clearPromptCache(cache)
+                    }),
+                ],
+                height: 48)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
     }
 
     private func relative(_ iso: String?) -> String {
@@ -361,212 +592,107 @@ private struct PromptCacheRow: View {
     }
 }
 
-private struct GenerationTable: View {
+// MARK: - Log console
+
+private struct LogSection: View {
     @Bindable var model: DarioModel
 
-    var body: some View {
-        VStack(spacing: 0) {
-            headerRow
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 1) {
-                    ForEach(model.generations) { generation in
-                        GenerationRow(
-                            generation: generation,
-                            isActive: generation.id == model.status?.activeGenerationId,
-                            selected: generation.id == model.selectedGenerationId
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.selectedGenerationId = generation.id }
-                        .contextMenu {
-                            Button("Copy Generation ID") { model.copyGenerationId(generation) }
-                            Button("Reveal Log in Finder") { model.revealLog(generation) }
-                        }
-                    }
-                    if model.generations.isEmpty {
-                        Text("No generations")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 16)
-                    }
-                }
-                .padding(4)
-            }
-        }
+    private var logTabSelection: Binding<Int> {
+        Binding(
+            get: { model.logChannel == .stdout ? 0 : 1 },
+            set: { model.logChannel = $0 == 0 ? .stdout : .stderr })
     }
-
-    private var headerRow: some View {
-        HStack(spacing: 0) {
-            GenerationRow.cell("generation", width: nil, alignment: .leading)
-            GenerationRow.cell("version", width: 66)
-            GenerationRow.cell("phase", width: 76)
-            GenerationRow.cell("port", width: 52)
-            GenerationRow.cell("pid", width: 58)
-            GenerationRow.cell("busy", width: 40)
-            GenerationRow.cell("probe", width: 110)
-            GenerationRow.cell("age", width: 64)
-        }
-        .font(.system(size: 10, weight: .semibold))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-    }
-}
-
-private struct GenerationRow: View {
-    let generation: DarioGenerationDetail
-    let isActive: Bool
-    let selected: Bool
 
     var body: some View {
-        HStack(spacing: 0) {
-            Text((isActive ? "☥ " : "") + generation.id)
-                .font(.system(size: 11, weight: isActive ? .bold : .regular, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Self.cell(generation.version, width: 66, bold: isActive)
-            Text(generation.phase)
-                .font(.system(size: 11, weight: isActive ? .bold : .regular, design: .monospaced))
-                .foregroundStyle(phaseColor)
-                .frame(width: 76)
-            Self.cell(generation.port.map(String.init) ?? "–", width: 52)
-            Self.cell(generation.pid.map(String.init) ?? "–", width: 58)
-            Self.cell(generation.inFlight.map(String.init) ?? "–", width: 40)
-            probeCell
-                .frame(width: 110)
-            Self.cell(age, width: 64)
+        VStack(spacing: AlexTheme.Spacing.md) {
+            tabRow
+            console
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 5)
-                .fill(selected ? Color.accentColor.opacity(0.18) : Color.clear)
-        )
+        .padding(.horizontal, 16)
+        .padding(.top, AlexTheme.Spacing.md)
+        .padding(.bottom, 16)
     }
 
-    static func cell(
-        _ text: String, width: CGFloat?, alignment: Alignment = .center, bold: Bool = false
-    ) -> some View {
-        Text(text)
-            .font(.system(size: 11, weight: bold ? .bold : .regular, design: .monospaced))
-            .lineLimit(1)
-            .frame(width: width)
-            .frame(maxWidth: width == nil ? .infinity : width, alignment: alignment)
-    }
-
-    private var phaseColor: Color {
-        switch generation.phase {
-        case "ready": .green
-        case "starting": .orange
-        case "unhealthy": .red
-        case "draining": .yellow
-        case "dead": .gray
-        default: .secondary
-        }
-    }
-
-    @ViewBuilder
-    private var probeCell: some View {
-        if let probe = generation.lastProbe {
-            if probe.ok {
-                Text("✓ \(probe.latencyMs.map { "\($0)ms" } ?? "ok")")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.green)
-            } else {
-                Text("✗ \(probe.error ?? "failed")")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.red)
+    private var tabRow: some View {
+        HStack(spacing: AlexTheme.Spacing.md) {
+            SegmentedTabs(
+                tabs: DarioModel.LogChannel.allCases.map(\.rawValue),
+                selection: logTabSelection,
+                style: .solid)
+            if let generation = model.selectedGeneration {
+                StatusDot(
+                    status: DarioStyle.phaseStatus(generation.phase), size: 5)
+                Text(generation.id)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(probe.error ?? "probe failed")
+                    .truncationMode(.middle)
             }
-        } else {
-            Text("–")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
+            Spacer()
         }
+        .frame(height: 28)
     }
 
-    private var age: String {
-        guard let started = generation.startedAt else { return "–" }
-        let delta = Int64(Date().timeIntervalSince1970) - started / 1000
-        return Format.duration(max(0, delta))
-    }
-}
-
-private struct LogPane: View {
-    @Bindable var model: DarioModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Picker("", selection: $model.logChannel) {
-                    ForEach(DarioModel.LogChannel.allCases, id: \.self) { channel in
-                        Text(channel.rawValue).tag(channel)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 160)
-                if let generation = model.selectedGeneration {
-                    Text(generation.id)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            Divider()
-            ScrollViewReader { proxy in
-                ZStack(alignment: .bottom) {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(model.logText.isEmpty ? "(empty)" : model.logText)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                                .foregroundStyle(model.logText.isEmpty ? .secondary : .primary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear
-                                .frame(height: 1)
-                                .id("bottom")
-                                .onAppear { model.setUserAtBottom(true) }
-                                .onDisappear { model.setUserAtBottom(false) }
+    private var console: some View {
+        ScrollViewReader { proxy in
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Group {
+                            if model.logText.isEmpty {
+                                Text("(empty)")
+                                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                            } else {
+                                Text(DarioStyle.styledLog(model.logText))
+                            }
                         }
-                        .padding(10)
+                        .font(AlexTheme.Fonts.mono(10.5))
+                        .lineSpacing(5)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottom")
+                            .onAppear { model.setUserAtBottom(true) }
+                            .onDisappear { model.setUserAtBottom(false) }
                     }
-                    if !model.userAtBottom, !model.logText.isEmpty {
-                        Button {
-                            model.setUserAtBottom(true)
-                            proxy.scrollTo("bottom", anchor: .bottom)
-                        } label: {
-                            Label("Jump to latest", systemImage: "arrow.down.to.line")
-                                .font(.system(size: 11, weight: .medium))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Capsule().fill(.thinMaterial))
-                                .overlay(Capsule().strokeBorder(.quaternary))
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.bottom, 10)
-                    }
+                    .padding(12)
                 }
-                .onChange(of: model.logText.count) {
-                    if model.userAtBottom {
+                if !model.userAtBottom, !model.logText.isEmpty {
+                    Button {
+                        model.setUserAtBottom(true)
                         proxy.scrollTo("bottom", anchor: .bottom)
+                    } label: {
+                        Label("Jump to latest", systemImage: "arrow.down.to.line")
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(.thinMaterial))
+                            .overlay(Capsule().strokeBorder(.quaternary))
                     }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 10)
                 }
-                .onChange(of: model.selectedGenerationId) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-                .onChange(of: model.logChannel) {
+            }
+            .onChange(of: model.logText.count) {
+                if model.userAtBottom {
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
             }
+            .onChange(of: model.selectedGenerationId) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            .onChange(of: model.logChannel) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
         }
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.consoleBackground))
+        .overlay(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(AlexTheme.Colors.cardBorder))
+        .clipShape(RoundedRectangle(cornerRadius: AlexTheme.Radius.md))
     }
 }
 
@@ -587,7 +713,7 @@ final class DarioWindowController: NSObject, NSWindowDelegate {
             self.model = model
             let host = NSHostingController(rootView: DarioView(model: model))
             let win = NSWindow(contentViewController: host)
-            win.title = "Alexandria — Dario"
+            win.title = "Alex UI — Dario"
             win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             win.isReleasedWhenClosed = false
             win.delegate = self

@@ -18,12 +18,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var daemonUpdateApplying = false
     private var daemonUpdateTarget: String?
     private var daemonUpdateMessage: String?
+    private var daemonUpdateDismissedVersion: String?
+    private var appUpdateDismissedVersion: String?
+    private weak var updateBannerItem: NSMenuItem?
+    private static let accountsExpandedDefaultsKey = "MenuAccountsExpanded"
+    private static let harnessesExpandedDefaultsKey = "MenuHarnessesExpanded"
 
     init(store: SnapshotStore) {
         self.store = store
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         statusItem.autosaveName = "AlexandriaBar"
+        // Explicit enabling keeps interactive hosted SwiftUI items (update
+        // banner, providers card buttons) clickable.
+        menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
         updateIcon()
@@ -33,6 +41,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             MainActor.assumeIsolated {
                 self?.updateIcon()
             }
+        }
+        updaterController.onAppUpdateStateChanged = { [weak self] in
+            self?.reconcileAppUpdateState()
+            self?.updateIcon()
         }
     }
 
@@ -74,19 +86,50 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
+    // Section order follows the system-menu mock (ui/Design macOS system
+    // menu App.tsx:665-795): header · update banner · stats · providers ·
+    // accounts · harnesses · Dario · traces · footer actions.
     private func rebuildMenu() {
         menu.removeAllItems()
         buildHeader()
         buildIssues()
+        // The app (Sparkle) update is independent of daemon health, so this
+        // stays outside the `daemonUp` gate — unlike the daemon row, it can
+        // still render "Update Alex UI" while the daemon itself is down.
+        buildUpdateBanner()
         if store.daemonUp {
+            buildStats()
             buildProviderEmptyState()
             buildLimits()
             buildAccounts()
             buildHarnesses()
             buildDario()
-            buildAnalytics()
         }
+        buildTraces()
         buildActions()
+    }
+
+    /// Adds a hosted SwiftUI view as a (non-highlighting) menu item.
+    @discardableResult
+    private func addHostedView<Content: View>(
+        _ view: Content, edgeToEdge: Bool = false
+    ) -> NSMenuItem {
+        let item = NSMenuItem()
+        let host = NSHostingView(rootView: view)
+        if edgeToEdge {
+            // Custom NSMenuItem hosting views inherit the menu's safe-area
+            // inset. The update tint must meet the adjacent separator.
+            host.safeAreaRegions = []
+        }
+        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        item.view = host
+        menu.addItem(item)
+        return item
+    }
+
+    private func addSectionLabel(_ text: String) {
+        let item = addHostedView(MenuSectionLabelView(text: text))
+        item.isEnabled = false
     }
 
     private func buildIssues() {
@@ -114,8 +157,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    private func addAction(_ title: String, indent: Int = 0, symbol: String? = nil, handler: @escaping @MainActor () -> Void) {
-        let item = NSMenuItem(title: title, action: #selector(runHandler(_:)), keyEquivalent: "")
+    private func addAction(
+        _ title: String, indent: Int = 0, symbol: String? = nil, key: String = "",
+        handler: @escaping @MainActor () -> Void
+    ) {
+        let item = NSMenuItem(title: title, action: #selector(runHandler(_:)), keyEquivalent: key)
         item.target = self
         item.indentationLevel = indent
         if let symbol {
@@ -135,12 +181,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildHeader() {
         if store.daemonUp, let health = store.health {
-            var line = "Alexandria app v\(appVersion) · daemon v\(health.version)"
-            line += " · up \(Format.duration(health.uptimeS))"
-            if health.inFlight > 0 { line += " · \(health.inFlight) in flight" }
-            addInfo(line)
+            addHostedView(MenuHeaderView(
+                appVersion: appVersion,
+                daemonVersion: health.version,
+                uptimeS: health.uptimeS,
+                inFlight: health.inFlight))
         } else if store.lastRefresh == nil {
-            addInfo("Alexandria — connecting…")
+            addInfo("Alex UI — connecting…")
         } else {
             addInfo("Alexandria daemon is not running")
             if let err = store.lastError {
@@ -153,21 +200,119 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
     }
 
+    /// Update banner (mock App.tsx:592-635, `UpdateSection`): an "App" row
+    /// (Sparkle, via `UpdaterController.availableAppUpdateVersion`), a
+    /// "Daemon" row (via `store.daemonUpdate`), or both — with a single
+    /// button that reads "Update Both" when both are pending.
+    private func buildUpdateBanner() {
+        let appVersion = pendingAppUpdateVersion
+        let daemonVersion = !daemonUpdateApplying ? pendingDaemonUpdateVersion : nil
+        guard appVersion != nil || daemonVersion != nil else { return }
+        let banner = MenuUpdateBannerView(
+            appVersion: appVersion,
+            daemonVersion: daemonVersion,
+            onUpdate: { [weak self] in
+                self?.menu.cancelTrackingWithoutAnimation()
+                self?.applyPendingUpdates(appVersion: appVersion, daemonVersion: daemonVersion)
+            },
+            onLater: { [weak self] in
+                guard let self else { return }
+                if appVersion != nil { self.appUpdateDismissedVersion = appVersion }
+                if daemonVersion != nil { self.daemonUpdateDismissedVersion = daemonVersion }
+                if let item = self.updateBannerItem, self.menu.items.contains(item) {
+                    self.menu.removeItem(item)
+                }
+            })
+        updateBannerItem = addHostedView(banner, edgeToEdge: true)
+    }
+
+    /// Debug-only manual preview hook: `defaults write
+    /// com.madhavajay.alexandria-macos DebugFakeUpdateBanner app|daemon|both`
+    /// (see UpdaterController.applyDebugFakeUpdateOverride for the app half).
+    /// This covers the daemon half, since daemon-update state normally comes
+    /// from the live daemon's `/admin/update/status` response.
+    private var debugFakeUpdateBannerMode: String? {
+        UserDefaults.standard.string(forKey: UpdaterController.debugFakeUpdateBannerKey)
+    }
+
+    private var pendingAppUpdateVersion: String? {
+        guard let version = updaterController.availableAppUpdateVersion,
+              version != appUpdateDismissedVersion
+        else { return nil }
+        return version
+    }
+
+    private var pendingDaemonUpdateVersion: String? {
+        if let mode = debugFakeUpdateBannerMode, mode == "daemon" || mode == "both" {
+            let fake = "0.1.99-debug"
+            return fake != daemonUpdateDismissedVersion ? fake : nil
+        }
+        guard let update = store.daemonUpdate, update.updateAvailable,
+              let latest = update.latest, latest != daemonUpdateDismissedVersion
+        else { return nil }
+        return latest
+    }
+
+    /// "Update Both" per the mock: the daemon update first since applying it
+    /// doesn't restart this app, then hand off to Sparkle's own install flow
+    /// (which does restart the app, so it must go last).
+    private func applyPendingUpdates(appVersion: String?, daemonVersion: String?) {
+        if let daemonVersion {
+            applyDaemonUpdate(latest: daemonVersion)
+        }
+        if appVersion != nil {
+            updaterController.checkForUpdates()
+        }
+    }
+
+    /// Requests / cost / errors stats bar (mock App.tsx:696-708).
+    private func buildStats() {
+        guard let analytics = store.analytics, analytics.totals.requests > 0 else { return }
+        addHostedView(MenuStatsBarView(totals: analytics.totals))
+        menu.addItem(.separator())
+    }
+
+    private var heartbeatsById: [String: Heartbeat] {
+        Dictionary(uniqueKeysWithValues: store.healthAccounts.compactMap { account in
+            account.lastHeartbeat.map { (account.id, $0) }
+        })
+    }
+
     private func buildLimits() {
         guard ProviderPresentation.shouldShowLimitsCard(
             limits: store.limits, accounts: store.accounts
         ) else {
             return
         }
-        let item = NSMenuItem()
         let card = LimitsCardView(
             limits: store.limits,
             accounts: store.accounts,
-            warnPct: store.limitWarnPct)
-        let host = NSHostingView(rootView: card)
-        host.frame = NSRect(origin: .zero, size: host.fittingSize)
-        item.view = host
-        menu.addItem(item)
+            warnPct: store.limitWarnPct,
+            heartbeats: heartbeatsById,
+            routing: store.routingByProvider,
+            dario: store.dario,
+            onRefresh: { [weak self] in
+                guard let self else { return false }
+                await self.store.refresh()
+                // menuWillOpen may already have started the coalesced store
+                // refresh. In that case refresh() returns immediately, so
+                // keep the hosted spinner up until that in-flight work ends.
+                while self.store.refreshing {
+                    guard !Task.isCancelled else { return false }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                return self.store.lastError == nil
+            },
+            onPing: { [weak self] in
+                self?.menu.cancelTrackingWithoutAnimation()
+                self?.runPing(target: "all", name: "All providers")
+            },
+            onOpenDario: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openDario()
+            })
+        addHostedView(card)
         menu.addItem(.separator())
     }
 
@@ -182,16 +327,42 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildAccounts() {
         guard !store.accounts.isEmpty else { return }
-        addInfo("Accounts")
-        let heartbeats = Dictionary(
-            uniqueKeysWithValues: store.healthAccounts.map { ($0.id, $0.lastHeartbeat) })
+        let expanded = UserDefaults.standard.bool(
+            forKey: Self.accountsExpandedDefaultsKey)
+        addHostedView(MenuCollapsibleSectionHeaderView(
+            title: "Accounts",
+            itemCount: store.accounts.count,
+            singularItemName: "account",
+            isExpanded: expanded,
+            onToggle: { [weak self] in self?.toggleAccountsExpanded() }))
+        guard expanded else {
+            menu.addItem(.separator())
+            return
+        }
+        let heartbeats = heartbeatsById
         for account in store.accounts {
+            let heartbeat = heartbeats[account.id]
             let item = NSMenuItem(title: accountTitle(account), action: nil, keyEquivalent: "")
-            item.image = dotImage(for: account, heartbeat: heartbeats[account.id] ?? nil)
-            item.submenu = accountSubmenu(account, heartbeat: heartbeats[account.id] ?? nil)
+            item.attributedTitle = accountRowTitle(account)
+            item.image = MenuItemIcon.provider(
+                account.provider,
+                health: MenuHealthStatus.forAccount(account, heartbeat: heartbeat))
+            item.submenu = accountSubmenu(account, heartbeat: heartbeat)
             menu.addItem(item)
         }
         menu.addItem(.separator())
+    }
+
+    /// NSMenu supports changing its items while tracking. Defer the rebuild
+    /// until the hosted button's click has unwound so its NSHostingView is not
+    /// removed in the middle of dispatching the action.
+    private func toggleAccountsExpanded() {
+        let defaults = UserDefaults.standard
+        let expanded = defaults.bool(forKey: Self.accountsExpandedDefaultsKey)
+        defaults.set(!expanded, forKey: Self.accountsExpandedDefaultsKey)
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildMenu()
+        }
     }
 
     private func accountTitle(_ account: Account) -> String {
@@ -202,17 +373,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return title
     }
 
-    private func dotImage(for account: Account, heartbeat: Heartbeat?) -> NSImage? {
-        let color: NSColor
-        if account.status != "active" || heartbeat?.ok == false {
-            color = .systemRed
-        } else if account.isExpired {
-            color = .systemOrange
-        } else {
-            color = .systemGreen
+    /// Row title per the mock (App.tsx:766-772): provider name in medium
+    /// weight, email/label detail in the secondary tier.
+    private func accountRowTitle(_ account: Account) -> NSAttributedString {
+        let title = NSMutableAttributedString(
+            string: ProviderInfo.displayName(account.provider),
+            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)])
+        var detail: String?
+        if let email = account.email, !email.isEmpty {
+            detail = email
+        } else if let label = account.label, !label.isEmpty {
+            detail = label
+        } else if account.name != "default" {
+            detail = account.name
         }
-        return NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(paletteColors: [color]))
+        if let detail {
+            title.append(NSAttributedString(
+                string: "  \(detail)",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]))
+        }
+        return title
     }
 
     private func accountSubmenu(_ account: Account, heartbeat: Heartbeat?) -> NSMenu {
@@ -309,35 +492,36 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 title += " · \(ms)ms"
             }
         }
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        let nodeInfo = NSMenuItem(
-            title: store.nodePath.map { "Node: \($0)" } ?? "Node.js not found — install it for dario",
-            action: nil, keyEquivalent: "")
-        nodeInfo.isEnabled = false
-        sub.addItem(nodeInfo)
-        sub.addItem(.separator())
-        let restart = NSMenuItem(title: "Restart Dario", action: #selector(runHandler(_:)), keyEquivalent: "")
-        restart.target = self
-        restart.representedObject = MenuHandler { [weak self] in self?.darioAction(update: false) }
-        sub.addItem(restart)
-        let update = NSMenuItem(title: "Check for Update", action: #selector(runHandler(_:)), keyEquivalent: "")
-        update.target = self
-        update.representedObject = MenuHandler { [weak self] in self?.darioAction(update: true) }
-        sub.addItem(update)
-        sub.addItem(.separator())
-        let about = NSMenuItem(title: "What is Dario?", action: #selector(runHandler(_:)), keyEquivalent: "")
-        about.target = self
-        about.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil)
-        about.representedObject = MenuHandler {
-            NSWorkspace.shared.open(URL(string: "https://github.com/askalf/dario")!)
-        }
-        sub.addItem(about)
-        item.submenu = sub
+        let item = NSMenuItem(
+            title: title, action: #selector(runHandler(_:)), keyEquivalent: "")
+        item.target = self
+        item.image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil)
+        item.representedObject = MenuHandler { [weak self] in self?.openDario() }
         menu.addItem(item)
         menu.addItem(.separator())
     }
 
+    /// The mock places Trace Browser access in a Traces section immediately
+    /// above the footer, rather than among footer commands.
+    private func buildTraces() {
+        addHostedView(MenuTracesSectionView(
+            sessions: store.recentSessions,
+            onOpen: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openTraceBrowser()
+            },
+            onOpenSession: { [weak self] id in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openTraceBrowser(selectSessionId: id)
+            }))
+        menu.addItem(.separator())
+    }
+
+    /// Harness rows sit directly in the menu under a section label (mock
+    /// App.tsx:343-417); each row's native submenu is the mock's flyout panel,
+    /// with the system menu-highlight standing in for the mock's #0057d8.
     private func buildHarnesses() {
         guard store.harnessesSupported == true else { return }
         // Only show harnesses with a complete connect/update/disconnect workflow.
@@ -345,18 +529,61 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             $0.installed && $0.supportsConnect
         }
         guard !installed.isEmpty else { return }
-        let item = NSMenuItem(title: "Harnesses", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        for harness in installed {
-            let harnessItem = NSMenuItem(
-                title: HarnessCatalog.displayName(harness.name), action: nil, keyEquivalent: "")
-            harnessItem.image = harnessDotImage(harness)
-            harnessItem.submenu = harnessSubmenu(harness)
-            sub.addItem(harnessItem)
+        let expanded = UserDefaults.standard.bool(
+            forKey: Self.harnessesExpandedDefaultsKey)
+        addHostedView(MenuCollapsibleSectionHeaderView(
+            title: "Harnesses",
+            itemCount: installed.count,
+            singularItemName: "harness",
+            isExpanded: expanded,
+            onToggle: { [weak self] in self?.toggleHarnessesExpanded() }))
+        guard expanded else {
+            menu.addItem(.separator())
+            return
         }
-        item.submenu = sub
-        menu.addItem(item)
+        for harness in installed {
+            let item = NSMenuItem(
+                title: HarnessCatalog.displayName(harness.name), action: nil, keyEquivalent: "")
+            item.attributedTitle = harnessRowTitle(harness)
+            item.image = MenuItemIcon.harness(
+                harness.name, health: harness.connected ? .ok : .pending)
+                ?? harnessDotImage(harness)
+            item.submenu = harnessSubmenu(harness)
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
+    }
+
+    private func toggleHarnessesExpanded() {
+        let defaults = UserDefaults.standard
+        let expanded = defaults.bool(forKey: Self.harnessesExpandedDefaultsKey)
+        defaults.set(!expanded, forKey: Self.harnessesExpandedDefaultsKey)
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildMenu()
+        }
+    }
+
+    private func harnessRowTitle(_ harness: Harness) -> NSAttributedString {
+        let title = NSMutableAttributedString(
+            string: HarnessCatalog.displayName(harness.name),
+            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)])
+        if let version = harness.version, !version.isEmpty {
+            title.append(NSAttributedString(
+                string: "  v\(version)",
+                attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]))
+        }
+        if !harness.connected {
+            title.append(NSAttributedString(
+                string: "  not connected",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ]))
+        }
+        return title
     }
 
     private func harnessDotImage(_ harness: Harness) -> NSImage? {
@@ -464,98 +691,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func buildAnalytics() {
-        guard let analytics = store.analytics, analytics.totals.requests > 0 else { return }
-        let t = analytics.totals
-        var line = "Last hour: \(t.requests) requests · $\(String(format: "%.4f", t.costUsd))"
-        if t.errors > 0 { line += " · \(t.errors) errors" }
-        addInfo(line)
-        menu.addItem(.separator())
-    }
-
     private func buildActions() {
-        addAction("Run Ping Checks", symbol: "dot.radiowaves.left.and.right") { [weak self] in
-            self?.runPing(target: "all", name: "All providers")
-        }
-        addAction("Re-auth Subscriptions…", symbol: "key") { }
-        if let last = menu.items.last {
-            let sub = NSMenu()
-            for provider in ["anthropic", "openai", "xai", "gemini"] {
-                let item = NSMenuItem(
-                    title: ProviderInfo.displayName(provider),
-                    action: #selector(runHandler(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = MenuHandler { [weak self] in
-                    self?.openAuth(provider: provider)
-                }
-                sub.addItem(item)
-            }
-            sub.addItem(.separator())
-            let importItem = NSMenuItem(title: "Re-import All Credentials", action: #selector(runHandler(_:)), keyEquivalent: "")
-            importItem.target = self
-            importItem.representedObject = MenuHandler { [weak self] in self?.importCredentials() }
-            sub.addItem(importItem)
-            last.submenu = sub
-        }
-        addAction("Refresh Now", symbol: "arrow.clockwise") { [weak self] in
-            Task { await self?.store.refresh() }
-        }
-        addAction("Trace Browser…", symbol: "list.bullet.rectangle") { [weak self] in
-            self?.openTraceBrowser()
-        }
-        addAction("Dario…", symbol: "server.rack") { [weak self] in
-            self?.openDario()
-        }
-        addAction("Reveal Log File", symbol: "doc.text.magnifyingglass") {
-            NSWorkspace.shared.activateFileViewerSelecting([BarLog.fileURL])
-        }
-        addAction("Open TUI in Terminal", symbol: "terminal") {
-            let bin = DaemonController.findBinary() ?? "alexandria"
-            TerminalLauncher.launch(command: "\(bin) tui")
-        }
-        menu.addItem(.separator())
-        addAction("Report a Bug or Request a Feature…", symbol: "exclamationmark.bubble") {
+        addAction("Report a Bug or Feature…", symbol: "exclamationmark.bubble") {
             NSWorkspace.shared.open(PreferencesView.issuesURL)
         }
-        addAction("Settings…", symbol: "gearshape") { [weak self] in
+        addAction("Settings…", symbol: "gearshape", key: ",") { [weak self] in
             self?.openPreferences()
         }
-        buildDaemonUpdateAction()
-        let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(runHandler(_:)), keyEquivalent: "")
-        updateItem.target = self
-        updateItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
-        updateItem.isEnabled = updaterController.canCheckForUpdates
-        updateItem.representedObject = MenuHandler { [weak self] in
-            self?.updaterController.checkForUpdates()
+        addAction("Star GitHub Project", symbol: "star") {
+            NSWorkspace.shared.open(URL(string: "https://github.com/madhavajay/alex")!)
         }
-        menu.addItem(updateItem)
         if LaunchAtLogin.available {
-            let item = NSMenuItem(title: "Launch at Login", action: #selector(runHandler(_:)), keyEquivalent: "")
+            let item = NSMenuItem(
+                title: "Launch at Login", action: #selector(runHandler(_:)), keyEquivalent: "")
             item.target = self
             item.state = LaunchAtLogin.isEnabled ? .on : .off
             item.representedObject = MenuHandler { LaunchAtLogin.toggle() }
             menu.addItem(item)
         }
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit AlexandriaBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(
+            title: "Quit Alex UI", action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
-    }
-
-    private func buildDaemonUpdateAction() {
-        if daemonUpdateApplying {
-            let target = daemonUpdateTarget ?? store.daemonUpdate?.latest ?? "latest"
-            addInfo("Updating daemon to \(target)…")
-            return
-        }
-        if let update = store.daemonUpdate, update.updateAvailable, let latest = update.latest {
-            addAction("Update daemon to \(latest)…", symbol: "arrow.down.circle") { [weak self] in
-                self?.applyDaemonUpdate(latest: latest)
-            }
-        }
-        if let message = daemonUpdateMessage {
-            addInfo(String(message.prefix(70)))
-        }
     }
 
     private func startDaemon() {
@@ -638,24 +796,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func darioAction(update: Bool) {
-        guard let config = store.config else { return }
-        let client = AlexandriaClient(config: config)
-        Task { [weak self] in
-            do {
-                if update {
-                    try await client.darioUpdate()
-                } else {
-                    try await client.darioRestart()
-                }
-                await self?.store.refresh()
-                self?.notify(title: update ? "Dario update triggered" : "Dario restart triggered", body: "")
-            } catch {
-                self?.notify(title: "Dario action failed", body: error.localizedDescription)
-            }
-        }
-    }
-
     private func applyDaemonUpdate(latest: String) {
         guard let config = store.config else { return }
         let client = AlexandriaClient(config: config)
@@ -690,9 +830,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Mirrors `reconcileDaemonUpdateState`'s dismissal-reset for the app row:
+    /// once Sparkle no longer has a pending update, clear the stale dismissal
+    /// so a later update isn't accidentally hidden.
+    private func reconcileAppUpdateState() {
+        if updaterController.availableAppUpdateVersion == nil {
+            appUpdateDismissedVersion = nil
+        }
+    }
+
     private func reconcileDaemonUpdateState() {
         if store.daemonUpdate?.updateAvailable == false {
             daemonUpdateMessage = nil
+            daemonUpdateDismissedVersion = nil
         }
         guard daemonUpdateApplying, let target = daemonUpdateTarget else { return }
         let healthMatches = store.health.map { versionsMatch($0.version, target) } ?? false
@@ -716,11 +866,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
     }
 
-    private func openTraceBrowser(harness: String? = nil) {
+    private func openTraceBrowser(harness: String? = nil, selectSessionId: String? = nil) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show(harness: harness)
+        traceBrowser?.show(harness: harness, selectSessionId: selectSessionId)
     }
 
     private func openDario() {
@@ -743,5 +893,65 @@ private final class MenuHandler: NSObject {
     let run: @MainActor () -> Void
     init(_ run: @escaping @MainActor () -> Void) {
         self.run = run
+    }
+}
+
+/// Renders menu-item icons: a brand logo (rounded 3) with a bottom-right
+/// health dot separated from the artwork by a punched-out transparent ring so
+/// the badge reads on plain and highlighted row backgrounds alike (mock
+/// ProviderIcon, ui/Design macOS system menu App.tsx:130-170).
+@MainActor
+private enum MenuItemIcon {
+    static func provider(_ provider: String, health: MenuHealthStatus?) -> NSImage {
+        let base: NSImage = if let alias = ProviderMenuIcon.harnessAlias[provider],
+                               let logo = HarnessIconLoader.image(harness: alias, tags: nil)
+        {
+            logo
+        } else {
+            ProviderChipRenderer.image(for: provider)
+        }
+        return badged(base, health: health)
+    }
+
+    static func harness(_ name: String, health: MenuHealthStatus?) -> NSImage? {
+        guard let logo = HarnessIconLoader.image(harness: name, tags: nil) else { return nil }
+        return badged(logo, health: health)
+    }
+
+    static func badged(
+        _ base: NSImage, size: CGFloat = 14, health: MenuHealthStatus?
+    ) -> NSImage {
+        let badge = max(4, (size * 0.38).rounded())
+        let canvas = NSSize(width: size + 2, height: size + 2)
+        return NSImage(size: canvas, flipped: false) { _ in
+            let baseRect = NSRect(x: 0, y: 2, width: size, height: size)
+            NSGraphicsContext.current?.saveGraphicsState()
+            NSBezierPath(roundedRect: baseRect, xRadius: 3, yRadius: 3).addClip()
+            base.draw(in: baseRect)
+            NSGraphicsContext.current?.restoreGraphicsState()
+            if let health {
+                let dotRect = NSRect(
+                    x: canvas.width - badge, y: 0, width: badge, height: badge)
+                if let cg = NSGraphicsContext.current?.cgContext {
+                    cg.setBlendMode(.clear)
+                    cg.fillEllipse(in: dotRect.insetBy(dx: -1.5, dy: -1.5))
+                    cg.setBlendMode(.normal)
+                }
+                tint(health)
+                    .withAlphaComponent(health == .pending ? 0.5 : 1)
+                    .setFill()
+                NSBezierPath(ovalIn: dotRect).fill()
+            }
+            return true
+        }
+    }
+
+    private static func tint(_ health: MenuHealthStatus) -> NSColor {
+        switch health {
+        case .ok: .systemGreen
+        case .slow: .systemOrange
+        case .error: .systemRed
+        case .pending: .systemGray
+        }
     }
 }

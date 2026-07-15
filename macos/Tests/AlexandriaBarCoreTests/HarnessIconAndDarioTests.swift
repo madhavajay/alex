@@ -35,6 +35,13 @@ import Testing
             HarnessIcon.assetName(harness: nil, tags: ["harness": "opensage-adk"])
                 == "opensage-adk.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "stirrup"]) == "stirrup.ico")
+        #expect(
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "oh-my-pi"])
+                == "oh-my-pi.png")
+        #expect(
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "pydantic-ai-harness"])
+                == "pydantic-ai-harness.png")
+        #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "jcode"]) == "jcode.png")
     }
 
     @Test func tagAliases() {
@@ -57,6 +64,10 @@ import Testing
             HarnessIcon.assetName(harness: nil, tags: ["harness": "opensage"])
                 == "opensage-adk.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "CODEX"]) == "codex.png")
+        #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "omp"]) == "oh-my-pi.png")
+        #expect(
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "pydantic-ai"])
+                == "pydantic-ai-harness.png")
     }
 
     @Test func userAgentSniffing() {
@@ -78,6 +89,9 @@ import Testing
         #expect(HarnessIcon.assetName(harness: "factory-cli/1.2.3", tags: nil) == "droid-cli.svg")
         #expect(
             HarnessIcon.assetName(harness: "kimi-code-cli/0.20.2", tags: nil) == "kimi-code.jpg")
+        #expect(HarnessIcon.assetName(harness: "omp", tags: nil) == "oh-my-pi.png")
+        #expect(HarnessIcon.assetName(harness: "pydantic-ai", tags: nil) == "pydantic-ai-harness.png")
+        #expect(HarnessIcon.assetName(harness: "jcode", tags: nil) == "jcode.png")
         #expect(HarnessIcon.assetName(harness: "Bun/1.3.14", tags: nil) == nil)
         #expect(HarnessIcon.assetName(harness: "OpenAI/JS 6.26.0", tags: nil) == nil)
         #expect(HarnessIcon.assetName(harness: "OpenAI/Python 2.44.0", tags: nil) == nil)
