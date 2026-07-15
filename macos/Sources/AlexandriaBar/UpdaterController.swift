@@ -7,13 +7,19 @@ import AlexandriaBarCore
 /// so switching back to stable always works.
 final class ChannelFeedDelegate: NSObject, SPUUpdaterDelegate {
     func feedURLString(for updater: SPUUpdater) -> String? {
-        let channel = UpdateChannelSetting.from(
-            UserDefaults.standard.string(forKey: UpdateChannelSetting.defaultsKey))
-        guard let stableFeed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
-        else {
-            return nil
-        }
-        return channel.feedURLString(stableFeed: stableFeed)
+        let rawChannel = UserDefaults.standard.string(forKey: UpdateChannelSetting.defaultsKey)
+        let channel = UpdateChannelSetting.from(rawChannel)
+        let stableFeed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
+        let resolved = stableFeed.flatMap { channel.feedURLString(stableFeed: $0) }
+        // Diagnostic (Reveal Log File): this proves whether Sparkle consults the
+        // delegate and which feed it is handed. If this line appears with a beta
+        // URL but the check still finds nothing, the fault is downstream in Sparkle.
+        BarLog.info(
+            .ui,
+            "sparkle feedURL: channel=\(rawChannel ?? "nil")->\(channel.rawValue) "
+                + "baked=\(stableFeed ?? "nil") resolved=\(resolved ?? "nil(uses baked)")")
+        guard stableFeed != nil else { return nil }
+        return resolved
     }
 }
 
