@@ -67,6 +67,7 @@ struct SectionLabel<Accessory: View>: View {
     }
 }
 
+#if DEBUG
 #Preview("SectionLabel") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         SectionLabel(text: "System")
@@ -82,3 +83,4 @@ struct SectionLabel<Accessory: View>: View {
     .frame(width: 220)
     .background(AlexTheme.Colors.background)
 }
+#endif

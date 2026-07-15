@@ -106,6 +106,7 @@ struct StatTilesRow: View {
     }
 }
 
+#if DEBUG
 #Preview("StatTilesRow") {
     VStack(spacing: AlexTheme.Spacing.xl) {
         StatTilesRow(items: [
@@ -132,3 +133,4 @@ struct StatTilesRow: View {
     .frame(width: 340)
     .background(AlexTheme.Colors.background)
 }
+#endif

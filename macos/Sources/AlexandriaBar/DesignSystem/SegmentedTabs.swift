@@ -92,6 +92,7 @@ struct SegmentedTabs: View {
     }
 }
 
+#if DEBUG
 #Preview("SegmentedTabs") {
     struct Host: View {
         @State private var first = 0
@@ -115,3 +116,4 @@ struct SegmentedTabs: View {
     }
     return Host()
 }
+#endif

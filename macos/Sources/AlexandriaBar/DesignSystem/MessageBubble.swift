@@ -262,6 +262,7 @@ struct MessageBubble: View {
     }
 }
 
+#if DEBUG
 #Preview("MessageBubble") {
     ScrollView {
         VStack(spacing: 0) {
@@ -322,3 +323,4 @@ struct MessageBubble: View {
     .frame(width: 560, height: 640)
     .background(AlexTheme.Colors.background)
 }
+#endif

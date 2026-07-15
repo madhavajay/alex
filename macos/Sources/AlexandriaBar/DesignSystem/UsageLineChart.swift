@@ -247,6 +247,7 @@ struct UsageLineChart: View {
     }
 }
 
+#if DEBUG
 #Preview("UsageLineChart") {
     let hours = (0..<24).map { String(format: "%02d:00", $0) }
     let primary = (0..<24).map { hour in
@@ -276,3 +277,4 @@ struct UsageLineChart: View {
     .frame(width: 560)
     .background(AlexTheme.Colors.background)
 }
+#endif

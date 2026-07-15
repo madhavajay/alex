@@ -60,6 +60,7 @@ struct RoleAvatar: View {
     }
 }
 
+#if DEBUG
 #Preview("RoleAvatar") {
     HStack(spacing: AlexTheme.Spacing.lg) {
         RoleAvatar(variant: .user)
@@ -70,3 +71,4 @@ struct RoleAvatar: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

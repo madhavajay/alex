@@ -105,6 +105,7 @@ struct CopyButton: View {
     }
 }
 
+#if DEBUG
 #Preview("CopyButton") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         HStack(spacing: AlexTheme.Spacing.md) {
@@ -124,3 +125,4 @@ struct CopyButton: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

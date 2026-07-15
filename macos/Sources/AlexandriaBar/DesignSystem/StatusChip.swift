@@ -80,6 +80,7 @@ struct StatusChip: View {
     }
 }
 
+#if DEBUG
 #Preview("StatusChip") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         HStack(spacing: AlexTheme.Spacing.md) {
@@ -99,3 +100,4 @@ struct StatusChip: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

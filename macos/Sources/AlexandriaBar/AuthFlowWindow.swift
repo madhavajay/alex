@@ -628,6 +628,7 @@ final class AuthWindowController {
     }
 }
 
+#if DEBUG
 #Preview("Auth step components") {
     VStack(alignment: .leading, spacing: 20) {
         AuthIdentityHeader(
@@ -656,3 +657,4 @@ final class AuthWindowController {
     .frame(width: 480)
     .background(AlexTheme.Colors.background)
 }
+#endif

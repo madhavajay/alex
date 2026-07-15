@@ -27,6 +27,7 @@ struct SearchField: View {
     }
 }
 
+#if DEBUG
 #Preview("SearchField") {
     struct Host: View {
         @State private var text = ""
@@ -42,3 +43,4 @@ struct SearchField: View {
     }
     return Host()
 }
+#endif

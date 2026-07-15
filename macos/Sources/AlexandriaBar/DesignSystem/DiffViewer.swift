@@ -266,6 +266,7 @@ struct DiffViewer<Icon: View>: View {
     }
 }
 
+#if DEBUG
 #Preview("DiffViewer") {
     DiffViewer(
         title: "Claude Code",
@@ -302,3 +303,4 @@ struct DiffViewer<Icon: View>: View {
     .padding(40)
     .background(Color.black.opacity(0.6))
 }
+#endif

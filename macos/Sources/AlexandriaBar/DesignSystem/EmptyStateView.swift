@@ -53,6 +53,7 @@ struct EmptyStateView: View {
     }
 }
 
+#if DEBUG
 #Preview("EmptyStateView") {
     VStack(spacing: AlexTheme.Spacing.xl) {
         EmptyStateView(message: "No sessions match")
@@ -66,3 +67,4 @@ struct EmptyStateView: View {
     .frame(width: 320)
     .background(AlexTheme.Colors.background)
 }
+#endif

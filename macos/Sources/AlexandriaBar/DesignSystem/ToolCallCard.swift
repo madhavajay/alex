@@ -158,6 +158,7 @@ struct ToolCallCard: View {
     }
 }
 
+#if DEBUG
 #Preview("ToolCallCard") {
     VStack(spacing: AlexTheme.Spacing.sm) {
         ToolCallCard(
@@ -186,3 +187,4 @@ struct ToolCallCard: View {
     .frame(width: 440)
     .background(AlexTheme.Colors.background)
 }
+#endif

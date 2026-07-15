@@ -51,6 +51,7 @@ struct CollapsibleCard<Header: View, Expanded: View>: View {
     }
 }
 
+#if DEBUG
 #Preview("CollapsibleCard") {
     VStack(spacing: AlexTheme.Spacing.md) {
         CollapsibleCard {
@@ -82,3 +83,4 @@ struct CollapsibleCard<Header: View, Expanded: View>: View {
     .frame(width: 420)
     .background(AlexTheme.Colors.background)
 }
+#endif

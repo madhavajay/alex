@@ -23,6 +23,7 @@ struct MetaLabel: View {
     }
 }
 
+#if DEBUG
 #Preview("MetaLabel") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         MetaLabel(systemImage: "cpu", text: "claude-sonnet-4-6")
@@ -33,3 +34,4 @@ struct MetaLabel: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

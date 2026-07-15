@@ -57,6 +57,7 @@ struct ModelBadge: View {
     }
 }
 
+#if DEBUG
 #Preview("ModelBadge") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         ModelBadge(model: "claude-opus-4-8")
@@ -68,3 +69,4 @@ struct ModelBadge: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

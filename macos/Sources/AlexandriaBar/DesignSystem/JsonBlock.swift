@@ -44,6 +44,7 @@ struct JsonBlock: View {
     }
 }
 
+#if DEBUG
 #Preview("JsonBlock") {
     JsonBlock(
         content: """
@@ -61,3 +62,4 @@ struct JsonBlock: View {
     .frame(width: 360)
     .background(AlexTheme.Colors.background)
 }
+#endif

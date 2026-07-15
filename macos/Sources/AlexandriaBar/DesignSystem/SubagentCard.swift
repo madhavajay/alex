@@ -90,6 +90,7 @@ struct SubagentCard: View {
     }
 }
 
+#if DEBUG
 #Preview("SubagentCard") {
     VStack(spacing: AlexTheme.Spacing.md) {
         SubagentCard(
@@ -110,3 +111,4 @@ struct SubagentCard: View {
     .frame(width: 440)
     .background(AlexTheme.Colors.background)
 }
+#endif

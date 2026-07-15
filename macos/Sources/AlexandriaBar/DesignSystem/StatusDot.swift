@@ -52,6 +52,7 @@ struct StatusBadge: View {
     }
 }
 
+#if DEBUG
 #Preview("StatusDot") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
         HStack(spacing: AlexTheme.Spacing.md) {
@@ -68,3 +69,4 @@ struct StatusBadge: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif

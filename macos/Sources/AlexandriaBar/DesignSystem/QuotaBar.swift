@@ -99,6 +99,7 @@ struct LabeledQuotaBar: View {
     }
 }
 
+#if DEBUG
 #Preview("QuotaBar") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
         QuotaBarRow(
@@ -123,3 +124,4 @@ struct LabeledQuotaBar: View {
     .frame(width: 320)
     .background(AlexTheme.Colors.background)
 }
+#endif

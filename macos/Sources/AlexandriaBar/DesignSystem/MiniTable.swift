@@ -170,6 +170,7 @@ struct MiniTable: View {
     }
 }
 
+#if DEBUG
 #Preview("MiniTable") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.md) {
         SectionLabel(text: "Generation", style: .prominent)
@@ -259,3 +260,4 @@ struct MiniTable: View {
     .frame(width: 560)
     .background(AlexTheme.Colors.background)
 }
+#endif

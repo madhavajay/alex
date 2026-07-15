@@ -254,6 +254,7 @@ struct DashedAddButton: View {
     }
 }
 
+#if DEBUG
 #Preview("PillButton") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
         HStack(spacing: AlexTheme.Spacing.md) {
@@ -312,3 +313,4 @@ struct DashedAddButton: View {
     .frame(width: 380)
     .background(AlexTheme.Colors.background)
 }
+#endif

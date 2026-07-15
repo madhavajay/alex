@@ -200,6 +200,7 @@ struct SessionListFooter: View {
     }
 }
 
+#if DEBUG
 #Preview("SessionListRow") {
     struct Host: View {
         @State private var expanded = true
@@ -230,3 +231,4 @@ struct SessionListFooter: View {
     }
     return Host()
 }
+#endif

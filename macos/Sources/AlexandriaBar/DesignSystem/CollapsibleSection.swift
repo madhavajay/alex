@@ -101,6 +101,7 @@ struct CollapsibleSection<Content: View>: View {
     }
 }
 
+#if DEBUG
 #Preview("CollapsibleSection") {
     struct Host: View {
         @State private var bodyOpen = true
@@ -129,3 +130,4 @@ struct CollapsibleSection<Content: View>: View {
     }
     return Host()
 }
+#endif

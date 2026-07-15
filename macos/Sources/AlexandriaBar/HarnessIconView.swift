@@ -259,6 +259,7 @@ struct ProviderBadgeView: View {
     }
 }
 
+#if DEBUG
 #Preview("Harness & provider badges") {
     VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
         HStack(spacing: AlexTheme.Spacing.md) {
@@ -297,6 +298,7 @@ struct ProviderBadgeView: View {
     .padding()
     .background(AlexTheme.Colors.background)
 }
+#endif
 
 /// The session list's deliberately compact identity: harness + model provider.
 struct SessionIdentityIconsView: View {

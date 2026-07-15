@@ -114,6 +114,7 @@ struct FilterRow<Content: View>: View {
     }
 }
 
+#if DEBUG
 #Preview("PanelHeader") {
     struct Host: View {
         @State private var query = ""
@@ -144,3 +145,4 @@ struct FilterRow<Content: View>: View {
     }
     return Host()
 }
+#endif
