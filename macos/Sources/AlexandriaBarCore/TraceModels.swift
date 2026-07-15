@@ -212,6 +212,8 @@ public struct TraceDetail: Codable, Sendable {
     public let upstreamProvider: String?
     public let billingBucket: String?
     public let accountId: String?
+    public let viaDario: Bool?
+    public let darioGeneration: String?
     public let clientIp: String?
     public let keyFingerprint: String?
     public let inputTokens: Int64?
@@ -243,6 +245,8 @@ public struct TraceDetail: Codable, Sendable {
         case upstreamProvider = "upstream_provider"
         case billingBucket = "billing_bucket"
         case accountId = "account_id"
+        case viaDario = "via_dario"
+        case darioGeneration = "dario_generation"
         case clientIp = "client_ip"
         case keyFingerprint = "key_fingerprint"
         case inputTokens = "input_tokens"
