@@ -431,6 +431,11 @@ struct RemoteTraceArgs {
     /// Central Alexandria base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
     #[arg(long, alias = "alex-url")]
     trace_url: Option<String>,
+    /// Correlate this wrap session under a caller-supplied run id instead of a
+    /// generated one (env: ALEXANDRIA_RUN_ID). Lets an orchestrator pre-register
+    /// the run and skip scraping the announced id.
+    #[arg(long)]
+    run_id: Option<String>,
     /// File containing a wrap key (env alternatives: ALEXANDRIA_TRACE_KEY[_FILE])
     #[arg(long)]
     trace_key_file: Option<PathBuf>,
@@ -3875,6 +3880,18 @@ async fn wrap_run_cmd(
     quiet: bool,
     args: Vec<String>,
 ) -> Result<()> {
+    let external_run_id = remote_trace
+        .run_id
+        .clone()
+        .or_else(|| std::env::var("ALEXANDRIA_RUN_ID").ok())
+        .map(|run_id| {
+            if valid_wrap_run_id(&run_id) {
+                Ok(run_id)
+            } else {
+                anyhow::bail!("invalid --run-id: use [A-Za-z0-9._-], max 128 chars")
+            }
+        })
+        .transpose()?;
     let remote_config = match resolve_remote_trace_config(&remote_trace)? {
         Some(remote) => match preflight_remote_trace(&remote).await {
             Ok(()) => {
@@ -3957,6 +3974,7 @@ async fn wrap_run_cmd(
                 harness,
                 remote_sender.clone(),
                 amp_billing_account,
+                external_run_id.clone(),
             )
             .await?,
         )
@@ -3969,6 +3987,7 @@ async fn wrap_run_cmd(
                 config.data_dir.clone(),
                 remote_sender,
                 cursor_metadata.unwrap_or_default(),
+                external_run_id,
             )
             .await?,
         )
@@ -4052,17 +4071,38 @@ impl AmpTraceImporter {
     }
 }
 
+fn valid_wrap_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 128
+        && !run_id.contains("..")
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn resolve_wrap_run_id(external_run_id: Option<String>, harness: &str) -> String {
+    external_run_id.unwrap_or_else(|| match harness {
+        "agent" => format!(
+            "wrap-agent-{}-{:08x}",
+            now_ms(),
+            rand::thread_rng().gen::<u32>()
+        ),
+        _ => format!(
+            "wrap-{harness}-{}-{:08x}",
+            now_ms(),
+            rand::thread_rng().gen::<u32>()
+        ),
+    })
+}
+
 async fn start_amp_trace_import(
     data_dir: PathBuf,
     harness: &str,
     remote: Option<RemoteTraceSender>,
     billing_account: Option<KnownAccount>,
+    external_run_id: Option<String>,
 ) -> Result<AmpTraceImporter> {
-    let run_id = format!(
-        "wrap-{harness}-{}-{:08x}",
-        now_ms(),
-        rand::thread_rng().gen::<u32>()
-    );
+    let run_id = resolve_wrap_run_id(external_run_id, harness);
     let tags = serde_json::json!({
         "harness": harness,
         "wrap": "amp",
@@ -4592,12 +4632,9 @@ async fn start_agent_trace_import(
     data_dir: PathBuf,
     remote: Option<RemoteTraceSender>,
     metadata: CursorTraceMetadata,
+    external_run_id: Option<String>,
 ) -> Result<AgentTraceImporter> {
-    let run_id = format!(
-        "wrap-agent-{}-{:08x}",
-        now_ms(),
-        rand::thread_rng().gen::<u32>()
-    );
+    let run_id = resolve_wrap_run_id(external_run_id, "agent");
     let transcript_root = cursor_agent_transcript_root()?;
     std::fs::create_dir_all(&transcript_root).ok();
     let started_ms = now_ms();
@@ -8120,6 +8157,31 @@ mod tests {
     }
 
     #[test]
+    fn valid_wrap_run_id_allows_safe_ids_only() {
+        assert!(valid_wrap_run_id("cove-run-123"));
+        assert!(valid_wrap_run_id("run.2026_07_15"));
+        assert!(!valid_wrap_run_id(""));
+        assert!(!valid_wrap_run_id("../etc"));
+        assert!(!valid_wrap_run_id("a b"));
+        assert!(!valid_wrap_run_id(&"a".repeat(200)));
+        assert!(!valid_wrap_run_id("foo/bar"));
+    }
+
+    #[test]
+    fn resolve_wrap_run_id_uses_external_value_or_legacy_prefix() {
+        assert_eq!(
+            resolve_wrap_run_id(Some("cove-run-123".to_string()), "amp"),
+            "cove-run-123"
+        );
+
+        let amp_run_id = resolve_wrap_run_id(None, "amp");
+        assert!(amp_run_id.starts_with("wrap-amp-"));
+
+        let agent_run_id = resolve_wrap_run_id(None, "agent");
+        assert!(agent_run_id.starts_with("wrap-agent-"));
+    }
+
+    #[test]
     fn wrap_claude_forwards_hyphenated_args_verbatim() {
         let cli = Cli::try_parse_from([
             "alex",
@@ -8608,6 +8670,7 @@ mod tests {
         std::fs::write(&key_file, "  alxk-file-key\n").unwrap();
         let config = resolve_remote_trace_config(&RemoteTraceArgs {
             trace_url: Some("https://alex.example.test/".into()),
+            run_id: None,
             trace_key_file: Some(key_file),
             allow_insecure_http: false,
         })
