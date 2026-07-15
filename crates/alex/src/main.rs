@@ -304,6 +304,8 @@ enum DarioCommand {
     Enable,
     /// Keep Dario ready but route Anthropic requests directly
     Disable,
+    /// Route through Dario automatically when an active Claude subscription is available
+    Auto,
     /// Show generations and their states
     Status,
     /// Roll to a fresh generation of the same version
@@ -739,6 +741,9 @@ struct Config {
     gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
     anthropic_upstream: String,
+    /// Records the one-time conversion of the legacy `direct` default to `auto`.
+    #[serde(default)]
+    dario_mode_migrated: bool,
     #[serde(default)]
     dario_api_key: String,
     /// Explicit real Claude Code executable for Dario prompt capture.
@@ -829,7 +834,7 @@ fn default_upstream_stream_idle_timeout_seconds() -> u64 {
 }
 
 fn default_ping_anthropic() -> String {
-    "claude-haiku-4-5".into()
+    "claude-sonnet-5".into()
 }
 
 fn default_ping_openai() -> String {
@@ -853,7 +858,7 @@ fn default_ping_openrouter() -> String {
 }
 
 fn default_anthropic_upstream() -> String {
-    "direct".into()
+    "auto".into()
 }
 
 fn default_dario_update_minutes() -> u64 {
@@ -911,6 +916,21 @@ impl Config {
         if self.ping_openrouter_model == "anthropic/claude-3.5-sonnet" {
             self.ping_openrouter_model = default_ping_openrouter();
         }
+        // Haiku's subscription route remains healthy even when Anthropic
+        // rate-limits the premium models used by non-Claude-Code clients.
+        // Only replace this former default, never a user's chosen ping model.
+        if self.ping_anthropic_model == "claude-haiku-4-5" {
+            self.ping_anthropic_model = default_ping_anthropic();
+        }
+        // Before tri-state routing, `direct` was the implicit default. Convert
+        // it exactly once, so a later explicit `dario disable` continues to win.
+        if !self.dario_mode_migrated {
+            if self.anthropic_upstream == "direct" {
+                self.anthropic_upstream = default_anthropic_upstream();
+            }
+            self.dario_mode_migrated = true;
+            tracing::info!("migrated legacy Dario routing default to auto");
+        }
     }
 
     fn defaults_for(data_dir: PathBuf) -> Self {
@@ -927,6 +947,7 @@ impl Config {
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
             anthropic_upstream: default_anthropic_upstream(),
+            dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
             dario_update_check_minutes: default_dario_update_minutes(),
@@ -955,8 +976,25 @@ impl Config {
         }
     }
 
-    fn dario_enabled(&self) -> bool {
-        self.anthropic_upstream == "dario"
+    fn dario_route_should_enable(&self, has_active_anthropic_oauth: bool) -> bool {
+        match self.anthropic_upstream.as_str() {
+            "dario" => true,
+            "direct" => false,
+            "auto" => has_active_anthropic_oauth,
+            _ => false,
+        }
+    }
+
+    fn dario_routing_reason(&self, has_active_anthropic_oauth: bool) -> String {
+        match self.anthropic_upstream.as_str() {
+            "dario" => "forced on".into(),
+            "direct" => "forced off".into(),
+            "auto" if has_active_anthropic_oauth => {
+                "auto: active Claude subscription detected".into()
+            }
+            "auto" => "auto: no Claude subscription".into(),
+            other => format!("unrecognized mode {other:?}; routing direct"),
+        }
     }
 
     /// The URL a *client* should connect to.
@@ -1185,6 +1223,14 @@ fn open_vault(config: &Config) -> Result<Vault> {
     Ok(vault)
 }
 
+async fn has_active_anthropic_oauth(vault: &Vault) -> bool {
+    vault.list().await.into_iter().any(|account| {
+        account.provider == alex_core::Provider::Anthropic
+            && account.status == "active"
+            && account.kind == "oauth"
+    })
+}
+
 fn validate_account_name(name: &str) -> Result<()> {
     if name.len() > 32
         || name.is_empty()
@@ -1212,6 +1258,9 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
 struct DarioGlue {
     supervisor: Arc<dario::DarioSupervisor>,
     route_enabled: bool,
+    routing_mode: String,
+    routing_reason: String,
+    bootstrap_error: Option<String>,
 }
 
 impl alex_proxy::DarioRouter for DarioGlue {
@@ -1267,6 +1316,13 @@ impl alex_proxy::DarioRouter for DarioGlue {
     fn status(&self) -> serde_json::Value {
         let mut status = self.supervisor.status();
         status["route_enabled"] = serde_json::json!(self.route_enabled);
+        status["routing_mode"] = serde_json::json!(self.routing_mode);
+        status["routing_reason"] = serde_json::json!(self.routing_reason);
+        if let Some(error) = &self.bootstrap_error {
+            status["health"] = serde_json::json!("degraded");
+            status["health_reason"] =
+                serde_json::json!(format!("startup bootstrap failed: {error}"));
+        }
         status
     }
 
@@ -1278,6 +1334,8 @@ impl alex_proxy::DarioRouter for DarioGlue {
 struct DarioUnavailable {
     error: String,
     route_enabled: bool,
+    routing_mode: String,
+    routing_reason: String,
 }
 
 impl alex_proxy::DarioRouter for DarioUnavailable {
@@ -1313,6 +1371,10 @@ impl alex_proxy::DarioRouter for DarioUnavailable {
             "configured": true,
             "available": false,
             "route_enabled": self.route_enabled,
+            "routing_mode": self.routing_mode,
+            "routing_reason": self.routing_reason,
+            "health": "down",
+            "health_reason": self.error,
             "active_generation_id": null,
             "generations": [],
             "error": self.error,
@@ -2316,7 +2378,36 @@ async fn main() -> Result<()> {
                 save_config(&config)?;
                 eprintln!("generated dario_api_key and saved it to config.toml");
             }
-            let dario_route_enabled = config.dario_enabled();
+            let has_active_anthropic_oauth = has_active_anthropic_oauth(&vault).await;
+            let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth);
+            let dario_routing_reason = config.dario_routing_reason(has_active_anthropic_oauth);
+            let dario_routing_mode = config.anthropic_upstream.clone();
+            // Dario normally installs on demand when its supervisor creates a
+            // generation. When routing has been selected, preflight that work so
+            // the first premium Claude ping/request is less likely to fall back
+            // direct while its generation warms. A failure remains non-fatal:
+            // the supervisor's existing repair/direct-fallback path handles it.
+            let bootstrap_error = if dario_route_enabled {
+                match dario::bootstrap(config.data_dir.join("dario"), config.dario_version.clone())
+                    .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            version = %result.version,
+                            already_installed = result.already_installed,
+                            "Dario startup bootstrap complete"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        tracing::warn!(%error, "Dario startup bootstrap failed; continuing with on-demand repair");
+                        Some(error)
+                    }
+                }
+            } else {
+                None
+            };
             let settings = dario::DarioSettings {
                 install_root: config.data_dir.join("dario"),
                 log_root: config.data_dir.join("dario").join("logs"),
@@ -2348,6 +2439,9 @@ async fn main() -> Result<()> {
                         Some(Arc::new(DarioGlue {
                             supervisor: sup.clone(),
                             route_enabled: dario_route_enabled,
+                            routing_mode: dario_routing_mode.clone(),
+                            routing_reason: dario_routing_reason.clone(),
+                            bootstrap_error,
                         })
                             as Arc<dyn alex_proxy::DarioRouter>),
                         Some(sup),
@@ -2365,6 +2459,8 @@ async fn main() -> Result<()> {
                         Some(Arc::new(DarioUnavailable {
                             error: e.to_string(),
                             route_enabled: dario_route_enabled,
+                            routing_mode: dario_routing_mode,
+                            routing_reason: dario_routing_reason,
                         })
                             as Arc<dyn alex_proxy::DarioRouter>),
                         None,
@@ -3041,6 +3137,9 @@ async fn main() -> Result<()> {
                     .transpose()?
                     .map(|key| key.trim().to_string())
                     .filter(|key| !key.is_empty());
+                let vault = open_vault(&config)?;
+                let dario_enabled =
+                    config.dario_route_should_enable(has_active_anthropic_oauth(&vault).await);
                 let summary = harness_e2e::run_harness(harness_e2e::RunOptions {
                     harness,
                     model,
@@ -3053,7 +3152,7 @@ async fn main() -> Result<()> {
                     }),
                     timeout_secs: timeout_secs.unwrap_or_else(harness_e2e::default_timeout_secs),
                     no_trace_check,
-                    dario_enabled: config.dario_enabled(),
+                    dario_enabled,
                     local_key: run_key.unwrap_or_else(|| config.local_key.clone()),
                     run_id,
                     data_dir: config.data_dir.clone(),
@@ -3257,14 +3356,21 @@ async fn main() -> Result<()> {
                     }
                     return Ok(());
                 }
-                DarioCommand::Enable | DarioCommand::Disable => {
-                    let enabled = matches!(command, DarioCommand::Enable);
+                DarioCommand::Enable | DarioCommand::Disable | DarioCommand::Auto => {
                     let mut config = config;
-                    config.anthropic_upstream = if enabled { "dario" } else { "direct" }.into();
+                    let (mode, message) = match command {
+                        DarioCommand::Enable => ("dario", "forced on"),
+                        DarioCommand::Disable => ("direct", "forced off"),
+                        DarioCommand::Auto => ("auto", "automatic"),
+                        _ => unreachable!(),
+                    };
+                    config.anthropic_upstream = mode.into();
+                    // Writing an explicit routing choice must never be treated as
+                    // a legacy config by a later invocation.
+                    config.dario_mode_migrated = true;
                     save_config(&config)?;
                     println!(
-                        "Dario routing {} in config.toml; restart Alexandria to apply",
-                        if enabled { "enabled" } else { "disabled" }
+                        "Dario routing set to {message} ({mode}) in config.toml; restart Alexandria to apply"
                     );
                     return Ok(());
                 }
@@ -3293,7 +3399,10 @@ async fn main() -> Result<()> {
                         .send()
                         .await
                 }
-                DarioCommand::Bootstrap { .. } | DarioCommand::Enable | DarioCommand::Disable => {
+                DarioCommand::Bootstrap { .. }
+                | DarioCommand::Enable
+                | DarioCommand::Disable
+                | DarioCommand::Auto => {
                     unreachable!()
                 }
             };
@@ -6331,20 +6440,15 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
     };
     println!("{}", ui::section("dario generations"));
     let available = body["available"].as_bool().unwrap_or(false);
-    let route_enabled = body["route_enabled"].as_bool().unwrap_or(false);
     println!(
-        "available: {}  routing: {}",
+        "available: {}",
         if available {
             ui::green("yes")
         } else {
             ui::red("no")
-        },
-        if route_enabled {
-            ui::green("dario")
-        } else {
-            ui::dim("direct")
         }
     );
+    println!("{}", dario_status_routing_text(body));
     if let (Some(runtime), Some(version)) =
         (body["runtime"].as_str(), body["runtime_version"].as_str())
     {
@@ -6430,6 +6534,17 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn dario_status_routing_text(body: &serde_json::Value) -> String {
+    let routing_mode = body["routing_mode"].as_str().unwrap_or("unknown");
+    let routing_reason = body["routing_reason"].as_str().unwrap_or("unknown");
+    let route = if body["route_enabled"].as_bool().unwrap_or(false) {
+        "dario"
+    } else {
+        "direct"
+    };
+    format!("mode: {routing_mode}\nrouting: {route} ({routing_reason})")
 }
 
 fn print_banner(host: &str, port: u16, local_key: &str) {
@@ -8944,6 +9059,7 @@ mod tests {
             ping_openrouter_model: default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
+            dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
             dario_update_check_minutes: 60,
@@ -8960,6 +9076,96 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn dario_route_should_enable_resolves_tri_state() {
+        let mut config = test_config(tmpdir("dario-route-resolver"));
+
+        config.anthropic_upstream = "auto".into();
+        assert!(config.dario_route_should_enable(true));
+        assert!(
+            !config.dario_route_should_enable(false),
+            "no OAuth subscription (including API-key-only) must stay direct"
+        );
+
+        config.anthropic_upstream = "dario".into();
+        assert!(config.dario_route_should_enable(true));
+        assert!(config.dario_route_should_enable(false));
+
+        config.anthropic_upstream = "direct".into();
+        assert!(!config.dario_route_should_enable(true));
+        assert!(!config.dario_route_should_enable(false));
+    }
+
+    #[test]
+    fn config_heal_migrates_legacy_dario_default_once() {
+        let mut config = test_config(tmpdir("dario-heal-legacy"));
+        config.anthropic_upstream = "direct".into();
+        config.dario_mode_migrated = false;
+
+        config.heal();
+        assert_eq!(config.anthropic_upstream, "auto");
+        assert!(config.dario_mode_migrated);
+        config.heal();
+        assert_eq!(config.anthropic_upstream, "auto");
+
+        let mut disabled = test_config(tmpdir("dario-heal-explicit-disable"));
+        disabled.anthropic_upstream = "direct".into();
+        disabled.dario_mode_migrated = true;
+        disabled.heal();
+        assert_eq!(disabled.anthropic_upstream, "direct");
+    }
+
+    #[test]
+    fn config_heal_migrates_only_the_old_anthropic_ping_default() {
+        let mut config = test_config(tmpdir("anthropic-ping-heal"));
+        config.ping_anthropic_model = "claude-haiku-4-5".into();
+        config.heal();
+        assert_eq!(config.ping_anthropic_model, "claude-sonnet-5");
+
+        config.ping_anthropic_model = "claude-opus-4-8".into();
+        config.heal();
+        assert_eq!(config.ping_anthropic_model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn dario_and_anthropic_ping_defaults_target_auto_and_sonnet() {
+        assert_eq!(default_anthropic_upstream(), "auto");
+        assert_eq!(default_ping_anthropic(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn dario_status_shows_mode_effective_route_and_reason() {
+        let auto_with_subscription = serde_json::json!({
+            "routing_mode": "auto",
+            "route_enabled": true,
+            "routing_reason": "auto: active Claude subscription detected",
+        });
+        assert_eq!(
+            dario_status_routing_text(&auto_with_subscription),
+            "mode: auto\nrouting: dario (auto: active Claude subscription detected)"
+        );
+
+        let auto_without_subscription = serde_json::json!({
+            "routing_mode": "auto",
+            "route_enabled": false,
+            "routing_reason": "auto: no Claude subscription",
+        });
+        assert_eq!(
+            dario_status_routing_text(&auto_without_subscription),
+            "mode: auto\nrouting: direct (auto: no Claude subscription)"
+        );
+
+        let forced_disabled = serde_json::json!({
+            "routing_mode": "direct",
+            "route_enabled": false,
+            "routing_reason": "forced off",
+        });
+        assert_eq!(
+            dario_status_routing_text(&forced_disabled),
+            "mode: direct\nrouting: direct (forced off)"
+        );
     }
 
     #[test]
@@ -9319,6 +9525,7 @@ mod tests {
             ping_openrouter_model: default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
+            dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
             dario_update_check_minutes: 60,

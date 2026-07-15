@@ -2836,6 +2836,11 @@ pub async fn ping_provider(
     let prompt = "Health check: what time is it? If you cannot know, just reply: creds ok";
     let (format, path, body) = match provider {
         Provider::Anthropic => (
+            // Sonnet costs roughly 10x Haiku per ping, but it verifies that a
+            // subscription can actually use premium models. Immediately after
+            // Dario is enabled its first Sonnet ping may warm the prompt cache
+            // (or briefly use the direct fallback and receive one 429) before
+            // subsequent routed checks become green.
             ClientFormat::AnthropicMessages,
             "/v1/messages",
             json!({

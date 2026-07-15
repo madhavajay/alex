@@ -4932,6 +4932,7 @@ mod tests {
             ping_openrouter_model: crate::default_ping_openrouter(),
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
+            dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
             dario_update_check_minutes: crate::default_dario_update_minutes(),
