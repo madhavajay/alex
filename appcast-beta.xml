@@ -3,13 +3,13 @@
     <channel>
         <title>AlexandriaBar</title>
         <item>
-            <title>0.1.26-beta.26</title>
-            <pubDate>Wed, 15 Jul 2026 23:17:27 +0000</pubDate>
-            <sparkle:version>0.1.26-beta.26</sparkle:version>
-            <sparkle:shortVersionString>0.1.26-beta.26</sparkle:shortVersionString>
+            <title>0.1.26-beta.27</title>
+            <pubDate>Wed, 15 Jul 2026 23:40:25 +0000</pubDate>
+            <sparkle:version>0.1.26-beta.27</sparkle:version>
+            <sparkle:shortVersionString>0.1.26-beta.27</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.26-beta.26/AlexandriaBar-0.1.26-beta.26.dmg" length="7124560" type="application/octet-stream" sparkle:edSignature="QMG+ekzI9TiJw/OkUe3JDpUVlCzIn9Ez6MOtrg26mQDTc34OrWsMViu4rq4kHNNXEjYjRrY+dNnpVYFUuFdFBQ=="/>
+            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.26-beta.27/AlexandriaBar-0.1.26-beta.27.dmg" length="7132763" type="application/octet-stream" sparkle:edSignature="NP7J1iw/qZL8StCQ9KX6ITeO9DK/AGUu+ZsvgVkEyjD7ma8ZavyCeIb41SaRJ+AbKGPRXf/b4S1zQl65aKFOAA=="/>
         </item>
     </channel>
 </rss>
