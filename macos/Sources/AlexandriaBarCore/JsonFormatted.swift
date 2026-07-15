@@ -94,7 +94,7 @@ public enum JsonFormatted {
         case let string as String:
             emitString(string, indent: indent, depth: depth, budget: &budget, into: &out)
         case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            if isJSONBoolean(number) {
                 append(Token(.boolean, number.boolValue ? "true" : "false"), &budget, into: &out)
             } else {
                 append(Token(.number, number.stringValue), &budget, into: &out)

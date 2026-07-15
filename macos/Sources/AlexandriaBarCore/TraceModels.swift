@@ -1,9 +1,14 @@
 import Foundation
-import CoreFoundation
 
 #if canImport(AppKit)
 import AppKit
 #endif
+
+// JSONSerialization encodes JSON booleans as an NSNumber whose Objective-C type
+// tag is "c" (a signed char). This is stable on Darwin and swift-corelibs-Foundation.
+func isJSONBoolean(_ number: NSNumber) -> Bool {
+    String(cString: number.objCType) == "c"
+}
 
 public struct TraceSessionsResponse: Codable, Sendable {
     public let sessions: [TraceSession]
@@ -783,7 +788,7 @@ public enum RequestJSONDiff {
         case let string as String:
             return .string(string)
         case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            if isJSONBoolean(number) {
                 return .bool(number.boolValue)
             }
             return .number(number.stringValue)
@@ -1014,7 +1019,7 @@ public enum JsonNice {
     static func scalarText(_ value: Any) -> String {
         if value is NSNull { return "null" }
         if let number = value as? NSNumber {
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            if isJSONBoolean(number) {
                 return number.boolValue ? "true" : "false"
             }
             return number.stringValue
@@ -1959,11 +1964,13 @@ public enum TranscriptBubbleKind: String, Sendable {
     case turn, user, model, tool, toolResult, error
 }
 
+#if canImport(AppKit)
 extension NSAttributedString.Key {
     public static let transcriptBubbleKind = NSAttributedString.Key("alexandriaBubbleKind")
     public static let transcriptBubbleGroup = NSAttributedString.Key("alexandriaBubbleGroup")
     public static let transcriptTurnId = NSAttributedString.Key("alexandriaTurnId")
 }
+#endif
 
 public enum TurnHitTest {
     public static func traceId(at index: Int, in ranges: [TurnRange]) -> String? {
@@ -2573,6 +2580,7 @@ public enum TranscriptRender {
         out.addAttributes(attrs, range: NSRange(location: 0, length: out.length))
         return out
     }
+    #endif
 
     static func cap(_ text: String, maxChars: Int = maxTurnChars) -> String {
         guard text.count > maxChars else { return text }
@@ -2582,7 +2590,6 @@ public enum TranscriptRender {
     static func tokens(_ count: Int64?) -> String { TraceNumberFormat.tokens(count) }
 
     static func cost(_ usd: Double) -> String { TraceNumberFormat.cost(usd) }
-    #endif
 }
 
 public struct DarioAdminStatus: Codable, Sendable {

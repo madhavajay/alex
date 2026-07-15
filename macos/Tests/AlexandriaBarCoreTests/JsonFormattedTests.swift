@@ -26,6 +26,12 @@ import Testing
         #expect(tokens.contains { $0.kind == .key && $0.text.contains("\"a\"") })
     }
 
+    @Test func booleansAreNotRenderedAsNumbers() throws {
+        let tokens = try #require(JsonFormatted.tokens(#"{"flag": true, "count": 7}"#))
+        #expect(tokens.contains { $0.kind == .boolean && $0.text == "true" })
+        #expect(tokens.contains { $0.kind == .number && $0.text == "7" })
+    }
+
     @Test func embeddedJSONStringExpandsIntoAnnotatedSubBlock() throws {
         let raw = #"{"body": "{\"nested\": 1}"}"#
         let tokens = try #require(JsonFormatted.tokens(raw))
