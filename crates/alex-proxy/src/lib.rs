@@ -27,6 +27,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -632,6 +634,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // lifecycle events. Authentication happens before JSON buffering.
     let tool_events = Router::new()
         .route("/tool-events", post(tool_event))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_harness_event_key,
@@ -4688,6 +4691,13 @@ fn valid_ingest_trace_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+// Tool call bodies use an id derived from session_id and tool_call_id. Dots are
+// legal in trace ids, but the body filename sanitizer maps them to underscores.
+// Keep that broader trace-id contract and reject dots only for tool identities.
+fn valid_tool_event_id(id: &str) -> bool {
+    valid_ingest_trace_id(id) && !id.contains('.')
+}
+
 fn decode_ingest_body(encoded: Option<&str>, field: &str) -> Result<Option<Vec<u8>>, String> {
     use base64::Engine;
 
@@ -4882,6 +4892,46 @@ fn normalize_harness_event(event: &mut Value) {
     }
 }
 
+static TOOL_AUTH_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)([^\s'"\\]+)"#).unwrap()
+});
+static TOOL_API_KEY_HEADER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?i)(\bx-api-key\s*:\s*)([^\s'"\\]+)"#).unwrap());
+static TOOL_ENV_ASSIGNMENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(\b(?:export\s+)?(?:pgpassword|aws_secret_access_key|token|api[_-]?key|authorization|password|secret)\s*=\s*)(?:'[^']*'|"[^"]*"|[^\s;]+)"#).unwrap()
+});
+static TOOL_FLAG_ASSIGNMENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(--(?:token|api-key|apikey|password|secret|key|bearer|auth)\s*=\s*)(?:'[^']*'|"[^"]*"|[^\s;]+)"#).unwrap()
+});
+static TOOL_FLAG_VALUE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(--(?:token|api-key|apikey|password|secret|key|bearer|auth)\s+)(?:'[^']*'|"[^"]*"|[^\s;]+)"#).unwrap()
+});
+static TOOL_URL_PASSWORD_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(https?://[^\s/:@]+:)([^@\s/]+)(@)").unwrap());
+static TOOL_STANDALONE_KEY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:sk_live_[a-z0-9_-]+|sk-[a-z0-9_-]+|ghp_[a-z0-9]+|xoxb-[a-z0-9-]+|akia[0-9a-z]{16})\b").unwrap()
+});
+
+/// Mask well-known secret formats embedded in otherwise useful free text.
+///
+/// This deliberately favors explicit credential syntax over entropy-based
+/// detection: command context remains useful without masking ordinary prose.
+fn scrub_secret_string(input: &str) -> Option<String> {
+    let mut scrubbed = input.to_string();
+    for (regex, replacement) in [
+        (&*TOOL_AUTH_HEADER_RE, "$1<redacted>"),
+        (&*TOOL_API_KEY_HEADER_RE, "$1<redacted>"),
+        (&*TOOL_ENV_ASSIGNMENT_RE, "$1<redacted>"),
+        (&*TOOL_FLAG_ASSIGNMENT_RE, "$1<redacted>"),
+        (&*TOOL_FLAG_VALUE_RE, "$1<redacted>"),
+        (&*TOOL_URL_PASSWORD_RE, "$1<redacted>$3"),
+        (&*TOOL_STANDALONE_KEY_RE, "<redacted>"),
+    ] {
+        scrubbed = regex.replace_all(&scrubbed, replacement).into_owned();
+    }
+    (scrubbed != input).then_some(scrubbed)
+}
+
 fn redact_tool_value(value: &mut Value) {
     const SECRET_KEYS: &[&str] = &[
         "authorization",
@@ -4915,25 +4965,38 @@ fn redact_tool_value(value: &mut Value) {
                 }
                 if let Some(argument) = value.as_str() {
                     let lower = argument.to_ascii_lowercase();
-                    redact_next = ["--token", "--api-key", "--apikey", "--password", "--secret"]
-                        .iter()
-                        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")));
-                    if lower.starts_with("--token=")
-                        || lower.starts_with("--api-key=")
-                        || lower.starts_with("--password=")
-                        || lower.starts_with("--secret=")
-                    {
-                        *value = Value::String(format!(
-                            "{}<redacted>",
-                            argument
-                                .split_once('=')
-                                .map(|(k, _)| format!("{k}="))
-                                .unwrap_or_default()
-                        ));
+                    const SECRET_FLAGS: &[&str] = &[
+                        "--token",
+                        "--api-key",
+                        "--apikey",
+                        "--password",
+                        "--secret",
+                        "--key",
+                        "--bearer",
+                        "--auth",
+                        "-h",
+                        "--header",
+                    ];
+                    if let Some((flag, _)) = lower.split_once('=') {
+                        if SECRET_FLAGS.iter().any(|secret_flag| flag == *secret_flag) {
+                            let (key, _) = argument.split_once('=').unwrap();
+                            *value = Value::String(format!("{key}=<redacted>"));
+                            continue;
+                        }
+                    }
+                    if SECRET_FLAGS.iter().any(|flag| lower == *flag) {
+                        redact_next = true;
+                    } else if let Some(scrubbed) = scrub_secret_string(argument) {
+                        *value = Value::String(scrubbed);
                     }
                 } else {
                     redact_tool_value(value);
                 }
+            }
+        }
+        Value::String(string) => {
+            if let Some(scrubbed) = scrub_secret_string(string) {
+                *string = scrubbed;
             }
         }
         _ => {}
@@ -5016,13 +5079,13 @@ async fn tool_event(
     }
     let session_id = match event["session_id"]
         .as_str()
-        .filter(|id| valid_ingest_trace_id(id))
+        .filter(|id| valid_tool_event_id(id))
     {
         Some(id) => id.to_string(),
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "tool event requires safe session_id",
+                "tool event requires a safe session_id without '.'",
             )
         }
     };
@@ -5037,13 +5100,13 @@ async fn tool_event(
     }
     let tool_call_id = match event["tool_call_id"]
         .as_str()
-        .filter(|id| valid_ingest_trace_id(id))
+        .filter(|id| valid_tool_event_id(id))
     {
         Some(id) => id.to_string(),
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "tool event requires safe tool_call_id",
+                "tool event requires a safe tool_call_id without '.'",
             )
         }
     };
@@ -6480,15 +6543,57 @@ mod tests {
     }
 
     #[test]
-    fn tool_payload_redacts_argv_and_environment_secrets() {
+    fn tool_payload_redacts_free_text_argv_and_environment_secrets() {
+        let command = "curl -H 'Authorization: Bearer sk-LEAK' https://user:p4ss@h";
         let bytes = tool_event_body(Some(json!({
+            "command": command,
             "argv": ["curl", "--token", "super-secret"],
+            "inline_args": ["--apikey=SECRET", "keepme"],
+            "equals_args": ["--token=abc", "keepme"],
             "env": {"API_KEY": "also-secret"}
         })))
         .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["argv"][2], "<redacted>");
+        assert_eq!(
+            value["inline_args"],
+            json!(["--apikey=<redacted>", "keepme"])
+        );
+        assert_eq!(
+            value["equals_args"],
+            json!(["--token=<redacted>", "keepme"])
+        );
         assert_eq!(value["env"], "<redacted>");
+        assert_eq!(
+            value["command"],
+            "curl -H 'Authorization: Bearer <redacted>' https://user:<redacted>@h"
+        );
+        let redacted = String::from_utf8(bytes).unwrap();
+        assert!(!redacted.contains("sk-LEAK"));
+        assert!(!redacted.contains("p4ss"));
+    }
+
+    #[test]
+    fn scrub_secret_string_masks_known_inline_credential_forms() {
+        let input = "Authorization: Basic basic-secret x-api-key: api-secret PGPASSWORD=pg-secret AWS_SECRET_ACCESS_KEY=aws-secret export TOKEN=token-secret --password password-secret sk_live_secret ghp_secret xoxb-secret AKIA1234567890ABCDEF";
+        let redacted = scrub_secret_string(input).unwrap();
+        for secret in [
+            "basic-secret",
+            "api-secret",
+            "pg-secret",
+            "aws-secret",
+            "token-secret",
+            "password-secret",
+            "sk_live_secret",
+            "ghp_secret",
+            "xoxb-secret",
+            "AKIA1234567890ABCDEF",
+        ] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        assert!(redacted.contains("Authorization: Basic <redacted>"));
+        assert!(redacted.contains("x-api-key: <redacted>"));
+        assert!(redacted.contains("PGPASSWORD=<redacted>"));
     }
 
     #[test]
@@ -6538,6 +6643,63 @@ mod tests {
         assert_eq!(rows[0]["turn_id"], "1");
         let response = tool_event(State(state), HeaderMap::new(), axum::Json(json!({}))).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn tool_ingest_rejects_dotted_ids_before_they_can_collide_with_body_paths() {
+        let state = test_state("tool-ingest-dot-id");
+        let key = "tool-dot-id-harness-key";
+        state
+            .store
+            .insert_run_key(
+                "rk-tool-dot-id",
+                &key_hash_hex(key),
+                "harness",
+                None,
+                None,
+                Some("pi"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static(key));
+
+        let dotted = json!({
+            "phase": "end",
+            "session_id": "s.1",
+            "tool_call_id": "call",
+            "tool_name": "bash",
+            "args": {"command": "echo dotted"},
+            "timestamp_ms": 100,
+        });
+        assert_eq!(
+            tool_event(State(state.clone()), headers.clone(), axum::Json(dotted))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let underscore = json!({
+            "phase": "end",
+            "session_id": "s_1",
+            "tool_call_id": "call",
+            "tool_name": "bash",
+            "args": {"command": "echo underscore"},
+            "timestamp_ms": 100,
+        });
+        assert_eq!(
+            tool_event(State(state.clone()), headers, axum::Json(underscore))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let rows = state.store.session_tool_calls("s_1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            read_gz_json(rows[0]["args_body_path"].as_str()).unwrap()["command"],
+            "echo underscore"
+        );
     }
 
     #[tokio::test]
