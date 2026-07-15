@@ -8,7 +8,8 @@ import Testing
             traceId: traceId, tsRequestMs: 0, tsResponseMs: nil, model: "gpt", provider: "openai",
             status: 200, inputTokens: nil, outputTokens: nil, reasoningEffort: nil,
             thinkingBudget: nil, costUsd: nil, billingBucket: nil, accountId: nil, viaDario: nil,
-            darioGeneration: nil, error: nil, user: user, assistant: assistant, toolCalls: nil,
+            darioGeneration: nil, error: nil, errorKind: nil, errorCode: nil, errorClass: nil,
+            user: user, assistant: assistant, toolCalls: nil,
             assistantBlocks: nil, executedTools: nil)
     }
 

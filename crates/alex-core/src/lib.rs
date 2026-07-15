@@ -390,6 +390,15 @@ pub struct TraceRecord {
     pub req_headers_json: Option<String>,
     pub resp_headers_json: Option<String>,
     pub error: Option<String>,
+    /// Provider supplied error type (or a synthetic transport failure tag).
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    /// Provider supplied error code; falls back to the HTTP status for HTTP errors.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    /// Alexandria's stable, coarse error taxonomy.
+    #[serde(default)]
+    pub error_class: Option<String>,
     pub account_id: Option<String>,
     /// Durable upstream subscription identity. Unlike `account_id`, this must
     /// not be derived from the user-editable local account nickname.

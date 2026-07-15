@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS traces (
   req_headers_json  TEXT,
   resp_headers_json TEXT,
   error             TEXT,
+  error_kind        TEXT,
+  error_code        TEXT,
+  error_class       TEXT,
   account_id        TEXT,
   run_id            TEXT,
   tags_json         TEXT,
@@ -191,6 +194,7 @@ const TRACE_COLS: &str =
      requested_model, routed_model, status, streamed,
      input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
      cost_usd, billing_bucket, error, session_id, resp_body_path,
+     error_kind, error_code, error_class,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
      account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
      method, path, subscription_identity, via_dario, dario_generation";
@@ -219,23 +223,26 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "error": r.get::<_, Option<String>>(17)?,
         "session_id": r.get::<_, Option<String>>(18)?,
         "resp_body_path": r.get::<_, Option<String>>(19)?,
-        "upstream_format": r.get::<_, Option<String>>(20)?,
-        "req_body_path": r.get::<_, Option<String>>(21)?,
-        "upstream_req_body_path": r.get::<_, Option<String>>(22)?,
-        "req_headers_json": r.get::<_, Option<String>>(23)?,
-        "resp_headers_json": r.get::<_, Option<String>>(24)?,
-        "account_id": r.get::<_, Option<String>>(25)?,
-        "run_id": r.get::<_, Option<String>>(26)?,
-        "tags_json": r.get::<_, Option<String>>(27)?,
-        "client_ip": r.get::<_, Option<String>>(28)?,
-        "key_fingerprint": r.get::<_, Option<String>>(29)?,
-        "reasoning_effort": r.get::<_, Option<String>>(30)?,
-        "thinking_budget": r.get::<_, Option<i64>>(31)?,
-        "method": r.get::<_, Option<String>>(32)?,
-        "path": r.get::<_, Option<String>>(33)?,
-        "subscription_identity": r.get::<_, Option<String>>(34)?,
-        "via_dario": r.get::<_, i64>(35)? != 0,
-        "dario_generation": r.get::<_, Option<String>>(36)?,
+        "error_kind": r.get::<_, Option<String>>(20)?,
+        "error_code": r.get::<_, Option<String>>(21)?,
+        "error_class": r.get::<_, Option<String>>(22)?,
+        "upstream_format": r.get::<_, Option<String>>(23)?,
+        "req_body_path": r.get::<_, Option<String>>(24)?,
+        "upstream_req_body_path": r.get::<_, Option<String>>(25)?,
+        "req_headers_json": r.get::<_, Option<String>>(26)?,
+        "resp_headers_json": r.get::<_, Option<String>>(27)?,
+        "account_id": r.get::<_, Option<String>>(28)?,
+        "run_id": r.get::<_, Option<String>>(29)?,
+        "tags_json": r.get::<_, Option<String>>(30)?,
+        "client_ip": r.get::<_, Option<String>>(31)?,
+        "key_fingerprint": r.get::<_, Option<String>>(32)?,
+        "reasoning_effort": r.get::<_, Option<String>>(33)?,
+        "thinking_budget": r.get::<_, Option<i64>>(34)?,
+        "method": r.get::<_, Option<String>>(35)?,
+        "path": r.get::<_, Option<String>>(36)?,
+        "subscription_identity": r.get::<_, Option<String>>(37)?,
+        "via_dario": r.get::<_, i64>(38)? != 0,
+        "dario_generation": r.get::<_, Option<String>>(39)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
     }))
 }
@@ -297,6 +304,9 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
         "subscription_identity TEXT",
         "via_dario INTEGER NOT NULL DEFAULT 0",
         "dario_generation TEXT",
+        "error_kind TEXT",
+        "error_code TEXT",
+        "error_class TEXT",
     ] {
         if let Err(e) = conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {col}")) {
             if !e.to_string().contains("duplicate column name") {
@@ -365,6 +375,7 @@ pub struct TraceFilter {
     pub harness: Option<String>,
     pub status: Option<i64>,
     pub errors_only: bool,
+    pub error_class: Option<String>,
     pub key_fingerprint: Option<String>,
     pub reasoning_effort: Option<String>,
     pub limit: usize,
@@ -405,6 +416,7 @@ impl Default for TraceFilter {
             harness: None,
             status: None,
             errors_only: false,
+            error_class: None,
             key_fingerprint: None,
             reasoning_effort: None,
             limit: DEFAULT_SEARCH_LIMIT,
@@ -619,9 +631,10 @@ impl Store {
                 cost_usd, billing_bucket,
                 req_body_path, upstream_req_body_path, resp_body_path,
                 req_headers_json, resp_headers_json, error, account_id,
+                error_kind, error_code, error_class,
                 run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
                 subscription_identity, via_dario, dario_generation
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)"#,
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40)"#,
             params![
                 t.id,
                 t.ts_request_ms,
@@ -651,6 +664,9 @@ impl Store {
                 t.resp_headers_json,
                 t.error,
                 t.account_id,
+                t.error_kind,
+                t.error_code,
+                t.error_class,
                 t.run_id,
                 t.tags,
                 t.client_ip,
@@ -864,6 +880,10 @@ impl Store {
         if f.errors_only {
             sql.push_str(" AND error IS NOT NULL");
         }
+        if let Some(class) = &f.error_class {
+            sql.push_str(" AND error_class = ?");
+            args.push(class.clone());
+        }
         if let Some(k) = &f.key_fingerprint {
             sql.push_str(" AND key_fingerprint = ?");
             args.push(k.clone());
@@ -894,7 +914,14 @@ impl Store {
                     GROUP_CONCAT(tags_json, char(31)),
                     GROUP_CONCAT(DISTINCT reasoning_effort),
                     GROUP_CONCAT(DISTINCT account_id),
-                    GROUP_CONCAT(DISTINCT upstream_provider)
+                    GROUP_CONCAT(DISTINCT upstream_provider),
+                    COALESCE(SUM(CASE WHEN error_class = 'auth' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'capacity' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'bad_request' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'server' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'client_disconnect' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'network' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN error_class = 'other' THEN 1 ELSE 0 END),0)
              FROM traces WHERE session_id IS NOT NULL",
         );
         let mut args: Vec<String> = vec![];
@@ -935,6 +962,21 @@ impl Store {
                 .get::<_, Option<String>>(15)?
                 .map(|s| s.split(',').map(str::to_string).collect())
                 .unwrap_or_default();
+            let error_class_counts: serde_json::Map<String, Value> = [
+                ("auth", 17),
+                ("capacity", 18),
+                ("bad_request", 19),
+                ("server", 20),
+                ("client_disconnect", 21),
+                ("network", 22),
+                ("other", 23),
+            ]
+            .into_iter()
+            .filter_map(|(class, index)| {
+                let count = r.get::<_, i64>(index).ok()?;
+                (count > 0).then(|| (class.to_string(), json!(count)))
+            })
+            .collect();
             Ok(json!({
                 "session_id": r.get::<_, String>(0)?,
                 "run_id": r.get::<_, Option<String>>(1)?,
@@ -952,6 +994,7 @@ impl Store {
                 "tags": tags,
                 "efforts": efforts,
                 "account_ids": account_ids,
+                "error_class_counts": error_class_counts,
             }))
         })?;
         let mut rows: Vec<Value> = rows.filter_map(|r| r.ok()).collect();

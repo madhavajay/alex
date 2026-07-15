@@ -6,6 +6,13 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite struct TraceInspectorLogicTests {
+    @Test func errorDisplayFormatterIsPortableAndStructured() {
+        #expect(TraceErrorDisplay.line(
+            kind: "rate_limit_error", code: "429", message: "slow down")
+            == "rate_limit_error · 429 — slow down")
+        #expect(TraceErrorDisplay.line(kind: nil, code: nil, message: "network failed") == "network failed")
+    }
+
     @Test func turnHeaderDuration() {
         #expect(TurnHeader.duration(requestMs: 1000, responseMs: 2800) == "1.8s")
         #expect(TurnHeader.duration(requestMs: 1000, responseMs: 1000) == "0.0s")

@@ -197,6 +197,8 @@ curl -s "$OPENAI_BASE_URL/chat/completions" \
 
 Every response carries an `x-alexandria-trace-id`. Typed headers (`x-alexandria-harness|task|model|job`) and free-form `x-alexandria-trace-tag: key=value` tags are captured with each trace. Collect a session back out:
 
+For deterministic local harness testing, authenticated local-key or scoped **harness-key** requests may add `x-alexandria-simulate-error: STATUS[:kind]` (for example `429:rate_limit_error`, `401:authentication_error`, `529:overloaded_error`, or `503`). Alexandria returns the matching provider error envelope and records a normal trace tagged `simulated=true`; it never contacts an upstream or affects account cooldowns.
+
 ```bash
 alex traces --session "$SESSION" --json                 # CLI
 curl -H "x-api-key: <local_key>" \

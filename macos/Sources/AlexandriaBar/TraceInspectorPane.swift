@@ -601,8 +601,11 @@ struct TraceInspectorView: View {
             if let cost = trace.costUsd, cost > 0 {
                 InfoRow(label: "cost", value: TraceNumberFormat.cost(cost))
             }
-            if let error = trace.error, !error.isEmpty {
-                InfoRow(label: "error", value: error, color: .red)
+            if let error = TraceErrorDisplay.line(
+                kind: trace.errorKind, code: trace.errorCode, message: trace.error)
+            {
+                let label = trace.errorClass.map { "error [\($0)]" } ?? "error"
+                InfoRow(label: label, value: error, color: .red)
             }
         }
     }

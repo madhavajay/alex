@@ -412,6 +412,7 @@ public struct AlexandriaClient: Sendable {
                 URLQueryItem(name: "session", value: filters.session),
                 URLQueryItem(name: "run_id", value: filters.run),
                 URLQueryItem(name: "effort", value: filters.effort),
+                URLQueryItem(name: "error_class", value: filters.errorClass),
             ],
             as: TraceSearchResponse.self)
     }

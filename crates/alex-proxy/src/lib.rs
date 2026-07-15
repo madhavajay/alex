@@ -1770,7 +1770,7 @@ async fn admin_traces(
     // certification: a scoped run key gives every request a unique run id.
     // `list_traces` predates run keys, so delegate only run-id queries to the
     // richer filter API while retaining its established response shape.
-    if q.contains_key("run_id") {
+    if q.contains_key("run_id") || q.contains_key("error_class") || q.contains_key("errors") {
         let mut filter = filter_from_query(&q);
         filter.limit = limit;
         return match state.store.search_traces(&filter) {
@@ -1815,6 +1815,7 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
             .get("errors")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
+        error_class: q.get("error_class").cloned(),
         key_fingerprint: q.get("key_fingerprint").cloned(),
         reasoning_effort: q.get("effort").cloned(),
         limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
@@ -2130,6 +2131,9 @@ fn transcript_turn(row: &Value) -> Value {
         "billing_bucket": row["billing_bucket"],
         "account_id": row["account_id"],
         "error": row["error"],
+        "error_kind": row["error_kind"],
+        "error_code": row["error_code"],
+        "error_class": row["error_class"],
         "user": user,
         "assistant": assistant,
         "tool_calls": tool_calls,
@@ -5412,6 +5416,7 @@ async fn proxy(
     peer: Option<std::net::SocketAddr>,
 ) -> Response {
     let mut run_key: Option<CachedRunKey> = None;
+    let mut local_key_request = false;
     let client_fingerprint = match client_key(&headers) {
         Some(k)
             if state
@@ -5420,6 +5425,7 @@ async fn proxy(
                 .map(|local| k == *local)
                 .unwrap_or(false) =>
         {
+            local_key_request = true;
             key_fingerprint(&k)
         }
         Some(k) => {
@@ -5585,6 +5591,41 @@ async fn proxy(
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
+    if let Some(value) = headers
+        .get("x-alexandria-simulate-error")
+        .and_then(|value| value.to_str().ok())
+    {
+        if !local_key_request && run_key.as_ref().map_or(true, |key| key.kind != "harness") {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "x-alexandria-simulate-error requires a local or harness run key",
+            );
+        }
+        let (status, kind) = match parse_simulated_error(value) {
+            Ok(value) => value,
+            Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+        };
+        let message = format!("simulated upstream error: {kind}");
+        trace.status = Some(status as i64);
+        trace.error_kind = Some(kind.clone());
+        trace.error_code = Some(status.to_string());
+        trace.error_class = Some(
+            classify_error(provider.as_str(), Some(status), Some(&kind))
+                .as_str()
+                .into(),
+        );
+        trace.error = Some(format!("{kind}: {message}"));
+        trace.tags = merge_trace_note(trace.tags.take(), "simulated", "true");
+        trace.ts_response_ms = Some(now_ms());
+        let response_body = simulated_error_body(format, status, &kind, &message);
+        finalize_trace(&state, trace, &body, None, Some(&response_body));
+        return Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+            .header("content-type", "application/json")
+            .header("x-alexandria-trace-id", &trace_id)
+            .body(Body::from(response_body))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+    }
     let in_flight = InFlight::new(
         &state,
         routed_model.clone(),
@@ -5722,6 +5763,8 @@ async fn proxy(
                     suspect_dario(&state, &account);
                     trace.status = Some(502);
                     trace.error = Some(msg.clone());
+                    trace.error_kind = Some("upstream_unreachable".into());
+                    trace.error_class = Some(ErrorClass::Network.as_str().into());
                     finalize_trace(&state, trace, &body, Some(&plan.body), None);
                     return error_response(StatusCode::BAD_GATEWAY, &msg);
                 }
@@ -5873,6 +5916,8 @@ async fn proxy(
                 suspect_dario(&state, &account);
                 trace.status = Some(502);
                 trace.error = Some(msg.clone());
+                trace.error_kind = Some("upstream_unreachable".into());
+                trace.error_class = Some(ErrorClass::Network.as_str().into());
                 finalize_trace(&state, trace, &body, Some(&plan.body), None);
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
@@ -6004,6 +6049,8 @@ async fn proxy(
                 let msg = format!("upstream body read failed: {e}");
                 trace.status = Some(502);
                 trace.error = Some(msg.clone());
+                trace.error_kind = Some("upstream_unreachable".into());
+                trace.error_class = Some(ErrorClass::Network.as_str().into());
                 finalize_trace(&state, trace, &body, Some(&plan.body), None);
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
@@ -6063,14 +6110,43 @@ async fn proxy(
         .await;
         drop(tx);
         trace.ts_response_ms = Some(now_ms());
+        let sse_error = sse_error_observer.as_mut().and_then(|observer| {
+            observer.finish();
+            observer.upstream_error()
+        });
         if trace.error.is_none() {
-            trace.error = sse_error_observer
-                .as_mut()
-                .and_then(|observer| {
-                    observer.finish();
-                    observer.error()
-                })
-                .or(stream_error);
+            trace.error = sse_error
+                .as_ref()
+                .map(UpstreamSseError::trace_message)
+                .or(stream_error.clone());
+        }
+        if trace.error_kind.is_none() {
+            trace.error_kind = sse_error
+                .as_ref()
+                .map(|error| error.kind.clone())
+                .or_else(|| {
+                    stream_error.as_deref().map(|message| {
+                        if message.starts_with("client disconnected") {
+                            "client_disconnect"
+                        } else if message.contains("idle timeout") {
+                            "idle_timeout"
+                        } else {
+                            "stream_error"
+                        }
+                        .to_string()
+                    })
+                });
+        }
+        if trace.error.is_some() && trace.error_class.is_none() {
+            trace.error_class = Some(
+                classify_error(
+                    trace.upstream_provider.as_deref().unwrap_or("unknown"),
+                    trace.status.and_then(|value| u16::try_from(value).ok()),
+                    trace.error_kind.as_deref(),
+                )
+                .as_str()
+                .into(),
+            );
         }
         if trace.error.is_some() {
             if let (Some(dario), Some(gen)) = (
@@ -6187,6 +6263,195 @@ fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedError {
+    kind: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    Auth,
+    Capacity,
+    BadRequest,
+    Server,
+    ClientDisconnect,
+    Network,
+    Other,
+}
+
+impl ErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Capacity => "capacity",
+            Self::BadRequest => "bad_request",
+            Self::Server => "server",
+            Self::ClientDisconnect => "client_disconnect",
+            Self::Network => "network",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The sole error taxonomy used by trace storage and later substitution work.
+fn classify_error(_provider: &str, status: Option<u16>, error_kind: Option<&str>) -> ErrorClass {
+    let kind = error_kind.unwrap_or("").to_ascii_lowercase();
+    if kind == "client_disconnect" {
+        return ErrorClass::ClientDisconnect;
+    }
+    if matches!(
+        kind.as_str(),
+        "stream_error" | "idle_timeout" | "upstream_unreachable"
+    ) || kind.contains("timeout")
+        || kind.contains("connect")
+        || kind.contains("reset")
+        || kind.contains("early-eof")
+    {
+        return ErrorClass::Network;
+    }
+    if matches!(status, Some(401 | 403))
+        || matches!(
+            kind.as_str(),
+            "authentication_error"
+                | "permission_error"
+                | "invalid_api_key"
+                | "token_refresh_failure"
+                | "token-refresh-failure"
+        )
+    {
+        return ErrorClass::Auth;
+    }
+    if status == Some(429)
+        || matches!(
+            kind.as_str(),
+            "rate_limit_error" | "overloaded_error" | "insufficient_quota" | "quota_exceeded"
+        )
+        || kind.contains("at capacity")
+    {
+        return ErrorClass::Capacity;
+    }
+    if matches!(status, Some(400 | 404 | 422))
+        || kind == "invalid_request_error"
+        || kind.contains("model_not_found")
+        || kind.contains("model-not-found")
+    {
+        return ErrorClass::BadRequest;
+    }
+    if status.is_some_and(|status| status >= 500)
+        || matches!(kind.as_str(), "api_error" | "internal_server_error")
+    {
+        return ErrorClass::Server;
+    }
+    ErrorClass::Other
+}
+
+fn json_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(String::from)
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+}
+
+/// Reads the native provider error envelope without translating it.  `format`
+/// is the upstream wire format, including the two OpenAI variants.
+fn parse_upstream_error(format: &str, _status: u16, body: &[u8]) -> Option<ParsedError> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = match format {
+        "anthropic" => value.get("error")?,
+        "openai-chat" | "openai-responses" => value.get("error")?,
+        "gemini" => value
+            .get("error")
+            .or_else(|| value.pointer("/response/error"))?,
+        _ => value.get("error")?,
+    };
+    if !error.is_object() {
+        return None;
+    }
+    Some(ParsedError {
+        kind: json_string(&error["type"]).or_else(|| json_string(&error["status"])),
+        code: json_string(&error["code"]),
+        message: json_string(&error["message"]),
+    })
+}
+
+fn capture_response_error(trace: &mut TraceRecord, body: &[u8]) {
+    let Some(status) = trace.status.and_then(|status| u16::try_from(status).ok()) else {
+        return;
+    };
+    if (200..300).contains(&status) {
+        return;
+    }
+    let parsed = trace
+        .upstream_format
+        .as_deref()
+        .and_then(|format| parse_upstream_error(format, status, body));
+    let fallback_kind = format!("http_status_{status}");
+    let kind = parsed
+        .as_ref()
+        .and_then(|error| error.kind.clone())
+        .unwrap_or(fallback_kind);
+    let code = parsed
+        .as_ref()
+        .and_then(|error| error.code.clone())
+        .unwrap_or_else(|| status.to_string());
+    if trace.error_kind.is_none() {
+        trace.error_kind = Some(kind.clone());
+    }
+    if trace.error_code.is_none() {
+        trace.error_code = Some(code);
+    }
+    if trace.error.is_none() {
+        let message = parsed
+            .and_then(|error| error.message)
+            .unwrap_or_else(|| format!("upstream returned HTTP {status}"));
+        trace.error = Some(format!("{kind}: {message}"));
+    }
+    if trace.error_class.is_none() {
+        trace.error_class = Some(
+            classify_error(
+                trace.upstream_provider.as_deref().unwrap_or("unknown"),
+                Some(status),
+                trace.error_kind.as_deref(),
+            )
+            .as_str()
+            .into(),
+        );
+    }
+}
+
+fn parse_simulated_error(value: &str) -> Result<(u16, String), String> {
+    let (status, kind) = value.trim().split_once(':').unwrap_or((value.trim(), ""));
+    let status: u16 = status
+        .parse()
+        .map_err(|_| "x-alexandria-simulate-error must be STATUS or STATUS:kind".to_string())?;
+    if !(400..600).contains(&status) {
+        return Err("x-alexandria-simulate-error status must be 400-599".into());
+    }
+    let kind = if kind.trim().is_empty() {
+        format!("http_status_{status}")
+    } else {
+        kind.trim().to_string()
+    };
+    Ok((status, kind))
+}
+
+fn simulated_error_body(format: ClientFormat, status: u16, kind: &str, message: &str) -> Vec<u8> {
+    let value = match format {
+        ClientFormat::AnthropicMessages => json!({
+            "type": "error", "error": {"type": kind, "message": message}
+        }),
+        ClientFormat::OpenaiChat | ClientFormat::OpenaiResponses => json!({
+            "error": {"type": kind, "code": status.to_string(), "message": message}
+        }),
+        ClientFormat::GeminiGenerate => json!({
+            "error": {"code": status, "status": kind, "message": message}
+        }),
+    };
+    serde_json::to_vec(&value).unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UpstreamSseError {
     kind: String,
     message: String,
@@ -6245,6 +6510,11 @@ impl SseErrorObserver {
         self.finish_event();
     }
 
+    fn upstream_error(&self) -> Option<UpstreamSseError> {
+        self.error.clone()
+    }
+
+    #[cfg(test)]
     fn error(&self) -> Option<String> {
         self.error.as_ref().map(UpstreamSseError::trace_message)
     }
@@ -6397,6 +6667,9 @@ fn finalize_trace(
     resp_body: Option<&[u8]>,
 ) {
     let store = &state.store;
+    if let Some(resp) = resp_body {
+        capture_response_error(&mut trace, resp);
+    }
     match store.write_body(&trace.id, "request.json", client_body) {
         Ok(p) => trace.req_body_path = Some(p),
         Err(e) => tracing::warn!("failed to write request body: {e}"),
@@ -7272,7 +7545,14 @@ mod tests {
             upstream_format: Some(upstream_format.into()),
             ..Default::default()
         };
-        trace.error = observer.error();
+        let observed_error = observer.upstream_error();
+        trace.error = observed_error.as_ref().map(UpstreamSseError::trace_message);
+        trace.error_kind = observed_error.as_ref().map(|error| error.kind.clone());
+        trace.error_class = trace.error_kind.as_deref().map(|kind| {
+            classify_error("test", Some(StatusCode::OK.as_u16()), Some(kind))
+                .as_str()
+                .to_string()
+        });
         let response: Vec<u8> = forwarded.iter().flatten().copied().collect();
         finalize_trace(state, trace, b"{}", None, Some(&response));
         forwarded
@@ -7301,6 +7581,8 @@ mod tests {
             trace["error"],
             "upstream stream error: overloaded_error: Overloaded"
         );
+        assert_eq!(trace["error_kind"], "overloaded_error");
+        assert_eq!(trace["error_class"], "capacity");
     }
 
     #[test]
@@ -8302,6 +8584,170 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("only post to /traces/ingest"));
+    }
+
+    #[tokio::test]
+    async fn simulate_error_short_circuits_upstream_and_records_classified_trace() {
+        let state = test_state("simulate-error");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("429:rate_limit_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        let rows = state.store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], 429);
+        assert_eq!(rows[0]["error_kind"], "rate_limit_error");
+        assert_eq!(rows[0]["error_class"], "capacity");
+        assert_eq!(rows[0]["tags_json"], r#"{"simulated":"true"}"#);
+        let mut query = HashMap::new();
+        query.insert("error_class".into(), "capacity".into());
+        let (admin_status, admin_body) =
+            response_json(admin_traces(State(state.clone()), Query(query)).await).await;
+        assert_eq!(admin_status, StatusCode::OK);
+        assert_eq!(admin_body["traces"][0]["status"], 429);
+        assert_eq!(admin_body["traces"][0]["error_kind"], "rate_limit_error");
+        assert_eq!(admin_body["traces"][0]["error_class"], "capacity");
+        // This test state has no usable upstream account. A response proves
+        // the simulation returned before account planning / HTTP dispatch.
+        assert_eq!(
+            state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_rejects_non_harness_run_keys() {
+        let state = test_state("simulate-error-run-key-gate");
+        let (_, created) = response_json(
+            admin_run_keys_create(
+                State(state.clone()),
+                Some(axum::Json(json!({"kind": "run", "label": "ordinary run"}))),
+            )
+            .await,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(created["key"].as_str().unwrap()).unwrap(),
+        );
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("429:rate_limit_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parses_native_provider_error_envelopes() {
+        let cases = [
+            ("anthropic", 429, br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.as_slice(), "rate_limit_error", None, "slow down"),
+            ("openai-chat", 401, br#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"bad key"}}"#.as_slice(), "authentication_error", Some("invalid_api_key"), "bad key"),
+            ("openai-responses", 529, br#"{"error":{"type":"overloaded_error","message":"busy"}}"#.as_slice(), "overloaded_error", None, "busy"),
+            ("gemini", 429, br#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota"}}"#.as_slice(), "RESOURCE_EXHAUSTED", Some("429"), "quota"),
+        ];
+        for (format, status, body, kind, code, message) in cases {
+            let parsed = parse_upstream_error(format, status, body).unwrap();
+            assert_eq!(parsed.kind.as_deref(), Some(kind));
+            assert_eq!(parsed.code.as_deref(), code);
+            assert_eq!(parsed.message.as_deref(), Some(message));
+        }
+    }
+
+    #[test]
+    fn dario_brokered_http_error_is_classified_at_finalization() {
+        let state = test_state("dario-classified-error");
+        let trace = TraceRecord {
+            id: "dario-429".into(),
+            ts_request_ms: now_ms(),
+            status: Some(429),
+            upstream_provider: Some("anthropic".into()),
+            upstream_format: Some("anthropic".into()),
+            via_dario: true,
+            dario_generation: Some("generation-test".into()),
+            ..Default::default()
+        };
+        finalize_trace(
+            &state,
+            trace,
+            b"{}",
+            None,
+            Some(br#"{"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}"#),
+        );
+        let trace = state.store.get_trace("dario-429").unwrap().unwrap();
+        assert_eq!(trace["via_dario"], true);
+        assert_eq!(trace["status"], 429);
+        assert_eq!(trace["error_kind"], "rate_limit_error");
+        assert_eq!(trace["error_class"], "capacity");
+    }
+
+    #[test]
+    fn classifies_provider_and_transport_errors() {
+        let cases = [
+            (
+                "anthropic",
+                Some(401),
+                Some("authentication_error"),
+                ErrorClass::Auth,
+            ),
+            (
+                "openai",
+                Some(429),
+                Some("rate_limit_error"),
+                ErrorClass::Capacity,
+            ),
+            (
+                "gemini",
+                Some(400),
+                Some("INVALID_ARGUMENT"),
+                ErrorClass::BadRequest,
+            ),
+            ("openai", Some(503), Some("api_error"), ErrorClass::Server),
+            (
+                "anthropic",
+                Some(200),
+                Some("client_disconnect"),
+                ErrorClass::ClientDisconnect,
+            ),
+            (
+                "openai",
+                Some(502),
+                Some("upstream_unreachable"),
+                ErrorClass::Network,
+            ),
+            ("gemini", Some(418), Some("teapot"), ErrorClass::Other),
+        ];
+        for (provider, status, kind, expected) in cases {
+            assert_eq!(classify_error(provider, status, kind), expected);
+        }
     }
 
     #[test]

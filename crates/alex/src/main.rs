@@ -4466,6 +4466,9 @@ impl AmpWsTraceState {
                 "content-type": "application/json"
             }).to_string()),
             error,
+            error_kind: None,
+            error_code: None,
+            error_class: None,
             account_id: self
                 .billing_account
                 .as_ref()
@@ -5246,6 +5249,9 @@ fn reconcile_agent_turn(
         req_headers_json: Some(serde_json::json!({"x-alexandria-wrap":"agent","x-alexandria-run-id":run_id}).to_string()),
         resp_headers_json: Some(serde_json::json!({"x-alexandria-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
         error: None,
+        error_kind: None,
+        error_code: None,
+        error_class: None,
         account_id: metadata
             .billing_account
             .as_ref()

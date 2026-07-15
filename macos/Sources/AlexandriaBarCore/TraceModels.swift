@@ -31,6 +31,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let tags: [String: String]?
     public let efforts: [String]?
     public let accountIds: [String]?
+    public let errorClassCounts: [String: Int64]?
     public let parentSessionId: String?
     public let lineageTurnId: String?
     public let agentType: String?
@@ -56,6 +57,7 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         case totalCostUsd = "total_cost_usd"
         case lastStatus = "last_status"
         case accountIds = "account_ids"
+        case errorClassCounts = "error_class_counts"
         case parentSessionId = "parent_session_id"
         case lineageTurnId = "lineage_turn_id"
         case agentType = "agent_type"
@@ -92,6 +94,9 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let viaDario: Bool?
     public let darioGeneration: String?
     public let error: String?
+    public let errorKind: String?
+    public let errorCode: String?
+    public let errorClass: String?
     public let user: String?
     public let assistant: String?
     public let toolCalls: [ToolCall]?
@@ -102,6 +107,9 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case model, provider, status, error, user, assistant
+        case errorKind = "error_kind"
+        case errorCode = "error_code"
+        case errorClass = "error_class"
         case traceId = "trace_id"
         case tsRequestMs = "ts_request_ms"
         case tsResponseMs = "ts_response_ms"
@@ -275,6 +283,9 @@ public struct TraceDetail: Codable, Sendable {
     public let path: String?
     public let status: Int?
     public let error: String?
+    public let errorKind: String?
+    public let errorCode: String?
+    public let errorClass: String?
     public let tsRequestMs: Int64?
     public let tsResponseMs: Int64?
     public let latencyMs: Int64?
@@ -306,6 +317,9 @@ public struct TraceDetail: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, harness, method, path, status, error
+        case errorKind = "error_kind"
+        case errorCode = "error_code"
+        case errorClass = "error_class"
         case sessionId = "session_id"
         case runId = "run_id"
         case tsRequestMs = "ts_request_ms"
@@ -336,6 +350,25 @@ public struct TraceDetail: Codable, Sendable {
         case upstreamReqBodyPath = "upstream_req_body_path"
         case respBodyPath = "resp_body_path"
         case tagsJson = "tags_json"
+    }
+}
+
+/// Portable presentation for the trace inspector. Keep this Foundation-only so
+/// AlexandriaBarCore continues to compile and test on Linux.
+public enum TraceErrorDisplay {
+    public static func line(kind: String?, code: String?, message: String?) -> String? {
+        let parts = [kind, code].compactMap { value -> String? in
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+                return nil
+            }
+            return value
+        }
+        let prefix = parts.joined(separator: " · ")
+        let message = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let message, !message.isEmpty {
+            return prefix.isEmpty ? message : "\(prefix) — \(message)"
+        }
+        return prefix.isEmpty ? nil : prefix
     }
 }
 
@@ -1467,6 +1500,7 @@ public struct OmniQuery: Equatable, Sendable {
     public var effort: String?
     public var duration: String?
     public var account: String?
+    public var errorClass: String?
 
     public init() {}
 
@@ -1479,6 +1513,7 @@ public struct OmniQuery: Equatable, Sendable {
             || status != nil || run != nil || session != nil
             || task != nil || job != nil || tag != nil
             || effort != nil || duration != nil || account != nil
+            || errorClass != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -1502,6 +1537,7 @@ public struct OmniQuery: Equatable, Sendable {
                     case "effort": query.effort = value; continue
                     case "duration": query.duration = value; continue
                     case "account": query.account = value; continue
+                    case "error_class": query.errorClass = value; continue
                     default: break
                     }
                 }
@@ -1573,6 +1609,9 @@ public struct OmniQuery: Equatable, Sendable {
             guard (session.accountIds ?? []).contains(where: {
                 $0.caseInsensitiveCompare(account) == .orderedSame
             }) else { return false }
+        }
+        if let errorClass {
+            guard session.errorClassCounts?[errorClass] != nil else { return false }
         }
         return true
     }
@@ -1682,10 +1721,12 @@ public enum SessionDurationFilter: String, CaseIterable, Sendable {
 }
 
 public enum TagFilterDimension: String, CaseIterable, Sendable {
-    case harness, task, job, model, account, effort, duration
+    case harness, task, job, model, account, effort, duration, errorClass = "error_class"
 
     public var title: String {
-        self == .account ? "Billing Account" : rawValue.capitalized
+        if self == .account { return "Billing Account" }
+        if self == .errorClass { return "Error Class" }
+        return rawValue.capitalized
     }
 
     public func label(for value: String) -> String {
@@ -1730,6 +1771,8 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
                 (session.efforts ?? []).forEach { add($0) }
             case .account:
                 (session.accountIds ?? []).forEach { add($0) }
+            case .errorClass:
+                (session.errorClassCounts ?? [:]).keys.forEach { add($0) }
             case .duration:
                 break
             }
@@ -1746,6 +1789,7 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
         case .effort: query.effort
         case .duration: query.duration
         case .account: query.account
+        case .errorClass: query.errorClass
         }
     }
 }

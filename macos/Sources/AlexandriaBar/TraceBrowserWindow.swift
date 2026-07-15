@@ -505,6 +505,22 @@ final class TraceBrowserModel {
         queryText = OmniQuery.settingToken(in: queryText, key: dimension.rawValue, value: value)
     }
 
+    var errorClassSummaryLine: String? {
+        let counts = sessions
+            .filter { parsedQuery.matches($0) }
+            .reduce(into: [String: Int64]()) { totals, session in
+                for (errorClass, count) in session.errorClassCounts ?? [:] {
+                    totals[errorClass, default: 0] += count
+                }
+            }
+        guard !counts.isEmpty else { return nil }
+        let real = counts.filter { $0.key != "client_disconnect" }.values.reduce(0, +)
+        let detail = counts.sorted { $0.key < $1.key }
+            .map { "\($0.key) \($0.value)" }
+            .joined(separator: " · ")
+        return "\(real) errored (excluding client disconnect) · \(detail)"
+    }
+
     var selectedSession: TraceSession? {
         sessions.first { $0.sessionId == selectedSessionId }
     }
@@ -1192,6 +1208,13 @@ struct TraceBrowserView: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .help("Show turn details")
+            if let summary = model.errorClassSummaryLine {
+                Text(summary)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .lineLimit(1)
+                    .help("Errored traces grouped by Alexandria error class")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
