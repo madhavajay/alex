@@ -100,24 +100,111 @@ struct HarnessIconView: View {
     let harness: String?
     let tags: [String: String]?
     var size: CGFloat = 16
+    /// Draw the logo on a brand tile (Settings 32px variant,
+    /// Create Settings App.tsx:90-123). `backgroundPadding` insets the asset.
+    var background: Color?
+    var backgroundPadding: CGFloat = 0
+    var cornerRadius: CGFloat?
+    /// When no logo asset exists, draw the mock's 17×17 tinted chip with a
+    /// gear glyph instead of collapsing to nothing (shared.tsx:178-192).
+    var showsFallback = false
 
     var body: some View {
         if let image = HarnessIconLoader.image(harness: harness, tags: tags) {
-            Image(nsImage: image)
+            let logo = Image(nsImage: image)
                 .resizable()
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fit)
+            if let background {
+                logo
+                    .padding(backgroundPadding)
+                    .frame(width: size, height: size)
+                    .background(
+                        RoundedRectangle(cornerRadius: radius).fill(background))
+                    .clipShape(RoundedRectangle(cornerRadius: radius))
+            } else {
+                logo
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: radius))
+            }
+        } else if showsFallback {
+            RoundedRectangle(cornerRadius: radius)
+                .fill(background ?? AlexTheme.Colors.overlay(0.08))
+                .overlay(
+                    Image(systemName: "gearshape")
+                        .font(.system(size: max(6, size * 0.53)))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary))
                 .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: size * 0.2))
+                .help(harness ?? "unknown harness")
         }
+    }
+
+    private var radius: CGFloat {
+        cornerRadius ?? size * 0.2
+    }
+}
+
+/// Brand icon with a bottom-right health dot (menu App.tsx:130-170):
+/// badge = max(4, 0.38×size), nudged past the corner by 0.35×badge, ringed
+/// with the panel background; pending renders at 50% opacity.
+struct IconWithHealthBadge<Icon: View>: View {
+    var size: CGFloat
+    var tint: Color
+    var pending = false
+    /// Ring separating the badge from the icon; match it to the surface the
+    /// icon sits on (defaults to the panel background).
+    var ringColor: Color?
+    private let icon: Icon
+
+    init(
+        size: CGFloat, tint: Color, pending: Bool = false,
+        ringColor: Color? = nil, @ViewBuilder icon: () -> Icon
+    ) {
+        self.size = size
+        self.tint = tint
+        self.pending = pending
+        self.ringColor = ringColor
+        self.icon = icon()
+    }
+
+    var body: some View {
+        let badge = max(4, (size * 0.38).rounded())
+        icon
+            .frame(width: size, height: size)
+            .overlay(alignment: .bottomTrailing) {
+                Circle()
+                    .fill(tint)
+                    .overlay(
+                        Circle().strokeBorder(
+                            ringColor ?? AlexTheme.Colors.background, lineWidth: 1.5))
+                    .frame(width: badge + 3, height: badge + 3)
+                    .offset(x: 0.35 * badge, y: 0.35 * badge)
+                    .opacity(pending ? 0.5 : 1)
+            }
     }
 }
 
 struct ProviderBadgeView: View {
+    /// `.solid` is the original 13px filled circle with a white initial
+    /// (menu bar); `.tinted` is the mock's 17×17 rounded square with a
+    /// colored letter on a translucent brand tint (shared.tsx:196-209).
+    enum Style {
+        case solid
+        case tinted
+    }
+
     let provider: String
     var size: CGFloat = 10
+    var style: Style = .solid
 
     var body: some View {
+        switch style {
+        case .solid: solidBadge
+        case .tinted: tintedBadge
+        }
+    }
+
+    private var solidBadge: some View {
         Circle()
             .fill(color)
             .overlay(
@@ -129,6 +216,18 @@ struct ProviderBadgeView: View {
                 Text(ModelProvider.initial(for: provider))
                     .font(.system(size: max(6, size * 0.48), weight: .bold))
                     .foregroundStyle(.white))
+            .frame(width: size, height: size)
+            .help(name)
+    }
+
+    private var tintedBadge: some View {
+        let brand = AlexTheme.ProviderBrand.brand(for: provider)
+        return RoundedRectangle(cornerRadius: max(3, size * 0.22))
+            .fill(brand.chipBackground)
+            .overlay(
+                Text(ModelProvider.initial(for: provider))
+                    .font(.system(size: max(6, size * 0.53), weight: .bold))
+                    .foregroundStyle(brand.chipText))
             .frame(width: size, height: size)
             .help(name)
     }
@@ -158,6 +257,45 @@ struct ProviderBadgeView: View {
         default: provider.capitalized
         }
     }
+}
+
+#Preview("Harness & provider badges") {
+    VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
+        HStack(spacing: AlexTheme.Spacing.md) {
+            HarnessIconView(harness: "claude", tags: nil, size: 17, showsFallback: true)
+            HarnessIconView(harness: "mystery", tags: nil, size: 17, showsFallback: true)
+            HarnessIconView(
+                harness: "claude", tags: nil, size: 32,
+                background: AlexTheme.Colors.dynamic(light: 0xF0EBE3, dark: 0xF0EBE3),
+                backgroundPadding: 4, cornerRadius: 8, showsFallback: true)
+        }
+        HStack(spacing: AlexTheme.Spacing.md) {
+            ProviderBadgeView(provider: "anthropic", size: 17, style: .tinted)
+            ProviderBadgeView(provider: "openai", size: 17, style: .tinted)
+            ProviderBadgeView(provider: "gemini", size: 17, style: .tinted)
+            ProviderBadgeView(provider: "anthropic", size: 13)
+        }
+        HStack(spacing: AlexTheme.Spacing.md) {
+            IconWithHealthBadge(size: 14, tint: AlexTheme.Colors.success) {
+                HarnessIconView(harness: "claude", tags: nil, size: 14, showsFallback: true)
+            }
+            IconWithHealthBadge(
+                size: 14, tint: AlexTheme.Colors.textTertiary, pending: true
+            ) {
+                HarnessIconView(harness: "codex", tags: nil, size: 14, showsFallback: true)
+            }
+            IconWithHealthBadge(
+                size: 14, tint: AlexTheme.Colors.success,
+                ringColor: AlexTheme.Colors.card
+            ) {
+                HarnessIconView(harness: "claude", tags: nil, size: 14, showsFallback: true)
+            }
+            .padding(4)
+            .background(AlexTheme.Colors.card)
+        }
+    }
+    .padding()
+    .background(AlexTheme.Colors.background)
 }
 
 /// The session list's deliberately compact identity: harness + model provider.

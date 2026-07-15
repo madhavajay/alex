@@ -115,7 +115,9 @@ struct TraceInspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            if let trace = detail?.trace {
+                quickStats(trace)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if let detail {
@@ -201,21 +203,24 @@ struct TraceInspectorView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Text("Turn Details")
-                .font(.system(size: 11, weight: .semibold))
-            Text(traceId)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            if isLoading, detail != nil {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.55)
+        PanelHeader(accentLeft: true) {
+            VStack(alignment: .leading, spacing: 2) {
+                breadcrumb
+                HStack(spacing: AlexTheme.Spacing.md) {
+                    Text(detail?.trace.method != nil ? "API Request" : "Turn Details")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    if let status = detail?.trace.status {
+                        httpStatusChip(status)
+                    }
+                    if isLoading, detail != nil {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.55)
+                    }
+                }
             }
-            Spacer()
+        } right: {
             Button(copiedAll ? "Copied" : "Copy All") {
                 copyAll()
             }
@@ -223,42 +228,110 @@ struct TraceInspectorView: View {
             .font(.system(size: 10))
             .disabled(detail == nil)
             .help("Copy the whole turn as markdown")
-            Button {
+            PanelIconButton(systemImage: "chevron.left", help: "Previous turn") {
                 model.stepInspector(-1)
-            } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
             .disabled(!model.canStepInspector(-1))
-            .help("Previous turn")
-            Button {
+            PanelIconButton(systemImage: "chevron.right", help: "Next turn") {
                 model.stepInspector(1)
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
             .disabled(!model.canStepInspector(1))
-            .help("Next turn")
-            Button {
+            PanelIconButton(systemImage: "xmark", help: "Close details") {
                 model.closeInspector()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
-            .help("Close details")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+    }
+
+    /// Breadcrumb "shortId › Turn N" (mock TB App.tsx:759-768). The mock's
+    /// trailing role segment has no per-turn source here — the inspector
+    /// targets whole turns, not individual messages.
+    private var breadcrumb: some View {
+        HStack(spacing: 4) {
+            if let sessionId = model.selectedSessionId {
+                Text(SessionShortId.shorten(sessionId))
+                    .font(AlexTheme.Fonts.mono(9.5))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+            Text(turnNumber.map { "Turn \($0)" } ?? "Turn —")
+                .font(AlexTheme.Fonts.mono(9.5))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+        }
+    }
+
+    private var turnNumber: Int? {
+        guard let index = model.turns.firstIndex(where: { $0.traceId == traceId }) else {
+            return nil
+        }
+        return index + 1
+    }
+
+    /// HTTP status chip: mono 9.5, 2×6 padding, radius 4, green/red tint pair
+    /// (mock TB App.tsx:773-780).
+    private func httpStatusChip(_ status: Int) -> some View {
+        let ok = (200..<300).contains(status)
+        let tint = ok ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
+        return Text("\(status)")
+            .font(AlexTheme.Fonts.mono(9.5))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 4).fill(tint.opacity(0.1)))
+            .fixedSize()
+    }
+
+    /// 3-up Method | Duration | Tokens strip (mock TB App.tsx:788-801).
+    private func quickStats(_ trace: TraceDetail) -> some View {
+        let duration = trace.tsRequestMs.flatMap { requestMs in
+            TurnHeader.duration(requestMs: requestMs, responseMs: trace.tsResponseMs)
+        } ?? trace.latencyMs.map { "\($0)ms" }
+        let tokens: String? = trace.inputTokens == nil && trace.outputTokens == nil
+            ? nil
+            : TraceNumberFormat.tokens((trace.inputTokens ?? 0) + (trace.outputTokens ?? 0))
+        return StatTilesRow(
+            items: [
+                StatTileData(label: "Method", value: trace.method ?? "—"),
+                StatTileData(label: "Duration", value: duration ?? "—"),
+                StatTileData(label: "Tokens", value: tokens ?? "—"),
+            ],
+            style: .bordered)
+    }
+
+    /// Endpoint block: uppercase label, endpoint, request id
+    /// (mock TB App.tsx:806-816).
+    @ViewBuilder
+    private func endpointBlock(_ trace: TraceDetail) -> some View {
+        let methodPath = [trace.method, trace.path].compactMap(\.self)
+            .joined(separator: " ")
+        if !methodPath.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("ENDPOINT")
+                    .font(.system(size: 10, weight: .medium))
+                    .tracking(0.7)
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                Text(methodPath)
+                    .font(AlexTheme.Fonts.metaMono)
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                Text(trace.id)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
     }
 
     @ViewBuilder
     private func content(_ response: TraceDetailResponse) -> some View {
         let trace = response.trace
+        endpointBlock(trace)
         overview(trace)
         if let extras = response.extras, extras.hasAny {
             section(
@@ -343,9 +416,6 @@ struct TraceInspectorView: View {
                     label: "status", value: "\(status)",
                     color: status >= 400 ? .red : .green)
             }
-            let methodPath = [trace.method, trace.path].compactMap(\.self)
-                .joined(separator: " ")
-            InfoRow(label: "endpoint", value: methodPath.isEmpty ? nil : methodPath)
             if let requestMs = trace.tsRequestMs {
                 InfoRow(label: "time", value: TraceFormat.time(requestMs))
                 InfoRow(
@@ -415,9 +485,10 @@ struct TraceInspectorView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text(title)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                Text(title.uppercased())
+                    .font(.system(size: 10, weight: .medium))
+                    .tracking(0.7)
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                 if let copyText, !copyText.isEmpty {
                     CopyIconButton(text: copyText, help: "Copy \(title.lowercased())")
                 }
@@ -633,6 +704,7 @@ struct TraceInspectorView: View {
     private func groupLabel(_ text: String) -> some View {
         Text(text)
             .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(AlexTheme.Colors.mutedForeground)
     }
 
     private func loadDetail() async {
@@ -670,12 +742,12 @@ struct InfoRow: View {
         if let value, !value.isEmpty {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(label)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .frame(width: 96, alignment: .leading)
                 Text(value)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(color ?? Color.primary)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(color ?? AlexTheme.Colors.textSecondary)
                     .textSelection(.enabled)
                     .lineLimit(4)
             }
@@ -695,12 +767,14 @@ struct FormatRow: View {
                 && clientFormat != upstreamFormat
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("format")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .frame(width: 96, alignment: .leading)
                 Text("\(client) → \(upstream)\(translated ? "  (translated)" : "")")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(translated ? Color.orange : Color.primary)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(
+                        translated
+                            ? AlexTheme.Colors.warningOrange : AlexTheme.Colors.textSecondary)
                     .textSelection(.enabled)
             }
         }
@@ -716,24 +790,37 @@ struct HeaderListView: View {
             if let delta, !delta.isEmpty {
                 Label("differs from first request", systemImage: "circle.fill")
                     .font(.system(size: 9))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AlexTheme.Colors.warningOrange)
             }
+            // KV table styling (shared.tsx:405-420): dim right-aligned key
+            // column, brighter truncating value.
             ForEach(pairs, id: \.name) { pair in
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Circle()
-                        .fill(marked(pair.name) ? Color.orange : Color.clear)
+                        .fill(
+                            marked(pair.name)
+                                ? AlexTheme.Colors.warningOrange : Color.clear)
                         .frame(width: 5, height: 5)
-                    Text("\(pair.name): \(pair.value)")
-                        .font(.system(size: 10, design: .monospaced))
+                    Text(pair.name)
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(width: 130, alignment: .trailing)
+                        .help(pair.name)
+                    Text(pair.value)
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
                         .textSelection(.enabled)
                         .lineLimit(3)
                 }
+                .padding(.vertical, 1)
                 .help(markHelp(pair.name) ?? "")
             }
             if let delta, !delta.removed.isEmpty {
                 Text("missing vs first request: \(delta.removed.sorted().joined(separator: ", "))")
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AlexTheme.Colors.warningOrange)
             }
         }
     }
@@ -819,6 +906,27 @@ struct InspectorTextPane: NSViewRepresentable {
         NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
     }
 
+    /// JSON syntax palette aligned with `AlexTheme.Colors.Json`
+    /// (shared.tsx:380-388); appearance-dynamic NSColors for the NSTextView.
+    static let jsonColors = JsonHighlight.Colors(
+        key: dynamicColor(light: 0x33708E, dark: 0x79B8D4),
+        string: dynamicColor(light: 0x4A7A3E, dark: 0x87BD78),
+        number: dynamicColor(light: 0x9C5A28, dark: 0xD49668),
+        keyword: dynamicColor(light: 0x7C4FA8, dark: 0xB48ADE),
+        punctuation: dynamicColor(light: 0xB8B8C2, dark: 0x3E3E4A))
+
+    private static func dynamicColor(light: UInt32, dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? dark : light
+            return NSColor(
+                srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+                green: CGFloat((hex >> 8) & 0xFF) / 255,
+                blue: CGFloat(hex & 0xFF) / 255,
+                alpha: 1)
+        }
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NSTextView(usingTextLayoutManager: true)
         textView.isEditable = false
@@ -847,7 +955,8 @@ struct InspectorTextPane: NSViewRepresentable {
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key
         if highlightJSON {
-            storage.setAttributedString(JsonHighlight.attributed(text, font: font))
+            storage.setAttributedString(
+                JsonHighlight.attributed(text, font: font, colors: Self.jsonColors))
         } else {
             storage.setAttributedString(NSAttributedString(
                 string: text,

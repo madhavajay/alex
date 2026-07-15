@@ -17,6 +17,7 @@ final class PingModel {
     private(set) var stage: Stage = .running
     private(set) var lines: [String] = []
     private(set) var startedAt = Date()
+    private(set) var finishedAt: Date?
     private var task: Task<Void, Never>?
 
     init(target: String, title: String, store: SnapshotStore) {
@@ -31,6 +32,7 @@ final class PingModel {
         stage = .running
         lines = []
         startedAt = Date()
+        finishedAt = nil
         task?.cancel()
         lines.append("$ alexandria ping \(target)")
         task = Task { [weak self] in
@@ -44,6 +46,7 @@ final class PingModel {
             }
             if Task.isCancelled { return }
             self.stage = .done(result.exitCode)
+            self.finishedAt = Date()
             let elapsed = Int(Date().timeIntervalSince(self.startedAt))
             self.lines.append(
                 result.ok
@@ -62,66 +65,185 @@ struct PingView: View {
     @Bindable var model: PingModel
     let close: () -> Void
 
-    @State private var copied = false
+    var body: some View {
+        VStack(spacing: 0) {
+            PanelHeader {
+                headerStatusIcon
+                Text(headerTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                    .lineLimit(1)
+                if !model.lines.isEmpty {
+                    PanelCountBadge(count: model.lines.count)
+                }
+            } right: {
+                CopyButton(value: model.lines.joined(separator: "\n"), label: "Copy")
+            }
+            StatTilesRow(
+                items: [
+                    StatTileData(label: "Target", value: model.target),
+                    StatTileData(
+                        label: "Status", value: statusValue, valueTint: statusTint),
+                    StatTileData(label: "Duration", value: durationValue),
+                ],
+                style: .bordered)
+            console
+            footer
+        }
+        .background(AlexTheme.Colors.background)
+        .frame(width: 560, height: 380)
+    }
 
-    private func copyAll() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(model.lines.joined(separator: "\n"), forType: .string)
-        copied = true
-        Task {
-            try? await Task.sleep(for: .seconds(1.5))
-            copied = false
+    // MARK: Header
+
+    @ViewBuilder
+    private var headerStatusIcon: some View {
+        switch model.stage {
+        case .running:
+            ProgressView()
+                .controlSize(.small)
+        case .done(let code):
+            StatusDot(status: code == 0 ? .success : .error, size: 7, glow: true)
         }
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                switch model.stage {
-                case .running:
-                    ProgressView().controlSize(.small)
-                    Text("Pinging \(model.title)…").font(.headline)
-                case .done(let code):
-                    Image(systemName: code == 0 ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                        .foregroundStyle(code == 0 ? .green : .red)
-                    Text(code == 0 ? "Ping OK" : "Ping failed").font(.headline)
+    private var headerTitle: String {
+        switch model.stage {
+        case .running: "Pinging \(model.title)…"
+        case .done(let code): code == 0 ? "Ping OK — \(model.title)" : "Ping Failed — \(model.title)"
+        }
+    }
+
+    // MARK: Stats
+
+    private var statusValue: String {
+        switch model.stage {
+        case .running: "Running"
+        case .done(let code): code == 0 ? "OK" : "Exit \(code)"
+        }
+    }
+
+    private var statusTint: Color {
+        switch model.stage {
+        case .running: DisplayStatus.running.tint
+        case .done(let code): code == 0 ? DisplayStatus.success.tint : DisplayStatus.error.tint
+        }
+    }
+
+    private var durationValue: String {
+        guard let finishedAt = model.finishedAt else { return "…" }
+        return "\(Int(finishedAt.timeIntervalSince(model.startedAt)))s"
+    }
+
+    // MARK: Console
+
+    private var console: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(model.lines.enumerated()), id: \.offset) { _, line in
+                        resultRow(line)
+                    }
+                    Color.clear.frame(height: 1).id("bottom")
                 }
-                Spacer()
-                Button { copyAll() } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                }
-                .disabled(model.lines.isEmpty)
-                .help("Copy all output")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(model.lines.joined(separator: "\n"))
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .overlay(alignment: .bottom) {
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
-                }
-                .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
-                .onChange(of: model.lines.count) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-            }
-            HStack {
-                Button("Run Again") { model.start() }
-                    .disabled(model.isRunning)
-                Spacer()
-                Button(model.isRunning ? "Cancel" : "Close") {
-                    model.cancel()
-                    close()
-                }
-                .keyboardShortcut(.cancelAction)
+            .background(
+                RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                    .fill(AlexTheme.Colors.consoleBackground))
+            .overlay(
+                RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                    .strokeBorder(AlexTheme.Colors.cardBorder))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .onChange(of: model.lines.count) {
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
-        .padding(16)
-        .frame(width: 520, height: 340)
+    }
+
+    @ViewBuilder
+    private func resultRow(_ line: String) -> some View {
+        let kind = LineKind(line)
+        HStack(alignment: .firstTextBaseline, spacing: AlexTheme.Spacing.sm) {
+            StatusDot(tint: kind.dotTint, size: 5)
+                .padding(.top, 1)
+            Text(line)
+                .font(AlexTheme.Fonts.metaMono)
+                .foregroundStyle(kind.textColor)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Client-side classification of streamed `alexandria ping` lines
+    /// (✓/✗ marks survive; ANSI is stripped upstream).
+    private enum LineKind {
+        case command
+        case success
+        case failure
+        case summary
+        case plain
+
+        init(_ line: String) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("$") {
+                self = .command
+            } else if trimmed.hasPrefix("✓") {
+                self = .success
+            } else if trimmed.hasPrefix("✗") || trimmed.localizedCaseInsensitiveContains("error") {
+                self = .failure
+            } else if trimmed.hasPrefix("—") {
+                self = .summary
+            } else {
+                self = .plain
+            }
+        }
+
+        var dotTint: Color {
+            switch self {
+            case .command: AlexTheme.Colors.textFaintest
+            case .success: DisplayStatus.success.tint
+            case .failure: DisplayStatus.error.tint
+            case .summary: AlexTheme.Colors.textTertiary
+            case .plain: AlexTheme.Colors.textFaintest
+            }
+        }
+
+        var textColor: Color {
+            switch self {
+            case .command: AlexTheme.Colors.textTertiary
+            case .success: AlexTheme.Colors.foreground
+            case .failure: AlexTheme.Colors.destructive
+            case .summary: AlexTheme.Colors.textTertiary
+            case .plain: AlexTheme.Colors.textSecondary
+            }
+        }
+    }
+
+    // MARK: Footer
+
+    private var footer: some View {
+        HStack(spacing: AlexTheme.Spacing.md) {
+            PillButton(
+                title: "Run Again", variant: .bordered,
+                isEnabled: !model.isRunning
+            ) {
+                model.start()
+            }
+            Spacer()
+            PillButton(
+                title: model.isRunning ? "Cancel" : "Close", variant: .standard,
+                horizontalPadding: 12, verticalPadding: 5, cornerRadius: 6,
+                keyboardShortcut: .cancelAction
+            ) {
+                model.cancel()
+                close()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
     }
 }
 

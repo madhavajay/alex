@@ -48,44 +48,91 @@ struct GeminiKeyView: View {
     @Bindable var model: GeminiKeyModel
     let close: @MainActor @Sendable () -> Void
 
+    private static let keyPageUrl = "https://aistudio.google.com/apikey"
+
+    private var accent: Color {
+        AlexTheme.ProviderBrand.brand(for: "gemini").authAccent
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Set AI Studio API Key")
-                .font(.title2.bold())
-            Text("Paste a key from aistudio.google.com/apikey")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            SecureField("API key", text: $model.key)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12, design: .monospaced))
-                .onSubmit { if model.canSave { model.save(close: close) } }
-            if case .failed(let error) = model.stage {
-                Label(error, systemImage: "xmark.octagon.fill")
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                    .textSelection(.enabled)
-                    .lineLimit(3)
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 20) {
+                AuthIdentityHeader(
+                    provider: "gemini", title: "AI Studio", byline: "by Google",
+                    badgeText: "API Key")
+                Rectangle()
+                    .fill(AlexTheme.Colors.overlay(0.06))
+                    .frame(height: 1)
+                AuthStep(n: 1, title: "Create an API key in Google AI Studio.", accent: accent) {
+                    Button {
+                        if let url = URL(string: Self.keyPageUrl) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.up.forward")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("Open aistudio.google.com")
+                        }
+                    }
+                    .buttonStyle(AuthTintButtonStyle(accent: accent))
+                    .help(Self.keyPageUrl)
+                }
+                AuthStep(n: 2, title: "Paste the key here:", accent: accent) {
+                    SecureField("API key", text: $model.key)
+                        .textFieldStyle(.plain)
+                        .font(AlexTheme.Fonts.mono(12))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(AlexTheme.Colors.overlay(0.04)))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(AlexTheme.Colors.overlay(0.08)))
+                        .onSubmit { if model.canSave { model.save(close: close) } }
+                }
+                if case .failed(let error) = model.stage {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        StatusDot(status: .error, size: 7, glow: true)
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(AlexTheme.Colors.destructive)
+                            .textSelection(.enabled)
+                            .lineLimit(3)
+                    }
+                }
             }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .padding(.bottom, 20)
             Spacer(minLength: 0)
-            HStack {
+            HStack(spacing: 8) {
                 Spacer()
                 Button("Cancel") { close() }
+                    .buttonStyle(AuthFooterButtonStyle())
                     .keyboardShortcut(.cancelAction)
                 Button {
                     model.save(close: close)
                 } label: {
                     if model.stage == .saving {
-                        ProgressView().controlSize(.small)
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 34)
                     } else {
                         Text("Save")
                     }
                 }
+                .buttonStyle(AuthTintButtonStyle(accent: accent))
                 .keyboardShortcut(.defaultAction)
                 .disabled(!model.canSave)
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
-        .padding(20)
-        .frame(width: 420, height: 220, alignment: .topLeading)
+        .frame(width: 480, height: 380, alignment: .top)
+        .background(AlexTheme.Colors.background)
     }
 }
 

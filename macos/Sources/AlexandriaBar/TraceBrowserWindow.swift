@@ -40,6 +40,33 @@ final class TraceBrowserModel {
             queryChanged()
         }
     }
+    /// Quick status filter pills (All | Running | Error | Done) layered on top
+    /// of the omni query (mock TB App.tsx:313-326).
+    var statusPill = SessionStatusPill.all {
+        didSet { recomputeVisible() }
+    }
+
+    /// Transcript message filter row state (mock TB App.tsx:646-649).
+    var transcriptQuery = ""
+    var transcriptFilterTab = 0
+
+    /// Session id of a subagent the user followed via "Follow trace"; drives
+    /// the follow banner at the top of the transcript (mock TB App.tsx:652-672).
+    private(set) var followedSubagentId: String?
+
+    func followSubagent(_ id: String) {
+        guard sessions.contains(where: { $0.sessionId == id }) else {
+            // Fall back to the previous behavior: treat the id as a trace id.
+            openInspector(traceId: id)
+            return
+        }
+        selectFromUser(id)
+        followedSubagentId = id
+    }
+
+    func dismissFollowBanner() {
+        followedSubagentId = nil
+    }
 
     private(set) var userAtBottom = true
 
@@ -237,11 +264,32 @@ final class TraceBrowserModel {
     private func recomputeVisible() {
         let query = parsedQuery
         BarLog.measure(.browser, label: "filter sessions=\(sessions.count)") {
-            visibleRows = SessionTable.visibleRows(
+            let rows = SessionTable.visibleRows(
                 sessions: sessions, rowsById: rowsById, showPings: showPings,
                 query: query, serverMatches: searchSessionIds, sortOrder: sortOrder,
                 nestSubagents: nestSubagents, collapsedRoots: collapsedLineageRoots)
+            visibleRows = Self.applyStatusPill(statusPill, rows: rows)
         }
+    }
+
+    /// Keeps rows matching the pill plus any descendants of a kept row so a
+    /// nested lineage stays attached to its parent.
+    static func applyStatusPill(
+        _ pill: SessionStatusPill, rows: [SessionRow], now: Date = Date()
+    ) -> [SessionRow] {
+        guard pill != .all else { return rows }
+        var kept: [SessionRow] = []
+        var keptIds = Set<String>()
+        for row in rows {
+            if let parent = row.parentSessionId, keptIds.contains(parent) {
+                kept.append(row)
+                keptIds.insert(row.id)
+            } else if pill.matches(SessionDisplayStatus.status(for: row, now: now)) {
+                kept.append(row)
+                keptIds.insert(row.id)
+            }
+        }
+        return kept
     }
 
     func isLineageCollapsed(_ sessionId: String) -> Bool {
@@ -334,6 +382,22 @@ final class TraceBrowserModel {
         sessions.first { $0.sessionId == selectedSessionId }
     }
 
+    /// Total tool calls across the loaded transcript (header summary line).
+    var transcriptToolCount: Int {
+        turns.reduce(0) { $0 + TranscriptChatMessages.toolCount(for: $1) }
+    }
+
+    /// Child sessions spawned by the selected session (header summary line).
+    var transcriptSubagentCount: Int {
+        guard let sid = selectedSessionId else { return 0 }
+        return sessions.filter { $0.parentSessionId == sid }.count
+    }
+
+    /// Sum of input+output tokens across the loaded transcript (footer).
+    var transcriptTokensTotal: Int64 {
+        turns.reduce(0) { $0 + ($1.inputTokens ?? 0) + ($1.outputTokens ?? 0) }
+    }
+
     func start() {
         stop()
         sessionsTask = Task { [weak self] in
@@ -377,6 +441,7 @@ final class TraceBrowserModel {
 
     private func apply(_ change: SessionSelection.Change) {
         guard case .selected = change else { return }
+        followedSubagentId = nil
         resetTurns()
         setUserAtBottom(true)
         Task { await pollTranscript() }
@@ -729,6 +794,54 @@ private struct BuiltDocument: @unchecked Sendable {
     let ms: Int
 }
 
+/// Quick session status filter (mock TB App.tsx:259-260).
+enum SessionStatusPill: Int, CaseIterable {
+    case all
+    case running
+    case error
+    case done
+
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .running: "Running"
+        case .error: "Error"
+        case .done: "Done"
+        }
+    }
+
+    func matches(_ status: DisplayStatus) -> Bool {
+        switch self {
+        case .all: true
+        case .running: status == .running
+        case .error: status == .error
+        case .done: status == .success
+        }
+    }
+}
+
+/// Derives the mock's session status from real fields: errors → error,
+/// 0 turns → pending, recent activity → running, else success (spec §2.1).
+enum SessionDisplayStatus {
+    static let runningWindowMs: Int64 = 120_000
+
+    static func status(for row: SessionRow, now: Date = Date()) -> DisplayStatus {
+        if row.errors > 0 { return .error }
+        if row.turns == 0 { return .pending }
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        if nowMs - row.lastTsMs < runningWindowMs { return .running }
+        return .success
+    }
+}
+
+/// Local mirror of the session short-id rule used by `SessionRow` in Core.
+enum SessionShortId {
+    static func shorten(_ id: String, maxLength: Int = 22) -> String {
+        guard id.count > maxLength else { return id }
+        return "\(id.prefix(10))…\(id.suffix(8))"
+    }
+}
+
 struct TraceBrowserView: View {
     @Bindable var model: TraceBrowserModel
     @AppStorage("TraceBrowserDetailsOn") private var persistedDetailsOn = false
@@ -794,29 +907,36 @@ struct TraceBrowserView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 6) {
+            HStack(spacing: AlexTheme.Spacing.md) {
                 Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
                 TextField(
                     "Search — free text + model: harness: account: effort: duration: task: job: tag:key=value status: run: session:",
                     text: $model.queryText
                 )
                 .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .monospaced))
+                .font(AlexTheme.Fonts.mono(11))
+                .foregroundStyle(AlexTheme.Colors.foreground)
                 .onExitCommand { model.queryText = "" }
                 if !model.queryText.isEmpty {
                     Button {
                         model.queryText = ""
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
+            .padding(.horizontal, AlexTheme.Spacing.ml)
+            .frame(height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                    .fill(AlexTheme.Colors.surfaceHover))
+            .overlay(
+                RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                    .strokeBorder(AlexTheme.Colors.cardBorder))
             Label("Live", systemImage: "dot.radiowaves.left.and.right")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.green)
@@ -854,26 +974,19 @@ private struct TraceInspectorPlaceholderView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
+            PanelHeader(accentLeft: true) {
                 Text("Turn Details")
-                    .font(.system(size: 11, weight: .semibold))
-                Spacer()
-                Button {
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+            } right: {
+                PanelIconButton(systemImage: "xmark", help: "Close details") {
                     model.closeInspector()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Close details")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            Divider()
-            Text(model.selectedSessionId == nil ? "Select a session" : "No turn selected")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            EmptyStateView(
+                message: model.selectedSessionId == nil
+                    ? "Select a session" : "Select a message to inspect",
+                style: .panel(icon: "waveform.path.ecg"))
         }
     }
 }
@@ -1010,15 +1123,41 @@ private struct SessionListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PanelHeader {
+                Text("Sessions")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                PanelCountBadge(count: model.sessions.count)
+            }
+            statusPills
             ScrollViewReader { proxy in
                 table
                     .onChange(of: model.selectedSessionId) { _, id in
                         if let id { proxy.scrollTo(id) }
                     }
             }
-            Divider()
             footer
         }
+    }
+
+    private var statusPills: some View {
+        HStack(spacing: AlexTheme.Spacing.sm) {
+            SegmentedTabs(
+                tabs: SessionStatusPill.allCases.map(\.title),
+                selection: pillBinding, style: .bare)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+        }
+    }
+
+    private var pillBinding: Binding<Int> {
+        Binding(
+            get: { model.statusPill.rawValue },
+            set: { model.statusPill = SessionStatusPill(rawValue: $0) ?? .all })
     }
 
     private var table: some View {
@@ -1163,17 +1302,24 @@ private struct SessionListView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
+            Text("\(model.visibleRows.count) of \(model.sessions.count) sessions")
+                .font(AlexTheme.Fonts.mono(10))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
             if model.searchSessionIds != nil {
                 Text("\(model.searchMatchCount) matches · scanned \(model.searchScanned)")
-                    .foregroundStyle(.secondary)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
             }
             Spacer()
             Text("Right-click headers to show/hide columns")
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 10))
+                .foregroundStyle(AlexTheme.Colors.textFaint)
         }
-        .font(.system(size: 10))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .frame(height: AlexTheme.Metrics.footerHeight)
+        .overlay(alignment: .top) {
+            Rectangle().fill(AlexTheme.Colors.cardBorder).frame(height: 1)
+        }
     }
 
     private func numericCell(_ text: String) -> some View {
@@ -1215,29 +1361,58 @@ private struct SessionCellView: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            if nestSubagents, row.lineageDepth > 0 {
-                Spacer().frame(width: CGFloat(row.lineageDepth * 18))
+            if nestSubagents, row.lineageDepth > 1 {
+                Spacer().frame(width: CGFloat((row.lineageDepth - 1) * 18))
             }
             if nestSubagents, row.childCount > 0 {
                 Button(action: toggleLineage) {
-                    Image(systemName: lineageCollapsed ? "chevron.right" : "chevron.down")
+                    Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
-                        .frame(width: 10)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .rotationEffect(.degrees(lineageCollapsed ? 0 : 90))
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help(lineageCollapsed ? "Show sub-agents" : "Hide sub-agents")
             } else if nestSubagents, row.lineageDepth > 0 {
-                Image(systemName: "arrow.turn.down.right")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 10)
+                // Tree connector: 1×12 vertical + 8×1 horizontal bar
+                // (mock TB App.tsx:216-219).
+                HStack(spacing: 3) {
+                    Rectangle()
+                        .fill(AlexTheme.Colors.textFaintest)
+                        .frame(width: 1, height: 12)
+                        .offset(y: -3)
+                    Rectangle()
+                        .fill(AlexTheme.Colors.textFaintest)
+                        .frame(width: 8, height: 1)
+                }
+                .padding(.leading, 4)
+                .frame(width: 16, alignment: .leading)
+            } else {
+                Color.clear.frame(width: 16, height: 1)
             }
-            SessionIdentityIconsView(
-                harness: row.harnessRaw, tags: row.tags, providers: row.providers, size: 16)
+            StatusDot(status: SessionDisplayStatus.status(for: row))
+            HarnessIconView(
+                harness: row.harnessRaw, tags: row.tags, size: 17, showsFallback: true)
+            if let provider = SessionIdentity.primaryProvider(
+                providers: row.providers, harness: row.harnessRaw, tags: row.tags)
+            {
+                ProviderBadgeView(provider: provider, size: 17, style: .tinted)
+            }
             Text(row.sessionShort)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .font(AlexTheme.Fonts.mono(11))
+                .kerning(0.11)
+                .foregroundStyle(AlexTheme.Colors.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if let firstModel = row.models
+                .split(separator: ",").first
+                .map({ $0.trimmingCharacters(in: .whitespaces) }),
+                !firstModel.isEmpty
+            {
+                ModelBadge(model: firstModel)
+            }
             if nestSubagents, row.lineageDepth > 0 {
                 Text(SessionIdentity.subagentLabel)
                     .font(.system(size: 9, weight: .medium))
@@ -1285,16 +1460,22 @@ private struct SessionCellView: View {
 private struct TranscriptView: View {
     @Bindable var model: TraceBrowserModel
     @AppStorage("SessionInfoExpanded") private var infoExpanded = false
+    @AppStorage("TranscriptClassicPane") private var classicPane = false
     @State private var showSystemPrompt = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             if infoExpanded, model.selectedSession != nil {
-                Divider()
                 SessionInfoCard(model: model)
+                Divider()
             }
-            Divider()
+            if !classicPane, model.selectedSession != nil {
+                filterRow
+            }
+            if let followed = model.followedSubagentId {
+                followBanner(followed)
+            }
             if model.hiddenTurnCount > 0 {
                 Button("Load earlier turns (\(model.hiddenTurnCount) more)") {
                     model.loadEarlierTurns()
@@ -1306,7 +1487,11 @@ private struct TranscriptView: View {
                 Divider()
             }
             ZStack(alignment: .bottom) {
-                TranscriptTextPane(model: model)
+                if classicPane {
+                    TranscriptTextPane(model: model)
+                } else {
+                    TranscriptChatPane(model: model)
+                }
                 if model.turns.isEmpty {
                     Text(model.selectedSessionId == nil ? "Select a session" : "No turns yet")
                         .font(.system(size: 11))
@@ -1347,61 +1532,90 @@ private struct TranscriptView: View {
                 }
                 .padding(.bottom, 12)
             }
+            if !classicPane {
+                transcriptFooter
+            }
         }
     }
 
+    private var filterRow: some View {
+        FilterRow {
+            SearchField(text: $model.transcriptQuery, placeholder: "Filter messages…")
+            SegmentedTabs(
+                tabs: TranscriptChatEntries.filterTabs,
+                selection: $model.transcriptFilterTab, style: .contained)
+        }
+    }
+
+    private func followBanner(_ sessionId: String) -> some View {
+        HStack(spacing: AlexTheme.Spacing.lg) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 13))
+                .foregroundStyle(AlexTheme.Colors.primary)
+            (Text("Following subagent ")
+                .font(.system(size: 11))
+                .foregroundColor(AlexTheme.Colors.textSecondary)
+                + Text(SessionShortId.shorten(sessionId))
+                .font(AlexTheme.Fonts.mono(11))
+                .foregroundColor(AlexTheme.Colors.primaryBright))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+            Button {
+                model.dismissFollowBanner()
+            } label: {
+                Text("Dismiss")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.xl)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            AlexTheme.Colors.primary.opacity(0.12),
+                            AlexTheme.Colors.indigo.opacity(0.08),
+                        ],
+                        startPoint: .topLeading, endPoint: .bottomTrailing)))
+        .overlay(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.xl)
+                .strokeBorder(AlexTheme.Colors.primary.opacity(0.3)))
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
+    }
+
+    private var transcriptFooter: some View {
+        let total = TranscriptChatEntries.entries(
+            turns: model.turns, filterTab: 0, query: "").count
+        let shown = TranscriptChatEntries.entries(
+            turns: model.turns, filterTab: model.transcriptFilterTab,
+            query: model.transcriptQuery).count
+        return SessionListFooter(
+            text: "\(shown) of \(total) messages",
+            showsDot: true,
+            trailingText: "\(TraceFormat.tokens(model.transcriptTokensTotal)) tokens total")
+    }
+
     private var header: some View {
-        HStack(spacing: 8) {
+        PanelHeader(accentLeft: true) {
             if let session = model.selectedSession {
-                HarnessIconView(harness: session.harness, tags: session.tags, size: 18)
-                Image(systemName: "dot.radiowaves.left.and.right")
-                    .foregroundStyle(.green)
-                    .help("Live — this transcript refreshes automatically")
-                Text(session.sessionId)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                if let accountName = model.accountNames(session.accountIds ?? []) {
-                    Text(accountName)
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Color.accentColor)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.12)))
-                        .help(model.accountIdentity(session.accountIds ?? []) ?? accountName)
-                }
-                let chips = SessionTagChips.chips(
-                    tags: session.tags, harness: session.harness, models: session.models)
-                ForEach(chips, id: \.key) { chip in
-                    TagChipView(text: chip.label())
-                }
-                if let models = session.models, !models.isEmpty {
-                    Text(models.joined(separator: ", "))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                if let cost = session.totalCostUsd, cost > 0 {
-                    Text(TraceFormat.cost(cost))
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-                if let runId = session.runId, !runId.isEmpty {
-                    Text("run \(runId)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: 120)
-                }
-                Spacer()
-                Text("\(model.turns.count) turn\(model.turns.count == 1 ? "" : "s")")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                headerLeft(session)
+            } else {
+                Text("No session selected")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+        } right: {
+            if let session = model.selectedSession {
+                CopyButton(value: session.sessionId, label: "Copy ID")
                 Toggle("Raw", isOn: $model.transcriptRawMode)
                     .toggleStyle(.checkbox)
                     .controlSize(.mini)
@@ -1409,49 +1623,99 @@ private struct TranscriptView: View {
                     .fixedSize()
                     .help("Show exact wire text without JSON formatting")
                 if model.sessionSystemPrompt != nil {
-                    Button {
+                    PanelIconButton(systemImage: "doc.text", help: "View system prompt") {
                         showSystemPrompt = true
-                    } label: {
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .help("View system prompt")
                     .popover(isPresented: $showSystemPrompt) {
                         SystemPromptView(
                             prompt: model.sessionSystemPrompt ?? "",
                             modelName: model.selectedSession?.models?.first)
                     }
                 }
-                Button {
+                PanelIconButton(
+                    systemImage: "magnifyingglass", help: "Find in transcript (⌘F)"
+                ) {
                     model.requestFind()
-                } label: {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Find in transcript (⌘F)")
-                Button {
+                PanelIconButton(
+                    systemImage: infoExpanded ? "chevron.up" : "chevron.down",
+                    help: infoExpanded ? "Hide session info" : "Show session info"
+                ) {
                     infoExpanded.toggle()
                     if infoExpanded { model.ensureFirstTraceDetail() }
-                } label: {
-                    Image(systemName: infoExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help(infoExpanded ? "Hide session info" : "Show session info")
-            } else {
-                Text("No session selected")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Spacer()
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+    }
+
+    @ViewBuilder
+    private func headerLeft(_ session: TraceSession) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.primary.opacity(0.15))
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(AlexTheme.Colors.primary.opacity(0.22))
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(AlexTheme.Colors.primary)
+        }
+        .frame(width: 30, height: 30)
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: AlexTheme.Spacing.sm) {
+                Text(SessionShortId.shorten(session.sessionId))
+                    .font(AlexTheme.Fonts.mono(11, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(session.sessionId)
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.system(size: 9))
+                    .foregroundStyle(AlexTheme.Colors.success)
+                    .help("Live — this transcript refreshes automatically")
+            }
+            Text(headerSubtitle(session))
+                .font(.system(size: 10))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        if let firstModel = session.models?.first {
+            ModelBadge(model: firstModel)
+        }
+        if let accountName = model.accountNames(session.accountIds ?? []) {
+            Text(accountName)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(AlexTheme.Colors.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(AlexTheme.Colors.primary.opacity(0.12)))
+                .help(model.accountIdentity(session.accountIds ?? []) ?? accountName)
+        }
+        let chips = SessionTagChips.chips(
+            tags: session.tags, harness: session.harness, models: session.models)
+        ForEach(chips, id: \.key) { chip in
+            TagChipView(text: chip.label())
+        }
+    }
+
+    private func headerSubtitle(_ session: TraceSession) -> String {
+        let toolCount = model.transcriptToolCount
+        let agentCount = model.transcriptSubagentCount
+        var parts = [
+            "\(model.turns.count) turn\(model.turns.count == 1 ? "" : "s")",
+            "\(toolCount) tool\(toolCount == 1 ? "" : "s")",
+            "\(agentCount) subagent\(agentCount == 1 ? "" : "s")",
+        ]
+        if let cost = session.totalCostUsd, cost > 0 {
+            parts.append(TraceFormat.cost(cost))
+        }
+        if let runId = session.runId, !runId.isEmpty {
+            parts.append("run \(runId)")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
