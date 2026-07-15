@@ -272,31 +272,32 @@ build_body() {
 # fields: id|client_format|endpoint|model|provider|format_prefix|bucket|needs|stream|cross|routed_model|dario
 wire_cells() {
   cat <<'EOF'
-W1|anthropic|/v1/messages|claude-opus-4-8|anthropic|anthropic|subscription|anthropic|0|0|claude-opus-4-8|0
+W1|anthropic|/v1/messages|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|0
 W2|anthropic|/v1/messages|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|1|0|claude-haiku-4-5|0
-W3|openai-responses|/v1/responses|gpt-5.5|openai|openai-responses|subscription|openai|1|0|gpt-5.5|0
-W4|openai-responses|/v1/responses|gpt-5.5|openai|openai-responses|subscription|openai|0|0|gpt-5.5|0
-W5|openai-chat|/v1/chat/completions|gpt-5.5|openai|openai-|subscription|openai|0|0|gpt-5.5|0
-W6|anthropic|/v1/messages|gpt-5.5|openai|openai-|subscription|openai|0|1|gpt-5.5|0
-W7|openai-chat|/v1/chat/completions|claude-opus-4-8|anthropic|anthropic|subscription|anthropic|0|1|claude-opus-4-8|0
-W8|openai-responses|/v1/responses|claude-opus-4-8|anthropic|anthropic|subscription|anthropic|0|1|claude-opus-4-8|0
+W3|openai-responses|/v1/responses|gpt-5.6-luna|openai|openai-responses|subscription|openai|1|0|gpt-5.6-luna|0
+W4|openai-responses|/v1/responses|gpt-5.6-luna|openai|openai-responses|subscription|openai|0|0|gpt-5.6-luna|0
+W5|openai-chat|/v1/chat/completions|gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
+W6|anthropic|/v1/messages|gpt-5.6-luna|openai|openai-|subscription|openai|0|1|gpt-5.6-luna|0
+W7|openai-chat|/v1/chat/completions|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|1|claude-haiku-4-5|0
+W8|openai-responses|/v1/responses|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|1|claude-haiku-4-5|0
 W9|openai-chat|/v1/chat/completions|grok-code-fast-1|xai|openai-|subscription|xai|0|0|grok-code-fast-1|0
-W10|anthropic|/v1/messages|claude-opus-4-8|anthropic|anthropic|subscription|anthropic|0|0|claude-opus-4-8|1
-W11a|openai-chat|/v1/chat/completions|alexandria/gpt-5.5|openai|openai-|subscription|openai|0|0|gpt-5.5|0
-W11b|anthropic|/v1/messages|opus-4.8|anthropic|anthropic|subscription|anthropic|0|0|claude-opus-4-8|0
-W12|gemini|/v1beta/models/gpt-5.5:generateContent|gpt-5.5|openai|openai-|subscription|openai|0|1|gpt-5.5|0
-W13|gemini|/v1beta/models/gpt-5.5:streamGenerateContent?alt=sse|gpt-5.5|openai|openai-|subscription|openai|1|1|gpt-5.5|0
+W10|anthropic|/v1/messages|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|1
+W11a|openai-chat|/v1/chat/completions|alexandria/gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
+W11b|anthropic|/v1/messages|haiku-4.5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|0
+W12|gemini|/v1beta/models/gpt-5.6-luna:generateContent|gpt-5.6-luna|openai|openai-|subscription|openai|0|1|gpt-5.6-luna|0
+W13|gemini|/v1beta/models/gpt-5.6-luna:streamGenerateContent?alt=sse|gpt-5.6-luna|openai|openai-|subscription|openai|1|1|gpt-5.6-luna|0
+W14|openai-chat|/v1/chat/completions|openrouter/google/gemma-4-26b-a4b-it:free|openrouter|openai-|api|openrouter|0|0|google/gemma-4-26b-a4b-it:free|0
 EOF
 }
 
 # fields: id|harness|model|needs
 harness_cells() {
   cat <<'EOF'
-H1|claude|claude-opus-4-8|anthropic
-H2|claude|gpt-5.5|openai
-H3|codex|gpt-5.5|openai
-H4|codex|claude-opus-4-8|anthropic
-H5|grok-build|gpt-5.5|openai
+H1|claude|claude-haiku-4-5|anthropic
+H2|claude|gpt-5.6-luna|openai
+H3|codex|gpt-5.6-luna|openai
+H4|codex|claude-haiku-4-5|anthropic
+H5|grok-build|gpt-5.6-luna|openai
 H6|grok-build|grok-code-fast-1|xai
 EOF
 }
@@ -398,9 +399,10 @@ preflight_provider() {
     return 0
   fi
   case "$p" in
-    anthropic) ep="/v1/messages";        body=$(build_body anthropic claude-haiku-4-5 0 16) ;;
-    openai)    ep="/v1/responses";       body=$(build_body openai-responses gpt-5.5 0) ;;
-    xai)       ep="/v1/chat/completions"; body=$(build_body openai-chat grok-code-fast-1 0) ;;
+    anthropic)  ep="/v1/messages";        body=$(build_body anthropic claude-haiku-4-5 0 16) ;;
+    openai)     ep="/v1/responses";       body=$(build_body openai-responses gpt-5.6-luna 0) ;;
+    xai)        ep="/v1/chat/completions"; body=$(build_body openai-chat grok-code-fast-1 0) ;;
+    openrouter) ep="/v1/chat/completions"; body=$(build_body openai-chat "openrouter/google/gemma-4-26b-a4b-it:free" 0) ;;
     *)
       printf 'SKIP|0|no preflight ping defined for provider %s\n' "$p" > "$PRE/$p"
       return 0
@@ -620,7 +622,7 @@ run_dario_tier() {
   if dario_active; then
     write_result DARIO PASS 0 "active generation reported by /admin/dario"
     if [ ! -f "$RESULTS/W10.res" ] && in_only W10; then
-      ( set +e; run_wire_cell W10 anthropic /v1/messages claude-opus-4-8 anthropic anthropic subscription 0 0 claude-opus-4-8 1 ) || true
+      ( set +e; run_wire_cell W10 anthropic /v1/messages claude-haiku-4-5 anthropic anthropic subscription 0 0 claude-haiku-4-5 1 ) || true
     fi
   else
     write_result DARIO SKIP 0 "dario unavailable (/admin/dario 404 or no active generation)"
