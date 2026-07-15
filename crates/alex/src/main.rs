@@ -3822,20 +3822,7 @@ async fn wrap_run_cmd(
             .and_then(|a| a.api_key.or(a.access_token))
     };
     let amp_billing_account = if harness == "amp" {
-        vault
-            .list()
-            .await
-            .into_iter()
-            .find(|account| {
-                account.provider == alex_core::Provider::Amp
-                    && account.status == "active"
-                    && account
-                        .api_key
-                        .as_deref()
-                        .or(account.access_token.as_deref())
-                        == credential_override.as_deref()
-            })
-            .map(|account| known_account(&account))
+        active_amp_account(&vault.list().await)
     } else {
         None
     };
@@ -5166,12 +5153,7 @@ async fn traces_repair_amp_cmd(
     .to_string();
     let vault = open_vault(config)?;
     let _ = alex_auth::import_amp(&vault).await;
-    let billing_account = vault
-        .list()
-        .await
-        .into_iter()
-        .find(|account| account.provider == alex_core::Provider::Amp && account.status == "active")
-        .map(|account| known_account(&account));
+    let billing_account = active_amp_account(&vault.list().await);
     let mut state = AmpWsTraceState::new(
         config.data_dir.clone(),
         run_id.clone(),
@@ -5694,6 +5676,25 @@ fn known_account(account: &alex_auth::Account) -> KnownAccount {
         account.subscription_identity(),
         account.email(),
     )
+}
+
+/// Pick the active Amp account from a vault snapshot for trace billing
+/// attribution.
+///
+/// This mirrors how every other provider attributes wrap/proxy traces to an
+/// account: look up the vault's active account for the provider, not a
+/// byte-for-byte match against a freshly re-resolved credential string. The
+/// wrap runtime prefers `AMP_API_KEY` (or other env overrides) over the
+/// on-disk `secrets.json` value when it launches the harness process, so
+/// comparing that resolved credential against the vault's stored key was
+/// fragile: any divergence between the two resolution paths (env override in
+/// scope, a key rotated moments apart, etc.) silently dropped attribution
+/// even though `import_amp` had just upserted a matching account.
+fn active_amp_account(accounts: &[alex_auth::Account]) -> Option<KnownAccount> {
+    accounts
+        .iter()
+        .find(|account| account.provider == alex_core::Provider::Amp && account.status == "active")
+        .map(known_account)
 }
 
 async fn traces_reattach_cmd(
@@ -8768,6 +8769,62 @@ mod tests {
                 "what is the weather like in Spain"
             ]
         );
+    }
+
+    fn amp_account(id: &str, status: &str, api_key: Option<&str>) -> alex_auth::Account {
+        alex_auth::Account {
+            id: id.into(),
+            provider: alex_core::Provider::Amp,
+            kind: "api_key".into(),
+            name: "amp".into(),
+            description: None,
+            paused: false,
+            label: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+            api_key: api_key.map(String::from),
+            expires_at_ms: None,
+            last_refresh_ms: None,
+            account_meta: serde_json::json!({}),
+            cooldown_until_ms: None,
+            status: status.into(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn active_amp_account_attributes_without_requiring_a_credential_match() {
+        // The wrap runtime may launch the harness with a freshly resolved
+        // credential (env override, or a key re-read from secrets.json a
+        // moment after `import_amp` ran) that no longer matches the vault's
+        // stored api_key byte-for-byte. Attribution must not depend on that
+        // match — it should simply pick the active Amp account, the same way
+        // every other provider is attributed.
+        let accounts = vec![amp_account(
+            "amp-api-key",
+            "active",
+            Some("stale-key-that-does-not-match-anything-live"),
+        )];
+        let account = active_amp_account(&accounts).expect("active amp account found");
+        assert_eq!(account.account_id, "amp-api-key");
+        assert_eq!(account.provider, "amp");
+    }
+
+    #[test]
+    fn active_amp_account_skips_paused_or_removed_accounts() {
+        let accounts = vec![
+            amp_account("amp-old", "removed", Some("old-key")),
+            amp_account("amp-api-key", "active", Some("current-key")),
+        ];
+        let account = active_amp_account(&accounts).expect("active amp account found");
+        assert_eq!(account.account_id, "amp-api-key");
+    }
+
+    #[test]
+    fn active_amp_account_returns_none_without_an_active_account() {
+        let accounts = vec![amp_account("amp-old", "removed", Some("old-key"))];
+        assert!(active_amp_account(&accounts).is_none());
     }
 
     #[test]
