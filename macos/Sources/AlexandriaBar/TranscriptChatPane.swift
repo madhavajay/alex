@@ -11,18 +11,27 @@ struct TranscriptChatPane: View {
     private static let bottomAnchor = "transcript-bottom"
 
     var body: some View {
-        let entries = TranscriptChatEntries.entries(
-            turns: model.turns, filterTab: model.transcriptFilterTab,
-            query: model.transcriptQuery)
+        // Filtering runs off the main actor and is debounced by the model
+        // (TraceBrowserModel.scheduleTranscriptFilter) — this view just
+        // renders the latest cached result instead of recomputing it on
+        // every keystroke (that synchronous, uncapped recompute used to
+        // freeze the window on large sessions).
+        let entries = model.transcriptEntries
+        // Displayed role per entry (user / harness tool-result / assistant)
+        // resolved once up front: role-change dividers and thread connectors
+        // need the *actual* rendered role, not just which half of the turn
+        // the entry structurally belongs to (a "user"-slot entry can render
+        // as `.harness` — see `TranscriptChatMessages.messages`).
+        let messages = entries.map { displayMessage($0) }
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
                         entryView(
-                            entry,
-                            roleChanged: index > 0 && entries[index - 1].role != entry.role,
+                            entry, message: messages[index],
+                            roleChanged: index > 0 && messages[index - 1]?.role != messages[index]?.role,
                             isThreaded: index + 1 < entries.count
-                                && entries[index + 1].role == entry.role)
+                                && messages[index + 1]?.role == messages[index]?.role)
                     }
                     if entries.isEmpty, !model.turns.isEmpty {
                         EmptyStateView(message: "No messages match")
@@ -60,19 +69,22 @@ struct TranscriptChatPane: View {
 
     @ViewBuilder
     private func entryView(
-        _ entry: TranscriptChatEntry, roleChanged: Bool, isThreaded: Bool
+        _ entry: TranscriptChatEntry, message: MessageDisplay?, roleChanged: Bool, isThreaded: Bool
     ) -> some View {
-        if roleChanged {
-            RoleChangeDivider(role: entry.role)
-        }
-        if let message = displayMessage(entry) {
+        if let message {
+            if roleChanged {
+                RoleChangeDivider(role: message.role)
+            }
             let selected = model.inspectorTraceId == entry.turn.traceId
             MessageBubble(
                 message: message,
                 selected: selected,
                 onSelect: { model.openInspector(traceId: entry.turn.traceId) },
                 onFollowSubagent: { model.followSubagent($0) },
-                onViewToolBody: { id, kind in model.openToolBody(id: id, kind: kind) })
+                onViewToolBody: { id, kind in model.openToolBody(id: id, kind: kind) },
+                fetchToolBodyText: { id, kind in
+                    try? await model.fetchToolBody(id: id, kind: kind).text
+                })
                 .overlay(alignment: entry.role == .user ? .topLeading : .topTrailing) {
                     if isThreaded {
                         threadConnector(role: entry.role)
@@ -92,9 +104,18 @@ struct TranscriptChatPane: View {
     private func displayMessage(_ entry: TranscriptChatEntry) -> MessageDisplay? {
         let session = model.selectedSession
         let harnessName = HarnessName.display(harness: session?.harness, tags: session?.tags)
+        // `entry.turnNumber` is 1-based; the previous turn (whose tool
+        // call(s) a "[tool result]" user message answers) sits one index
+        // back in `model.turns`.
+        let previousTurn = model.turns.indices.contains(entry.turnNumber - 2)
+            ? model.turns[entry.turnNumber - 2] : nil
         let messages = TranscriptChatMessages.messages(
-            for: entry.turn, harnessName: harnessName)
-        guard var message = messages.first(where: { $0.role == entry.role }) else {
+            for: entry.turn, harnessName: harnessName, previousTurn: previousTurn)
+        // `entry.role` only distinguishes which half of the turn this slot
+        // is (structural), while the resolved message may be `.harness`
+        // instead of `.user` for that same slot — match on "assistant half
+        // vs. not" rather than exact role equality.
+        guard var message = messages.first(where: { entry.role == .assistant ? $0.role == .assistant : $0.role != .assistant }) else {
             return nil
         }
         // Turn-number gutter (mock TB App.tsx:534-539). MessageBubble has no
@@ -122,25 +143,39 @@ struct TranscriptChatPane: View {
     }
 }
 
-/// Centered "USER"/"MODEL" divider between role groups
-/// (mock TB App.tsx:685-696).
+/// Centered "USER"/"HARNESS"/"MODEL" divider between role groups (mock TB
+/// App.tsx:685-696; "HARNESS" added so a tool-result reply visibly breaks
+/// from a plain user message even though both are the "user" slot of a turn).
 private struct RoleChangeDivider: View {
     let role: MessageDisplay.Role
 
     var body: some View {
         HStack(spacing: AlexTheme.Spacing.lg) {
             line
-            Text(role == .user ? "USER" : "MODEL")
+            Text(label)
                 .font(AlexTheme.Fonts.mono(9.5, weight: .semibold))
                 .tracking(0.66)
-                .foregroundStyle(
-                    role == .user
-                        ? AlexTheme.Colors.textTertiary
-                        : AlexTheme.Colors.primary.opacity(0.5))
+                .foregroundStyle(tint)
             line
         }
         .padding(.horizontal, AlexTheme.Spacing.xl)
         .padding(.vertical, AlexTheme.Spacing.ml)
+    }
+
+    private var label: String {
+        switch role {
+        case .user: "USER"
+        case .harness: "HARNESS"
+        case .assistant: "MODEL"
+        }
+    }
+
+    private var tint: Color {
+        switch role {
+        case .user: AlexTheme.Colors.textTertiary
+        case .harness: AlexTheme.Colors.warningOrange
+        case .assistant: AlexTheme.Colors.primary.opacity(0.5)
+        }
     }
 
     private var line: some View {
@@ -162,68 +197,13 @@ struct TranscriptChatEntry: Identifiable {
     }
 }
 
-/// Flattens turns into filterable message entries. Mirrors the message
-/// presence rules of `TranscriptChatMessages.messages(for:harnessName:)`
-/// without building the (heavier) display structs.
+/// Segmented-tab labels for the transcript filter row. The actual filtering
+/// (which used to live here as a synchronous, uncapped full-text scan run on
+/// every keystroke — the root cause of a window freeze on large sessions) now
+/// lives in `TranscriptFilter` (AlexandriaBarCore), invoked off the main
+/// actor and debounced by `TraceBrowserModel.scheduleTranscriptFilter`.
 enum TranscriptChatEntries {
-    static let filterTabs = ["All", "User", "Model", "Tools", "Agents"]
-
-    static func entries(
-        turns: [TranscriptTurn], filterTab: Int, query: String
-    ) -> [TranscriptChatEntry] {
-        var out: [TranscriptChatEntry] = []
-        for (index, turn) in turns.enumerated() {
-            if hasUserMessage(turn),
-                matches(role: .user, turn: turn, filterTab: filterTab, query: query)
-            {
-                out.append(
-                    TranscriptChatEntry(turn: turn, turnNumber: index + 1, role: .user))
-            }
-            if hasAssistantMessage(turn),
-                matches(role: .assistant, turn: turn, filterTab: filterTab, query: query)
-            {
-                out.append(
-                    TranscriptChatEntry(turn: turn, turnNumber: index + 1, role: .assistant))
-            }
-        }
-        return out
-    }
-
-    static func hasUserMessage(_ turn: TranscriptTurn) -> Bool {
-        turn.user?.isEmpty == false
-    }
-
-    static func hasAssistantMessage(_ turn: TranscriptTurn) -> Bool {
-        !TranscriptChatMessages.assistantText(turn).isEmpty
-            || hasTools(turn)
-            || turn.error?.isEmpty == false
-    }
-
-    static func hasTools(_ turn: TranscriptTurn) -> Bool {
-        let blocks = turn.assistantBlocks ?? []
-        if blocks.contains(where: { $0.type == "tool_call" }) { return true }
-        if blocks.isEmpty, turn.toolCalls?.isEmpty == false { return true }
-        return turn.executedTools?.isEmpty == false
-    }
-
-    static func matches(
-        role: MessageDisplay.Role, turn: TranscriptTurn, filterTab: Int, query: String
-    ) -> Bool {
-        switch filterTab {
-        case 1: guard role == .user else { return false }
-        case 2: guard role == .assistant else { return false }
-        case 3: guard role == .assistant, hasTools(turn) else { return false }
-        case 4: return false  // Agents: per-message subagent data has no source yet.
-        default: break
-        }
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return true }
-        let text = role == .user
-            ? (turn.user ?? "")
-            : [TranscriptChatMessages.assistantText(turn), turn.error ?? ""]
-                .joined(separator: "\n")
-        return text.localizedCaseInsensitiveContains(trimmed)
-    }
+    static let filterTabs = TranscriptFilter.filterTabs
 }
 
 /// Maps the transcript wire model onto DesignSystem display structs. Reuses the
@@ -231,18 +211,22 @@ enum TranscriptChatEntries {
 /// blocks, tool calls paired with executions via ToolLifecycle).
 enum TranscriptChatMessages {
     @MainActor
-    static func messages(for turn: TranscriptTurn, harnessName: String) -> [MessageDisplay] {
+    static func messages(
+        for turn: TranscriptTurn, harnessName: String, previousTurn: TranscriptTurn? = nil
+    ) -> [MessageDisplay] {
         var out: [MessageDisplay] = []
         if let text = turn.user, !text.isEmpty {
             let toolBody = TurnHeader.toolResultBody(text)
+            let isHarness = toolBody != nil
             out.append(MessageDisplay(
                 id: turn.traceId + "#user",
                 turnId: turn.traceId,
-                role: .user,
-                roleLabel: TurnHeader.requestLabel(
-                    harness: harnessName, isToolResult: toolBody != nil),
+                role: isHarness ? .harness : .user,
+                roleLabel: isHarness
+                    ? TurnHeader.harnessResultLabel(toolName: pairedToolName(previousTurn))
+                    : TurnHeader.requestLabel(harness: harnessName),
                 content: cap(toolBody ?? text),
-                isMonospaced: toolBody != nil,
+                isMonospaced: isHarness,
                 timestamp: TraceFormat.time(turn.tsRequestMs),
                 tokenText: ChatDisplayFormat.tokenLabel(turn.inputTokens)))
         }
@@ -279,6 +263,18 @@ enum TranscriptChatMessages {
             .joined(separator: "\n\n")
     }
 
+    /// The tool name to show alongside "Harness · tool result" when it can
+    /// be identified unambiguously: the previous turn's assistant made the
+    /// tool call(s) this turn's "[tool result]" user text answers. Only
+    /// resolves a name when the previous turn made exactly one distinct
+    /// tool call — with more than one in flight, attributing the result to
+    /// a specific one would be a guess.
+    static func pairedToolName(_ previousTurn: TranscriptTurn?) -> String? {
+        guard let previousTurn else { return nil }
+        let names = Set(toolRequests(for: previousTurn).map(\.name))
+        return names.count == 1 ? names.first : nil
+    }
+
     static func toolRequests(for turn: TranscriptTurn) -> [AlexandriaBarCore.ToolCall] {
         let blocks = turn.assistantBlocks ?? []
         if blocks.isEmpty {
@@ -311,7 +307,12 @@ enum TranscriptChatMessages {
     ) -> ToolCallDisplay {
         let execution = lifecycle.execution
         let arguments = lifecycle.request?.arguments
-        let input = arguments.map { AlexandriaBarCore.ToolCall.summary($0) } ?? ""
+        // Single-string-arg tools (Bash's "command", Read's "file_path", …)
+        // render as the plain string, not escaped JSON; multi-argument
+        // calls still get the full pretty-printed object.
+        let input = arguments.map {
+            ChatDisplayFormat.meaningfulArgumentText($0) ?? AlexandriaBarCore.ToolCall.summary($0)
+        } ?? ""
         return ToolCallDisplay(
             id: execution?.id
                 ?? lifecycle.request?.id

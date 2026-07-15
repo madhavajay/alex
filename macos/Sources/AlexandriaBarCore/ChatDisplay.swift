@@ -28,6 +28,25 @@ public enum ChatDisplayFormat {
         return singleLine(JsonNice.scalarText(first.value))
     }
 
+    /// A tool call's single meaningful argument rendered as plain text (not
+    /// escaped JSON) when the arguments are "single-string-arg" shaped:
+    /// exactly one key, and that key is one of `previewKeyPriority`. E.g.
+    /// for `{"command": "cargo test -p alex"}` this returns
+    /// `cargo test -p alex` rather than the pretty-printed JSON object, so
+    /// tools like Bash/Read/Grep read naturally in the transcript's Input
+    /// tab. Returns nil (callers should fall back to pretty JSON) for
+    /// multi-argument calls, where hiding the other arguments would lose
+    /// information.
+    public static func meaningfulArgumentText(_ arguments: String) -> String? {
+        let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            obj.count == 1, let onlyKey = obj.keys.first,
+            previewKeyPriority.contains(onlyKey), let value = obj[onlyKey] as? String
+        else { return nil }
+        return value
+    }
+
     /// Sub-second durations render as milliseconds ("42ms"); longer ones as
     /// seconds with one decimal ("3.2s").
     public static func toolDuration(startMs: Int64, endMs: Int64?) -> String? {

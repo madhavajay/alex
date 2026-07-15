@@ -1,4 +1,5 @@
 import SwiftUI
+import AlexandriaBarCore
 
 /// Collapsible tool-call row: icon, name, first-argument preview, duration,
 /// status; expands into an Input/Output tab view with mono content.
@@ -6,8 +7,18 @@ struct ToolCallCard: View {
     let tool: ToolCallDisplay
     var onViewArgs: (() -> Void)?
     var onViewOutput: (() -> Void)?
+    /// Falls back to the captured execution body when the wire-parsed
+    /// arguments/result were empty (root cause of "(no input)" showing even
+    /// though "View captured args" had real content: the inline tabs only
+    /// ever rendered the wire args, never the captured body).
+    var loadArgsBody: (() async -> String?)?
+    var loadOutputBody: (() async -> String?)?
 
     @State private var tab = 0
+    @State private var capturedArgs: String?
+    @State private var capturedOutput: String?
+    @State private var loadingArgs = false
+    @State private var loadingOutput = false
 
     var body: some View {
         CollapsibleCard {
@@ -15,6 +26,7 @@ struct ToolCallCard: View {
         } expanded: {
             expandedContent
         }
+        .task(id: tool.id) { await loadCapturedIfNeeded() }
     }
 
     private var headerContent: some View {
@@ -27,7 +39,7 @@ struct ToolCallCard: View {
                 .font(AlexTheme.Fonts.metaLabel)
                 .foregroundStyle(AlexTheme.Colors.foreground)
                 .lineLimit(1)
-            if let preview = tool.argumentPreview, !preview.isEmpty {
+            if let preview = headerPreview, !preview.isEmpty {
                 Text(preview)
                     .font(AlexTheme.Fonts.mono(11))
                     .foregroundStyle(AlexTheme.Colors.mutedForeground)
@@ -81,11 +93,52 @@ struct ToolCallCard: View {
         }
     }
 
-    private var paneText: String {
-        if tab == 0 {
-            return tool.input.isEmpty ? "(no input)" : tool.input
+    private var paneText: String { tab == 0 ? inputText : outputText }
+
+    /// Header preview prefers the wire-parsed summary; once the captured
+    /// args body loads (only fetched when the wire args were empty — see
+    /// `loadCapturedIfNeeded`) it's derived from that instead, so commands
+    /// like Bash still show inline after the tool name.
+    private var headerPreview: String? {
+        if let preview = tool.argumentPreview, !preview.isEmpty { return preview }
+        guard let capturedArgs, !capturedArgs.isEmpty else { return nil }
+        return ChatDisplayFormat.firstArgumentPreview(capturedArgs)
+    }
+
+    private var inputText: String {
+        if !tool.input.isEmpty { return tool.input }
+        if let capturedArgs {
+            guard !capturedArgs.isEmpty else { return "(no input)" }
+            // Single-string-arg tools (command, file_path, …) render as
+            // plain text, not escaped JSON — same treatment as the
+            // wire-args path (TranscriptChatMessages.display).
+            return ChatDisplayFormat.meaningfulArgumentText(capturedArgs)
+                ?? AlexandriaBarCore.ToolCall.summary(capturedArgs)
         }
-        return tool.output ?? "(no output captured)"
+        return loadingArgs ? "loading…" : "(no input)"
+    }
+
+    private var outputText: String {
+        if let output = tool.output, !output.isEmpty { return output }
+        if let capturedOutput {
+            return capturedOutput.isEmpty ? "(no output captured)" : capturedOutput
+        }
+        return loadingOutput ? "loading…" : "(no output captured)"
+    }
+
+    private func loadCapturedIfNeeded() async {
+        if tool.input.isEmpty, tool.hasArgsBody, capturedArgs == nil, let loadArgsBody {
+            loadingArgs = true
+            capturedArgs = await loadArgsBody() ?? ""
+            loadingArgs = false
+        }
+        if (tool.output ?? "").isEmpty, tool.hasResultBody, capturedOutput == nil,
+            let loadOutputBody
+        {
+            loadingOutput = true
+            capturedOutput = await loadOutputBody() ?? ""
+            loadingOutput = false
+        }
     }
 
     private func bodyLink(_ title: String, action: @escaping () -> Void) -> some View {

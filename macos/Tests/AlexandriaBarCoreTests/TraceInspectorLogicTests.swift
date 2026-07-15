@@ -41,6 +41,9 @@ import Testing
             == "claude-code · user")
         #expect(TurnHeader.requestLabel(harness: "codex", isToolResult: true)
             == "codex · tool result")
+        #expect(TurnHeader.harnessResultLabel() == "Harness · tool result")
+        #expect(TurnHeader.harnessResultLabel(toolName: "Read") == "Harness · tool result · Read")
+        #expect(TurnHeader.harnessResultLabel(toolName: "") == "Harness · tool result")
         #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "gpt-5.5 · model")
         #expect(TurnHeader.responseLabel(
             model: "gpt-5.6-sol", reasoningEffort: "high",

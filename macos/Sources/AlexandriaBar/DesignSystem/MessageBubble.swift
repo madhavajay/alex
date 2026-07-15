@@ -8,15 +8,31 @@ struct MessageBubble: View {
     var selected = false
     var onSelect: (() -> Void)?
     var onFollowSubagent: ((String) -> Void)?
-    /// (toolExecutionId, kind) where kind is "args" or "result".
+    /// (toolExecutionId, kind) where kind is "args" or "result". Routes the
+    /// captured body into the inspector pane.
     var onViewToolBody: ((String, String) -> Void)?
+    /// (toolExecutionId, kind) -> captured body text, used to backfill the
+    /// Input/Output tabs when the wire-parsed tool call had no arguments or
+    /// result (captured execution body exists but the request/response JSON
+    /// didn't carry it).
+    var fetchToolBodyText: ((String, String) async -> String?)?
 
-    private var isUser: Bool { message.role == .user }
+    @State private var expandedHarnessBody = false
+
+    /// Both `.user` and `.harness` render on the left with the same gray
+    /// bubble treatment ("left-side mono bubbles" — only the avatar glyph
+    /// and role label distinguish a harness tool-result reply from literal
+    /// user input); only `.assistant` is right-aligned.
+    private var isUser: Bool { message.role != .assistant }
+
+    private var avatarVariant: RoleAvatar.Variant {
+        message.role == .harness ? .harness : .user
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: AlexTheme.Spacing.ml) {
             if isUser {
-                RoleAvatar(variant: .user)
+                RoleAvatar(variant: avatarVariant)
                     .padding(.top, AlexTheme.Spacing.xxs)
                 column
             } else {
@@ -37,6 +53,7 @@ struct MessageBubble: View {
             headerRow
             if !message.content.isEmpty {
                 bubble
+                expandToggle
             }
             if !message.toolCalls.isEmpty {
                 toolCallsSection
@@ -77,9 +94,16 @@ struct MessageBubble: View {
     private var roleText: some View {
         Text(message.roleLabel)
             .font(AlexTheme.Fonts.roleLabel)
-            .foregroundStyle(
-                isUser ? AlexTheme.Colors.mutedForeground : AlexTheme.Colors.primaryBright)
+            .foregroundStyle(roleTextColor)
             .lineLimit(1)
+    }
+
+    private var roleTextColor: Color {
+        switch message.role {
+        case .harness: AlexTheme.Colors.warningOrange
+        case .user: AlexTheme.Colors.mutedForeground
+        case .assistant: AlexTheme.Colors.primaryBright
+        }
     }
 
     @ViewBuilder private var modelText: some View {
@@ -117,8 +141,43 @@ struct MessageBubble: View {
         }
     }
 
+    /// Long harness tool-result bodies collapse to their first ~4 lines by
+    /// default, consistent with the tool-call card's collapsed-by-default
+    /// treatment; user/assistant bubbles are unaffected.
+    private var harnessLines: [Substring] {
+        message.content.split(separator: "\n", omittingEmptySubsequences: false)
+    }
+
+    private var isLongHarnessBody: Bool {
+        message.role == .harness && harnessLines.count > 4
+    }
+
+    private var displayedContent: String {
+        guard isLongHarnessBody, !expandedHarnessBody else { return message.content }
+        return harnessLines.prefix(4).joined(separator: "\n")
+    }
+
+    @ViewBuilder private var expandToggle: some View {
+        if isLongHarnessBody {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expandedHarnessBody.toggle() }
+            } label: {
+                HStack(spacing: AlexTheme.Spacing.xs) {
+                    Text(expandedHarnessBody ? "Show less" : "Show more (\(harnessLines.count) lines)")
+                    Image(systemName: expandedHarnessBody ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(AlexTheme.Fonts.smallControl)
+                .foregroundStyle(AlexTheme.Colors.primary)
+            }
+            .buttonStyle(.plain)
+            .padding(isUser ? .trailing : .leading, 48)
+            .padding(.top, 2)
+        }
+    }
+
     private var bubble: some View {
-        Text(message.content)
+        Text(displayedContent)
             .font(message.isMonospaced ? AlexTheme.Fonts.mono(11.5) : AlexTheme.Fonts.bubbleBody)
             .lineSpacing(3)
             .foregroundStyle(
@@ -165,7 +224,9 @@ struct MessageBubble: View {
                 ToolCallCard(
                     tool: tool,
                     onViewArgs: toolBodyAction(tool, kind: "args"),
-                    onViewOutput: toolBodyAction(tool, kind: "result"))
+                    onViewOutput: toolBodyAction(tool, kind: "result"),
+                    loadArgsBody: fetchTextAction(tool, kind: "args"),
+                    loadOutputBody: fetchTextAction(tool, kind: "result"))
             }
         }
         .padding(isUser ? .trailing : .leading, cardInset)
@@ -176,6 +237,12 @@ struct MessageBubble: View {
         let available = kind == "args" ? tool.hasArgsBody : tool.hasResultBody
         guard available, let onViewToolBody else { return nil }
         return { onViewToolBody(tool.id, kind) }
+    }
+
+    private func fetchTextAction(_ tool: ToolCallDisplay, kind: String) -> (() async -> String?)? {
+        let available = kind == "args" ? tool.hasArgsBody : tool.hasResultBody
+        guard available, let fetchToolBodyText else { return nil }
+        return { await fetchToolBodyText(tool.id, kind) }
     }
 
     private func errorCard(_ error: String) -> some View {
@@ -242,6 +309,13 @@ struct MessageBubble: View {
                     roleLabel: "Model", model: "claude-opus-4-8",
                     timestamp: "14:23:45",
                     error: "429 rate_limit_error: rate limited, retry in 12s"))
+            MessageBubble(
+                message: MessageDisplay(
+                    id: "m5", turnId: "t5", role: .harness,
+                    roleLabel: "Harness · tool result · Read",
+                    content: "import jwt from 'jsonwebtoken';\nimport { Request } from 'express';\n\nexport function verify(req: Request) {\n  return jwt.verify(req.headers.authorization, SECRET);\n}\n",
+                    isMonospaced: true,
+                    timestamp: "14:23:03"))
         }
         .padding(.vertical)
     }

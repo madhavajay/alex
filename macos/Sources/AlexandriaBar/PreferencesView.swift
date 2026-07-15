@@ -53,7 +53,7 @@ struct PreferencesView: View {
             // fullSizeContentView); just reserve the height.
             Spacer().frame(height: 52)
 
-            SectionLabel(text: "AlexandriaBar")
+            SectionLabel(text: "Alex UI")
                 .padding(.horizontal, 14)
                 .padding(.bottom, 12)
 
@@ -106,10 +106,7 @@ struct PreferencesView: View {
                 case .providers:
                     ProvidersPreferencesSection(store: store, onAuthenticate: onAuthenticate)
                 case .harnesses:
-                    Form {
-                        HarnessesPreferencesSection(store: store)
-                    }
-                    .formStyle(.grouped)
+                    HarnessesPreferencesSection(store: store)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -203,7 +200,7 @@ final class PreferencesWindowController {
                         store: self.store)
                 }))
             let win = NSWindow(contentViewController: host)
-            win.title = "AlexandriaBar Settings"
+            win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock
             // (§1.30): content extends under a transparent titlebar.
             win.styleMask = [.titled, .closable, .fullSizeContentView]

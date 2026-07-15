@@ -2,6 +2,34 @@ import AppKit
 import SwiftUI
 import AlexandriaBarCore
 
+private enum ProvidersChartRange: String, CaseIterable {
+    case twentyFourHours = "24h"
+    case sevenDays = "7d"
+    case thirtyDays = "30d"
+    case all = "All"
+
+    var sinceMinutes: Int {
+        switch self {
+        case .twentyFourHours: 1_440
+        case .sevenDays: 10_080
+        case .thirtyDays, .all: 43_200
+        }
+    }
+
+    var bucketMinutes: Int {
+        switch self {
+        case .twentyFourHours: 60
+        case .sevenDays: 360
+        case .thirtyDays, .all: 1_440
+        }
+    }
+
+    /// Ascending lookback spans, matching `allCases` order — the input
+    /// `UsageChartMath.enabledRanges` needs to tell which tabs actually
+    /// reveal more history than the tab before them.
+    static var spansMinutes: [Int] { allCases.map(\.sinceMinutes) }
+}
+
 /// The Preferences → Providers tab: provider sidebar, per-account usage and
 /// quota, and routing rules. Restyled to the "Accounts section with graph"
 /// design (ui/Accounts section with graph/src/app/App.tsx) on top of the
@@ -11,6 +39,37 @@ struct ProvidersPreferencesSection: View {
     let onAuthenticate: (String, String?, Bool) -> Void
     @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
+    @AppStorage("ProvidersChartRange") private var chartRangeValue =
+        ProvidersChartRange.twentyFourHours.rawValue
+    @State private var accountAnalyticsLoadID: UUID?
+    /// Earliest bucket timestamp seen across a one-off 30d fetch, used to
+    /// decide which range tabs have enough history to be worth showing.
+    /// `nil` until loaded (or if the lookup fails) — `enabledRanges` fails
+    /// open in that case, so every tab stays enabled rather than getting
+    /// stuck disabled.
+    @State private var earliestActivityMs: Int64?
+
+    private var chartRange: ProvidersChartRange {
+        ProvidersChartRange(rawValue: chartRangeValue) ?? .twentyFourHours
+    }
+
+    /// Per-tab enabled state for the 24h/7d/30d/All chart-range switcher —
+    /// see `UsageChartMath.enabledRanges`.
+    private var enabledRanges: [Bool] {
+        UsageChartMath.enabledRanges(
+            spansMinutes: ProvidersChartRange.spansMinutes,
+            earliestActivityMs: earliestActivityMs,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000))
+    }
+
+    private var chartRangeSelection: Binding<Int> {
+        Binding(
+            get: { ProvidersChartRange.allCases.firstIndex(of: chartRange) ?? 0 },
+            set: { index in
+                guard ProvidersChartRange.allCases.indices.contains(index) else { return }
+                chartRangeValue = ProvidersChartRange.allCases[index].rawValue
+            })
+    }
 
     private var providers: [String] {
         Array(Set(["anthropic", "openai", "gemini", "xai", "openrouter"] + store.accounts.map(\.provider))).sorted {
@@ -59,6 +118,9 @@ struct ProvidersPreferencesSection: View {
                         provider: provider,
                         store: store,
                         usageByAccount: usageByAccount,
+                        chartRangeSelection: chartRangeSelection,
+                        chartRangeEnabled: enabledRanges,
+                        accountAnalyticsLoading: accountAnalyticsLoadID != nil,
                         onConnect: addAccount,
                         onAuthenticate: onAuthenticate)
                 } else {
@@ -70,6 +132,25 @@ struct ProvidersPreferencesSection: View {
             }
         }
         .background(AlexTheme.Colors.background)
+        .task(id: chartRange) {
+            let loadID = UUID()
+            accountAnalyticsLoadID = loadID
+            await store.refreshAccountAnalytics(
+                sinceMinutes: chartRange.sinceMinutes,
+                bucketMinutes: chartRange.bucketMinutes)
+            if accountAnalyticsLoadID == loadID {
+                accountAnalyticsLoadID = nil
+            }
+        }
+        .task {
+            await loadEarliestActivity()
+        }
+        .onChange(of: earliestActivityMs) { _, _ in
+            guard let index = ProvidersChartRange.allCases.firstIndex(of: chartRange),
+                  enabledRanges.indices.contains(index), !enabledRanges[index]
+            else { return }
+            chartRangeValue = ProvidersChartRange.twentyFourHours.rawValue
+        }
         .sheet(
             isPresented: Binding(
                 get: { providerToAdd != nil },
@@ -156,6 +237,22 @@ struct ProvidersPreferencesSection: View {
             onAuthenticate(provider, nil, provider == "openai")
         }
     }
+
+    /// One-off, range-independent lookup of how far back activity exists
+    /// (across all providers/accounts), so the chart-range tabs can be
+    /// disabled where they wouldn't reveal anything new. Runs once per
+    /// section appearance; failures leave `earliestActivityMs` nil, which
+    /// `enabledRanges` treats as "unknown" and fails open.
+    private func loadEarliestActivity() async {
+        guard let config = store.config else { return }
+        do {
+            let response = try await AlexandriaClient(config: config)
+                .accountAnalytics(sinceMinutes: 43_200, bucketMinutes: 1_440)
+            earliestActivityMs = response.series.map(\.bucketMs).min()
+        } catch {
+            earliestActivityMs = nil
+        }
+    }
 }
 
 private struct ProviderSidebarRow: View {
@@ -209,6 +306,9 @@ private struct ProviderPreferencesDetail: View {
     let provider: String
     let store: SnapshotStore
     let usageByAccount: [String: AccountUsage]
+    @Binding var chartRangeSelection: Int
+    let chartRangeEnabled: [Bool]
+    let accountAnalyticsLoading: Bool
     let onConnect: (String) -> Void
     let onAuthenticate: (String, String?, Bool) -> Void
 
@@ -240,6 +340,9 @@ private struct ProviderPreferencesDetail: View {
                     UsageChartCard(
                         analytics: analytics,
                         accounts: accounts,
+                        rangeSelection: $chartRangeSelection,
+                        rangeEnabled: chartRangeEnabled,
+                        isLoading: accountAnalyticsLoading,
                         colorFor: accountColor)
                 }
 
@@ -318,10 +421,12 @@ private struct ProviderPreferencesDetail: View {
 
 /// The Accounts chart card (§1.27): "Tokens routed over time" caption, a
 /// time-range switcher, per-account legend, and the shared `UsageLineChart`.
-/// Ranged analytics (7d/30d/All) need a backend endpoint — only 24h is live.
 private struct UsageChartCard: View {
     let analytics: AccountAnalyticsResponse
     let accounts: [Account]
+    @Binding var rangeSelection: Int
+    let rangeEnabled: [Bool]
+    let isLoading: Bool
     let colorFor: (String) -> Color
 
     private var accountIds: Set<String> { Set(accounts.map(\.id)) }
@@ -334,8 +439,17 @@ private struct UsageChartCard: View {
         points.contains { $0.inputTokens + $0.outputTokens > 0 }
     }
 
+    /// The full bucket-aligned timeline for the requested range, not just
+    /// the (often sparse, per-provider) buckets that have data — see
+    /// `UsageChartMath.canonicalBuckets`. Deriving the x-axis from
+    /// `points` alone collapsed the real time gaps between an account's
+    /// infrequent activity into adjacent chart columns, which is what made
+    /// the 7d/30d date labels look wrong.
     private var buckets: [Int64] {
-        Set(points.map(\.bucketMs)).sorted()
+        UsageChartMath.canonicalBuckets(
+            sinceMs: analytics.sinceMs,
+            bucketMs: analytics.bucketMs,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000))
     }
 
     private var chartSeries: [UsageChartSeries] {
@@ -359,8 +473,9 @@ private struct UsageChartCard: View {
     }
 
     private var xLabels: [String] {
-        let hourly = analytics.bucketMs <= 3_600_000
-        return buckets.map { UsageChartMath.axisLabel(bucketMs: $0, hourly: hourly) }
+        buckets.map {
+            UsageChartMath.axisLabel(bucketMs: $0, bucketSizeMs: analytics.bucketMs)
+        }
     }
 
     private var usages: [AccountUsage] {
@@ -374,13 +489,10 @@ private struct UsageChartCard: View {
                     .font(.system(size: 11))
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
                 Spacer()
-                SegmentedTabs(
+                UsageRangeTabs(
                     tabs: ["24h", "7d", "30d", "All"],
-                    // Ranged analytics need backend support; pin to 24h.
-                    selection: Binding(get: { 0 }, set: { _ in }),
-                    style: .contained,
-                    fontSize: 10)
-                    .help("7d, 30d, and All ranges need a ranged analytics endpoint")
+                    selection: $rangeSelection,
+                    enabled: rangeEnabled)
             }
 
             if hasTokenActivity {
@@ -393,10 +505,76 @@ private struct UsageChartCard: View {
                 RequestShareBar(usages: usages, colorFor: colorFor)
             }
         }
+        .opacity(isLoading ? 0.55 : 1)
+        .overlay {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                            .fill(AlexTheme.Colors.card.opacity(0.9)))
+                    .allowsHitTesting(false)
+            }
+        }
         .padding(.top, 16)
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
         .alexCard(background: AlexTheme.Colors.overlay(0.03))
+    }
+}
+
+/// A 24h/7d/30d/All range switcher with per-tab disabled state. `SegmentedTabs`
+/// (DesignSystem) has no notion of a disabled tab — it only takes a flat
+/// `tabs: [String]` label list and a single `selection` binding — so this
+/// reimplements its `.contained` visual style locally rather than editing the
+/// shared component. A tab is disabled (dimmed, non-interactive,
+/// `.help("Not enough history")`) when `enabled` says the daemon doesn't have
+/// data old enough to make it show anything a shorter tab wouldn't already —
+/// see `UsageChartMath.enabledRanges`.
+private struct UsageRangeTabs: View {
+    let tabs: [String]
+    @Binding var selection: Int
+    let enabled: [Bool]
+
+    private func isEnabled(_ index: Int) -> Bool {
+        guard enabled.indices.contains(index) else { return true }
+        return enabled[index]
+    }
+
+    var body: some View {
+        HStack(spacing: AlexTheme.Spacing.xxs) {
+            ForEach(tabs.indices, id: \.self) { index in
+                let selected = selection == index
+                let active = isEnabled(index)
+                Button {
+                    selection = index
+                } label: {
+                    Text(tabs[index])
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(
+                            !active
+                                ? AlexTheme.Colors.textTertiary.opacity(0.4)
+                                : (selected ? AlexTheme.Colors.foreground : AlexTheme.Colors.textTertiary))
+                        .padding(.horizontal, AlexTheme.Spacing.ml)
+                        .padding(.vertical, AlexTheme.Spacing.xs)
+                        .background(
+                            RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                                .fill(active && selected ? AlexTheme.Colors.surfaceActive : .clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!active)
+                .help(active ? "Server retains up to 30 days" : "Not enough history")
+            }
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.overlay(0.05)))
+        .overlay(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(AlexTheme.Colors.cardBorder))
     }
 }
 

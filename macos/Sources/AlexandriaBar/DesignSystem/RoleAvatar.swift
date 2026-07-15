@@ -6,6 +6,10 @@ struct RoleAvatar: View {
         case user
         case assistant
         case subagent
+        /// Tool-result reply fed back to the model by the harness (mock has
+        /// no equivalent — this app added a distinct "Harness" role for
+        /// what used to render under the user's own vocabulary).
+        case harness
     }
 
     let variant: Variant
@@ -42,6 +46,14 @@ struct RoleAvatar: View {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: size * 0.46, weight: .semibold))
                     .foregroundStyle(AlexTheme.Colors.primary)
+            case .harness:
+                Circle()
+                    .fill(AlexTheme.Colors.warningOrange.opacity(0.15))
+                Circle()
+                    .strokeBorder(AlexTheme.Colors.warningOrange.opacity(0.4))
+                Image(systemName: "wrench.and.screwdriver.fill")
+                    .font(.system(size: size * 0.46, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.warningOrange)
             }
         }
         .frame(width: size, height: size)
@@ -53,6 +65,7 @@ struct RoleAvatar: View {
         RoleAvatar(variant: .user)
         RoleAvatar(variant: .assistant)
         RoleAvatar(variant: .subagent, size: 28)
+        RoleAvatar(variant: .harness)
     }
     .padding()
     .background(AlexTheme.Colors.background)

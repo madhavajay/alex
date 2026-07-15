@@ -9,13 +9,19 @@ final class TraceBrowserModel {
     private let store: SnapshotStore
 
     private(set) var sessions: [TraceSession] = []
-    private(set) var turns: [TranscriptTurn] = []
+    private(set) var turns: [TranscriptTurn] = [] {
+        didSet { scheduleTranscriptFilter(debounce: false) }
+    }
     private(set) var visibleRows: [SessionRow] = []
     private(set) var parsedQuery = OmniQuery()
     private(set) var daemonDown = false
     private(set) var searchSessionIds: Set<String>?
     private(set) var searchMatchCount = 0
     private(set) var searchScanned = 0
+    /// True while a body-text search request is in flight (debounce elapsed,
+    /// awaiting `/traces/search`); drives the omni search field's trailing
+    /// spinner.
+    private(set) var searchInFlight = false
     private var sessionsFingerprint = ""
     private var turnsFingerprint = ""
     private var rowsById: [String: SessionRow] = [:]
@@ -23,8 +29,28 @@ final class TraceBrowserModel {
     private var allTurns: [TranscriptTurn] = []
     private var selectionState = SessionSelection()
 
+    /// Table selection, driving shift/cmd-click multi-select. A single id
+    /// keeps `selectionState` (and therefore transcript/inspector loading,
+    /// pin, live-follow) behaving exactly as before multi-select existed;
+    /// more than one suspends all of that and shows an empty state instead
+    /// (see `TranscriptView.multiSelectionState`).
+    private(set) var multiSelection: Set<String> = []
+    var isMultiSelected: Bool { multiSelection.count > 1 }
+
     var selectedSessionId: String? { selectionState.selectedId }
     var pinned: Bool { selectionState.pinned }
+
+    /// Table selection binding target. Ignores an empty set the same way
+    /// the old `Binding<String?>` ignored `nil` — Table reports a transient
+    /// empty selection during some data updates, and this app always wants
+    /// a "last selected" session to stick for the detail panes.
+    func updateSelection(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        multiSelection = ids
+        if ids.count == 1, let only = ids.first {
+            selectFromUser(only)
+        }
+    }
     var sortOrder = SessionTable.defaultSortOrder() {
         didSet { recomputeVisible() }
     }
@@ -46,9 +72,66 @@ final class TraceBrowserModel {
         didSet { recomputeVisible() }
     }
 
-    /// Transcript message filter row state (mock TB App.tsx:646-649).
-    var transcriptQuery = ""
-    var transcriptFilterTab = 0
+    /// Transcript message filter row state (mock TB App.tsx:646-649). Typing
+    /// drives a debounced, off-main-actor recompute of `transcriptEntries`
+    /// rather than filtering synchronously in the view body — see
+    /// `scheduleTranscriptFilter` (previously froze the window on large
+    /// sessions; the filter now runs via `TranscriptFilter` in Core).
+    var transcriptQuery = "" {
+        didSet {
+            guard oldValue != transcriptQuery else { return }
+            scheduleTranscriptFilter(debounce: true)
+        }
+    }
+    var transcriptFilterTab = 0 {
+        didSet {
+            guard oldValue != transcriptFilterTab else { return }
+            scheduleTranscriptFilter(debounce: false)
+        }
+    }
+    private(set) var transcriptEntries: [TranscriptChatEntry] = []
+    private(set) var transcriptTotalCount = 0
+    private var transcriptFilterTask: Task<Void, Never>?
+
+    /// Recomputes `transcriptEntries`/`transcriptTotalCount` off the main
+    /// actor. `debounce` is true for keystrokes (200ms settle) and false for
+    /// structural changes (new turns, tab switch) that should apply
+    /// immediately. Cancels any in-flight recompute first, so a burst of
+    /// keystrokes only pays for the final one.
+    private func scheduleTranscriptFilter(debounce: Bool) {
+        transcriptFilterTask?.cancel()
+        let turnsSnapshot = turns
+        let tab = transcriptFilterTab
+        let query = transcriptQuery
+        transcriptFilterTask = Task { [weak self] in
+            if debounce {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+            }
+            let result = await Task.detached(priority: .userInitiated) {
+                () -> ([TranscriptFilterEntry], Int) in
+                let shown = TranscriptFilter.entries(turns: turnsSnapshot, filterTab: tab, query: query)
+                let total = TranscriptFilter.entries(turns: turnsSnapshot, filterTab: 0, query: "").count
+                return (shown, total)
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            self.transcriptEntries = self.mapFilterEntries(result.0, turns: turnsSnapshot)
+            self.transcriptTotalCount = result.1
+        }
+    }
+
+    private func mapFilterEntries(
+        _ filtered: [TranscriptFilterEntry], turns: [TranscriptTurn]
+    ) -> [TranscriptChatEntry] {
+        filtered.compactMap { entry in
+            guard turns.indices.contains(entry.turnIndex) else { return nil }
+            let turn = turns[entry.turnIndex]
+            guard turn.traceId == entry.turnId else { return nil }
+            return TranscriptChatEntry(
+                turn: turn, turnNumber: entry.turnIndex + 1,
+                role: entry.role == .user ? .user : .assistant)
+        }
+    }
 
     /// Session id of a subagent the user followed via "Follow trace"; drives
     /// the follow banner at the top of the transcript (mock TB App.tsx:652-672).
@@ -141,12 +224,55 @@ final class TraceBrowserModel {
         return content
     }
 
-    func openToolBody(id: String, kind: String) {
-        Task {
-            guard let client = client(), let body = try? await client.toolBody(id: id, kind: kind) else { return }
-            let alert = NSAlert(); alert.messageText = "Tool \(kind)"; alert.informativeText = BodyPretty.display(body.text).text
-            alert.addButton(withTitle: "Close"); alert.runModal()
+    private var toolBodyCache: [String: TraceBodyContent] = [:]
+
+    /// Captured args/result body for a tool execution (kind: "args" |
+    /// "result"). Used both to backfill the Input/Output tabs when the wire
+    /// arguments were empty and to drive `inspectorToolBody`. Cached per
+    /// (tool id, kind) since a card can request it more than once (tab
+    /// switch, reopening the inspector route).
+    func fetchToolBody(id: String, kind: String) async throws -> TraceBodyContent {
+        let key = "\(id)|\(kind)"
+        if let cached = toolBodyCache[key] { return cached }
+        guard let client = client() else {
+            throw AlexandriaClient.ClientError.http(0, "daemon unavailable")
         }
+        let content = try await client.toolBody(id: id, kind: kind)
+        toolBodyCache[key] = content
+        return content
+    }
+
+    /// "View captured args"/"View output" route into the inspector column
+    /// (with a breadcrumb back to the turn) instead of a popup window.
+    struct ToolBodyRoute: Equatable {
+        let toolId: String
+        let toolName: String
+        let kind: String
+        let turnId: String
+    }
+
+    private(set) var inspectorToolBody: ToolBodyRoute?
+
+    func openInspectorToolBody(toolId: String, toolName: String, kind: String, turnId: String) {
+        inspectorToolBody = ToolBodyRoute(toolId: toolId, toolName: toolName, kind: kind, turnId: turnId)
+        detailsVisible = true
+    }
+
+    func closeInspectorToolBody() {
+        inspectorToolBody = nil
+    }
+
+    /// Legacy (id, kind)-only entry point — still used by the classic text
+    /// pane's clickable tool links, which don't carry a tool name/turn id at
+    /// the click site. Resolves both by scanning the loaded turns.
+    func openToolBody(id: String, kind: String) {
+        for turn in turns {
+            guard let executed = turn.executedTools?.first(where: { $0.id == id }) else { continue }
+            openInspectorToolBody(
+                toolId: id, toolName: executed.toolName, kind: kind, turnId: turn.traceId)
+            return
+        }
+        openInspectorToolBody(toolId: id, toolName: "Tool", kind: kind, turnId: inspectorTraceId ?? "")
     }
 
     var firstRequestHeaders: [HeaderPair] {
@@ -161,6 +287,7 @@ final class TraceBrowserModel {
     func closeInspector() {
         detailsVisible = false
         inspectorTraceId = nil
+        inspectorToolBody = nil
     }
 
     func setDetailsVisible(_ visible: Bool) {
@@ -425,6 +552,8 @@ final class TraceBrowserModel {
         renderChain = nil
         firstDetailTask?.cancel()
         firstDetailTask = nil
+        transcriptFilterTask?.cancel()
+        transcriptFilterTask = nil
     }
 
     func selectFromUser(_ id: String) {
@@ -435,12 +564,12 @@ final class TraceBrowserModel {
         apply(selectionState.followSelect(id))
     }
 
-    func selectFromBinding(_ id: String?) {
-        apply(selectionState.bindingSelect(id))
-    }
-
     private func apply(_ change: SessionSelection.Change) {
-        guard case .selected = change else { return }
+        guard case let .selected(id) = change else { return }
+        // Any programmatic single-selection (follow, arrow-key nav, table
+        // click) collapses a prior multi-selection so the table's highlight
+        // and the transcript pane agree on one session again.
+        multiSelection = [id]
         followedSubagentId = nil
         resetTurns()
         setUserAtBottom(true)
@@ -450,6 +579,10 @@ final class TraceBrowserModel {
     private func resetTurns() {
         allTurns = []
         turns = []
+        inspectorToolBody = nil
+        transcriptFilterTask?.cancel()
+        transcriptEntries = []
+        transcriptTotalCount = 0
         turnsFingerprint = ""
         if !detailsVisible {
             inspectorTraceId = nil
@@ -602,6 +735,11 @@ final class TraceBrowserModel {
                     recomputeVisible()
                 }
             }
+            if let pending = pendingSelectSessionId,
+                sessions.contains(where: { $0.sessionId == pending })
+            {
+                selectSessionWhenLoaded(pending)
+            }
             applyLiveFollow()
         } catch is AlexandriaClient.ClientError {
             daemonDown = false
@@ -611,7 +749,7 @@ final class TraceBrowserModel {
     }
 
     private func applyLiveFollow() {
-        guard selectedSessionId == nil, !pinned,
+        guard selectedSessionId == nil, !pinned, !isMultiSelected,
             let candidate = newestVisibleRow
         else { return }
         selectFromFollow(candidate.id)
@@ -655,6 +793,7 @@ final class TraceBrowserModel {
         applyTurnFilter()
         guard !query.freeText.isEmpty else {
             searchSessionIds = nil
+            searchInFlight = false
             recomputeVisible()
             return
         }
@@ -662,6 +801,7 @@ final class TraceBrowserModel {
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
+            self?.searchInFlight = true
             await self?.runSearch(query)
         }
     }
@@ -678,7 +818,10 @@ final class TraceBrowserModel {
     }
 
     private func runSearch(_ query: OmniQuery) async {
-        guard let client = client() else { return }
+        guard let client = client() else {
+            searchInFlight = false
+            return
+        }
         let start = ContinuousClock.now
         do {
             let resp = try await client.searchTraces(text: query.freeText, filters: query)
@@ -690,11 +833,16 @@ final class TraceBrowserModel {
             BarLog.info(.browser, "search \"\(query.freeText)\" matches=\(resp.traces.count) scanned=\(resp.scanned ?? 0) in \(elapsed.components.seconds * 1000 + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000))ms")
         } catch {
             guard parsedQuery == query else { return }
+            // Degrade silently to metadata-only matching (tag matches still
+            // apply via `OmniQuery.isVisible`; server-side body matches just
+            // don't contribute) rather than surfacing an error UI.
             searchSessionIds = []
             searchMatchCount = 0
             searchScanned = 0
             BarLog.warn(.browser, "search \"\(query.freeText)\" failed: \(error.localizedDescription)")
         }
+        guard parsedQuery == query else { return }
+        searchInFlight = false
         recomputeVisible()
     }
 
@@ -760,32 +908,119 @@ final class TraceBrowserModel {
         return out
     }
 
+    /// Single-session delete, e.g. from the row context menu. Routes through
+    /// the same confirm+bulk-delete flow as the Delete key / multi-select
+    /// bulk delete so there's exactly one confirmation dialog in the app.
     func deleteSessionTraces(_ session: TraceSession) {
+        confirmDeleteSessions([session])
+    }
+
+    /// Delete-key handler for the sessions table: acts on the full
+    /// multi-selection when more than one row is selected, otherwise on the
+    /// single selected session — same confirmation dialog either way.
+    func deleteSelectedSessions() {
+        let ids = isMultiSelected ? multiSelection : Set(selectedSessionId.map { [$0] } ?? [])
+        guard !ids.isEmpty else { return }
+        confirmDeleteSessions(sessions.filter { ids.contains($0.sessionId) })
+    }
+
+    private func confirmDeleteSessions(_ toDelete: [TraceSession]) {
+        guard !toDelete.isEmpty else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete all traces for this session?"
-        alert.informativeText =
-            "Removes \(session.traceCount) trace(s) of session \(session.sessionId) from the daemon. This cannot be undone."
+        if toDelete.count == 1, let session = toDelete.first {
+            alert.messageText = "Delete all traces for this session?"
+            alert.informativeText =
+                "Removes \(session.traceCount) trace(s) of session \(session.sessionId) from the daemon. This cannot be undone."
+        } else {
+            let totalTraces = toDelete.reduce(0) { $0 + $1.traceCount }
+            alert.messageText = "Delete all traces for \(toDelete.count) sessions?"
+            alert.informativeText =
+                "Removes \(totalTraces) trace(s) across \(toDelete.count) sessions from the daemon. This cannot be undone."
+        }
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let deletedIds = Set(toDelete.map(\.sessionId))
+        // Captured before the (async) delete so we can restore the list to
+        // roughly the same visual position afterwards instead of it jumping
+        // to the top — SwiftUI's Table reloads/re-sorts on any data change
+        // rather than diffing incrementally, so without this the whole list
+        // scrolls back to row 0 every time.
+        let anchorId = Self.nearestSurvivor(deletedIds: deletedIds, in: visibleRows)
+
         Task {
             guard let client = client() else { return }
-            do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                for turn in transcript.turns {
-                    try await client.deleteTrace(id: turn.traceId)
+            for session in toDelete {
+                do {
+                    let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                    for turn in transcript.turns {
+                        try await client.deleteTrace(id: turn.traceId)
+                    }
+                } catch {
+                    NSSound.beep()
                 }
-                if selectedSessionId == session.sessionId {
-                    selectionState.clear()
-                    resetTurns()
-                }
-                await pollSessions()
-            } catch {
-                NSSound.beep()
+            }
+            if let sid = selectedSessionId, deletedIds.contains(sid) {
+                selectionState.clear()
+                resetTurns()
+            }
+            multiSelection.subtract(deletedIds)
+            await pollSessions()
+            guard let anchorId, visibleRows.contains(where: { $0.id == anchorId }) else { return }
+            requestScrollAnchor(anchorId)
+            if selectedSessionId == nil, !isMultiSelected {
+                selectFromUser(anchorId)
             }
         }
+    }
+
+    /// Nearest row that will still exist after removing `deletedIds`,
+    /// searching outward from the first deleted row's position (checking
+    /// the row right after it, then right before, then two after, …) so the
+    /// scroll/selection lands as close as possible to where the deleted
+    /// block was.
+    static func nearestSurvivor(deletedIds: Set<String>, in rows: [SessionRow]) -> String? {
+        guard let anchorIndex = rows.firstIndex(where: { deletedIds.contains($0.id) }) else {
+            return nil
+        }
+        for offset in 1..<rows.count {
+            let after = anchorIndex + offset
+            if after < rows.count, !deletedIds.contains(rows[after].id) { return rows[after].id }
+            let before = anchorIndex - offset
+            if before >= 0, !deletedIds.contains(rows[before].id) { return rows[before].id }
+        }
+        return nil
+    }
+
+    private(set) var scrollAnchorId: String?
+    private(set) var scrollAnchorVersion = 0
+
+    private func requestScrollAnchor(_ id: String) {
+        scrollAnchorId = id
+        scrollAnchorVersion += 1
+    }
+
+    /// Session id a caller (e.g. the status-item menu's "recent session"
+    /// rows, via `TraceBrowserWindowController.show(selectSessionId:)`)
+    /// asked to land on before the session list had loaded. Consumed by the
+    /// next `pollSessions()` that finds it.
+    private var pendingSelectSessionId: String?
+
+    /// Selects `sessionId` once it's present in `sessions` and scrolls it
+    /// into view (reusing the delete flow's scroll-anchor mechanism), rather
+    /// than opening the browser un-targeted. Selects immediately if the
+    /// session list is already loaded.
+    func selectSessionWhenLoaded(_ sessionId: String) {
+        guard sessions.contains(where: { $0.sessionId == sessionId }) else {
+            pendingSelectSessionId = sessionId
+            return
+        }
+        pendingSelectSessionId = nil
+        selectFromUser(sessionId)
+        requestScrollAnchor(sessionId)
     }
 }
 
@@ -871,7 +1106,12 @@ struct TraceBrowserView: View {
                 TranscriptView(model: model)
                     .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
                 if model.detailsVisible {
-                    if let traceId = model.inspectorTraceId {
+                    if let route = model.inspectorToolBody {
+                        ToolBodyInspectorView(route: route, model: model)
+                            .frame(
+                                minWidth: 300, idealWidth: 340, maxWidth: 520,
+                                maxHeight: .infinity)
+                    } else if let traceId = model.inspectorTraceId {
                         TraceInspectorView(traceId: traceId, model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
@@ -919,6 +1159,13 @@ struct TraceBrowserView: View {
                 .font(AlexTheme.Fonts.mono(11))
                 .foregroundStyle(AlexTheme.Colors.foreground)
                 .onExitCommand { model.queryText = "" }
+                if model.searchInFlight {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                        .help("Searching message bodies…")
+                }
                 if !model.queryText.isEmpty {
                     Button {
                         model.queryText = ""
@@ -941,11 +1188,6 @@ struct TraceBrowserView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.green)
                 .help("The selected transcript refreshes automatically")
-            Toggle("Show pings", isOn: $model.showPings)
-                .controlSize(.small)
-            Toggle("Nest sub-agents", isOn: $model.nestSubagents)
-                .controlSize(.small)
-                .help("Group Codex sub-agent sessions under their parent session")
             Toggle("Details", isOn: detailsBinding)
                 .toggleStyle(.switch)
                 .controlSize(.small)
@@ -1133,7 +1375,10 @@ private struct SessionListView: View {
             ScrollViewReader { proxy in
                 table
                     .onChange(of: model.selectedSessionId) { _, id in
-                        if let id { proxy.scrollTo(id) }
+                        if let id, !model.isMultiSelected { proxy.scrollTo(id) }
+                    }
+                    .onChange(of: model.scrollAnchorVersion) { _, _ in
+                        if let id = model.scrollAnchorId { proxy.scrollTo(id, anchor: .top) }
                     }
             }
             footer
@@ -1146,6 +1391,18 @@ private struct SessionListView: View {
                 tabs: SessionStatusPill.allCases.map(\.title),
                 selection: pillBinding, style: .bare)
             Spacer(minLength: 0)
+            // These two only affect the session list, so they live here
+            // rather than in the window toolbar (moved from there).
+            Toggle("Nest sub-agents", isOn: $model.nestSubagents)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .font(.system(size: 10))
+                .help("Group Codex sub-agent sessions under their parent session")
+            Toggle("Pings", isOn: $model.showPings)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .font(.system(size: 10))
+                .help("Show ping/test sessions in the list")
         }
         .padding(.horizontal, 12)
         .frame(height: 32)
@@ -1169,8 +1426,10 @@ private struct SessionListView: View {
             secondaryColumns
         }
         .contextMenu(forSelectionType: SessionRow.ID.self) { ids in
-            if let id = ids.first,
-                let session = model.sessions.first(where: { $0.sessionId == id }) {
+            let selected = model.sessions.filter { ids.contains($0.sessionId) }
+            if selected.count > 1 {
+                bulkContextMenu(selected)
+            } else if let session = selected.first {
                 contextMenu(session)
             }
         }
@@ -1190,6 +1449,7 @@ private struct SessionListView: View {
             model.moveSelection(.end)
             return .handled
         }
+        .onDeleteCommand { model.deleteSelectedSessions() }
         .onAppear { listFocused = true }
         .onChange(of: customization) { _, updated in
             SessionColumnStore.save(updated)
@@ -1205,7 +1465,9 @@ private struct SessionListView: View {
                 showPingBadge: model.showPings && row.isPingOrTest,
                 nestSubagents: model.nestSubagents,
                 lineageCollapsed: model.isLineageCollapsed(row.id),
-                toggleLineage: { model.toggleLineage(row.id) })
+                toggleLineage: { model.toggleLineage(row.id) },
+                bodyOnlyMatch: model.parsedQuery.isBodyOnlyMatch(
+                    row, serverMatches: model.searchSessionIds))
         }
         .width(min: 240)
         .customizationID("session")
@@ -1329,11 +1591,16 @@ private struct SessionListView: View {
             .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
-    private var selectionBinding: Binding<String?> {
+    /// Set-based binding: SwiftUI's Table gives shift-click ranges and
+    /// cmd-click toggles for free once selection is `Binding<Set<ID>>`
+    /// (single selection still binds through `updateSelection`, which keeps
+    /// today's single-select behavior — transcript load, pin, live-follow —
+    /// unchanged).
+    private var selectionBinding: Binding<Set<String>> {
         Binding(
-            get: { model.selectedSessionId },
-            set: { id in
-                model.selectFromBinding(id)
+            get: { model.multiSelection },
+            set: { ids in
+                model.updateSelection(ids)
                 listFocused = true
             })
     }
@@ -1349,6 +1616,13 @@ private struct SessionListView: View {
             model.deleteSessionTraces(session)
         }
     }
+
+    @ViewBuilder
+    private func bulkContextMenu(_ selected: [TraceSession]) -> some View {
+        Button("Delete \(selected.count) Sessions' Traces…", role: .destructive) {
+            model.deleteSelectedSessions()
+        }
+    }
 }
 
 private struct SessionCellView: View {
@@ -1358,43 +1632,62 @@ private struct SessionCellView: View {
     let nestSubagents: Bool
     let lineageCollapsed: Bool
     let toggleLineage: () -> Void
+    var bodyOnlyMatch: Bool = false
+
+    /// Per-depth-level indent, within the "~14-18pt, unmistakable" range the
+    /// original design called for (was effectively 0pt for a depth-1 row
+    /// before this change — only the 16pt connector slot separated it from
+    /// its parent).
+    private let indentUnit: CGFloat = 16
+    /// Fixed x-offset of the lineage rail, in the leading gutter. Constant
+    /// across depths so a whole subtree (children *and* grandchildren)
+    /// shares one continuous rail aligned under the root's status-dot
+    /// column, rather than each depth drawing its own.
+    private let railX: CGFloat = 8
+
+    private var isDescendant: Bool { nestSubagents && row.lineageDepth > 0 }
 
     var body: some View {
-        HStack(spacing: 5) {
-            if nestSubagents, row.lineageDepth > 1 {
-                Spacer().frame(width: CGFloat((row.lineageDepth - 1) * 18))
+        ZStack(alignment: .leading) {
+            if isDescendant {
+                // Group-identity rail: one continuous 2px line down the
+                // leading edge of every descendant row of a lineage,
+                // stronger than the old single "|—" glyph. Row content
+                // (below) draws a short horizontal tick from this rail out
+                // to its own status dot, so grandchildren still visibly
+                // join the same rail as their sibling subtree.
+                Rectangle()
+                    .fill(AlexTheme.Colors.primary.opacity(0.35))
+                    .frame(width: 2)
+                    .frame(maxHeight: .infinity)
+                    .offset(x: railX)
+                Rectangle()
+                    .fill(AlexTheme.Colors.primary.opacity(0.35))
+                    .frame(height: 1)
+                    .frame(width: CGFloat(row.lineageDepth) * indentUnit + 16 - railX)
+                    .offset(x: railX)
             }
-            if nestSubagents, row.childCount > 0 {
-                Button(action: toggleLineage) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(AlexTheme.Colors.textTertiary)
-                        .rotationEffect(.degrees(lineageCollapsed ? 0 : 90))
-                        .frame(width: 16, height: 16)
-                        .contentShape(Rectangle())
+            HStack(spacing: 5) {
+                if isDescendant {
+                    Spacer().frame(width: CGFloat(row.lineageDepth) * indentUnit)
                 }
-                .buttonStyle(.plain)
-                .help(lineageCollapsed ? "Show sub-agents" : "Hide sub-agents")
-            } else if nestSubagents, row.lineageDepth > 0 {
-                // Tree connector: 1×12 vertical + 8×1 horizontal bar
-                // (mock TB App.tsx:216-219).
-                HStack(spacing: 3) {
-                    Rectangle()
-                        .fill(AlexTheme.Colors.textFaintest)
-                        .frame(width: 1, height: 12)
-                        .offset(y: -3)
-                    Rectangle()
-                        .fill(AlexTheme.Colors.textFaintest)
-                        .frame(width: 8, height: 1)
+                if nestSubagents, row.childCount > 0 {
+                    Button(action: toggleLineage) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                            .rotationEffect(.degrees(lineageCollapsed ? 0 : 90))
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(lineageCollapsed ? "Show sub-agents" : "Hide sub-agents")
+                } else {
+                    Color.clear.frame(width: 16, height: 1)
                 }
-                .padding(.leading, 4)
-                .frame(width: 16, alignment: .leading)
-            } else {
-                Color.clear.frame(width: 16, height: 1)
-            }
-            StatusDot(status: SessionDisplayStatus.status(for: row))
-            HarnessIconView(
-                harness: row.harnessRaw, tags: row.tags, size: 17, showsFallback: true)
+                StatusDot(status: SessionDisplayStatus.status(for: row))
+                HarnessIconView(
+                    harness: row.harnessRaw, tags: row.tags, size: 17, showsFallback: true)
             if let provider = SessionIdentity.primaryProvider(
                 providers: row.providers, harness: row.harnessRaw, tags: row.tags)
             {
@@ -1448,10 +1741,17 @@ private struct SessionCellView: View {
                     .font(.system(size: 8))
                     .foregroundStyle(.orange)
             }
-            if showPingBadge, let badge = row.kindBadge {
-                Text("[\(badge)]")
+            if bodyOnlyMatch {
+                Image(systemName: "text.magnifyingglass")
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
+                    .help("Matched by a message body search, not visible session metadata")
+            }
+                if showPingBadge, let badge = row.kindBadge {
+                    Text("[\(badge)]")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -1464,6 +1764,25 @@ private struct TranscriptView: View {
     @State private var showSystemPrompt = false
 
     var body: some View {
+        VStack(spacing: 0) {
+            if model.isMultiSelected {
+                multiSelectionState
+            } else {
+                singleSelectionBody
+            }
+        }
+    }
+
+    /// Multiple session rows selected (shift/cmd-click on the sessions
+    /// table): no single transcript to show, so the right panes present an
+    /// empty state instead. Delete acts on the whole selection.
+    private var multiSelectionState: some View {
+        EmptyStateView(
+            message: "\(model.multiSelection.count) sessions selected\nDelete removes them all",
+            style: .panel(icon: "checklist"))
+    }
+
+    private var singleSelectionBody: some View {
         VStack(spacing: 0) {
             header
             if infoExpanded, model.selectedSession != nil {
@@ -1593,13 +1912,11 @@ private struct TranscriptView: View {
     }
 
     private var transcriptFooter: some View {
-        let total = TranscriptChatEntries.entries(
-            turns: model.turns, filterTab: 0, query: "").count
-        let shown = TranscriptChatEntries.entries(
-            turns: model.turns, filterTab: model.transcriptFilterTab,
-            query: model.transcriptQuery).count
-        return SessionListFooter(
-            text: "\(shown) of \(total) messages",
+        // Both counts come from the model's cached, debounced filter result
+        // (see TraceBrowserModel.scheduleTranscriptFilter) instead of
+        // recomputing over every turn here on each render.
+        SessionListFooter(
+            text: "\(model.transcriptEntries.count) of \(model.transcriptTotalCount) messages",
             showsDot: true,
             trailingText: "\(TraceFormat.tokens(model.transcriptTokensTotal)) tokens total")
     }
@@ -1753,13 +2070,18 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show(harness: String? = nil) {
+    /// - Parameter selectSessionId: When set, the browser lands on this
+    ///   session once the list loads (`TraceBrowserModel.selectSessionWhenLoaded`)
+    ///   instead of opening un-targeted. One-line adoption for a caller that
+    ///   already holds a `TraceBrowserWindowController`: pass the session id
+    ///   here instead of calling `show(harness:)` alone.
+    func show(harness: String? = nil, selectSessionId: String? = nil) {
         if window == nil {
             let model = TraceBrowserModel(store: store, initialHarness: harness)
             self.model = model
             let host = NSHostingController(rootView: TraceBrowserView(model: model))
             let win = NSWindow(contentViewController: host)
-            win.title = "Alexandria — Trace Browser"
+            win.title = "Alex UI — Trace Browser"
             win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             win.isReleasedWhenClosed = false
             win.delegate = self
@@ -1772,6 +2094,9 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         }
         BarLog.info(.ui, "trace browser opened")
         model?.start()
+        if let selectSessionId {
+            model?.selectSessionWhenLoaded(selectSessionId)
+        }
         if let window {
             DockIconManager.shared.track(window)
             window.makeKeyAndOrderFront(nil)

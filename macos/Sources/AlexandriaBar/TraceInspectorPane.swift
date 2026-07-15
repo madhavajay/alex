@@ -79,6 +79,150 @@ struct SessionInfoCard: View {
     }
 }
 
+/// Captured tool args/result body shown in the inspector column instead of
+/// a popup window (mock had none of this — "View captured args"/"View
+/// output" used to open an NSAlert). Breadcrumb lets the user step back to
+/// the turn's normal inspector view.
+struct ToolBodyInspectorView: View {
+    let route: TraceBrowserModel.ToolBodyRoute
+    @Bindable var model: TraceBrowserModel
+
+    @State private var phase: TraceInspectorView.BodyLoad.Phase = .loading
+    @State private var loadedRoute: TraceBrowserModel.ToolBodyRoute?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    content
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+            }
+        }
+        .task(id: route) {
+            guard loadedRoute != route else { return }
+            phase = .loading
+            do {
+                let body = try await model.fetchToolBody(id: route.toolId, kind: route.kind)
+                phase = .loaded(raw: body.text, diskPath: body.diskPath)
+            } catch {
+                phase = .failed(error.localizedDescription)
+            }
+            loadedRoute = route
+        }
+    }
+
+    private var header: some View {
+        PanelHeader(accentLeft: true) {
+            VStack(alignment: .leading, spacing: 2) {
+                breadcrumb
+                Text(route.kind == "args" ? "Captured arguments" : "Captured output")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+            }
+        } right: {
+            PanelIconButton(systemImage: "xmark", help: "Close details") {
+                model.closeInspector()
+            }
+        }
+    }
+
+    /// "shortId › Turn N › toolName args|output" with a back arrow to
+    /// return to the turn's normal inspector view.
+    private var breadcrumb: some View {
+        HStack(spacing: 4) {
+            Button {
+                model.closeInspectorToolBody()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AlexTheme.Colors.primary)
+            .help("Back to turn")
+            if let sessionId = model.selectedSessionId {
+                Text(SessionShortId.shorten(sessionId))
+                    .font(AlexTheme.Fonts.mono(9.5))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+            Text(turnNumber.map { "Turn \($0)" } ?? "Turn —")
+                .font(AlexTheme.Fonts.mono(9.5))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            Text("\(route.toolName) \(route.kind == "args" ? "args" : "output")")
+                .font(AlexTheme.Fonts.mono(9.5))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .lineLimit(1)
+        }
+    }
+
+    private var turnNumber: Int? {
+        guard let index = model.turns.firstIndex(where: { $0.traceId == route.turnId }) else {
+            return nil
+        }
+        return index + 1
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch phase {
+        case .idle, .loading:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Loading captured body…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        case let .failed(message):
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+        case let .loaded(raw, diskPath):
+            let displayed = BodyPretty.display(raw, cap: .max).text
+            let capped = BodyPretty.capped(displayed)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(displayed, forType: .string)
+                    }
+                    Button("Reveal in Finder") {
+                        guard let diskPath else { return }
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: diskPath)])
+                    }
+                    .disabled(diskPath == nil)
+                    if !SSEFrames.isSSE(raw), !BodyPretty.isJSON(raw), capped.isTruncated {
+                        Text("truncated to \(BodyPretty.displayCap / 1000)KB")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                }
+                .controlSize(.small)
+                if SSEFrames.isSSE(raw) {
+                    SSEBodyView(source: raw)
+                } else if BodyPretty.isJSON(raw) {
+                    FormattedJSONBody(source: raw)
+                } else {
+                    InspectorTextPane(text: capped.text, highlightJSON: false)
+                        .frame(minHeight: 220, maxHeight: .infinity)
+                }
+            }
+        }
+    }
+}
+
 struct TraceInspectorView: View {
     let traceId: String
     @Bindable var model: TraceBrowserModel
@@ -318,6 +462,22 @@ struct TraceInspectorView: View {
                     .foregroundStyle(AlexTheme.Colors.textSecondary)
                     .textSelection(.enabled)
                     .lineLimit(2)
+                // The daemon doesn't record the actual upstream base URL on
+                // the trace (no such field in TraceDetail — only method,
+                // path, and upstream_provider), so this shows the truthful
+                // "<provider> · <path>" rather than guessing a host from the
+                // provider name. See report's needs-backend note.
+                if let provider = trace.upstreamProvider, let path = trace.path {
+                    Text("\(provider) · \(path)")
+                        .font(AlexTheme.Fonts.mono(9.5))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(
+                            "The full upstream URL wasn't captured by the daemon — "
+                                + "only the provider name and request path are available.")
+                }
                 Text(trace.id)
                     .font(AlexTheme.Fonts.mono(10))
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
@@ -683,7 +843,11 @@ struct TraceInspectorView: View {
                         .font(.system(size: 10))
                         .help("Show as-fetched text without pretty-printing or highlighting")
                 }
-                if capped.isTruncated {
+                // The formatted SSE/JSON views below have their own
+                // truncation affordances (a "… (truncated)" token, or a
+                // "showing the first N events" note); this generic banner
+                // only applies to the plain capped-text fallback path.
+                if !usesEnhancedFormatting(source: source), capped.isTruncated {
                     Text("truncated to \(BodyPretty.displayCap / 1000)KB")
                         .font(.system(size: 9))
                         .foregroundStyle(.orange)
@@ -696,9 +860,23 @@ struct TraceInspectorView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
-            InspectorTextPane(text: capped.text, highlightJSON: highlightJSON)
-                .frame(height: 220)
+            if !rawMode, SSEFrames.isSSE(source) {
+                SSEBodyView(source: source)
+            } else if !rawMode, BodyPretty.isJSON(source) {
+                FormattedJSONBody(source: source)
+            } else {
+                InspectorTextPane(text: capped.text, highlightJSON: highlightJSON)
+                    .frame(height: 220)
+            }
         }
+    }
+
+    /// Whether `bodyViewer` renders one of the new formatted views (SSE
+    /// frames or tree-aware JSON) instead of the plain capped-text fallback,
+    /// mirroring the branch above.
+    private func usesEnhancedFormatting(source: String) -> Bool {
+        guard !rawMode else { return false }
+        return SSEFrames.isSSE(source) || BodyPretty.isJSON(source)
     }
 
     private func groupLabel(_ text: String) -> some View {
@@ -897,10 +1075,205 @@ struct SystemPromptView: View {
     }
 }
 
+/// Formatted (non-Raw) JSON body view: string values that are themselves
+/// valid JSON render as indented, annotated sub-blocks, and literal newlines
+/// inside long strings render as real line breaks — see `JsonFormatted` in
+/// Core for the tree walk. The walk (plus the linear-highlighter fallback
+/// for oversized bodies) runs off the main actor in `.task(id:)`, so a
+/// multi-MB body never blocks the UI; Raw mode bypasses this view entirely
+/// and shows the exact original text.
+struct FormattedJSONBody: View {
+    let source: String
+
+    @State private var built: NSAttributedString?
+    @State private var builtKey: String?
+
+    var body: some View {
+        Group {
+            if let built {
+                InspectorTextPane(text: "", precomputed: built)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Formatting…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(height: 220)
+        .task(id: source) {
+            guard builtKey != source else { return }
+            let attributed = await FormattedJSONBodyBuilder.build(source)
+            guard !Task.isCancelled else { return }
+            built = attributed.value
+            builtKey = source
+        }
+    }
+}
+
+/// The formatting work itself, split out of `FormattedJSONBody` (a `View`,
+/// and so implicitly `@MainActor`) so it can genuinely run off the main
+/// actor via `Task.detached`.
+private enum FormattedJSONBodyBuilder {
+    /// Above this size, skip the tree-walk enhancement (embedded-JSON
+    /// sub-blocks, literal-newline rendering) and fall back to the existing
+    /// linear `JsonHighlight` colorer — still computed off the main thread
+    /// here, just without the extra per-string-value work a huge document
+    /// would make expensive.
+    static let enhancedSizeCap = 600_000
+
+    static func build(_ source: String) async -> AttributedStringBox {
+        await Task.detached(priority: .userInitiated) { () -> AttributedStringBox in
+            let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+            if source.utf8.count <= enhancedSizeCap,
+                let tokens = JsonFormatted.tokens(source, maxChars: BodyPretty.displayCap)
+            {
+                return AttributedStringBox(attributedString(tokens: tokens, font: font))
+            }
+            let displayed = BodyPretty.display(source, cap: .max).text
+            let capped = BodyPretty.capped(displayed).text
+            return AttributedStringBox(
+                JsonHighlight.attributed(capped, font: font, colors: InspectorTextPane.jsonColors))
+        }.value
+    }
+
+    private static func attributedString(tokens: [JsonFormatted.Token], font: NSFont) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let colors = InspectorTextPane.jsonColors
+        for token in tokens {
+            let color: NSColor
+            switch token.kind {
+            case .key: color = colors.key
+            case .string: color = colors.string
+            case .number: color = colors.number
+            case .boolean, .null: color = colors.keyword
+            case .punctuation, .whitespace: color = colors.punctuation
+            case .annotation: color = .tertiaryLabelColor
+            }
+            out.append(NSAttributedString(
+                string: token.text, attributes: [.font: font, .foregroundColor: color]))
+        }
+        return out
+    }
+}
+
+/// `NSAttributedString` isn't `Sendable` (Apple explicitly withholds the
+/// conformance); this box carries a freshly-built, not-yet-shared one across
+/// the `Task.detached` boundary, matching the existing
+/// `TranscriptDocument`/`BuiltDocument` pattern used for render output.
+private struct AttributedStringBox: @unchecked Sendable {
+    let value: NSAttributedString
+
+    init(_ value: NSAttributedString) {
+        self.value = value
+    }
+}
+
+/// Formatted SSE ("event: X\ndata: {...}") body view: splits the stream into
+/// frames (`SSEFrames` in Core), shows a dim "event: <name>" header per
+/// frame, and pretty-prints/highlights each frame's data via the existing
+/// `JsonBlock`/`JsonSyntax` machinery. Frames are capped (see `SSEFrames`)
+/// and paged in client-side with a "Show more" affordance rather than
+/// rendering the whole stream at once. Parsing runs off the main actor.
+struct SSEBodyView: View {
+    let source: String
+
+    @State private var frames: [SSEFrames.Frame] = []
+    @State private var truncated = false
+    @State private var parsedKey: String?
+    @State private var visibleCount = 20
+
+    private static let pageSize = 20
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                if parsedKey == nil {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Parsing events…")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                } else if frames.isEmpty {
+                    Text("No events parsed")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(frames.prefix(visibleCount).enumerated()), id: \.offset) {
+                        _, frame in
+                        frameView(frame)
+                    }
+                    if visibleCount < frames.count {
+                        Button("Show more (\(frames.count - visibleCount) more loaded)") {
+                            visibleCount = min(frames.count, visibleCount + Self.pageSize)
+                        }
+                        .buttonStyle(.link)
+                        .font(.system(size: 10))
+                    } else if truncated {
+                        Text(
+                            "Showing the first \(frames.count) events — switch to Raw mode to see the full stream."
+                        )
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+        }
+        .frame(height: 220)
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.surfaceFaint))
+        .task(id: source) {
+            guard parsedKey != source else { return }
+            let result = await Task.detached(priority: .userInitiated) {
+                SSEFrames.parse(source)
+            }.value
+            guard !Task.isCancelled else { return }
+            frames = result.frames
+            truncated = result.truncated
+            parsedKey = source
+            visibleCount = min(Self.pageSize, result.frames.count)
+        }
+    }
+
+    @ViewBuilder
+    private func frameView(_ frame: SSEFrames.Frame) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("event: \(frame.event ?? "message")")
+                .font(AlexTheme.Fonts.mono(9.5))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            if !frame.data.isEmpty, BodyPretty.isJSON(frame.data) {
+                JsonBlock(content: BodyPretty.display(frame.data).text, maxHeight: 160)
+            } else if !frame.data.isEmpty {
+                Text(frame.data)
+                    .font(AlexTheme.Fonts.metaMono)
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                .fill(AlexTheme.Colors.overlay(0.02)))
+    }
+}
+
 struct InspectorTextPane: NSViewRepresentable {
     let text: String
     var highlightJSON = false
     var fontSize: CGFloat = 10
+    /// When set, rendered as-is instead of computing highlighting from
+    /// `text`/`highlightJSON` — lets a caller hand in an attributed string
+    /// it already built off the main actor (see `FormattedJSONBody`, which
+    /// runs `JsonFormatted` in a background task and hands the result here).
+    var precomputed: NSAttributedString?
 
     private var font: NSFont {
         NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
@@ -908,14 +1281,16 @@ struct InspectorTextPane: NSViewRepresentable {
 
     /// JSON syntax palette aligned with `AlexTheme.Colors.Json`
     /// (shared.tsx:380-388); appearance-dynamic NSColors for the NSTextView.
-    static let jsonColors = JsonHighlight.Colors(
+    /// `nonisolated`: read from `FormattedJSONBodyBuilder`'s off-main
+    /// formatting task; `JsonHighlight.Colors` is `@unchecked Sendable`.
+    nonisolated static let jsonColors = JsonHighlight.Colors(
         key: dynamicColor(light: 0x33708E, dark: 0x79B8D4),
         string: dynamicColor(light: 0x4A7A3E, dark: 0x87BD78),
         number: dynamicColor(light: 0x9C5A28, dark: 0xD49668),
         keyword: dynamicColor(light: 0x7C4FA8, dark: 0xB48ADE),
         punctuation: dynamicColor(light: 0xB8B8C2, dark: 0x3E3E4A))
 
-    private static func dynamicColor(light: UInt32, dark: UInt32) -> NSColor {
+    private nonisolated static func dynamicColor(light: UInt32, dark: UInt32) -> NSColor {
         NSColor(name: nil) { appearance in
             let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
                 ? dark : light
@@ -951,6 +1326,14 @@ struct InspectorTextPane: NSViewRepresentable {
         guard let textView = scroll.documentView as? NSTextView,
             let storage = textView.textStorage
         else { return }
+        if let precomputed {
+            let key = "precomputed|\(precomputed.length)|\(precomputed.string.hashValue)"
+            guard context.coordinator.lastKey != key else { return }
+            context.coordinator.lastKey = key
+            storage.setAttributedString(precomputed)
+            textView.scroll(.zero)
+            return
+        }
         let key = "\(highlightJSON)|\(fontSize)|\(text.count)|\(text.hashValue)"
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key

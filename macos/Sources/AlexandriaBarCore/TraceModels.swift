@@ -556,6 +556,17 @@ public enum TurnHeader {
         "\(harness) · \(isToolResult ? "tool result" : "user")"
     }
 
+    /// Label for a "user"-slot message that is actually a tool result fed
+    /// back to the model by the harness, not literal user input — "Harness"
+    /// rather than the harness's own name, since the harness (not the user)
+    /// authored this content. Includes the tool name when the pairing to the
+    /// tool call that produced it is unambiguous (see
+    /// `TranscriptChatMessages.pairedToolName`).
+    public static func harnessResultLabel(toolName: String? = nil) -> String {
+        guard let toolName, !toolName.isEmpty else { return "Harness · tool result" }
+        return "Harness · tool result · \(toolName)"
+    }
+
     public static func responseLabel(
         model: String?, reasoningEffort: String? = nil, thinkingBudget: Int64? = nil,
         billingBucket: String? = nil
@@ -1298,6 +1309,9 @@ public enum HarnessIcon {
         "amp-code": "amp-code.svg",
         "opensage-adk": "opensage-adk.png",
         "stirrup": "stirrup.ico",
+        "oh-my-pi": "oh-my-pi.png",
+        "pydantic-ai-harness": "pydantic-ai-harness.png",
+        "jcode": "jcode.png",
     ]
 
     static let aliases: [String: String] = [
@@ -1313,6 +1327,8 @@ public enum HarnessIcon {
         "cursor-agent": "cursor-cli",
         "amp": "amp-code",
         "opensage": "opensage-adk",
+        "omp": "oh-my-pi",
+        "pydantic-ai": "pydantic-ai-harness",
     ]
 
     static let userAgentAliases: [String: String] = [
@@ -1574,6 +1590,19 @@ public struct OmniQuery: Equatable, Sendable {
         if freeText.isEmpty { return true }
         if freeTextMatchesTags(session) { return true }
         return serverMatches?.contains(session.sessionId) == true
+    }
+
+    /// True when a row is only visible because the server-side body-text
+    /// search (`/traces/search`) matched it — not because any local
+    /// metadata (tags) matched the free text. Drives the row's "body match"
+    /// indicator so the user can tell why a session with no visible textual
+    /// match in the table is showing up.
+    public func isBodyOnlyMatch(_ row: SessionRow, serverMatches: Set<String>?) -> Bool {
+        guard !freeText.isEmpty, serverMatches?.contains(row.id) == true else { return false }
+        if let tags = row.tags, tags.values.contains(where: { $0.localizedCaseInsensitiveContains(freeText) }) {
+            return false
+        }
+        return true
     }
 
     static func tagTokenMatches(_ token: String, tags: [String: String]) -> Bool {

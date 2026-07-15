@@ -206,6 +206,8 @@ enum AlexTheme {
             case "grok": Colors.dynamic(light: 0x0D0D0D, dark: 0x0D0D0D)
             case "gemini": Colors.dynamic(light: 0xFFFFFF, dark: 0xFFFFFF)
             case "opencode": Colors.dynamic(light: 0x000000, dark: 0x000000)
+            // Transparent magenta mark needs an opaque light tile for legibility.
+            case "pydantic-ai": Colors.dynamic(light: 0xFFFFFF, dark: 0xFFFFFF)
             default: Colors.overlay(0.08)
             }
         }

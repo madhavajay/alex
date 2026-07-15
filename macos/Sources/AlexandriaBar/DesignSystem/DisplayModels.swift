@@ -70,6 +70,10 @@ struct MessageDisplay: Identifiable, Equatable, Sendable {
     enum Role: Equatable, Sendable {
         case user
         case assistant
+        /// A tool result fed back to the model by the harness — structurally
+        /// the "user" slot of the turn, but authored by the harness, not the
+        /// user (see `TurnHeader.harnessResultLabel`).
+        case harness
     }
 
     let id: String
