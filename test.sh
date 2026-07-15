@@ -15,6 +15,8 @@ JSON=0
 TIMEOUT=""
 HOST_OVERRIDE=""
 PORT_OVERRIDE=""
+BASE_OVERRIDE=""
+KEY_OVERRIDE=""
 ALLOW_UNIMPL=0
 STRICT=0
 
@@ -37,6 +39,10 @@ Flags:
   --json                  machine-readable report on stdout
   --timeout N             per-cell seconds (default: 120 wire / 600 harness)
   --host H, --port N      daemon overrides (default: ~/.alexandria/config.toml)
+  --base URL              point the whole suite at a (possibly remote) proxy,
+                          e.g. http://192.168.1.150:4100 for the Mac's daemon;
+                          uses the already-running daemon, does not start one
+  --key KEY               admin/local key for that proxy (default: config local_key)
   --allow-unimplemented   proxy HTTP 501 becomes SKIP instead of FAIL
   --strict                run cells even when the provider preflight ping failed
   -h, --help              show this help
@@ -71,6 +77,10 @@ while [ "$#" -gt 0 ]; do
     --host=*)      HOST_OVERRIDE=${1#*=} ;;
     --port)        need_val "$@"; PORT_OVERRIDE=$2; shift ;;
     --port=*)      PORT_OVERRIDE=${1#*=} ;;
+    --base)        need_val "$@"; BASE_OVERRIDE=$2; shift ;;
+    --base=*)      BASE_OVERRIDE=${1#*=} ;;
+    --key)         need_val "$@"; KEY_OVERRIDE=$2; shift ;;
+    --key=*)       KEY_OVERRIDE=${1#*=} ;;
     --json)        JSON=1 ;;
     --allow-unimplemented) ALLOW_UNIMPL=1 ;;
     --strict)      STRICT=1 ;;
@@ -118,13 +128,29 @@ cfg_num() {
   fi
 }
 
-HOST=${HOST_OVERRIDE:-$(cfg_str host)}
-HOST=${HOST:-127.0.0.1}
-PORT=${PORT_OVERRIDE:-$(cfg_num port)}
-PORT=${PORT:-4100}
-KEY=$(cfg_str local_key)
+if [ -n "$BASE_OVERRIDE" ]; then
+  # --base http[s]://host:port  -> point the whole suite at a (possibly remote)
+  # proxy. Derive HOST/PORT from it for the health checks; the suite will use the
+  # already-running daemon rather than starting a local one.
+  BASE="${BASE_OVERRIDE%/}"
+  rest="${BASE#*://}"
+  HOST="${rest%%:*}"
+  PORT="${rest##*:}"
+  case "$PORT" in *[!0-9]*|"") PORT=$([ "${BASE%%:*}" = https ] && echo 443 || echo 80) ;; esac
+else
+  HOST=${HOST_OVERRIDE:-$(cfg_str host)}
+  HOST=${HOST:-127.0.0.1}
+  PORT=${PORT_OVERRIDE:-$(cfg_num port)}
+  PORT=${PORT:-4100}
+  BASE="http://$HOST:$PORT"
+fi
+KEY=${KEY_OVERRIDE:-$(cfg_str local_key)}
 KEY=${KEY:-}
-BASE="http://$HOST:$PORT"
+# Treat an explicit --base, or any non-loopback host, as a remote proxy we must
+# not try to spawn locally.
+REMOTE=0
+if [ -n "$BASE_OVERRIDE" ]; then REMOTE=1; fi
+case "$HOST" in 127.0.0.1|localhost|::1|"") ;; *) REMOTE=1 ;; esac
 
 if [ -z "$JOBS" ]; then
   JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
@@ -182,6 +208,10 @@ ensure_daemon() {
   if health_ok; then
     log "daemon: using running instance at $BASE"
     return 0
+  fi
+  if [ "$REMOTE" = "1" ]; then
+    log "daemon: remote proxy at $BASE is not reachable (health check failed); not starting a local daemon"
+    exit 2
   fi
   log "daemon: none at $BASE - starting ./alex daemon (cargo may compile; waiting up to 60s)"
   "$ROOT/alex" daemon --host "$HOST" --port "$PORT" >"$TMP/daemon.log" 2>&1 &
@@ -379,7 +409,8 @@ PY
     return 0
   fi
   set -- --traces "$tf" --session "$sess" --provider "$provider" \
-    --format-prefix "$fprefix" --bucket "$bucket" --routed "$routed"
+    --format-prefix "$fprefix" --bucket "$bucket" --routed "$routed" \
+    --base "$BASE" --key "$KEY"
   if [ "$cross" = "1" ]; then set -- "$@" --cross; fi
   if [ "$dflag" = "1" ]; then set -- "$@" --expect-dario; fi
   if msg=$(python3 "$ROOT/scripts/test-assert.py" "$@" 2>&1); then

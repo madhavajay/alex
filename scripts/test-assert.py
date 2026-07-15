@@ -3,6 +3,20 @@ import argparse
 import json
 import os
 import sys
+import urllib.request
+
+
+def body_reachable_http(base, key, trace_id, kind):
+    """Verify a stored body by fetching it from the daemon, so the check works
+    against a REMOTE proxy (the body files live on the daemon's machine, not
+    wherever this script runs)."""
+    url = f"{base.rstrip('/')}/traces/{trace_id}/body/{kind}"
+    req = urllib.request.Request(url, headers={"x-api-key": key} if key else {})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status == 200 and len(r.read(1)) == 1
+    except Exception:
+        return False
 
 
 def main():
@@ -15,6 +29,10 @@ def main():
     ap.add_argument("--routed")
     ap.add_argument("--cross", action="store_true")
     ap.add_argument("--expect-dario", action="store_true")
+    # When --base is given, bodies are verified over HTTP instead of the local
+    # filesystem, so the suite works against a proxy on another machine.
+    ap.add_argument("--base")
+    ap.add_argument("--key")
     a = ap.parse_args()
 
     fails = []
@@ -57,12 +75,16 @@ def main():
     if t.get("cost_usd") is None:
         warns.append("cost_usd null")
 
-    for key in ("req_body_path", "resp_body_path"):
-        p = t.get(key)
+    body_kind = {"req_body_path": "request", "resp_body_path": "response"}
+    for field, kind in body_kind.items():
+        p = t.get(field)
         if not p:
-            fails.append(f"{key} missing from trace")
+            fails.append(f"{field} missing from trace")
+        elif a.base:
+            if not body_reachable_http(a.base, a.key, t.get("id"), kind):
+                fails.append(f"{field} not fetchable from daemon ({kind})")
         elif not os.path.isfile(p):
-            fails.append(f"{key} not on disk: {p}")
+            fails.append(f"{field} not on disk: {p}")
 
     chk(t.get("error") in (None, ""), f"error={t.get('error')!r} want null")
 
