@@ -8,7 +8,6 @@ use std::time::Duration;
 mod plugins;
 pub use plugins::{PluginManager, PluginManifest};
 
-use anyhow::Result;
 use alex_auth::{
     now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
     AccountPolicy, AccountPolicyMode, RemovedAccount, Vault,
@@ -20,6 +19,7 @@ use alex_core::{
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{KnownAccount, Store, ToolCallRecord, TraceFilter};
+use anyhow::Result;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -73,7 +73,8 @@ pub trait DarioRouter: Send + Sync {
 }
 
 pub type DarioPrepareFuture = Pin<Box<dyn Future<Output = DarioPrepare> + Send + 'static>>;
-pub type DarioEnsureFuture = Pin<Box<dyn Future<Output = Result<DarioActive, String>> + Send + 'static>>;
+pub type DarioEnsureFuture =
+    Pin<Box<dyn Future<Output = Result<DarioActive, String>> + Send + 'static>>;
 pub type DarioProbeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,7 +667,11 @@ async fn admin_reset(
             "cannot reset while routed requests are in flight; retry after they complete",
         );
     }
-    let handler = state.reset_handler.read().ok().and_then(|slot| slot.clone());
+    let handler = state
+        .reset_handler
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
     let Some(handler) = handler else {
         return error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -821,9 +826,7 @@ async fn admin_auth_openrouter_key(
     let remove = match body.0.get("remove") {
         Some(value) => match value.as_bool() {
             Some(value) => value,
-            None => {
-                return error_response(StatusCode::BAD_REQUEST, "'remove' must be boolean")
-            }
+            None => return error_response(StatusCode::BAD_REQUEST, "'remove' must be boolean"),
         },
         None => false,
     };
@@ -842,9 +845,7 @@ async fn admin_auth_openrouter_key(
                 "removed": removed.then_some("openrouter-api-key")
             }))
             .into_response(),
-            Err(error) => {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-            }
+            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         };
     }
 
@@ -1494,7 +1495,10 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
         }
     }
     for entry in &mut providers {
-        if let Some(provider) = entry["provider"].as_str().and_then(Provider::from_str_loose) {
+        if let Some(provider) = entry["provider"]
+            .as_str()
+            .and_then(Provider::from_str_loose)
+        {
             let quota = quota_state(provider, entry);
             if let Some(object) = entry.as_object_mut() {
                 object.insert("quota".into(), quota);
@@ -1560,21 +1564,20 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
     match &state.dario {
         Some(d) => {
             let mut status = d.status();
-            let anthropic_credentials_present = state
-                .vault
-                .list()
-                .await
-                .into_iter()
-                .any(|account| account.provider == Provider::Anthropic && account.status == "active");
-            let generation_ready = d.active().is_some();
-            let probe_succeeds = status["generations"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|generation| {
-                    generation["id"].as_str() == status["active_generation_id"].as_str()
-                        && generation["last_probe"]["ok"].as_bool() == Some(true)
+            let anthropic_credentials_present =
+                state.vault.list().await.into_iter().any(|account| {
+                    account.provider == Provider::Anthropic && account.status == "active"
                 });
+            let generation_ready = d.active().is_some();
+            let probe_succeeds =
+                status["generations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|generation| {
+                        generation["id"].as_str() == status["active_generation_id"].as_str()
+                            && generation["last_probe"]["ok"].as_bool() == Some(true)
+                    });
             let prompt_cache_degraded = !status["health_reason"].is_null();
             if let Some(obj) = status.as_object_mut() {
                 obj.insert("prompt_caches".into(), json!(dario_prompt_caches(&state)));
@@ -2051,14 +2054,22 @@ fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
             Some("tool_call") if tool_calls < 24 => {
                 let name = block["name"].as_str()?;
                 tool_calls += 1;
-                Some(json!({
+                let mut item = json!({
                     "type": "tool_call",
                     "name": name,
                     "arguments": truncate_chars(
                         block["arguments"].as_str().unwrap_or_default().to_string(),
                         600,
                     ),
-                }))
+                });
+                if let Some(id) = block["id"]
+                    .as_str()
+                    .or_else(|| block["call_id"].as_str())
+                    .filter(|id| !id.is_empty())
+                {
+                    item["id"] = json!(id);
+                }
+                Some(item)
             }
             _ => None,
         })
@@ -2113,6 +2124,7 @@ fn transcript_turn(row: &Value) -> Value {
         "reasoning_effort": row["reasoning_effort"],
         "thinking_budget": row["thinking_budget"],
         "cost_usd": row["cost_usd"],
+        "billing_bucket": row["billing_bucket"],
         "account_id": row["account_id"],
         "error": row["error"],
         "user": user,
@@ -2180,13 +2192,22 @@ async fn traces_session_transcript(
             // and before the next provider request. Associate by explicit
             // trace_id when available, otherwise by that session-local time
             // interval. `turn_id` remains on each tool row for Pi-level joins.
-            let next_request = rows.get(index + 1).and_then(|next| next["ts_request_ms"].as_i64());
+            let next_request = rows
+                .get(index + 1)
+                .and_then(|next| next["ts_request_ms"].as_i64());
             let trace_id = row["id"].as_str();
             let started = row["ts_request_ms"].as_i64().unwrap_or_default();
-            let executed: Vec<Value> = tools.iter().filter(|tool| {
-                tool["trace_id"].as_str() == trace_id || (tool["trace_id"].is_null()
-                    && tool["ts_start_ms"].as_i64().is_some_and(|ts| ts >= started && next_request.is_none_or(|next| ts < next)))
-            }).cloned().collect();
+            let executed: Vec<Value> = tools
+                .iter()
+                .filter(|tool| {
+                    tool["trace_id"].as_str() == trace_id
+                        || (tool["trace_id"].is_null()
+                            && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
+                                ts >= started && next_request.is_none_or(|next| ts < next)
+                            }))
+                })
+                .cloned()
+                .collect();
             turn["executed_tools"] = json!(executed);
             if replayed_user {
                 turn["user"] = Value::Null;
@@ -2198,12 +2219,18 @@ async fn traces_session_transcript(
 }
 
 fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
+    let thinking_budget = req["thinking"]
+        .as_object()
+        .filter(|thinking| thinking.get("type").and_then(Value::as_str) == Some("enabled"))
+        .and_then(|thinking| thinking.get("budget_tokens").and_then(Value::as_i64));
     (
         req["reasoning"]["effort"]
             .as_str()
+            .or_else(|| req["reasoning_effort"].as_str())
             .or_else(|| req["output_config"]["effort"].as_str())
-            .map(String::from),
-        req["thinking"]["budget_tokens"].as_i64(),
+            .map(String::from)
+            .or_else(|| thinking_budget.map(|budget| format!("budget:{budget}"))),
+        thinking_budget,
     )
 }
 
@@ -2315,10 +2342,15 @@ async fn trace_body(
     }
 }
 
-async fn tool_body(State(state): State<Arc<AppState>>, Path((id, kind)): Path<(String, String)>) -> Response {
+async fn tool_body(
+    State(state): State<Arc<AppState>>,
+    Path((id, kind)): Path<(String, String)>,
+) -> Response {
     let row = match state.store.get_tool_call(&id) {
         Ok(Some(row)) => row,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'")),
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'"))
+        }
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let path = match kind.as_str() {
@@ -2327,10 +2359,15 @@ async fn tool_body(State(state): State<Arc<AppState>>, Path((id, kind)): Path<(S
         _ => return error_response(StatusCode::BAD_REQUEST, "kind must be args or result"),
     };
     match read_gz_text(path) {
-        Some(text) => Response::builder().status(StatusCode::OK)
+        Some(text) => Response::builder()
+            .status(StatusCode::OK)
             .header("content-type", "application/json; charset=utf-8")
-            .body(Body::from(text)).unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-        None => error_response(StatusCode::NOT_FOUND, &format!("no {kind} body stored for tool call '{id}'")),
+            .body(Body::from(text))
+            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &format!("no {kind} body stored for tool call '{id}'"),
+        ),
     }
 }
 
@@ -2937,7 +2974,11 @@ pub async fn ping_dario(state: &Arc<AppState>, model: &str) -> (DarioHealthState
             },
         );
     };
-    let generation_ready = state.dario.as_ref().and_then(|dario| dario.active()).is_some();
+    let generation_ready = state
+        .dario
+        .as_ref()
+        .and_then(|dario| dario.active())
+        .is_some();
     let result = match &state.dario {
         Some(dario) if generation_ready => dario.probe(model).await,
         Some(_) => Err("no healthy Dario generation".into()),
@@ -4040,7 +4081,7 @@ mod trace_api_tests {
     }
 
     #[test]
-    fn extras_per_format() {
+    fn proxy_reasoning_effort_capture_for_anthropic_thinking() {
         let anthropic = json!({
             "system": [{"type": "text", "text": "abcd"}],
             "messages": [{"role": "user", "content": "hi"}],
@@ -4050,12 +4091,28 @@ mod trace_api_tests {
         });
         let e = trace_extras(&anthropic);
         assert_eq!(e["thinking_budget"], 4096);
-        assert_eq!(trace_reasoning_fields(&anthropic), (None, Some(4096)));
+        assert_eq!(
+            trace_reasoning_fields(&anthropic),
+            (Some("budget:4096".into()), Some(4096))
+        );
         assert_eq!(e["max_tokens"], 100);
         assert_eq!(e["temperature"], 0.5);
         assert_eq!(e["message_count"], 1);
         assert_eq!(e["system_chars"], 4);
-        assert_eq!(e["reasoning_effort"], serde_json::Value::Null);
+        assert_eq!(e["reasoning_effort"], "budget:4096");
+
+        let anthropic_without_thinking = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [],
+        });
+        assert_eq!(
+            trace_reasoning_fields(&anthropic_without_thinking),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn proxy_reasoning_effort_capture_for_openai_responses() {
         let responses = json!({
             "instructions": "abc",
             "input": [{"type": "message"}, {"type": "message"}],
@@ -4075,6 +4132,16 @@ mod trace_api_tests {
     }
 
     #[test]
+    fn proxy_reasoning_effort_capture_for_openai_chat_completions() {
+        let chat = json!({
+            "model": "gpt-5",
+            "messages": [],
+            "reasoning_effort": "medium",
+        });
+        assert_eq!(trace_reasoning_fields(&chat), (Some("medium".into()), None));
+    }
+
+    #[test]
     fn truncates_on_char_boundaries() {
         assert_eq!(truncate_chars("abc".into(), 8000), "abc");
         assert_eq!(
@@ -4089,6 +4156,7 @@ mod trace_api_tests {
             "id": "t1", "ts_request_ms": 1, "ts_response_ms": 2,
             "routed_model": "m", "status": 200,
             "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01, "error": null,
+            "billing_bucket": "subscription",
             "reasoning_effort": "minimal", "thinking_budget": null,
             "req_body_path": "/nonexistent/x.gz", "resp_body_path": null,
             "client_format": "anthropic", "upstream_format": "anthropic",
@@ -4099,6 +4167,7 @@ mod trace_api_tests {
         assert_eq!(turn["assistant"], serde_json::Value::Null);
         assert_eq!(turn["model"], "m");
         assert_eq!(turn["reasoning_effort"], "minimal");
+        assert_eq!(turn["billing_bucket"], "subscription");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
     }
 
@@ -4107,7 +4176,7 @@ mod trace_api_tests {
         let response = json!({
             "_alexandria": {"assistant_blocks": [
                 {"type": "text", "text": "Listing the workspace."},
-                {"type": "tool_call", "name": "Shell", "arguments": "{\"command\":\"ls\"}"},
+                {"type": "tool_call", "id": "call-1", "name": "Shell", "arguments": "{\"command\":\"ls\"}"},
                 {"type": "text", "text": "Here are the files."},
             ]}
         });
@@ -4116,6 +4185,7 @@ mod trace_api_tests {
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "Listing the workspace.");
         assert_eq!(blocks[1]["type"], "tool_call");
+        assert_eq!(blocks[1]["id"], "call-1");
         assert_eq!(blocks[1]["name"], "Shell");
         assert_eq!(blocks[2]["type"], "text");
         assert_eq!(blocks[2]["text"], "Here are the files.");
@@ -4646,7 +4716,12 @@ fn authenticate_trace_ingest(
             "trace ingest requires an Alexandria wrap key",
         ));
     };
-    if state.local_key.read().map(|local| key == *local).unwrap_or(false) {
+    if state
+        .local_key
+        .read()
+        .map(|local| key == *local)
+        .unwrap_or(false)
+    {
         return Ok((key_fingerprint(&key), None, true));
     }
     let key_hash = key_hash_hex(&key);
@@ -4808,28 +4883,57 @@ fn normalize_harness_event(event: &mut Value) {
 }
 
 fn redact_tool_value(value: &mut Value) {
-    const SECRET_KEYS: &[&str] = &["authorization", "token", "secret", "password", "api_key", "apikey", "cookie", "env", "environment"];
+    const SECRET_KEYS: &[&str] = &[
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "cookie",
+        "env",
+        "environment",
+    ];
     match value {
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
                 let lower = key.to_ascii_lowercase();
                 if SECRET_KEYS.iter().any(|needle| lower.contains(needle)) {
                     *value = Value::String("<redacted>".into());
-                } else { redact_tool_value(value); }
+                } else {
+                    redact_tool_value(value);
+                }
             }
         }
         Value::Array(values) => {
             let mut redact_next = false;
             for value in values {
-                if redact_next { *value = Value::String("<redacted>".into()); redact_next = false; continue; }
+                if redact_next {
+                    *value = Value::String("<redacted>".into());
+                    redact_next = false;
+                    continue;
+                }
                 if let Some(argument) = value.as_str() {
                     let lower = argument.to_ascii_lowercase();
                     redact_next = ["--token", "--api-key", "--apikey", "--password", "--secret"]
-                        .iter().any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")));
-                    if lower.starts_with("--token=") || lower.starts_with("--api-key=") || lower.starts_with("--password=") || lower.starts_with("--secret=") {
-                        *value = Value::String(format!("{}<redacted>", argument.split_once('=').map(|(k, _)| format!("{k}=")).unwrap_or_default()));
+                        .iter()
+                        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")));
+                    if lower.starts_with("--token=")
+                        || lower.starts_with("--api-key=")
+                        || lower.starts_with("--password=")
+                        || lower.starts_with("--secret=")
+                    {
+                        *value = Value::String(format!(
+                            "{}<redacted>",
+                            argument
+                                .split_once('=')
+                                .map(|(k, _)| format!("{k}="))
+                                .unwrap_or_default()
+                        ));
                     }
-                } else { redact_tool_value(value); }
+                } else {
+                    redact_tool_value(value);
+                }
             }
         }
         _ => {}
@@ -4837,52 +4941,159 @@ fn redact_tool_value(value: &mut Value) {
 }
 
 fn tool_event_body(value: Option<Value>) -> Option<Vec<u8>> {
-    value.map(|mut value| { redact_tool_value(&mut value); serde_json::to_vec(&value).unwrap_or_default() })
+    value.map(|mut value| {
+        redact_tool_value(&mut value);
+        serde_json::to_vec(&value).unwrap_or_default()
+    })
+}
+
+/// Translate the native Claude Code/Codex hook payload into the tool ingest
+/// contract. Hooks deliberately send their stdin unchanged so this stays the
+/// single compatibility boundary for harness-specific payloads.
+fn normalize_tool_event(event: &mut Value) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+    if object.get("phase").and_then(Value::as_str).is_none() {
+        let phase = match object.get("hook_event_name").and_then(Value::as_str) {
+            Some("PreToolUse") => Some("start"),
+            Some("PostToolUse") | Some("PostToolUseFailure") => Some("end"),
+            _ => None,
+        };
+        if let Some(phase) = phase {
+            object.insert("phase".into(), Value::String(phase.into()));
+        }
+    }
+    if object.get("hook_event_name").and_then(Value::as_str) == Some("PostToolUseFailure") {
+        object.insert("is_error".into(), Value::Bool(true));
+    }
+    for (canonical, aliases) in [
+        (
+            "tool_call_id",
+            &["tool_use_id", "toolUseId", "tool_useID"][..],
+        ),
+        ("session_id", &["sessionId"][..]),
+    ] {
+        if object.get(canonical).and_then(Value::as_str).is_some() {
+            continue;
+        }
+        if let Some(value) = aliases
+            .iter()
+            .find_map(|alias| object.get(*alias).and_then(Value::as_str))
+        {
+            object.insert(canonical.into(), Value::String(value.to_string()));
+        }
+    }
+    for (canonical, native) in [("args", "tool_input"), ("result", "tool_response")] {
+        if !object.contains_key(canonical) {
+            if let Some(value) = object.get(native).cloned() {
+                object.insert(canonical.into(), value);
+            }
+        }
+    }
 }
 
 async fn tool_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::Json(event): axum::Json<Value>,
+    axum::Json(mut event): axum::Json<Value>,
 ) -> Response {
     let (key_hash, key) = match authenticate_harness_event(&state, &headers) {
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    if let Err(error) = state.store.touch_run_key(&key_hash, now_ms()) { tracing::warn!(%error, "failed to touch harness key"); }
+    if let Err(error) = state.store.touch_run_key(&key_hash, now_ms()) {
+        tracing::warn!(%error, "failed to touch harness key");
+    }
     let harness = key.label.as_deref().unwrap_or_default();
+    normalize_tool_event(&mut event);
     let phase = event["phase"].as_str().unwrap_or_default();
-    if !matches!(phase, "start" | "end" | "turn_start" | "turn_end" | "agent_start" | "agent_end") { return error_response(StatusCode::BAD_REQUEST, "tool event phase is unsupported"); }
-    let session_id = match event["session_id"].as_str().filter(|id| valid_ingest_trace_id(id)) {
-        Some(id) => id.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires safe session_id"),
+    if !matches!(
+        phase,
+        "start" | "end" | "turn_start" | "turn_end" | "agent_start" | "agent_end"
+    ) {
+        return error_response(StatusCode::BAD_REQUEST, "tool event phase is unsupported");
+    }
+    let session_id = match event["session_id"]
+        .as_str()
+        .filter(|id| valid_ingest_trace_id(id))
+    {
+        Some(id) => id.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tool event requires safe session_id",
+            )
+        }
     };
     // Pi 0.80.6's AgentStartEvent and AgentEndEvent have no parent/child id;
     // acknowledge them without fabricating a session_lineage edge.
-    if matches!(phase, "turn_start" | "turn_end" | "agent_start" | "agent_end") {
-        return axum::Json(json!({"ok": true, "session_id": session_id, "lineage_updated": false})).into_response();
+    if matches!(
+        phase,
+        "turn_start" | "turn_end" | "agent_start" | "agent_end"
+    ) {
+        return axum::Json(json!({"ok": true, "session_id": session_id, "lineage_updated": false}))
+            .into_response();
     }
-    let tool_call_id = match event["tool_call_id"].as_str().filter(|id| valid_ingest_trace_id(id)) {
-        Some(id) => id.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires safe tool_call_id"),
+    let tool_call_id = match event["tool_call_id"]
+        .as_str()
+        .filter(|id| valid_ingest_trace_id(id))
+    {
+        Some(id) => id.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tool event requires safe tool_call_id",
+            )
+        }
     };
-    let tool_name = match event["tool_name"].as_str().filter(|name| !name.is_empty() && name.len() <= 200) {
-        Some(name) => name.to_string(), None => return error_response(StatusCode::BAD_REQUEST, "tool event requires tool_name"),
+    let tool_name = match event["tool_name"]
+        .as_str()
+        .filter(|name| !name.is_empty() && name.len() <= 200)
+    {
+        Some(name) => name.to_string(),
+        None => return error_response(StatusCode::BAD_REQUEST, "tool event requires tool_name"),
     };
-    let ts_ms = event["timestamp_ms"].as_i64().filter(|ts| *ts > 0).unwrap_or_else(now_ms);
-    let id = format!("tool-{}-{}", session_id, tool_call_id).replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_', "_");
+    let ts_ms = event["timestamp_ms"]
+        .as_i64()
+        .filter(|ts| *ts > 0)
+        .unwrap_or_else(now_ms);
+    let id = format!("tool-{}-{}", session_id, tool_call_id).replace(
+        |c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_',
+        "_",
+    );
     let args_body_path = match tool_event_body(event.get("args").cloned()) {
-        Some(bytes) => match state.store.write_body(&id, "tool-args.json", &bytes) { Ok(path) => Some(path), Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) },
+        Some(bytes) => match state.store.write_body(&id, "tool-args.json", &bytes) {
+            Ok(path) => Some(path),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        },
         None => None,
     };
     let result_body_path = match tool_event_body(event.get("result").cloned()) {
-        Some(bytes) => match state.store.write_body(&id, "tool-result.json", &bytes) { Ok(path) => Some(path), Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) },
+        Some(bytes) => match state.store.write_body(&id, "tool-result.json", &bytes) {
+            Ok(path) => Some(path),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        },
         None => None,
     };
     let record = ToolCallRecord {
-        id, harness: harness.to_string(), session_id, turn_id: event["turn_id"].as_str().map(String::from),
-        tool_call_id, trace_id: event["trace_id"].as_str().map(String::from), tool_name,
-        ts_start_ms: if phase == "start" { ts_ms } else { event["started_ms"].as_i64().unwrap_or(ts_ms) },
-        ts_end_ms: (phase == "end").then_some(ts_ms), is_error: event["is_error"].as_bool(),
-        exit_status: event["exit_status"].as_i64(), args_body_path, result_body_path,
+        id,
+        harness: harness.to_string(),
+        session_id,
+        turn_id: event["turn_id"].as_str().map(String::from),
+        tool_call_id,
+        trace_id: event["trace_id"].as_str().map(String::from),
+        tool_name,
+        ts_start_ms: if phase == "start" {
+            ts_ms
+        } else {
+            event["started_ms"].as_i64().unwrap_or(ts_ms)
+        },
+        ts_end_ms: (phase == "end").then_some(ts_ms),
+        is_error: event["is_error"].as_bool(),
+        exit_status: event["exit_status"].as_i64(),
+        args_body_path,
+        result_body_path,
     };
     match state.store.upsert_tool_call(&record) {
         Ok(()) => axum::Json(json!({"ok": true})).into_response(),
@@ -5134,7 +5345,15 @@ async fn proxy(
 ) -> Response {
     let mut run_key: Option<CachedRunKey> = None;
     let client_fingerprint = match client_key(&headers) {
-        Some(k) if state.local_key.read().map(|local| k == *local).unwrap_or(false) => key_fingerprint(&k),
+        Some(k)
+            if state
+                .local_key
+                .read()
+                .map(|local| k == *local)
+                .unwrap_or(false) =>
+        {
+            key_fingerprint(&k)
+        }
         Some(k) => {
             let key_hash = key_hash_hex(&k);
             match run_key_entry(&state, &key_hash) {
@@ -5199,11 +5418,22 @@ async fn proxy(
             return error_response(StatusCode::BAD_REQUEST, &format!("body is not JSON: {e}"))
         }
     };
-    let plugin_headers: serde_json::Map<String, Value> = headers.iter().filter_map(|(name, value)|
-        value.to_str().ok().map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
-    ).collect();
-    let plugin_request = state.plugins.invoke("on_request", json!({"headers": plugin_headers, "body": body_json}));
-    if let Some(mutated) = plugin_request.get("body").filter(|value| value.is_object()) { body_json = mutated.clone(); }
+    let plugin_headers: serde_json::Map<String, Value> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
+        })
+        .collect();
+    let plugin_request = state.plugins.invoke(
+        "on_request",
+        json!({"headers": plugin_headers, "body": body_json}),
+    );
+    if let Some(mutated) = plugin_request.get("body").filter(|value| value.is_object()) {
+        body_json = mutated.clone();
+    }
     let (reasoning_effort, thinking_budget) = trace_reasoning_fields(&body_json);
     trace.reasoning_effort = reasoning_effort;
     trace.thinking_budget = thinking_budget;
@@ -6120,7 +6350,10 @@ fn finalize_trace(
     if let Err(e) = store.insert_trace(&trace) {
         tracing::error!("failed to insert trace {}: {e}", trace.id);
     } else {
-        let _ = state.plugins.invoke("on_trace", serde_json::to_value(&trace).unwrap_or(Value::Null));
+        let _ = state.plugins.invoke(
+            "on_trace",
+            serde_json::to_value(&trace).unwrap_or(Value::Null),
+        );
         tracing::info!(
             trace_id = %trace.id,
             status = trace.status,
@@ -6225,9 +6458,18 @@ mod tests {
             dario_health_state(false, true, true),
             DarioHealthState::NotApplicable
         );
-        assert_eq!(dario_health_state(true, false, true), DarioHealthState::Down);
-        assert_eq!(dario_health_state(true, true, false), DarioHealthState::Down);
-        assert_eq!(dario_health_state(true, true, true), DarioHealthState::Healthy);
+        assert_eq!(
+            dario_health_state(true, false, true),
+            DarioHealthState::Down
+        );
+        assert_eq!(
+            dario_health_state(true, true, false),
+            DarioHealthState::Down
+        );
+        assert_eq!(
+            dario_health_state(true, true, true),
+            DarioHealthState::Healthy
+        );
     }
 
     #[test]
@@ -6242,25 +6484,118 @@ mod tests {
         let bytes = tool_event_body(Some(json!({
             "argv": ["curl", "--token", "super-secret"],
             "env": {"API_KEY": "also-secret"}
-        }))).unwrap();
+        })))
+        .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["argv"][2], "<redacted>");
         assert_eq!(value["env"], "<redacted>");
+    }
+
+    #[test]
+    fn normalizes_native_tool_hook_payloads() {
+        let mut event = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session",
+            "toolUseId": "call",
+            "tool_input": {"command": "echo hi"},
+        });
+        normalize_tool_event(&mut event);
+        assert_eq!(event["phase"], "start");
+        assert_eq!(event["tool_call_id"], "call");
+        assert_eq!(event["args"]["command"], "echo hi");
+
+        let mut failed = json!({"hook_event_name": "PostToolUseFailure", "tool_useID": "call"});
+        normalize_tool_event(&mut failed);
+        assert_eq!(failed["phase"], "end");
+        assert_eq!(failed["is_error"], true);
+        assert_eq!(failed["tool_call_id"], "call");
     }
 
     #[tokio::test]
     async fn tool_ingest_requires_harness_key_and_persists_a_session_join() {
         let state = test_state("tool-ingest");
         let key = "tool-harness-key";
-        state.store.insert_run_key("rk-tool", &key_hash_hex(key), "harness", None, None, Some("pi"), now_ms(), None).unwrap();
+        state
+            .store
+            .insert_run_key(
+                "rk-tool",
+                &key_hash_hex(key),
+                "harness",
+                None,
+                None,
+                Some("pi"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
         let event = json!({"phase":"end", "session_id":"session", "turn_id":"1", "tool_call_id":"call", "tool_name":"bash", "args":{"command":"echo hi"}, "result":{"content":"hi"}, "is_error":false, "exit_status":0, "timestamp_ms":100});
-        let mut headers = HeaderMap::new(); headers.insert("x-api-key", HeaderValue::from_static(key));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static(key));
         let response = tool_event(State(state.clone()), headers, axum::Json(event)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let rows = state.store.session_tool_calls("session").unwrap();
-        assert_eq!(rows.len(), 1); assert_eq!(rows[0]["turn_id"], "1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["turn_id"], "1");
         let response = tool_event(State(state), HeaderMap::new(), axum::Json(json!({}))).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn native_tool_hooks_persist_bodies_complete_calls_and_mark_failures() {
+        let state = test_state("native-tool-hooks");
+        let key = "native-tool-harness-key";
+        state
+            .store
+            .insert_run_key(
+                "rk-native-tool",
+                &key_hash_hex(key),
+                "harness",
+                None,
+                None,
+                Some("claude"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer native-tool-harness-key"),
+        );
+
+        let start = json!({"hook_event_name":"PreToolUse", "session_id":"session", "tool_use_id":"call", "tool_name":"Bash", "tool_input":{"command":"echo hi"}, "timestamp_ms":100});
+        assert_eq!(
+            tool_event(State(state.clone()), headers.clone(), axum::Json(start))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let end = json!({"hook_event_name":"PostToolUse", "session_id":"session", "tool_use_id":"call", "tool_name":"Bash", "tool_response":{"content":"hi"}, "timestamp_ms":200});
+        assert_eq!(
+            tool_event(State(state.clone()), headers.clone(), axum::Json(end))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let rows = state.store.session_tool_calls("session").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["ts_end_ms"], 200);
+        let args = read_gz_json(rows[0]["args_body_path"].as_str()).unwrap();
+        let result = read_gz_json(rows[0]["result_body_path"].as_str()).unwrap();
+        assert_eq!(args["command"], "echo hi");
+        assert_eq!(result["content"], "hi");
+
+        let failed = json!({"hook_event_name":"PostToolUseFailure", "session_id":"session", "tool_use_id":"failed", "tool_name":"Bash", "tool_response":{"error":"nope"}, "timestamp_ms":300});
+        assert_eq!(
+            tool_event(State(state.clone()), headers, axum::Json(failed))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            state.store.session_tool_calls("session").unwrap()[1]["is_error"],
+            true
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6307,7 +6642,10 @@ mod tests {
                 None
             } else {
                 tokio::time::sleep(Duration::from_secs(4)).await;
-                Some((Ok::<_, std::io::Error>(Bytes::from_static(b"token")), index + 1))
+                Some((
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"token")),
+                    index + 1,
+                ))
             }
         })
         .boxed();
@@ -6318,10 +6656,16 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
-        assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from_static(b"token"));
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"token")
+        );
         tokio::time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
-        assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from_static(b"token"));
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"token")
+        );
         assert_eq!(task.await.unwrap(), None);
     }
 
@@ -6615,7 +6959,10 @@ mod tests {
         let plan = result.unwrap();
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
         assert!(!plan.via_dario);
-        assert!(plan.dario_fallback_reason.unwrap().contains("repair failed"));
+        assert!(plan
+            .dario_fallback_reason
+            .unwrap()
+            .contains("repair failed"));
     }
 
     #[tokio::test]
@@ -6654,7 +7001,10 @@ mod tests {
         let plan = result.unwrap();
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
         assert!(!plan.via_dario);
-        assert!(plan.dario_fallback_reason.unwrap().contains("became unavailable"));
+        assert!(plan
+            .dario_fallback_reason
+            .unwrap()
+            .contains("became unavailable"));
     }
 
     #[test]
@@ -7356,47 +7706,208 @@ mod tests {
         assert_eq!(stop["hook_event_name"], "SubagentStop");
     }
 
+    fn lineage_test_headers(state: &Arc<AppState>, harness: &str, key: &str) -> HeaderMap {
+        state
+            .store
+            .insert_run_key(
+                "rk-lineage",
+                &key_hash_hex(key),
+                "harness",
+                None,
+                None,
+                Some(harness),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+        headers
+    }
+
+    fn insert_lineage_test_traces(state: &Arc<AppState>, harness: &str, parent: &str, child: &str) {
+        for (id, session_id) in [("lineage-parent", parent), ("lineage-child", child)] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: format!("{harness}-{id}"),
+                    ts_request_ms: now_ms(),
+                    session_id: Some(session_id.into()),
+                    harness: Some(harness.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
+
+    fn lineage_session(state: &Arc<AppState>, child: &str) -> Value {
+        state
+            .store
+            .sessions(None, 0)
+            .unwrap()
+            .into_iter()
+            .find(|row| row["session_id"] == child)
+            .unwrap()
+    }
+
+    async fn post_lineage_event(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+        event: Value,
+    ) -> (StatusCode, Value) {
+        response_json(harness_event(State(state), headers, axum::Json(event)).await).await
+    }
+
+    #[tokio::test]
+    async fn claude_hook_subagent_start_and_stop_persist_lineage_timestamps() {
+        let state = test_state("claude-hook-lineage");
+        let parent = "claude-parent";
+        let child = "claude-child";
+        insert_lineage_test_traces(&state, "claude", parent, child);
+        let headers = lineage_test_headers(&state, "claude", "claude-lineage-key");
+        for (hook_event_name, timestamp_ms) in [("SubagentStart", 1_001), ("SubagentStop", 2_002)] {
+            let (status, body) = post_lineage_event(
+                state.clone(),
+                headers.clone(),
+                json!({
+                    "hook_event_name": hook_event_name,
+                    "session_id": parent,
+                    "agent_id": child,
+                    "agent_type": "general-purpose",
+                    "timestamp_ms": timestamp_ms,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["lineage_updated"], true);
+        }
+        let row = lineage_session(&state, child);
+        assert_eq!(row["parent_session_id"], parent);
+        assert_eq!(row["agent_type"], "general-purpose");
+        assert_eq!(row["subagent_started_ms"], 1_001);
+        assert_eq!(row["subagent_stopped_ms"], 2_002);
+    }
+
     #[tokio::test]
     async fn codex_harness_event_records_authenticated_lineage() {
         let state = test_state("codex-harness-event");
-        let (status, created) = response_json(
-            admin_run_keys_create(
-                State(state.clone()),
-                Some(axum::Json(json!({"kind": "harness", "label": "codex"}))),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", created["key"].as_str().unwrap())).unwrap(),
-        );
-        let (status, body) = response_json(
-            harness_event(
-                State(state.clone()),
-                headers,
-                axum::Json(json!({
-                    "hook_event_name": "SubagentStart",
-                    "session_id": "parent-session",
-                    "turn_id": "turn-1",
-                    "agent_id": "child-session",
+        let parent = "codex-parent";
+        let child = "codex-child";
+        insert_lineage_test_traces(&state, "codex", parent, child);
+        let headers = lineage_test_headers(&state, "codex", "codex-lineage-key");
+        for (hook_event_name, timestamp_ms) in [("SubagentStart", 3_003), ("SubagentStop", 4_004)] {
+            let (status, body) = post_lineage_event(
+                state.clone(),
+                headers.clone(),
+                json!({
+                    "hook_event_name": hook_event_name,
+                    "session_id": parent,
+                    "agent_id": child,
                     "agent_type": "default",
-                })),
+                    "timestamp_ms": timestamp_ms,
+                }),
             )
-            .await,
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["harness"], "codex");
+        }
+        assert_eq!(
+            state.store.session_lineage_root("codex", child).unwrap(),
+            parent
+        );
+        let row = lineage_session(&state, child);
+        assert_eq!(row["agent_type"], "default");
+        assert_eq!(row["subagent_started_ms"], 3_003);
+        assert_eq!(row["subagent_stopped_ms"], 4_004);
+    }
+
+    #[tokio::test]
+    async fn pi_extension_announcement_with_x_api_key_persists_lineage() {
+        let state = test_state("pi-extension-lineage");
+        let parent = "pi-parent";
+        let child = "pi-child";
+        insert_lineage_test_traces(&state, "pi", parent, child);
+        let headers = lineage_test_headers(&state, "pi", "pi-lineage-key");
+        let (status, body) = post_lineage_event(
+            state.clone(),
+            headers,
+            json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": parent,
+                "agent_id": child,
+                "agent_type": "pi",
+                "timestamp_ms": 5_005,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["harness"], "codex");
+        assert_eq!(body["harness"], "pi");
         assert_eq!(body["lineage_updated"], true);
+        let row = lineage_session(&state, child);
+        assert_eq!(row["parent_session_id"], parent);
+        assert_eq!(row["agent_type"], "pi");
+        assert_eq!(row["subagent_started_ms"], 5_005);
+        assert_eq!(row["subagent_stopped_ms"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn amp_subagent_start_and_stop_persist_tool_agent_type_and_timestamps() {
+        let state = test_state("amp-hook-lineage");
+        let parent = "T-parent";
+        let child = "T-child";
+        insert_lineage_test_traces(&state, "amp", parent, child);
+        let headers = lineage_test_headers(&state, "amp", "amp-lineage-key");
+        for (hook_event_name, timestamp_ms) in [("SubagentStart", 6_006), ("SubagentStop", 7_007)] {
+            let (status, _) = post_lineage_event(
+                state.clone(),
+                headers.clone(),
+                json!({
+                    "hook_event_name": hook_event_name,
+                    "session_id": parent,
+                    "agent_id": child,
+                    "agent_type": "Task",
+                    "timestamp_ms": timestamp_ms,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let row = lineage_session(&state, child);
+        assert_eq!(row["agent_type"], "Task");
+        assert_eq!(row["subagent_started_ms"], 6_006);
+        assert_eq!(row["subagent_stopped_ms"], 7_007);
+    }
+
+    #[tokio::test]
+    async fn subagent_event_missing_agent_id_is_rejected_without_a_lineage_row() {
+        let state = test_state("lineage-missing-agent-id");
+        let parent = "missing-parent";
+        let child = "missing-child";
+        insert_lineage_test_traces(&state, "pi", parent, child);
+        let headers = lineage_test_headers(&state, "pi", "missing-agent-id-key");
+        let (status, body) = post_lineage_event(
+            state.clone(),
+            headers,
+            json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": parent,
+                "timestamp_ms": 8_008,
+            }),
+        )
+        .await;
+        // The current endpoint contract rejects incomplete subagent events.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent_id"));
         assert_eq!(
-            state
-                .store
-                .session_lineage_root("codex", "child-session")
-                .unwrap(),
-            "parent-session"
+            state.store.session_lineage_root("pi", child).unwrap(),
+            child
+        );
+        assert_eq!(
+            lineage_session(&state, child)["parent_session_id"],
+            Value::Null
         );
     }
 

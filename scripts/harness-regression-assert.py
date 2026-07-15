@@ -48,6 +48,8 @@ def lineage(args):
     if not edges:
         fail("no parent/child session_lineage edge in /traces/sessions response")
     edge = edges[0]
+    if args.agent_type and edge.get("agent_type") != args.agent_type:
+        fail(f"lineage agent_type={edge.get('agent_type')!r}, expected {args.agent_type!r}")
     for key in ("parent_session_id", "child_count", "subagent_started_ms"):
         if edge.get(key) is None:
             fail(f"lineage UI field {key} is missing")
@@ -76,6 +78,7 @@ p.add_argument("--harness", required=True); p.add_argument("--provider", require
 p.set_defaults(func=trace)
 p = sub.add_parser("lineage")
 p.add_argument("--traces", required=True); p.add_argument("--sessions", required=True); p.add_argument("--run-id", required=True)
+p.add_argument("--agent-type")
 p.set_defaults(func=lineage)
 p = sub.add_parser("tools")
 p.add_argument("--transcript", required=True); p.set_defaults(func=tools)

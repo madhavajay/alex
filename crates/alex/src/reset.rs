@@ -254,6 +254,19 @@ mod tests {
         // Reset tests exercise offline cleanup.  Never accidentally talk to a
         // developer's daemon on the default port while doing so.
         config.port = 0;
+        // Harness detection resolves config dirs under the developer's real
+        // home unless overridden; a reset execute() with harnesses selected
+        // would then disconnect their live claude/codex/amp integrations.
+        // Pin every harness into this test's sandbox so that can never happen.
+        for spec in harness_connect::HARNESSES {
+            config.harness_overrides.insert(
+                spec.name.into(),
+                crate::HarnessOverride {
+                    binary: Some(home.join("no-such-binary")),
+                    config_dir: Some(home.join("harness").join(spec.name)),
+                },
+            );
+        }
         let config_path = home.join("config.toml");
         save_config_at(&config, &config_path).unwrap();
         let vault = Vault::open(home.join("accounts")).unwrap();
@@ -374,6 +387,11 @@ mod tests {
         assert_eq!(after.host, "127.0.0.1");
 
         let mut with_empty_harness_dir = after.clone();
+        // The settings reset above wrote defaults to disk, dropping the
+        // fixture's sandbox overrides; without restoring them the harness
+        // disconnect below resolves claude/codex/amp to the developer's REAL
+        // home config and disconnects their live integrations.
+        with_empty_harness_dir.harness_overrides = config.harness_overrides.clone();
         with_empty_harness_dir.harness_overrides.insert(
             "pi".into(),
             crate::HarnessOverride {

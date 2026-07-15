@@ -1550,13 +1550,13 @@ private struct HarnessRowView: View {
                             "Plain `codex` follows this setting. Explicit --profile openai and --profile alex commands always remain available."
                         )
                 }
-                if harness.name == "pi", harness.connected {
+                if HarnessCatalog.toolCaptureHarnesses.contains(harness.name), harness.connected {
                     Toggle("Capture tools", isOn: Binding(
                         get: { harness.toolCaptureEnabled ?? false },
                         set: { setToolCapture($0) }))
                         .toggleStyle(.switch).controlSize(.small)
                         .disabled(toolCaptureUpdating || actionModel != nil)
-                        .help("Opt in to storing Pi tool arguments and results locally. Secrets are redacted before storage.")
+                        .help("Opt in to storing this harness's tool arguments and results locally. Secrets are redacted before storage.")
                 }
                 if harness.supportsConnect {
                     if harness.connected {
@@ -1658,6 +1658,8 @@ private struct HarnessActionSheetHost: View {
             kind: model.kind,
             harnessDisplayName: model.displayName,
             phase: model.phase,
+            toolCapture: model.showsToolCapture ? $model.captureToolCalls : nil,
+            captureWarning: model.captureWarning,
             onApprove: { model.approve() },
             onCancel: onClose,
             onClose: onClose

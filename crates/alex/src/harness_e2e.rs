@@ -527,7 +527,10 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
                 // This is a normal Claude gateway setting and makes the
                 // harness tag deterministic rather than depending on a
                 // version-specific user-agent string.
-                ("ANTHROPIC_CUSTOM_HEADERS", "x-alexandria-harness: claude".to_string()),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS",
+                    "x-alexandria-harness: claude".to_string(),
+                ),
                 ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
                 ("IS_SANDBOX", "1".to_string()),

@@ -26,6 +26,7 @@ pub const GEMINI_CLIENT_ID: &str =
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ANTHROPIC_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const XAI_USERINFO_URL: &str = "https://auth.x.ai/oauth2/userinfo";
+const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
 
 // The gemini-cli OAuth client is a public "installed app" credential embedded
 // in Google's open-source CLI (not a confidential secret). Assembled from
@@ -1407,7 +1408,14 @@ pub async fn import_amp(vault: &Vault) -> ImportOutcome {
         outcome.note = Some("no apiKey@… entry in amp secrets.json".into());
         return outcome;
     };
-    let account = Account {
+    let previous_email = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == "amp-api-key")
+        .and_then(|account| account.email());
+    let email = fetch_amp_account_email(&api_key).await.or(previous_email);
+    let mut account = Account {
         id: "amp-api-key".into(),
         provider: Provider::Amp,
         kind: "api_key".into(),
@@ -1426,6 +1434,9 @@ pub async fn import_amp(vault: &Vault) -> ImportOutcome {
         status: "active".into(),
         path: None,
     };
+    if let Some(email) = email {
+        persist_account_email(&mut account, &email);
+    }
     match vault.upsert(account).await {
         Ok(()) => outcome.imported.push("amp-api-key".into()),
         Err(e) => outcome.note = Some(format!("failed to save: {e}")),
@@ -1439,7 +1450,14 @@ pub async fn save_amp_api_key(vault: &Vault, api_key: &str) -> Result<String> {
     if key.is_empty() {
         bail!("empty amp api key");
     }
-    let account = Account {
+    let previous_email = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == "amp-api-key")
+        .and_then(|account| account.email());
+    let email = fetch_amp_account_email(key).await.or(previous_email);
+    let mut account = Account {
         id: "amp-api-key".into(),
         provider: Provider::Amp,
         kind: "api_key".into(),
@@ -1458,8 +1476,45 @@ pub async fn save_amp_api_key(vault: &Vault, api_key: &str) -> Result<String> {
         status: "active".into(),
         path: None,
     };
+    if let Some(email) = email {
+        persist_account_email(&mut account, &email);
+    }
     vault.upsert(account).await?;
     Ok("amp-api-key".into())
+}
+
+/// Resolve the display identity exposed by Amp's authenticated usage API.
+///
+/// Amp's CLI secrets file contains only an opaque API key, so it cannot name
+/// the subscription on its own. Identity lookup is deliberately best-effort:
+/// auth import and wrapped runs continue if the endpoint is unavailable, and
+/// neither the key nor the raw usage response is logged or persisted here.
+pub async fn fetch_amp_account_email(api_key: &str) -> Option<String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let response = client
+        .post(AMP_USAGE_URL)
+        .bearer_auth(key)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .header("user-agent", "alexandria-amp-auth")
+        .json(&json!({"method": "userDisplayBalanceInfo", "params": {}}))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let snapshot = alex_core::parse_usage_api_response(&body).ok()?;
+    snapshot.account_email.as_deref().and_then(normalize_email)
 }
 
 /// Save an OpenRouter API key and optional, locally configured attribution.

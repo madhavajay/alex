@@ -82,6 +82,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let reasoningEffort: String?
     public let thinkingBudget: Int64?
     public let costUsd: Double?
+    public let billingBucket: String?
     public let accountId: String?
     public let viaDario: Bool?
     public let darioGeneration: String?
@@ -104,6 +105,7 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case reasoningEffort = "reasoning_effort"
         case thinkingBudget = "thinking_budget"
         case costUsd = "cost_usd"
+        case billingBucket = "billing_bucket"
         case accountId = "account_id"
         case viaDario = "via_dario"
         case darioGeneration = "dario_generation"
@@ -115,6 +117,8 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
 
 public struct ExecutedTool: Codable, Sendable, Equatable, Identifiable {
     public let id: String
+    public let toolCallId: String?
+    public let traceId: String?
     public let toolName: String
     public let turnId: String?
     public let tsStartMs: Int64
@@ -126,6 +130,8 @@ public struct ExecutedTool: Codable, Sendable, Equatable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case toolCallId = "tool_call_id"
+        case traceId = "trace_id"
         case toolName = "tool_name"
         case turnId = "turn_id"
         case tsStartMs = "ts_start_ms"
@@ -141,12 +147,17 @@ public struct ExecutedTool: Codable, Sendable, Equatable, Identifiable {
 
 public struct AssistantBlock: Codable, Sendable, Equatable {
     public let type: String
+    public let id: String?
     public let text: String?
     public let name: String?
     public let arguments: String?
 
-    public init(type: String, text: String? = nil, name: String? = nil, arguments: String? = nil) {
+    public init(
+        type: String, id: String? = nil, text: String? = nil, name: String? = nil,
+        arguments: String? = nil
+    ) {
         self.type = type
+        self.id = id
         self.text = text
         self.name = name
         self.arguments = arguments
@@ -156,10 +167,12 @@ public struct AssistantBlock: Codable, Sendable, Equatable {
 public struct ToolCall: Codable, Sendable, Equatable {
     public let name: String
     public let arguments: String?
+    public let id: String?
 
-    public init(name: String, arguments: String?) {
+    public init(name: String, arguments: String?, id: String? = nil) {
         self.name = name
         self.arguments = arguments
+        self.id = id
     }
 
     public var argumentSummary: String { Self.summary(arguments ?? "") }
@@ -185,6 +198,61 @@ public struct ToolCall: Codable, Sendable, Equatable {
             return text
         }
         return trimmed
+    }
+}
+
+/// One model-requested tool call paired with the authoritative harness execution,
+/// when the harness exposes one. Exact provider call IDs win; older traces fall
+/// back to stable name-and-order matching.
+public struct ToolLifecycle: Sendable, Equatable {
+    public let request: ToolCall?
+    public let execution: ExecutedTool?
+
+    public var name: String { request?.name ?? execution?.toolName ?? "tool" }
+
+    public enum Status: String, Sendable {
+        case requested
+        case running
+        case executed
+        case failed
+    }
+
+    public var status: Status {
+        guard let execution else { return .requested }
+        guard execution.tsEndMs != nil else { return .running }
+        if execution.isError == true || execution.exitStatus.map({ $0 != 0 }) == true {
+            return .failed
+        }
+        return .executed
+    }
+
+    public static func pair(
+        requests: [ToolCall], executions: [ExecutedTool]
+    ) -> [ToolLifecycle] {
+        var remaining = Array(executions.indices)
+        var paired: [ToolLifecycle] = []
+        paired.reserveCapacity(max(requests.count, executions.count))
+
+        for request in requests {
+            let exact = request.id.flatMap { requestId in
+                remaining.first { executions[$0].toolCallId == requestId }
+            }
+            let fallback = remaining.first {
+                (request.id == nil || executions[$0].toolCallId == nil)
+                    && executions[$0].toolName.caseInsensitiveCompare(request.name) == .orderedSame
+            }
+            let match = exact ?? fallback
+            if let match {
+                remaining.removeAll { $0 == match }
+                paired.append(ToolLifecycle(request: request, execution: executions[match]))
+            } else {
+                paired.append(ToolLifecycle(request: request, execution: nil))
+            }
+        }
+        paired.append(contentsOf: remaining.map {
+            ToolLifecycle(request: nil, execution: executions[$0])
+        })
+        return paired
     }
 }
 
@@ -472,26 +540,35 @@ public enum TurnHeader {
     public static func separatorFacts(
         turnNumber: Int, time: String, status: Int?,
         requestMs: Int64, responseMs: Int64?, costUsd: Double? = nil,
-        reasoningEffort: String? = nil, thinkingBudget: Int64? = nil, accountId: String? = nil
+        costUnavailable: Bool = false
     ) -> String {
         var parts = ["turn \(turnNumber)", time]
         if let status { parts.append("\(status)") }
-        let effortLabel = effort(reasoningEffort: reasoningEffort, thinkingBudget: thinkingBudget)
-        if effortLabel != "-" { parts.append(effortLabel) }
         if let dur = duration(requestMs: requestMs, responseMs: responseMs) {
             parts.append(dur)
         }
         if let costUsd, costUsd > 0 { parts.append(TraceNumberFormat.cost(costUsd)) }
-        if let accountId, !accountId.isEmpty { parts.append("acct \(accountId)") }
+        else if costUnavailable { parts.append("cost unavailable") }
         return parts.joined(separator: " · ")
     }
 
     public static func requestLabel(harness: String, isToolResult: Bool = false) -> String {
-        "⬆ \(harness) · \(isToolResult ? "tool result" : "user")"
+        "\(harness) · \(isToolResult ? "tool result" : "user")"
     }
 
-    public static func responseLabel(model: String?) -> String {
-        model.map { "⬇ \($0) · model" } ?? "⬇ model"
+    public static func responseLabel(
+        model: String?, reasoningEffort: String? = nil, thinkingBudget: Int64? = nil,
+        billingBucket: String? = nil
+    ) -> String {
+        var parts = [model ?? "model"]
+        if model != nil { parts.append("model") }
+        let effortLabel = effort(
+            reasoningEffort: reasoningEffort, thinkingBudget: thinkingBudget)
+        if effortLabel != "-" { parts.append(effortLabel) }
+        if billingBucket?.localizedCaseInsensitiveContains("subscription") == true {
+            parts.append("subscription")
+        }
+        return parts.joined(separator: " · ")
     }
 
     public static func toolResultBody(_ text: String) -> String? {
@@ -546,6 +623,229 @@ public enum BodyPretty {
         guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return false }
         guard let data = trimmed.data(using: .utf8) else { return false }
         return (try? JSONSerialization.jsonObject(with: data)) != nil
+    }
+}
+
+public struct RequestJSONDiffPresentation: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case diff
+        case unchanged
+        case firstRequest
+        case invalidCurrent
+        case invalidPrevious
+    }
+
+    public let text: String
+    public let kind: Kind
+
+    public init(text: String, kind: Kind) {
+        self.text = text
+        self.kind = kind
+    }
+
+    public var note: String? {
+        switch kind {
+        case .diff: nil
+        case .unchanged: "No JSON changes from the previous request."
+        case .firstRequest: "First request in this session; showing the full JSON."
+        case .invalidCurrent: "This request is not valid JSON; showing the full body."
+        case .invalidPrevious:
+            "The previous request is not valid JSON; showing the full current JSON."
+        }
+    }
+}
+
+/// Produces a compact, valid JSON Patch-style view of changes between adjacent
+/// request bodies. `previous` values are included for replacements and removals
+/// so the inspector remains useful without opening the preceding turn.
+public enum RequestJSONDiff {
+    public static func presentation(
+        previous: String?, current: String
+    ) -> RequestJSONDiffPresentation {
+        guard let currentValue = parse(current) else {
+            return RequestJSONDiffPresentation(
+                text: BodyPretty.display(current, cap: .max).text, kind: .invalidCurrent)
+        }
+        guard let previous else {
+            return RequestJSONDiffPresentation(
+                text: currentValue.pretty(), kind: .firstRequest)
+        }
+        guard let previousValue = parse(previous) else {
+            return RequestJSONDiffPresentation(
+                text: currentValue.pretty(), kind: .invalidPrevious)
+        }
+
+        var operations: [Operation] = []
+        compare(previousValue, currentValue, path: "", into: &operations)
+        guard !operations.isEmpty else {
+            return RequestJSONDiffPresentation(text: "[]", kind: .unchanged)
+        }
+        let rendered = operations.map { $0.pretty(indentation: 2) }
+            .joined(separator: ",\n")
+        return RequestJSONDiffPresentation(
+            text: "[\n\(rendered)\n]", kind: .diff)
+    }
+
+    private indirect enum Value: Equatable {
+        case object([String: Value])
+        case array([Value])
+        case string(String)
+        case number(String)
+        case bool(Bool)
+        case null
+
+        func pretty(indentation: Int = 0) -> String {
+            switch self {
+            case let .object(values):
+                guard !values.isEmpty else { return "{}" }
+                let childIndent = indentation + 2
+                let body = values.keys.sorted().map { key in
+                    "\(spaces(childIndent))\(quoted(key)): \(values[key]!.pretty(indentation: childIndent))"
+                }.joined(separator: ",\n")
+                return "{\n\(body)\n\(spaces(indentation))}"
+            case let .array(values):
+                guard !values.isEmpty else { return "[]" }
+                let childIndent = indentation + 2
+                let body = values.map {
+                    "\(spaces(childIndent))\($0.pretty(indentation: childIndent))"
+                }.joined(separator: ",\n")
+                return "[\n\(body)\n\(spaces(indentation))]"
+            case let .string(value): return quoted(value)
+            case let .number(value): return value
+            case let .bool(value): return value ? "true" : "false"
+            case .null: return "null"
+            }
+        }
+    }
+
+    private struct Operation {
+        enum Kind: String { case add, remove, replace }
+
+        let kind: Kind
+        let path: String
+        let previous: Value?
+        let value: Value?
+
+        func pretty(indentation: Int) -> String {
+            let childIndent = indentation + 2
+            var fields = [
+                "\(spaces(childIndent))\(quoted("op")): \(quoted(kind.rawValue))",
+                "\(spaces(childIndent))\(quoted("path")): \(quoted(path))",
+            ]
+            if let previous {
+                fields.append(
+                    "\(spaces(childIndent))\(quoted("previous")): \(previous.pretty(indentation: childIndent))")
+            }
+            if let value {
+                fields.append(
+                    "\(spaces(childIndent))\(quoted("value")): \(value.pretty(indentation: childIndent))")
+            }
+            return "\(spaces(indentation)){\n\(fields.joined(separator: ",\n"))\n\(spaces(indentation))}"
+        }
+    }
+
+    private static func parse(_ raw: String) -> Value? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
+        guard let data = trimmed.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data)
+        else { return nil }
+        return value(object)
+    }
+
+    private static func value(_ object: Any) -> Value? {
+        switch object {
+        case let dictionary as [String: Any]:
+            var values: [String: Value] = [:]
+            for (key, rawValue) in dictionary {
+                guard let converted = value(rawValue) else { return nil }
+                values[key] = converted
+            }
+            return .object(values)
+        case let array as [Any]:
+            var values: [Value] = []
+            for rawValue in array {
+                guard let converted = value(rawValue) else { return nil }
+                values.append(converted)
+            }
+            return .array(values)
+        case let string as String:
+            return .string(string)
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return .bool(number.boolValue)
+            }
+            return .number(number.stringValue)
+        case _ as NSNull:
+            return .null
+        default:
+            return nil
+        }
+    }
+
+    private static func compare(
+        _ previous: Value, _ current: Value, path: String,
+        into operations: inout [Operation]
+    ) {
+        guard previous != current else { return }
+        switch (previous, current) {
+        case let (.object(old), .object(new)):
+            let oldKeys = Set(old.keys)
+            let newKeys = Set(new.keys)
+            for key in oldKeys.subtracting(newKeys).sorted() {
+                operations.append(Operation(
+                    kind: .remove, path: childPath(path, key),
+                    previous: old[key], value: nil))
+            }
+            for key in newKeys.subtracting(oldKeys).sorted() {
+                operations.append(Operation(
+                    kind: .add, path: childPath(path, key),
+                    previous: nil, value: new[key]))
+            }
+            for key in oldKeys.intersection(newKeys).sorted() {
+                compare(old[key]!, new[key]!, path: childPath(path, key), into: &operations)
+            }
+        case let (.array(old), .array(new)):
+            for index in 0..<min(old.count, new.count) {
+                compare(
+                    old[index], new[index], path: childPath(path, "\(index)"),
+                    into: &operations)
+            }
+            if old.count > new.count {
+                for index in stride(from: old.count - 1, through: new.count, by: -1) {
+                    operations.append(Operation(
+                        kind: .remove, path: childPath(path, "\(index)"),
+                        previous: old[index], value: nil))
+                }
+            } else if new.count > old.count {
+                for index in old.count..<new.count {
+                    operations.append(Operation(
+                        kind: .add, path: childPath(path, "\(index)"),
+                        previous: nil, value: new[index]))
+                }
+            }
+        default:
+            operations.append(Operation(
+                kind: .replace, path: path, previous: previous, value: current))
+        }
+    }
+
+    private static func childPath(_ path: String, _ component: String) -> String {
+        let escaped = component.replacingOccurrences(of: "~", with: "~0")
+            .replacingOccurrences(of: "/", with: "~1")
+        return "\(path)/\(escaped)"
+    }
+
+    private static func quoted(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: value, options: [.fragmentsAllowed, .withoutEscapingSlashes]),
+            let encoded = String(data: data, encoding: .utf8)
+        else { return "\"\"" }
+        return encoded
+    }
+
+    private static func spaces(_ count: Int) -> String {
+        String(repeating: " ", count: count)
     }
 }
 
@@ -1510,20 +1810,37 @@ public enum TraceFingerprint {
             hasher.combine(turn.reasoningEffort)
             hasher.combine(turn.thinkingBudget)
             hasher.combine(turn.costUsd)
+            hasher.combine(turn.billingBucket)
             hasher.combine(turn.error)
             hasher.combine(turn.user)
             hasher.combine(turn.assistant)
             hasher.combine(turn.toolCalls?.count)
             for call in turn.toolCalls ?? [] {
+                hasher.combine(call.id)
                 hasher.combine(call.name)
                 hasher.combine(call.arguments)
             }
             hasher.combine(turn.assistantBlocks?.count)
             for block in turn.assistantBlocks ?? [] {
                 hasher.combine(block.type)
+                hasher.combine(block.id)
                 hasher.combine(block.text)
                 hasher.combine(block.name)
                 hasher.combine(block.arguments)
+            }
+            hasher.combine(turn.executedTools?.count)
+            for execution in turn.executedTools ?? [] {
+                hasher.combine(execution.id)
+                hasher.combine(execution.toolCallId)
+                hasher.combine(execution.traceId)
+                hasher.combine(execution.toolName)
+                hasher.combine(execution.turnId)
+                hasher.combine(execution.tsStartMs)
+                hasher.combine(execution.tsEndMs)
+                hasher.combine(execution.isError)
+                hasher.combine(execution.exitStatus)
+                hasher.combine(execution.argsBodyPath)
+                hasher.combine(execution.resultBodyPath)
             }
         }
         return "\(turns.count)|\(hasher.finalize())"
@@ -1610,7 +1927,7 @@ public struct TurnRange: Equatable, Sendable {
 }
 
 public enum TranscriptBubbleKind: String, Sendable {
-    case user, model, tool, toolResult, error
+    case turn, user, model, tool, toolResult, error
 }
 
 extension NSAttributedString.Key {
@@ -1632,6 +1949,11 @@ public enum TraceInspectorSelection {
             return currentTraceId
         }
         return traceIds.last
+    }
+
+    public static func previous(before traceId: String, in traceIds: [String]) -> String? {
+        guard let index = traceIds.firstIndex(of: traceId), index > 0 else { return nil }
+        return traceIds[index - 1]
     }
 }
 
@@ -1877,15 +2199,31 @@ public enum TranscriptRender {
         hasher.combine(turn.error)
         hasher.combine(turn.reasoningEffort)
         hasher.combine(turn.thinkingBudget)
+        hasher.combine(turn.billingBucket)
         for call in turn.toolCalls ?? [] {
+            hasher.combine(call.id)
             hasher.combine(call.name)
             hasher.combine(call.arguments)
         }
         for block in turn.assistantBlocks ?? [] {
             hasher.combine(block.type)
+            hasher.combine(block.id)
             hasher.combine(block.text)
             hasher.combine(block.name)
             hasher.combine(block.arguments)
+        }
+        for execution in turn.executedTools ?? [] {
+            hasher.combine(execution.id)
+            hasher.combine(execution.toolCallId)
+            hasher.combine(execution.traceId)
+            hasher.combine(execution.toolName)
+            hasher.combine(execution.turnId)
+            hasher.combine(execution.tsStartMs)
+            hasher.combine(execution.tsEndMs)
+            hasher.combine(execution.isError)
+            hasher.combine(execution.exitStatus)
+            hasher.combine(execution.argsBodyPath)
+            hasher.combine(execution.resultBodyPath)
         }
         return String(hasher.finalize())
     }
@@ -1893,19 +2231,17 @@ public enum TranscriptRender {
     #if canImport(AppKit)
     public static func document(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none, rawMode: Bool = false,
-        billingAccountIds: Set<String>? = nil
+        icons: TranscriptIcons = .none, rawMode: Bool = false
     ) -> NSAttributedString {
         build(
             turns: turns, firstTurnNumber: firstTurnNumber, harnessName: harnessName,
-            icons: icons, rawMode: rawMode, billingAccountIds: billingAccountIds
+            icons: icons, rawMode: rawMode
         ).text
     }
 
     public static func build(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none, rawMode: Bool = false,
-        billingAccountIds: Set<String>? = nil
+        icons: TranscriptIcons = .none, rawMode: Bool = false
     ) -> TranscriptDocument {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -1913,7 +2249,6 @@ public enum TranscriptRender {
         let separatorFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
         let proseFont = NSFont.systemFont(ofSize: 13)
         let monoFont = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-        let detailsFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
 
         let separatorPara = NSMutableParagraphStyle()
         separatorPara.paragraphSpacing = 6
@@ -2008,31 +2343,59 @@ public enum TranscriptRender {
         }
 
         let out = NSMutableAttributedString()
-        func appendTool(name: String, arguments: String?) {
-            out.append(NSAttributedString(string: "⚙ \(name)\n", attributes: toolLabel))
-            let arguments = arguments ?? ""
+        func appendToolLink(_ label: String, id: String, kind: String, leading: Bool) {
+            if leading {
+                out.append(NSAttributedString(string: "  ·  ", attributes: toolKey))
+            }
+            var attrs = tool
+            attrs[.foregroundColor] = NSColor.linkColor
+            if let url = ToolLink.url(id: id, kind: kind) { attrs[.link] = url }
+            out.append(NSAttributedString(string: label, attributes: attrs))
+        }
+        func rawExecution(_ execution: ExecutedTool) -> String? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            guard let data = try? encoder.encode(execution) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        func appendTool(_ lifecycle: ToolLifecycle) {
+            let execution = lifecycle.execution
+            var facts = [lifecycle.name, lifecycle.status.rawValue]
+            if let exit = execution?.exitStatus { facts.append("exit \(exit)") }
+            if let duration = execution?.duration { facts.append(duration) }
+            var labelAttrs = toolLabel
+            if lifecycle.status == .failed { labelAttrs[.foregroundColor] = NSColor.systemRed }
+            out.append(NSAttributedString(
+                string: "⚙ \(facts.joined(separator: " · "))\n", attributes: labelAttrs))
+
+            let arguments = lifecycle.request?.arguments ?? ""
             if rawMode {
                 if !arguments.isEmpty {
                     out.append(NSAttributedString(
                         string: "\(cap(arguments))\n", attributes: tool))
                 }
-            } else if let command = ToolCall(name: name, arguments: arguments).command {
+                if let execution, let raw = rawExecution(execution) {
+                    out.append(NSAttributedString(string: "\(cap(raw))\n", attributes: tool))
+                }
+            } else if let command = lifecycle.request?.command {
                 out.append(NSAttributedString(string: "\(cap(command))\n", attributes: tool))
             } else if !arguments.isEmpty {
                 appendNice(arguments, to: out, keyAttrs: toolKey, valueAttrs: tool)
             }
-        }
-        func appendExecutedTool(_ execution: ExecutedTool) {
-            var facts = [execution.toolName]
-            if let exit = execution.exitStatus { facts.append("exit \(exit)") }
-            if execution.isError == true { facts.append("error") }
-            if let duration = execution.duration { facts.append(duration) }
-            out.append(NSAttributedString(string: "⚙ \(facts.joined(separator: " · "))\n", attributes: toolLabel))
-            if execution.argsBodyPath != nil { out.append(NSAttributedString(string: "arguments captured\n", attributes: tool)) }
-            if execution.resultBodyPath != nil {
-                var attrs = tool
-                if let url = ToolLink.url(id: execution.id, kind: "result") { attrs[.link] = url }
-                out.append(NSAttributedString(string: "output captured — view output\n", attributes: attrs))
+
+            if let execution {
+                var hasLink = false
+                if execution.argsBodyPath != nil {
+                    appendToolLink("view captured arguments", id: execution.id, kind: "args", leading: false)
+                    hasLink = true
+                }
+                if execution.resultBodyPath != nil {
+                    appendToolLink("view output", id: execution.id, kind: "result", leading: hasLink)
+                    hasLink = true
+                }
+                if hasLink {
+                    out.append(NSAttributedString(string: "\n", attributes: tool))
+                }
             }
         }
         var ranges: [TurnRange] = []
@@ -2045,19 +2408,11 @@ public enum TranscriptRender {
                 status: turn.status,
                 requestMs: turn.tsRequestMs, responseMs: turn.tsResponseMs,
                 costUsd: turn.costUsd,
-                reasoningEffort: turn.reasoningEffort,
-                thinkingBudget: turn.thinkingBudget,
-                accountId: turn.accountId.flatMap { accountId in
-                    billingAccountIds?.contains(accountId) == false ? nil : accountId
-                })
+                costUnavailable: turn.provider?.caseInsensitiveCompare("cursor") == .orderedSame
+                    && turn.costUsd == nil)
             let isError = (turn.status ?? 0) >= 400
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
-            out.append(NSAttributedString(string: "· \(facts) ·", attributes: sepAttrs))
-            var detailsAttrs = sepAttrs
-            detailsAttrs[.font] = detailsFont
-            detailsAttrs[.foregroundColor] = NSColor.controlAccentColor
-            out.append(NSAttributedString(string: "   ⓘ Details", attributes: detailsAttrs))
-            out.append(NSAttributedString(string: "\n", attributes: sepAttrs))
+            out.append(NSAttributedString(string: "· \(facts) ·\n", attributes: sepAttrs))
             if let text = turn.user, !text.isEmpty {
                 let toolBody = TurnHeader.toolResultBody(text)
                 let label = TurnHeader.requestLabel(
@@ -2068,7 +2423,7 @@ public enum TranscriptRender {
                     out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
                 out.append(NSAttributedString(string: label, attributes: labelAttrs))
-                out.append(infoMark(labelAttrs))
+                out.append(NSAttributedString(string: "\n", attributes: labelAttrs))
                 if let toolBody {
                     if rawMode {
                         out.append(NSAttributedString(
@@ -2083,8 +2438,15 @@ public enum TranscriptRender {
             }
             let calls = turn.toolCalls ?? []
             let orderedBlocks = turn.assistantBlocks ?? []
+            let requestedTools = orderedBlocks.isEmpty ? calls : orderedBlocks.compactMap { block in
+                guard block.type == "tool_call", let name = block.name else { return nil }
+                return ToolCall(name: name, arguments: block.arguments, id: block.id)
+            }
+            let toolLifecycles = ToolLifecycle.pair(
+                requests: requestedTools, executions: turn.executedTools ?? [])
+            var nextTool = 0
             let hasModelText = turn.assistant?.isEmpty == false
-            if hasModelText || !calls.isEmpty || !orderedBlocks.isEmpty {
+            if hasModelText || !toolLifecycles.isEmpty || !orderedBlocks.isEmpty {
                 let labelAttrs = linked(modelLabel, turn.traceId)
                 if let icon = providerIcon(
                     provider: turn.provider, model: turn.model, icons: icons)
@@ -2093,9 +2455,11 @@ public enum TranscriptRender {
                     out.append(NSAttributedString(string: " ", attributes: labelAttrs))
                 }
                 out.append(NSAttributedString(
-                    string: TurnHeader.responseLabel(model: turn.model),
+                    string: TurnHeader.responseLabel(
+                        model: turn.model, reasoningEffort: turn.reasoningEffort,
+                        thinkingBudget: turn.thinkingBudget, billingBucket: turn.billingBucket),
                     attributes: labelAttrs))
-                out.append(infoMark(labelAttrs))
+                out.append(NSAttributedString(string: "\n", attributes: labelAttrs))
             }
             if !orderedBlocks.isEmpty {
                 for block in orderedBlocks {
@@ -2106,8 +2470,9 @@ public enum TranscriptRender {
                                 string: "\(cap(text))\n", attributes: assistant))
                         }
                     case "tool_call":
-                        if let name = block.name {
-                            appendTool(name: name, arguments: block.arguments)
+                        if nextTool < toolLifecycles.count {
+                            appendTool(toolLifecycles[nextTool])
+                            nextTool += 1
                         }
                     default:
                         continue
@@ -2118,36 +2483,26 @@ public enum TranscriptRender {
                     out.append(NSAttributedString(
                         string: "\(cap(text))\n", attributes: assistant))
                 }
-                for call in calls {
-                    appendTool(name: call.name, arguments: call.arguments)
+                for lifecycle in toolLifecycles {
+                    appendTool(lifecycle)
+                    nextTool += 1
                 }
             }
-            for execution in turn.executedTools ?? [] { appendExecutedTool(execution) }
+            for lifecycle in toolLifecycles.dropFirst(nextTool) { appendTool(lifecycle) }
             if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }
             out.append(NSAttributedString(string: "\n", attributes: separator))
             let turnRange = NSRange(location: turnStart, length: out.length - turnStart)
             out.addAttribute(.transcriptTurnId, value: turn.traceId, range: turnRange)
-            var kindRuns: [NSRange] = []
-            out.enumerateAttribute(.transcriptBubbleKind, in: turnRange) { value, range, _ in
-                if value != nil { kindRuns.append(range) }
-            }
-            for (groupIndex, runRange) in kindRuns.enumerated() {
-                out.addAttribute(
-                    .transcriptBubbleGroup, value: "\(turn.traceId)#\(groupIndex)",
-                    range: runRange)
-            }
+            out.addAttribute(
+                .transcriptBubbleKind, value: TranscriptBubbleKind.turn.rawValue, range: turnRange)
+            out.addAttribute(
+                .transcriptBubbleGroup, value: "\(turn.traceId)#turn", range: turnRange)
             ranges.append(TurnRange(traceId: turn.traceId, range: turnRange))
         }
         return TranscriptDocument(
             text: NSAttributedString(attributedString: out), turnRanges: ranges)
-    }
-
-    static func infoMark(_ labelAttrs: [NSAttributedString.Key: Any]) -> NSAttributedString {
-        var attrs = labelAttrs
-        attrs[.foregroundColor] = NSColor.controlAccentColor
-        return NSAttributedString(string: "  ⓘ\n", attributes: attrs)
     }
 
     static func appendNice(

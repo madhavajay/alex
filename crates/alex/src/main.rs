@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
 use alex_store::{KnownAccount, Store};
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,26 @@ enum Command {
         /// Override the harness config dir
         #[arg(long)]
         config_dir: Option<PathBuf>,
+        /// Alexandria daemon base URL (env: ALEXANDRIA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Pre-minted harness key (env: ALEXANDRIA_HARNESS_KEY)
+        #[arg(long)]
+        key: Option<String>,
+        /// Cosmetic ID for a pre-minted key
+        #[arg(long)]
+        key_id: Option<String>,
+        /// Install tool-execution hooks in this connection
+        #[arg(long)]
+        tool_capture: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or change harness tool-capture status
+    ToolCapture {
+        harness: String,
+        /// Set capture on or off; omit to show the current status
+        state: Option<ToolCaptureState>,
         #[arg(long)]
         json: bool,
     },
@@ -116,7 +137,7 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Wrap a special harness for capture (amp, …) — application-level, not system intercept
+    /// Launch connected Claude/Codex or wrap Amp/Cursor Agent for capture
     Wrap {
         #[command(subcommand)]
         command: WrapCommand,
@@ -200,6 +221,18 @@ enum Command {
     },
     /// Live dashboard: traces, limits, accounts, dario generations
     Tui,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ToolCaptureState {
+    On,
+    Off,
+}
+
+impl ToolCaptureState {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 #[derive(Subcommand)]
@@ -303,6 +336,18 @@ enum WrapCommand {
         /// Machine-readable plan (no shell exports)
         #[arg(long)]
         json: bool,
+    },
+    /// Launch connected Claude with its Alexandria settings: `alex wrap claude -p 'hi'`
+    Claude {
+        /// Args passed through verbatim to `claude`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch connected Codex with the Alexandria profile: `alex wrap codex exec 'hi'`
+    Codex {
+        /// Args passed through verbatim to `codex`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Start reverse wrap + run Amp: `alex wrap amp` or `alex wrap amp -- -x 'hi'`
     Amp {
@@ -1099,7 +1144,8 @@ fn load_or_create_config() -> Result<(Config, bool)> {
     let path = home.join("config.toml");
     if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
+        let mut config: Config =
+            toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
         config.heal();
         let upgraded = toml::to_string_pretty(&config)?;
         if upgraded != raw {
@@ -1184,11 +1230,14 @@ impl alex_proxy::DarioRouter for DarioGlue {
     fn ensure_active(&self) -> alex_proxy::DarioEnsureFuture {
         let supervisor = self.supervisor.clone();
         Box::pin(async move {
-            supervisor.ensure_active().await.map(|a| alex_proxy::DarioActive {
-                generation_id: a.generation_id,
-                base_url: a.base_url,
-                api_key: a.api_key,
-            })
+            supervisor
+                .ensure_active()
+                .await
+                .map(|a| alex_proxy::DarioActive {
+                    generation_id: a.generation_id,
+                    base_url: a.base_url,
+                    api_key: a.api_key,
+                })
         })
     }
 
@@ -1298,13 +1347,7 @@ fn dario_admin_router(
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .map(str::to_string)
             });
-        if presented.as_deref()
-            != key
-                .read()
-                .ok()
-                .as_deref()
-                .map(String::as_str)
-        {
+        if presented.as_deref() != key.read().ok().as_deref().map(String::as_str) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(
@@ -1413,7 +1456,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
     }
 
     #[derive(Deserialize)]
-    struct ToolCaptureBody { enabled: bool }
+    struct ToolCaptureBody {
+        enabled: bool,
+    }
 
     fn parse_dry_run(q: &std::collections::HashMap<String, String>) -> bool {
         q.get("dry_run")
@@ -1459,14 +1504,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .map(str::to_string)
             });
-        if presented.as_deref()
-            != state
-                .local_key
-                .read()
-                .ok()
-                .as_deref()
-                .map(String::as_str)
-        {
+        if presented.as_deref() != state.local_key.read().ok().as_deref().map(String::as_str) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(
@@ -1694,23 +1732,37 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 key,
                 models,
                 status.version,
-                config.harness_tool_capture.get("pi").copied().unwrap_or(false),
+                config
+                    .harness_tool_capture
+                    .get("pi")
+                    .copied()
+                    .unwrap_or(false),
             ),
-            "codex" => harness_connect::write_codex_connection(
+            "codex" => harness_connect::write_codex_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 key,
                 codex_catalog.expect("Codex catalog prepared"),
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("codex")
+                    .copied()
+                    .unwrap_or(false),
             ),
-            "claude" => harness_connect::write_claude_connection(
+            "claude" => harness_connect::write_claude_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 key,
                 models,
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("claude")
+                    .copied()
+                    .unwrap_or(false),
             ),
             "grok" => harness_connect::write_grok_connection(
                 config_dir,
@@ -1720,12 +1772,17 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 models,
                 status.version,
             ),
-            "amp" => harness_connect::write_amp_connection(
+            "amp" => harness_connect::write_amp_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 key,
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("amp")
+                    .copied()
+                    .unwrap_or(false),
             ),
             _ => unreachable!("connect-capable harness must have a writer"),
         };
@@ -1894,22 +1951,32 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                         return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
                     }
                 };
-            harness_connect::write_codex_connection(
+            harness_connect::write_codex_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 api_key,
                 catalog,
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("codex")
+                    .copied()
+                    .unwrap_or(false),
             )
         } else if name == "claude" {
-            harness_connect::write_claude_connection(
+            harness_connect::write_claude_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 api_key,
                 models,
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("claude")
+                    .copied()
+                    .unwrap_or(false),
             )
         } else if name == "grok" {
             harness_connect::write_grok_connection(
@@ -1921,12 +1988,17 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 status.version,
             )
         } else if name == "amp" {
-            harness_connect::write_amp_connection(
+            harness_connect::write_amp_connection_with_capture(
                 config_dir,
                 state.base_url.clone(),
                 key_id,
                 api_key,
                 status.version,
+                config
+                    .harness_tool_capture
+                    .get("amp")
+                    .copied()
+                    .unwrap_or(false),
             )
         } else {
             harness_connect::write_pi_connection_with_capture(
@@ -1936,7 +2008,11 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 api_key,
                 models,
                 status.version,
-                config.harness_tool_capture.get("pi").copied().unwrap_or(false),
+                config
+                    .harness_tool_capture
+                    .get("pi")
+                    .copied()
+                    .unwrap_or(false),
             )
         };
         match result {
@@ -2024,15 +2100,41 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         AxPath(name): AxPath<String>,
         axum::Json(body): axum::Json<ToolCaptureBody>,
     ) -> axum::response::Response {
-        let Some(spec) = harness_connect::spec_by_name(&name) else { return error(axum::http::StatusCode::NOT_FOUND, "unknown harness"); };
-        let (mut config, _) = match load_or_create_config() { Ok(value) => value, Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) };
-        if name != "pi" { return error(axum::http::StatusCode::BAD_REQUEST, "tool capture is currently supported only by Pi"); }
+        let Some(spec) = harness_connect::spec_by_name(&name) else {
+            return error(axum::http::StatusCode::NOT_FOUND, "unknown harness");
+        };
+        let (mut config, _) = match load_or_create_config() {
+            Ok(value) => value,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
         let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
-        if let Err(e) = harness_connect::set_pi_tool_capture(&config_dir, &state.base_url, body.enabled) {
+        let result = match name.as_str() {
+            "pi" => {
+                harness_connect::set_pi_tool_capture(&config_dir, &state.base_url, body.enabled)
+            }
+            "claude" => {
+                harness_connect::set_claude_tool_capture(&config_dir, &state.base_url, body.enabled)
+            }
+            "codex" => {
+                harness_connect::set_codex_tool_capture(&config_dir, &state.base_url, body.enabled)
+            }
+            "amp" => {
+                harness_connect::set_amp_tool_capture(&config_dir, &state.base_url, body.enabled)
+            }
+            _ => {
+                return error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("tool capture is not yet supported for {name}"),
+                )
+            }
+        };
+        if let Err(e) = result {
             return error(axum::http::StatusCode::BAD_REQUEST, e.to_string());
         }
         config.harness_tool_capture.insert(name, body.enabled);
-        if let Err(e) = save_config(&config) { return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()); }
+        if let Err(e) = save_config(&config) {
+            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
         axum::Json(serde_json::json!({"tool_capture_enabled": body.enabled})).into_response()
     }
 
@@ -2045,7 +2147,10 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             post(refresh_config),
         )
         .route("/admin/harnesses/{name}/override", put(put_override))
-        .route("/admin/harnesses/{name}/tool-capture", put(put_tool_capture))
+        .route(
+            "/admin/harnesses/{name}/tool-capture",
+            put(put_tool_capture),
+        )
         .route(
             "/admin/harnesses/codex/default-route",
             put(put_codex_default_route),
@@ -2079,7 +2184,9 @@ async fn bind_daemon_listener(host: &str, port: u16) -> Result<tokio::net::TcpLi
     socket
         .bind(addr)
         .with_context(|| format!("binding {addr}"))?;
-    socket.listen(1024).context("listening for daemon connections")
+    socket
+        .listen(1024)
+        .context("listening for daemon connections")
 }
 
 /// Bind the configured listener, preserving a local daemon if a selected
@@ -2127,6 +2234,44 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
+
+    // Cove runs this command in a container with only a scoped harness key.
+    // Handle the fully remote form before loading config so it neither needs
+    // nor creates ~/.alexandria/config.toml in that container.
+    if let Command::Connect {
+        harness,
+        config_dir,
+        url,
+        key,
+        key_id,
+        tool_capture,
+        json,
+    } = &command
+    {
+        let supplied_key = key
+            .clone()
+            .or_else(|| std::env::var("ALEXANDRIA_HARNESS_KEY").ok());
+        let remote_url = url.clone().or_else(|| std::env::var("ALEXANDRIA_URL").ok());
+        if let Some(key) = supplied_key.as_deref() {
+            let harness = harness
+                .as_deref()
+                .context("a pre-minted harness key requires a harness name")?;
+            let url = remote_url.as_deref().context(
+                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alexandria config",
+            )?;
+            harness_connect::connect_with_preminted_key(
+                harness,
+                config_dir.clone(),
+                url,
+                key.to_string(),
+                key_id.clone(),
+                *tool_capture,
+                *json,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     let (config, fresh_install) = load_or_create_config()?;
 
     match command {
@@ -2360,17 +2505,23 @@ async fn main() -> Result<()> {
                 eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
             }
             let local_listener = if requires_explicit_loopback_listener(&bound_host) {
-                Some(bind_daemon_listener("127.0.0.1", port).await.with_context(|| {
-                    format!(
+                Some(
+                    bind_daemon_listener("127.0.0.1", port)
+                        .await
+                        .with_context(|| {
+                            format!(
                         "binding loopback alongside the selected interface {bound_host}:{port}"
                     )
-                })?)
+                        })?,
+                )
             } else {
                 None
             };
             print_banner(&bound_host, port, &config.local_key);
             if local_listener.is_some() {
-                eprintln!("local clients and harnesses remain available at http://127.0.0.1:{port}");
+                eprintln!(
+                    "local clients and harnesses remain available at http://127.0.0.1:{port}"
+                );
             }
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let shutdown_task = tokio::spawn(async move {
@@ -2759,7 +2910,7 @@ async fn main() -> Result<()> {
                 traces_repair_agent_cmd(&config, &transcript_id, dry_run, json)?;
             }
             Some(TracesCommand::RepairAmp { run_id, json }) => {
-                traces_repair_amp_cmd(&config, run_id.as_deref(), json)?;
+                traces_repair_amp_cmd(&config, run_id.as_deref(), json).await?;
             }
             Some(TracesCommand::Push {
                 run_id,
@@ -2774,9 +2925,26 @@ async fn main() -> Result<()> {
         Command::Connect {
             harness,
             config_dir,
+            url: _,
+            key: _,
+            key_id: _,
+            tool_capture: _,
             json,
         } => {
             harness_connect::connect_cmd(&config, harness, config_dir, json).await?;
+        }
+        Command::ToolCapture {
+            harness,
+            state,
+            json,
+        } => {
+            harness_connect::tool_capture_cmd(
+                &config,
+                harness,
+                state.map(ToolCaptureState::enabled),
+                json,
+            )
+            .await?;
         }
         Command::Disconnect {
             harness,
@@ -3210,6 +3378,12 @@ async fn main() -> Result<()> {
             } => {
                 wrap_env_cmd(&config, &harness, mode.as_deref(), &wrap_url, ca_cert, json).await?;
             }
+            WrapCommand::Claude { args } => {
+                wrap_launcher_cmd(&config, "claude", args)?;
+            }
+            WrapCommand::Codex { args } => {
+                wrap_launcher_cmd(&config, "codex", args)?;
+            }
             WrapCommand::Amp {
                 remote_trace,
                 mode,
@@ -3289,6 +3463,90 @@ async fn main() -> Result<()> {
 struct RemoteTraceConfig {
     base_url: String,
     key: String,
+}
+
+fn claude_launcher_args(config_dir: &Path, args: &[String]) -> Vec<OsString> {
+    let mut launch_args = vec![
+        OsString::from("--settings"),
+        config_dir
+            .join(harness_connect::CLAUDE_PROFILE_FILE)
+            .into_os_string(),
+    ];
+    launch_args.extend(args.iter().map(OsString::from));
+    launch_args
+}
+
+fn codex_launcher_args(args: &[String]) -> Vec<OsString> {
+    let mut launch_args = vec![OsString::from("--profile"), OsString::from("alex")];
+    launch_args.extend(args.iter().map(OsString::from));
+    launch_args
+}
+
+fn ensure_wrap_launcher_connected(harness: &str, config_dir: &Path) -> Result<()> {
+    let connected = match harness {
+        "claude" => harness_connect::claude_config_connected(config_dir)?,
+        "codex" => {
+            harness_connect::codex_config_connected(config_dir)?
+                && config_dir
+                    .join(harness_connect::CODEX_ALEX_PROFILE_FILE)
+                    .is_file()
+        }
+        _ => unreachable!("wrap launchers are only defined for Claude and Codex"),
+    };
+    if !connected {
+        anyhow::bail!(
+            "{harness} is not connected to Alexandria; run `alex connect {harness}` first"
+        );
+    }
+    Ok(())
+}
+
+fn wrap_launcher_cmd(config: &Config, harness: &str, args: Vec<String>) -> Result<()> {
+    let spec = match harness {
+        "claude" => harness_connect::claude_spec(),
+        "codex" => harness_connect::codex_spec(),
+        _ => unreachable!("wrap launchers are only defined for Claude and Codex"),
+    };
+    let config_dir = harness_connect::resolve_config_dir(config, spec, None);
+    ensure_wrap_launcher_connected(harness, &config_dir)?;
+    let binary = harness_connect::resolve_harness_binary(config, spec)
+        .with_context(|| format!("{harness} is not installed or not on PATH"))?;
+    let launch_args = match harness {
+        "claude" => claude_launcher_args(&config_dir, &args),
+        "codex" => codex_launcher_args(&args),
+        _ => unreachable!("wrap launchers are only defined for Claude and Codex"),
+    };
+    launch_harness(&binary, &launch_args)
+}
+
+#[cfg(unix)]
+fn launch_harness(binary: &Path, args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    Err(std::process::Command::new(binary).args(args).exec())
+        .with_context(|| format!("could not launch {}", binary.display()))
+}
+
+#[cfg(windows)]
+fn launch_harness(binary: &Path, args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("could not launch {}", binary.display()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(any(unix, windows)))]
+fn launch_harness(binary: &Path, args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("could not launch {}", binary.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} exited with {status}", binary.display())
+    }
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -3530,6 +3788,11 @@ async fn wrap_run_cmd(
     let remote_worker = remote_config.map(RemoteTraceWorker::start);
     let remote_sender = remote_worker.as_ref().map(RemoteTraceWorker::sender);
     let vault = open_vault(config)?;
+    if harness == "amp" {
+        // Refresh the native token and its provider-reported email before the
+        // trace importer snapshots billing attribution for this run.
+        let _ = alex_auth::import_amp(&vault).await;
+    }
     let catalog = alex_wrap::load_catalog()?;
     let provider = catalog
         .resolve(harness)
@@ -3558,14 +3821,48 @@ async fn wrap_run_cmd(
             .find(|a| a.provider.as_str() == provider && a.status == "active")
             .and_then(|a| a.api_key.or(a.access_token))
     };
+    let amp_billing_account = if harness == "amp" {
+        vault
+            .list()
+            .await
+            .into_iter()
+            .find(|account| {
+                account.provider == alex_core::Provider::Amp
+                    && account.status == "active"
+                    && account
+                        .api_key
+                        .as_deref()
+                        .or(account.access_token.as_deref())
+                        == credential_override.as_deref()
+            })
+            .map(|account| known_account(&account))
+    } else {
+        None
+    };
+    let cursor_metadata = (harness == "agent").then(|| cursor_trace_metadata(&args));
 
     let amp_trace = if harness == "amp" {
-        Some(start_amp_trace_import(config.data_dir.clone(), harness, remote_sender.clone()).await?)
+        Some(
+            start_amp_trace_import(
+                config.data_dir.clone(),
+                harness,
+                remote_sender.clone(),
+                amp_billing_account,
+            )
+            .await?,
+        )
     } else {
         None
     };
     let agent_trace = if harness == "agent" {
-        Some(start_agent_trace_import(config.data_dir.clone(), remote_sender).await?)
+        Some(
+            start_agent_trace_import(
+                config.data_dir.clone(),
+                remote_sender,
+                cursor_metadata.unwrap_or_default(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -3650,6 +3947,7 @@ async fn start_amp_trace_import(
     data_dir: PathBuf,
     harness: &str,
     remote: Option<RemoteTraceSender>,
+    billing_account: Option<KnownAccount>,
 ) -> Result<AmpTraceImporter> {
     let run_id = format!(
         "wrap-{harness}-{}-{:08x}",
@@ -3690,6 +3988,7 @@ async fn start_amp_trace_import(
             run_key_hash[..16].to_string(),
             remote,
         );
+        state.billing_account = billing_account;
         let mut offset = 0u64;
         loop {
             tokio::select! {
@@ -3722,6 +4021,7 @@ struct AmpWsTraceState {
     user_by_thread: BTreeMap<String, AmpUserMessage>,
     inserted: std::collections::BTreeSet<String>,
     active_error: Option<String>,
+    billing_account: Option<KnownAccount>,
 }
 
 #[derive(Clone)]
@@ -3748,6 +4048,7 @@ impl AmpWsTraceState {
             user_by_thread: BTreeMap::new(),
             inserted: std::collections::BTreeSet::new(),
             active_error: None,
+            billing_account: None,
         }
     }
 
@@ -3975,6 +4276,9 @@ impl AmpWsTraceState {
             "response.body",
             serde_json::to_string_pretty(&resp)?.as_bytes(),
         )?);
+        if let Some(account) = &self.billing_account {
+            store.upsert_known_account(account)?;
+        }
         let rec = alex_core::TraceRecord {
             id: trace_id,
             ts_request_ms: ts_req,
@@ -4013,8 +4317,14 @@ impl AmpWsTraceState {
                 "content-type": "application/json"
             }).to_string()),
             error,
-            account_id: None,
-            subscription_identity: None,
+            account_id: self
+                .billing_account
+                .as_ref()
+                .map(|account| account.account_id.clone()),
+            subscription_identity: self
+                .billing_account
+                .as_ref()
+                .and_then(|account| account.subscription_identity.clone()),
             via_dario: false,
             dario_generation: None,
             run_id: Some(self.run_id.clone()),
@@ -4066,6 +4376,95 @@ struct AgentTraceImporter {
     run_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct CursorTraceMetadata {
+    model: String,
+    billing_account: Option<KnownAccount>,
+}
+
+impl Default for CursorTraceMetadata {
+    fn default() -> Self {
+        Self {
+            model: "cursor-agent".into(),
+            billing_account: None,
+        }
+    }
+}
+
+fn cursor_trace_metadata(args: &[String]) -> CursorTraceMetadata {
+    let config = dirs::home_dir()
+        .map(|home| home.join(".cursor/cli-config.json"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+    cursor_trace_metadata_from_config(&config, args)
+}
+
+fn cursor_trace_metadata_from_config(
+    config: &serde_json::Value,
+    args: &[String],
+) -> CursorTraceMetadata {
+    let argument_model = args.iter().enumerate().find_map(|(offset, argument)| {
+        argument
+            .strip_prefix("--model=")
+            .filter(|model| !model.trim().is_empty())
+            .map(String::from)
+            .or_else(|| {
+                (argument == "--model")
+                    .then(|| args.get(offset + 1))
+                    .flatten()
+                    .filter(|model| !model.trim().is_empty())
+                    .cloned()
+            })
+    });
+    let configured_model = config["selectedModel"]["modelId"]
+        .as_str()
+        .or_else(|| config["model"]["modelId"].as_str())
+        .map(String::from);
+    let model = argument_model
+        .or(configured_model)
+        .unwrap_or_else(|| "cursor-agent".into());
+
+    let auth = &config["authInfo"];
+    let email = auth["email"]
+        .as_str()
+        .map(str::trim)
+        .filter(|email| email.contains('@') && !email.chars().any(char::is_whitespace))
+        .map(str::to_ascii_lowercase);
+    let user_id = auth["userId"]
+        .as_u64()
+        .map(|id| id.to_string())
+        .or_else(|| auth["userId"].as_str().map(String::from));
+    let auth_id = auth["authId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(String::from);
+    let identity = user_id
+        .as_deref()
+        .map(|id| format!("cursor:user:{id}"))
+        .or_else(|| auth_id.as_deref().map(|id| format!("cursor:auth:{id}")))
+        .or_else(|| {
+            email
+                .as_deref()
+                .map(|email| format!("cursor:email:{email}"))
+        });
+    let billing_account = identity.map(|identity| {
+        let digest = amp_key_hash_hex(&identity);
+        KnownAccount::new(
+            format!("cursor-subscription-{}", &digest[..16]),
+            "cursor",
+            email.clone().unwrap_or_else(|| "Cursor".into()),
+            "subscription",
+            Some(identity),
+            email,
+        )
+    });
+    CursorTraceMetadata {
+        model,
+        billing_account,
+    }
+}
+
 impl AgentTraceImporter {
     async fn stop(self) -> Result<()> {
         let _ = self.stop.send(());
@@ -4083,6 +4482,7 @@ impl AgentTraceImporter {
 async fn start_agent_trace_import(
     data_dir: PathBuf,
     remote: Option<RemoteTraceSender>,
+    metadata: CursorTraceMetadata,
 ) -> Result<AgentTraceImporter> {
     let run_id = format!(
         "wrap-agent-{}-{:08x}",
@@ -4100,10 +4500,10 @@ async fn start_agent_trace_import(
         loop {
             tokio::select! {
                 _ = &mut rx => {
-                    break import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref());
+                    break import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref(), &metadata);
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    if let Err(error) = import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref()) {
+                    if let Err(error) = import_agent_transcripts(&data_dir, &transcript_root_c, &run_id_c, started_ms, &mut seen, remote.as_ref(), &metadata) {
                         eprintln!("alex wrap: agent trace import failed: {error:#}");
                     }
                 }
@@ -4142,6 +4542,7 @@ fn import_agent_transcripts(
     started_ms: i64,
     seen: &mut BTreeMap<String, AgentTranscriptTurn>,
     remote: Option<&RemoteTraceSender>,
+    metadata: &CursorTraceMetadata,
 ) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Ok(());
@@ -4176,7 +4577,8 @@ fn import_agent_transcripts(
             if seen.get(&key) == Some(&turn) {
                 continue;
             }
-            let outcome = reconcile_agent_turn(&store, run_id, id, idx, modified, &turn, false)?;
+            let outcome =
+                reconcile_agent_turn(&store, run_id, id, idx, modified, &turn, false, metadata)?;
             if outcome != AgentReconcileOutcome::Unchanged {
                 if let Some(remote) = remote {
                     let trace_id = format!("agent-{id}-{idx}");
@@ -4373,8 +4775,17 @@ fn agent_trace_bodies(
     turn_index: usize,
     turn: &AgentTranscriptTurn,
 ) -> (serde_json::Value, serde_json::Value) {
+    agent_trace_bodies_for_model(transcript_id, turn_index, turn, "cursor-agent")
+}
+
+fn agent_trace_bodies_for_model(
+    transcript_id: &str,
+    turn_index: usize,
+    turn: &AgentTranscriptTurn,
+    model: &str,
+) -> (serde_json::Value, serde_json::Value) {
     let req = serde_json::json!({
-        "model": "cursor-agent",
+        "model": model,
         "messages": [{"role": "user", "content": turn.user}],
         "cursor": {"transcript_id": transcript_id}
     });
@@ -4406,7 +4817,7 @@ fn agent_trace_bodies(
     }
     let resp = serde_json::json!({
         "id": transcript_id,
-        "model": "cursor-agent",
+        "model": model,
         "_alexandria": {"assistant_blocks": turn.assistant_blocks},
         "choices": [{
             "index": 0,
@@ -4577,10 +4988,28 @@ fn reconcile_agent_turn(
     ts_ms: i64,
     turn: &AgentTranscriptTurn,
     dry_run: bool,
+    metadata: &CursorTraceMetadata,
 ) -> Result<AgentReconcileOutcome> {
     let trace_id = format!("agent-{transcript_id}-{turn_index}");
-    let (req, resp) = agent_trace_bodies(transcript_id, turn_index, turn);
+    let (req, resp) =
+        agent_trace_bodies_for_model(transcript_id, turn_index, turn, &metadata.model);
     if let Some(existing) = store.get_trace(&trace_id)? {
+        let expected_account_id = metadata
+            .billing_account
+            .as_ref()
+            .map(|account| account.account_id.as_str());
+        let expected_subscription_identity = metadata
+            .billing_account
+            .as_ref()
+            .and_then(|account| account.subscription_identity.as_deref());
+        let metadata_matches = existing["requested_model"].as_str() == Some(&metadata.model)
+            && existing["routed_model"].as_str() == Some(&metadata.model)
+            && existing["billing_bucket"].as_str() == Some("cursor")
+            && expected_account_id
+                .is_none_or(|expected| existing["account_id"].as_str() == Some(expected))
+            && expected_subscription_identity.is_none_or(|expected| {
+                existing["subscription_identity"].as_str() == Some(expected)
+            });
         let req_path = existing["req_body_path"]
             .as_str()
             .map(std::path::PathBuf::from);
@@ -4597,10 +5026,23 @@ fn reconcile_agent_turn(
             .and_then(|path| read_gzip_json(path).ok())
             .as_ref()
             == Some(&resp);
-        if req_matches && resp_matches {
+        if req_matches && resp_matches && metadata_matches {
             return Ok(AgentReconcileOutcome::Unchanged);
         }
         if !dry_run {
+            if !metadata_matches {
+                if let Some(account) = &metadata.billing_account {
+                    store.upsert_known_account(account)?;
+                }
+                store.update_trace_billing_metadata(
+                    &trace_id,
+                    &metadata.model,
+                    &metadata.model,
+                    "cursor",
+                    expected_account_id,
+                    expected_subscription_identity,
+                )?;
+            }
             if !req_matches {
                 let path = req_path.with_context(|| {
                     format!("existing Agent trace {trace_id} has no request body path")
@@ -4630,6 +5072,9 @@ fn reconcile_agent_turn(
         "response.body",
         serde_json::to_string_pretty(&resp)?.as_bytes(),
     )?);
+    if let Some(account) = &metadata.billing_account {
+        store.upsert_known_account(account)?;
+    }
     let tags = serde_json::json!({"harness":"agent","wrap":"agent","source":"cursor-agent-transcript","stream":"dialogue"}).to_string();
     let rec = alex_core::TraceRecord {
         id: trace_id,
@@ -4640,8 +5085,8 @@ fn reconcile_agent_turn(
         client_format: Some("openai-chat".into()),
         upstream_provider: Some("cursor".into()),
         upstream_format: Some("openai-chat".into()),
-        requested_model: Some("cursor-agent".into()),
-        routed_model: Some("cursor-agent".into()),
+        requested_model: Some(metadata.model.clone()),
+        routed_model: Some(metadata.model.clone()),
         method: Some("TRANSCRIPT".into()),
         path: Some("cursor-agent-transcript".into()),
         status: Some(200),
@@ -4655,8 +5100,14 @@ fn reconcile_agent_turn(
         req_headers_json: Some(serde_json::json!({"x-alexandria-wrap":"agent","x-alexandria-run-id":run_id}).to_string()),
         resp_headers_json: Some(serde_json::json!({"x-alexandria-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
         error: None,
-        account_id: None,
-        subscription_identity: None,
+        account_id: metadata
+            .billing_account
+            .as_ref()
+            .map(|account| account.account_id.clone()),
+        subscription_identity: metadata
+            .billing_account
+            .as_ref()
+            .and_then(|account| account.subscription_identity.clone()),
         via_dario: false,
         dario_generation: None,
         run_id: Some(run_id.to_string()),
@@ -4691,7 +5142,11 @@ fn validate_agent_transcript_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn traces_repair_amp_cmd(config: &Config, run_id: Option<&str>, json_out: bool) -> Result<()> {
+async fn traces_repair_amp_cmd(
+    config: &Config,
+    run_id: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
     let capture_path = alex_wrap::capture_dir_for(&config.data_dir, "amp").join("ws.jsonl");
     if !capture_path.exists() {
         anyhow::bail!(
@@ -4709,6 +5164,14 @@ fn traces_repair_amp_cmd(config: &Config, run_id: Option<&str>, json_out: bool) 
         "stream": "dialogue",
     })
     .to_string();
+    let vault = open_vault(config)?;
+    let _ = alex_auth::import_amp(&vault).await;
+    let billing_account = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.provider == alex_core::Provider::Amp && account.status == "active")
+        .map(|account| known_account(&account));
     let mut state = AmpWsTraceState::new(
         config.data_dir.clone(),
         run_id.clone(),
@@ -4716,6 +5179,7 @@ fn traces_repair_amp_cmd(config: &Config, run_id: Option<&str>, json_out: bool) 
         "amp-repair".into(),
         None,
     );
+    state.billing_account = billing_account;
     let mut offset = 0;
     state.ingest_new(&capture_path, &mut offset)?;
     let result = serde_json::json!({
@@ -4771,6 +5235,7 @@ fn repair_agent_transcript(
         unchanged: 0,
         dry_run,
     };
+    let metadata = cursor_trace_metadata(&[]);
     for (offset, turn) in turns.iter().enumerate() {
         match reconcile_agent_turn(
             &store,
@@ -4780,6 +5245,7 @@ fn repair_agent_transcript(
             modified,
             turn,
             dry_run,
+            &metadata,
         )? {
             AgentReconcileOutcome::Inserted => report.inserted += 1,
             AgentReconcileOutcome::Updated => report.updated += 1,
@@ -5777,8 +6243,7 @@ fn print_limits(snap: &serde_json::Value) {
             let raw_label = w["window"].as_str().unwrap_or("-");
             // The Grok billing window is already printed as the primary credit
             // quota. Amp's paid balances are likewise represented above.
-            if quota_kind == "credit_window" || (credit_primary && raw_label == "credits")
-            {
+            if quota_kind == "credit_window" || (credit_primary && raw_label == "credits") {
                 continue;
             }
             // Amp paid balances: show dollars remaining instead of an empty % bar.
@@ -6079,7 +6544,10 @@ fn ping_done_line(r: &alex_proxy::PingResult) -> String {
 
 async fn ping_dario_daemon(config: &Config) -> alex_proxy::PingResult {
     let started = now_ms();
-    let endpoint = format!("{}/admin/dario/ping", config.base_url().trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/admin/dario/ping",
+        config.base_url().trim_end_matches('/')
+    );
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()
@@ -7523,12 +7991,150 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn tool_capture_cli_parses_harness_state_and_json() {
+        let cli = Cli::try_parse_from(["alex", "tool-capture", "codex", "on", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            Command::ToolCapture {
+                harness,
+                state: Some(ToolCaptureState::On),
+                json: true,
+            } => assert_eq!(harness, "codex"),
+            _ => panic!("unexpected tool-capture command"),
+        }
+    }
+
+    #[test]
+    fn wrap_claude_forwards_hyphenated_args_verbatim() {
+        let cli = Cli::try_parse_from([
+            "alex",
+            "wrap",
+            "claude",
+            "-p",
+            "hi",
+            "--allowedTools",
+            "Bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wrap {
+                command: WrapCommand::Claude { args },
+            } => assert_eq!(args, ["-p", "hi", "--allowedTools", "Bash"]),
+            _ => panic!("unexpected wrap command"),
+        }
+    }
+
+    #[test]
+    fn wrap_launcher_builds_expected_arguments() {
+        let dir = PathBuf::from("/tmp/alex-claude");
+        let claude = claude_launcher_args(&dir, &["-p".into(), "hi".into()]);
+        assert_eq!(
+            claude,
+            vec![
+                OsString::from("--settings"),
+                dir.join(harness_connect::CLAUDE_PROFILE_FILE)
+                    .into_os_string(),
+                OsString::from("-p"),
+                OsString::from("hi"),
+            ]
+        );
+        assert_eq!(
+            codex_launcher_args(&["exec".into(), "hi".into()]),
+            vec![
+                OsString::from("--profile"),
+                OsString::from("alex"),
+                OsString::from("exec"),
+                OsString::from("hi"),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_launcher_requires_connected_harness_state() {
+        let dir = tmpdir("wrap-launcher-preflight");
+        let claude = ensure_wrap_launcher_connected("claude", &dir).unwrap_err();
+        assert!(claude.to_string().contains("alex connect claude"));
+        let codex = ensure_wrap_launcher_connected("codex", &dir).unwrap_err();
+        assert!(codex.to_string().contains("alex connect codex"));
+    }
+
     fn agent_jsonl(lines: Vec<serde_json::Value>) -> String {
         lines
             .into_iter()
             .map(|line| serde_json::to_string(&line).unwrap())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn cursor_trace_metadata_uses_cli_identity_and_explicit_model() {
+        let config = serde_json::json!({
+            "authInfo": {
+                "email": "Person@Example.com",
+                "userId": 42,
+                "authId": "github|secret-looking-but-not-used-as-the-local-id"
+            },
+            "selectedModel": {"modelId": "composer-2.5"}
+        });
+        let metadata =
+            cursor_trace_metadata_from_config(&config, &["--model".into(), "gpt-5.6-sol".into()]);
+        assert_eq!(metadata.model, "gpt-5.6-sol");
+        let account = metadata.billing_account.unwrap();
+        assert_eq!(account.provider, "cursor");
+        assert_eq!(account.kind, "subscription");
+        assert_eq!(account.email.as_deref(), Some("person@example.com"));
+        assert_eq!(
+            account.subscription_identity.as_deref(),
+            Some("cursor:user:42")
+        );
+        assert!(account.account_id.starts_with("cursor-subscription-"));
+        assert!(!account.account_id.contains("secret-looking"));
+    }
+
+    #[test]
+    fn cursor_reconcile_records_billing_account_without_inventing_cost() {
+        let store = Store::open(tmpdir("cursor-billing-attribution")).unwrap();
+        let account = KnownAccount::new(
+            "cursor-subscription-test",
+            "cursor",
+            "person@example.com",
+            "subscription",
+            Some("cursor:user:42".into()),
+            Some("person@example.com".into()),
+        );
+        let metadata = CursorTraceMetadata {
+            model: "composer-2.5".into(),
+            billing_account: Some(account.clone()),
+        };
+        let turn = AgentTranscriptTurn {
+            user: "hello".into(),
+            assistant: "hi".into(),
+            tool_calls: vec![],
+            assistant_blocks: vec![],
+            complete: true,
+            end_status: Some("success".into()),
+        };
+        assert_eq!(
+            reconcile_agent_turn(
+                &store,
+                "wrap-agent-test",
+                "transcript-test",
+                1,
+                100,
+                &turn,
+                false,
+                &metadata,
+            )
+            .unwrap(),
+            AgentReconcileOutcome::Inserted
+        );
+        let row = store.get_trace("agent-transcript-test-1").unwrap().unwrap();
+        assert_eq!(row["requested_model"], "composer-2.5");
+        assert_eq!(row["account_id"], account.account_id);
+        assert_eq!(row["subscription_identity"], "cursor:user:42");
+        assert!(row["cost_usd"].is_null());
+        let known = store.list_known_accounts().unwrap();
+        assert_eq!(known[0]["email"], "person@example.com");
     }
 
     #[tokio::test]
@@ -7741,6 +8347,7 @@ mod tests {
         .unwrap();
 
         let mut seen = BTreeMap::new();
+        let metadata = CursorTraceMetadata::default();
         import_agent_transcripts(
             &data_dir,
             &transcript_root,
@@ -7748,6 +8355,7 @@ mod tests {
             0,
             &mut seen,
             None,
+            &metadata,
         )
         .unwrap();
         let store = Store::open(data_dir.clone()).unwrap();
@@ -7793,6 +8401,7 @@ mod tests {
             0,
             &mut seen,
             None,
+            &metadata,
         )
         .unwrap();
 
@@ -8011,6 +8620,14 @@ mod tests {
             "test-key".into(),
             None,
         );
+        state.billing_account = Some(KnownAccount::new(
+            "amp-api-key",
+            "amp",
+            "person@example.com",
+            "api_key",
+            Some("amp:email:person@example.com".into()),
+            Some("person@example.com".into()),
+        ));
         let outer = |ts: &str, message: serde_json::Value| {
             serde_json::json!({
                 "direction": "upstream_to_client",
@@ -8130,6 +8747,10 @@ mod tests {
             .session_traces("thread-multi", None)
             .unwrap();
         assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["account_id"] == "amp-api-key"));
+        assert!(rows
+            .iter()
+            .all(|row| { row["subscription_identity"] == "amp:email:person@example.com" }));
         let questions = rows
             .iter()
             .map(|row| {
@@ -8362,10 +8983,9 @@ mod tests {
     #[tokio::test]
     async fn unavailable_configured_bind_falls_back_to_loopback() {
         // RFC 5737 TEST-NET-1 is never a locally assigned interface address.
-        let (listener, host, reason) =
-            bind_daemon_listener_with_fallback("192.0.2.1", 0, true)
-                .await
-                .unwrap();
+        let (listener, host, reason) = bind_daemon_listener_with_fallback("192.0.2.1", 0, true)
+            .await
+            .unwrap();
         assert_eq!(host, "127.0.0.1");
         assert!(reason.is_some());
         assert!(listener.local_addr().unwrap().ip().is_loopback());
@@ -8797,10 +9417,23 @@ mod tests {
         let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
-        assert_eq!(harnesses.len(), 7);
+        assert_eq!(harnesses.len(), 19);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));
+
+        let (status, body) = router_json(
+            app.clone(),
+            Method::PUT,
+            "/admin/harnesses/gemini/tool-capture",
+            Some(serde_json::json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"].as_str(),
+            Some("tool capture is not yet supported for gemini")
+        );
 
         let (status, body) =
             router_json(app, Method::POST, "/admin/harnesses/gemini/connect", None).await;

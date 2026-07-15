@@ -270,7 +270,10 @@ struct HttpReader<R> {
 
 impl<R: AsyncRead + Unpin> HttpReader<R> {
     fn new(inner: R) -> Self {
-        Self { inner, buffered: Vec::new() }
+        Self {
+            inner,
+            buffered: Vec::new(),
+        }
     }
 
     async fn read_headers(&mut self) -> Result<Option<Vec<u8>>> {
@@ -281,7 +284,11 @@ impl<R: AsyncRead + Unpin> HttpReader<R> {
             let mut tmp = [0u8; 2048];
             let n = self.inner.read(&mut tmp).await?;
             if n == 0 {
-                return if self.buffered.is_empty() { Ok(None) } else { bail!("incomplete HTTP headers") };
+                return if self.buffered.is_empty() {
+                    Ok(None)
+                } else {
+                    bail!("incomplete HTTP headers")
+                };
             }
             self.buffered.extend_from_slice(&tmp[..n]);
             if self.buffered.len() > 1024 * 1024 {
@@ -467,7 +474,10 @@ async fn proxy_http_cycles(
         // has a separately framed body and its upstream socket is dropped below.
         client
             .inner
-            .write_all(&rewrite_response_connection(&resp_head, resp_close && !close_client)?)
+            .write_all(&rewrite_response_connection(
+                &resp_head,
+                resp_close && !close_client,
+            )?)
             .await?;
         let mut resp_capture = Vec::new();
 
@@ -974,7 +984,11 @@ where
 }
 
 /// Copy HTTP/1.1 chunked body including terminating 0-chunk.
-async fn copy_chunked_body_capture<R, W>(r: &mut HttpReader<R>, w: &mut W, capture: &mut Vec<u8>) -> Result<()>
+async fn copy_chunked_body_capture<R, W>(
+    r: &mut HttpReader<R>,
+    w: &mut W,
+    capture: &mut Vec<u8>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1450,7 +1464,10 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap();
                 let request = String::from_utf8_lossy(&buf[..n]);
-                assert!(request.starts_with(&format!("GET {expected_path} ")), "{request}");
+                assert!(
+                    request.starts_with(&format!("GET {expected_path} ")),
+                    "{request}"
+                );
                 sock.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                 )

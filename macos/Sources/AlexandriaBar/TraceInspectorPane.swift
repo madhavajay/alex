@@ -86,11 +86,13 @@ struct TraceInspectorView: View {
     @State private var detail: TraceDetailResponse?
     @State private var loadError: String?
     @State private var reqBody = BodyLoad()
+    @State private var previousReqBody = BodyLoad()
     @State private var respBody = BodyLoad()
     @State private var darioReqBody = BodyLoad()
     @State private var darioRespBody = BodyLoad()
     @State private var copiedAll = false
     @State private var isLoading = false
+    @State private var fullRequestJSON = false
     @AppStorage("InspectorRawMode") private var rawMode = false
     @AppStorage("InspectorReqHeadersOpen") private var reqHeadersOpen = false
     @AppStorage("InspectorRespHeadersOpen") private var respHeadersOpen = false
@@ -139,8 +141,13 @@ struct TraceInspectorView: View {
         .task(id: traceId) {
             loadError = nil
             isLoading = true
+            previousReqBody = BodyLoad()
             if reqBodyOpen {
+                reqBody.phase = .loading
                 loadBody(.request, into: $reqBody)
+                if !fullRequestJSON {
+                    loadPreviousRequestBody()
+                }
             } else {
                 reqBody = BodyLoad()
             }
@@ -176,6 +183,20 @@ struct TraceInspectorView: View {
             let phase = await fetchBody(tid, kind: kind)
             guard tid == traceId else { return }
             load.wrappedValue.phase = phase
+        }
+    }
+
+    private func loadPreviousRequestBody() {
+        let currentTraceId = traceId
+        guard let previousTraceId = model.previousTraceId(before: currentTraceId) else {
+            previousReqBody = BodyLoad()
+            return
+        }
+        previousReqBody.phase = .loading
+        Task {
+            let phase = await fetchBody(previousTraceId, kind: .request)
+            guard currentTraceId == traceId else { return }
+            previousReqBody.phase = phase
         }
     }
 
@@ -274,8 +295,7 @@ struct TraceInspectorView: View {
             title: "Response headers", json: trace.respHeadersJson,
             isExpanded: $respHeadersOpen, diffAgainstFirst: false)
         Divider()
-        bodyGroup(
-            title: "Request body", kind: .request, load: $reqBody, isExpanded: $reqBodyOpen)
+        requestBodyGroup()
         bodyGroup(
             title: "Response body", kind: .response, load: $respBody, isExpanded: $respBodyOpen)
         if let capture = response.extras?.darioCapture {
@@ -440,6 +460,33 @@ struct TraceInspectorView: View {
     }
 
     @ViewBuilder
+    private func requestBodyGroup() -> some View {
+        DisclosureGroup(isExpanded: $reqBodyOpen) {
+            requestBodyContent(reqBody.phase)
+        } label: {
+            groupLabel("Request body")
+        }
+        .onChange(of: reqBodyOpen) { _, open in
+            guard open else { return }
+            if case .idle = reqBody.phase {
+                loadBody(.request, into: $reqBody)
+            }
+            if !fullRequestJSON, model.previousTraceId(before: traceId) != nil,
+                case .idle = previousReqBody.phase
+            {
+                loadPreviousRequestBody()
+            }
+        }
+        .onChange(of: fullRequestJSON) { _, showFull in
+            guard !showFull, reqBodyOpen,
+                model.previousTraceId(before: traceId) != nil,
+                case .idle = previousReqBody.phase
+            else { return }
+            loadPreviousRequestBody()
+        }
+    }
+
+    @ViewBuilder
     private func bodyGroup(
         title: String, kind: TraceBodyKind, load: Binding<BodyLoad>, isExpanded: Binding<Bool>
     ) -> some View {
@@ -455,51 +502,131 @@ struct TraceInspectorView: View {
     }
 
     @ViewBuilder
+    private func requestBodyContent(_ phase: BodyLoad.Phase) -> some View {
+        switch phase {
+        case .idle, .loading:
+            bodyLoadingView("Loading request body…")
+        case let .failed(message):
+            bodyErrorView(message)
+        case let .loaded(raw, diskPath):
+            if fullRequestJSON {
+                bodyViewer(
+                    source: raw,
+                    displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
+                    diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
+                    note: nil, showsFullJSONToggle: true)
+            } else if model.previousTraceId(before: traceId) == nil {
+                let presentation = RequestJSONDiff.presentation(previous: nil, current: raw)
+                requestDiffViewer(presentation, source: raw, diskPath: diskPath)
+            } else {
+                switch previousReqBody.phase {
+                case .idle, .loading:
+                    bodyLoadingView("Loading previous request for comparison…")
+                case let .failed(message):
+                    bodyViewer(
+                        source: raw, displayed: BodyPretty.display(raw, cap: .max).text,
+                        diskPath: diskPath, highlightJSON: BodyPretty.isJSON(raw),
+                        note: "Previous request unavailable (\(message)); showing the full current body.",
+                        showsFullJSONToggle: true)
+                case let .loaded(previous, _):
+                    let presentation = RequestJSONDiff.presentation(
+                        previous: previous, current: raw)
+                    requestDiffViewer(presentation, source: raw, diskPath: diskPath)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func requestDiffViewer(
+        _ presentation: RequestJSONDiffPresentation, source: String, diskPath: String?
+    ) -> some View {
+        bodyViewer(
+            source: source, displayed: presentation.text, diskPath: diskPath,
+            highlightJSON: BodyPretty.isJSON(presentation.text), note: presentation.note,
+            showsFullJSONToggle: true)
+    }
+
+    @ViewBuilder
     private func bodyContent(_ phase: BodyLoad.Phase) -> some View {
         switch phase {
         case .idle, .loading:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Loading body…")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.vertical, 4)
+            bodyLoadingView("Loading body…")
         case let .failed(message):
-            Text(message)
-                .font(.system(size: 10))
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
+            bodyErrorView(message)
         case let .loaded(raw, diskPath):
-            let capped = rawMode ? BodyPretty.capped(raw) : BodyPretty.display(raw)
-            let highlight = !rawMode && BodyPretty.isJSON(raw)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(raw, forType: .string)
-                    }
-                    Button("Reveal in Finder") {
-                        guard let diskPath else { return }
-                        NSWorkspace.shared.activateFileViewerSelecting(
-                            [URL(fileURLWithPath: diskPath)])
-                    }
-                    .disabled(diskPath == nil)
+            bodyViewer(
+                source: raw,
+                displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
+                diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
+                note: nil, showsFullJSONToggle: false)
+        }
+    }
+
+    private func bodyLoadingView(_ label: String) -> some View {
+        HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func bodyErrorView(_ message: String) -> some View {
+        Text(message)
+            .font(.system(size: 10))
+            .foregroundStyle(.red)
+            .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func bodyViewer(
+        source: String, displayed: String, diskPath: String?, highlightJSON: Bool,
+        note: String?, showsFullJSONToggle: Bool
+    ) -> some View {
+        let capped = BodyPretty.capped(displayed)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        showsFullJSONToggle && !fullRequestJSON ? displayed : source,
+                        forType: .string)
+                }
+                Button("Reveal in Finder") {
+                    guard let diskPath else { return }
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: diskPath)])
+                }
+                .disabled(diskPath == nil)
+                if showsFullJSONToggle {
+                    Toggle("Full JSON", isOn: $fullRequestJSON)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10))
+                        .help("Show the complete request instead of changes from the previous request")
+                }
+                if !showsFullJSONToggle || fullRequestJSON {
                     Toggle("Raw", isOn: $rawMode)
                         .toggleStyle(.checkbox)
                         .font(.system(size: 10))
                         .help("Show as-fetched text without pretty-printing or highlighting")
-                    if capped.isTruncated {
-                        Text("truncated to \(BodyPretty.displayCap / 1000)KB")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                    }
-                    Spacer()
                 }
-                .controlSize(.small)
-                InspectorTextPane(text: capped.text, highlightJSON: highlight)
-                    .frame(height: 220)
+                if capped.isTruncated {
+                    Text("truncated to \(BodyPretty.displayCap / 1000)KB")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
             }
+            .controlSize(.small)
+            if let note {
+                Text(note)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            InspectorTextPane(text: capped.text, highlightJSON: highlightJSON)
+                .frame(height: 220)
         }
     }
 

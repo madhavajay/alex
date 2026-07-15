@@ -207,6 +207,32 @@ curl -H "x-api-key: <local_key>" \
   "http://127.0.0.1:4100/traces/search?text=professor&session=$SESSION"  # body-text search
 ```
 
+## Tool capture
+
+Model traces show the tool calls a model *requested*; tool capture additionally records what the harness *actually executed* — tool name, arguments, result, and error status — and joins it to the same session and turn. Execution events arrive on a separate ingest endpoint (`POST /tool-events`, authenticated with the harness key), never ride on model traffic, and are best-effort: a failed telemetry post never blocks or alters a tool run.
+
+Each harness reports through the integration surface it supports:
+
+| Harness | Mechanism |
+| --- | --- |
+| Pi | in-process TypeScript extension (`tool_execution_start`/`tool_execution_end`) |
+| Claude Code | `PreToolUse`/`PostToolUse` lifecycle hooks in the Alexandria settings profile |
+| Codex | `PreToolUse`/`PostToolUse` hooks in `hooks.json` (requires `features.hooks`) |
+| Amp | system plugin `tool.call`/`tool.result` handlers |
+| Cursor | requested tool calls imported from transcripts (no execution results) |
+
+Hook payloads are sent as-is; the daemon normalizes native shapes (`hook_event_name`, `tool_use_id`, `tool_input`, `tool_response`) into one record, strips secrets from arguments and results, and stores rows in the `tool_calls` table with bodies on disk.
+
+Capture is off by default and toggled per harness (pi, claude, codex, amp):
+
+```bash
+curl -X PUT -H "x-api-key: <local_key>" -H "content-type: application/json" \
+  -d '{"enabled":true}' \
+  "http://127.0.0.1:4100/admin/harnesses/claude/tool-capture"
+```
+
+Toggling rewrites the harness's hook/extension/plugin files in place; restart the harness to pick them up. Executed tools come back on the stitched transcript as `turns[].executed_tools`, with argument and result bodies at `GET /tools/{id}/body/{args|result}`. The Trace Browser pairs requested and executed calls per turn (requested → running → executed/failed). Other harnesses currently show requested tool calls inferred from model traffic only; the support matrix lives in `crates/alex/tests/harness_matrix.rs`.
+
 ## Remote wrap capture
 
 `alex wrap agent` and `alex wrap amp` can run on a different machine while sending their normalized conversation traces to a central Alexandria daemon. The remote reverse wrap still connects directly to Cursor or Amp; only the captured trace records and bodies are uploaded to Alexandria.
@@ -293,6 +319,8 @@ When a subscription expires you get a notification and a one-click fix. Each pro
 ./scripts/harness-regression.sh  # real Docker harnesses + host-side trace assertions
 cd macos && swift test    # menu bar app tests
 ```
+
+Build Linux container binaries with `./scripts/build-linux.sh`; it builds only the release `alex` binary for x86_64 and aarch64 musl, preferring `cargo zigbuild`, then Docker-backed `cross`, and finally a locally installed Rust musl toolchain. The script prints the two output paths when it finishes.
 
 ## Got a bug or feature request?
 

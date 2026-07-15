@@ -175,7 +175,9 @@ run_fixture() {
       ;;
     lineage)
       curl -fsS --max-time 5 -H "x-api-key: $KEY" "$BASE/traces/sessions?limit=1000" > "$TMP/$id.sessions.json" || { result "$id" FAIL 'cannot read sessions'; revoke_key "$key_id"; return 0; }
-      python3 "$ROOT/scripts/harness-regression-assert.py" lineage --traces "$TMP/$id.traces.json" --sessions "$TMP/$id.sessions.json" --run-id "$run_id" > "$TMP/$id.lineage.json" || { result "$id" FAIL 'lineage assertion failed'; revoke_key "$key_id"; return 0; }
+      local lineage_args=(lineage --traces "$TMP/$id.traces.json" --sessions "$TMP/$id.sessions.json" --run-id "$run_id")
+      [ "$id" != I9 ] || lineage_args+=(--agent-type pi)
+      python3 "$ROOT/scripts/harness-regression-assert.py" "${lineage_args[@]}" > "$TMP/$id.lineage.json" || { result "$id" FAIL 'lineage assertion failed'; revoke_key "$key_id"; return 0; }
       ;;
   esac
   result "$id" PASS "run_id=$run_id $details"
@@ -201,6 +203,9 @@ main() {
   run_builtin I2 claude anthropic claude-haiku-4-5
   run_fixture I3 pi openai gpt-5.6-luna ALEX_INTEGRATION_PI_IMAGE ALEX_INTEGRATION_PI_COMMAND tools
   run_fixture I4 codex openai gpt-5.6-luna ALEX_INTEGRATION_CODEX_SUBAGENT_IMAGE ALEX_INTEGRATION_CODEX_SUBAGENT_COMMAND lineage
+  # The command must invoke `pi --print --no-session '…'` from the parent Pi
+  # process. The child inherits ALEXANDRIA_SESSION_ID from its parent.
+  run_fixture I9 pi openai gpt-5.6-luna ALEX_INTEGRATION_PI_IMAGE ALEX_INTEGRATION_PI_SUBAGENT_COMMAND lineage
   optional_cell I5A 'Amp wrap fixture unavailable (requires logged-in Amp CLI)'
   optional_cell I5B 'Cursor Agent wrap fixture unavailable (requires logged-in agent CLI)'
   if dario_active; then run_builtin I6 codex anthropic claude-fable-5 1; else optional_cell I6 'Dario fable fixture unavailable (requires active dario generation + Anthropic account)'; fi

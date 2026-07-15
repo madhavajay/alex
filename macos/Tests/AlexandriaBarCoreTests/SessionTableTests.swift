@@ -98,6 +98,30 @@ import Testing
         #expect(cursor.iconAsset == "cursor-cli.png")
     }
 
+    @Test func compactSessionIdentityUsesOnePrimaryProvider() {
+        #expect(SessionIdentity.primaryProvider(
+            providers: ["openai"], harness: "pi", tags: ["harness": "pi"]
+        ) == "openai")
+        #expect(SessionIdentity.primaryProvider(
+            providers: ["anthropic", "openrouter"], harness: "pi", tags: nil
+        ) == "openrouter")
+        #expect(SessionIdentity.primaryProvider(
+            providers: [], harness: "amp", tags: ["harness": "amp"]
+        ) == "amp")
+        #expect(SessionIdentity.primaryProvider(
+            providers: [], harness: "pi", tags: ["harness": "pi"]
+        ) == nil)
+    }
+
+    @Test func lineageChildrenShareOnePrimaryChipWithOptionalTypeTag() {
+        #expect(SessionIdentity.subagentLabel == "sub-agent")
+        #expect(SessionIdentity.agentTypeTag(agentType: "default") == nil)
+        #expect(SessionIdentity.agentTypeTag(agentType: "Default") == nil)
+        #expect(SessionIdentity.agentTypeTag(agentType: nil) == nil)
+        #expect(SessionIdentity.agentTypeTag(agentType: "  ") == nil)
+        #expect(SessionIdentity.agentTypeTag(agentType: "general-purpose") == "general-purpose")
+    }
+
     @Test func shortSessionId() {
         #expect(SessionRow.shortId("exactly-22-characters-") == "exactly-22-characters-")
         #expect(SessionRow.shortId("exactly-23-characters-x") == "exactly-23…acters-x")

@@ -218,6 +218,9 @@ public struct CodexDefaultRouteResponse: Codable, Sendable, Equatable {
 public enum HarnessCatalog {
     public static let names = ["pi", "claude", "codex", "grok", "amp", "gemini", "opencode"]
 
+    /// Harnesses whose daemon supports per-harness tool capture opt-in.
+    public static let toolCaptureHarnesses: Set<String> = ["pi", "claude", "codex", "amp"]
+
     public static func displayName(_ name: String) -> String {
         switch name {
         case "pi": "Pi"

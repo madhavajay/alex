@@ -205,14 +205,27 @@ struct TranscriptTextPane: NSViewRepresentable {
 
         private func handleKey(_ event: NSEvent) -> Bool {
             guard let textView, let window = textView.window, window.isKeyWindow,
-                event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-                event.charactersIgnoringModifiers?.lowercased() == "f"
+                window.firstResponder === textView
             else { return false }
             if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
                 return false
             }
-            showFindBar()
-            return true
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if modifiers == .command, event.charactersIgnoringModifiers?.lowercased() == "f" {
+                showFindBar()
+                return true
+            }
+            guard modifiers.isEmpty else { return false }
+            switch event.keyCode {
+            case 126: // up arrow
+                if model?.canStepInspector(-1) == true { model?.stepInspector(-1) }
+                return true
+            case 125: // down arrow
+                if model?.canStepInspector(1) == true { model?.stepInspector(1) }
+                return true
+            default:
+                return false
+            }
         }
 
         private func showFindBar() {

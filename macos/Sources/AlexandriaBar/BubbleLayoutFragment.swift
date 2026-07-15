@@ -12,6 +12,7 @@ enum BubbleStyle {
             return NSColor.controlAccentColor.withAlphaComponent(0.16)
         }
         return switch kind {
+        case .turn: .unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.28)
         case .user, .toolResult:
             .unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.55)
         case .model: .controlAccentColor.withAlphaComponent(0.10)
@@ -25,7 +26,7 @@ enum BubbleStyle {
         case .tool: .systemPurple
         case .toolResult: .systemTeal
         case .error: .systemRed
-        case .user, .model: nil
+        case .turn, .user, .model: nil
         }
     }
 
@@ -45,6 +46,12 @@ enum BubbleStyle {
         context.addPath(path)
         context.setFillColor(fill(kind, selected: selected).cgColor)
         context.fillPath()
+        if kind == .turn {
+            context.addPath(path)
+            context.setStrokeColor(NSColor.separatorColor.withAlphaComponent(0.45).cgColor)
+            context.setLineWidth(0.75)
+            context.strokePath()
+        }
         if let barColor = bar(kind) {
             context.addPath(path)
             context.clip()

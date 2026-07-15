@@ -1233,13 +1233,17 @@ fn openai_chat_sse_text(sse: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn tool_call_json(name: &Value, args: &Value) -> Value {
+fn tool_call_json(id: &Value, name: &Value, args: &Value) -> Value {
     let arguments = match args {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         other => other.to_string(),
     };
-    json!({"name": name, "arguments": arguments})
+    let mut call = json!({"name": name, "arguments": arguments});
+    if let Some(id) = id.as_str().filter(|id| !id.is_empty()) {
+        call["id"] = json!(id);
+    }
+    call
 }
 
 pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value> {
@@ -1258,14 +1262,14 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
                     .into_iter()
                     .flatten()
                     .filter(|b| b["type"] == "tool_use")
-                    .map(|b| tool_call_json(&b["name"], &b["input"]))
+                    .map(|b| tool_call_json(&b["id"], &b["name"], &b["input"]))
                     .collect()
             })
             .unwrap_or_default()
         }
         "openai-chat" => {
             if is_sse {
-                let mut calls: Vec<(String, String)> = Vec::new();
+                let mut calls: Vec<(String, String, String)> = Vec::new();
                 for v in sse_datas(resp_text) {
                     for tc in v["choices"][0]["delta"]["tool_calls"]
                         .as_array()
@@ -1274,20 +1278,25 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
                     {
                         let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                         while calls.len() <= idx {
-                            calls.push((String::new(), String::new()));
+                            calls.push((String::new(), String::new(), String::new()));
+                        }
+                        if let Some(id) = tc["id"].as_str() {
+                            calls[idx].0.push_str(id);
                         }
                         if let Some(n) = tc["function"]["name"].as_str() {
-                            calls[idx].0.push_str(n);
+                            calls[idx].1.push_str(n);
                         }
                         if let Some(a) = tc["function"]["arguments"].as_str() {
-                            calls[idx].1.push_str(a);
+                            calls[idx].2.push_str(a);
                         }
                     }
                 }
                 calls
                     .into_iter()
-                    .filter(|(n, _)| !n.is_empty())
-                    .map(|(n, a)| json!({"name": n, "arguments": a}))
+                    .filter(|(_, n, _)| !n.is_empty())
+                    .map(|(id, n, a)| {
+                        tool_call_json(&Value::String(id), &Value::String(n), &Value::String(a))
+                    })
                     .collect()
             } else {
                 serde_json::from_str::<Value>(resp_text)
@@ -1299,6 +1308,7 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
                             .flatten()
                             .map(|tc| {
                                 tool_call_json(
+                                    &tc["id"],
                                     &tc["function"]["name"],
                                     &tc["function"]["arguments"],
                                 )
@@ -1320,7 +1330,14 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
                     .into_iter()
                     .flatten()
                     .filter(|it| it["type"] == "function_call")
-                    .map(|it| tool_call_json(&it["name"], &it["arguments"]))
+                    .map(|it| {
+                        let id = if it["call_id"].is_string() {
+                            &it["call_id"]
+                        } else {
+                            &it["id"]
+                        };
+                        tool_call_json(id, &it["name"], &it["arguments"])
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -2863,6 +2880,36 @@ mod tests {
         assert_eq!(
             assistant_reply_text("openai-responses", "data: {\"type\":\"ping\"}\n\n"),
             None
+        );
+    }
+
+    #[test]
+    fn assistant_tool_calls_preserve_provider_call_ids() {
+        let anthropic = json!({"content": [{
+            "type": "tool_use", "id": "toolu_1", "name": "bash",
+            "input": {"command": "pwd"}
+        }]});
+        assert_eq!(
+            assistant_tool_calls("anthropic", &anthropic.to_string())[0]["id"],
+            "toolu_1"
+        );
+
+        let chat = json!({"choices": [{"message": {"tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"pwd\"}"}
+        }]}}]});
+        assert_eq!(
+            assistant_tool_calls("openai-chat", &chat.to_string())[0]["id"],
+            "call_1"
+        );
+
+        let responses = json!({"output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_2",
+            "name": "bash", "arguments": "{\"command\":\"pwd\"}"
+        }]});
+        assert_eq!(
+            assistant_tool_calls("openai-responses", &responses.to_string())[0]["id"],
+            "call_2"
         );
     }
 }

@@ -29,25 +29,34 @@ import Testing
             turnNumber: 4, time: "10:10:10", status: 200,
             requestMs: 0, responseMs: 100, costUsd: 0)
         #expect(zeroCost == "turn 4 · 10:10:10 · 200 · 0.1s")
+        let unavailable = TurnHeader.separatorFacts(
+            turnNumber: 5, time: "10:10:11", status: 200,
+            requestMs: 0, responseMs: 100, costUnavailable: true)
+        #expect(unavailable == "turn 5 · 10:10:11 · 200 · 0.1s · cost unavailable")
     }
 
     @Test func bubbleLabels() {
-        #expect(TurnHeader.requestLabel(harness: "pi") == "⬆ pi · user")
+        #expect(TurnHeader.requestLabel(harness: "pi") == "pi · user")
         #expect(TurnHeader.requestLabel(harness: "claude-code", isToolResult: false)
-            == "⬆ claude-code · user")
+            == "claude-code · user")
         #expect(TurnHeader.requestLabel(harness: "codex", isToolResult: true)
-            == "⬆ codex · tool result")
-        #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "⬇ gpt-5.5 · model")
-        #expect(TurnHeader.responseLabel(model: nil) == "⬇ model")
+            == "codex · tool result")
+        #expect(TurnHeader.responseLabel(model: "gpt-5.5") == "gpt-5.5 · model")
+        #expect(TurnHeader.responseLabel(
+            model: "gpt-5.6-sol", reasoningEffort: "high",
+            billingBucket: "subscription")
+            == "gpt-5.6-sol · model · high · subscription")
+        #expect(TurnHeader.responseLabel(model: nil) == "model")
     }
 
     @Test func toolCallDecoding() throws {
         let json = #"""
-        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":null,"assistant":"ok","tool_calls":[{"name":"bash","arguments":"{\"command\":\"ls -l\"}"},{"name":"read_file","arguments":null}]},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"hi","assistant":"yo"}]}
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":0,"ts_response_ms":1,"model":"gpt-5.5","status":200,"user":null,"assistant":"ok","tool_calls":[{"id":"call-1","name":"bash","arguments":"{\"command\":\"ls -l\"}"},{"name":"read_file","arguments":null}]},{"trace_id":"t2","ts_request_ms":2,"ts_response_ms":3,"model":"m","status":200,"user":"hi","assistant":"yo"}]}
         """#
         let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
         #expect(turns[0].toolCalls?.count == 2)
-        #expect(turns[0].toolCalls?[0] == ToolCall(name: "bash", arguments: #"{"command":"ls -l"}"#))
+        #expect(turns[0].toolCalls?[0] == ToolCall(
+            name: "bash", arguments: #"{"command":"ls -l"}"#, id: "call-1"))
         #expect(turns[0].toolCalls?[1] == ToolCall(name: "read_file", arguments: nil))
         #expect(turns[1].toolCalls == nil)
     }
@@ -68,6 +77,42 @@ import Testing
         #expect(ToolCall(name: "bash", arguments: nil).argumentSummary == "")
     }
 
+    @Test func toolLifecyclePairsExactIdsThenSafelyFallsBack() throws {
+        let executions = try JSONDecoder().decode([ExecutedTool].self, from: Data(#"""
+        [
+          {"id":"e1","tool_call_id":"call-2","trace_id":null,"tool_name":"bash","turn_id":"0","ts_start_ms":1000,"ts_end_ms":1100,"is_error":false,"exit_status":0,"args_body_path":"/args","result_body_path":"/result"},
+          {"id":"e2","tool_call_id":null,"trace_id":null,"tool_name":"read","turn_id":"0","ts_start_ms":1200,"ts_end_ms":null,"is_error":null,"exit_status":null,"args_body_path":null,"result_body_path":null}
+        ]
+        """#.utf8))
+        let requests = [
+            ToolCall(name: "bash", arguments: "{}", id: "call-2"),
+            ToolCall(name: "read", arguments: "{}"),
+        ]
+        let paired = ToolLifecycle.pair(requests: requests, executions: executions)
+        #expect(paired.count == 2)
+        #expect(paired[0].execution?.id == "e1")
+        #expect(paired[0].status == .executed)
+        #expect(paired[1].execution?.id == "e2")
+        #expect(paired[1].status == .running)
+
+        let mismatched = ToolLifecycle.pair(
+            requests: [ToolCall(name: "bash", arguments: "{}", id: "different-call")],
+            executions: [executions[0]])
+        #expect(mismatched.count == 2)
+        #expect(mismatched[0].status == .requested)
+        #expect(mismatched[1].status == .executed)
+    }
+
+    @Test func toolLifecycleReportsFailedExecution() throws {
+        let execution = try JSONDecoder().decode(ExecutedTool.self, from: Data(#"""
+        {"id":"e1","tool_call_id":"call-1","tool_name":"bash","turn_id":"0","ts_start_ms":1000,"ts_end_ms":1100,"is_error":true,"exit_status":1,"args_body_path":"/args","result_body_path":"/result"}
+        """#.utf8))
+        let lifecycle = ToolLifecycle.pair(
+            requests: [ToolCall(name: "bash", arguments: "{}", id: "call-1")],
+            executions: [execution])[0]
+        #expect(lifecycle.status == .failed)
+    }
+
     #if canImport(AppKit)
     @Test func documentRendersToolCalls() {
         let json = #"""
@@ -81,10 +126,47 @@ import Testing
         #expect(text.contains("⚙ str_replace"))
         #expect(text.contains("old: x"))
         #expect(text.contains("path: /a"))
-        #expect(text.contains("⬇ gpt-5.5 · model"))
+        #expect(text.contains("gpt-5.5 · model"))
         let raw = TranscriptRender.document(turns: turns, rawMode: true).string
         #expect(raw.contains(#"{"command":"ls -l /app","intent":"look"}"#))
         #expect(raw.contains(#"{"path":"/a","old":"x"}"#))
+    }
+
+    @Test func documentMergesRequestedAndExecutedToolIntoOneCard() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2000,"model":"gpt-5.6-sol","status":200,"user":"run it","assistant":null,"tool_calls":[{"id":"call-1","name":"bash","arguments":"{\"command\":\"printf ok\"}"}],"executed_tools":[{"id":"exec-1","tool_call_id":"call-1","trace_id":null,"tool_name":"bash","turn_id":"0","ts_start_ms":2100,"ts_end_ms":2112,"is_error":false,"exit_status":null,"args_body_path":"/args","result_body_path":"/result"}]}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let document = TranscriptRender.document(turns: turns)
+        let text = document.string
+        #expect(text.components(separatedBy: "⚙ bash").count - 1 == 1)
+        #expect(text.contains("bash · executed · 0.0s"))
+        #expect(text.contains("printf ok"))
+        #expect(text.contains("view captured arguments  ·  view output"))
+        #expect(!text.contains("arguments captured"))
+
+        var toolLinks: [String] = []
+        document.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: document.length)
+        ) { value, _, _ in
+            guard let url = value as? URL, url.host == "tool" else { return }
+            toolLinks.append(url.absoluteString)
+        }
+        #expect(toolLinks == [
+            "alexandria://tool/exec-1/args",
+            "alexandria://tool/exec-1/result",
+        ])
+    }
+
+    @Test func documentLabelsRequestedRunningAndFailedToolStates() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t1","ts_request_ms":1000,"ts_response_ms":2000,"model":"m","status":200,"user":null,"assistant":null,"tool_calls":[{"id":"requested","name":"read","arguments":"{}"},{"id":"running","name":"bash","arguments":"{}"},{"id":"failed","name":"edit","arguments":"{}"}],"executed_tools":[{"id":"e-running","tool_call_id":"running","tool_name":"bash","ts_start_ms":2100,"ts_end_ms":null,"is_error":null,"exit_status":null},{"id":"e-failed","tool_call_id":"failed","tool_name":"edit","ts_start_ms":2200,"ts_end_ms":2300,"is_error":true,"exit_status":2}]}]}
+        """#
+        let turns = try JSONDecoder().decode(TranscriptResponse.self, from: Data(json.utf8)).turns
+        let text = TranscriptRender.document(turns: turns).string
+        #expect(text.contains("read · requested"))
+        #expect(text.contains("bash · running"))
+        #expect(text.contains("edit · failed · exit 2 · 0.1s"))
     }
 
     @Test func documentPreservesOrderedAssistantBlocks() throws {
@@ -208,12 +290,7 @@ import Testing
             guard let kind = value as? String else { return }
             if kinds.last != kind { kinds.append(kind) }
         }
-        #expect(kinds == [
-            TranscriptBubbleKind.user.rawValue,
-            TranscriptBubbleKind.model.rawValue,
-            TranscriptBubbleKind.tool.rawValue,
-            TranscriptBubbleKind.toolResult.rawValue,
-        ])
+        #expect(kinds == [TranscriptBubbleKind.turn.rawValue])
         for range in built.turnRanges {
             let atStart = built.text.attribute(
                 .transcriptTurnId, at: range.range.location, effectiveRange: nil) as? String
@@ -231,7 +308,7 @@ import Testing
             #expect(built.text.attribute(
                 .transcriptBubbleKind, at: range.location, effectiveRange: nil) != nil)
         }
-        #expect(groups == ["t1#0", "t1#1", "t1#2", "t2#0"])
+        #expect(groups == ["t1#turn", "t2#turn"])
         #expect(groups.count == Set(groups).count)
     }
 
@@ -258,6 +335,9 @@ import Testing
         #expect(TraceInspectorSelection.target(currentTraceId: "missing", in: ids) == "t3")
         #expect(TraceInspectorSelection.target(currentTraceId: nil, in: ids) == "t3")
         #expect(TraceInspectorSelection.target(currentTraceId: "t2", in: []) == nil)
+        #expect(TraceInspectorSelection.previous(before: "t3", in: ids) == "t2")
+        #expect(TraceInspectorSelection.previous(before: "t1", in: ids) == nil)
+        #expect(TraceInspectorSelection.previous(before: "missing", in: ids) == nil)
     }
 
     @Test func bodyCacheLRU() {
@@ -406,6 +486,71 @@ import Testing
         #expect(exact.text == long)
     }
 
+    @Test func requestJSONDiffShowsOnlyStructuralChanges() throws {
+        let previous = #"{"changed":1,"messages":[{"role":"system","content":"long prompt"},{"role":"user","content":"hello"}],"removed":{"secret":1},"same":"keep"}"#
+        let current = #"{"added":true,"changed":2,"messages":[{"role":"system","content":"long prompt"},{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}],"same":"keep"}"#
+        let presentation = RequestJSONDiff.presentation(previous: previous, current: current)
+        #expect(presentation.kind == .diff)
+        #expect(presentation.note == nil)
+        #expect(!presentation.text.contains("long prompt"))
+        #expect(!presentation.text.contains(#""same""#))
+
+        let data = try #require(presentation.text.data(using: .utf8))
+        let operations = try #require(
+            JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        #expect(operations.count == 4)
+        #expect(operations.map { $0["op"] as? String }
+            == ["remove", "add", "replace", "add"])
+        #expect(operations.map { $0["path"] as? String }
+            == ["/removed", "/added", "/changed", "/messages/2"])
+        #expect((operations[0]["previous"] as? [String: Any])?["secret"] as? Int == 1)
+        #expect(operations[2]["previous"] as? Int == 1)
+        #expect(operations[2]["value"] as? Int == 2)
+        #expect((operations[3]["value"] as? [String: Any])?["role"] as? String
+            == "assistant")
+    }
+
+    @Test func requestJSONDiffHandlesArrayChangesAndRemovals() throws {
+        let presentation = RequestJSONDiff.presentation(
+            previous: #"{"items":[{"id":1},{"id":2},{"id":3}]}"#,
+            current: #"{"items":[{"id":1},{"id":20}]}"#)
+        let data = try #require(presentation.text.data(using: .utf8))
+        let operations = try #require(
+            JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        #expect(operations.map { $0["op"] as? String } == ["replace", "remove"])
+        #expect(operations.map { $0["path"] as? String } == ["/items/1/id", "/items/2"])
+        #expect((operations[1]["previous"] as? [String: Any])?["id"] as? Int == 3)
+        #expect(operations[1]["value"] == nil)
+
+        let escaped = RequestJSONDiff.presentation(
+            previous: #"{"a/b":1,"til~de":1}"#,
+            current: #"{"a/b":2,"til~de":2}"#)
+        #expect(escaped.text.contains(#""path": "/a~1b""#))
+        #expect(escaped.text.contains(#""path": "/til~0de""#))
+    }
+
+    @Test func requestJSONDiffFallbackStates() {
+        let first = RequestJSONDiff.presentation(previous: nil, current: #"{"b":2,"a":1}"#)
+        #expect(first.kind == .firstRequest)
+        #expect(first.text.range(of: #""a""#)!.lowerBound
+            < first.text.range(of: #""b""#)!.lowerBound)
+
+        let unchanged = RequestJSONDiff.presentation(
+            previous: #"{"a":1}"#, current: #"{ "a": 1 }"#)
+        #expect(unchanged.kind == .unchanged)
+        #expect(unchanged.text == "[]")
+
+        let invalidCurrent = RequestJSONDiff.presentation(
+            previous: #"{"a":1}"#, current: "not json")
+        #expect(invalidCurrent.kind == .invalidCurrent)
+        #expect(invalidCurrent.text == "not json")
+
+        let invalidPrevious = RequestJSONDiff.presentation(
+            previous: "not json", current: #"{"a":1}"#)
+        #expect(invalidPrevious.kind == .invalidPrevious)
+        #expect(invalidPrevious.text.contains(#""a": 1"#))
+    }
+
     @Test func headersJsonParsing() {
         let json = #"{"user-agent":"ureq/2.12.1","accept":"*/*","content-length":"116","Zeta":1}"#
         let pairs = TraceHeaders.sortedPairs(json)
@@ -484,10 +629,10 @@ import Testing
         let text = doc.string
         #expect(text.contains("turn 42"))
         #expect(text.contains("turn 43"))
-        #expect(text.contains("Details"))
-        #expect(text.contains("⬆ pi · user"))
-        #expect(text.contains("⬇ m · model"))
-        #expect(text.contains("⬆ pi · tool result"))
+        #expect(!text.contains("Details"))
+        #expect(text.contains("pi · user"))
+        #expect(text.contains("m · model"))
+        #expect(text.contains("pi · tool result"))
         #expect(text.contains("grep output"))
         #expect(!text.contains("[tool result]"))
         var foundLinks: [URL] = []

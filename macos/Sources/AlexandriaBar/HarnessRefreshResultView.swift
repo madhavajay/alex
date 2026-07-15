@@ -73,6 +73,8 @@ struct HarnessActionResultView: View {
     let kind: HarnessActionKind
     let harnessDisplayName: String
     let phase: HarnessActionPhase
+    var toolCapture: Binding<Bool>? = nil
+    var captureWarning: String? = nil
     var onApprove: (() -> Void)? = nil
     var onCancel: (() -> Void)? = nil
     let onClose: () -> Void
@@ -143,6 +145,13 @@ struct HarnessActionResultView: View {
                     planBody(steps, mark: .ok, heading: "Completed:")
                 }
                 configSuccessBody(result)
+                if let captureWarning {
+                    Text(captureWarning)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         case .successDisconnect(let steps, let result):
             VStack(alignment: .leading, spacing: 12) {
@@ -178,9 +187,23 @@ struct HarnessActionResultView: View {
         "\(kind.label)…"
     }
 
+    /// True once the action has finished (success or failure) and the capture choice is locked in.
+    private var isSettled: Bool {
+        switch phase {
+        case .successConfig, .successDisconnect, .failure: true
+        case .loading, .plan, .executing: false
+        }
+    }
+
     @ViewBuilder
     private var footer: some View {
         HStack {
+            if let toolCapture {
+                Toggle("Capture tool calls", isOn: toolCapture)
+                    .controlSize(.small)
+                    .disabled(isSettled)
+                    .help("Opt in to storing this harness's tool arguments and results locally. Secrets are redacted before storage.")
+            }
             Spacer()
             switch phase {
             case .plan:
@@ -902,13 +925,20 @@ final class HarnessActionSheetModel: Identifiable {
     let harness: Harness
     let kind: HarnessActionKind
     private(set) var phase: HarnessActionPhase = .loading
+    var captureToolCalls: Bool
+    private(set) var captureWarning: String?
 
     var displayName: String { HarnessCatalog.displayName(harness.name) }
+
+    var showsToolCapture: Bool {
+        kind != .disconnect && HarnessCatalog.toolCaptureHarnesses.contains(harness.name)
+    }
 
     init(store: SnapshotStore, harness: Harness, kind: HarnessActionKind) {
         self.store = store
         self.harness = harness
         self.kind = kind
+        self.captureToolCalls = (harness.connected ? harness.toolCaptureEnabled : nil) ?? true
     }
 
     func start() {
@@ -926,6 +956,7 @@ final class HarnessActionSheetModel: Identifiable {
                 case .refresh:
                     self?.phase = .executing([])
                     let result = try await client.refreshHarnessConfig(name)
+                    await self?.applyToolCaptureIfNeeded(client)
                     await self?.store.refresh()
                     self?.phase = .successConfig([], result)
                 case .connect:
@@ -956,6 +987,7 @@ final class HarnessActionSheetModel: Identifiable {
                 switch kind {
                 case .connect:
                     let result = try await client.connectHarness(name)
+                    await self?.applyToolCaptureIfNeeded(client)
                     await self?.store.refresh()
                     self?.phase = .successConfig(steps, result)
                 case .disconnect:
@@ -968,6 +1000,18 @@ final class HarnessActionSheetModel: Identifiable {
             } catch {
                 self?.phase = .failure(steps, error.localizedDescription)
             }
+        }
+    }
+
+    /// Applies the sheet's "Capture tool calls" choice after a successful connect/refresh.
+    /// Failures never fail the action itself; they surface as a secondary warning.
+    private func applyToolCaptureIfNeeded(_ client: AlexandriaClient) async {
+        guard showsToolCapture, captureToolCalls != (harness.toolCaptureEnabled ?? false) else { return }
+        do {
+            try await client.setHarnessToolCapture(harness.name, enabled: captureToolCalls)
+        } catch {
+            captureWarning =
+                "Tool capture setting was not applied: \(error.localizedDescription)"
         }
     }
 }

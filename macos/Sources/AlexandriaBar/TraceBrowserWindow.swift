@@ -90,6 +90,10 @@ final class TraceBrowserModel {
 
     var firstTurnTraceId: String? { turns.first?.traceId }
 
+    func previousTraceId(before traceId: String) -> String? {
+        TraceInspectorSelection.previous(before: traceId, in: turns.map(\.traceId))
+    }
+
     var sessionSystemPrompt: String? {
         guard let prompt = firstTraceDetail?.extras?.systemPrompt, !prompt.isEmpty else {
             return nil
@@ -473,7 +477,6 @@ final class TraceBrowserModel {
             providers: Dictionary(uniqueKeysWithValues: providerNames.map {
                 ($0, ProviderChipRenderer.image(for: $0))
             }))
-        let billingAccountIds = Set(billingAccounts.map(\.id))
         let prev = renderChain
         renderChain = Task { [weak self] in
             await prev?.value
@@ -481,7 +484,7 @@ final class TraceBrowserModel {
                 let start = ContinuousClock.now
                 let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
-                    icons: icons, rawMode: rawMode, billingAccountIds: billingAccountIds)
+                    icons: icons, rawMode: rawMode)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
@@ -1061,8 +1064,6 @@ private struct SessionListView: View {
                 row: row,
                 pinned: model.pinned && row.id == model.selectedSessionId,
                 showPingBadge: model.showPings && row.isPingOrTest,
-                accountName: model.accountNames(row.accountIds),
-                accountIdentity: model.accountIdentity(row.accountIds),
                 nestSubagents: model.nestSubagents,
                 lineageCollapsed: model.isLineageCollapsed(row.id),
                 toggleLineage: { model.toggleLineage(row.id) })
@@ -1208,8 +1209,6 @@ private struct SessionCellView: View {
     let row: SessionRow
     let pinned: Bool
     let showPingBadge: Bool
-    let accountName: String?
-    let accountIdentity: String?
     let nestSubagents: Bool
     let lineageCollapsed: Bool
     let toggleLineage: () -> Void
@@ -1233,40 +1232,32 @@ private struct SessionCellView: View {
                     .foregroundStyle(.tertiary)
                     .frame(width: 10)
             }
-            HarnessIconView(harness: row.harnessRaw, tags: row.tags, size: 16)
-            if !row.providers.isEmpty {
-                HStack(spacing: 3) {
-                    ForEach(row.providers, id: \.self) { provider in
-                        ProviderBadgeView(provider: provider)
-                    }
-                }
-            }
+            SessionIdentityIconsView(
+                harness: row.harnessRaw, tags: row.tags, providers: row.providers, size: 16)
             Text(row.sessionShort)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
-            if nestSubagents, row.childCount > 0 {
-                Text("\(row.childCount) agent\(row.childCount == 1 ? "" : "s")")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.secondary)
-            } else if nestSubagents, row.lineageDepth > 0 {
-                Text(row.agentType ?? "sub-agent")
+            if nestSubagents, row.lineageDepth > 0 {
+                Text(SessionIdentity.subagentLabel)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.purple)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Capsule().fill(.purple.opacity(0.12)))
+                if let typeTag = SessionIdentity.agentTypeTag(agentType: row.agentType) {
+                    Text(typeTag)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .overlay(Capsule().strokeBorder(.quaternary))
+                }
             }
-            if let accountName {
-                Text(accountName)
+            if nestSubagents, row.childCount > 0 {
+                Text("\(row.childCount) agent\(row.childCount == 1 ? "" : "s")")
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
-                    .help(accountIdentity ?? accountName)
+                    .foregroundStyle(.secondary)
             }
             if row.errors > 0 {
                 Text("✗ \(row.errors)")

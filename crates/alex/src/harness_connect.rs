@@ -1,13 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
@@ -23,12 +25,15 @@ const CODEX_KEY_FILE: &str = "alexandria-api-key";
 const CODEX_STATE_FILE: &str = "alexandria-harness-state.json";
 const CODEX_BACKUP_FILE: &str = "alexandria-original-config.toml";
 const CODEX_OPENAI_PROFILE_FILE: &str = "openai.config.toml";
-const CODEX_ALEX_PROFILE_FILE: &str = "alex.config.toml";
+pub(crate) const CODEX_ALEX_PROFILE_FILE: &str = "alex.config.toml";
 const CODEX_HOOK_FILE: &str = "alexandria-session-hook.sh";
 const CODEX_HOOK_CURL_FILE: &str = "alexandria-hook-curl.conf";
 const CODEX_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
+const CODEX_TOOL_HOOK_FILE: &str = "alexandria-tool-hook.sh";
+const CODEX_TOOL_HOOK_CURL_FILE: &str = "alexandria-tool-curl.conf";
+const CODEX_TOOL_EVENT_LOG_FILE: &str = "alexandria-tool-events.jsonl";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
-const CLAUDE_PROFILE_FILE: &str = "alexandria-settings.json";
+pub(crate) const CLAUDE_PROFILE_FILE: &str = "alexandria-settings.json";
 const CLAUDE_CATALOG_FILE: &str = "alexandria-models.json";
 const CLAUDE_KEY_FILE: &str = "alexandria-api-key";
 const CLAUDE_STATE_FILE: &str = "alexandria-harness-state.json";
@@ -36,6 +41,9 @@ const CLAUDE_BACKUP_FILE: &str = "alexandria-original-settings.json";
 const CLAUDE_HOOK_FILE: &str = "alexandria-session-hook.sh";
 const CLAUDE_HOOK_CURL_FILE: &str = "alexandria-hook-curl.conf";
 const CLAUDE_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
+const CLAUDE_TOOL_HOOK_FILE: &str = "alexandria-tool-hook.sh";
+const CLAUDE_TOOL_HOOK_CURL_FILE: &str = "alexandria-tool-curl.conf";
+const CLAUDE_TOOL_EVENT_LOG_FILE: &str = "alexandria-tool-events.jsonl";
 const GROK_CONFIG_FILE: &str = "config.toml";
 const GROK_KEY_FILE: &str = "alexandria-api-key";
 const GROK_STATE_FILE: &str = "alexandria-harness-state.json";
@@ -59,23 +67,38 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
   const captureEnabled = __CAPTURE_ENABLED__;
   const toolEventsUrl = __TOOL_EVENTS_URL__;
+  const harnessEventsUrl = __HARNESS_EVENTS_URL__;
   const apiKey = __API_KEY__;
+  // Pi spawns subagents as child `pi` processes, so the parent's session id
+  // reaches them only through inherited environment. Capture it before this
+  // session overwrites the variable with its own id for grandchildren.
+  const inheritedParent = process.env.ALEXANDRIA_SESSION_ID;
+  let announced = false;
   let turnId: string | undefined;
   const post = (event: Record<string, unknown>) => {
     if (!captureEnabled) return;
     // Never delay or modify Pi's tool execution for telemetry.
     void fetch(toolEventsUrl, { method: "POST", headers: { "content-type": "application/json", "x-api-key": apiKey }, body: JSON.stringify(event) }).catch(() => {});
   };
+  // Lineage is independent of the tool-capture opt-in.
+  const announce = (sessionId: string) => {
+    if (announced || !sessionId) return;
+    announced = true;
+    process.env.ALEXANDRIA_SESSION_ID = sessionId;
+    if (!inheritedParent || inheritedParent === sessionId) return;
+    void fetch(harnessEventsUrl, { method: "POST", headers: { "content-type": "application/json", "x-api-key": apiKey }, body: JSON.stringify({ hook_event_name: "SubagentStart", session_id: inheritedParent, agent_id: sessionId, agent_type: "pi", timestamp_ms: Date.now() }) }).catch(() => {});
+  };
   pi.on("before_provider_headers", (event, ctx) => {
     // This extension is global, but session attribution belongs only on
     // requests routed through Alexandria's provider.
     if (ctx.model.provider !== "alexandria") return;
 
+    announce(ctx.sessionManager.getSessionId());
     event.headers["x-session-id"] = ctx.sessionManager.getSessionId();
     if (turnId) event.headers["x-pi-turn-id"] = turnId;
   });
-  pi.on("turn_start", (event, ctx) => { turnId = String(event.turnIndex); post({ phase: "turn_start", session_id: ctx.sessionManager.getSessionId(), turn_id: turnId, timestamp_ms: event.timestamp }); });
-  pi.on("agent_start", (_event, ctx) => post({ phase: "agent_start", session_id: ctx.sessionManager.getSessionId(), timestamp_ms: Date.now() }));
+  pi.on("turn_start", (event, ctx) => { turnId = String(event.turnIndex); announce(ctx.sessionManager.getSessionId()); post({ phase: "turn_start", session_id: ctx.sessionManager.getSessionId(), turn_id: turnId, timestamp_ms: event.timestamp }); });
+  pi.on("agent_start", (_event, ctx) => { announce(ctx.sessionManager.getSessionId()); post({ phase: "agent_start", session_id: ctx.sessionManager.getSessionId(), timestamp_ms: Date.now() }); });
   pi.on("agent_end", (_event, ctx) => post({ phase: "agent_end", session_id: ctx.sessionManager.getSessionId(), timestamp_ms: Date.now() }));
   pi.on("tool_execution_start", (event, ctx) => post({ phase: "start", session_id: ctx.sessionManager.getSessionId(), turn_id: turnId, tool_call_id: event.toolCallId, tool_name: event.toolName, args: event.args, timestamp_ms: Date.now() }));
   pi.on("tool_execution_end", (event, ctx) => post({ phase: "end", session_id: ctx.sessionManager.getSessionId(), turn_id: turnId, tool_call_id: event.toolCallId, tool_name: event.toolName, result: event.result, is_error: event.isError, timestamp_ms: Date.now() }));
@@ -135,9 +158,100 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         supports_connect: true,
     },
     HarnessSpec {
+        name: "omp",
+        binary: "omp",
+        config_dir: omp_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "opencode",
+        binary: "opencode",
+        config_dir: opencode_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "mini-swe-agent",
+        binary: "mini-swe-agent",
+        config_dir: mini_swe_agent_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "kimi",
+        binary: "kimi",
+        config_dir: kimi_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
         name: "gemini",
         binary: "gemini",
         config_dir: gemini_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "qwen",
+        binary: "qwen",
+        config_dir: qwen_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "goose",
+        binary: "goose",
+        config_dir: goose_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "opensage",
+        binary: "opensage",
+        config_dir: opensage_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "pydantic-ai",
+        binary: "pydantic-ai",
+        config_dir: pydantic_ai_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "stirrup",
+        binary: "stirrup",
+        config_dir: stirrup_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "jcode",
+        binary: "jcode",
+        config_dir: jcode_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "cursor",
+        binary: "cursor-agent",
+        config_dir: cursor_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: false,
+    },
+    HarnessSpec {
+        name: "amp",
+        binary: "amp",
+        config_dir: amp_config_dir_for_home,
+        version_args: &["--version"],
+        supports_connect: true,
+    },
+    HarnessSpec {
+        name: "droid",
+        binary: "droid",
+        config_dir: droid_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
     },
@@ -149,16 +263,9 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         supports_connect: true,
     },
     HarnessSpec {
-        name: "amp",
-        binary: "amp",
-        config_dir: amp_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: true,
-    },
-    HarnessSpec {
-        name: "opencode",
-        binary: "opencode",
-        config_dir: opencode_config_dir_for_home,
+        name: "hermes",
+        binary: "hermes",
+        config_dir: hermes_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
     },
@@ -225,11 +332,20 @@ pub(crate) struct HarnessConnectSummary {
     pub(crate) description: &'static str,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct VersionOutput {
     version: Option<String>,
     warning: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DetectionCacheKey {
+    binary: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+static VERSION_DETECTION_CACHE: OnceLock<Mutex<HashMap<DetectionCacheKey, VersionOutput>>> =
+    OnceLock::new();
 
 #[derive(Debug)]
 struct PiDetection {
@@ -294,6 +410,214 @@ pub(crate) async fn connect_cmd(
                 .join(", ")
         ),
     }
+}
+
+/// Connect using a controller-minted harness key. This path deliberately has
+/// no `Config` argument: it is used by container entrypoints that do not have
+/// the host's Alexandria home directory or local admin key.
+pub(crate) async fn connect_with_preminted_key(
+    harness: &str,
+    explicit_config_dir: Option<PathBuf>,
+    base_url: &str,
+    api_key: String,
+    key_id: Option<String>,
+    capture_enabled: bool,
+    json_out: bool,
+) -> Result<()> {
+    let spec = spec_by_name(harness).with_context(|| format!("unknown harness '{harness}'"))?;
+    if !spec.supports_connect {
+        bail!("harness '{harness}' does not support connect");
+    }
+
+    let detection = detect_harness_without_config(spec).await;
+    let binary = detection
+        .binary
+        .as_ref()
+        .with_context(|| format!("{harness} is not installed or not on PATH"))?;
+    let config_dir = explicit_config_dir.unwrap_or_else(|| {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        (spec.config_dir)(&home)
+    });
+    if !config_dir.is_dir() {
+        bail!(
+            "{harness} config dir does not exist at {}; run {harness} once first, or pass --config-dir",
+            config_dir.display()
+        );
+    }
+
+    let base_url = base_url.trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        bail!("--url / ALEXANDRIA_URL must not be empty");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let models = fetch_models_with_harness_key(&base_url, &client, &api_key).await?;
+    let codex_catalog = (harness == "codex")
+        .then(|| codex_model_catalog(binary, &models))
+        .transpose()?;
+    let summary = write_preminted_connection(
+        harness,
+        config_dir,
+        base_url,
+        key_id.unwrap_or_else(|| "rk-external".into()),
+        api_key,
+        models,
+        codex_catalog,
+        detection.version,
+        capture_enabled,
+    )?;
+
+    if json_out {
+        let mut body = config_write_json(&summary, "provided", None);
+        body["harness"] = json!(harness);
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else {
+        println!("{}", ui::section(&format!("{harness} connected")));
+        println!("key id: {}", ui::amber(&summary.key_id));
+        println!("models: {}", summary.models.len());
+        println!("config: {}", summary.config_path.display());
+    }
+    Ok(())
+}
+
+fn write_preminted_connection(
+    harness: &str,
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    models: Vec<String>,
+    codex_catalog: Option<Value>,
+    version: Option<String>,
+    capture_enabled: bool,
+) -> Result<HarnessConnectSummary> {
+    match harness {
+        "pi" => write_pi_connection_with_capture(
+            config_dir,
+            base_url,
+            key_id,
+            api_key,
+            models,
+            version,
+            capture_enabled,
+        ),
+        "claude" => write_claude_connection_with_capture(
+            config_dir,
+            base_url,
+            key_id,
+            api_key,
+            models,
+            version,
+            capture_enabled,
+        ),
+        "codex" => write_codex_connection_with_capture(
+            config_dir,
+            base_url,
+            key_id,
+            api_key,
+            codex_catalog.context("Codex model catalog was not prepared")?,
+            version,
+            capture_enabled,
+        ),
+        "grok" => write_grok_connection(config_dir, base_url, key_id, api_key, models, version),
+        "amp" => write_amp_connection_with_capture(
+            config_dir,
+            base_url,
+            key_id,
+            api_key,
+            version,
+            capture_enabled,
+        ),
+        _ => bail!("harness '{harness}' does not support connect"),
+    }
+}
+
+pub(crate) async fn tool_capture_cmd(
+    config: &Config,
+    harness: String,
+    enabled: Option<bool>,
+    json_out: bool,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let base_url = normalized_base_url(config);
+    if let Some(enabled) = enabled {
+        let response = client
+            .put(format!("{base_url}/admin/harnesses/{harness}/tool-capture"))
+            .header("x-api-key", &config.local_key)
+            .json(&json!({"enabled": enabled}))
+            .send()
+            .await
+            .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(daemon_error_text(&body));
+        }
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        } else {
+            println!(
+                "{harness} tool capture {}",
+                if body["tool_capture_enabled"].as_bool().unwrap_or(enabled) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        return Ok(());
+    }
+
+    let response = client
+        .get(format!("{base_url}/admin/harnesses"))
+        .header("x-api-key", &config.local_key)
+        .send()
+        .await
+        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(daemon_error_text(&body));
+    }
+    let status = body["harnesses"]
+        .as_array()
+        .and_then(|harnesses| {
+            harnesses
+                .iter()
+                .find(|candidate| candidate["name"].as_str() == Some(harness.as_str()))
+        })
+        .with_context(|| format!("unknown harness '{harness}'"))?;
+    let capture_enabled = status["tool_capture_enabled"].as_bool().unwrap_or(false);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "harness": harness,
+                "tool_capture_enabled": capture_enabled,
+            }))?
+        );
+    } else {
+        println!(
+            "{harness} tool capture {}",
+            if capture_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn daemon_error_text(body: &Value) -> String {
+    body["error"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| body["error"]["message"].as_str().map(String::from))
+        .unwrap_or_else(|| ui::truncate(&body.to_string(), 300))
 }
 
 pub(crate) async fn disconnect_cmd(
@@ -375,16 +699,15 @@ pub(crate) async fn harness_statuses(
     pi_config_dir: Option<PathBuf>,
     daemon_reachable: bool,
 ) -> Result<Vec<HarnessStatus>> {
-    let mut statuses = Vec::new();
-    for spec in HARNESSES {
+    let statuses = HARNESSES.iter().map(|spec| {
         let explicit_config_dir = if spec.name == "pi" {
             pi_config_dir.clone()
         } else {
             None
         };
-        statuses.push(harness_status(config, spec, explicit_config_dir, daemon_reachable).await?);
-    }
-    Ok(statuses)
+        harness_status(config, spec, explicit_config_dir, daemon_reachable)
+    });
+    join_all(statuses).await.into_iter().collect()
 }
 
 pub(crate) async fn harness_status(
@@ -430,7 +753,11 @@ pub(crate) async fn harness_status(
         config_dir: config_dir.to_string_lossy().to_string(),
         config_dir_exists,
         connected,
-        tool_capture_enabled: config.harness_tool_capture.get(spec.name).copied().unwrap_or(false),
+        tool_capture_enabled: config
+            .harness_tool_capture
+            .get(spec.name)
+            .copied()
+            .unwrap_or(false),
         supports_connect: spec.supports_connect,
         override_,
         daemon_reachable,
@@ -478,7 +805,11 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
         minted.key,
         models,
         detection.version_raw,
-        config.harness_tool_capture.get("pi").copied().unwrap_or(false),
+        config
+            .harness_tool_capture
+            .get("pi")
+            .copied()
+            .unwrap_or(false),
     )?;
 
     if json_out {
@@ -552,8 +883,7 @@ fn revoke_local_harness_keys(config: &Config, harness: &str) -> Result<usize> {
     for id in rows
         .iter()
         .filter(|row| {
-            row["kind"].as_str() == Some("harness")
-                && row["label"].as_str() == Some(harness)
+            row["kind"].as_str() == Some("harness") && row["label"].as_str() == Some(harness)
         })
         .filter_map(|row| row["id"].as_str())
     {
@@ -596,13 +926,18 @@ async fn connect_claude(
     let models = fetch_models(config, &client)
         .await
         .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
-    let summary = write_claude_connection(
+    let summary = write_claude_connection_with_capture(
         config_dir.clone(),
         normalized_base_url(config),
         minted.id,
         minted.key,
         models,
         detection.version,
+        config
+            .harness_tool_capture
+            .get("claude")
+            .copied()
+            .unwrap_or(false),
     )?;
 
     if json_out {
@@ -689,13 +1024,18 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
         .await
         .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
     let catalog = codex_model_catalog(&binary, &available)?;
-    let summary = write_codex_connection(
+    let summary = write_codex_connection_with_capture(
         config_dir,
         normalized_base_url(config),
         minted.id,
         minted.key,
         catalog,
         detection.version,
+        config
+            .harness_tool_capture
+            .get("codex")
+            .copied()
+            .unwrap_or(false),
     )?;
 
     if json_out {
@@ -718,6 +1058,9 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
         println!();
         println!("Start a new Codex session to use Alexandria.");
         println!("Codex will ask you to review and trust the new lifecycle hooks.");
+        println!(
+            "Until you open `codex` interactively once and approve that review, headless `codex exec` silently skips untrusted hooks and no tool events are recorded."
+        );
     }
     Ok(())
 }
@@ -872,12 +1215,17 @@ async fn connect_amp(config: &Config, config_dir: Option<PathBuf>, json_out: boo
         .build()?;
     revoke_harness_keys(config, &client, "amp").await?;
     let minted = mint_harness_key(config, &client, "amp").await?;
-    let summary = write_amp_connection(
+    let summary = write_amp_connection_with_capture(
         config_dir,
         normalized_base_url(config),
         minted.id,
         minted.key,
         detection.version,
+        config
+            .harness_tool_capture
+            .get("amp")
+            .copied()
+            .unwrap_or(false),
     )?;
 
     if json_out {
@@ -1003,6 +1351,7 @@ pub(crate) fn codex_model_catalog(binary: &Path, available: &[String]) -> Result
     Ok(catalog)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_pi_connection(
     config_dir: PathBuf,
     base_url: String,
@@ -1011,7 +1360,9 @@ pub(crate) fn write_pi_connection(
     models: Vec<String>,
     version: Option<String>,
 ) -> Result<HarnessConnectSummary> {
-    write_pi_connection_with_capture(config_dir, base_url, key_id, api_key, models, version, false)
+    write_pi_connection_with_capture(
+        config_dir, base_url, key_id, api_key, models, version, false,
+    )
 }
 
 pub(crate) fn write_pi_connection_with_capture(
@@ -1028,7 +1379,8 @@ pub(crate) fn write_pi_connection_with_capture(
     let before = read_pi_model_ids(&config_dir);
     upsert_pi_provider(&models_path, &base_url, &api_key, &models)?;
     let (added, removed, unchanged) = model_id_diff(&before, &models);
-    let extension_path = install_pi_session_extension(&config_dir, &base_url, &api_key, capture_enabled)?;
+    let extension_path =
+        install_pi_session_extension(&config_dir, &base_url, &api_key, capture_enabled)?;
     Ok(HarnessConnectSummary {
         key_id,
         models,
@@ -1043,6 +1395,7 @@ pub(crate) fn write_pi_connection_with_capture(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_claude_connection(
     config_dir: PathBuf,
     base_url: String,
@@ -1050,6 +1403,20 @@ pub(crate) fn write_claude_connection(
     api_key: String,
     models: Vec<String>,
     version: Option<String>,
+) -> Result<HarnessConnectSummary> {
+    write_claude_connection_with_capture(
+        config_dir, base_url, key_id, api_key, models, version, false,
+    )
+}
+
+pub(crate) fn write_claude_connection_with_capture(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    models: Vec<String>,
+    version: Option<String>,
+    capture_enabled: bool,
 ) -> Result<HarnessConnectSummary> {
     let settings_path = config_dir.join(CLAUDE_SETTINGS_FILE);
     let profile_path = config_dir.join(CLAUDE_PROFILE_FILE);
@@ -1059,6 +1426,8 @@ pub(crate) fn write_claude_connection(
     let backup_path = config_dir.join(CLAUDE_BACKUP_FILE);
     let hook_path = config_dir.join(CLAUDE_HOOK_FILE);
     let hook_curl_path = config_dir.join(CLAUDE_HOOK_CURL_FILE);
+    let tool_hook_path = config_dir.join(CLAUDE_TOOL_HOOK_FILE);
+    let tool_hook_curl_path = config_dir.join(CLAUDE_TOOL_HOOK_CURL_FILE);
     let before = read_claude_model_ids(&config_dir);
     let display_models = short_alex_model_ids(models);
     if display_models.is_empty() {
@@ -1109,9 +1478,9 @@ pub(crate) fn write_claude_connection(
             .as_str()
             .filter(|model| gateway_models.iter().any(|candidate| candidate == model))
             .map(String::from)
-            .unwrap_or_else(|| gateway_models[0].clone())
+            .unwrap_or_else(|| preferred_claude_model(&gateway_models).clone())
     } else {
-        gateway_models[0].clone()
+        preferred_claude_model(&gateway_models).clone()
     };
     let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
     let hook_url = format!("{}/harness-events", hook_base_url.trim_end_matches('/'));
@@ -1128,6 +1497,17 @@ pub(crate) fn write_claude_connection(
             event.to_string(),
             json!([{ "hooks": [hook_handler.clone()] }]),
         );
+    }
+    if capture_enabled {
+        let handler = json!({
+            "type": "command",
+            "command": claude_hook_command(&tool_hook_path),
+            "timeout": 5,
+            "statusMessage": "Recording Alexandria tool execution",
+        });
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            hooks.insert(event.to_string(), json!([{ "hooks": [handler.clone()] }]));
+        }
     }
     let profile = json!({
         "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -1167,6 +1547,17 @@ pub(crate) fn write_claude_connection(
         &api_key,
         "Claude Code",
     )?;
+    if capture_enabled {
+        install_harness_hook(
+            &tool_hook_path,
+            &config_dir.join(CLAUDE_TOOL_EVENT_LOG_FILE),
+            &tool_hook_curl_path,
+            &format!("{}/tool-events", hook_base_url.trim_end_matches('/')),
+            &key_path,
+            &api_key,
+            "Claude Code",
+        )?;
+    }
     atomic_write_json(&profile_path, &profile)?;
 
     let (added, removed, unchanged) = model_id_diff(&before, &display_models);
@@ -1230,25 +1621,139 @@ pub(crate) fn claude_config_connected(config_dir: &Path) -> Result<bool> {
 
 pub(crate) fn disconnect_claude_config(config_dir: &Path) -> Result<bool> {
     let state_path = config_dir.join(CLAUDE_STATE_FILE);
+    let mut changed = clear_stale_claude_gateway_selection(config_dir)?;
     if !state_path.exists() {
-        return Ok(false);
+        return Ok(changed);
     }
     let state = read_claude_state(&state_path)?;
     restore_managed_text_file(
         &config_dir.join(CLAUDE_PROFILE_FILE),
         state.previous_profile.as_deref(),
     )?;
-    let mut changed = true;
+    changed = true;
     for path in [
         config_dir.join(CLAUDE_CATALOG_FILE),
         config_dir.join(CLAUDE_KEY_FILE),
         config_dir.join(CLAUDE_HOOK_FILE),
         config_dir.join(CLAUDE_HOOK_CURL_FILE),
+        config_dir.join(CLAUDE_TOOL_HOOK_FILE),
+        config_dir.join(CLAUDE_TOOL_HOOK_CURL_FILE),
         state_path,
     ] {
         if path.exists() {
             std::fs::remove_file(&path)
                 .with_context(|| format!("could not remove {}", path.display()))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+pub(crate) fn set_claude_tool_capture(
+    config_dir: &Path,
+    base_url: &str,
+    enabled: bool,
+) -> Result<()> {
+    if !claude_config_connected(config_dir)? {
+        bail!("Claude is not connected to Alexandria; connect it before enabling tool capture");
+    }
+    let profile_path = config_dir.join(CLAUDE_PROFILE_FILE);
+    let mut profile = read_json_object(&profile_path)?;
+    let tool_hook_path = config_dir.join(CLAUDE_TOOL_HOOK_FILE);
+    let tool_command = claude_hook_command(&tool_hook_path);
+    remove_hook_handlers(&mut profile, &tool_command, &tool_hook_path)?;
+    if enabled {
+        let key = read_claude_api_key(config_dir)
+            .context("Claude is not connected to Alexandria; missing harness key")?;
+        let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
+        install_harness_hook(
+            &tool_hook_path,
+            &config_dir.join(CLAUDE_TOOL_EVENT_LOG_FILE),
+            &config_dir.join(CLAUDE_TOOL_HOOK_CURL_FILE),
+            &format!("{}/tool-events", hook_base_url.trim_end_matches('/')),
+            &config_dir.join(CLAUDE_KEY_FILE),
+            &key,
+            "Claude Code",
+        )?;
+        let hooks = profile["hooks"]
+            .as_object_mut()
+            .context("Claude Alexandria profile hooks must be an object")?;
+        let handler = json!({ "type": "command", "command": tool_command, "timeout": 5, "statusMessage": "Recording Alexandria tool execution" });
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            hooks.insert(event.to_string(), json!([{ "hooks": [handler.clone()] }]));
+        }
+    }
+    atomic_write_json(&profile_path, &profile)
+}
+
+fn remove_hook_handlers(value: &mut Value, command: &str, hook_path: &Path) -> Result<bool> {
+    let Some(hooks) = value.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let hooks = hooks.as_object_mut().context("hooks must be an object")?;
+    let path_text = hook_path.to_string_lossy();
+    let mut changed = false;
+    for groups in hooks.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| {
+                let configured = handler["command"].as_str().unwrap_or_default();
+                configured != command && !configured.contains(path_text.as_ref())
+            });
+            changed |= handlers.len() != before;
+        }
+        groups.retain(|group| {
+            group["hooks"]
+                .as_array()
+                .is_none_or(|handlers| !handlers.is_empty())
+        });
+    }
+    hooks.retain(|_, groups| groups.as_array().is_none_or(|groups| !groups.is_empty()));
+    Ok(changed)
+}
+
+/// Claude Code can persist a model selected from an additive `--settings`
+/// profile into the user's ordinary settings file. Once Alexandria's profile
+/// is removed that provider-prefixed model is no longer resolvable, so remove
+/// only the stale Alexandria selection and its discovered gateway cache.
+/// Native model choices and unrelated gateway caches are left untouched.
+fn clear_stale_claude_gateway_selection(config_dir: &Path) -> Result<bool> {
+    let mut changed = false;
+    let settings_path = config_dir.join(CLAUDE_SETTINGS_FILE);
+    if settings_path.exists() {
+        let mut settings = read_json_object(&settings_path)?;
+        let stale_model = settings["model"]
+            .as_str()
+            .is_some_and(|model| model.starts_with("claude-alex/"));
+        if stale_model {
+            settings
+                .as_object_mut()
+                .expect("read_json_object returns an object")
+                .remove("model");
+            atomic_write_json(&settings_path, &settings)?;
+            changed = true;
+        }
+    }
+
+    let cache_path = config_dir.join("cache").join("gateway-models.json");
+    if cache_path.exists() {
+        let cache = read_json_object(&cache_path)?;
+        let is_alexandria_cache = cache["models"].as_array().is_some_and(|models| {
+            models.iter().any(|model| {
+                model["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("claude-alex/"))
+            })
+        });
+        if is_alexandria_cache {
+            std::fs::remove_file(&cache_path)
+                .with_context(|| format!("could not remove {}", cache_path.display()))?;
             changed = true;
         }
     }
@@ -1543,12 +2048,24 @@ fn read_grok_state(path: &Path) -> Result<GrokManagedState> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_amp_connection(
     config_dir: PathBuf,
     base_url: String,
     key_id: String,
     api_key: String,
     version: Option<String>,
+) -> Result<HarnessConnectSummary> {
+    write_amp_connection_with_capture(config_dir, base_url, key_id, api_key, version, false)
+}
+
+pub(crate) fn write_amp_connection_with_capture(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    version: Option<String>,
+    capture_enabled: bool,
 ) -> Result<HarnessConnectSummary> {
     let plugin_path = amp_plugin_path(&config_dir);
     let key_path = config_dir.join(AMP_KEY_FILE);
@@ -1568,7 +2085,15 @@ pub(crate) fn write_amp_connection(
     )?;
     let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
     let event_url = format!("{}/harness-events", hook_base_url.trim_end_matches('/'));
-    let source = amp_plugin_source(&hook_base_url, &event_url, &key_path, &event_log_path)?;
+    let tool_event_url = format!("{}/tool-events", hook_base_url.trim_end_matches('/'));
+    let source = amp_plugin_source(
+        &hook_base_url,
+        &event_url,
+        &tool_event_url,
+        &key_path,
+        &event_log_path,
+        capture_enabled,
+    )?;
 
     atomic_write_json(&state_path, &serde_json::to_value(&state)?)?;
     atomic_write_text(&key_path, &format!("{api_key}\n"))?;
@@ -1614,6 +2139,24 @@ pub(crate) fn amp_config_connected(config_dir: &Path) -> Result<bool> {
     Ok(source.contains("Generated by Alexandria for Amp"))
 }
 
+pub(crate) fn set_amp_tool_capture(config_dir: &Path, base_url: &str, enabled: bool) -> Result<()> {
+    if !amp_config_connected(config_dir)? {
+        bail!("Amp is not connected to Alexandria; connect it before enabling tool capture");
+    }
+    let key_path = config_dir.join(AMP_KEY_FILE);
+    let event_log_path = config_dir.join(AMP_EVENT_LOG_FILE);
+    let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
+    let source = amp_plugin_source(
+        &hook_base_url,
+        &format!("{}/harness-events", hook_base_url.trim_end_matches('/')),
+        &format!("{}/tool-events", hook_base_url.trim_end_matches('/')),
+        &key_path,
+        &event_log_path,
+        enabled,
+    )?;
+    atomic_write_text(&amp_plugin_path(config_dir), &source)
+}
+
 pub(crate) fn disconnect_amp_config(config_dir: &Path) -> Result<bool> {
     let state_path = config_dir.join(AMP_STATE_FILE);
     if !state_path.exists() {
@@ -1650,13 +2193,16 @@ fn read_amp_state(path: &Path) -> Result<AmpManagedState> {
 fn amp_plugin_source(
     base_url: &str,
     event_url: &str,
+    tool_event_url: &str,
     key_path: &Path,
     event_log_path: &Path,
+    capture_enabled: bool,
 ) -> Result<String> {
     let mut source = AMP_PLUGIN_SOURCE.to_string();
     for (token, value) in [
         ("__BASE_URL__", base_url.to_string()),
         ("__EVENT_URL__", event_url.to_string()),
+        ("__TOOL_EVENT_URL__", tool_event_url.to_string()),
         ("__KEY_FILE__", key_path.to_string_lossy().to_string()),
         (
             "__EVENT_LOG__",
@@ -1665,6 +2211,28 @@ fn amp_plugin_source(
     ] {
         source = source.replace(token, &serde_json::to_string(&value)?);
     }
+    source = source.replace(
+        "__CAPTURE_ENABLED__",
+        if capture_enabled { "true" } else { "false" },
+    );
+    source = source.replace(
+        "__TOOL_CALL_CAPTURE__",
+        if capture_enabled {
+            "postToolEvent({ phase: 'start', session_id: event.thread.id, turn_id: event.toolUseID, tool_call_id: event.toolUseID, tool_name: event.tool, args: event.input, timestamp_ms: Date.now() })"
+        } else {
+            ""
+        },
+    );
+    source = source.replace(
+        "__TOOL_RESULT_CAPTURE__",
+        if capture_enabled {
+            // Amp reports success as status 'done'; only explicit failure words
+            // may set is_error or every successful call renders as failed.
+            "const resultEvent = event as unknown as Record<string, unknown>\n    const resultBody = resultEvent.output ?? resultEvent.result ?? event\n    const exitCode = typeof resultBody === 'object' && resultBody !== null && typeof (resultBody as Record<string, unknown>).exitCode === 'number' ? (resultBody as Record<string, unknown>).exitCode as number : undefined\n    const failedStatuses = new Set(['error', 'failed', 'failure', 'cancelled', 'canceled', 'rejected', 'timeout', 'timed_out'])\n    postToolEvent({ phase: 'end', session_id: event.thread.id, turn_id: event.toolUseID, tool_call_id: event.toolUseID, tool_name: event.tool, result: resultBody, is_error: failedStatuses.has(String(event.status ?? '').toLowerCase()) || (exitCode !== undefined && exitCode !== 0), exit_status: exitCode, timestamp_ms: Date.now() })"
+        } else {
+            ""
+        },
+    );
     Ok(source)
 }
 
@@ -1674,6 +2242,8 @@ import { appendFile, chmod } from 'node:fs/promises'
 
 const BASE_URL = __BASE_URL__
 const EVENT_URL = __EVENT_URL__
+const TOOL_EVENT_URL = __TOOL_EVENT_URL__
+const CAPTURE_ENABLED = __CAPTURE_ENABLED__
 const KEY_FILE = __KEY_FILE__
 const EVENT_LOG = __EVENT_LOG__
 const SUBAGENT_TOOLS = new Set(['task', 'finder', 'librarian', 'oracle', 'painter'])
@@ -1717,6 +2287,29 @@ export default function (amp: PluginAPI) {
       amp.logger.log('Alexandria lifecycle capture failed', String(error))
     })
     return queue
+  }
+
+  function postToolEvent(record: Record<string, unknown>) {
+    if (!CAPTURE_ENABLED) return
+    // Tool telemetry is deliberately independent from the local lineage queue.
+    void (async () => {
+      const key = (await Bun.file(KEY_FILE).text()).trim()
+      if (!key) return
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 1500)
+      try {
+        await fetch(TOOL_EVENT_URL, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-alexandria-harness': 'amp' },
+          body: JSON.stringify(record),
+          signal: controller.signal,
+        })
+      } catch {
+        // Telemetry must never influence Amp tool execution.
+      } finally {
+        clearTimeout(timeout)
+      }
+    })()
   }
 
   function threadIDs(value: unknown, found = new Set<string>(), depth = 0, field = ''): Set<string> {
@@ -1789,6 +2382,7 @@ export default function (amp: PluginAPI) {
       turn_id: event.toolUseID,
       tool: event.tool,
     })
+    __TOOL_CALL_CAPTURE__
     return { action: 'allow' }
   })
 
@@ -1830,6 +2424,7 @@ export default function (amp: PluginAPI) {
       tool: event.tool,
       status: event.status,
     })
+    __TOOL_RESULT_CAPTURE__
   })
 
   amp.on('agent.end', (event) => {
@@ -1865,6 +2460,7 @@ export default function (amp: PluginAPI) {
 }
 "#;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_codex_connection(
     config_dir: PathBuf,
     base_url: String,
@@ -1872,6 +2468,20 @@ pub(crate) fn write_codex_connection(
     api_key: String,
     catalog: Value,
     version: Option<String>,
+) -> Result<HarnessConnectSummary> {
+    write_codex_connection_with_capture(
+        config_dir, base_url, key_id, api_key, catalog, version, false,
+    )
+}
+
+pub(crate) fn write_codex_connection_with_capture(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    catalog: Value,
+    version: Option<String>,
+    capture_enabled: bool,
 ) -> Result<HarnessConnectSummary> {
     let config_path = config_dir.join(CODEX_CONFIG_FILE);
     let catalog_path = config_dir.join(CODEX_CATALOG_FILE);
@@ -1883,6 +2493,8 @@ pub(crate) fn write_codex_connection(
     let alex_profile_path = config_dir.join(CODEX_ALEX_PROFILE_FILE);
     let hook_path = config_dir.join(CODEX_HOOK_FILE);
     let hook_curl_path = config_dir.join(CODEX_HOOK_CURL_FILE);
+    let tool_hook_path = config_dir.join(CODEX_TOOL_HOOK_FILE);
+    let tool_hook_curl_path = config_dir.join(CODEX_TOOL_HOOK_CURL_FILE);
     let hooks_path = config_dir.join("hooks.json");
     let models = codex_catalog_model_ids(&catalog)?;
     let native_catalog = codex_native_catalog(&catalog)?;
@@ -1987,7 +2599,14 @@ pub(crate) fn write_codex_connection(
     state.alex_model = Some(selected_model.clone());
     let mut hooks = read_hooks_json(&hooks_path)?;
     let hook_command = codex_hook_command(&hook_path);
-    upsert_codex_hooks(&mut hooks, &hook_command, &hook_path)?;
+    let tool_command = codex_hook_command(&tool_hook_path);
+    upsert_codex_hooks(
+        &mut hooks,
+        &hook_command,
+        &hook_path,
+        capture_enabled.then_some((tool_command.as_str(), tool_hook_path.as_path())),
+        &tool_hook_path,
+    )?;
     upsert_codex_config(
         &mut config_doc,
         &base_url,
@@ -2028,6 +2647,17 @@ pub(crate) fn write_codex_connection(
         &api_key,
         "Codex",
     )?;
+    if capture_enabled {
+        install_harness_hook(
+            &tool_hook_path,
+            &config_dir.join(CODEX_TOOL_EVENT_LOG_FILE),
+            &tool_hook_curl_path,
+            &format!("{}/tool-events", hook_base_url.trim_end_matches('/')),
+            &key_path,
+            &api_key,
+            "Codex",
+        )?;
+    }
     atomic_write_json(&hooks_path, &hooks)?;
     atomic_write_text(&config_path, &config_doc.to_string())?;
 
@@ -2267,6 +2897,7 @@ pub(crate) fn disconnect_codex_config(config_dir: &Path) -> Result<bool> {
             &mut hooks,
             &codex_hook_command(&config_dir.join(CODEX_HOOK_FILE)),
             &config_dir.join(CODEX_HOOK_FILE),
+            Some(&config_dir.join(CODEX_TOOL_HOOK_FILE)),
         )? {
             atomic_write_json(&hooks_path, &hooks)?;
             changed = true;
@@ -2288,6 +2919,8 @@ pub(crate) fn disconnect_codex_config(config_dir: &Path) -> Result<bool> {
         config_dir.join(CODEX_NATIVE_CATALOG_FILE),
         config_dir.join(CODEX_HOOK_FILE),
         config_dir.join(CODEX_HOOK_CURL_FILE),
+        config_dir.join(CODEX_TOOL_HOOK_FILE),
+        config_dir.join(CODEX_TOOL_HOOK_CURL_FILE),
         state_path,
     ] {
         if path.exists() {
@@ -2359,7 +2992,10 @@ fn upsert_codex_config(
     doc["model"] = value(selected_model);
     doc["model_provider"] = value(PROVIDER_NAME);
     doc["model_catalog_json"] = value(catalog_path.to_string_lossy().as_ref());
-    if codex_hooks_enabled(doc) == Some(false) {
+    // Codex treats an omitted setting as disabled. Alexandria's lifecycle
+    // hooks must therefore opt in both absent and explicitly-false configs,
+    // while preserving an explicit user true.
+    if codex_hooks_enabled(doc) != Some(true) {
         doc["features"]["hooks"] = value(true);
     }
 
@@ -2426,8 +3062,14 @@ fn read_hooks_json(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-fn upsert_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Result<()> {
-    remove_codex_hooks(value, command, hook_path)?;
+fn upsert_codex_hooks(
+    value: &mut Value,
+    command: &str,
+    hook_path: &Path,
+    tool_hook: Option<(&str, &Path)>,
+    tool_hook_path: &Path,
+) -> Result<()> {
+    remove_codex_hooks(value, command, hook_path, Some(tool_hook_path))?;
     if value.get("hooks").is_none() {
         value["hooks"] = json!({});
     }
@@ -2448,10 +3090,33 @@ fn upsert_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Res
             }]
         }));
     }
+    if let Some((tool_command, _)) = tool_hook {
+        // Codex 0.144 has no PostToolUseFailure event; unknown names are
+        // silently dropped from hooks.json, so register only what fires.
+        for event in ["PreToolUse", "PostToolUse"] {
+            let groups = hooks.entry(event).or_insert_with(|| json!([]));
+            let groups = groups
+                .as_array_mut()
+                .with_context(|| format!("hooks.json hooks.{event} must be an array"))?;
+            groups.push(json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": tool_command,
+                    "timeout": 5,
+                    "statusMessage": "Recording Alexandria tool execution"
+                }]
+            }));
+        }
+    }
     Ok(())
 }
 
-fn remove_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Result<bool> {
+fn remove_codex_hooks(
+    value: &mut Value,
+    command: &str,
+    hook_path: &Path,
+    tool_hook_path: Option<&Path>,
+) -> Result<bool> {
     let Some(hooks) = value.get_mut("hooks") else {
         return Ok(false);
     };
@@ -2459,6 +3124,7 @@ fn remove_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Res
         .as_object_mut()
         .context("hooks.json .hooks must be an object")?;
     let path_text = hook_path.to_string_lossy();
+    let tool_path_text = tool_hook_path.map(|path| path.to_string_lossy().to_string());
     let mut changed = false;
     for groups in hooks.values_mut() {
         let Some(groups) = groups.as_array_mut() else {
@@ -2471,7 +3137,11 @@ fn remove_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Res
             let before = handlers.len();
             handlers.retain(|handler| {
                 let configured = handler["command"].as_str().unwrap_or_default();
-                configured != command && !configured.contains(path_text.as_ref())
+                configured != command
+                    && !configured.contains(path_text.as_ref())
+                    && tool_path_text
+                        .as_deref()
+                        .is_none_or(|path| !configured.contains(path))
             });
             changed |= handlers.len() != before;
         }
@@ -2489,6 +3159,44 @@ fn remove_codex_hooks(value: &mut Value, command: &str, hook_path: &Path) -> Res
             .remove("hooks");
     }
     Ok(changed)
+}
+
+pub(crate) fn set_codex_tool_capture(
+    config_dir: &Path,
+    base_url: &str,
+    enabled: bool,
+) -> Result<()> {
+    if !codex_config_connected(config_dir)? {
+        bail!("Codex is not connected to Alexandria; connect it before enabling tool capture");
+    }
+    let hooks_path = config_dir.join("hooks.json");
+    let mut hooks = read_hooks_json(&hooks_path)?;
+    let hook_path = config_dir.join(CODEX_HOOK_FILE);
+    let tool_hook_path = config_dir.join(CODEX_TOOL_HOOK_FILE);
+    let command = codex_hook_command(&hook_path);
+    let tool_command = codex_hook_command(&tool_hook_path);
+    upsert_codex_hooks(
+        &mut hooks,
+        &command,
+        &hook_path,
+        enabled.then_some((tool_command.as_str(), tool_hook_path.as_path())),
+        &tool_hook_path,
+    )?;
+    if enabled {
+        let key = read_codex_api_key(config_dir)
+            .context("Codex is not connected to Alexandria; missing harness key")?;
+        let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
+        install_harness_hook(
+            &tool_hook_path,
+            &config_dir.join(CODEX_TOOL_EVENT_LOG_FILE),
+            &config_dir.join(CODEX_TOOL_HOOK_CURL_FILE),
+            &format!("{}/tool-events", hook_base_url.trim_end_matches('/')),
+            &config_dir.join(CODEX_KEY_FILE),
+            &key,
+            "Codex",
+        )?;
+    }
+    atomic_write_json(&hooks_path, &hooks)
 }
 
 #[cfg(not(windows))]
@@ -2572,6 +3280,17 @@ pub(crate) fn short_alex_model_ids(models: Vec<String>) -> Vec<String> {
         .into_iter()
         .map(|id| short_alex_model_id(&id))
         .collect()
+}
+
+fn preferred_claude_model(models: &[String]) -> &String {
+    for family in ["sonnet-5", "sonnet-4", "haiku-4", "fable-5", "opus-4"] {
+        if let Some(model) = models.iter().find(|model| model.contains(family)) {
+            return model;
+        }
+    }
+    models
+        .first()
+        .expect("Claude gateway model ids are validated as non-empty")
 }
 
 fn managed_codex_model(doc: &DocumentMut, models: &[String]) -> String {
@@ -3192,7 +3911,12 @@ fn pi_session_extension_path(config_dir: &Path) -> PathBuf {
         .join(PI_SESSION_EXTENSION_FILE)
 }
 
-fn install_pi_session_extension(config_dir: &Path, base_url: &str, api_key: &str, capture_enabled: bool) -> Result<PathBuf> {
+fn install_pi_session_extension(
+    config_dir: &Path,
+    base_url: &str,
+    api_key: &str,
+    capture_enabled: bool,
+) -> Result<PathBuf> {
     let path = pi_session_extension_path(config_dir);
     let parent = path.parent().expect("Pi extension path has a parent");
     std::fs::create_dir_all(parent).with_context(|| {
@@ -3202,8 +3926,21 @@ fn install_pi_session_extension(config_dir: &Path, base_url: &str, api_key: &str
         )
     })?;
     let source = PI_SESSION_EXTENSION
-        .replace("__CAPTURE_ENABLED__", if capture_enabled { "true" } else { "false" })
-        .replace("__TOOL_EVENTS_URL__", &serde_json::to_string(&format!("{}/tool-events", base_url.trim_end_matches('/')))? )
+        .replace(
+            "__CAPTURE_ENABLED__",
+            if capture_enabled { "true" } else { "false" },
+        )
+        .replace(
+            "__TOOL_EVENTS_URL__",
+            &serde_json::to_string(&format!("{}/tool-events", base_url.trim_end_matches('/')))?,
+        )
+        .replace(
+            "__HARNESS_EVENTS_URL__",
+            &serde_json::to_string(&format!(
+                "{}/harness-events",
+                base_url.trim_end_matches('/')
+            ))?,
+        )
         .replace("__API_KEY__", &serde_json::to_string(api_key)?);
     atomic_write_text(&path, &source)?;
     Ok(path)
@@ -3211,7 +3948,8 @@ fn install_pi_session_extension(config_dir: &Path, base_url: &str, api_key: &str
 
 pub(crate) fn set_pi_tool_capture(config_dir: &Path, base_url: &str, enabled: bool) -> Result<()> {
     let models = read_models_json(&config_dir.join("models.json"))?;
-    let key = models["providers"][PROVIDER_NAME]["apiKey"].as_str()
+    let key = models["providers"][PROVIDER_NAME]["apiKey"]
+        .as_str()
         .filter(|key| !key.is_empty())
         .context("Pi is not connected to Alexandria; connect it before enabling tool capture")?;
     install_pi_session_extension(config_dir, base_url, key, enabled)?;
@@ -3321,6 +4059,38 @@ async fn fetch_models(config: &Config, client: &reqwest::Client) -> Option<Vec<S
         .collect();
     let filtered = filter_model_ids(ids);
     (!filtered.is_empty()).then_some(filtered)
+}
+
+async fn fetch_models_with_harness_key(
+    base_url: &str,
+    client: &reqwest::Client,
+    api_key: &str,
+) -> Result<Vec<String>> {
+    let response = client
+        .get(format!("{base_url}/v1/models"))
+        .header("x-api-key", api_key)
+        .send()
+        .await
+        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "daemon rejected the supplied harness key while fetching /v1/models ({status}): {}",
+            ui::truncate(&value.to_string(), 300)
+        );
+    }
+    let ids = value["data"]
+        .as_array()
+        .context("daemon /v1/models response did not contain a data array")?
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(String::from))
+        .collect();
+    let models = filter_model_ids(ids);
+    if models.is_empty() {
+        bail!("daemon /v1/models did not return any usable models");
+    }
+    Ok(models)
 }
 
 async fn admin_get(
@@ -3480,6 +4250,43 @@ fn opencode_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".config").join("opencode")
 }
 
+fn omp_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".omp").join("agent")
+}
+fn mini_swe_agent_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".mini-swe-agent")
+}
+fn kimi_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".kimi-code")
+}
+fn qwen_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".qwen")
+}
+fn goose_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".config").join("goose")
+}
+fn opensage_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".opensage")
+}
+fn pydantic_ai_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".pydantic-ai")
+}
+fn stirrup_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".stirrup")
+}
+fn jcode_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".jcode")
+}
+fn cursor_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".cursor")
+}
+fn droid_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".factory")
+}
+fn hermes_config_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".hermes")
+}
+
 fn override_json(override_: Option<&HarnessOverride>) -> HarnessOverrideJson {
     HarnessOverrideJson {
         binary: override_
@@ -3512,20 +4319,32 @@ async fn detect_harness(config: &Config, spec: &HarnessSpec) -> HarnessDetection
     detect_harness_with_timeout(config, spec, Duration::from_secs(5)).await
 }
 
+async fn detect_harness_without_config(spec: &HarnessSpec) -> HarnessDetection {
+    let Some(binary) = find_on_path(spec.binary) else {
+        return HarnessDetection {
+            binary: None,
+            version: None,
+            version_warning: None,
+        };
+    };
+    let version = command_version(&binary, spec.version_args, Duration::from_secs(5)).await;
+    let mut version_warning = version.warning.clone();
+    if spec.name == "pi" {
+        version_warning = version_warning.or(check_version(version.version.as_deref()).warning);
+    }
+    HarnessDetection {
+        binary: Some(binary),
+        version: version.version,
+        version_warning,
+    }
+}
+
 async fn detect_harness_with_timeout(
     config: &Config,
     spec: &HarnessSpec,
     timeout: Duration,
 ) -> HarnessDetection {
-    let override_binary = config
-        .harness_overrides
-        .get(spec.name)
-        .and_then(|override_| override_.binary.clone());
-    let binary = match override_binary {
-        Some(path) if is_executable_file(&path) => Some(path),
-        Some(_) => None,
-        None => find_on_path(spec.binary),
-    };
+    let binary = resolve_harness_binary(config, spec);
     let Some(binary_path) = binary.clone() else {
         return HarnessDetection {
             binary: None,
@@ -3543,6 +4362,19 @@ async fn detect_harness_with_timeout(
         binary: Some(binary_path),
         version: version.version,
         version_warning,
+    }
+}
+
+/// Resolve a harness binary using the same override-or-PATH rules as connect.
+pub(crate) fn resolve_harness_binary(config: &Config, spec: &HarnessSpec) -> Option<PathBuf> {
+    match config
+        .harness_overrides
+        .get(spec.name)
+        .and_then(|override_| override_.binary.clone())
+    {
+        Some(path) if is_executable_file(&path) => Some(path),
+        Some(_) => None,
+        None => find_on_path(spec.binary),
     }
 }
 
@@ -3593,6 +4425,43 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> VersionOutput {
+    let cache_key = binary_detection_cache_key(binary);
+    if let Some(cached) = VERSION_DETECTION_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return cached;
+    }
+    let output = command_version_uncached(binary, args, timeout).await;
+    if let Ok(mut cache) = VERSION_DETECTION_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.retain(|key, _| key.binary != cache_key.binary || key == &cache_key);
+        cache.insert(cache_key, output.clone());
+    }
+    output
+}
+
+fn detection_cache_key(binary: PathBuf, modified: Option<SystemTime>) -> DetectionCacheKey {
+    DetectionCacheKey { binary, modified }
+}
+
+fn binary_detection_cache_key(binary: &Path) -> DetectionCacheKey {
+    let binary = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    let modified = std::fs::metadata(&binary)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    detection_cache_key(binary, modified)
+}
+
+async fn command_version_uncached(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> VersionOutput {
     let binary = binary.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
     match tokio::time::timeout(
@@ -3955,6 +4824,100 @@ mod tests {
         assert_eq!(unchanged, 2);
     }
 
+    #[test]
+    fn codex_upsert_enables_absent_hooks_and_preserves_true() {
+        let dir = tmpdir("codex-hooks-default");
+        let catalog = dir.join(CODEX_CATALOG_FILE);
+        let key = dir.join(CODEX_KEY_FILE);
+
+        let mut absent = DocumentMut::new();
+        upsert_codex_config(
+            &mut absent,
+            "http://127.0.0.1:4100",
+            &catalog,
+            &key,
+            "alex/gpt-5.5",
+            None,
+        )
+        .unwrap();
+        assert_eq!(absent["features"]["hooks"].as_bool(), Some(true));
+
+        let mut enabled = DocumentMut::from_str("[features]\nhooks = true\n").unwrap();
+        upsert_codex_config(
+            &mut enabled,
+            "http://127.0.0.1:4100",
+            &catalog,
+            &key,
+            "alex/gpt-5.5",
+            None,
+        )
+        .unwrap();
+        assert_eq!(enabled["features"]["hooks"].as_bool(), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preminted_claude_writer_uses_provided_key_and_remote_hook_url() {
+        let dir = tmpdir("preminted-claude");
+        let summary = write_preminted_connection(
+            "claude",
+            dir.clone(),
+            "http://host.docker.internal:4100".into(),
+            "rk-cove-claude".into(),
+            "alxk-cove-claude".into(),
+            model_ids(),
+            None,
+            Some("1.2.3".into()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.key_id, "rk-cove-claude");
+        assert_eq!(
+            read_claude_api_key(&dir).as_deref(),
+            Some("alxk-cove-claude")
+        );
+        assert!(std::fs::read_to_string(dir.join(CLAUDE_HOOK_CURL_FILE))
+            .unwrap()
+            .contains("http://host.docker.internal:4100/harness-events"));
+        assert!(
+            std::fs::read_to_string(dir.join(CLAUDE_TOOL_HOOK_CURL_FILE))
+                .unwrap()
+                .contains("http://host.docker.internal:4100/tool-events")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preminted_codex_writer_uses_provided_key_and_remote_hook_url() {
+        let dir = tmpdir("preminted-codex");
+        let catalog = json!({"models": [
+            {"slug": "gpt-5.6-luna", "display_name": "Luna"},
+            {"slug": "alex/gpt-5.6-luna", "display_name": "alex/gpt-5.6-luna"}
+        ]});
+        let summary = write_preminted_connection(
+            "codex",
+            dir.clone(),
+            "http://host.docker.internal:4100".into(),
+            "rk-cove-codex".into(),
+            "alxk-cove-codex".into(),
+            model_ids(),
+            Some(catalog),
+            Some("0.144.3".into()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.key_id, "rk-cove-codex");
+        assert_eq!(read_codex_api_key(&dir).as_deref(), Some("alxk-cove-codex"));
+        assert!(std::fs::read_to_string(dir.join(CODEX_HOOK_CURL_FILE))
+            .unwrap()
+            .contains("http://host.docker.internal:4100/harness-events"));
+        assert!(std::fs::read_to_string(dir.join(CODEX_TOOL_HOOK_CURL_FILE))
+            .unwrap()
+            .contains("http://host.docker.internal:4100/tool-events"));
+    }
+
     fn test_config() -> Config {
         Config {
             host: "127.0.0.1".into(),
@@ -4030,7 +4993,7 @@ mod tests {
         );
 
         let statuses = harness_statuses(&config, None, true).await.unwrap();
-        assert_eq!(statuses.len(), 7);
+        assert_eq!(statuses.len(), 19);
         assert!(statuses.iter().any(|s| s.name == "opencode"));
         assert!(statuses.iter().any(|s| s.name == "amp"));
     }
@@ -4170,6 +5133,13 @@ mod tests {
         assert!(
             source.contains("event.headers[\"x-session-id\"] = ctx.sessionManager.getSessionId()")
         );
+        // Subagent lineage: parent session id travels to child pi processes
+        // via inherited env, and inherited ids announce to /harness-events.
+        assert!(
+            source.contains("const harnessEventsUrl = \"http://127.0.0.1:4100/harness-events\"")
+        );
+        assert!(source.contains("process.env.ALEXANDRIA_SESSION_ID"));
+        assert!(source.contains("\"SubagentStart\""));
     }
 
     #[cfg(unix)]
@@ -4338,6 +5308,51 @@ mod tests {
         assert!(!dir.join(CLAUDE_KEY_FILE).exists());
         assert!(!dir.join(CLAUDE_CATALOG_FILE).exists());
         assert!(!summary.extension_path.exists());
+    }
+
+    #[test]
+    fn claude_disconnect_cleans_persisted_alexandria_model_after_state_is_gone() {
+        let dir = tmpdir("claude-stale-selection");
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(
+            dir.join(CLAUDE_SETTINGS_FILE),
+            r#"{"model":"claude-alex/claude-fable-5","theme":"dark"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cache").join("gateway-models.json"),
+            r#"{"baseUrl":"http://127.0.0.1:4100","models":[{"id":"claude-alex/claude-fable-5"}]}"#,
+        )
+        .unwrap();
+
+        assert!(disconnect_claude_config(&dir).unwrap());
+        let settings = read_json_object(&dir.join(CLAUDE_SETTINGS_FILE)).unwrap();
+        assert!(settings.get("model").is_none());
+        assert_eq!(settings["theme"], "dark");
+        assert!(!dir.join("cache").join("gateway-models.json").exists());
+        assert!(!disconnect_claude_config(&dir).unwrap());
+    }
+
+    #[test]
+    fn claude_disconnect_preserves_native_model_and_unrelated_gateway_cache() {
+        let dir = tmpdir("claude-native-selection");
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(
+            dir.join(CLAUDE_SETTINGS_FILE),
+            r#"{"model":"claude-fable-5","theme":"dark"}"#,
+        )
+        .unwrap();
+        let cache_path = dir.join("cache").join("gateway-models.json");
+        std::fs::write(
+            &cache_path,
+            r#"{"baseUrl":"https://gateway.example","models":[{"id":"claude-fable-5"}]}"#,
+        )
+        .unwrap();
+
+        assert!(!disconnect_claude_config(&dir).unwrap());
+        let settings = read_json_object(&dir.join(CLAUDE_SETTINGS_FILE)).unwrap();
+        assert_eq!(settings["model"], "claude-fable-5");
+        assert!(cache_path.exists());
     }
 
     #[cfg(unix)]
@@ -4674,6 +5689,39 @@ fi"#,
     }
 
     #[test]
+    fn detection_cache_key_includes_resolved_path_and_mtime() {
+        let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let second_time = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+        let first = detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time));
+        assert_eq!(
+            first,
+            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time))
+        );
+        assert_ne!(
+            first,
+            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(second_time))
+        );
+        assert_ne!(
+            first,
+            detection_cache_key(PathBuf::from("/tmp/bin/codex"), Some(first_time))
+        );
+    }
+
+    #[test]
+    fn preferred_claude_default_skips_retired_alphabetical_first_model() {
+        let models = vec![
+            "claude-alex/claude-3-5-haiku".to_string(),
+            "claude-alex/claude-haiku-4-5".to_string(),
+            "claude-alex/claude-opus-4-8".to_string(),
+            "claude-alex/claude-sonnet-5".to_string(),
+        ];
+        assert_eq!(
+            preferred_claude_model(&models),
+            "claude-alex/claude-sonnet-5"
+        );
+    }
+
+    #[test]
     fn gpt_5_6_pi_settings_match_codex_catalog() {
         let sol = pi_model_config("gpt-5.6-sol");
         assert_eq!(sol["name"], "GPT-5.6 Sol");
@@ -4706,5 +5754,83 @@ fi"#,
         assert!(reasoning_enabled("gemini-2.5-pro"));
         assert!(!reasoning_enabled("claude-haiku-4-5"));
         assert!(!reasoning_enabled("gemini-2.5-flash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tool_capture_profile_and_toggle_are_idempotent() {
+        let dir = tmpdir("claude-tool-capture");
+        write_claude_connection_with_capture(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk".into(),
+            "key".into(),
+            model_ids(),
+            None,
+            true,
+        )
+        .unwrap();
+        let profile_path = dir.join(CLAUDE_PROFILE_FILE);
+        let profile = read_json_object(&profile_path).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(profile["hooks"][event].as_array().unwrap().len(), 1);
+        }
+        set_claude_tool_capture(&dir, "http://127.0.0.1:4100", false).unwrap();
+        let profile = read_json_object(&profile_path).unwrap();
+        assert!(profile["hooks"]["PreToolUse"].is_null());
+        set_claude_tool_capture(&dir, "http://127.0.0.1:4100", true).unwrap();
+        set_claude_tool_capture(&dir, "http://127.0.0.1:4100", true).unwrap();
+        let profile = read_json_object(&profile_path).unwrap();
+        assert_eq!(profile["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_tool_capture_hooks_toggle_and_disconnect_clean_tool_hooks() {
+        let dir = tmpdir("codex-tool-capture");
+        let catalog = json!({"models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]});
+        write_codex_connection_with_capture(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk".into(),
+            "key".into(),
+            catalog,
+            None,
+            true,
+        )
+        .unwrap();
+        let hooks_path = dir.join("hooks.json");
+        let hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(CODEX_TOOL_HOOK_FILE));
+        set_codex_tool_capture(&dir, "http://127.0.0.1:4100", false).unwrap();
+        let hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(hooks["hooks"]["PreToolUse"].is_null());
+        set_codex_tool_capture(&dir, "http://127.0.0.1:4100", true).unwrap();
+        assert!(disconnect_codex_config(&dir).unwrap());
+        let hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(hooks["hooks"].is_null());
+    }
+
+    #[test]
+    fn amp_tool_capture_source_has_independent_tool_event_posts() {
+        let source = amp_plugin_source(
+            "http://127.0.0.1:4100",
+            "http://127.0.0.1:4100/harness-events",
+            "http://127.0.0.1:4100/tool-events",
+            Path::new("/tmp/key"),
+            Path::new("/tmp/events"),
+            true,
+        )
+        .unwrap();
+        assert!(source.contains("const TOOL_EVENT_URL = \"http://127.0.0.1:4100/tool-events\""));
+        assert!(source.contains("const CAPTURE_ENABLED = true"));
+        assert!(source.contains("postToolEvent({ phase: 'start'"));
+        assert!(source.contains("postToolEvent({ phase: 'end'"));
     }
 }

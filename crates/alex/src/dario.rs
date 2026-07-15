@@ -61,7 +61,9 @@ fn dario_request_decision(
         }
         (PromptCacheState::Cold, Some(CacheWarmResult::TimedOut)) => {
             DarioRequestDecision::DirectFallback {
-                reason: format!("dario prompt-cache warm timed out after {CACHE_WARM_TIMEOUT_MS}ms"),
+                reason: format!(
+                    "dario prompt-cache warm timed out after {CACHE_WARM_TIMEOUT_MS}ms"
+                ),
             }
         }
         (PromptCacheState::Cold, Some(CacheWarmResult::Failed(error))) => {
@@ -757,7 +759,8 @@ impl DarioSupervisor {
                 None
             }
             DarioRequestDecision::DirectFallback { reason } => {
-                *self.prompt_cache_issue.lock().unwrap() = Some(format!("cannot warm prompt cache: {reason}"));
+                *self.prompt_cache_issue.lock().unwrap() =
+                    Some(format!("cannot warm prompt cache: {reason}"));
                 Some(reason)
             }
         }
@@ -775,10 +778,19 @@ impl DarioSupervisor {
             Some(version) => Ok(version),
             None => self.resolve_version().await.map_err(|e| e.to_string()),
         }?;
-        match tokio::time::timeout(Duration::from_millis(CACHE_WARM_TIMEOUT_MS), self.roll(&version)).await {
-            Ok(Ok(_)) => self.active().ok_or_else(|| "Dario roll completed without an active generation".into()),
+        match tokio::time::timeout(
+            Duration::from_millis(CACHE_WARM_TIMEOUT_MS),
+            self.roll(&version),
+        )
+        .await
+        {
+            Ok(Ok(_)) => self
+                .active()
+                .ok_or_else(|| "Dario roll completed without an active generation".into()),
             Ok(Err(error)) => Err(format!("Dario on-demand repair failed: {error}")),
-            Err(_) => Err(format!("Dario on-demand repair timed out after {CACHE_WARM_TIMEOUT_MS}ms")),
+            Err(_) => Err(format!(
+                "Dario on-demand repair timed out after {CACHE_WARM_TIMEOUT_MS}ms"
+            )),
         }
     }
 
@@ -797,7 +809,10 @@ impl DarioSupervisor {
             Duration::from_millis(PROBE_TOTAL_TIMEOUT_MS),
         )
         .await;
-        outcome.is_ready().then_some(()).ok_or_else(|| outcome.summary())
+        outcome
+            .is_ready()
+            .then_some(())
+            .ok_or_else(|| outcome.summary())
     }
 
     async fn warm_prompt_cache(&self, model: &str) -> CacheWarmResult {
@@ -815,7 +830,10 @@ impl DarioSupervisor {
         let request = client
             .post(format!("{}/v1/messages", active.base_url))
             .header("x-api-key", active.api_key)
-            .header("x-dario-capture-id", format!("dario-warm-{}", prompt_cache_key(model)))
+            .header(
+                "x-dario-capture-id",
+                format!("dario-warm-{}", prompt_cache_key(model)),
+            )
             .header("x-dario-capture-model", model)
             .json(&json!({
                 "model": model,
@@ -833,7 +851,10 @@ impl DarioSupervisor {
                     )
                 }
             }
-            Ok(response) => CacheWarmResult::Failed(format!("Dario warm request returned {}", response.status())),
+            Ok(response) => CacheWarmResult::Failed(format!(
+                "Dario warm request returned {}",
+                response.status()
+            )),
             Err(error) if error.is_timeout() => CacheWarmResult::TimedOut,
             Err(error) => CacheWarmResult::Failed(error.to_string()),
         }
@@ -1495,7 +1516,13 @@ fn prompt_cache_key(model: &str) -> String {
     let slug = model
         .to_ascii_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .chars()
@@ -1503,20 +1530,30 @@ fn prompt_cache_key(model: &str) -> String {
         .collect::<String>();
     let slug = if slug.is_empty() { "model" } else { &slug };
     let digest = Sha256::digest(model.as_bytes());
-    let hash = digest.iter().take(6).map(|b| format!("{b:02x}")).collect::<String>();
+    let hash = digest
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     format!("{slug}-{hash}")
 }
 
 fn prompt_cache_is_warm(root: &Path, model: &str) -> bool {
     let path = root.join(format!("{}.json", prompt_cache_key(model)));
-    let Ok(raw) = std::fs::read_to_string(path) else { return false };
-    let Ok(entry) = serde_json::from_str::<Value>(&raw) else { return false };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(entry) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
     if entry["model"].as_str() != Some(model)
         || entry["system_prompt"].as_str().is_none_or(str::is_empty)
     {
         return false;
     }
-    let Some(captured_at) = entry["captured_at"].as_str() else { return false };
+    let Some(captured_at) = entry["captured_at"].as_str() else {
+        return false;
+    };
     let Ok(captured) = captured_at.parse::<chrono::DateTime<chrono::Utc>>() else {
         return false;
     };
@@ -2738,10 +2775,8 @@ mod tests {
 
     #[test]
     fn warm_timeout_falls_back_with_a_traceable_reason() {
-        let decision = dario_request_decision(
-            PromptCacheState::Cold,
-            Some(CacheWarmResult::TimedOut),
-        );
+        let decision =
+            dario_request_decision(PromptCacheState::Cold, Some(CacheWarmResult::TimedOut));
         match decision {
             DarioRequestDecision::DirectFallback { reason } => {
                 assert!(reason.contains("timed out"));
@@ -2750,5 +2785,4 @@ mod tests {
             other => panic!("expected direct fallback, got {other:?}"),
         }
     }
-
 }

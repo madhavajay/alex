@@ -587,8 +587,9 @@ impl Store {
     pub fn clear_derived_cache(&self) -> Result<u64> {
         let prompt_cache = self.data_dir.join("dario-prompt-cache");
         if prompt_cache.exists() {
-            std::fs::remove_dir_all(&prompt_cache)
-                .with_context(|| format!("removing dario prompt cache at {}", prompt_cache.display()))?;
+            std::fs::remove_dir_all(&prompt_cache).with_context(|| {
+                format!("removing dario prompt cache at {}", prompt_cache.display())
+            })?;
         }
         self.clear_pricing()
     }
@@ -659,6 +660,36 @@ impl Store {
                 subscription_identity,
                 t.via_dario as i64,
                 t.dario_generation,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh non-payload billing attribution on an already-imported trace.
+    /// Optional account fields are additive so an importer that cannot resolve
+    /// identity never erases attribution recorded by an earlier pass.
+    pub fn update_trace_billing_metadata(
+        &self,
+        trace_id: &str,
+        requested_model: &str,
+        routed_model: &str,
+        billing_bucket: &str,
+        account_id: Option<&str>,
+        subscription_identity: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE traces SET requested_model=?2, routed_model=?3, billing_bucket=?4,
+               account_id=COALESCE(?5, account_id),
+               subscription_identity=COALESCE(?6, subscription_identity)
+             WHERE id=?1",
+            params![
+                trace_id,
+                requested_model,
+                routed_model,
+                billing_bucket,
+                account_id,
+                subscription_identity
             ],
         )?;
         Ok(())
@@ -987,9 +1018,15 @@ impl Store {
         let Some(child) = event["agent_id"].as_str().filter(|id| !id.is_empty()) else {
             return Ok(false);
         };
+        // Hooks provide their own event clock.  Retain it when present so a
+        // start/stop pair remains meaningful even if delivery is delayed.
+        let event_ms = event["timestamp_ms"]
+            .as_i64()
+            .filter(|timestamp_ms| *timestamp_ms > 0)
+            .unwrap_or(received_ms);
         let turn_id = event["turn_id"].as_str();
         let agent_type = event["agent_type"].as_str();
-        let stopped_ms = (event_name == "SubagentStop").then_some(received_ms);
+        let stopped_ms = (event_name == "SubagentStop").then_some(event_ms);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO session_lineage
@@ -1002,15 +1039,7 @@ impl Store {
                 agent_type = COALESCE(excluded.agent_type, session_lineage.agent_type),
                 started_ms = MIN(session_lineage.started_ms, excluded.started_ms),
                 stopped_ms = COALESCE(excluded.stopped_ms, session_lineage.stopped_ms)",
-            params![
-                harness,
-                child,
-                parent,
-                turn_id,
-                agent_type,
-                received_ms,
-                stopped_ms
-            ],
+            params![harness, child, parent, turn_id, agent_type, event_ms, stopped_ms],
         )?;
         Ok(true)
     }
@@ -1112,16 +1141,18 @@ impl Store {
                     ts_end_ms, is_error, exit_status, args_body_path, result_body_path
              FROM tool_calls WHERE session_id=?1 ORDER BY ts_start_ms ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| Ok(json!({
-            "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
-            "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
-            "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
-            "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
-            "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
-            "exit_status": r.get::<_, Option<i64>>(9)?,
-            "args_body_path": r.get::<_, Option<String>>(10)?,
-            "result_body_path": r.get::<_, Option<String>>(11)?,
-        })))?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
+                "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
+                "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
+                "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
+                "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+                "exit_status": r.get::<_, Option<i64>>(9)?,
+                "args_body_path": r.get::<_, Option<String>>(10)?,
+                "result_body_path": r.get::<_, Option<String>>(11)?,
+            }))
+        })?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
@@ -1524,20 +1555,30 @@ impl Store {
                 "SELECT id, args_body_path, result_body_path FROM tool_calls
                  WHERE ts_start_ms < ?1 AND (args_body_path IS NOT NULL OR result_body_path IS NOT NULL)",
             )?;
-            let rows = stmt.query_map(params![older_than_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .filter_map(|r| r.ok()).collect();
+            let rows = stmt
+                .query_map(params![older_than_ms], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             rows
         };
         for (id, args, result) in tool_rows {
             for path in [args, result].into_iter().flatten() {
                 if let Ok(meta) = std::fs::metadata(&path) {
-                    report.bytes_freed += meta.len(); report.bodies_deleted += 1;
-                    if !dry_run { std::fs::remove_file(&path).with_context(|| format!("deleting body file {path}"))?; }
+                    report.bytes_freed += meta.len();
+                    report.bodies_deleted += 1;
+                    if !dry_run {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("deleting body file {path}"))?;
+                    }
                 }
             }
             if !dry_run {
                 self.conn.lock().unwrap().execute(
-                    "UPDATE tool_calls SET args_body_path=NULL, result_body_path=NULL WHERE id=?1", params![id])?;
+                    "UPDATE tool_calls SET args_body_path=NULL, result_body_path=NULL WHERE id=?1",
+                    params![id],
+                )?;
             }
             report.rows_affected += 1;
         }
@@ -1595,7 +1636,9 @@ impl Store {
                     params![older_than_ms],
                 )? as u64;
                 report.rows_deleted += conn.execute(
-                    "DELETE FROM tool_calls WHERE ts_start_ms < ?1", params![older_than_ms])? as u64;
+                    "DELETE FROM tool_calls WHERE ts_start_ms < ?1",
+                    params![older_than_ms],
+                )? as u64;
                 if report.rows_deleted > 0 {
                     if let Err(e) = conn.execute_batch("VACUUM") {
                         tracing::warn!("prune: VACUUM skipped: {e}");
@@ -2030,14 +2073,33 @@ mod tests {
     #[test]
     fn tool_calls_join_sessions_and_share_reset_body_accounting() {
         let store = Store::open(tmpdir("tool-calls")).unwrap();
-        let args = store.write_body("tool-session-call", "tool-args.json", br#"{"argv":["echo","ok"]}"#).unwrap();
-        let result = store.write_body("tool-session-call", "tool-result.json", b"large output").unwrap();
-        store.upsert_tool_call(&ToolCallRecord {
-            id: "tool-session-call".into(), harness: "pi".into(), session_id: "session".into(),
-            turn_id: Some("2".into()), tool_call_id: "call".into(), trace_id: Some("trace".into()),
-            tool_name: "bash".into(), ts_start_ms: 10, ts_end_ms: Some(20), is_error: Some(false),
-            exit_status: Some(0), args_body_path: Some(args), result_body_path: Some(result),
-        }).unwrap();
+        let args = store
+            .write_body(
+                "tool-session-call",
+                "tool-args.json",
+                br#"{"argv":["echo","ok"]}"#,
+            )
+            .unwrap();
+        let result = store
+            .write_body("tool-session-call", "tool-result.json", b"large output")
+            .unwrap();
+        store
+            .upsert_tool_call(&ToolCallRecord {
+                id: "tool-session-call".into(),
+                harness: "pi".into(),
+                session_id: "session".into(),
+                turn_id: Some("2".into()),
+                tool_call_id: "call".into(),
+                trace_id: Some("trace".into()),
+                tool_name: "bash".into(),
+                ts_start_ms: 10,
+                ts_end_ms: Some(20),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: Some(args),
+                result_body_path: Some(result),
+            })
+            .unwrap();
         let calls = store.session_tool_calls("session").unwrap();
         assert_eq!(calls[0]["trace_id"], "trace");
         assert_eq!(calls[0]["turn_id"], "2");
@@ -2420,6 +2482,50 @@ mod tests {
         assert_eq!(rows[1]["run_id"], Value::Null);
         assert_eq!(rows[1]["reasoning_effort"], Value::Null);
         assert_eq!(rows[1]["thinking_budget"], Value::Null);
+    }
+
+    #[test]
+    fn reasoning_effort_migration_is_idempotent_and_preserves_old_rows() {
+        let dir = tmpdir("reasoning-effort-migrate");
+        let db_path = dir.join("alexandria.sqlite3");
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE traces (
+                   id TEXT PRIMARY KEY,
+                   ts_request_ms INTEGER NOT NULL,
+                   ts_response_ms INTEGER,
+                   session_id TEXT, harness TEXT, client_format TEXT,
+                   upstream_provider TEXT, upstream_format TEXT,
+                   requested_model TEXT, routed_model TEXT,
+                   method TEXT, path TEXT, status INTEGER, streamed INTEGER,
+                   input_tokens INTEGER, cached_input_tokens INTEGER,
+                   cache_creation_tokens INTEGER, output_tokens INTEGER,
+                   reasoning_tokens INTEGER, cost_usd REAL, billing_bucket TEXT,
+                   req_body_path TEXT, upstream_req_body_path TEXT, resp_body_path TEXT,
+                   req_headers_json TEXT, resp_headers_json TEXT,
+                   error TEXT, account_id TEXT
+                 );
+                 INSERT INTO traces (id, ts_request_ms, session_id, routed_model)
+                   VALUES ('historic-effort', 100, 'historic-session', 'gpt-5');",
+            )
+            .unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        let historic = store.get_trace("historic-effort").unwrap().unwrap();
+        assert_eq!(historic["reasoning_effort"], Value::Null);
+        drop(store);
+
+        let store = Store::open(dir).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('traces') WHERE name='reasoning_effort'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "reopening must not add reasoning_effort twice");
     }
 
     #[test]

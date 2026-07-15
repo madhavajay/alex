@@ -63,7 +63,7 @@ enum ProviderChipRenderer {
         return NSImage(size: NSSize(width: 13, height: 13), flipped: false) { rect in
             fill.setFill()
             NSBezierPath(ovalIn: rect).fill()
-            if provider == "xai" {
+            if provider == "xai" || provider == "amp" {
                 NSColor.white.withAlphaComponent(0.85).setStroke()
                 let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
                 ring.lineWidth = 1
@@ -90,6 +90,7 @@ enum ProviderChipRenderer {
         case "gemini": NSColor(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255, alpha: 1)
         case "cursor": NSColor(red: 0x8E / 255, green: 0x5C / 255, blue: 0xFF / 255, alpha: 1)
         case "amp": .black
+        case "openrouter": NSColor(red: 0x65 / 255, green: 0x61 / 255, blue: 0xFF / 255, alpha: 1)
         default: .gray
         }
     }
@@ -114,19 +115,21 @@ struct HarnessIconView: View {
 
 struct ProviderBadgeView: View {
     let provider: String
+    var size: CGFloat = 10
 
     var body: some View {
         Circle()
             .fill(color)
             .overlay(
                 Circle().strokeBorder(
-                    provider == "xai" ? Color.white.opacity(0.85) : Color.clear,
+                    provider == "xai" || provider == "amp"
+                        ? Color.white.opacity(0.85) : Color.clear,
                     lineWidth: 1))
             .overlay(
                 Text(ModelProvider.initial(for: provider))
-                    .font(.system(size: 6, weight: .bold))
+                    .font(.system(size: max(6, size * 0.48), weight: .bold))
                     .foregroundStyle(.white))
-            .frame(width: 10, height: 10)
+            .frame(width: size, height: size)
             .help(name)
     }
 
@@ -138,6 +141,7 @@ struct ProviderBadgeView: View {
         case "gemini": Color(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255)
         case "cursor": Color(red: 0x8E / 255, green: 0x5C / 255, blue: 0xFF / 255)
         case "amp": Color.black
+        case "openrouter": Color(red: 0x65 / 255, green: 0x61 / 255, blue: 0xFF / 255)
         default: Color.gray
         }
     }
@@ -150,7 +154,28 @@ struct ProviderBadgeView: View {
         case "gemini": "Gemini"
         case "cursor": "Cursor"
         case "amp": "Amp"
+        case "openrouter": "OpenRouter"
         default: provider.capitalized
         }
+    }
+}
+
+/// The session list's deliberately compact identity: harness + model provider.
+struct SessionIdentityIconsView: View {
+    let harness: String?
+    let tags: [String: String]?
+    let providers: [String]
+    var size: CGFloat = 16
+
+    var body: some View {
+        HStack(spacing: 4) {
+            HarnessIconView(harness: harness, tags: tags, size: size)
+            if let provider = SessionIdentity.primaryProvider(
+                providers: providers, harness: harness, tags: tags)
+            {
+                ProviderBadgeView(provider: provider, size: size)
+            }
+        }
+        .fixedSize()
     }
 }
