@@ -1,7 +1,7 @@
 {
   "low": {
     "agent": {
-      "model": "alex/openrouter/z-ai/glm-5.2",
+      "model": "alex/gpt-5.6-luna",
       "thinking": "medium"
     },
     "oracle": {
@@ -38,18 +38,12 @@
     },
     "oracle": {
       "model": "alex/claude-fable-5",
-      "fallbacks": [
-        "alex/openrouter/anthropic/claude-fable-5"
-      ],
       "thinking": "high"
     }
   },
   "ultra": {
     "agent": {
       "model": "alex/claude-fable-5",
-      "fallbacks": [
-        "alex/openrouter/anthropic/claude-fable-5"
-      ],
       "thinking": "high"
     },
     "oracle": {

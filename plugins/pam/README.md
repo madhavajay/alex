@@ -21,7 +21,8 @@ pi install ./plugins/pam
 
 Loading Pam starts at `medium`, matching Amp's recommendation. Press `Ctrl+S`
 or run `/pam` to open the dial. Use left/right, Enter to apply, or Escape to
-cancel.
+cancel. Press `S` from the dial to open model settings; closing settings returns
+to the same place on the dial.
 Modes can also be selected directly:
 
 ```text
@@ -52,7 +53,9 @@ the changed slot is the active tier's agent, Pam also switches the running Pi
 session to the new model immediately.
 
 You can still edit `settings.json` by hand. Models must use an `alex/*` ID from
-Pi's Alexandria catalog; run `/reload` in Pi after manual edits.
+Pi's Alexandria catalog; run `/reload` in Pi after manual edits. Pam resolves
+those routing IDs through Pi's model catalog and displays their familiar names,
+such as `GPT-5.6 Luna`, while retaining the exact `alex/*` ID for requests.
 
 Each choice has a primary `model`, optional `fallbacks`, and a reasoning
 `thinking` level:

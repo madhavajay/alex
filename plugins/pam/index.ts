@@ -29,6 +29,9 @@ type ModeName = (typeof MODE_NAMES)[number];
 type ModeColor = "thinkingLow" | "thinkingMedium" | "thinkingHigh" | "thinkingMax";
 type ModeRole = "agent" | "oracle";
 type SettingsTarget = { mode: ModeName; role: ModeRole };
+type DialAction =
+	| { type: "apply"; mode: ModeName }
+	| { type: "settings"; mode: ModeName };
 
 type ModelChoice = {
 	ids: readonly string[];
@@ -96,7 +99,7 @@ const DEFAULT_MODES: Record<ModeName, PamMode> = {
 		},
 		oracle: {
 			ids: ["alex/claude-fable-5", "alex/openrouter/anthropic/claude-fable-5"],
-			display: "Fable 5",
+			display: "Claude Fable 5",
 			thinking: "high",
 		},
 		description: "High capability for difficult work where subtle misses are expensive",
@@ -111,7 +114,7 @@ const DEFAULT_MODES: Record<ModeName, PamMode> = {
 		color: "thinkingMax",
 		agent: {
 			ids: ["alex/claude-fable-5", "alex/openrouter/anthropic/claude-fable-5"],
-			display: "Fable 5",
+			display: "Claude Fable 5",
 			thinking: "high",
 		},
 		oracle: {
@@ -263,10 +266,43 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 
 function modelDisplay(id: string): string {
 	const bare = id.split("/").at(-1) ?? id;
-	if (bare === "glm-5.2") return "GLM-5.2";
-	if (bare === "gpt-5.6-sol") return "GPT-5.6 Sol";
-	if (bare === "claude-fable-5") return "Fable 5";
-	return bare;
+	const knownNames: Record<string, string> = {
+		"glm-5.2": "GLM-5.2",
+		"gpt-5.6-sol": "GPT-5.6 Sol",
+		"gpt-5.6-terra": "GPT-5.6 Terra",
+		"gpt-5.6-luna": "GPT-5.6 Luna",
+		"gpt-5.5": "GPT-5.5",
+		"gpt-5.5-codex": "GPT-5.5 Codex",
+		"claude-fable-5": "Claude Fable 5",
+		"claude-opus-4-8": "Claude Opus 4.8",
+		"claude-sonnet-5": "Claude Sonnet 5",
+		"gemini-2.5-flash": "Gemini 2.5 Flash",
+		"grok-code-fast-1": "Grok Code Fast 1",
+	};
+	if (knownNames[bare]) return knownNames[bare];
+	return bare
+		.split("-")
+		.map((part) => {
+			if (["gpt", "glm", "ai"].includes(part.toLowerCase())) return part.toUpperCase();
+			return part ? `${part[0].toUpperCase()}${part.slice(1)}` : part;
+		})
+		.join(" ");
+}
+
+function canonicalModelName(model: Model<any>): string {
+	const name = model.name.trim();
+	const bareId = model.id.split("/").at(-1) ?? model.id;
+	return name && name !== model.id && name !== bareId && !name.includes("/") ? name : modelDisplay(model.id);
+}
+
+function refreshModeDisplays(modes: Record<ModeName, PamMode>, ctx: ExtensionContext): void {
+	for (const modeName of MODE_NAMES) {
+		for (const role of ["agent", "oracle"] as const) {
+			const choice = modes[modeName][role];
+			const model = findModel(ctx, choice.ids);
+			choice.display = model ? canonicalModelName(model) : modelDisplay(choice.ids[0]);
+		}
+	}
 }
 
 type StoredMode = { mode: ModeName | null };
@@ -361,6 +397,8 @@ export default function pam(pi: ExtensionAPI) {
 		}
 	};
 
+	let showSettings: (ctx: ExtensionContext) => Promise<void>;
+
 	const showDial = async (ctx: ExtensionContext): Promise<void> => {
 		if (ctx.mode !== "tui") {
 			if (ctx.hasUI) ctx.ui.notify("Use /pam low|medium|high|ultra outside the TUI", "warning");
@@ -372,31 +410,40 @@ export default function pam(pi: ExtensionAPI) {
 		}
 		if (dialOpen) return;
 
-		const initial = activeMode ?? inferMode(modes, ctx.model, pi.getThinkingLevel()) ?? DEFAULT_MODE;
-		let selected: ModeName | undefined;
-		dialOpen = true;
-		try {
-			selected = await ctx.ui.custom<ModeName | undefined>(
-				(tui, theme, _keybindings, done) => new PamDial(tui, theme, modes, initial, done),
-				{
-					overlay: true,
-					overlayOptions: {
-						anchor: "center",
-						width: "90%",
-						minWidth: 48,
-						maxHeight: 18,
-						margin: 1,
+		let initial = activeMode ?? inferMode(modes, ctx.model, pi.getThinkingLevel()) ?? DEFAULT_MODE;
+		while (true) {
+			let action: DialAction | undefined;
+			dialOpen = true;
+			try {
+				action = await ctx.ui.custom<DialAction | undefined>(
+					(tui, theme, _keybindings, done) => new PamDial(tui, theme, modes, initial, done),
+					{
+						overlay: true,
+						overlayOptions: {
+							anchor: "center",
+							width: "90%",
+							minWidth: 48,
+							maxHeight: 18,
+							margin: 1,
+						},
 					},
-				},
-			);
-		} finally {
-			dialOpen = false;
-		}
+				);
+			} finally {
+				dialOpen = false;
+			}
 
-		if (selected) await applyMode(selected, ctx);
+			if (!action) return;
+			if (action.type === "apply") {
+				await applyMode(action.mode, ctx);
+				return;
+			}
+
+			initial = action.mode;
+			await showSettings(ctx);
+		}
 	};
 
-	const showSettings = async (ctx: ExtensionContext): Promise<void> => {
+	showSettings = async (ctx: ExtensionContext): Promise<void> => {
 		if (ctx.mode !== "tui") {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`${settingsSummary(modes)}\nEdit ${SETTINGS_PATH}, then run /reload.`, "info");
@@ -410,6 +457,7 @@ export default function pam(pi: ExtensionAPI) {
 		if (settingsOpen) return;
 
 		ctx.modelRegistry.refresh();
+		refreshModeDisplays(modes, ctx);
 		const registryError = ctx.modelRegistry.getError();
 		if (registryError) ctx.ui.notify(`Pi model catalog: ${registryError}`, "warning");
 		const availableModels = ctx.modelRegistry
@@ -464,7 +512,7 @@ export default function pam(pi: ExtensionAPI) {
 
 				const previous = { ...choice, ids: [...choice.ids] };
 				choice.ids = [selectedModel.id];
-				choice.display = selectedModel.name || modelDisplay(selectedModel.id);
+				choice.display = canonicalModelName(selectedModel);
 				try {
 					saveModeSettings(modes);
 				} catch (error) {
@@ -622,6 +670,7 @@ export default function pam(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const loaded = loadModeSettings();
 		modes = loaded.modes;
+		refreshModeDisplays(modes, ctx);
 		for (const warning of loaded.warnings) ctx.ui.notify(`Pam settings: ${warning}`, "warning");
 		bindTerminalShortcut(ctx);
 		const restored = restoreMode(ctx);
@@ -707,8 +756,9 @@ class PamSettingsMenu {
 			const prefix = index === this.selected ? th.fg("accent", "› ") : "  ";
 			const mode = modeText(th, this.modes[target.mode], target.mode.padEnd(7));
 			const role = th.fg("text", target.role.padEnd(8));
-			const id = index === this.selected ? th.fg("accent", choice.ids[0]) : th.fg("muted", choice.ids[0]);
-			lines.push(row(truncateToWidth(`${prefix}${mode}${role}${id}`, contentWidth)));
+			const name = index === this.selected ? th.fg("accent", choice.display) : th.fg("text", choice.display);
+			const id = th.fg("dim", `  ${choice.ids[0]}`);
+			lines.push(row(truncateToWidth(`${prefix}${mode}${role}${name}${id}`, contentWidth)));
 		}
 		lines.push(row(""));
 		lines.push(row(th.fg("dim", "↑↓ choose  ·  enter pick model  ·  esc close")));
@@ -817,9 +867,10 @@ class PamModelPicker {
 				const isSelected = index === this.selected;
 				const prefix = isSelected ? th.fg("accent", "› ") : "  ";
 				const check = model.id === this.currentId ? th.fg("success", " ✓") : "";
-				const name = model.name && model.name !== model.id ? th.fg("dim", `  ${model.name}`) : "";
-				const id = isSelected ? th.fg("accent", model.id) : th.fg("text", model.id);
-				lines.push(row(truncateToWidth(`${prefix}${id}${check}${name}`, contentWidth)));
+				const friendlyName = canonicalModelName(model);
+				const name = isSelected ? th.fg("accent", friendlyName) : th.fg("text", friendlyName);
+				const id = th.fg("dim", `  ${model.id}`);
+				lines.push(row(truncateToWidth(`${prefix}${name}${check}${id}`, contentWidth)));
 			}
 			lines.push(row(th.fg("dim", `${this.selected + 1}/${this.filtered.length} available alex/* models`)));
 		}
@@ -836,49 +887,68 @@ class PamModelPicker {
 
 class PamDial {
 	private selected: number;
+	private phase = 0;
+	private interval: ReturnType<typeof setInterval> | undefined;
 
 	constructor(
 		private readonly tui: TUI,
 		private readonly theme: Theme,
 		private readonly modes: Record<ModeName, PamMode>,
 		initial: ModeName,
-		private readonly done: (mode: ModeName | undefined) => void,
+		private readonly done: (action: DialAction | undefined) => void,
 	) {
 		this.selected = MODE_NAMES.indexOf(initial);
+		this.interval = setInterval(() => {
+			this.phase++;
+			this.tui.requestRender();
+		}, 90);
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "ctrl+c")) {
-			this.done(undefined);
+			this.finish(undefined);
 			return;
 		}
 		if (matchesKey(data, "escape")) {
-			this.done(undefined);
+			this.finish(undefined);
 			return;
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
-			this.done(MODE_NAMES[this.selected]);
+			this.finish({ type: "apply", mode: MODE_NAMES[this.selected] });
+			return;
+		}
+		if (data === "s" || data === "S") {
+			this.finish({ type: "settings", mode: MODE_NAMES[this.selected] });
 			return;
 		}
 		if (matchesKey(data, "left") || matchesKey(data, "up")) {
 			this.selected = Math.max(0, this.selected - 1);
+			this.phase = 0;
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "right") || matchesKey(data, "down")) {
 			this.selected = Math.min(MODE_NAMES.length - 1, this.selected + 1);
+			this.phase = 0;
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "home")) {
 			this.selected = 0;
+			this.phase = 0;
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "end")) {
 			this.selected = MODE_NAMES.length - 1;
+			this.phase = 0;
 			this.tui.requestRender();
 		}
+	}
+
+	private finish(action: DialAction | undefined): void {
+		this.dispose();
+		this.done(action);
 	}
 
 	render(width: number): string[] {
@@ -887,31 +957,83 @@ class PamDial {
 		const sidePadding = innerWidth >= 54 ? 3 : 1;
 		const contentWidth = Math.max(1, innerWidth - sidePadding * 2);
 		const selectedMode = this.modes[MODE_NAMES[this.selected]];
+		const sheenPhase = Math.floor(this.phase / 2);
+		const agentTextLength = choiceDisplay(selectedMode.agent).length;
+		const oracleTextLength = choiceDisplay(selectedMode.oracle).length;
+		const sheenGap = 6;
+		const agentSheenStart = 0;
+		const oracleSheenStart = agentSheenStart + agentTextLength + sheenGap;
+		const descriptionSheenStart = oracleSheenStart + oracleTextLength + sheenGap;
+		const sheenCycleLength = descriptionSheenStart + selectedMode.description.length + sheenGap;
 		const lines: string[] = [];
+		let rowIndex = 0;
 
 		const row = (content = "") => {
 			const padded = `${" ".repeat(sidePadding)}${content}`;
-			return th.fg("border", "│") + truncateToWidth(padded, innerWidth, "", true) + th.fg("border", "│");
+			const left = electricSide(th, selectedMode, this.phase, rowIndex, 0);
+			const right = electricSide(th, selectedMode, this.phase, rowIndex, 5);
+			rowIndex++;
+			return left + truncateToWidth(padded, innerWidth, "", true) + right;
 		};
 
-		lines.push(th.fg("border", `╭${"─".repeat(innerWidth)}╮`));
+		lines.push(electricBorder(th, selectedMode, innerWidth, this.phase, false));
 		lines.push(row(""));
 		lines.push(row(renderDots(th, selectedMode, this.selected, contentWidth)));
 		lines.push(row(renderLabels(th, this.modes, this.selected, contentWidth)));
 		lines.push(row(""));
-		lines.push(row(detailLine(th, "Agent:", selectedMode.agent)));
-		lines.push(row(detailLine(th, "Oracle:", selectedMode.oracle)));
+		lines.push(
+			row(
+				detailLine(
+					th,
+					"Agent:",
+					selectedMode.agent,
+					selectedMode,
+					sheenPhase,
+					agentSheenStart,
+					sheenCycleLength,
+				),
+			),
+		);
+		lines.push(
+			row(
+				detailLine(
+					th,
+					"Oracle:",
+					selectedMode.oracle,
+					selectedMode,
+					sheenPhase,
+					oracleSheenStart,
+					sheenCycleLength,
+				),
+			),
+		);
 		lines.push(row(""));
-		for (const descriptionLine of wrapTextWithAnsi(th.fg("muted", selectedMode.description), contentWidth)) {
+		const glowingDescription = sheenText(
+			th,
+			selectedMode,
+			selectedMode.description,
+			sheenPhase,
+			descriptionSheenStart,
+			sheenCycleLength,
+			"muted",
+		);
+		for (const descriptionLine of wrapTextWithAnsi(glowingDescription, contentWidth)) {
 			lines.push(row(descriptionLine));
 		}
 		lines.push(row(""));
-		lines.push(row(th.fg("dim", "←→ choose  ·  enter apply  ·  esc cancel")));
-		lines.push(th.fg("border", `╰${"─".repeat(innerWidth)}╯`));
+		lines.push(row(th.fg("dim", "←→ choose  ·  enter apply  ·  s settings  ·  esc cancel")));
+		lines.push(electricBorder(th, selectedMode, innerWidth, this.phase + 11, true));
 		return lines;
 	}
 
 	invalidate(): void {}
+
+	dispose(): void {
+		if (this.interval) {
+			clearInterval(this.interval);
+			this.interval = undefined;
+		}
+	}
 }
 
 function framedRow(theme: Theme, content: string, innerWidth: number, sidePadding: number): string {
@@ -919,13 +1041,54 @@ function framedRow(theme: Theme, content: string, innerWidth: number, sidePaddin
 	return theme.fg("border", "│") + truncateToWidth(padded, innerWidth, "", true) + theme.fg("border", "│");
 }
 
+function electricBorder(
+	theme: Theme,
+	mode: PamMode,
+	innerWidth: number,
+	phase: number,
+	bottom: boolean,
+): string {
+	const rippleRadius = mode.name === "medium" ? 3 : mode.name === "high" ? 4 : 2;
+	const hotspot = bottom
+		? innerWidth - 1 - positiveMod(phase, innerWidth)
+		: positiveMod(phase, innerWidth);
+	let rail = "";
+	for (let index = 0; index < innerWidth; index++) {
+		const directDistance = Math.abs(index - hotspot);
+		const distance = Math.min(directDistance, innerWidth - directDistance);
+		if (distance === 0) {
+			rail += theme.fg("text", theme.bold("━"));
+		} else if (distance <= rippleRadius) {
+			rail += modeText(theme, mode, theme.bold("╍"));
+		} else {
+			rail += energeticModeText(theme, mode, "─");
+		}
+	}
+	const left = modeText(theme, mode, theme.bold(bottom ? "╰" : "╭"));
+	const right = modeText(theme, mode, theme.bold(bottom ? "╯" : "╮"));
+	return `${left}${rail}${right}`;
+}
+
+function electricSide(theme: Theme, mode: PamMode, phase: number, row: number, offset: number): string {
+	const period = mode.name === "medium" ? 12 : mode.name === "high" ? 10 : 14;
+	const pulse = positiveMod(phase - row * 2 + offset, period);
+	if (pulse === 0) return theme.fg("text", theme.bold("┃"));
+	if (pulse <= 2 || pulse >= period - 1) return modeText(theme, mode, theme.bold("╏"));
+	return energeticModeText(theme, mode, "│");
+}
+
 function renderDots(theme: Theme, mode: PamMode, selected: number, width: number): string {
 	const dotCount = Math.max(8, Math.floor((width + 1) / 2));
 	const activeCount = 1 + Math.round((selected / (MODE_NAMES.length - 1)) * (dotCount - 1));
-	const active = Array.from({ length: activeCount }, () => "•").join(" ");
-	const inactive = Array.from({ length: dotCount - activeCount }, () => "•").join(" ");
-	const separator = active && inactive ? " " : "";
-	return modeText(theme, mode, active) + separator + theme.fg("dim", inactive);
+	return Array.from({ length: dotCount }, (_, index) => {
+		const dot =
+			index === activeCount - 1
+				? theme.fg("text", theme.bold("●"))
+				: index >= activeCount
+				? theme.fg("dim", "•")
+				: energeticModeText(theme, mode, "•");
+		return index === dotCount - 1 ? dot : `${dot} `;
+	}).join("");
 }
 
 function renderLabels(
@@ -941,18 +1104,64 @@ function renderLabels(
 		const name = MODE_NAMES[index];
 		const position = Math.max(cursor, positions[index]);
 		line += " ".repeat(Math.max(0, position - cursor));
-		line += index === selected ? modeText(theme, modes[name], theme.bold(name)) : theme.fg("muted", name);
+		line +=
+			index === selected
+				? modeText(theme, modes[name], theme.bold(name))
+				: theme.fg("muted", name);
 		cursor = position + name.length;
 	}
 	return line;
 }
 
-function detailLine(theme: Theme, label: string, choice: ModelChoice): string {
-	return `${theme.fg("text", label.padEnd(9))}${theme.fg("muted", `${choice.display} ${choice.thinking}`)}`;
+function detailLine(
+	theme: Theme,
+	label: string,
+	choice: ModelChoice,
+	mode: PamMode,
+	phase: number,
+	start: number,
+	cycleLength: number,
+): string {
+	const value = choiceDisplay(choice);
+	return `${theme.fg("text", label.padEnd(9))}${sheenText(theme, mode, value, phase, start, cycleLength, "muted")}`;
+}
+
+function choiceDisplay(choice: ModelChoice): string {
+	return `${choice.display} ${choice.thinking}`;
+}
+
+function sheenText(
+	theme: Theme,
+	mode: PamMode,
+	text: string,
+	phase: number,
+	start: number,
+	cycleLength: number,
+	base: "mode" | "muted",
+): string {
+	const hotspot = positiveMod(phase, cycleLength) - start;
+	return [...text]
+		.map((character, index) => {
+			if (character === " ") return character;
+			const distance = Math.abs(index - hotspot);
+			if (distance === 0) return theme.fg("text", theme.bold(character));
+			if (distance === 1) return modeText(theme, mode, theme.bold(character));
+			return base === "mode" ? modeText(theme, mode, theme.bold(character)) : theme.fg("muted", character);
+		})
+		.join("");
+}
+
+function positiveMod(value: number, divisor: number): number {
+	return ((value % divisor) + divisor) % divisor;
 }
 
 function modeText(theme: Theme, mode: PamMode, text: string): string {
 	return theme.fg(mode.color, text);
+}
+
+function energeticModeText(theme: Theme, mode: PamMode, text: string): string {
+	const styled = mode.name === "medium" || mode.name === "high" ? theme.bold(text) : text;
+	return modeText(theme, mode, styled);
 }
 
 function findModel(ctx: ExtensionContext, ids: readonly string[]): Model<any> | undefined {
