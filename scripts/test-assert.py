@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--routed")
     ap.add_argument("--cross", action="store_true")
     ap.add_argument("--expect-dario", action="store_true")
+    ap.add_argument("--expect-via-dario", action="store_true")
+    ap.add_argument("--reject-via-dario", action="store_true")
     # When --base is given, bodies are verified over HTTP instead of the local
     # filesystem, so the suite works against a proxy on another machine.
     ap.add_argument("--base")
@@ -97,6 +99,12 @@ def main():
         blob = json.dumps(t).lower()
         chk("dario" in blob or "generation" in blob,
             "trace does not reference a dario generation")
+    if a.expect_via_dario:
+        chk(t.get("via_dario") is True,
+            f"via_dario={t.get('via_dario')!r} want true")
+    if a.reject_via_dario:
+        chk(t.get("via_dario") is False,
+            f"via_dario={t.get('via_dario')!r} want false")
 
     if fails:
         print("; ".join(fails))

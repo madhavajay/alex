@@ -696,6 +696,9 @@ struct Config {
     anthropic_upstream: String,
     #[serde(default)]
     dario_api_key: String,
+    /// Explicit real Claude Code executable for Dario prompt capture.
+    #[serde(default)]
+    dario_claude_bin: Option<PathBuf>,
     #[serde(default = "default_dario_update_minutes")]
     dario_update_check_minutes: u64,
     #[serde(default)]
@@ -824,6 +827,33 @@ fn default_dario_probe_model() -> String {
     "claude-haiku-4-5".into()
 }
 
+/// Resolve Claude before entering the service-manager environment inherited by
+/// the Dario child. User-local installs are intentionally checked even when a
+/// systemd/launchd PATH omits them.
+fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = override_bin {
+        // An explicit override is authoritative: falling through to another
+        // binary conceals a typo and makes the configured deployment
+        // irreproducible. `None` is surfaced as a prompt-cache health issue.
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("ALEXANDRIA_REAL_CLAUDE_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("claude")));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/claude"));
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude"),
+    ]);
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 impl Config {
     /// Repair values that a stale config on disk would otherwise keep forever,
     /// since serde defaults only fill MISSING keys. Changing a default does not
@@ -853,6 +883,7 @@ impl Config {
             ping_xai_model: default_ping_xai(),
             anthropic_upstream: default_anthropic_upstream(),
             dario_api_key: String::new(),
+            dario_claude_bin: None,
             dario_update_check_minutes: default_dario_update_minutes(),
             dario_version: None,
             dario_probe_seconds: default_dario_probe_seconds(),
@@ -1150,6 +1181,17 @@ impl alex_proxy::DarioRouter for DarioGlue {
         })
     }
 
+    fn ensure_active(&self) -> alex_proxy::DarioEnsureFuture {
+        let supervisor = self.supervisor.clone();
+        Box::pin(async move {
+            supervisor.ensure_active().await.map(|a| alex_proxy::DarioActive {
+                generation_id: a.generation_id,
+                base_url: a.base_url,
+                api_key: a.api_key,
+            })
+        })
+    }
+
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
         self.supervisor
             .begin_request(generation_id)
@@ -1196,6 +1238,11 @@ impl alex_proxy::DarioRouter for DarioUnavailable {
 
     fn active(&self) -> Option<alex_proxy::DarioActive> {
         None
+    }
+
+    fn ensure_active(&self) -> alex_proxy::DarioEnsureFuture {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
     }
 
     fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
@@ -2137,6 +2184,7 @@ async fn main() -> Result<()> {
                 probe_failures: config.dario_probe_failures,
                 probe_model: config.dario_probe_model.clone(),
                 validate_subscription: dario_route_enabled,
+                claude_bin: resolve_dario_claude_bin(config.dario_claude_bin.as_deref()),
             };
             let (dario_router, supervisor) = match dario::DarioSupervisor::start(settings).await {
                 Ok(sup) => {
@@ -3967,6 +4015,8 @@ impl AmpWsTraceState {
             error,
             account_id: None,
             subscription_identity: None,
+            via_dario: false,
+            dario_generation: None,
             run_id: Some(self.run_id.clone()),
             tags: Some(self.tags.clone()),
             client_ip: None,
@@ -4607,6 +4657,8 @@ fn reconcile_agent_turn(
         error: None,
         account_id: None,
         subscription_identity: None,
+        via_dario: false,
+        dario_generation: None,
         run_id: Some(run_id.to_string()),
         tags: Some(tags),
         client_ip: None,
@@ -8272,6 +8324,7 @@ mod tests {
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_api_key: String::new(),
+            dario_claude_bin: None,
             dario_update_check_minutes: 60,
             dario_version: None,
             dario_probe_seconds: 90,
@@ -8647,6 +8700,7 @@ mod tests {
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_api_key: String::new(),
+            dario_claude_bin: None,
             dario_update_check_minutes: 60,
             dario_version: None,
             dario_probe_seconds: 90,

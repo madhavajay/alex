@@ -3970,6 +3970,7 @@ mod tests {
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
             dario_api_key: String::new(),
+            dario_claude_bin: None,
             dario_update_check_minutes: crate::default_dario_update_minutes(),
             dario_version: None,
             dario_probe_seconds: crate::default_dario_probe_seconds(),
