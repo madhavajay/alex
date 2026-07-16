@@ -14,6 +14,11 @@ use tokio::sync::{Mutex, RwLock};
 
 pub mod login;
 pub mod sessions;
+pub mod vault_bundle;
+pub use vault_bundle::{
+    decrypt_bundle, encrypt_bundle, export_bundle, harness_cred_paths, import_bundle,
+    BundleSelection,
+};
 
 pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";

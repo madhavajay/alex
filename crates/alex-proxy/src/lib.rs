@@ -9,8 +9,9 @@ mod plugins;
 pub use plugins::{PluginManager, PluginManifest};
 
 use alex_auth::{
-    now_ms, routing_reserve_blocked, routing_reserve_pct, routing_reset_selection, Account,
-    AccountPolicy, AccountPolicyMode, RemovedAccount, Vault,
+    encrypt_bundle, export_bundle, harness_cred_paths, now_ms, routing_reserve_blocked,
+    routing_reserve_pct, routing_reset_selection, Account, AccountPolicy, AccountPolicyMode,
+    BundleSelection, RemovedAccount, Vault,
 };
 use alex_core::{
     compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
@@ -583,6 +584,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(admin_dario_prompt_cache_delete),
         )
         .route("/admin/auth/import", post(admin_auth_import))
+        .route("/admin/vault/export", post(admin_vault_export))
+        .route("/admin/credentials", get(admin_credentials))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
         .route(
             "/admin/auth/login/complete",
@@ -713,6 +716,71 @@ async fn admin_auth_import(
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct VaultExportRequest {
+    passphrase: Option<String>,
+    #[serde(default)]
+    selection: BundleSelection,
+}
+
+async fn admin_vault_export(
+    State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<VaultExportRequest>>,
+) -> Response {
+    let Some(request) = body.map(|v| v.0) else {
+        return error_response(StatusCode::BAD_REQUEST, "passphrase is required");
+    };
+    let Some(passphrase) = request.passphrase.filter(|p| !p.is_empty()) else {
+        return error_response(StatusCode::BAD_REQUEST, "passphrase is required");
+    };
+    match export_bundle(&state.vault, request.selection)
+        .await
+        .and_then(|bundle| encrypt_bundle(&bundle, &passphrase))
+    {
+        Ok(blob) => axum::Json(blob).into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_credentials(State(state): State<Arc<AppState>>) -> Response {
+    let now = now_ms();
+    let mut outbound = Vec::new();
+    for account in state.vault.list().await {
+        let present = account
+            .access_token
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+            || account
+                .refresh_token
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+            || account.api_key.as_deref().is_some_and(|v| !v.is_empty());
+        let active = present
+            && !account.paused
+            && account.status == "active"
+            && account
+                .cooldown_until_ms
+                .map(|until| until <= now)
+                .unwrap_or(true)
+            && (account.kind != "oauth"
+                || account
+                    .expires_at_ms
+                    .map(|expires| expires > now)
+                    .unwrap_or(true));
+        outbound.push(json!({"kind": account.kind, "id": account.id, "provider": account.provider.as_str(), "present": present, "active": active, "identity": account.email(), "expires_at_ms": account.expires_at_ms, "source": "vault"}));
+    }
+    for harness in alex_auth::vault_bundle::HARNESS_NAMES {
+        let paths = harness_cred_paths(harness);
+        let present = !paths.is_empty() && paths.iter().all(|(_, path)| path.exists());
+        outbound.push(json!({"kind": "harness_login", "name": harness, "present": present, "active": present, "identity": Value::Null, "expires_at_ms": Value::Null, "source": "harness_file"}));
+    }
+    let run_keys = match state.store.list_run_keys(true) {
+        Ok(keys) => keys,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    axum::Json(json!({"outbound": outbound, "inbound": {"admin_key": {"present": !state.local_key.read().map(|v| v.is_empty()).unwrap_or(true)}, "local_key": {"present": !state.local_key.read().map(|v| v.is_empty()).unwrap_or(true)}, "run_keys": run_keys}})).into_response()
 }
 
 async fn admin_account_remove(
@@ -7730,6 +7798,103 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn vault_export_requires_passphrase_and_is_decryptable() {
+        let state = test_state("vault-export");
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let (status, _) = response_json(admin_vault_export(State(state.clone()), None).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = response_json(
+            admin_vault_export(
+                State(state.clone()),
+                Some(axum::Json(VaultExportRequest {
+                    passphrase: Some(String::new()),
+                    selection: BundleSelection::default(),
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, blob) = response_json(
+            admin_vault_export(
+                State(state),
+                Some(axum::Json(VaultExportRequest {
+                    passphrase: Some("test123".into()),
+                    selection: BundleSelection::default(),
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let blob: alex_auth::vault_bundle::EncryptedVaultBlob =
+            serde_json::from_value(blob).unwrap();
+        assert_eq!(
+            alex_auth::decrypt_bundle(&blob, "test123")
+                .unwrap()
+                .accounts
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_export_route_requires_admin_key() {
+        use tower::ServiceExt;
+        let state = test_state("vault-export-auth");
+        let request = axum::http::Request::post("/admin/vault/export")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"passphrase":"test123"}"#))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let request = axum::http::Request::post("/admin/vault/export")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_view_redacts_secrets_and_includes_run_key_metadata() {
+        let state = test_state("credentials-view");
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        state
+            .store
+            .insert_run_key(
+                "rk-1",
+                "not-a-secret-value",
+                "run",
+                Some("run-1"),
+                Some(r#"{"team":"test"}"#),
+                Some("test run"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let (status, body) = response_json(admin_credentials(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["outbound"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["provider"] == "anthropic" && row["present"] == true));
+        assert_eq!(body["inbound"]["run_keys"][0]["tags"]["team"], "test");
+        assert!(!body.to_string().contains("direct-token"));
+        assert!(!body.to_string().contains("not-a-secret-value"));
     }
 
     fn record_synthetic_sse_trace(

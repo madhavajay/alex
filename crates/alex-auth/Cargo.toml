@@ -19,3 +19,5 @@ sha2 = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+argon2 = { workspace = true }
+aes-gcm = { workspace = true }

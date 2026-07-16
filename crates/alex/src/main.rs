@@ -4,7 +4,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use alex_auth::{import_all, named_account_id, now_ms, AccountPolicy, Vault};
+use alex_auth::{
+    decrypt_bundle, encrypt_bundle, export_bundle, import_all, import_bundle, named_account_id,
+    now_ms, AccountPolicy, BundleSelection, Vault,
+};
 use alex_store::{KnownAccount, Store};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,6 +53,11 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Encrypted portable vault and harness credential bundles
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
     },
     /// Query captured traces
     Traces {
@@ -493,6 +501,40 @@ enum AuthCommand {
     },
     /// List vault accounts
     List,
+}
+
+#[derive(Subcommand)]
+enum VaultCommand {
+    /// Encrypt selected vault and installed harness credentials into a bundle
+    Export {
+        #[arg(long)]
+        passphrase: String,
+        #[arg(long, default_value = "all")]
+        accounts: String,
+        #[arg(long, default_value = "all")]
+        harnesses: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Decrypt a bundle and merge its credentials into this machine
+    Import {
+        file: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+    },
+    /// Fetch an encrypted bundle from another Alexandria daemon and import it
+    Pull {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long)]
+        admin_key: String,
+        #[arg(long)]
+        passphrase: String,
+        #[arg(long, default_value = "all")]
+        accounts: String,
+        #[arg(long, default_value = "all")]
+        harnesses: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1226,6 +1268,37 @@ fn open_vault(config: &Config) -> Result<Vault> {
         vault.set_policies_blocking(policies);
     }
     Ok(vault)
+}
+
+fn bundle_selection(accounts: &str, harnesses: &str) -> BundleSelection {
+    let parse = |value: &str| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    BundleSelection {
+        accounts: Some(parse(accounts)),
+        harnesses: Some(parse(harnesses)),
+    }
+}
+
+fn print_bundle_import_summary(summary: &alex_auth::vault_bundle::ImportSummary) {
+    println!(
+        "imported {} vault account(s): {}",
+        summary.accounts.len(),
+        summary.accounts.join(", ")
+    );
+    println!(
+        "imported {} harness credential file(s): {}",
+        summary.harness_credentials.len(),
+        summary.harness_credentials.join(", ")
+    );
+    for id in &summary.oauth_overwritten {
+        eprintln!("warning: OAuth account {id} was overwritten; two always-on daemons sharing it will contend on refresh");
+    }
 }
 
 async fn has_active_anthropic_oauth(vault: &Vault) -> bool {
@@ -2671,6 +2744,52 @@ async fn main() -> Result<()> {
                 sup.shutdown().await;
             }
         }
+        Command::Vault { command } => match command {
+            VaultCommand::Export {
+                passphrase,
+                accounts,
+                harnesses,
+                out,
+            } => {
+                let vault = open_vault(&config)?;
+                let selection = bundle_selection(&accounts, &harnesses);
+                let bundle = export_bundle(&vault, selection).await?;
+                let account_count = bundle.accounts.len();
+                let harness_count = bundle.harness_credentials.len();
+                let encrypted = encrypt_bundle(&bundle, &passphrase)?;
+                std::fs::write(&out, serde_json::to_vec(&encrypted)?)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600))?;
+                }
+                println!("exported {account_count} vault account(s) and {harness_count} harness credential file(s) to {}", out.display());
+            }
+            VaultCommand::Import { file, passphrase } => {
+                let blob = serde_json::from_slice(&std::fs::read(&file)?)
+                    .context("reading encrypted vault bundle")?;
+                let vault = open_vault(&config)?;
+                let summary = import_bundle(&vault, decrypt_bundle(&blob, &passphrase)?).await?;
+                print_bundle_import_summary(&summary);
+            }
+            VaultCommand::Pull {
+                from,
+                admin_key,
+                passphrase,
+                accounts,
+                harnesses,
+            } => {
+                let base = from.trim_end_matches('/');
+                let response = reqwest::Client::new().post(format!("{base}/admin/vault/export"))
+                    .header("x-api-key", admin_key)
+                    .json(&serde_json::json!({"passphrase": passphrase, "selection": bundle_selection(&accounts, &harnesses)}))
+                    .send().await?.error_for_status()?;
+                let blob = response.json().await?;
+                let vault = open_vault(&config)?;
+                let summary = import_bundle(&vault, decrypt_bundle(&blob, &passphrase)?).await?;
+                print_bundle_import_summary(&summary);
+            }
+        },
         Command::Auth { command } => match command {
             AuthCommand::Import {
                 source,
