@@ -505,7 +505,7 @@ private struct UsageChartCard: View {
 
     private var uncachedXLabels: [String] {
         if let labels = analytics.xLabels { return labels }
-        buckets.map {
+        return buckets.map {
             UsageChartMath.axisLabel(bucketMs: $0, bucketSizeMs: analytics.bucketMs)
         }
     }
