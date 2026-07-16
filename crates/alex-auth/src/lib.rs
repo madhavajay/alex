@@ -878,6 +878,21 @@ impl Vault {
         self.upsert(account).await
     }
 
+    /// A successful health probe makes the account immediately eligible again.
+    /// This prevents a transient capacity/server failure from becoming a
+    /// sticky downgrade after the upstream has recovered.
+    pub async fn clear_cooldown(&self, id: &str) -> Result<()> {
+        let mut account = self
+            .accounts
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown account {id}"))?;
+        account.cooldown_until_ms = None;
+        self.upsert(account).await
+    }
+
     pub async fn refresh(&self, id: &str, force: bool) -> Result<Account> {
         let lock = {
             let mut locks = self.locks.lock().await;

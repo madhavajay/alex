@@ -399,6 +399,25 @@ pub struct TraceRecord {
     /// Alexandria's stable, coarse error taxonomy.
     #[serde(default)]
     pub error_class: Option<String>,
+    /// True when Alexandria retried this request through another account or model.
+    #[serde(default)]
+    pub substituted: bool,
+    /// Model the client asked for before any configured fallback was considered.
+    #[serde(default)]
+    pub original_model: Option<String>,
+    /// Model selected for the final upstream attempt.
+    #[serde(default)]
+    pub served_model: Option<String>,
+    /// Reroutable error class that caused the most recent reroute.
+    #[serde(default)]
+    pub substitution_reason: Option<String>,
+    /// JSON array of account/model attempts, kept as text for SQLite portability.
+    #[serde(default)]
+    pub attempts: Option<String>,
+    #[serde(default)]
+    pub original_account_id: Option<String>,
+    #[serde(default)]
+    pub served_account_id: Option<String>,
     pub account_id: Option<String>,
     /// Durable upstream subscription identity. Unlike `account_id`, this must
     /// not be derived from the user-editable local account nickname.

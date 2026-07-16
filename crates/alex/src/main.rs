@@ -860,6 +860,10 @@ struct Config {
     harness_tool_capture: BTreeMap<String, bool>,
     #[serde(default)]
     account_policy: BTreeMap<String, AccountPolicy>,
+    /// Explicit cross-model fallback policy. Account failover does not read
+    /// this: it is always enabled for reroutable capacity/server failures.
+    #[serde(default)]
+    substitution: alex_proxy::SubstitutionConfig,
 }
 
 #[derive(Clone)]
@@ -1057,6 +1061,7 @@ impl Config {
             harness_overrides: BTreeMap::new(),
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            substitution: alex_proxy::SubstitutionConfig::default(),
         }
     }
 
@@ -2734,13 +2739,14 @@ async fn main() -> Result<()> {
             if supervisor.is_none() {
                 glue.spawn_initial_retry();
             }
-            let state = alex_proxy::build_state(
+            let state = alex_proxy::build_state_with_substitution(
                 config.local_key.clone(),
                 vault,
                 store,
                 dario_router,
                 daemon_connect_base_url(&host, port),
                 config.upstream_stream_idle_timeout(),
+                config.substitution.clone(),
             );
             alex_proxy::set_daemon_updater(
                 &state,
@@ -4806,6 +4812,13 @@ impl AmpWsTraceState {
             error_kind: None,
             error_code: None,
             error_class: None,
+            substituted: false,
+            original_model: None,
+            served_model: None,
+            substitution_reason: None,
+            attempts: None,
+            original_account_id: None,
+            served_account_id: None,
             account_id: self
                 .billing_account
                 .as_ref()
@@ -5589,6 +5602,13 @@ fn reconcile_agent_turn(
         error_kind: None,
         error_code: None,
         error_class: None,
+        substituted: false,
+        original_model: None,
+        served_model: None,
+        substitution_reason: None,
+        attempts: None,
+        original_account_id: None,
+        served_account_id: None,
         account_id: metadata
             .billing_account
             .as_ref()
@@ -9702,6 +9722,7 @@ mod tests {
             harness_overrides: BTreeMap::new(),
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            substitution: alex_proxy::SubstitutionConfig::default(),
         }
     }
 
@@ -10242,6 +10263,7 @@ mod tests {
             harness_overrides: BTreeMap::new(),
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            substitution: alex_proxy::SubstitutionConfig::default(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();
@@ -10262,6 +10284,21 @@ mod tests {
             .join("\n");
         let reloaded: Config = toml::from_str(&old_text).unwrap();
         assert!(reloaded.harness_overrides.is_empty());
+    }
+
+    #[test]
+    fn config_without_substitution_section_keeps_cross_model_fallbacks_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+host = "127.0.0.1"
+port = 4100
+data_dir = "/tmp/alex-config-test"
+local_key = "alx-test"
+"#,
+        )
+        .unwrap();
+        assert!(!config.substitution.enabled);
+        assert!(config.substitution.fallbacks.is_empty());
     }
 
     #[test]
