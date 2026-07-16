@@ -5132,6 +5132,7 @@ mod tests {
             harness_overrides: BTreeMap::new(),
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            substitution: alex_proxy::SubstitutionConfig::default(),
         }
     }
 

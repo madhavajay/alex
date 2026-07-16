@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -31,6 +31,7 @@ use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -46,6 +47,16 @@ const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
+
+/// Cross-model substitution is deliberately opt-in. Same-provider account
+/// failover is independent of this setting and remains enabled by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubstitutionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub fallbacks: BTreeMap<String, Vec<String>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct DarioActive {
@@ -232,6 +243,7 @@ pub struct AppState {
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    substitution: SubstitutionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +446,26 @@ pub fn build_state(
     base_url: String,
     upstream_stream_idle_timeout: Duration,
 ) -> Arc<AppState> {
+    build_state_with_substitution(
+        local_key,
+        vault,
+        store,
+        dario,
+        base_url,
+        upstream_stream_idle_timeout,
+        SubstitutionConfig::default(),
+    )
+}
+
+pub fn build_state_with_substitution(
+    local_key: String,
+    vault: Arc<Vault>,
+    store: Arc<Store>,
+    dario: Option<Arc<dyn DarioRouter>>,
+    base_url: String,
+    upstream_stream_idle_timeout: Duration,
+    substitution: SubstitutionConfig,
+) -> Arc<AppState> {
     // Import sidecars written by Vault::remove so a daemon restarted after a
     // terminal-side removal still exposes removed history to the Trace Browser.
     for removed in vault.removed_accounts() {
@@ -476,6 +508,7 @@ pub fn build_state(
         plugins: Arc::new(PluginManager::empty()),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
+        substitution,
     })
 }
 
@@ -3338,6 +3371,13 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
     let mut results = Vec::new();
     for provider in providers {
         let r = ping_provider(state, provider, models).await;
+        if r.ok {
+            if let Some(account_id) = r.account_id.as_deref() {
+                if let Err(error) = state.vault.clear_cooldown(account_id).await {
+                    tracing::warn!(%error, %account_id, "could not clear recovered account cooldown");
+                }
+            }
+        }
         if let Err(e) = state.store.insert_heartbeat(
             now_ms(),
             r.provider,
@@ -5685,11 +5725,53 @@ fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
     serde_json::to_string(&tags).ok()
 }
 
+fn reroutable_error_class(class: ErrorClass) -> bool {
+    matches!(class, ErrorClass::Capacity | ErrorClass::Server)
+}
+
+#[cfg(test)]
 fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-        || status.is_server_error()
+    reroutable_error_class(classify_error("unknown", Some(status.as_u16()), None))
+}
+
+fn no_substitute(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-alexandria-no-substitute")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1")
+}
+
+fn configured_fallback(
+    config: &SubstitutionConfig,
+    requested_model: &str,
+    current_model: &str,
+    attempted_models: &HashSet<String>,
+) -> Option<(Provider, String)> {
+    if !config.enabled {
+        return None;
+    }
+    config
+        .fallbacks
+        .get(requested_model)
+        .or_else(|| config.fallbacks.get(current_model))?
+        .iter()
+        .find_map(|candidate| {
+            (!attempted_models.contains(candidate)).then(|| route_model(candidate))
+        })
+        .and_then(|(provider, model)| provider.map(|provider| (provider, model)))
+}
+
+/// `Vault` deliberately has a degraded-mode selector for ordinary requests
+/// (it can pick the soonest-expiring cooldown when every account is down).
+/// A retry must not use that escape hatch: failover only moves to a genuinely
+/// ready, non-reserve-blocked account.
+fn retry_account_eligible(state: &AppState, account: &Account) -> bool {
+    let now = now_ms();
+    if account.cooldown_until_ms.is_some_and(|until| until > now) {
+        return false;
+    }
+    let policy = state.vault.policy(account.provider);
+    !routing_reserve_blocked(account, routing_reserve_pct(account, &policy), now / 1000)
 }
 
 fn retry_failover_allowed(
@@ -5884,6 +5966,7 @@ async fn proxy(
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
+    let substitution_disabled = no_substitute(&headers);
     if let Some(value) = headers
         .get("x-alexandria-simulate-error")
         .and_then(|value| value.to_str().ok())
@@ -5909,6 +5992,95 @@ async fn proxy(
         );
         trace.error = Some(format!("{kind}: {message}"));
         trace.tags = merge_trace_note(trace.tags.take(), "simulated", "true");
+        // Simulation deliberately never dispatches upstream traffic, but it
+        // follows the real account/model selection policy so failover can be
+        // tested with local or harness credentials alone.
+        let class = classify_error(provider.as_str(), Some(status), Some(&kind));
+        if reroutable_error_class(class) && !substitution_disabled {
+            let mut attempted_accounts = HashSet::new();
+            let mut attempted_models = HashSet::from([routed_model.clone()]);
+            let mut attempts = Vec::<Value>::new();
+            let mut current_provider = provider;
+            let mut current_model = routed_model.clone();
+            let prefer_oauth = format != ClientFormat::OpenaiChat;
+            let mut account = state
+                .vault
+                .account_for_excluding(current_provider, prefer_oauth, &attempted_accounts)
+                .await
+                .ok();
+            while let Some(current_account) = account {
+                attempted_accounts.insert(current_account.id.clone());
+                attempts.push(json!({"account_id": current_account.id, "model": current_model}));
+                let _ = state
+                    .vault
+                    .mark_cooldown(&current_account.id, now_ms() + 60_000)
+                    .await;
+                let next = state
+                    .vault
+                    .account_for_excluding(current_provider, prefer_oauth, &attempted_accounts)
+                    .await
+                    .ok()
+                    .filter(|candidate| {
+                        !attempted_accounts.contains(&candidate.id)
+                            && retry_account_eligible(&state, candidate)
+                    });
+                if let Some(next) = next {
+                    trace.substituted = true;
+                    trace
+                        .original_model
+                        .get_or_insert_with(|| requested_model.clone());
+                    trace
+                        .original_account_id
+                        .get_or_insert_with(|| current_account.id.clone());
+                    trace.substitution_reason = Some(class.as_str().into());
+                    trace.served_model = Some(current_model.clone());
+                    trace.served_account_id = Some(next.id.clone());
+                    bind_trace_account(&state.store, &mut trace, &next);
+                    account = Some(next);
+                    continue;
+                }
+                let Some((fallback_provider, fallback_model)) = configured_fallback(
+                    &state.substitution,
+                    &requested_model,
+                    &current_model,
+                    &attempted_models,
+                ) else {
+                    bind_trace_account(&state.store, &mut trace, &current_account);
+                    break;
+                };
+                current_provider = fallback_provider;
+                current_model = fallback_model;
+                attempted_models.insert(current_model.clone());
+                account = state
+                    .vault
+                    .account_for_excluding(
+                        current_provider,
+                        format != ClientFormat::OpenaiChat,
+                        &attempted_accounts,
+                    )
+                    .await
+                    .ok()
+                    .filter(|account| retry_account_eligible(&state, account));
+                if let Some(next) = account.as_ref() {
+                    trace.substituted = true;
+                    trace
+                        .original_model
+                        .get_or_insert_with(|| requested_model.clone());
+                    trace
+                        .original_account_id
+                        .get_or_insert_with(|| current_account.id.clone());
+                    trace.substitution_reason = Some(class.as_str().into());
+                    trace.served_model = Some(current_model.clone());
+                    trace.served_account_id = Some(next.id.clone());
+                    trace.routed_model = Some(current_model.clone());
+                    trace.upstream_provider = Some(current_provider.as_str().into());
+                    bind_trace_account(&state.store, &mut trace, next);
+                }
+            }
+            if trace.substituted {
+                trace.attempts = serde_json::to_string(&attempts).ok();
+            }
+        }
         trace.ts_response_ms = Some(now_ms());
         let response_body = simulated_error_body(format, status, &kind, &message);
         finalize_trace(&state, trace, &body, None, Some(&response_body));
@@ -5962,11 +6134,15 @@ async fn proxy(
 
     let original_body_json = body_json.clone();
     let mut attempted_accounts = HashSet::new();
+    let mut attempted_models = HashSet::from([routed_model.clone()]);
+    let mut attempt_records = Vec::<Value>::new();
+    let mut current_provider = provider;
+    let mut current_model = routed_model.clone();
     let mut plan = match plan_upstream(
         &state,
         format,
-        provider,
-        &routed_model,
+        current_provider,
+        &current_model,
         &mut body_json,
         &body,
         &trace_id,
@@ -6022,6 +6198,7 @@ async fn proxy(
             tracing::error!(account = %account.id, "refusing to retry an already-attempted account");
             break;
         }
+        attempt_records.push(json!({"account_id": plan.account.id, "model": current_model}));
 
         let mut forced_oauth_refresh = false;
         loop {
@@ -6096,7 +6273,15 @@ async fn proxy(
                 }
             }
 
-            if retryable_failover_status(resp.status()) && account.kind != "dario" {
+            let error_class = classify_error(
+                current_provider.as_str(),
+                Some(resp.status().as_u16()),
+                None,
+            );
+            if reroutable_error_class(error_class)
+                && !substitution_disabled
+                && account.kind != "dario"
+            {
                 let retry_after_s = resp
                     .headers()
                     .get("retry-after")
@@ -6114,7 +6299,7 @@ async fn proxy(
                 }
 
                 if !retry_failover_allowed(
-                    provider,
+                    current_provider,
                     codex_thread_was_affined,
                     allow_mid_thread_failover,
                 ) {
@@ -6131,8 +6316,8 @@ async fn proxy(
                 match plan_upstream(
                     &state,
                     format,
-                    provider,
-                    &routed_model,
+                    current_provider,
+                    &current_model,
                     &mut retry_body_json,
                     &body,
                     &trace_id,
@@ -6142,7 +6327,18 @@ async fn proxy(
                 )
                 .await
                 {
-                    Ok(next_plan) if !attempted_accounts.contains(&next_plan.account.id) => {
+                    Ok(next_plan)
+                        if !attempted_accounts.contains(&next_plan.account.id)
+                            && retry_account_eligible(&state, &next_plan.account) =>
+                    {
+                        trace.substituted = true;
+                        trace
+                            .original_model
+                            .get_or_insert_with(|| requested_model.clone());
+                        trace
+                            .original_account_id
+                            .get_or_insert_with(|| plan.account.id.clone());
+                        trace.substitution_reason = Some(error_class.as_str().into());
                         plan = next_plan;
                         account = plan
                             .connection_account
@@ -6152,6 +6348,8 @@ async fn proxy(
                         trace.upstream_format = Some(plan.upstream_format.into());
                         trace.via_dario = plan.via_dario;
                         trace.dario_generation = plan.dario_generation.clone();
+                        trace.served_model = Some(current_model.clone());
+                        trace.served_account_id = Some(plan.account.id.clone());
                         trace.billing_bucket = Some(
                             if account.kind == "oauth" || account.kind == "dario" {
                                 "subscription"
@@ -6180,6 +6378,74 @@ async fn proxy(
                         "no untried failover account available"
                     ),
                 }
+                if let Some((fallback_provider, fallback_model)) = configured_fallback(
+                    &state.substitution,
+                    &requested_model,
+                    &current_model,
+                    &attempted_models,
+                ) {
+                    let mut retry_body_json = original_body_json.clone();
+                    match plan_upstream(
+                        &state,
+                        format,
+                        fallback_provider,
+                        &fallback_model,
+                        &mut retry_body_json,
+                        &body,
+                        &trace_id,
+                        &attempted_accounts,
+                        affinity_session_id.as_deref(),
+                        &headers,
+                    )
+                    .await
+                    {
+                        Ok(next_plan)
+                            if !attempted_accounts.contains(&next_plan.account.id)
+                                && retry_account_eligible(&state, &next_plan.account) =>
+                        {
+                            trace.substituted = true;
+                            trace
+                                .original_model
+                                .get_or_insert_with(|| requested_model.clone());
+                            trace
+                                .original_account_id
+                                .get_or_insert_with(|| plan.account.id.clone());
+                            trace.substitution_reason = Some(error_class.as_str().into());
+                            current_provider = fallback_provider;
+                            current_model = fallback_model;
+                            attempted_models.insert(current_model.clone());
+                            plan = next_plan;
+                            account = plan
+                                .connection_account
+                                .clone()
+                                .unwrap_or_else(|| plan.account.clone());
+                            bind_trace_account(&state.store, &mut trace, &plan.account);
+                            trace.upstream_provider = Some(current_provider.as_str().into());
+                            trace.routed_model = Some(current_model.clone());
+                            trace.upstream_format = Some(plan.upstream_format.into());
+                            trace.via_dario = plan.via_dario;
+                            trace.dario_generation = plan.dario_generation.clone();
+                            trace.served_model = Some(current_model.clone());
+                            trace.served_account_id = Some(plan.account.id.clone());
+                            trace.billing_bucket = Some(
+                                if account.kind == "oauth" || account.kind == "dario" {
+                                    "subscription"
+                                } else {
+                                    "api"
+                                }
+                                .into(),
+                            );
+                            tracing::warn!(account = %account.id, model = %current_model, "retrying with configured model fallback");
+                            continue 'accounts;
+                        }
+                        Ok(next_plan) => {
+                            tracing::warn!(account = %next_plan.account.id, "configured fallback selected an attempted account")
+                        }
+                        Err((status, msg)) => {
+                            tracing::warn!(status = %status, error = %msg, model = %fallback_model, "configured fallback has no eligible account")
+                        }
+                    }
+                }
             }
 
             upstream_resp = Some(resp);
@@ -6187,6 +6453,11 @@ async fn proxy(
         }
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
+    if trace.substituted {
+        trace.served_model = Some(current_model.clone());
+        trace.served_account_id = Some(plan.account.id.clone());
+        trace.attempts = serde_json::to_string(&attempt_records).ok();
+    }
     bind_trace_account(&state.store, &mut trace, &plan.account);
 
     let status = upstream_resp.status();
@@ -7019,6 +7290,21 @@ mod tests {
 
     fn test_state(name: &str) -> Arc<AppState> {
         test_state_with_dario(name, None)
+    }
+
+    fn test_state_with_substitution(name: &str, substitution: SubstitutionConfig) -> Arc<AppState> {
+        let dir = tmpdir(name);
+        let store = Arc::new(Store::open(dir.join("store")).unwrap());
+        let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
+        build_state_with_substitution(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
+            substitution,
+        )
     }
 
     fn test_state_with_dario(name: &str, dario: Option<Arc<dyn DarioRouter>>) -> Arc<AppState> {
@@ -8068,6 +8354,28 @@ mod tests {
         }
     }
 
+    fn test_api_account(id: &str, provider: Provider) -> Account {
+        Account {
+            id: id.into(),
+            provider,
+            kind: "api_key".into(),
+            name: id.into(),
+            description: None,
+            paused: false,
+            label: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+            api_key: Some(format!("secret-{id}")),
+            expires_at_ms: None,
+            last_refresh_ms: None,
+            account_meta: Value::Null,
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
     #[test]
     fn codex_affinity_cache_expires_and_evicts_oldest_session() {
         let mut cache = CodexAffinityCache {
@@ -9019,6 +9327,153 @@ mod tests {
         );
     }
 
+    async fn simulated_capacity_request(state: Arc<AppState>, no_substitute: bool) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("429:rate_limit_error"),
+        );
+        if no_substitute {
+            headers.insert("x-alexandria-no-substitute", HeaderValue::from_static("1"));
+        }
+        proxy(
+            state,
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simulated_capacity_rotates_to_a_second_account_and_records_the_attempts() {
+        let state = test_state("simulated-account-failover");
+        state
+            .vault
+            .upsert(test_api_account("openai-a", Provider::Openai))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-b", Provider::Openai))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulated_capacity_request(state.clone(), false)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["original_model"], "gpt-5.5");
+        assert_eq!(trace["served_model"], "gpt-5.5");
+        assert_eq!(trace["original_account_id"], "openai-a");
+        assert_eq!(trace["served_account_id"], "openai-b");
+        assert_eq!(trace["substitution_reason"], "capacity");
+        assert_eq!(trace["attempts"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn simulated_capacity_with_only_one_account_passes_through_when_cross_model_is_disabled()
+    {
+        let state = test_state("simulated-single-account");
+        state
+            .vault
+            .upsert(test_api_account("openai-only", Provider::Openai))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulated_capacity_request(state.clone(), false)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], false);
+        assert_eq!(trace["error_class"], "capacity");
+    }
+
+    #[tokio::test]
+    async fn simulated_cross_model_fallback_requires_explicit_configuration() {
+        let mut substitution = SubstitutionConfig {
+            enabled: true,
+            fallbacks: BTreeMap::new(),
+        };
+        substitution
+            .fallbacks
+            .insert("gpt-5.5".into(), vec!["claude-sonnet-5".into()]);
+        let state = test_state_with_substitution("simulated-cross-model", substitution);
+        state
+            .vault
+            .upsert(test_api_account("openai-only", Provider::Openai))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("anthropic-fallback", Provider::Anthropic))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulated_capacity_request(state.clone(), false)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["original_model"], "gpt-5.5");
+        assert_eq!(trace["served_model"], "claude-sonnet-5");
+        assert_eq!(trace["served_account_id"], "anthropic-fallback");
+    }
+
+    #[tokio::test]
+    async fn no_substitute_header_forces_the_simulated_error_to_pass_through() {
+        let state = test_state("simulated-no-substitute");
+        state
+            .vault
+            .upsert(test_api_account("openai-a", Provider::Openai))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-b", Provider::Openai))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulated_capacity_request(state.clone(), true)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["attempts"].is_null());
+    }
+
     #[tokio::test]
     async fn simulation_rejects_non_harness_run_keys() {
         let state = test_state("simulate-error-run-key-gate");
@@ -9141,10 +9596,8 @@ mod tests {
     }
 
     #[test]
-    fn failover_statuses_are_limited_to_auth_rate_limit_and_server_errors() {
+    fn failover_statuses_are_limited_to_capacity_and_server_errors() {
         for status in [
-            reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::FORBIDDEN,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             reqwest::StatusCode::BAD_GATEWAY,
@@ -9157,6 +9610,8 @@ mod tests {
         }
         for status in [
             reqwest::StatusCode::OK,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
             reqwest::StatusCode::BAD_REQUEST,
             reqwest::StatusCode::NOT_FOUND,
             reqwest::StatusCode::UNPROCESSABLE_ENTITY,
