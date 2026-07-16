@@ -27,6 +27,7 @@ tracing = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

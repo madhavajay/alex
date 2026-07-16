@@ -126,6 +126,11 @@ enum Command {
         #[command(subcommand)]
         command: DarioCommand,
     },
+    /// Inspect configured notification channels or send a synthetic test alert
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommand,
+    },
     /// Show subscription plans, limit-window utilization, and reset times
     Limits {
         #[arg(long)]
@@ -350,6 +355,17 @@ enum DarioCommand {
     Update,
     /// Discover Node and Claude, save their paths, and start a fresh generation
     Fix,
+}
+
+#[derive(Subcommand)]
+enum NotifyCommand {
+    /// List configured channels (webhook URLs and tokens are redacted)
+    List,
+    /// Send a synthetic event through every channel or one channel index
+    Test {
+        #[arg(long)]
+        channel: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -864,6 +880,14 @@ struct Config {
     /// this: it is always enabled for reroutable capacity/server failures.
     #[serde(default)]
     substitution: alex_proxy::SubstitutionConfig,
+    /// One-way notification channels. URLs may contain tokens and are never
+    /// returned by the daemon admin API.
+    #[serde(default)]
+    notifications: Vec<alex_proxy::notify::NotificationChannelConfig>,
+    #[serde(default = "alex_proxy::notify::default_cooldown_seconds")]
+    notification_cooldown_seconds: u64,
+    #[serde(default = "alex_proxy::notify::default_timeout_seconds")]
+    notification_timeout_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -1062,6 +1086,9 @@ impl Config {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            notifications: Vec::new(),
+            notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
+            notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
         }
     }
 
@@ -1072,6 +1099,14 @@ impl Config {
             xai: self.ping_xai_model.clone(),
             gemini: self.ping_gemini_model.clone(),
             openrouter: self.ping_openrouter_model.clone(),
+        }
+    }
+
+    fn notification_settings(&self) -> alex_proxy::notify::NotificationSettings {
+        alex_proxy::notify::NotificationSettings {
+            channels: self.notifications.clone(),
+            cooldown_seconds: self.notification_cooldown_seconds,
+            timeout_seconds: self.notification_timeout_seconds,
         }
     }
 
@@ -2748,6 +2783,7 @@ async fn main() -> Result<()> {
                 config.upstream_stream_idle_timeout(),
                 config.substitution.clone(),
             );
+            alex_proxy::set_notifications(&state, config.notification_settings());
             alex_proxy::set_daemon_updater(
                 &state,
                 Arc::new(SelfUpdateApplier {
@@ -3772,6 +3808,31 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Notify { command } => match command {
+            NotifyCommand::List => {
+                let response = daemon_get(&config, "/admin/notifications", &[]).await?;
+                let body: serde_json::Value = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            NotifyCommand::Test { channel } => {
+                let body = Some(
+                    channel
+                        .map(|channel| json!({"channel": channel}))
+                        .unwrap_or_else(|| json!({})),
+                );
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/notifications/test",
+                    body,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("notification test request failed: {status}");
+                }
+            }
+        },
         Command::Keys { command } => match command {
             KeysCommand::Mint {
                 kind,
@@ -9723,6 +9784,9 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            notifications: Vec::new(),
+            notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
+            notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
         }
     }
 
@@ -10264,6 +10328,9 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            notifications: Vec::new(),
+            notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
+            notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&text).unwrap();
@@ -10274,16 +10341,30 @@ mod tests {
     }
 
     #[test]
-    fn config_old_toml_defaults_harness_overrides() {
+    fn config_old_toml_defaults_new_collection_and_notification_fields() {
         let config = test_config(tmpdir("old-config"));
         let text = toml::to_string_pretty(&config).unwrap();
         let old_text = text
             .lines()
-            .filter(|line| !line.starts_with("harness_overrides"))
+            .filter(|line| {
+                !line.starts_with("harness_overrides")
+                    && !line.starts_with("notifications")
+                    && !line.starts_with("notification_cooldown_seconds")
+                    && !line.starts_with("notification_timeout_seconds")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let reloaded: Config = toml::from_str(&old_text).unwrap();
         assert!(reloaded.harness_overrides.is_empty());
+        assert!(reloaded.notifications.is_empty());
+        assert_eq!(
+            reloaded.notification_cooldown_seconds,
+            alex_proxy::notify::default_cooldown_seconds()
+        );
+        assert_eq!(
+            reloaded.notification_timeout_seconds,
+            alex_proxy::notify::default_timeout_seconds()
+        );
     }
 
     #[test]
