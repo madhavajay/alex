@@ -2660,11 +2660,23 @@ public struct DarioAdminStatus: Codable, Sendable {
     public let activeGenerationId: String?
     public let generations: [DarioGenerationDetail]
     public let promptCaches: [DarioPromptCacheSummary]?
+    public let shouldBeHealthy: Bool?
+    public let issue: DarioIssue?
+    public let resolvedNodeBin: String?
+    public let resolvedClaudeBin: String?
+    public let runtimeVersion: String?
+    public let routeEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case generations
         case promptCaches = "prompt_caches"
         case activeGenerationId = "active_generation_id"
+        case shouldBeHealthy = "should_be_healthy"
+        case issue
+        case resolvedNodeBin = "resolved_node_bin"
+        case resolvedClaudeBin = "resolved_claude_bin"
+        case runtimeVersion = "runtime_version"
+        case routeEnabled = "route_enabled"
     }
 }
 

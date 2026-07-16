@@ -280,7 +280,7 @@ import Testing
 @Suite struct DarioModelsTests {
     @Test func adminStatusDecoding() throws {
         let json = #"""
-        {"active_generation_id":"gen-4.8.139-64986","generations":[{"consecutive_failures":0,"drain_started_at":null,"id":"gen-4.8.139-64986","in_flight":2,"last_activity_ms":1783488812322,"last_probe":{"at_ms":1783488905120,"error":null,"latency_ms":956,"ok":true,"status":null},"phase":"ready","pid":84167,"port":64986,"promoted_at":1783488814161,"started_at":1783488812322,"state":"active","stderr_log":"/x/gen.err.log","stdout_log":"/x/gen.out.log","version":"4.8.139"}]}
+        {"active_generation_id":"gen-4.8.139-64986","should_be_healthy":true,"issue":null,"resolved_node_bin":"/opt/homebrew/bin/node","resolved_claude_bin":"/opt/homebrew/bin/claude","runtime_version":"v22.14.0","route_enabled":true,"prompt_caches":[{"key":"cache-1","model":"claude-sonnet-4-5","source":"trace"}],"generations":[{"consecutive_failures":0,"drain_started_at":null,"id":"gen-4.8.139-64986","in_flight":2,"last_activity_ms":1783488812322,"last_probe":{"at_ms":1783488905120,"error":null,"latency_ms":956,"ok":true,"status":null},"phase":"ready","pid":84167,"port":64986,"promoted_at":1783488814161,"started_at":1783488812322,"state":"active","stderr_log":"/x/gen.err.log","stdout_log":"/x/gen.out.log","version":"4.8.139"}]}
         """#
         let status = try JSONDecoder().decode(DarioAdminStatus.self, from: Data(json.utf8))
         #expect(status.activeGenerationId == "gen-4.8.139-64986")
@@ -300,6 +300,13 @@ import Testing
         #expect(gen.lastProbe?.ok == true)
         #expect(gen.lastProbe?.latencyMs == 956)
         #expect(gen.lastProbe?.status == nil)
+        #expect(status.shouldBeHealthy == true)
+        #expect(status.issue == nil)
+        #expect(status.resolvedNodeBin == "/opt/homebrew/bin/node")
+        #expect(status.resolvedClaudeBin == "/opt/homebrew/bin/claude")
+        #expect(status.runtimeVersion == "v22.14.0")
+        #expect(status.routeEnabled == true)
+        #expect(status.promptCaches?.first?.model == "claude-sonnet-4-5")
     }
 
     @Test func logsDecoding() throws {

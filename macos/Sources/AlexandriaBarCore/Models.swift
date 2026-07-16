@@ -490,11 +490,31 @@ public struct ModelAnalytics: Codable, Sendable {
 public struct DarioStatus: Codable, Sendable {
     public let activeGenerationId: String?
     public let generations: [DarioGeneration]
+    public let promptCaches: [DarioPromptCacheSummary]?
+    public let shouldBeHealthy: Bool?
+    public let issue: DarioIssue?
+    public let resolvedNodeBin: String?
+    public let resolvedClaudeBin: String?
+    public let runtimeVersion: String?
+    public let routeEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case activeGenerationId = "active_generation_id"
         case generations
+        case promptCaches = "prompt_caches"
+        case shouldBeHealthy = "should_be_healthy"
+        case issue
+        case resolvedNodeBin = "resolved_node_bin"
+        case resolvedClaudeBin = "resolved_claude_bin"
+        case runtimeVersion = "runtime_version"
+        case routeEnabled = "route_enabled"
     }
+}
+
+public struct DarioIssue: Codable, Sendable, Equatable {
+    public let code: String
+    public let message: String
+    public let fixable: Bool
 }
 
 public struct DarioGeneration: Codable, Sendable, Identifiable {

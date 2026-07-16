@@ -174,12 +174,20 @@ import Testing
 
     @Test func dario() throws {
         let json = #"""
-        {"active_generation_id":"gen-4.8.139-61993","generations":[{"consecutive_failures":0,"drain_started_at":null,"id":"gen-4.8.139-61993","in_flight":0,"last_activity_ms":1783476977580,"last_probe":{"at_ms":1783477427269,"error":null,"latency_ms":1410,"ok":true,"status":null},"phase":"ready","pid":80392,"port":61993,"promoted_at":1783476975856,"started_at":1783476973704,"state":"active","stderr_log":"/x.log","stdout_log":"/y.log","version":"4.8.139"}]}
+        {"active_generation_id":"gen-4.8.139-61993","should_be_healthy":true,"issue":{"code":"node_missing","message":"cannot find Node runtime","fixable":true},"resolved_node_bin":"/opt/homebrew/bin/node","resolved_claude_bin":"/usr/local/bin/claude","runtime_version":"v22.14.0","route_enabled":true,"prompt_caches":[{"key":"cache-1","model":"claude-sonnet-4-5"}],"generations":[{"consecutive_failures":0,"drain_started_at":null,"id":"gen-4.8.139-61993","in_flight":0,"last_activity_ms":1783476977580,"last_probe":{"at_ms":1783477427269,"error":null,"latency_ms":1410,"ok":true,"status":null},"phase":"ready","pid":80392,"port":61993,"promoted_at":1783476975856,"started_at":1783476973704,"state":"active","stderr_log":"/x.log","stdout_log":"/y.log","version":"4.8.139"}]}
         """#
         let dario = try decode(json, as: DarioStatus.self)
         #expect(dario.activeGenerationId == "gen-4.8.139-61993")
         #expect(dario.generations[0].phase == "ready")
         #expect(dario.generations[0].lastProbe?.ok == true)
+        #expect(dario.shouldBeHealthy == true)
+        #expect(dario.issue?.code == "node_missing")
+        #expect(dario.issue?.fixable == true)
+        #expect(dario.resolvedNodeBin == "/opt/homebrew/bin/node")
+        #expect(dario.resolvedClaudeBin == "/usr/local/bin/claude")
+        #expect(dario.runtimeVersion == "v22.14.0")
+        #expect(dario.routeEnabled == true)
+        #expect(dario.promptCaches?.first?.model == "claude-sonnet-4-5")
     }
 
     @Test func daemonUpdateStatus() throws {
