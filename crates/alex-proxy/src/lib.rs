@@ -1725,6 +1725,11 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                 state.vault.list().await.into_iter().any(|account| {
                     account.provider == Provider::Anthropic && account.status == "active"
                 });
+            let anthropic_oauth_present = state.vault.list().await.into_iter().any(|account| {
+                account.provider == Provider::Anthropic
+                    && account.status == "active"
+                    && account.kind == "oauth"
+            });
             let generation_ready = d.active().is_some();
             let probe_succeeds =
                 status["generations"]
@@ -1736,6 +1741,8 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                             && generation["last_probe"]["ok"].as_bool() == Some(true)
                     });
             let prompt_cache_degraded = !status["health_reason"].is_null();
+            let should_be_healthy =
+                status["route_enabled"].as_bool().unwrap_or(false) && anthropic_oauth_present;
             if let Some(obj) = status.as_object_mut() {
                 obj.insert("prompt_caches".into(), json!(dario_prompt_caches(&state)));
                 let generation_health = dario_health_state(
@@ -1754,6 +1761,13 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                     "anthropic_credentials_present".into(),
                     json!(anthropic_credentials_present),
                 );
+                obj.insert("should_be_healthy".into(), json!(should_be_healthy));
+                if !anthropic_oauth_present {
+                    obj.insert(
+                        "issue".into(),
+                        json!({"code": "no_anthropic_creds", "message": "no active Anthropic OAuth credentials", "fixable": false}),
+                    );
+                }
                 obj.insert("ping_path".into(), json!("/admin/dario/ping"));
             }
             axum::Json(status).into_response()

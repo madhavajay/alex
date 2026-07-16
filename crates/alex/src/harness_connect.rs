@@ -4935,6 +4935,7 @@ mod tests {
             dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
+            dario_node_path: None,
             dario_update_check_minutes: crate::default_dario_update_minutes(),
             dario_version: None,
             dario_probe_seconds: crate::default_dario_probe_seconds(),

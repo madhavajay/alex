@@ -78,6 +78,7 @@ fn dario_request_decision(
     }
 }
 
+#[derive(Clone)]
 pub struct DarioSettings {
     pub install_root: PathBuf,
     pub log_root: PathBuf,
@@ -93,6 +94,9 @@ pub struct DarioSettings {
     /// Resolved by the daemon before it starts the child. This avoids relying
     /// on a service manager's deliberately minimal PATH.
     pub claude_bin: Option<PathBuf>,
+    /// Resolved before start for the same service-manager PATH reason as
+    /// `claude_bin`. Kept here rather than re-looking it up in the child.
+    pub node_bin: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -404,7 +408,7 @@ pub async fn bootstrap(
     install_root: PathBuf,
     version_pin: Option<String>,
 ) -> Result<BootstrapResult> {
-    let runtime = find_node_runtime().await?;
+    let runtime = find_node_runtime(None).await?;
     tokio::fs::create_dir_all(&install_root)
         .await
         .with_context(|| format!("creating {install_root:?}"))?;
@@ -550,12 +554,14 @@ fn package_managers() -> Vec<PackageManager> {
     .collect()
 }
 
-async fn find_node_runtime() -> Result<JavascriptRuntime> {
-    let bin = find_on_path("node").ok_or_else(|| {
-        anyhow!(
-            "Dario requires Node.js 18 or newer at runtime; install Node.js (npm, pnpm, or Bun may be used to install the package)"
-        )
+async fn find_node_runtime(override_bin: Option<&Path>) -> Result<JavascriptRuntime> {
+    let bin = resolve_dario_node_bin(override_bin).ok_or_else(|| {
+        anyhow!("cannot find Node runtime — install Node.js or set dario_node_path")
     })?;
+    node_runtime(&bin).await
+}
+
+async fn node_runtime(bin: &Path) -> Result<JavascriptRuntime> {
     let output = Command::new(&bin)
         .arg("--version")
         .stdin(Stdio::null())
@@ -576,7 +582,127 @@ async fn find_node_runtime() -> Result<JavascriptRuntime> {
         major >= 18,
         "Dario requires Node.js 18 or newer; found {version} at {bin:?}"
     );
-    Ok(JavascriptRuntime { bin, version })
+    Ok(JavascriptRuntime {
+        bin: bin.to_path_buf(),
+        version,
+    })
+}
+
+/// Find a usable Node runtime even when a launchd/systemd service has a
+/// deliberately small PATH. An explicit path is authoritative, while all
+/// discovered candidates must run Node 18 or newer.
+pub fn resolve_dario_node_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = override_bin {
+        return usable_node(path).then(|| path.to_path_buf());
+    }
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("ALEXANDRIA_NODE_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = find_on_path("node") {
+        candidates.push(path);
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.extend(newest_versioned_bins(
+            &home.join(".nvm/versions/node"),
+            "node",
+        ));
+        candidates.extend(newest_versioned_bins(
+            &home.join(".local/share/fnm"),
+            "node",
+        ));
+        candidates.extend(newest_versioned_bins(&home.join(".fnm"), "node"));
+        candidates.push(home.join(".volta/bin/node"));
+        candidates.extend(newest_versioned_bins(
+            &home.join(".local/share/mise/installs/node"),
+            "node",
+        ));
+        candidates.extend(newest_versioned_bins(
+            &home.join(".asdf/installs/nodejs"),
+            "node",
+        ));
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+        PathBuf::from("/usr/bin/node"),
+    ]);
+    candidates.into_iter().find(|path| usable_node(path))
+}
+
+fn usable_node(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8(out.stdout).ok().and_then(|version| {
+                version
+                    .trim()
+                    .trim_start_matches('v')
+                    .split('.')
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .is_some_and(|major| major >= 18)
+}
+
+/// Return candidates grouped from newest install-version to oldest. Version
+/// manager layouts differ, so descend a small bounded tree and use the
+/// nearest version-looking ancestor as the sort key.
+fn newest_versioned_bins(root: &Path, binary: &str) -> Vec<PathBuf> {
+    fn visit(dir: &Path, binary: &str, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 5 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, binary, depth + 1, out);
+            } else if entry.file_name() == binary
+                && path
+                    .parent()
+                    .is_some_and(|p| p.file_name().is_some_and(|n| n == "bin"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, binary, 0, &mut out);
+    out.sort_by(|a, b| node_path_version(b).cmp(&node_path_version(a)));
+    out
+}
+
+/// Shared with Claude discovery in the daemon glue. The candidates are sorted
+/// newest-first, but callers remain responsible for validating their binary.
+pub fn newest_versioned_bins_for_cli(root: &Path, binary: &str) -> Vec<PathBuf> {
+    newest_versioned_bins(root, binary)
+}
+
+fn node_path_version(path: &Path) -> Vec<u64> {
+    path.ancestors()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .find_map(|part| {
+            let trimmed = part.trim_start_matches('v');
+            let parts = trimmed
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            (parts.len() >= 2).then_some(parts)
+        })
+        .unwrap_or_default()
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -635,7 +761,7 @@ impl DarioSupervisor {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("building http client")?;
-        let runtime = find_node_runtime().await?;
+        let runtime = find_node_runtime(settings.node_bin.as_deref()).await?;
         let supervisor = Arc::new(Self {
             settings,
             runtime,
@@ -653,10 +779,7 @@ impl DarioSupervisor {
         let _ = supervisor.weak_self.set(Arc::downgrade(&supervisor));
         supervisor.reap_orphans();
         let version = supervisor.resolve_version().await?;
-        supervisor
-            .roll(&version)
-            .await
-            .context("starting initial dario generation")?;
+        supervisor.roll(&version).await?;
         supervisor.spawn_reaper();
         if supervisor.settings.update_check_minutes > 0 {
             supervisor.spawn_update_loop();

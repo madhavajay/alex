@@ -320,6 +320,8 @@ enum DarioCommand {
     Restart,
     /// Check npm for a newer version and roll if found
     Update,
+    /// Discover Node and Claude, save their paths, and start a fresh generation
+    Fix,
 }
 
 #[derive(Subcommand)]
@@ -796,6 +798,10 @@ struct Config {
     /// Explicit real Claude Code executable for Dario prompt capture.
     #[serde(default)]
     dario_claude_bin: Option<PathBuf>,
+    /// Explicit Node runtime for Dario. Persisted by `alex dario fix` so a
+    /// daemon started by launchd/systemd does not depend on its PATH.
+    #[serde(default)]
+    dario_node_path: Option<PathBuf>,
     #[serde(default = "default_dario_update_minutes")]
     dario_update_check_minutes: u64,
     #[serde(default)]
@@ -943,6 +949,18 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/bin/claude"));
+        // Claude Code is commonly installed adjacent to a version-manager
+        // Node installation, not just in ~/.local/bin.
+        for root in [
+            home.join(".nvm/versions/node"),
+            home.join(".local/share/fnm"),
+            home.join(".fnm"),
+            home.join(".local/share/mise/installs/node"),
+            home.join(".asdf/installs/nodejs"),
+        ] {
+            candidates.extend(dario::newest_versioned_bins_for_cli(&root, "claude"));
+        }
+        candidates.push(home.join(".volta/bin/claude"));
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/claude"),
@@ -997,6 +1015,7 @@ impl Config {
             dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
+            dario_node_path: None,
             dario_update_check_minutes: default_dario_update_minutes(),
             dario_version: None,
             dario_probe_seconds: default_dario_probe_seconds(),
@@ -1334,11 +1353,167 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
 }
 
 struct DarioGlue {
-    supervisor: Arc<dario::DarioSupervisor>,
+    supervisor: Arc<std::sync::RwLock<Option<Arc<dario::DarioSupervisor>>>>,
+    settings: Arc<std::sync::RwLock<dario::DarioSettings>>,
+    config: Arc<std::sync::Mutex<Config>>,
     route_enabled: bool,
     routing_mode: String,
     routing_reason: String,
-    bootstrap_error: Option<String>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+fn dario_issue(error: &str) -> serde_json::Value {
+    let (code, message) = if error.contains("cannot find Node runtime") {
+        (
+            "node_not_found",
+            "cannot find Node runtime — install Node.js or set dario_node_path",
+        )
+    } else if error.contains("claude binary not found") {
+        (
+            "claude_not_found",
+            "cannot find Claude Code — install claude or set dario_claude_bin",
+        )
+    } else if error.contains("Anthropic") && error.contains("credential") {
+        (
+            "no_anthropic_creds",
+            "no active Anthropic OAuth credentials",
+        )
+    } else {
+        ("generation_failed", error)
+    };
+    serde_json::json!({"code": code, "message": message, "fixable": code != "no_anthropic_creds"})
+}
+
+impl DarioGlue {
+    fn clone_for_async(&self) -> Self {
+        Self {
+            supervisor: self.supervisor.clone(),
+            settings: self.settings.clone(),
+            config: self.config.clone(),
+            route_enabled: self.route_enabled,
+            routing_mode: self.routing_mode.clone(),
+            routing_reason: self.routing_reason.clone(),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    fn supervisor(&self) -> Option<Arc<dario::DarioSupervisor>> {
+        self.supervisor.read().unwrap().clone()
+    }
+
+    fn unavailable_status(&self) -> serde_json::Value {
+        let settings = self.settings.read().unwrap();
+        let error = self
+            .last_error
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "Dario generation has not started".into());
+        serde_json::json!({
+            "configured": true,
+            "available": false,
+            "runtime": serde_json::Value::Null,
+            "runtime_version": serde_json::Value::Null,
+            "runtime_path": serde_json::Value::Null,
+            "resolved_node_bin": settings.node_bin,
+            "resolved_claude_bin": settings.claude_bin,
+            "claude_bin": settings.claude_bin,
+            "route_enabled": self.route_enabled,
+            "routing_mode": self.routing_mode,
+            "routing_reason": self.routing_reason,
+            "health": "down",
+            "health_reason": error,
+            "issue": dario_issue(&error),
+            "active_generation_id": serde_json::Value::Null,
+            "generations": [],
+            "error": error,
+        })
+    }
+
+    async fn retry_start(&self) -> Result<Arc<dario::DarioSupervisor>, String> {
+        if let Some(sup) = self.supervisor() {
+            return Ok(sup);
+        }
+        let mut settings = self.settings.read().unwrap().clone();
+        // Re-resolve each retry: Node/Claude might have been installed after
+        // the daemon began, and launchd/systemd PATH remains irrelevant.
+        settings.node_bin =
+            dario::resolve_dario_node_bin(self.config.lock().unwrap().dario_node_path.as_deref());
+        settings.claude_bin =
+            resolve_dario_claude_bin(self.config.lock().unwrap().dario_claude_bin.as_deref());
+        match dario::DarioSupervisor::start(settings.clone()).await {
+            Ok(sup) => {
+                *self.settings.write().unwrap() = settings;
+                *self.supervisor.write().unwrap() = Some(sup.clone());
+                *self.last_error.lock().unwrap() = None;
+                Ok(sup)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                *self.settings.write().unwrap() = settings;
+                *self.last_error.lock().unwrap() = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn spawn_initial_retry(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(glue) = weak.upgrade() else { break };
+                if glue.supervisor().is_some() {
+                    break;
+                }
+                if let Err(error) = glue.retry_start().await {
+                    tracing::warn!(%error, "Dario initial generation retry failed");
+                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                } else {
+                    tracing::info!("Dario initial generation retry succeeded");
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn repair(&self) -> serde_json::Value {
+        let node = dario::resolve_dario_node_bin(None);
+        let claude = resolve_dario_claude_bin(None);
+        let Some(node) = node else {
+            return serde_json::json!({"fixed": false, "node_bin": null, "claude_bin": claude, "fixable": true, "message": "cannot find Node runtime — install Node.js or set dario_node_path"});
+        };
+        let Some(claude) = claude else {
+            return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": null, "fixable": true, "message": "cannot find Claude Code — install claude or set dario_claude_bin"});
+        };
+        {
+            let mut config = self.config.lock().unwrap();
+            config.dario_node_path = Some(node.clone());
+            config.dario_claude_bin = Some(claude.clone());
+            if let Err(error) = save_config(&config) {
+                return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": claude, "fixable": true, "message": format!("found Dario runtimes but could not save config: {error}")});
+            }
+        }
+        if let Some(sup) = self.supervisor() {
+            match sup.ensure_active().await {
+                Ok(active) => {
+                    return serde_json::json!({"fixed": true, "node_bin": node, "claude_bin": claude, "message": format!("saved Dario runtime paths; generation {} is ready", active.generation_id)})
+                }
+                Err(error) => {
+                    return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": claude, "fixable": true, "message": error})
+                }
+            }
+        }
+        match self.retry_start().await {
+            Ok(sup) => {
+                serde_json::json!({"fixed": sup.active().is_some(), "node_bin": node, "claude_bin": claude, "message": "saved Dario runtime paths and started a fresh generation"})
+            }
+            Err(error) => {
+                serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": claude, "fixable": true, "message": format!("saved Dario runtime paths but generation failed to start: {error}")})
+            }
+        }
+    }
 }
 
 impl alex_proxy::DarioRouter for DarioGlue {
@@ -1347,17 +1522,20 @@ impl alex_proxy::DarioRouter for DarioGlue {
     }
 
     fn active(&self) -> Option<alex_proxy::DarioActive> {
-        self.supervisor.active().map(|a| alex_proxy::DarioActive {
-            generation_id: a.generation_id,
-            base_url: a.base_url,
-            api_key: a.api_key,
-        })
+        self.supervisor()?
+            .active()
+            .map(|a| alex_proxy::DarioActive {
+                generation_id: a.generation_id,
+                base_url: a.base_url,
+                api_key: a.api_key,
+            })
     }
 
     fn ensure_active(&self) -> alex_proxy::DarioEnsureFuture {
-        let supervisor = self.supervisor.clone();
+        let glue = self.clone_for_async();
         Box::pin(async move {
-            supervisor
+            glue.retry_start()
+                .await?
                 .ensure_active()
                 .await
                 .map(|a| alex_proxy::DarioActive {
@@ -1369,101 +1547,64 @@ impl alex_proxy::DarioRouter for DarioGlue {
     }
 
     fn begin(&self, generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
-        self.supervisor
+        self.supervisor()?
             .begin_request(generation_id)
             .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
     }
 
     fn prepare_model(&self, model: &str) -> alex_proxy::DarioPrepareFuture {
-        let supervisor = self.supervisor.clone();
+        let supervisor = self.supervisor();
         let model = model.to_string();
         Box::pin(async move {
-            match supervisor.prepare_model(&model).await {
-                Some(reason) => alex_proxy::DarioPrepare::DirectFallback { reason },
-                None => alex_proxy::DarioPrepare::ServeThroughDario,
+            match supervisor {
+                Some(supervisor) => match supervisor.prepare_model(&model).await {
+                    Some(reason) => alex_proxy::DarioPrepare::DirectFallback { reason },
+                    None => alex_proxy::DarioPrepare::ServeThroughDario,
+                },
+                None => alex_proxy::DarioPrepare::Unavailable {
+                    reason: "no healthy Dario generation".into(),
+                },
             }
         })
     }
 
     fn probe(&self, model: &str) -> alex_proxy::DarioProbeFuture {
-        let supervisor = self.supervisor.clone();
+        let supervisor = self.supervisor();
         let model = model.to_string();
-        Box::pin(async move { supervisor.through_dario_probe(&model).await })
+        Box::pin(async move {
+            supervisor
+                .ok_or_else(|| "no healthy Dario generation".to_string())?
+                .through_dario_probe(&model)
+                .await
+        })
     }
 
     fn status(&self) -> serde_json::Value {
-        let mut status = self.supervisor.status();
+        let Some(sup) = self.supervisor() else {
+            return self.unavailable_status();
+        };
+        let mut status = sup.status();
         status["route_enabled"] = serde_json::json!(self.route_enabled);
         status["routing_mode"] = serde_json::json!(self.routing_mode);
         status["routing_reason"] = serde_json::json!(self.routing_reason);
-        if let Some(error) = &self.bootstrap_error {
-            status["health"] = serde_json::json!("degraded");
-            status["health_reason"] =
-                serde_json::json!(format!("startup bootstrap failed: {error}"));
-        }
+        status["resolved_node_bin"] = status["runtime_path"].clone();
+        status["resolved_claude_bin"] = status["claude_bin"].clone();
+        status["issue"] = status["health_reason"]
+            .as_str()
+            .map(dario_issue)
+            .unwrap_or(serde_json::Value::Null);
         status
     }
 
     fn suspect(&self, generation_id: &str) {
-        self.supervisor.suspect(generation_id);
+        if let Some(sup) = self.supervisor() {
+            sup.suspect(generation_id);
+        }
     }
-}
-
-struct DarioUnavailable {
-    error: String,
-    route_enabled: bool,
-    routing_mode: String,
-    routing_reason: String,
-}
-
-impl alex_proxy::DarioRouter for DarioUnavailable {
-    fn routes_requests(&self) -> bool {
-        self.route_enabled
-    }
-
-    fn active(&self) -> Option<alex_proxy::DarioActive> {
-        None
-    }
-
-    fn ensure_active(&self) -> alex_proxy::DarioEnsureFuture {
-        let error = self.error.clone();
-        Box::pin(async move { Err(error) })
-    }
-
-    fn begin(&self, _generation_id: &str) -> Option<Box<dyn std::any::Any + Send>> {
-        None
-    }
-
-    fn prepare_model(&self, _model: &str) -> alex_proxy::DarioPrepareFuture {
-        let error = self.error.clone();
-        Box::pin(async move { alex_proxy::DarioPrepare::Unavailable { reason: error } })
-    }
-
-    fn probe(&self, _model: &str) -> alex_proxy::DarioProbeFuture {
-        let error = self.error.clone();
-        Box::pin(async move { Err(error) })
-    }
-
-    fn status(&self) -> serde_json::Value {
-        serde_json::json!({
-            "configured": true,
-            "available": false,
-            "route_enabled": self.route_enabled,
-            "routing_mode": self.routing_mode,
-            "routing_reason": self.routing_reason,
-            "health": "down",
-            "health_reason": self.error,
-            "active_generation_id": null,
-            "generations": [],
-            "error": self.error,
-        })
-    }
-
-    fn suspect(&self, _generation_id: &str) {}
 }
 
 fn dario_admin_router(
-    sup: Arc<dario::DarioSupervisor>,
+    glue: Arc<DarioGlue>,
     local_key: Arc<std::sync::RwLock<String>>,
 ) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
@@ -1510,7 +1651,7 @@ fn dario_admin_router(
     }
 
     async fn logs(
-        State(sup): State<Arc<dario::DarioSupervisor>>,
+        State(glue): State<Arc<DarioGlue>>,
         AxPath(gen_id): AxPath<String>,
         Query(q): Query<std::collections::HashMap<String, String>>,
     ) -> axum::response::Response {
@@ -1519,7 +1660,7 @@ fn dario_admin_router(
             .and_then(|s| s.parse().ok())
             .unwrap_or(200usize)
             .min(2000);
-        let status = sup.status();
+        let status = alex_proxy::DarioRouter::status(glue.as_ref());
         let found = status["generations"]
             .as_array()
             .into_iter()
@@ -1546,7 +1687,14 @@ fn dario_admin_router(
         }
     }
 
-    async fn restart(State(sup): State<Arc<dario::DarioSupervisor>>) -> axum::response::Response {
+    async fn restart(State(glue): State<Arc<DarioGlue>>) -> axum::response::Response {
+        let Some(sup) = glue.supervisor() else {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(glue.unavailable_status()),
+            )
+                .into_response();
+        };
         match sup.restart().await {
             Ok(v) => axum::Json(v).into_response(),
             Err(e) => (
@@ -1557,7 +1705,14 @@ fn dario_admin_router(
         }
     }
 
-    async fn update(State(sup): State<Arc<dario::DarioSupervisor>>) -> axum::response::Response {
+    async fn update(State(glue): State<Arc<DarioGlue>>) -> axum::response::Response {
+        let Some(sup) = glue.supervisor() else {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(glue.unavailable_status()),
+            )
+                .into_response();
+        };
         match sup.update_now().await {
             Ok(v) => axum::Json(v).into_response(),
             Err(e) => (
@@ -1568,15 +1723,20 @@ fn dario_admin_router(
         }
     }
 
+    async fn repair(State(glue): State<Arc<DarioGlue>>) -> axum::response::Response {
+        axum::Json(glue.repair().await).into_response()
+    }
+
     axum::Router::new()
         .route("/admin/dario/restart", post(restart))
         .route("/admin/dario/update", post(update))
+        .route("/admin/dario/repair", post(repair))
         .route("/admin/dario/logs/{generation_id}", get(logs))
         .route_layer(axum::middleware::from_fn_with_state(
             local_key,
             require_local_key,
         ))
-        .with_state(sup)
+        .with_state(glue)
 }
 
 fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
@@ -2465,7 +2625,7 @@ async fn main() -> Result<()> {
             // the first premium Claude ping/request is less likely to fall back
             // direct while its generation warms. A failure remains non-fatal:
             // the supervisor's existing repair/direct-fallback path handles it.
-            let bootstrap_error = if dario_route_enabled {
+            let _bootstrap_error = if dario_route_enabled {
                 match dario::bootstrap(config.data_dir.join("dario"), config.dario_version.clone())
                     .await
                 {
@@ -2499,9 +2659,22 @@ async fn main() -> Result<()> {
                 probe_model: config.dario_probe_model.clone(),
                 validate_subscription: dario_route_enabled,
                 claude_bin: resolve_dario_claude_bin(config.dario_claude_bin.as_deref()),
+                node_bin: dario::resolve_dario_node_bin(config.dario_node_path.as_deref()),
             };
-            let (dario_router, supervisor) = match dario::DarioSupervisor::start(settings).await {
-                Ok(sup) => {
+            let initial_start = dario::DarioSupervisor::start(settings.clone()).await;
+            let initial_error = initial_start.as_ref().err().map(ToString::to_string);
+            let initial_supervisor = initial_start.ok();
+            let glue = Arc::new(DarioGlue {
+                supervisor: Arc::new(std::sync::RwLock::new(initial_supervisor.clone())),
+                settings: Arc::new(std::sync::RwLock::new(settings)),
+                config: Arc::new(std::sync::Mutex::new(config.clone())),
+                route_enabled: dario_route_enabled,
+                routing_mode: dario_routing_mode.clone(),
+                routing_reason: dario_routing_reason.clone(),
+                last_error: Arc::new(std::sync::Mutex::new(initial_error.clone())),
+            });
+            let (dario_router, supervisor) = match initial_supervisor {
+                Some(sup) => {
                     eprintln!(
                         "dario: ready generation {} (routing {})",
                         sup.active()
@@ -2514,18 +2687,12 @@ async fn main() -> Result<()> {
                         }
                     );
                     (
-                        Some(Arc::new(DarioGlue {
-                            supervisor: sup.clone(),
-                            route_enabled: dario_route_enabled,
-                            routing_mode: dario_routing_mode.clone(),
-                            routing_reason: dario_routing_reason.clone(),
-                            bootstrap_error,
-                        })
-                            as Arc<dyn alex_proxy::DarioRouter>),
+                        Some(glue.clone() as Arc<dyn alex_proxy::DarioRouter>),
                         Some(sup),
                     )
                 }
-                Err(e) => {
+                None => {
+                    let e = initial_error.unwrap_or_else(|| "Dario failed to start".into());
                     if dario_route_enabled {
                         eprintln!(
                             "dario: failed to start ({e}); non-Claude-Code Anthropic traffic will fail closed"
@@ -2533,18 +2700,12 @@ async fn main() -> Result<()> {
                     } else {
                         eprintln!("dario: unavailable ({e}); Anthropic traffic remains direct");
                     }
-                    (
-                        Some(Arc::new(DarioUnavailable {
-                            error: e.to_string(),
-                            route_enabled: dario_route_enabled,
-                            routing_mode: dario_routing_mode,
-                            routing_reason: dario_routing_reason,
-                        })
-                            as Arc<dyn alex_proxy::DarioRouter>),
-                        None,
-                    )
+                    (Some(glue.clone() as Arc<dyn alex_proxy::DarioRouter>), None)
                 }
             };
+            if supervisor.is_none() {
+                glue.spawn_initial_retry();
+            }
             let state = alex_proxy::build_state(
                 config.local_key.clone(),
                 vault,
@@ -2661,9 +2822,7 @@ async fn main() -> Result<()> {
             }
             let mut app = alex_proxy::router(state.clone());
             app = app.merge(harness_admin_router(state.clone()));
-            if let Some(sup) = supervisor.clone() {
-                app = app.merge(dario_admin_router(sup, state.local_key.clone()));
-            }
+            app = app.merge(dario_admin_router(glue, state.local_key.clone()));
             let (listener, bound_host, fallback_reason) = bind_daemon_listener_with_fallback(
                 &host,
                 port,
@@ -3498,7 +3657,10 @@ async fn main() -> Result<()> {
                     );
                     return Ok(());
                 }
-                DarioCommand::Status | DarioCommand::Restart | DarioCommand::Update => {}
+                DarioCommand::Status
+                | DarioCommand::Restart
+                | DarioCommand::Update
+                | DarioCommand::Fix => {}
             }
             let http = reqwest::Client::new();
             let base = config.base_url();
@@ -3519,6 +3681,12 @@ async fn main() -> Result<()> {
                 }
                 DarioCommand::Update => {
                     http.post(format!("{base}/admin/dario/update"))
+                        .header("x-api-key", key)
+                        .send()
+                        .await
+                }
+                DarioCommand::Fix => {
+                    http.post(format!("{base}/admin/dario/repair"))
                         .header("x-api-key", key)
                         .send()
                         .await
@@ -6616,6 +6784,24 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
     {
         println!("runtime: {runtime} {version}");
     }
+    let node = body["resolved_node_bin"].as_str().unwrap_or("-");
+    let claude = body["resolved_claude_bin"]
+        .as_str()
+        .or_else(|| body["claude_bin"].as_str())
+        .unwrap_or("-");
+    println!("node: {node}");
+    println!("claude: {claude}");
+    if let Some(issue) = body["issue"].as_object() {
+        let code = issue
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let message = issue
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Dario issue");
+        println!("issue: {} — {}", ui::red(code), message);
+    }
     let active = body["active_generation_id"].as_str().unwrap_or("-");
     println!("active: {}", ui::bold(&ui::turquoise(active)));
     if gens.is_empty() {
@@ -9250,6 +9436,7 @@ mod tests {
             dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
+            dario_node_path: None,
             dario_update_check_minutes: 60,
             dario_version: None,
             dario_probe_seconds: 90,
@@ -9264,6 +9451,79 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_runtime_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dario_runtime_resolvers_cover_overrides_and_version_manager_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("dario-runtime-resolver");
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("PATH");
+        let old_node = std::env::var_os("ALEXANDRIA_NODE_BIN");
+        let old_claude = std::env::var_os("ALEXANDRIA_REAL_CLAUDE_BIN");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("PATH", "/definitely/no/node");
+        std::env::remove_var("ALEXANDRIA_NODE_BIN");
+        std::env::remove_var("ALEXANDRIA_REAL_CLAUDE_BIN");
+
+        let mise = home.join(".local/share/mise/installs/node");
+        let node20 = mise.join("20.1.0/bin/node");
+        let node22 = mise.join("22.3.0/bin/node");
+        let unsupported_node = mise.join("30.0.0/bin/node");
+        fake_runtime_executable(&node20, "#!/bin/sh\necho v20.1.0\n");
+        fake_runtime_executable(&node22, "#!/bin/sh\necho v22.3.0\n");
+        fake_runtime_executable(&unsupported_node, "#!/bin/sh\necho v17.9.0\n");
+        assert_eq!(dario::resolve_dario_node_bin(None), Some(node22.clone()));
+
+        let override_node = home.join("override-node");
+        fake_runtime_executable(&override_node, "#!/bin/sh\necho v23.0.0\n");
+        assert_eq!(
+            dario::resolve_dario_node_bin(Some(&override_node)),
+            Some(override_node)
+        );
+        assert_eq!(
+            dario::resolve_dario_node_bin(Some(&home.join("missing-node"))),
+            None
+        );
+
+        let claude20 = mise.join("20.1.0/bin/claude");
+        let claude22 = mise.join("22.3.0/bin/claude");
+        fake_runtime_executable(&claude20, "#!/bin/sh\nexit 0\n");
+        fake_runtime_executable(&claude22, "#!/bin/sh\nexit 0\n");
+        assert_eq!(resolve_dario_claude_bin(None), Some(claude22.clone()));
+        let override_claude = home.join("override-claude");
+        fake_runtime_executable(&override_claude, "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            resolve_dario_claude_bin(Some(&override_claude)),
+            Some(override_claude)
+        );
+
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match old_node {
+            Some(value) => std::env::set_var("ALEXANDRIA_NODE_BIN", value),
+            None => std::env::remove_var("ALEXANDRIA_NODE_BIN"),
+        }
+        match old_claude {
+            Some(value) => std::env::set_var("ALEXANDRIA_REAL_CLAUDE_BIN", value),
+            None => std::env::remove_var("ALEXANDRIA_REAL_CLAUDE_BIN"),
+        }
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -9716,6 +9976,7 @@ mod tests {
             dario_mode_migrated: true,
             dario_api_key: String::new(),
             dario_claude_bin: None,
+            dario_node_path: None,
             dario_update_check_minutes: 60,
             dario_version: None,
             dario_probe_seconds: 90,
