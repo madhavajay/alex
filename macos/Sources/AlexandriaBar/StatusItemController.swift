@@ -865,7 +865,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func openPreferences(section: PreferencesSection = .general) {
         if prefsController == nil {
-            prefsController = PreferencesWindowController(store: store)
+            prefsController = PreferencesWindowController(store: store, onOpenDario: { [weak self] in
+                self?.openDario()
+            })
         }
         prefsController?.show(section: section)
     }

@@ -12,12 +12,14 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case general = "General"
     case providers = "Providers"
     case harnesses = "Harnesses"
+    case dario = "Dario"
 
     var icon: String {
         switch self {
         case .general: "gearshape"
         case .providers: "bolt"
         case .harnesses: "terminal"
+        case .dario: "server.rack"
         }
     }
 }
@@ -32,6 +34,7 @@ struct PreferencesView: View {
     @Bindable var state: PreferencesViewState
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool) -> Void
+    let onOpenDario: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -107,6 +110,8 @@ struct PreferencesView: View {
                     ProvidersPreferencesSection(store: store, onAuthenticate: onAuthenticate)
                 case .harnesses:
                     HarnessesPreferencesSection(store: store)
+                case .dario:
+                    DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -182,9 +187,11 @@ final class PreferencesWindowController {
     private let state = PreferencesViewState()
     private let store: SnapshotStore
     private let authWindows = AuthWindowController()
+    private let onOpenDario: () -> Void
 
-    init(store: SnapshotStore) {
+    init(store: SnapshotStore, onOpenDario: @escaping () -> Void = {}) {
         self.store = store
+        self.onOpenDario = onOpenDario
     }
 
     func show(section: PreferencesSection = .general) {
@@ -198,7 +205,8 @@ final class PreferencesWindowController {
                     self.authWindows.show(
                         provider: provider, accountName: name, autoIdentity: autoIdentity,
                         store: self.store)
-                }))
+                },
+                onOpenDario: onOpenDario))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock

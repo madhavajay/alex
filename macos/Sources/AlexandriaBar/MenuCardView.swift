@@ -810,19 +810,24 @@ struct LimitsCardView: View {
            let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
         {
             let tint = agentTint(active)
-            HStack(spacing: 6) {
-                StatusDot(tint: tint, size: 5)
-                Text("Dario")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(AlexTheme.Colors.textSecondary)
-                Text("v\(active.version)")
-                    .font(AlexTheme.Fonts.mono(10))
-                    .foregroundStyle(AlexTheme.Colors.textFaint)
-                Spacer()
-                Text(agentStatusText(active))
-                    .font(.system(size: 9))
-                    .foregroundStyle(tint)
+            Button(action: { onOpenDario?() }) {
+                HStack(spacing: 6) {
+                    StatusDot(tint: tint, size: 5)
+                    Text("Dario")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    Text("v\(active.version)")
+                        .font(AlexTheme.Fonts.mono(10))
+                        .foregroundStyle(AlexTheme.Colors.textFaint)
+                    Spacer()
+                    Text(agentStatusText(active))
+                        .font(.system(size: 9))
+                        .foregroundStyle(tint)
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .disabled(onOpenDario == nil)
             .padding(.leading, 21)
             .padding(.vertical, 1)
         }

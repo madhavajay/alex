@@ -260,6 +260,10 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/dario/update", method: "POST")
     }
 
+    public func darioRepair() async throws {
+        _ = try await request("admin/dario/repair", method: "POST")
+    }
+
     public func daemonUpdateStatus() async throws -> DaemonUpdateStatus {
         try await get("admin/update", as: DaemonUpdateStatus.self)
     }
