@@ -143,7 +143,7 @@ curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-releas
 ```
 
 The macOS path uses Homebrew: the formula installs the `alex` CLI/daemon, the
-cask installs `AlexandriaBar.app`, and the bootstrap registers the daemon with
+cask installs `Alex.app`, and the bootstrap registers the daemon with
 launchd. The DMG by itself contains only the menu-bar app; it does not install
 the daemon. Linux downloads and SHA-256 verifies the precompiled x86_64 release
 binary, so neither platform needs a Rust compiler.
@@ -397,7 +397,7 @@ The menu bar app's Trace Browser gives the same data a UI: two-pane sessions + l
 `macos/` contains **AlexandriaBar**, a Swift menu bar app that shows daemon health, subscription limit gauges, and account status — with in-app re-auth (device codes, paste flows), ping checks, and notifications when a subscription needs attention.
 
 ```bash
-cd macos && ./Scripts/run.sh   # build + launch dist/AlexandriaBar.app
+cd macos && ./Scripts/run.sh   # build + launch dist/Alex.app
 ```
 
 ### Re-auth helpers

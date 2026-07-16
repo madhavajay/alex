@@ -2,7 +2,7 @@
 
 This archive contains the exact pull-request build of:
 
-- `AlexandriaBar.app`, ad-hoc signed with the production bundle identifier;
+- `Alex.app`, ad-hoc signed with the production bundle identifier;
 - the release-mode `alex` daemon/CLI; and
 - the equivalent `alexandria` CLI binary.
 
@@ -23,8 +23,8 @@ replaces, clears quarantine from this ad-hoc build, installs the CLI under
 the app. Existing data under `~/.alexandria` is left untouched.
 
 The app uses the same bundle identifier as production, so only one
-`AlexandriaBar.app` should be running. macOS may request an administrator
-password when replacing `/Applications/AlexandriaBar.app`.
+`Alex.app` should be running. macOS may request an administrator
+password when replacing `/Applications/Alex.app`.
 
 Confirm the daemon after installation:
 

@@ -229,7 +229,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     /// Debug-only manual preview hook: `defaults write
-    /// com.madhavajay.alexandria-macos DebugFakeUpdateBanner app|daemon|both`
+    /// com.madhavajay.alex DebugFakeUpdateBanner app|daemon|both`
     /// (see UpdaterController.applyDebugFakeUpdateOverride for the app half).
     /// This covers the daemon half, since daemon-update state normally comes
     /// from the live daemon's `/admin/update/status` response.

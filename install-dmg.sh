@@ -9,7 +9,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-APP_NAME="${APP_NAME:-AlexandriaBar.app}"
+APP_NAME="${APP_NAME:-Alex.app}"
+LEGACY_APP_STEM="AlexandriaBar"
+LEGACY_APP_NAME="${LEGACY_APP_STEM}.app"
 INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 DMG_PATH="${1:-$(ls -t macos/dist/*.dmg 2>/dev/null | head -1 || true)}"
 
@@ -28,6 +30,12 @@ trap cleanup EXIT
 echo "Using DMG: $DMG_PATH"
 hdiutil attach "$DMG_PATH" -nobrowse -mountpoint "$MOUNT_POINT" -quiet
 
+for app in AlexandriaBar Alex; do
+  osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
+done
+pkill -x AlexandriaBar 2>/dev/null || true
+pkill -x Alex 2>/dev/null || true
+
 if [[ ! -d "$MOUNT_POINT/$APP_NAME" ]]; then
   echo "App not found in mounted DMG: $APP_NAME" >&2
   exit 1
@@ -39,4 +47,5 @@ if [[ -d "$INSTALL_DIR/$APP_NAME" ]]; then
 fi
 
 ditto "$MOUNT_POINT/$APP_NAME" "$INSTALL_DIR/$APP_NAME"
+rm -rf "$INSTALL_DIR/$LEGACY_APP_NAME"
 echo "Installed $APP_NAME to $INSTALL_DIR"

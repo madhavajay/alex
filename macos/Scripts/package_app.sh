@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds AlexandriaBar.app into macos/dist/.
+# Builds Alex.app into macos/dist/.
 #   CONFIGURATION=debug|release (default release)
 #   IDENTITY="Developer ID Application: ..." (default adhoc "-")
-#   BUNDLE_ID=com.example.app (default com.madhavajay.alexandria-macos)
+#   BUNDLE_ID=com.example.app (default com.madhavajay.alex)
 #   VERSION=1.2.3 (default 0.1.0)
 # Adhoc-signed rebuilds change code identity each build, which resets
 # Little Snitch rules; use a stable IDENTITY if that bites.
@@ -14,7 +14,8 @@ cd "$(dirname "$0")/.."
 CONFIGURATION="${CONFIGURATION:-release}"
 IDENTITY="${IDENTITY:--}"
 APP_NAME="AlexandriaBar"
-BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alexandria-macos}"
+APP_DISPLAY="Alex"
+BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alex}"
 VERSION="${VERSION:-0.1.0}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://madhavajay.github.io/alex/appcast.xml}"
 
@@ -27,7 +28,7 @@ SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://madhavajay.github.io/alex/appcast.
 # local dev build ended up unable to escape itself.
 SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-WifIRZCxYKIrh/Jb40HOtNapTS5ZCXpXrv7LdDWHlCw=}"
 DIST="dist"
-APP="$DIST/$APP_NAME.app"
+APP="$DIST/$APP_DISPLAY.app"
 
 swift build -c "$CONFIGURATION"
 
@@ -96,8 +97,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleName</key><string>$APP_NAME</string>
-    <key>CFBundleDisplayName</key><string>AlexandriaBar</string>
+    <key>CFBundleName</key><string>$APP_DISPLAY</string>
+    <key>CFBundleDisplayName</key><string>$APP_DISPLAY</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>

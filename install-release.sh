@@ -8,6 +8,25 @@ say() {
   printf '%s\n' "$*"
 }
 
+quit_apps() {
+  for app in AlexandriaBar Alex; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
+  done
+  pkill -x AlexandriaBar 2>/dev/null || true
+  pkill -x Alex 2>/dev/null || true
+}
+
+remove_legacy_app() {
+  legacy_name="AlexandriaBar"
+  legacy="/Applications/${legacy_name}.app"
+  [ -e "$legacy" ] || return 0
+  if [ -w "/Applications" ]; then
+    rm -rf "$legacy"
+  else
+    sudo rm -rf "$legacy"
+  fi
+}
+
 install_macos() {
   if ! command -v brew >/dev/null 2>&1; then
     say "Homebrew is required for the macOS one-line install: https://brew.sh"
@@ -16,12 +35,14 @@ install_macos() {
   fi
 
   say "Installing the Alexandria CLI/daemon and menu-bar app with Homebrew…"
+  quit_apps
   brew install madhavajay/alex/alex
   brew install --cask madhavajay/alex/alexandria
+  remove_legacy_app
 
   alex_bin="$(brew --prefix)/bin/alex"
   "$alex_bin" service install
-  open -a AlexandriaBar
+  open -a Alex
 
   say "Alexandria is installed. The daemon is registered to run at login."
   say "Next: alex auth import"

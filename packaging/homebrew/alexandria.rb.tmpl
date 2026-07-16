@@ -2,16 +2,16 @@ cask "alexandria" do
   version "{{VERSION}}"
   sha256 "{{SHA_DMG}}"
 
-  url "https://github.com/madhavajay/alex/releases/download/v{{VERSION}}/AlexandriaBar-{{VERSION}}.dmg"
-  name "Alexandria"
+  url "https://github.com/madhavajay/alex/releases/download/v{{VERSION}}/Alex-{{VERSION}}.dmg"
+  name "Alex"
   desc "Menu bar app for the Alex local LLM subscription router"
   homepage "https://github.com/madhavajay/alex"
 
   depends_on formula: "madhavajay/alex/alex"
 
-  app "AlexandriaBar.app"
+  app "Alex.app"
 
-  uninstall quit: "com.madhavajay.alexandria-macos"
+  uninstall quit: "com.madhavajay.alex"
 
   livecheck do
     url :stable

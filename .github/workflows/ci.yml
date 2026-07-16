@@ -61,10 +61,10 @@ jobs:
           version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
           CONFIGURATION=release \
             IDENTITY=- \
-            BUNDLE_ID=com.madhavajay.alexandria-macos \
+            BUNDLE_ID=com.madhavajay.alex \
             VERSION="$version" \
             ./macos/Scripts/package_app.sh
-          codesign --verify --deep --strict macos/dist/AlexandriaBar.app
+          codesign --verify --deep --strict macos/dist/Alex.app
 
       - name: Assemble test bundle
         id: bundle
@@ -79,7 +79,7 @@ jobs:
 
           rm -rf "$stage" "$output"
           mkdir -p "$stage/bin" "$output"
-          ditto macos/dist/AlexandriaBar.app "$stage/AlexandriaBar.app"
+          ditto macos/dist/Alex.app "$stage/Alex.app"
           cp target/release/alex target/release/alexandria "$stage/bin/"
           cp packaging/ci-macos/install.sh packaging/ci-macos/README.md "$stage/"
           chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
@@ -90,8 +90,8 @@ jobs:
             echo "commit=${GITHUB_SHA}"
             echo "runner_arch=$(uname -m)"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "app_bundle_id=$(defaults read "$stage/AlexandriaBar.app/Contents/Info" CFBundleIdentifier)"
-            echo "app_version=$(defaults read "$stage/AlexandriaBar.app/Contents/Info" CFBundleShortVersionString)"
+            echo "app_bundle_id=$(defaults read "$stage/Alex.app/Contents/Info" CFBundleIdentifier)"
+            echo "app_version=$(defaults read "$stage/Alex.app/Contents/Info" CFBundleShortVersionString)"
           } > "$stage/BUILD_INFO.txt"
 
           tar -C "$RUNNER_TEMP" -czf "$output/$bundle_name.tar.gz" "$bundle_name"

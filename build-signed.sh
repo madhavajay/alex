@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: ./build-signed.sh [--clean] [--notarize|--skip-notarize]
 
-Builds, Developer ID signs, and packages AlexandriaBar.app as a signed DMG.
+Builds, Developer ID signs, and packages Alex.app as a signed DMG.
 
 Environment can be provided via .env or exported variables:
   APPLE_SIGNING_IDENTITY           Developer ID Application identity name
@@ -19,8 +19,8 @@ Environment can be provided via .env or exported variables:
   SPARKLE_PUBLIC_ED_KEY            Sparkle EdDSA public key
 
 Defaults:
-  BUNDLE_ID=com.madhavajay.alexandria-macos
-  APP_NAME=AlexandriaBar
+  BUNDLE_ID=com.madhavajay.alex
+  APP_DISPLAY=Alex
 EOF
 }
 
@@ -61,11 +61,12 @@ if [[ -f .env ]]; then
 fi
 
 APP_NAME="${APP_NAME:-AlexandriaBar}"
-BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alexandria-macos}"
+APP_DISPLAY="Alex"
+BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alex}"
 VERSION="${VERSION:-$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml 2>/dev/null || true)}"
 VERSION="${VERSION:-0.1.0}"
 DIST_DIR="${DIST_DIR:-macos/dist}"
-DMG_NAME="${DMG_NAME:-${APP_NAME}-${VERSION}.dmg}"
+DMG_NAME="${DMG_NAME:-${APP_DISPLAY}-${VERSION}.dmg}"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
 
 TRAP_P12=""
@@ -214,9 +215,10 @@ CONFIGURATION=release \
 IDENTITY="$CODESIGN_IDENTITY" \
 BUNDLE_ID="$BUNDLE_ID" \
 VERSION="$VERSION" \
+APP_DISPLAY="$APP_DISPLAY" \
 ./macos/Scripts/package_app.sh
 
-APP_PATH="$DIST_DIR/$APP_NAME.app"
+APP_PATH="$DIST_DIR/$APP_DISPLAY.app"
 if [[ ! -d "$APP_PATH" ]]; then
   echo "Expected app was not built: $APP_PATH" >&2
   exit 1
@@ -252,7 +254,7 @@ if [[ "$SHOULD_NOTARIZE" == "true" ]]; then
     exit 1
   fi
 
-  APP_ZIP="$DIST_DIR/${APP_NAME}-${VERSION}.zip"
+  APP_ZIP="$DIST_DIR/${APP_DISPLAY}-${VERSION}.zip"
   rm -f "$APP_ZIP"
   echo "Submitting app bundle for notarization..."
   ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
@@ -272,9 +274,9 @@ echo "Creating DMG..."
 mkdir -p "$DIST_DIR"
 rm -f "$DMG_PATH"
 DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-dmg-XXXXXX")"
-ditto "$APP_PATH" "$DMG_STAGE/$APP_NAME.app"
+ditto "$APP_PATH" "$DMG_STAGE/$APP_DISPLAY.app"
 ln -s /Applications "$DMG_STAGE/Applications"
-hdiutil create -volname "Alexandria" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null
+hdiutil create -volname "Alex" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null
 hdiutil verify "$DMG_PATH" >/dev/null
 
 echo "Signing DMG..."
