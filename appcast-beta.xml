@@ -1,15 +1,15 @@
 <?xml version="1.0" standalone="yes"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
-        <title>AlexandriaBar</title>
+        <title>Alex</title>
         <item>
-            <title>0.1.26-beta.34</title>
-            <pubDate>Thu, 16 Jul 2026 05:07:49 +0000</pubDate>
-            <sparkle:version>0.1.26-beta.34</sparkle:version>
-            <sparkle:shortVersionString>0.1.26-beta.34</sparkle:shortVersionString>
+            <title>0.1.26-beta.35</title>
+            <pubDate>Thu, 16 Jul 2026 05:31:39 +0000</pubDate>
+            <sparkle:version>0.1.26-beta.35</sparkle:version>
+            <sparkle:shortVersionString>0.1.26-beta.35</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.26-beta.34/AlexandriaBar-0.1.26-beta.34.dmg" length="7272899" type="application/octet-stream" sparkle:edSignature="JqEzoV9L0lHrxknKotyt3Cy92ayXt7py8ju3dbFYI5kqrePbxvoNLlomdXb0Li2pWkz8+D3nTc5LzziI7F9sCA=="/>
+            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.26-beta.35/Alex-0.1.26-beta.35.dmg" length="7272850" type="application/octet-stream" sparkle:edSignature="4V3dYuDilhFtMb7wkjVM1K5Oa15X1zYECAeVl0z+KqCS3Z+4SRQ50HPhM1IS2yhwgFHpUXyI2MpZ1MLtXkKfAA=="/>
         </item>
     </channel>
 </rss>
