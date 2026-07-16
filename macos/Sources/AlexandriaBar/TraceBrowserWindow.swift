@@ -19,6 +19,10 @@ final class TraceBrowserModel {
     private(set) var daemonDown = false
     private(set) var sessionsLoading = true
     private(set) var sessionsUnreachable = false
+    private(set) var simulationFixtures: [ErrorSimulationFixture] = []
+    private(set) var fixturesLoading = false
+    private(set) var fixtureLoadError: String?
+    private(set) var simulationNotice: String?
     private(set) var transcriptLoading = false
     private(set) var transcriptUnreachable = false
     private var transcriptLoadedSessionId: String?
@@ -193,6 +197,8 @@ final class TraceBrowserModel {
     private var transcriptTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var sessionFilterTask: Task<Void, Never>?
+    private var fixtureLoadTask: Task<Void, Never>?
+    private var simulationNoticeTask: Task<Void, Never>?
     private var sessionFilterGeneration = 0
 
     private(set) var detailsVisible = false
@@ -601,6 +607,9 @@ final class TraceBrowserModel {
 
     func start() {
         stop()
+        fixtureLoadTask = Task { [weak self] in
+            await self?.loadSimulationFixtures()
+        }
         sessionsTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.pollSessions()
@@ -630,6 +639,10 @@ final class TraceBrowserModel {
         transcriptFilterTask = nil
         sessionFilterTask?.cancel()
         sessionFilterTask = nil
+        fixtureLoadTask?.cancel()
+        fixtureLoadTask = nil
+        simulationNoticeTask?.cancel()
+        simulationNoticeTask = nil
     }
 
     func selectFromUser(_ id: String) {
@@ -973,6 +986,124 @@ final class TraceBrowserModel {
         NSPasteboard.general.setString(session.sessionId, forType: .string)
     }
 
+    /// Fetches the fixture menu once per window opening. The menu reads this
+    /// small cache so right-clicking a row stays instant.
+    func loadSimulationFixtures() async {
+        guard let client = client() else {
+            fixtureLoadError = "daemon unavailable"
+            return
+        }
+        fixturesLoading = true
+        fixtureLoadError = nil
+        defer { fixturesLoading = false }
+        do {
+            simulationFixtures = try await client.errorSimulationFixtures()
+        } catch is CancellationError {
+            return
+        } catch {
+            fixtureLoadError = error.localizedDescription
+        }
+    }
+
+    func injectFixture(_ fixture: ErrorSimulationFixture, into session: TraceSession) {
+        guard !session.sessionId.isEmpty else {
+            showSimulationNotice("Cannot simulate: no session id")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let client = self.client() else {
+                self.showSimulationNotice("Simulation failed: daemon unavailable")
+                return
+            }
+            do {
+                try await client.injectFixture(sessionId: session.sessionId, fixture: fixture.name)
+                self.showSimulationNotice("Queued \(fixture.name)")
+                await self.pollSessions()
+            } catch is CancellationError {
+                return
+            } catch {
+                self.showSimulationNotice("Simulation failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func clearFixtureInjections(for session: TraceSession) {
+        guard !session.sessionId.isEmpty else {
+            showSimulationNotice("Cannot clear: no session id")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let client = self.client() else {
+                self.showSimulationNotice("Clear failed: daemon unavailable")
+                return
+            }
+            do {
+                try await client.clearFixtureInjections(sessionId: session.sessionId)
+                self.showSimulationNotice("Cleared pending injections")
+                await self.pollSessions()
+            } catch is CancellationError {
+                return
+            } catch {
+                self.showSimulationNotice("Clear failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func promptSaveFixture(from session: TraceSession) {
+        guard (session.errors ?? 0) > 0 else { return }
+        let field = NSTextField(string: "")
+        field.placeholderString = "fixture name"
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        let alert = NSAlert()
+        alert.messageText = "Save error as fixture"
+        alert.informativeText = "Capture a response error from this session for later simulation."
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            showSimulationNotice("Fixture name is required")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let client = self.client() else {
+                self.showSimulationNotice("Save failed: daemon unavailable")
+                return
+            }
+            do {
+                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                guard let errorTrace = transcript.turns.reversed().first(where: {
+                    $0.error != nil || $0.errorKind != nil || ($0.status ?? 0) >= 400
+                }) else {
+                    self.showSimulationNotice("Save failed: no error trace found")
+                    return
+                }
+                try await client.createErrorSimulationFixture(name: name, fromTraceId: errorTrace.traceId)
+                await self.loadSimulationFixtures()
+                self.showSimulationNotice("Saved fixture \(name)")
+            } catch is CancellationError {
+                return
+            } catch {
+                self.showSimulationNotice("Save failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func showSimulationNotice(_ message: String) {
+        simulationNotice = message
+        simulationNoticeTask?.cancel()
+        simulationNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.simulationNotice = nil
+        }
+    }
+
     func copyLastReply(_ session: TraceSession) {
         Task {
             guard let client = client() else { return }
@@ -1248,6 +1379,18 @@ struct TraceBrowserView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 400)
+        .overlay(alignment: .bottom) {
+            if let notice = model.simulationNotice {
+                Text(notice)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 12)
+                    .accessibilityLabel("Error simulation: \(notice)")
+            }
+        }
         .onAppear {
             model.setDetailsVisible(persistedDetailsOn)
         }
@@ -1752,6 +1895,34 @@ private struct SessionListView: View {
 
     @ViewBuilder
     private func contextMenu(_ session: TraceSession) -> some View {
+        let hasSessionId = !session.sessionId.isEmpty
+        Menu("Simulate") {
+            if model.fixturesLoading {
+                Text("Loading fixtures…")
+            } else if model.simulationFixtures.isEmpty {
+                Text(model.fixtureLoadError == nil ? "No fixtures available" : "Fixtures unavailable")
+                if model.fixtureLoadError != nil {
+                    Button("Retry fixture load") {
+                        Task { await model.loadSimulationFixtures() }
+                    }
+                }
+            } else {
+                ForEach(model.simulationFixtures) { fixture in
+                    Button(fixtureMenuTitle(fixture)) {
+                        model.injectFixture(fixture, into: session)
+                    }
+                }
+            }
+        }
+        .disabled(!hasSessionId)
+        .help(hasSessionId ? "Queue an error fixture for this session" : "no session id")
+        Button("Clear pending injections") { model.clearFixtureInjections(for: session) }
+            .disabled(!hasSessionId)
+            .help(hasSessionId ? "Remove queued error fixtures" : "no session id")
+        if (session.errors ?? 0) > 0 {
+            Button("Save as fixture…") { model.promptSaveFixture(from: session) }
+        }
+        Divider()
         Button("Copy Session ID") { model.copySessionId(session) }
         Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
         Button("Export Session…") { model.exportSession(session) }
@@ -1760,6 +1931,12 @@ private struct SessionListView: View {
         Button("Delete Session's Traces…", role: .destructive) {
             model.deleteSessionTraces(session)
         }
+    }
+
+    private func fixtureMenuTitle(_ fixture: ErrorSimulationFixture) -> String {
+        let action = fixture.direction == "upstream_to_client" ? "Send" : "Replay"
+        let status = fixture.status.map { " (\($0))" } ?? ""
+        return "\(action): \(fixture.name)\(status)"
     }
 
     @ViewBuilder
