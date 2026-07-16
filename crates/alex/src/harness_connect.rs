@@ -5132,6 +5132,9 @@ mod tests {
             harness_overrides: BTreeMap::new(),
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            notifications: Vec::new(),
+            notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
+            notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
         }
     }
 

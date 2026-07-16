@@ -7,6 +7,7 @@ use std::time::Duration;
 
 mod plugins;
 pub use plugins::{PluginManager, PluginManifest};
+pub mod notify;
 
 use alex_auth::{
     encrypt_bundle, export_bundle, harness_cred_paths, now_ms, routing_reserve_blocked,
@@ -229,6 +230,7 @@ pub struct AppState {
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
     pub reset_handler: std::sync::RwLock<Option<Arc<dyn ResetHandler>>>,
     pub plugins: Arc<PluginManager>,
+    pub notifications: Arc<std::sync::RwLock<notify::NotificationDispatcher>>,
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -474,9 +476,21 @@ pub fn build_state(
         daemon_updater: std::sync::RwLock::new(None),
         reset_handler: std::sync::RwLock::new(None),
         plugins: Arc::new(PluginManager::empty()),
+        notifications: Arc::new(std::sync::RwLock::new(
+            notify::NotificationDispatcher::default(),
+        )),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
     })
+}
+
+/// Replaces the daemon's notification channels after config has been loaded.
+/// This is intentionally separate from `build_state` to keep its existing
+/// callers source-compatible (offline commands and tests have no channels).
+pub fn set_notifications(state: &Arc<AppState>, settings: notify::NotificationSettings) {
+    if let Ok(mut notifications) = state.notifications.write() {
+        *notifications = notify::NotificationDispatcher::from_settings(settings);
+    }
 }
 
 pub fn set_daemon_updater(state: &Arc<AppState>, updater: Arc<dyn DaemonUpdater>) {
@@ -573,6 +587,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_auth_openrouter_key),
         )
         .route("/admin/health", get(admin_health))
+        .route("/admin/notifications", get(admin_notifications))
+        .route("/admin/notifications/test", post(admin_notifications_test))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
         .route("/admin/update", get(admin_update).post(admin_update_apply))
@@ -660,6 +676,42 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(gated)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+async fn admin_notifications(State(state): State<Arc<AppState>>) -> Response {
+    let view = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.admin_view())
+        .unwrap_or_else(|_| json!({"channels": [], "error": "notification status unavailable"}));
+    axum::Json(view).into_response()
+}
+
+async fn admin_notifications_test(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let channel = match body.0.get("channel") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(index) => Some(index),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "channel must be a non-negative index",
+                )
+            }
+        },
+    };
+    if let Ok(notifications) = state.notifications.read() {
+        notifications.emit_test(channel, now_ms());
+        axum::Json(json!({"accepted": true, "channel": channel})).into_response()
+    } else {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "notification dispatcher unavailable",
+        )
+    }
 }
 
 async fn admin_reset(
@@ -6092,6 +6144,11 @@ async fn proxy(
                     }
                     Err(e) => {
                         tracing::warn!("forced refresh failed: {e}");
+                        // The refresh path has the managed account in scope.
+                        // Send now; final trace classification will attempt
+                        // the same event for the retained 401, and the
+                        // dispatcher coalesces that duplicate.
+                        emit_reauth_notification_for_account(&state, &account);
                     }
                 }
             }
@@ -6959,6 +7016,7 @@ fn finalize_trace(
     upstream_body: Option<&[u8]>,
     resp_body: Option<&[u8]>,
 ) {
+    emit_reauth_notification(state, &trace);
     let store = &state.store;
     if let Some(resp) = resp_body {
         capture_response_error(&mut trace, resp);
@@ -6996,6 +7054,67 @@ fn finalize_trace(
             cost = trace.cost_usd,
             "trace recorded"
         );
+    }
+}
+
+/// This is deliberately attached to trace finalization, after every response
+/// shape has been classified (regular JSON, translated responses, and SSE).
+/// It also covers a forced OAuth refresh failure: the retained upstream 401 is
+/// finalized as the existing `auth` class. The dispatcher only schedules work,
+/// so notification delivery cannot delay this request or stream finalization.
+fn emit_reauth_notification(state: &AppState, trace: &TraceRecord) {
+    let Some(event) = reauth_notification_event(state, trace) else {
+        return;
+    };
+    if let Ok(notifications) = state.notifications.read() {
+        notifications.emit(event);
+    }
+}
+
+fn emit_reauth_notification_for_account(state: &AppState, account: &Account) {
+    if account.kind != "oauth" {
+        return;
+    }
+    if let Ok(notifications) = state.notifications.read() {
+        notifications.emit(reauth_notification_event_for_account(account));
+    }
+}
+
+fn reauth_notification_event(
+    state: &AppState,
+    trace: &TraceRecord,
+) -> Option<notify::NotificationEvent> {
+    if trace.error_class.as_deref() != Some("auth") {
+        return None;
+    }
+    let Some(account_id) = trace.account_id.as_deref() else {
+        return None;
+    };
+    let Some(account) = state
+        .vault
+        .list_cached()
+        .into_iter()
+        .find(|account| account.id == account_id && account.kind == "oauth")
+    else {
+        return None;
+    };
+    Some(reauth_notification_event_for_account(&account))
+}
+
+fn reauth_notification_event_for_account(account: &Account) -> notify::NotificationEvent {
+    let provider = account.provider.as_str().to_string();
+    let label = account
+        .email()
+        .or(account.label.clone())
+        .or_else(|| (!account.name.trim().is_empty()).then(|| account.name.clone()));
+    notify::NotificationEvent {
+        level: notify::NotificationLevel::Warn,
+        category: "reauth".into(),
+        title: format!("{} needs re-authentication", provider),
+        body: "Alexandria received an authentication error for this managed subscription. Re-authenticate it before retrying.".into(),
+        account: notify::NotificationAccount { provider: provider.clone(), label },
+        action_url: Some(format!("alex auth login {provider}")),
+        ts: now_ms(),
     }
 }
 
@@ -9372,5 +9491,115 @@ mod tests {
         .account
         .id;
         assert_eq!(after_failover, failover);
+    }
+
+    #[tokio::test]
+    async fn admin_notification_test_posts_to_local_webhook_sink_and_redacts_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_address = sink.local_addr().unwrap();
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 1024];
+            let (header_end, content_length) = loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "webhook closed before request completed");
+                bytes.extend_from_slice(&buffer[..count]);
+                let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (end + 4, length);
+            };
+            while bytes.len() < header_end + content_length {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "webhook body ended early");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes[header_end..header_end + content_length])
+                .unwrap()
+        });
+
+        let state = test_state("notification-local-sink");
+        let secret = "very-secret-webhook-token";
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    url: format!("http://{sink_address}/{secret}"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_address = admin_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(admin_listener, router(state)).await;
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{admin_address}/admin/notifications/test"))
+            .header("x-api-key", "alx-local")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .expect("local webhook sink did not receive the test event")
+            .unwrap();
+        assert_eq!(event["category"], "test");
+        assert_eq!(event["account"]["provider"], "alexandria");
+
+        let listing = client
+            .get(format!("http://{admin_address}/admin/notifications"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        server.abort();
+        assert!(!listing.contains(secret));
+        assert!(!listing.contains(&format!("http://{sink_address}")));
+    }
+
+    #[tokio::test]
+    async fn auth_class_for_managed_oauth_account_builds_reauth_event() {
+        let state = test_state("auth-reauth-notification");
+        state
+            .vault
+            .upsert(test_openai_account("reauth-account"))
+            .await
+            .unwrap();
+        let trace = TraceRecord {
+            account_id: Some("openai-oauth-reauth-account".into()),
+            error_class: Some("auth".into()),
+            ..Default::default()
+        };
+        let event = reauth_notification_event(&state, &trace).expect("managed auth error event");
+        assert_eq!(event.category, "reauth");
+        assert_eq!(event.account.provider, "openai");
+        assert_eq!(event.action_url.as_deref(), Some("alex auth login openai"));
+
+        let non_auth = TraceRecord {
+            error_class: Some("network".into()),
+            ..trace
+        };
+        assert!(reauth_notification_event(&state, &non_auth).is_none());
     }
 }
