@@ -41,12 +41,18 @@ if [ "$BAR_ONLY" = "0" ]; then
 fi
 
 if [ "$NO_BAR" = "0" ]; then
-  echo "☥ building AlexandriaBar (menu bar app)…"
+  LEGACY_APP_NAME="AlexandriaBar"
+  echo "☥ building Alex (menu bar app)…"
   (cd macos && ./Scripts/package_app.sh)
+  for app in AlexandriaBar Alex; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
+  done
   pkill -x AlexandriaBar 2>/dev/null || true
+  pkill -x Alex 2>/dev/null || true
   mkdir -p ~/Applications
-  rm -rf ~/Applications/AlexandriaBar.app
-  cp -R macos/dist/AlexandriaBar.app ~/Applications/
-  open ~/Applications/AlexandriaBar.app
-  echo "☥ AlexandriaBar installed to ~/Applications and launched"
+  rm -rf ~/Applications/Alex.app
+  cp -R macos/dist/Alex.app ~/Applications/
+  rm -rf ~/Applications/"${LEGACY_APP_NAME}.app"
+  open ~/Applications/Alex.app
+  echo "☥ Alex installed to ~/Applications and launched"
 fi

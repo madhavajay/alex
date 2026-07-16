@@ -24,9 +24,10 @@ set -eu
 REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
 APP_DIR="${ALEX_APP_DIR:-/Applications}"
-APP_NAME="AlexandriaBar.app"
-APP_PROCESS="AlexandriaBar"
-APP_BUNDLE_ID="${ALEX_APP_BUNDLE_ID:-com.madhavajay.alexandria-macos}"
+APP_NAME="Alex.app"
+LEGACY_APP_STEM="AlexandriaBar"
+LEGACY_APP_NAME="${LEGACY_APP_STEM}.app"
+APP_BUNDLE_ID="${ALEX_APP_BUNDLE_ID:-com.madhavajay.alex}"
 
 say() {
   printf '%s\n' "$*"
@@ -135,20 +136,24 @@ replace_daemon() {
 }
 
 # The app bundle cannot be replaced underneath a running process, and a stale
-# AlexandriaBar keeps reporting the old version in the menu bar.
+# app keeps reporting the old version in the menu bar.
 quit_app() {
-  if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-    say "Quitting the running ${APP_PROCESS}..."
-    osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 </dev/null || true
+  for app in AlexandriaBar Alex; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 </dev/null || true
+  done
+  for process in AlexandriaBar Alex; do
+    if pgrep -x "$process" >/dev/null 2>&1; then
+      say "Quitting the running ${process}..."
     waited=0
-    while pgrep -x "$APP_PROCESS" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
+      while pgrep -x "$process" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
       sleep 0.5
       waited=$((waited + 1))
     done
-    if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-      pkill -x "$APP_PROCESS" >/dev/null 2>&1 || true
+      if pgrep -x "$process" >/dev/null 2>&1; then
+        pkill -x "$process" >/dev/null 2>&1 || true
+      fi
     fi
-  fi
+  done
 }
 
 install_app() {
@@ -160,12 +165,12 @@ install_app() {
   fi
 
   say "Downloading the signed menu-bar app..."
-  curl -fsSL "$dmg_url" -o "$2/AlexandriaBar-beta.dmg" </dev/null
+  curl -fsSL "$dmg_url" -o "$2/Alex-beta.dmg" </dev/null
 
   quit_app
 
   mount_point="$(mktemp -d "${TMPDIR:-/tmp}/alex-beta-dmg.XXXXXX")"
-  hdiutil attach "$2/AlexandriaBar-beta.dmg" -nobrowse -quiet -mountpoint "$mount_point" </dev/null
+  hdiutil attach "$2/Alex-beta.dmg" -nobrowse -quiet -mountpoint "$mount_point" </dev/null
 
   if [ ! -d "$mount_point/$APP_NAME" ]; then
     hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
@@ -180,6 +185,7 @@ install_app() {
 
   rm -rf "${APP_DIR:?}/$APP_NAME"
   ditto "$mount_point/$APP_NAME" "$APP_DIR/$APP_NAME"
+  rm -rf "${APP_DIR:?}/$LEGACY_APP_NAME"
   hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
   rmdir "$mount_point" 2>/dev/null || true
 

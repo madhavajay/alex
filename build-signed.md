@@ -1,13 +1,13 @@
 # Signed macOS Build
 
-This repo uses `build-signed.sh` to build `AlexandriaBar.app`, sign it with a
+This repo uses `build-signed.sh` to build `Alex.app`, sign it with a
 Developer ID Application certificate, package it into a DMG, and optionally
 notarize/staple the DMG.
 
 The bundle identifier is:
 
 ```text
-com.madhavajay.alexandria-macos
+com.madhavajay.alex
 ```
 
 ## Local Setup

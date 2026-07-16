@@ -2,9 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_SOURCE="$SCRIPT_DIR/AlexandriaBar.app"
+APP_SOURCE="$SCRIPT_DIR/Alex.app"
 BIN_SOURCE="$SCRIPT_DIR/bin"
-APP_DEST="${ALEXANDRIA_APP_DEST:-/Applications/AlexandriaBar.app}"
+APP_DEST="${ALEXANDRIA_APP_DEST:-/Applications/Alex.app}"
+LEGACY_APP_STEM="AlexandriaBar"
+LEGACY_APP_DEST="$(dirname "$APP_DEST")/${LEGACY_APP_STEM}.app"
 APP_BACKUP="${APP_DEST%.app}.pre-alexandria-ci"
 BIN_DEST="${ALEXANDRIA_BIN_DEST:-$HOME/.local/bin}"
 
@@ -13,7 +15,7 @@ usage() {
 Usage: ./install.sh [--restore]
 
 With no option, installs this CI build, registers/restarts the user daemon,
-and opens AlexandriaBar. --restore puts back the app and binaries saved by
+and opens Alex. --restore puts back the app and binaries saved by
 the first CI install.
 EOF
 }
@@ -27,7 +29,11 @@ run_for_applications() {
 }
 
 stop_app() {
+  for app in AlexandriaBar Alex; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
+  done
   pkill -x AlexandriaBar 2>/dev/null || true
+  pkill -x Alex 2>/dev/null || true
 }
 
 restart_service() {
@@ -70,7 +76,7 @@ install_ci_build() {
     exit 1
   fi
   if [[ ! -d "$APP_SOURCE" || ! -x "$BIN_SOURCE/alex" || ! -x "$BIN_SOURCE/alexandria" ]]; then
-    echo "The CI bundle is incomplete; keep install.sh beside AlexandriaBar.app and bin/." >&2
+    echo "The CI bundle is incomplete; keep install.sh beside Alex.app and bin/." >&2
     exit 1
   fi
 
@@ -90,6 +96,7 @@ install_ci_build() {
   done
 
   run_for_applications ditto "$APP_SOURCE" "$APP_DEST"
+  run_for_applications rm -rf "$LEGACY_APP_DEST"
   run_for_applications xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
   cp "$BIN_SOURCE/alex" "$BIN_SOURCE/alexandria" "$BIN_DEST/"
   chmod +x "$BIN_DEST/alex" "$BIN_DEST/alexandria"

@@ -40,8 +40,8 @@ exist only in a dirty integration worktree, and work that is still backlog.
   is deliberately created.
 - Do not bump, tag, notarize, release, or claim the pending follow-up is installed before the
   launchd blocker is fixed and tests/build/live checks pass.
-- Local AlexandriaBar builds must use bundle ID `com.madhavajay.alexandria-macos` so only one
-  menu-bar identity runs.
+- Local app builds use the current production bundle ID so only one menu-bar
+  identity runs.
 - The collaboration runtime does not expose a model/tier selector, so delegated agents cannot be
   selected or verified as “Codex Terra High.” Keep delegated tasks bounded and review their work.
 
@@ -49,8 +49,8 @@ exist only in a dirty integration worktree, and work that is still backlog.
 
 ### Installed app and daemon
 
-- App: `/Applications/AlexandriaBar.app`, version `0.1.23`, bundle ID
-  `com.madhavajay.alexandria-macos`, ad-hoc signed, PID `12044` at the last check.
+- Historical snapshot: a pre-rename menu-bar build, version `0.1.23`, was
+  ad-hoc signed and running as PID `12044` at the last check.
 - App executable SHA-256:
   `00ca17ee010d0e9da870d4e4588af2d7f97101a34e1999d00c8459dff976cae5`.
 - Daemon/CLI: `~/.local/bin/alex`, version `0.1.23`, launchd PID `12043` at the last check.

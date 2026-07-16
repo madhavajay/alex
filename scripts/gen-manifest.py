@@ -13,7 +13,7 @@ PATTERNS = [
     ("cli", "x86_64-apple-darwin", "alex-cli-*-macos-x86_64.tar.gz"),
     ("cli", "x86_64-unknown-linux-gnu", "alex-cli-*-linux-x86_64.tar.gz"),
     ("cli", "x86_64-pc-windows-msvc", "alex-cli-*-windows-x86_64.zip"),
-    ("app", "darwin-universal", "AlexandriaBar-*.dmg"),
+    ("app", "darwin-universal", "Alex-*.dmg"),
 ]
 
 COMPONENT_ORDER = ("cli", "app")

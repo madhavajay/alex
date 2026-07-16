@@ -125,9 +125,9 @@ final class UpdaterController: ObservableObject {
 
     /// Debug-only manual preview hook (see MenuUpdateBannerView doc) so the
     /// orange banner can be exercised without a real Sparkle/daemon release.
-    /// `defaults write com.madhavajay.alexandria-macos DebugFakeUpdateBanner app|daemon|both`
+    /// `defaults write com.madhavajay.alex DebugFakeUpdateBanner app|daemon|both`
     /// injects a fake pending app-update version; `defaults delete
-    /// com.madhavajay.alexandria-macos DebugFakeUpdateBanner` clears it. No
+    /// com.madhavajay.alex DebugFakeUpdateBanner` clears it. No
     /// effect when the key is unset.
     private func applyDebugFakeUpdateOverride() {
         guard let mode = UserDefaults.standard.string(forKey: Self.debugFakeUpdateBannerKey) else {
