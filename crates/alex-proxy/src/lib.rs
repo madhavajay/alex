@@ -75,6 +75,12 @@ pub struct ProtectionPolicy {
     pub equivalencies: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+/// Persists a protection-policy update owned by the daemon configuration.
+/// The proxy deliberately does not know the daemon's config format or path.
+pub trait ProtectionPolicyPersister: Send + Sync {
+    fn persist(&self, policy: &ProtectionPolicy) -> std::result::Result<(), String>;
+}
+
 impl Default for ProtectionPolicy {
     fn default() -> Self {
         Self {
@@ -315,6 +321,7 @@ pub struct AppState {
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     substitution: SubstitutionConfig,
     protection: std::sync::RwLock<ProtectionPolicy>,
+    protection_persister: std::sync::RwLock<Option<Arc<dyn ProtectionPolicyPersister>>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
 }
@@ -586,6 +593,7 @@ pub fn build_state_with_substitution(
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
         substitution,
         protection: std::sync::RwLock::new(ProtectionPolicy::default()),
+        protection_persister: std::sync::RwLock::new(None),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
     })
@@ -594,6 +602,16 @@ pub fn build_state_with_substitution(
 pub fn set_protection_policy(state: &Arc<AppState>, policy: ProtectionPolicy) {
     if let Ok(mut slot) = state.protection.write() {
         *slot = policy;
+    }
+}
+
+/// Installs the daemon-owned config persistence hook for admin policy writes.
+pub fn set_protection_policy_persister(
+    state: &Arc<AppState>,
+    persister: Arc<dyn ProtectionPolicyPersister>,
+) {
+    if let Ok(mut slot) = state.protection_persister.write() {
+        *slot = Some(persister);
     }
 }
 
@@ -707,6 +725,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/routing/{provider}",
             get(admin_routing).put(admin_routing_update),
+        )
+        .route(
+            "/admin/protection",
+            get(admin_protection).put(admin_protection_update),
         )
         // Compatibility aliases for released macOS clients.
         .route(
@@ -3508,6 +3530,71 @@ async fn update_routing(state: Arc<AppState>, provider: Provider, body: Value) -
         Ok(()) => axum::Json(routing_snapshot(&state, provider).await).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
+}
+
+fn validate_protection_policy(policy: &ProtectionPolicy) -> std::result::Result<(), String> {
+    if policy.retries > 10 {
+        return Err("retries must be between 0 and 10".into());
+    }
+    for (requested_model, equivalents) in &policy.equivalencies {
+        if requested_model.trim().is_empty() {
+            return Err("equivalency model names must not be empty".into());
+        }
+        if equivalents.is_empty() {
+            return Err(format!(
+                "equivalency for '{requested_model}' must contain a provider/model pair"
+            ));
+        }
+        for (provider, model) in equivalents {
+            if !matches!(
+                provider.as_str(),
+                "anthropic" | "openai" | "xai" | "gemini" | "openrouter"
+            ) {
+                return Err(format!("unknown equivalency provider '{provider}'"));
+            }
+            if model.trim().is_empty() {
+                return Err(format!(
+                    "equivalency model for provider '{provider}' must not be empty"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn admin_protection(State(state): State<Arc<AppState>>) -> Response {
+    match state.protection.read() {
+        Ok(policy) => axum::Json(policy.clone()).into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "protection policy unavailable",
+        ),
+    }
+}
+
+async fn admin_protection_update(
+    State(state): State<Arc<AppState>>,
+    axum::Json(policy): axum::Json<ProtectionPolicy>,
+) -> Response {
+    if let Err(error) = validate_protection_policy(&policy) {
+        return error_response(StatusCode::BAD_REQUEST, &error);
+    }
+    let persister = state
+        .protection_persister
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(persister) = persister else {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "protection policy persistence is not configured",
+        );
+    };
+    if let Err(error) = persister.persist(&policy) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
+    set_protection_policy(&state, policy.clone());
+    axum::Json(policy).into_response()
 }
 
 fn routing_provider(value: &str) -> Result<Provider, Response> {
@@ -7990,6 +8077,18 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct RecordingProtectionPolicyPersister {
+        policies: std::sync::Mutex<Vec<ProtectionPolicy>>,
+    }
+
+    impl ProtectionPolicyPersister for RecordingProtectionPolicyPersister {
+        fn persist(&self, policy: &ProtectionPolicy) -> std::result::Result<(), String> {
+            self.policies.lock().unwrap().push(policy.clone());
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn health_reports_in_flight_age_model_session_and_harness() {
         let state = test_state("in-flight-registry");
@@ -9188,6 +9287,131 @@ mod tests {
             state.vault.policy(Provider::Anthropic).account_reserve_pct["work"],
             3
         );
+    }
+
+    #[tokio::test]
+    async fn protection_endpoint_round_trips_persists_and_applies_live_policy() {
+        let state = test_state("admin-protection");
+        let persister = Arc::new(RecordingProtectionPolicyPersister::default());
+        set_protection_policy_persister(&state, persister.clone());
+
+        let mut anthropic = test_openai_account("anthropic-original");
+        anthropic.id = "anthropic-oauth-original".into();
+        anthropic.provider = Provider::Anthropic;
+        state.vault.upsert(anthropic).await.unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-fallback", Provider::Openai))
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{address}/admin/protection");
+
+        let defaults: Value = client
+            .get(&endpoint)
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            defaults,
+            json!({
+                "enabled": false,
+                "reroute_on_auth": false,
+                "retries": 1,
+                "auto_return": true,
+                "equivalencies": {},
+            })
+        );
+
+        let policy = json!({
+            "enabled": true,
+            "reroute_on_auth": true,
+            "retries": 2,
+            "auto_return": true,
+            "equivalencies": {
+                "claude-fable-5": {"openai": "gpt-5.6-sol"}
+            }
+        });
+        let saved: Value = client
+            .put(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&policy)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved, policy);
+        let fetched: Value = client
+            .get(&endpoint)
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fetched, policy);
+        let persisted = persister.policies.lock().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted[0].enabled);
+        assert_eq!(persisted[0].retries, 2);
+        assert_eq!(
+            persisted[0].equivalencies["claude-fable-5"]["openai"],
+            "gpt-5.6-sol"
+        );
+
+        let invalid = client
+            .put(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({"retries": 99}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("401:authentication_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-fable-5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["served_model"], "gpt-5.6-sol");
+        server.abort();
     }
 
     #[tokio::test]

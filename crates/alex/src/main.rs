@@ -960,6 +960,21 @@ struct Config {
     notification_timeout_seconds: u64,
 }
 
+struct ConfigProtectionPolicyPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
+    fn persist(&self, policy: &alex_proxy::ProtectionPolicy) -> std::result::Result<(), String> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| "daemon config lock is unavailable".to_string())?;
+        config.protection = policy.clone();
+        save_config(&config).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone)]
 struct SelfUpdateApplier {
     config: Config,
@@ -2856,6 +2871,12 @@ async fn main() -> Result<()> {
             );
             alex_proxy::set_notifications(&state, config.notification_settings());
             alex_proxy::set_protection_policy(&state, config.protection.clone());
+            alex_proxy::set_protection_policy_persister(
+                &state,
+                Arc::new(ConfigProtectionPolicyPersister {
+                    config: Arc::new(std::sync::Mutex::new(config.clone())),
+                }),
+            );
             alex_proxy::set_fixture_dir(&state, config.data_dir.join("fixtures"));
             alex_proxy::set_daemon_updater(
                 &state,
@@ -10597,6 +10618,93 @@ local_key = "alx-test"
         assert!(config.substitution.fallbacks.is_empty());
         assert!(!config.protection.enabled);
         assert!(!config.protection.reroute_on_auth);
+        assert_eq!(config.protection.retries, 1);
+        assert!(config.protection.auto_return);
+        assert!(config.protection.equivalencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_config_protection_defaults_are_served_by_admin_api() {
+        let config: Config = toml::from_str(
+            r#"
+host = "127.0.0.1"
+port = 4100
+data_dir = "/tmp/alex-config-test"
+local_key = "alx-test"
+"#,
+        )
+        .unwrap();
+        let dir = tmpdir("legacy-protection-api");
+        let state = alex_proxy::build_state(
+            config.local_key.clone(),
+            Arc::new(Vault::open(dir.join("vault")).unwrap()),
+            Arc::new(Store::open(dir.join("store")).unwrap()),
+            None,
+            "http://127.0.0.1:4100".into(),
+            config.upstream_stream_idle_timeout(),
+        );
+        alex_proxy::set_protection_policy(&state, config.protection);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, alex_proxy::router(state))
+                .await
+                .unwrap();
+        });
+        let policy: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{address}/admin/protection"))
+            .header("x-api-key", "alx-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            policy,
+            json!({
+                "enabled": false,
+                "reroute_on_auth": false,
+                "retries": 1,
+                "auto_return": true,
+                "equivalencies": {},
+            })
+        );
+    }
+
+    #[test]
+    fn protection_policy_persister_writes_config_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("protection-policy-persist");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        save_config(&config.lock().unwrap()).unwrap();
+        let persister = ConfigProtectionPolicyPersister {
+            config: config.clone(),
+        };
+        let policy = alex_proxy::ProtectionPolicy {
+            enabled: true,
+            reroute_on_auth: true,
+            retries: 2,
+            auto_return: false,
+            equivalencies: BTreeMap::from([(
+                "claude-fable-5".into(),
+                BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+            )]),
+        };
+        alex_proxy::ProtectionPolicyPersister::persist(&persister, &policy).unwrap();
+        let (saved, fresh) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert!(!fresh);
+        assert!(saved.protection.enabled);
+        assert_eq!(saved.protection.retries, 2);
+        assert_eq!(
+            saved.protection.equivalencies["claude-fable-5"]["openai"],
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]
