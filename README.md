@@ -26,8 +26,90 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
 - **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
 - **Harness regression lane** — `scripts/harness-regression.sh` uses per-cell scoped keys and verifies persisted trace API data, rather than trusting a harness exit code
-- **Self-updating, zero downtime** — `alex update` fetches the release manifest, sha256-verifies the binary, swaps it atomically, and blue-greens the daemon on a shared port (SO_REUSEPORT) so in-flight traffic never drops; the menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item that rides the same blue-green handover
+- **Self-updating** — `alex update` fetches the release manifest, sha256-verifies the binary, and re-points the daemon to the new build; the restart gracefully drains in-flight requests before exiting. The menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item _(zero-downtime blue-green handover is planned)_
 - **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
+
+## What it can do
+
+> Screenshots below are placeholders — drop real captures at the referenced `docs/img/…` paths.
+
+### Use fable-5 (or any premium Anthropic model) inside Pi
+
+Premium Claude models work in a non-Claude-Code harness, brokered through your Claude
+subscription via [Dario](#dario-mode):
+
+```bash
+npm install -g @earendil-works/pi-coding-agent   # install the Pi harness
+alex harness connect pi                           # adds alex/* models + a tracing hook
+pi --model alex/fable-5                            # fable-5, served from your Claude sub
+```
+
+### Use an OpenAI model inside Claude Code
+
+Cross-format translation lets Claude Code call a GPT model as if it were Claude:
+
+```bash
+alex harness connect claude                       # writes an Alexandria settings profile
+claude --model alex/gpt-5.6-sol                    # GPT-5.6 Sol, translated for Claude Code
+```
+
+### Bond two Codex subscriptions in round-robin
+
+```bash
+alex auth login codex                             # add the first OpenAI/Codex subscription
+alex auth login codex                             # add a second (different account)
+# alternate across both subs, with automatic failover on 429 / rate limits:
+curl -X PUT -H "x-api-key: <local_key>" -H "content-type: application/json" \
+  -d '{"strategy":"round_robin"}' \
+  http://127.0.0.1:4100/admin/routing/openai
+```
+
+Strategies: `round_robin`, `priority`, `reset_first` — also settable in the app's Providers
+settings. (`<local_key>` is your daemon key from `~/.alexandria/config.toml`.)
+
+### See subagent traces and costs
+
+Every request is captured with tokens, cost, and latency; sub-agent calls nest under their
+parent session so you can see the full tree and what each branch spent.
+
+![Subagent traces and costs in the Trace Browser](docs/img/subagent-traces.png)
+
+### Capture traces from Amp, Cursor, and other wrapped harnesses
+
+Harnesses that don't take a custom endpoint are captured with a reverse wrap — full
+conversation traces, no config changes to the tool:
+
+```bash
+alex wrap amp   -- -x 'refactor the auth module'      # Amp, fully traced
+alex wrap agent -- --print 'summarize this repo'      # Cursor Agent, fully traced
+```
+
+![Amp conversation captured through alex wrap](docs/img/wrap-amp-trace.png)
+
+### Know when a subscription needs re-auth
+
+When a subscription's token is revoked or expires, alex classifies the failure as an `auth`
+error and surfaces it in the Trace Browser and the menu bar so you can re-authenticate.
+_(Push notifications — Telegram / webhook — are on the roadmap.)_
+
+![Re-auth prompt in the menu bar](docs/img/reauth-alert.png)
+
+## Runs everywhere
+
+The daemon and CLI ship as prebuilt binaries for every common platform. The Linux builds are
+**fully static musl** (no glibc, no OpenSSL) — they run in any container image, down to
+`scratch`/`distroless`/Alpine.
+
+| OS | Arch | Artifact | Notes |
+| --- | --- | --- | --- |
+| macOS | Apple Silicon (aarch64) | signed `.app` + CLI | native menu-bar app |
+| macOS | Intel (x86_64) | CLI | |
+| Linux | x86_64 | static-musl binary + gnu tarball | musl runs in any container |
+| Linux | aarch64 | static-musl binary | arm64 servers / CI runners |
+| Windows | x86_64 | zip | CLI |
+
+Each release also publishes `checksums.txt` (sha256) so the static Linux binaries can be
+pulled and verified by URL per version.
 
 ## Install
 
