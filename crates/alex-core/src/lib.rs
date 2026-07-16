@@ -411,6 +411,12 @@ pub struct TraceRecord {
     /// Reroutable error class that caused the most recent reroute.
     #[serde(default)]
     pub substitution_reason: Option<String>,
+    /// True when the response was produced by an operator session injection.
+    #[serde(default)]
+    pub injected: bool,
+    /// Name of the fixture used for an injected response, when applicable.
+    #[serde(default)]
+    pub fixture_name: Option<String>,
     /// JSON array of account/model attempts, kept as text for SQLite portability.
     #[serde(default)]
     pub attempts: Option<String>,

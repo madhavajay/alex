@@ -131,6 +131,21 @@ enum Command {
         #[command(subcommand)]
         command: NotifyCommand,
     },
+    /// Manage captured upstream error fixtures
+    Fixtures {
+        #[command(subcommand)]
+        command: FixturesCommand,
+    },
+    /// Inject a fixture into the next request for a live session
+    Simulate {
+        #[command(subcommand)]
+        command: SimulateCommand,
+    },
+    /// Configure resilience protection presets
+    Protection {
+        #[command(subcommand)]
+        command: ProtectionCommand,
+    },
     /// Show subscription plans, limit-window utilization, and reset times
     Limits {
         #[arg(long)]
@@ -366,6 +381,58 @@ enum NotifyCommand {
         #[arg(long)]
         channel: Option<usize>,
     },
+}
+
+#[derive(Subcommand)]
+enum FixturesCommand {
+    List,
+    Show {
+        name: String,
+    },
+    Save {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "from-trace")]
+        from_trace: Option<String>,
+        #[arg(long)]
+        status: Option<u16>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    Rm {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SimulateCommand {
+    Inject {
+        session: String,
+        fixture: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        #[arg(long = "inline-status")]
+        inline_status: Option<u16>,
+        #[arg(long = "inline-kind")]
+        inline_kind: Option<String>,
+        #[arg(long = "inline-body")]
+        inline_body: Option<String>,
+    },
+    Pending {
+        session: String,
+    },
+    Clear {
+        session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProtectionCommand {
+    Preset { name: String },
 }
 
 #[derive(Subcommand)]
@@ -880,6 +947,9 @@ struct Config {
     /// this: it is always enabled for reroutable capacity/server failures.
     #[serde(default)]
     substitution: alex_proxy::SubstitutionConfig,
+    /// Opt-in retry/bond/cross-provider protection ladder.
+    #[serde(default)]
+    protection: alex_proxy::ProtectionPolicy,
     /// One-way notification channels. URLs may contain tokens and are never
     /// returned by the daemon admin API.
     #[serde(default)]
@@ -888,6 +958,21 @@ struct Config {
     notification_cooldown_seconds: u64,
     #[serde(default = "alex_proxy::notify::default_timeout_seconds")]
     notification_timeout_seconds: u64,
+}
+
+struct ConfigProtectionPolicyPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
+    fn persist(&self, policy: &alex_proxy::ProtectionPolicy) -> std::result::Result<(), String> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| "daemon config lock is unavailable".to_string())?;
+        config.protection = policy.clone();
+        save_config(&config).map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -1086,6 +1171,7 @@ impl Config {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -2784,6 +2870,14 @@ async fn main() -> Result<()> {
                 config.substitution.clone(),
             );
             alex_proxy::set_notifications(&state, config.notification_settings());
+            alex_proxy::set_protection_policy(&state, config.protection.clone());
+            alex_proxy::set_protection_policy_persister(
+                &state,
+                Arc::new(ConfigProtectionPolicyPersister {
+                    config: Arc::new(std::sync::Mutex::new(config.clone())),
+                }),
+            );
+            alex_proxy::set_fixture_dir(&state, config.data_dir.join("fixtures"));
             alex_proxy::set_daemon_updater(
                 &state,
                 Arc::new(SelfUpdateApplier {
@@ -3833,6 +3927,142 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Fixtures { command } => match command {
+            FixturesCommand::List => {
+                let response = daemon_get(&config, "/admin/fixtures", &[]).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            FixturesCommand::Show { name } => {
+                let response = daemon_get(&config, &format!("/admin/fixtures/{name}"), &[]).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            FixturesCommand::Rm { name } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::DELETE,
+                    &format!("/admin/fixtures/{name}"),
+                    None,
+                )
+                .await?;
+                if !status.is_success() {
+                    anyhow::bail!("fixture delete failed: {body}");
+                }
+            }
+            FixturesCommand::Save {
+                name,
+                provider,
+                from_trace,
+                status,
+                kind,
+                body,
+            } => {
+                let payload = if let Some(trace_id) = from_trace {
+                    json!({"name": name, "from_trace_id": trace_id, "kind": kind.unwrap_or_else(|| "resp".into())})
+                } else {
+                    let body =
+                        body.context("--body @file is required unless --from-trace is used")?;
+                    let body = if let Some(path) = body.strip_prefix('@') {
+                        std::fs::read_to_string(path)
+                            .with_context(|| format!("reading fixture body {path}"))?
+                    } else {
+                        body
+                    };
+                    json!({"name": name, "provider": provider, "status": status.context("--status is required")?, "error_kind": kind.context("--kind is required")?, "body": body})
+                };
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/fixtures",
+                    Some(payload),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("fixture save failed: {status}");
+                }
+            }
+        },
+        Command::Simulate { command } => match command {
+            SimulateCommand::Pending { session } => {
+                let response = daemon_get(
+                    &config,
+                    &format!("/admin/sessions/{session}/injections"),
+                    &[],
+                )
+                .await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            SimulateCommand::Clear { session } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::DELETE,
+                    &format!("/admin/sessions/{session}/injections"),
+                    None,
+                )
+                .await?;
+                if !status.is_success() {
+                    anyhow::bail!("clear failed: {body}");
+                }
+            }
+            SimulateCommand::Inject {
+                session,
+                fixture,
+                count,
+                inline_status,
+                inline_kind,
+                inline_body,
+            } => {
+                let payload = if let Some(fixture) = fixture {
+                    json!({"fixture": fixture, "count": count})
+                } else {
+                    let body = inline_body.context(
+                        "fixture or --inline-status/--inline-kind/--inline-body is required",
+                    )?;
+                    json!({"count": count, "inline": {"status": inline_status.context("--inline-status is required")?, "error_kind": inline_kind.context("--inline-kind is required")?, "body": body}})
+                };
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    &format!("/admin/sessions/{session}/inject"),
+                    Some(payload),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("injection failed: {status}");
+                }
+            }
+        },
+        Command::Protection { command } => match command {
+            ProtectionCommand::Preset { name } => {
+                if name != "anthropic-openai" {
+                    anyhow::bail!("unknown protection preset '{name}'");
+                }
+                let mut config = config;
+                config.protection.equivalencies.insert(
+                    "claude-fable-5".into(),
+                    BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+                );
+                config.protection.equivalencies.insert(
+                    "gpt-5.6-sol".into(),
+                    BTreeMap::from([("anthropic".into(), "claude-fable-5".into())]),
+                );
+                save_config(&config)?;
+                println!(
+                    "wrote anthropic-openai equivalencies; protection.enabled remains {}",
+                    config.protection.enabled
+                );
+            }
+        },
         Command::Keys { command } => match command {
             KeysCommand::Mint {
                 kind,
@@ -4877,6 +5107,8 @@ impl AmpWsTraceState {
             original_model: None,
             served_model: None,
             substitution_reason: None,
+            injected: false,
+            fixture_name: None,
             attempts: None,
             original_account_id: None,
             served_account_id: None,
@@ -5667,6 +5899,8 @@ fn reconcile_agent_turn(
         original_model: None,
         served_model: None,
         substitution_reason: None,
+        injected: false,
+        fixture_name: None,
         attempts: None,
         original_account_id: None,
         served_account_id: None,
@@ -9784,6 +10018,7 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -10328,6 +10563,7 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -10380,6 +10616,95 @@ local_key = "alx-test"
         .unwrap();
         assert!(!config.substitution.enabled);
         assert!(config.substitution.fallbacks.is_empty());
+        assert!(!config.protection.enabled);
+        assert!(!config.protection.reroute_on_auth);
+        assert_eq!(config.protection.retries, 1);
+        assert!(config.protection.auto_return);
+        assert!(config.protection.equivalencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_config_protection_defaults_are_served_by_admin_api() {
+        let config: Config = toml::from_str(
+            r#"
+host = "127.0.0.1"
+port = 4100
+data_dir = "/tmp/alex-config-test"
+local_key = "alx-test"
+"#,
+        )
+        .unwrap();
+        let dir = tmpdir("legacy-protection-api");
+        let state = alex_proxy::build_state(
+            config.local_key.clone(),
+            Arc::new(Vault::open(dir.join("vault")).unwrap()),
+            Arc::new(Store::open(dir.join("store")).unwrap()),
+            None,
+            "http://127.0.0.1:4100".into(),
+            config.upstream_stream_idle_timeout(),
+        );
+        alex_proxy::set_protection_policy(&state, config.protection);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, alex_proxy::router(state))
+                .await
+                .unwrap();
+        });
+        let policy: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{address}/admin/protection"))
+            .header("x-api-key", "alx-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            policy,
+            json!({
+                "enabled": false,
+                "reroute_on_auth": false,
+                "retries": 1,
+                "auto_return": true,
+                "equivalencies": {},
+            })
+        );
+    }
+
+    #[test]
+    fn protection_policy_persister_writes_config_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("protection-policy-persist");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        save_config(&config.lock().unwrap()).unwrap();
+        let persister = ConfigProtectionPolicyPersister {
+            config: config.clone(),
+        };
+        let policy = alex_proxy::ProtectionPolicy {
+            enabled: true,
+            reroute_on_auth: true,
+            retries: 2,
+            auto_return: false,
+            equivalencies: BTreeMap::from([(
+                "claude-fable-5".into(),
+                BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+            )]),
+        };
+        alex_proxy::ProtectionPolicyPersister::persist(&persister, &policy).unwrap();
+        let (saved, fresh) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert!(!fresh);
+        assert!(saved.protection.enabled);
+        assert_eq!(saved.protection.retries, 2);
+        assert_eq!(
+            saved.protection.equivalencies["claude-fable-5"]["openai"],
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]
