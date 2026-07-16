@@ -26,3 +26,4 @@ base64 = { workspace = true }
 tracing = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
+chrono = { workspace = true }

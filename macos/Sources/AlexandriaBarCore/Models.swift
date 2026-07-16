@@ -185,12 +185,33 @@ public struct AccountAnalyticsResponse: Codable, Sendable {
     public let bucketMs: Int64
     public let byAccount: [AccountUsage]
     public let series: [AccountUsageBucket]
+    /// Plot-ready, bucket-aligned values from newer daemons. `series` above
+    /// remains the legacy sparse-point response for mixed-version support.
+    public let plotSeries: [AccountPlotSeries]?
+    public let xLabels: [String]?
+    public let bucketCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case sinceMs = "since_ms"
         case bucketMs = "bucket_ms"
         case byAccount = "by_account"
         case series
+        case plotSeries = "plot_series"
+        case xLabels = "x_labels"
+        case bucketCount = "bucket_count"
+    }
+}
+
+public struct AccountPlotSeries: Codable, Sendable, Identifiable {
+    public let accountId: String
+    public let name: String
+    public let values: [Double]
+
+    public var id: String { accountId }
+
+    enum CodingKeys: String, CodingKey {
+        case name, values
+        case accountId = "account_id"
     }
 }
 

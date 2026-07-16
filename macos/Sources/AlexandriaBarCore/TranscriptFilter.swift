@@ -21,6 +21,12 @@ public struct TranscriptFilterEntry: Sendable, Equatable, Identifiable {
     }
 }
 
+public struct TranscriptFilterResult: Sendable, Equatable {
+    public let entries: [TranscriptFilterEntry]
+    /// Number of displayable entries before the selected tab/query is applied.
+    public let totalCount: Int
+}
+
 /// Pure transcript message filtering, safe to run off the main actor.
 ///
 /// This used to live inline in `TranscriptChatPane.body` (AlexandriaBar
@@ -43,8 +49,17 @@ public enum TranscriptFilter {
     public static func entries(
         turns: [TranscriptTurn], filterTab: Int, query: String
     ) -> [TranscriptFilterEntry] {
+        result(turns: turns, filterTab: filterTab, query: query).entries
+    }
+
+    /// Produces the filtered list and its unfiltered total in one pass. The
+    /// total used to call `entries` again and scan every turn twice per key.
+    public static func result(
+        turns: [TranscriptTurn], filterTab: Int, query: String
+    ) -> TranscriptFilterResult {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         var out: [TranscriptFilterEntry] = []
+        var total = 0
         out.reserveCapacity(turns.count * 2)
         for (index, turn) in turns.enumerated() {
             let userText = turn.user ?? ""
@@ -56,10 +71,12 @@ public enum TranscriptFilter {
             {
                 out.append(TranscriptFilterEntry(turnId: turn.traceId, turnIndex: index, role: .user))
             }
+            if !userText.isEmpty { total += 1 }
             let toolsPresent = hasTools(turn)
             let errorPresent = turn.error?.isEmpty == false
             let assistant = assistantText(turn)
             guard !assistant.isEmpty || toolsPresent || errorPresent else { continue }
+            total += 1
             let searchText = trimmed.isEmpty ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "")
             if matches(
                 role: .assistant, searchText: searchText, hasTools: toolsPresent,
@@ -68,7 +85,7 @@ public enum TranscriptFilter {
                 out.append(TranscriptFilterEntry(turnId: turn.traceId, turnIndex: index, role: .assistant))
             }
         }
-        return out
+        return TranscriptFilterResult(entries: out, totalCount: total)
     }
 
     /// Mirrors `TranscriptChatMessages.assistantText` (AlexandriaBar) without

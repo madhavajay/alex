@@ -7,6 +7,7 @@ import AlexandriaBarCore
 struct JsonBlock: View {
     let content: String
     var maxHeight: CGFloat = 200
+    @State private var highlighted = AttributedString()
 
     var body: some View {
         ScrollView([.vertical, .horizontal]) {
@@ -19,11 +20,27 @@ struct JsonBlock: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: maxHeight)
+        .task(id: content) {
+            let source = content
+            let tokens = await Task.detached(priority: .userInitiated) {
+                let start = ContinuousClock.now
+                defer {
+                    let elapsed = start.duration(to: .now)
+                    BarLog.timing(
+                        .ui, label: "json tokenize bytes=\(source.utf8.count)",
+                        milliseconds: Double(elapsed.components.seconds) * 1000
+                            + Double(elapsed.components.attoseconds) / 1e15)
+                }
+                return JsonSyntax.tokenize(source)
+            }.value
+            guard !Task.isCancelled else { return }
+            highlighted = Self.highlighted(tokens)
+        }
     }
 
-    private var highlighted: AttributedString {
+    private static func highlighted(_ tokens: [JsonSyntax.Token]) -> AttributedString {
         var result = AttributedString()
-        for token in JsonSyntax.tokenize(content) {
+        for token in tokens {
             var piece = AttributedString(token.text)
             piece.foregroundColor = Self.color(for: token.type)
             result += piece

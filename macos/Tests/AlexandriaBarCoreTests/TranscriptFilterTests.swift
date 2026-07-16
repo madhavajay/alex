@@ -44,6 +44,16 @@ import Testing
         #expect(entries.count == 3)
     }
 
+    @Test func resultCarriesUnfilteredTotalWithoutSecondScan() {
+        let turns = [
+            makeTurn(traceId: "t1", user: "needle", assistant: "reply"),
+            makeTurn(traceId: "t2", user: "", assistant: "other"),
+        ]
+        let result = TranscriptFilter.result(turns: turns, filterTab: 0, query: "needle")
+        #expect(result.entries.count == 1)
+        #expect(result.totalCount == 3)
+    }
+
     @Test func queryMatchesWithinCapAndMissesBeyondIt() {
         let padding = String(repeating: "x", count: TranscriptFilter.searchCharLimit + 500)
         let turnNear = makeTurn(traceId: "near", user: "needle at start " + padding, assistant: "")

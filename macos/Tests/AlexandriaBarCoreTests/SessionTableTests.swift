@@ -64,6 +64,19 @@ import Testing
         #expect(row.duration == "0s")
     }
 
+    @Test func rowPrefersAdditiveDaemonDisplayFields() {
+        let row = SessionRow(session: session([
+            "session_id": "long-session-id-that-would-normally-be-shortened",
+            "short_id": "daemon-short", "duration_ms": 9_001,
+            "tags_summary": "daemon=true", "status_label": "Done",
+            "providers": ["openai"],
+        ]))
+        #expect(row.sessionShort == "daemon-short")
+        #expect(row.durationMs == 9_001)
+        #expect(row.tagsSummary == "daemon=true")
+        #expect(row.providers == ["openai"])
+    }
+
     @Test func explicitHarnessTagOverridesRawSdkUserAgent() {
         let row = SessionRow(session: session([
             "session_id": "pi-session",

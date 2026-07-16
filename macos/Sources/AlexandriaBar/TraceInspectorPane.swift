@@ -1130,6 +1130,14 @@ private enum FormattedJSONBodyBuilder {
 
     static func build(_ source: String) async -> AttributedStringBox {
         await Task.detached(priority: .userInitiated) { () -> AttributedStringBox in
+            let start = ContinuousClock.now
+            defer {
+                let elapsed = start.duration(to: .now)
+                BarLog.timing(
+                    .ui, label: "formatted json build bytes=\(source.utf8.count)",
+                    milliseconds: Double(elapsed.components.seconds) * 1000
+                        + Double(elapsed.components.attoseconds) / 1e15)
+            }
             let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
             if source.utf8.count <= enhancedSizeCap,
                 let tokens = JsonFormatted.tokens(source, maxChars: BodyPretty.displayCap)

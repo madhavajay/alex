@@ -129,7 +129,16 @@ public struct AlexandriaClient: Sendable {
     ) async throws -> T {
         let data = try await request(path, query: query)
         do {
-            return try await Task.detached { try JSONDecoder().decode(T.self, from: data) }.value
+            return try await Task.detached {
+                let start = ContinuousClock.now
+                defer {
+                    let elapsed = start.duration(to: .now)
+                    let ms = Double(elapsed.components.seconds) * 1000
+                        + Double(elapsed.components.attoseconds) / 1e15
+                    BarLog.timing(.net, label: "decode /\(path) bytes=\(data.count)", milliseconds: ms)
+                }
+                return try JSONDecoder().decode(T.self, from: data)
+            }.value
         } catch {
             let snippet = String(data: data, encoding: .utf8).map { String($0.prefix(200)) } ?? "<non-utf8>"
             BarLog.error(.net, "decode \(T.self) failed for /\(path): \(error) body=\(snippet)")

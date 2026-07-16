@@ -8,13 +8,20 @@ import AlexandriaBarCore
 final class TraceBrowserModel {
     private let store: SnapshotStore
 
-    private(set) var sessions: [TraceSession] = []
+    private(set) var sessions: [TraceSession] = [] {
+        didSet { recomputeSessionSummary(); recomputeTranscriptSummary() }
+    }
     private(set) var turns: [TranscriptTurn] = [] {
-        didSet { scheduleTranscriptFilter(debounce: false) }
+        didSet { scheduleTranscriptFilter(debounce: false); recomputeTranscriptSummary() }
     }
     private(set) var visibleRows: [SessionRow] = []
     private(set) var parsedQuery = OmniQuery()
     private(set) var daemonDown = false
+    private(set) var sessionsLoading = true
+    private(set) var sessionsUnreachable = false
+    private(set) var transcriptLoading = false
+    private(set) var transcriptUnreachable = false
+    private var transcriptLoadedSessionId: String?
     private(set) var searchSessionIds: Set<String>?
     private(set) var searchMatchCount = 0
     private(set) var searchScanned = 0
@@ -91,6 +98,7 @@ final class TraceBrowserModel {
     }
     private(set) var transcriptEntries: [TranscriptChatEntry] = []
     private(set) var transcriptTotalCount = 0
+    private(set) var transcriptTabCounts: TranscriptTabCounts?
     private var transcriptFilterTask: Task<Void, Never>?
 
     /// Recomputes `transcriptEntries`/`transcriptTotalCount` off the main
@@ -110,9 +118,18 @@ final class TraceBrowserModel {
             }
             let result = await Task.detached(priority: .userInitiated) {
                 () -> ([TranscriptFilterEntry], Int) in
-                let shown = TranscriptFilter.entries(turns: turnsSnapshot, filterTab: tab, query: query)
-                let total = TranscriptFilter.entries(turns: turnsSnapshot, filterTab: 0, query: "").count
-                return (shown, total)
+                let start = ContinuousClock.now
+                defer {
+                    let elapsed = start.duration(to: .now)
+                    BarLog.timing(
+                        .browser,
+                        label: "transcript filter turns=\(turnsSnapshot.count) tab=\(tab)",
+                        milliseconds: Double(elapsed.components.seconds) * 1000
+                            + Double(elapsed.components.attoseconds) / 1e15)
+                }
+                let filtered = TranscriptFilter.result(
+                    turns: turnsSnapshot, filterTab: tab, query: query)
+                return (filtered.entries, filtered.totalCount)
             }.value
             guard !Task.isCancelled, let self else { return }
             self.transcriptEntries = self.mapFilterEntries(result.0, turns: turnsSnapshot)
@@ -175,6 +192,8 @@ final class TraceBrowserModel {
     private var sessionsTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    private var sessionFilterTask: Task<Void, Never>?
+    private var sessionFilterGeneration = 0
 
     private(set) var detailsVisible = false
     private(set) var inspectorTraceId: String?
@@ -388,20 +407,55 @@ final class TraceBrowserModel {
         queryText = OmniQuery.settingToken(in: queryText, key: "harness", value: harness)
     }
 
-    private func recomputeVisible() {
-        let query = parsedQuery
-        BarLog.measure(.browser, label: "filter sessions=\(sessions.count)") {
-            let rows = SessionTable.visibleRows(
-                sessions: sessions, rowsById: rowsById, showPings: showPings,
-                query: query, serverMatches: searchSessionIds, sortOrder: sortOrder,
-                nestSubagents: nestSubagents, collapsedRoots: collapsedLineageRoots)
-            visibleRows = Self.applyStatusPill(statusPill, rows: rows)
+    private func recomputeVisible(debounce: Bool = false) {
+        sessionFilterTask?.cancel()
+        sessionFilterGeneration += 1
+        let generation = sessionFilterGeneration
+        let input = SessionFilterInput(
+            sessions: sessions, rowsById: rowsById, showPings: showPings,
+            query: parsedQuery, serverMatches: searchSessionIds, sortOrder: sortOrder,
+            nestSubagents: nestSubagents, collapsedRoots: collapsedLineageRoots,
+            statusPill: statusPill)
+        sessionFilterTask = Task { [weak self] in
+            if debounce {
+                try? await Task.sleep(for: .milliseconds(175))
+                guard !Task.isCancelled else { return }
+            }
+            let rows = await Task.detached(priority: .userInitiated) {
+                let start = ContinuousClock.now
+                defer {
+                    let elapsed = start.duration(to: .now)
+                    BarLog.timing(
+                        .browser, label: "session filter sessions=\(input.sessions.count)",
+                        milliseconds: Double(elapsed.components.seconds) * 1000
+                            + Double(elapsed.components.attoseconds) / 1e15)
+                }
+                let raw = SessionTable.visibleRows(
+                    sessions: input.sessions, rowsById: input.rowsById, showPings: input.showPings,
+                    query: input.query, serverMatches: input.serverMatches, sortOrder: input.sortOrder,
+                    nestSubagents: input.nestSubagents, collapsedRoots: input.collapsedRoots)
+                return Self.applyStatusPill(input.statusPill, rows: raw)
+            }.value
+            guard !Task.isCancelled, let self, generation == self.sessionFilterGeneration else { return }
+            self.visibleRows = rows
         }
+    }
+
+    private struct SessionFilterInput: @unchecked Sendable {
+        let sessions: [TraceSession]
+        let rowsById: [String: SessionRow]
+        let showPings: Bool
+        let query: OmniQuery
+        let serverMatches: Set<String>?
+        let sortOrder: [KeyPathComparator<SessionRow>]
+        let nestSubagents: Bool
+        let collapsedRoots: Set<String>
+        let statusPill: SessionStatusPill
     }
 
     /// Keeps rows matching the pill plus any descendants of a kept row so a
     /// nested lineage stays attached to its parent.
-    static func applyStatusPill(
+    nonisolated static func applyStatusPill(
         _ pill: SessionStatusPill, rows: [SessionRow], now: Date = Date()
     ) -> [SessionRow] {
         guard pill != .all else { return rows }
@@ -505,7 +559,12 @@ final class TraceBrowserModel {
         queryText = OmniQuery.settingToken(in: queryText, key: dimension.rawValue, value: value)
     }
 
-    var errorClassSummaryLine: String? {
+    private(set) var errorClassSummaryLine: String?
+    private(set) var transcriptToolCount = 0
+    private(set) var transcriptSubagentCount = 0
+    private(set) var transcriptTokensTotal: Int64 = 0
+
+    private func recomputeSessionSummary() {
         let counts = sessions
             .filter { parsedQuery.matches($0) }
             .reduce(into: [String: Int64]()) { totals, session in
@@ -513,32 +572,31 @@ final class TraceBrowserModel {
                     totals[errorClass, default: 0] += count
                 }
             }
-        guard !counts.isEmpty else { return nil }
+        guard !counts.isEmpty else {
+            errorClassSummaryLine = nil
+            return
+        }
         let real = counts.filter { $0.key != "client_disconnect" }.values.reduce(0, +)
         let detail = counts.sorted { $0.key < $1.key }
             .map { "\($0.key) \($0.value)" }
             .joined(separator: " · ")
-        return "\(real) errored (excluding client disconnect) · \(detail)"
+        errorClassSummaryLine = "\(real) errored (excluding client disconnect) · \(detail)"
     }
 
     var selectedSession: TraceSession? {
         sessions.first { $0.sessionId == selectedSessionId }
     }
 
-    /// Total tool calls across the loaded transcript (header summary line).
-    var transcriptToolCount: Int {
-        turns.reduce(0) { $0 + TranscriptChatMessages.toolCount(for: $1) }
-    }
-
-    /// Child sessions spawned by the selected session (header summary line).
-    var transcriptSubagentCount: Int {
-        guard let sid = selectedSessionId else { return 0 }
-        return sessions.filter { $0.parentSessionId == sid }.count
-    }
-
-    /// Sum of input+output tokens across the loaded transcript (footer).
-    var transcriptTokensTotal: Int64 {
-        turns.reduce(0) { $0 + ($1.inputTokens ?? 0) + ($1.outputTokens ?? 0) }
+    /// Recompute only when sessions/turns or the selected session changes,
+    /// never from a SwiftUI view body.
+    private func recomputeTranscriptSummary() {
+        transcriptToolCount = turns.reduce(0) { $0 + TranscriptChatMessages.toolCount(for: $1) }
+        transcriptTokensTotal = turns.reduce(0) {
+            $0 + ($1.inputTokens ?? 0) + ($1.outputTokens ?? 0)
+        }
+        transcriptSubagentCount = selectedSessionId.map { sid in
+            sessions.filter { $0.parentSessionId == sid }.count
+        } ?? 0
     }
 
     func start() {
@@ -570,6 +628,8 @@ final class TraceBrowserModel {
         firstDetailTask = nil
         transcriptFilterTask?.cancel()
         transcriptFilterTask = nil
+        sessionFilterTask?.cancel()
+        sessionFilterTask = nil
     }
 
     func selectFromUser(_ id: String) {
@@ -587,6 +647,7 @@ final class TraceBrowserModel {
         // and the transcript pane agree on one session again.
         multiSelection = [id]
         followedSubagentId = nil
+        recomputeTranscriptSummary()
         resetTurns()
         setUserAtBottom(true)
         Task { await pollTranscript() }
@@ -595,6 +656,9 @@ final class TraceBrowserModel {
     private func resetTurns() {
         allTurns = []
         turns = []
+        transcriptLoadedSessionId = nil
+        transcriptLoading = selectedSessionId != nil
+        transcriptUnreachable = false
         inspectorToolBody = nil
         transcriptFilterTask?.cancel()
         transcriptEntries = []
@@ -730,18 +794,33 @@ final class TraceBrowserModel {
     }
 
     private func client() -> AlexandriaClient? {
-        guard let cfg = store.config ?? DaemonDiscovery.load() else { return nil }
+        // SnapshotStore owns config discovery/refresh. Reading and reparsing
+        // config.toml here used to synchronously hit disk on every 1s/500ms
+        // poll, directly on the main actor.
+        guard let cfg = store.config else { return nil }
         return AlexandriaClient(config: cfg)
     }
 
     private func pollSessions() async {
         guard let client = client() else {
             daemonDown = true
+            sessionsLoading = false
+            sessionsUnreachable = true
             return
+        }
+        let wasInitialLoad = sessionsLoading
+        if wasInitialLoad {
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(1500))
+                guard !Task.isCancelled, let self, self.sessionsLoading else { return }
+                self.sessionsUnreachable = true
+            }
         }
         do {
             let fetched = try await client.traceSessions(since: "24h", limit: 200)
             daemonDown = false
+            sessionsLoading = false
+            sessionsUnreachable = false
             let fingerprint = TraceFingerprint.sessions(fetched)
             if fingerprint != sessionsFingerprint {
                 sessionsFingerprint = fingerprint
@@ -757,10 +836,11 @@ final class TraceBrowserModel {
                 selectSessionWhenLoaded(pending)
             }
             applyLiveFollow()
-        } catch is AlexandriaClient.ClientError {
-            daemonDown = false
         } catch {
-            if !(error is CancellationError) { daemonDown = true }
+            guard !(error is CancellationError) else { return }
+            daemonDown = true
+            sessionsLoading = false
+            sessionsUnreachable = true
         }
     }
 
@@ -782,11 +862,32 @@ final class TraceBrowserModel {
     }
 
     private func pollTranscript() async {
-        guard let sid = selectedSessionId, let client = client() else { return }
+        guard let sid = selectedSessionId else { return }
+        guard let client = client() else {
+            daemonDown = true
+            transcriptLoading = false
+            transcriptUnreachable = true
+            return
+        }
+        let needsInitialLoad = transcriptLoadedSessionId != sid
+        if needsInitialLoad { transcriptLoading = true }
+        if needsInitialLoad {
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(1500))
+                guard !Task.isCancelled, let self, self.selectedSessionId == sid,
+                    self.transcriptLoading
+                else { return }
+                self.transcriptUnreachable = true
+            }
+        }
         do {
             let resp = try await client.traceTranscript(sessionId: sid, limit: 500)
             daemonDown = false
             guard resp.sessionId == selectedSessionId else { return }
+            transcriptLoadedSessionId = sid
+            transcriptLoading = false
+            transcriptUnreachable = false
+            transcriptTabCounts = resp.tabCounts
             let fingerprint = TraceFingerprint.turns(resp.turns)
             if fingerprint != turnsFingerprint {
                 turnsFingerprint = fingerprint
@@ -796,24 +897,29 @@ final class TraceBrowserModel {
                 applyTurnFilter()
                 ensureFirstTraceDetail()
             }
-        } catch is AlexandriaClient.ClientError {
-            daemonDown = false
         } catch {
-            if !(error is CancellationError) { daemonDown = true }
+            guard !(error is CancellationError) else { return }
+            daemonDown = true
+            transcriptLoading = false
+            transcriptUnreachable = true
         }
     }
+
+    func retrySessions() { Task { await pollSessions() } }
+    func retryTranscript() { Task { await pollTranscript() } }
 
     private func queryChanged() {
         searchTask?.cancel()
         let query = parsedQuery
+        recomputeSessionSummary()
         applyTurnFilter()
         guard !query.freeText.isEmpty else {
             searchSessionIds = nil
             searchInFlight = false
-            recomputeVisible()
+            recomputeVisible(debounce: true)
             return
         }
-        recomputeVisible()
+        recomputeVisible(debounce: true)
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
@@ -1458,9 +1564,25 @@ private struct SessionListView: View {
         }
         .overlay {
             if model.visibleRows.isEmpty {
-                Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
+                if model.sessionsLoading {
+                    VStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(model.sessionsUnreachable ? "Connecting to daemon…" : "Loading sessions…")
+                    }
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                } else if model.sessionsUnreachable {
+                    VStack(spacing: 8) {
+                        Text("Daemon unreachable")
+                        Button("Retry") { model.retrySessions() }.buttonStyle(.bordered)
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text(model.sessions.isEmpty ? "No sessions in the last 24h" : "No sessions match")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .focused($listFocused)
@@ -1835,10 +1957,29 @@ private struct TranscriptView: View {
                     TranscriptChatPane(model: model)
                 }
                 if model.turns.isEmpty {
-                    Text(model.selectedSessionId == nil ? "Select a session" : "No turns yet")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                    if model.selectedSessionId == nil {
+                        Text("Select a session")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if model.transcriptLoading {
+                        VStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text(model.transcriptUnreachable ? "Connecting to daemon…" : "Loading transcript…")
+                        }
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if model.transcriptUnreachable {
+                        VStack(spacing: 8) {
+                            Text("Daemon unreachable")
+                            Button("Retry") { model.retryTranscript() }.buttonStyle(.bordered)
+                        }
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        Text("No turns yet")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
                 VStack(spacing: 6) {
                     if let newer = model.newerActivityRow {

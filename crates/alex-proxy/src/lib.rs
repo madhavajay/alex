@@ -26,6 +26,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -1109,13 +1110,98 @@ async fn admin_account_analytics(
         .and_then(|s| s.parse().ok())
         .unwrap_or(60)
         .clamp(1, 24 * 60);
-    match state
-        .store
-        .account_analytics(now_ms() - minutes * 60_000, bucket_minutes * 60_000)
-    {
-        Ok(v) => axum::Json(v).into_response(),
+    let since_ms = now_ms() - minutes * 60_000;
+    let bucket_ms = bucket_minutes * 60_000;
+    match state.store.account_analytics(since_ms, bucket_ms) {
+        Ok(mut v) => {
+            // Keep the legacy sparse point list in `series`; `plot_series`
+            // is deliberately additive for older menu-bar clients. New
+            // clients can draw it directly without grouping or zero-filling.
+            let (plot_series, x_labels, bucket_count) =
+                account_plot_series(&v, since_ms, bucket_ms.max(60_000), now_ms());
+            v["plot_series"] = plot_series;
+            v["x_labels"] = json!(x_labels);
+            v["bucket_count"] = json!(bucket_count);
+            axum::Json(v).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Convert sparse aggregate points into the exact rectangular data shape a
+/// chart needs. This is intentionally pure so the boundary/zero-fill behavior
+/// is covered by unit tests and does not drift back into SwiftUI view bodies.
+fn account_plot_series(
+    response: &Value,
+    since_ms: i64,
+    bucket_ms: i64,
+    now_ms: i64,
+) -> (Value, Vec<String>, usize) {
+    let first = (since_ms / bucket_ms) * bucket_ms;
+    let last = (now_ms / bucket_ms) * bucket_ms;
+    let buckets: Vec<i64> = if last < first {
+        Vec::new()
+    } else {
+        (first..=last).step_by(bucket_ms as usize).collect()
+    };
+    let x_labels = buckets
+        .iter()
+        .map(|ms| {
+            let date = Utc.timestamp_millis_opt(*ms).single().unwrap_or_default();
+            if bucket_ms <= 60 * 60 * 1_000 {
+                date.format("%H:%M").to_string()
+            } else {
+                date.format("%b %-d").to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    let indices: HashMap<i64, usize> = buckets
+        .iter()
+        .enumerate()
+        .map(|(index, bucket)| (*bucket, index))
+        .collect();
+    let mut names: HashMap<String, String> = response["by_account"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|account| {
+            let id = account["account_id"].as_str()?.to_string();
+            Some((id.clone(), id))
+        })
+        .collect();
+    let mut values: HashMap<String, Vec<f64>> = HashMap::new();
+    for point in response["series"].as_array().into_iter().flatten() {
+        let Some(account_id) = point["account_id"].as_str() else {
+            continue;
+        };
+        let Some(bucket) = point["bucket_ms"].as_i64() else {
+            continue;
+        };
+        let Some(index) = indices.get(&bucket) else {
+            continue;
+        };
+        names
+            .entry(account_id.to_string())
+            .or_insert_with(|| account_id.to_string());
+        let entry = values
+            .entry(account_id.to_string())
+            .or_insert_with(|| vec![0.0; buckets.len()]);
+        entry[*index] = point["input_tokens"].as_f64().unwrap_or(0.0)
+            + point["output_tokens"].as_f64().unwrap_or(0.0);
+    }
+    let mut ids: Vec<_> = values.keys().cloned().collect();
+    ids.sort();
+    let plot_series = ids
+        .into_iter()
+        .map(|account_id| {
+            json!({
+                "account_id": account_id,
+                "name": names.remove(&account_id).unwrap_or(account_id.clone()),
+                "values": values.remove(&account_id).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (json!(plot_series), x_labels, buckets.len())
 }
 
 const USAGE_CACHE_TTL_MS: i64 = 300_000;
@@ -1774,7 +1860,9 @@ async fn admin_traces(
         let mut filter = filter_from_query(&q);
         filter.limit = limit;
         return match state.store.search_traces(&filter) {
-            Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+            Ok(rows) => {
+                axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
+            }
             Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
     }
@@ -1783,9 +1871,55 @@ async fn admin_traces(
         q.get("session").map(|s| s.as_str()),
         q.get("model").map(|s| s.as_str()),
     ) {
-        Ok(rows) => axum::Json(json!({"traces": rows})).into_response(),
+        Ok(rows) => {
+            axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// `/admin/traces` and `/traces/search` are also consumed as session-like
+/// lists by external clients. Add the same display primitives as the grouped
+/// sessions endpoint without changing any persisted trace semantics.
+fn trace_rows_with_display_fields(rows: Vec<Value>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|mut row| {
+            let id = row["session_id"]
+                .as_str()
+                .or_else(|| row["id"].as_str())
+                .unwrap_or_default();
+            let short_id = if id.chars().count() > 22 {
+                format!(
+                    "{}…{}",
+                    id.chars().take(10).collect::<String>(),
+                    id.chars()
+                        .rev()
+                        .take(8)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                )
+            } else {
+                id.to_string()
+            };
+            let status = row["status"].as_i64().unwrap_or_default();
+            row["short_id"] = json!(short_id);
+            row["duration_ms"] = json!(row["latency_ms"].as_i64().unwrap_or(0).max(0));
+            row["providers"] = json!(row["upstream_provider"]
+                .as_str()
+                .into_iter()
+                .collect::<Vec<_>>());
+            row["status_label"] = json!(if row["error"].is_string() || status >= 400 {
+                "Error"
+            } else if (200..400).contains(&status) {
+                "Done"
+            } else {
+                "Running"
+            });
+            row
+        })
+        .collect()
 }
 
 fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
@@ -1909,10 +2043,12 @@ async fn traces_search(
                 })
                 .await
                 .unwrap_or_default();
-                axum::Json(json!({"traces": rows, "scanned": scanned, "scan_cap": TEXT_SCAN_CAP}))
+                axum::Json(json!({"traces": trace_rows_with_display_fields(rows), "scanned": scanned, "scan_cap": TEXT_SCAN_CAP}))
                     .into_response()
             }
-            None => axum::Json(json!({"traces": rows})).into_response(),
+            None => {
+                axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
+            }
         },
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -2141,6 +2277,49 @@ fn transcript_turn(row: &Value) -> Value {
     })
 }
 
+/// Counts are sent with the transcript so tab labels never need to rescan a
+/// large response while the user is typing a filter. They intentionally count
+/// displayable message halves, matching the client filter's All/User/Model
+/// rules; tool/agent data is additive and harmless to older clients.
+fn transcript_tab_counts(turns: &[Value]) -> Value {
+    let mut all = 0usize;
+    let mut user = 0usize;
+    let mut model = 0usize;
+    let mut tools = 0usize;
+    let agents = 0usize;
+    for turn in turns {
+        let has_user = turn["user"].as_str().is_some_and(|text| !text.is_empty());
+        let has_tools = turn["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+            || turn["assistant_blocks"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block["type"].as_str() == Some("tool_call"))
+            })
+            || turn["executed_tools"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty());
+        let has_model = turn["assistant"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+            || has_tools
+            || turn["error"].as_str().is_some_and(|text| !text.is_empty());
+        if has_user {
+            user += 1;
+            all += 1;
+        }
+        if has_model {
+            model += 1;
+            all += 1;
+            if has_tools {
+                tools += 1;
+            }
+        }
+    }
+    json!({"all": all, "user": user, "model": model, "tools": tools, "agents": agents})
+}
+
 fn openai_responses_user_history_signature(request: &Value) -> Option<String> {
     let history = request["input"]
         .as_array()?
@@ -2222,7 +2401,9 @@ async fn traces_session_transcript(
             turn
         })
         .collect();
-    axum::Json(json!({"session_id": session_id, "turns": turns})).into_response()
+    let tab_counts = transcript_tab_counts(&turns);
+    axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
+        .into_response()
 }
 
 fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
@@ -4055,9 +4236,9 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        openai_responses_user_history_signature, session_from_metadata, trace_extras,
-        trace_harness, trace_reasoning_fields, transcript_assistant_blocks, transcript_turn,
-        truncate_chars,
+        account_plot_series, openai_responses_user_history_signature, session_from_metadata,
+        trace_extras, trace_harness, trace_reasoning_fields, transcript_assistant_blocks,
+        transcript_tab_counts, transcript_turn, truncate_chars,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
@@ -4075,6 +4256,36 @@ mod trace_api_tests {
             Some("{\"device_id\":\"d1\"}".into())
         );
         assert_eq!(session_from_metadata(&json!({})), None);
+    }
+
+    #[test]
+    fn account_plot_series_zero_fills_canonical_buckets() {
+        let response = json!({
+            "by_account": [{"account_id": "a"}, {"account_id": "b"}],
+            "series": [
+                {"bucket_ms": 0, "account_id": "a", "input_tokens": 2, "output_tokens": 3},
+                {"bucket_ms": 2_000, "account_id": "a", "input_tokens": 7, "output_tokens": 0},
+                {"bucket_ms": 1_000, "account_id": "b", "input_tokens": 1, "output_tokens": 1}
+            ]
+        });
+        let (series, labels, count) = account_plot_series(&response, 100, 1_000, 2_999);
+        assert_eq!(count, 3);
+        assert_eq!(labels, vec!["00:00", "00:00", "00:00"]);
+        assert_eq!(series[0]["account_id"], "a");
+        assert_eq!(series[0]["values"], json!([5.0, 0.0, 7.0]));
+        assert_eq!(series[1]["values"], json!([0.0, 2.0, 0.0]));
+    }
+
+    #[test]
+    fn transcript_tab_counts_count_displayable_halves_once() {
+        let turns = vec![
+            json!({"user": "hello", "assistant": "world", "tool_calls": []}),
+            json!({"user": null, "assistant": null, "tool_calls": [{"name": "ls"}]}),
+        ];
+        assert_eq!(
+            transcript_tab_counts(&turns),
+            json!({"all": 3, "user": 1, "model": 2, "tools": 1, "agents": 0})
+        );
     }
 
     #[test]

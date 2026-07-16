@@ -428,6 +428,8 @@ private struct UsageChartCard: View {
     let rangeEnabled: [Bool]
     let isLoading: Bool
     let colorFor: (String) -> Color
+    @State private var preparedSeries: [UsageChartSeries] = []
+    @State private var preparedLabels: [String] = []
 
     private var accountIds: Set<String> { Set(accounts.map(\.id)) }
 
@@ -436,7 +438,7 @@ private struct UsageChartCard: View {
     }
 
     private var hasTokenActivity: Bool {
-        points.contains { $0.inputTokens + $0.outputTokens > 0 }
+        preparedSeries.contains { $0.values.contains { $0 > 0 } }
     }
 
     /// The full bucket-aligned timeline for the requested range, not just
@@ -452,7 +454,36 @@ private struct UsageChartCard: View {
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000))
     }
 
-    private var chartSeries: [UsageChartSeries] {
+    private var chartSnapshotKey: Int {
+        var hasher = Hasher()
+        hasher.combine(analytics.sinceMs)
+        hasher.combine(analytics.bucketMs)
+        if let plotSeries = analytics.plotSeries {
+            for series in plotSeries {
+                hasher.combine(series.accountId)
+                hasher.combine(series.values)
+            }
+        } else {
+            for point in analytics.series { hasher.combine(point.id) }
+        }
+        return hasher.finalize()
+    }
+
+    private var uncachedChartSeries: [UsageChartSeries] {
+        if let precomputed = analytics.plotSeries {
+            return BarLog.measure(.ui, label: "chart data prep precomputed series=\(precomputed.count)") {
+                precomputed
+                    .filter { accountIds.contains($0.accountId) }
+                    .map { line in
+                        let account = accounts.first { $0.id == line.accountId }
+                        return UsageChartSeries(
+                            id: line.accountId,
+                            name: account?.email ?? account?.description ?? account?.name ?? line.name,
+                            color: colorFor(line.accountId), values: line.values)
+                    }
+            }
+        }
+        // Mixed daemon/app versions retain the old sparse-point fallback.
         let byAccount = Dictionary(grouping: points, by: \.accountId)
         let bucketIndex = Dictionary(
             uniqueKeysWithValues: buckets.enumerated().map { ($0.element, $0.offset) })
@@ -472,7 +503,8 @@ private struct UsageChartCard: View {
         }
     }
 
-    private var xLabels: [String] {
+    private var uncachedXLabels: [String] {
+        if let labels = analytics.xLabels { return labels }
         buckets.map {
             UsageChartMath.axisLabel(bucketMs: $0, bucketSizeMs: analytics.bucketMs)
         }
@@ -496,7 +528,7 @@ private struct UsageChartCard: View {
             }
 
             if hasTokenActivity {
-                UsageLineChart(series: chartSeries, xLabels: xLabels)
+                UsageLineChart(series: preparedSeries, xLabels: preparedLabels)
             } else {
                 EmptyStateView(message: "No per-account token activity to graph yet.")
             }
@@ -506,6 +538,15 @@ private struct UsageChartCard: View {
             }
         }
         .opacity(isLoading ? 0.55 : 1)
+        .task(id: chartSnapshotKey) {
+            // Build presentation once for an analytics snapshot. Hover state
+            // belongs to UsageLineChart and no longer re-enters this work.
+            let result = BarLog.measure(.ui, label: "chart data prep snapshot") {
+                (uncachedChartSeries, uncachedXLabels)
+            }
+            preparedSeries = result.0
+            preparedLabels = result.1
+        }
         .overlay {
             if isLoading {
                 ProgressView()

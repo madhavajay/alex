@@ -53,6 +53,17 @@ public enum BarLog {
         return try body()
     }
 
+    /// Async/detached work cannot use the main-actor `measure` overload.
+    /// Keep the exact same SLOW threshold for those paths.
+    public static func timing(_ category: Category, label: String, milliseconds: Double) {
+        let message = "\(label) \(String(format: "%.1f", milliseconds))ms"
+        if milliseconds >= slowThresholdMs {
+            warn(category, "SLOW \(message)")
+        } else {
+            info(category, message)
+        }
+    }
+
     public static func formatLine(
         timestamp: Date, level: Level, category: Category, message: String
     ) -> String {

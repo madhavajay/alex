@@ -13,6 +13,65 @@ use serde_json::{json, Value};
 
 static BODY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Display-only fields shared by the trace browser clients. Keeping this
+/// derivation beside the session aggregate means every client gets the same
+/// cheap, stable presentation values without having to reshape hundreds of
+/// rows on its UI thread.
+pub fn session_display_fields(row: &Value) -> Value {
+    let session_id = row["session_id"].as_str().unwrap_or_default();
+    let short_id = if session_id.chars().count() > 22 {
+        format!(
+            "{}…{}",
+            session_id.chars().take(10).collect::<String>(),
+            session_id
+                .chars()
+                .rev()
+                .take(8)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        )
+    } else {
+        session_id.to_string()
+    };
+    let first = row["first_ts_ms"].as_i64().unwrap_or(0);
+    let last = row["last_ts_ms"].as_i64().unwrap_or(first);
+    let tags_summary = row["tags"]
+        .as_object()
+        .map(|tags| {
+            let mut pairs: Vec<_> = tags
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().filter(|v| !v.is_empty()).map(|v| (key, v))
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let status = row["last_status"].as_i64();
+    let errors = row["errors"].as_i64().unwrap_or(0);
+    let status_label = if errors > 0 || status.is_some_and(|s| s >= 400) {
+        "Error"
+    } else if status.is_some_and(|s| (200..400).contains(&s)) {
+        "Done"
+    } else {
+        "Running"
+    };
+    json!({
+        "short_id": short_id,
+        "duration_ms": (last - first).max(0),
+        "providers": row["providers"].clone(),
+        "tags_summary": tags_summary,
+        "status_label": status_label,
+    })
+}
+
 /// Anthropic models are derived from the same embedded pricing catalogue used
 /// to seed the store.  Keeping this here prevents Dario (or any other caller)
 /// from growing a second, eventually-stale Claude list.
@@ -1036,6 +1095,11 @@ impl Store {
                 |r| r.get(0),
             )?;
             row["child_count"] = json!(child_count);
+            if let Some(display) = session_display_fields(row).as_object() {
+                for (key, value) in display {
+                    row[key] = value.clone();
+                }
+            }
         }
         Ok(rows)
     }
@@ -1836,6 +1900,22 @@ mod tests {
             cost_usd: Some(0.001),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_display_fields_are_stable_and_precomputed() {
+        let fields = session_display_fields(&json!({
+            "session_id": "abcdefghijklmno-pqrstuvwxyz-0123456789",
+            "first_ts_ms": 100, "last_ts_ms": 2_600,
+            "providers": ["openai", "anthropic"],
+            "tags": {"z": "last", "a": "first", "empty": ""},
+            "last_status": 500, "errors": 1,
+        }));
+        assert_eq!(fields["short_id"], "abcdefghij…23456789");
+        assert_eq!(fields["duration_ms"], 2500);
+        assert_eq!(fields["providers"], json!(["openai", "anthropic"]));
+        assert_eq!(fields["tags_summary"], "a=first z=last");
+        assert_eq!(fields["status_label"], "Error");
     }
 
     #[test]

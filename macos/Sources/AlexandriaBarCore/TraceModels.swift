@@ -38,6 +38,12 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let subagentStartedMs: Int64?
     public let subagentStoppedMs: Int64?
     public let childCount: Int?
+    /// Additive server-side display fields. Older daemons omit these and the
+    /// client retains the portable fallback below.
+    public let shortId: String?
+    public let durationMs: Int64?
+    public let tagsSummary: String?
+    public let statusLabel: String?
 
     public var id: String { sessionId }
 
@@ -64,17 +70,31 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         case subagentStartedMs = "subagent_started_ms"
         case subagentStoppedMs = "subagent_stopped_ms"
         case childCount = "child_count"
+        case shortId = "short_id"
+        case durationMs = "duration_ms"
+        case tagsSummary = "tags_summary"
+        case statusLabel = "status_label"
     }
 }
 
 public struct TranscriptResponse: Codable, Sendable {
     public let sessionId: String
     public let turns: [TranscriptTurn]
+    public let tabCounts: TranscriptTabCounts?
 
     enum CodingKeys: String, CodingKey {
         case turns
         case sessionId = "session_id"
+        case tabCounts = "tab_counts"
     }
+}
+
+public struct TranscriptTabCounts: Codable, Sendable, Equatable {
+    public let all: Int
+    public let user: Int
+    public let model: Int
+    public let tools: Int
+    public let agents: Int
 }
 
 public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
@@ -1153,7 +1173,7 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         firstTsMs = session.firstTsMs
         lastTsMs = session.lastTsMs
         lastTs = Date(timeIntervalSince1970: Double(session.lastTsMs) / 1000)
-        sessionShort = Self.shortId(session.sessionId)
+        sessionShort = session.shortId ?? Self.shortId(session.sessionId)
         let modelsList = session.models ?? []
         models = modelsList.joined(separator: ", ")
         if let capturedProviders = session.providers, !capturedProviders.isEmpty {
@@ -1175,9 +1195,9 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         cost = session.totalCostUsd ?? 0
         errors = Int(session.errors ?? 0)
         runId = session.runId ?? ""
-        durationMs = max(0, session.lastTsMs - session.firstTsMs)
+        durationMs = session.durationMs ?? max(0, session.lastTsMs - session.firstTsMs)
         duration = SessionDuration.format(ms: durationMs)
-        tagsSummary = (session.tags ?? [:])
+        tagsSummary = session.tagsSummary ?? (session.tags ?? [:])
             .filter { !$0.value.isEmpty }
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }

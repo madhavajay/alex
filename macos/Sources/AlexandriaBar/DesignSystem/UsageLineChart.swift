@@ -22,6 +22,7 @@ struct UsageLineChart: View {
     var showsLegend = true
     @State private var hoverIndex: Int?
     @State private var hoverLocation: CGPoint = .zero
+    @State private var curveCache = CurveCache.empty
 
     private static let yAxisWidth: CGFloat = 46
     private static let xLabelHeight: CGFloat = 18
@@ -30,8 +31,17 @@ struct UsageLineChart: View {
         max(series.map(\.values.count).max() ?? 0, xLabels.count)
     }
 
-    private var scale: UsageChartScale {
-        UsageChartScale(maxValue: series.flatMap(\.values).max() ?? 0)
+    /// This changes only when the input snapshot changes. It is used as an
+    /// identity for the one-time path build, not as work performed from the
+    /// hover-driven body invalidation.
+    private var dataKey: Int {
+        var hasher = Hasher()
+        for line in series {
+            hasher.combine(line.id)
+            hasher.combine(line.values)
+        }
+        hasher.combine(xLabels)
+        return hasher.finalize()
     }
 
     var body: some View {
@@ -62,13 +72,13 @@ struct UsageLineChart: View {
 
     private var yAxis: some View {
         ZStack(alignment: .trailing) {
-            ForEach(Array(scale.ticks.enumerated()), id: \.offset) { _, tick in
+            ForEach(Array(curveCache.scale.ticks.enumerated()), id: \.offset) { _, tick in
                 Text(UsageChartScale.tickLabel(tick))
                     .font(AlexTheme.Fonts.mono(9))
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
                     .position(
                         x: Self.yAxisWidth / 2 + 8,
-                        y: yPosition(for: tick))
+                        y: yPosition(for: tick, scale: curveCache.scale))
             }
         }
         .frame(width: Self.yAxisWidth, height: plotHeight + Self.xLabelHeight)
@@ -93,14 +103,17 @@ struct UsageLineChart: View {
                     hoverIndex = nil
                 }
             }
+            .onAppear { rebuildCurveCache(width: width) }
+            .onChange(of: width) { _, changed in rebuildCurveCache(width: changed) }
+            .onChange(of: dataKey) { _, _ in rebuildCurveCache(width: width) }
         }
         .frame(height: plotHeight + Self.xLabelHeight)
     }
 
     private func gridLines(width: CGFloat) -> some View {
-        ForEach(Array(scale.ticks.enumerated()), id: \.offset) { _, tick in
+            ForEach(Array(curveCache.scale.ticks.enumerated()), id: \.offset) { _, tick in
             Path { path in
-                let y = yPosition(for: tick)
+                let y = yPosition(for: tick, scale: curveCache.scale)
                 path.move(to: CGPoint(x: 0, y: y))
                 path.addLine(to: CGPoint(x: width, y: y))
             }
@@ -110,7 +123,7 @@ struct UsageLineChart: View {
 
     private func linePaths(width: CGFloat) -> some View {
         ForEach(series) { line in
-            path(for: line.values, width: width)
+            (curveCache.paths[line.id] ?? Path())
                 .stroke(
                     line.color,
                     style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
@@ -119,12 +132,14 @@ struct UsageLineChart: View {
 
     /// Monotone-cubic path through the series points (Hermite → Bézier with
     /// Core-computed tangents, so the curve never overshoots the data).
-    private func path(for values: [Double], width: CGFloat) -> Path {
+    private func path(
+        for values: [Double], width: CGFloat, scale: UsageChartScale, bucketCount: Int
+    ) -> Path {
         var path = Path()
         guard values.count > 1, bucketCount > 1 else {
             if values.count == 1 {
-                let point = CGPoint(x: xPosition(0, width: width),
-                                    y: yPosition(for: values[0]))
+                let point = CGPoint(x: xPosition(0, width: width, bucketCount: bucketCount),
+                                    y: yPosition(for: values[0], scale: scale))
                 path.addEllipse(in: CGRect(x: point.x - 1.5, y: point.y - 1.5,
                                            width: 3, height: 3))
             }
@@ -132,7 +147,9 @@ struct UsageLineChart: View {
         }
         let tangents = UsageChartMath.monotoneTangents(values)
         let points = values.enumerated().map { index, value in
-            CGPoint(x: xPosition(index, width: width), y: yPosition(for: value))
+            CGPoint(
+                x: xPosition(index, width: width, bucketCount: bucketCount),
+                y: yPosition(for: value, scale: scale))
         }
         path.move(to: points[0])
         for index in 0..<(points.count - 1) {
@@ -141,10 +158,10 @@ struct UsageLineChart: View {
             // valueSpan/plotHeight per pixel vertically (y is flipped).
             let control1 = CGPoint(
                 x: points[index].x + dx / 3,
-                y: points[index].y - yDelta(tangents[index]) / 3)
+                y: points[index].y - yDelta(tangents[index], scale: scale) / 3)
             let control2 = CGPoint(
                 x: points[index + 1].x - dx / 3,
-                y: points[index + 1].y + yDelta(tangents[index + 1]) / 3)
+                y: points[index + 1].y + yDelta(tangents[index + 1], scale: scale) / 3)
             path.addCurve(to: points[index + 1], control1: control1, control2: control2)
         }
         return path
@@ -153,7 +170,7 @@ struct UsageLineChart: View {
     @ViewBuilder
     private func hoverOverlay(width: CGFloat) -> some View {
         if let index = hoverIndex {
-            let x = xPosition(index, width: width)
+            let x = xPosition(index, width: width, bucketCount: curveCache.bucketCount)
             Path { path in
                 path.move(to: CGPoint(x: x, y: 0))
                 path.addLine(to: CGPoint(x: x, y: plotHeight))
@@ -164,7 +181,7 @@ struct UsageLineChart: View {
                     Circle()
                         .fill(line.color)
                         .frame(width: 6, height: 6)
-                        .position(x: x, y: yPosition(for: line.values[index]))
+                        .position(x: x, y: yPosition(for: line.values[index], scale: curveCache.scale))
                 }
             }
             tooltip(index: index)
@@ -217,23 +234,23 @@ struct UsageLineChart: View {
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
                 .fixedSize()
                 .position(
-                    x: xPosition(index, width: width),
+                    x: xPosition(index, width: width, bucketCount: curveCache.bucketCount),
                     y: plotHeight + 6 + Self.xLabelHeight / 2 - 4)
         }
     }
 
-    private func xPosition(_ index: Int, width: CGFloat) -> CGFloat {
+    private func xPosition(_ index: Int, width: CGFloat, bucketCount: Int) -> CGFloat {
         guard bucketCount > 1 else { return width / 2 }
         return width * CGFloat(index) / CGFloat(bucketCount - 1)
     }
 
-    private func yPosition(for value: Double) -> CGFloat {
+    private func yPosition(for value: Double, scale: UsageChartScale) -> CGFloat {
         guard scale.upper > 0 else { return plotHeight }
         return plotHeight * CGFloat(1 - min(1, max(0, value / scale.upper)))
     }
 
     /// Pixel rise for a per-index tangent (positive tangent → upward on screen).
-    private func yDelta(_ tangent: Double) -> CGFloat {
+    private func yDelta(_ tangent: Double, scale: UsageChartScale) -> CGFloat {
         guard scale.upper > 0 else { return 0 }
         return plotHeight * CGFloat(tangent / scale.upper)
     }
@@ -244,6 +261,28 @@ struct UsageLineChart: View {
         let fraction = x / max(width, 1)
         let index = Int((fraction * CGFloat(bucketCount - 1)).rounded())
         return min(max(index, 0), bucketCount - 1)
+    }
+
+    private func rebuildCurveCache(width: CGFloat) {
+        guard width > 0 else { return }
+        let lines = series
+        let count = bucketCount
+        let nextScale = UsageChartScale(maxValue: lines.flatMap(\.values).max() ?? 0)
+        BarLog.measure(.ui, label: "chart path build series=\(lines.count) buckets=\(count)") {
+            curveCache = CurveCache(
+                paths: Dictionary(uniqueKeysWithValues: lines.map { line in
+                    (line.id, path(for: line.values, width: width, scale: nextScale, bucketCount: count))
+                }),
+                scale: nextScale,
+                bucketCount: count)
+        }
+    }
+
+    private struct CurveCache {
+        var paths: [String: Path]
+        var scale: UsageChartScale
+        var bucketCount: Int
+        static let empty = CurveCache(paths: [:], scale: UsageChartScale(maxValue: 0), bucketCount: 0)
     }
 }
 

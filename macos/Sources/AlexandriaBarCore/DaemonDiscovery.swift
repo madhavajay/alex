@@ -34,14 +34,43 @@ public struct DaemonConfig: Sendable, Equatable {
 }
 
 public enum DaemonDiscovery {
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedModificationDate: Date?
+    nonisolated(unsafe) private static var cachedConfig: DaemonConfig?
     public static var configPath: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".alexandria/config.toml")
     }
 
     public static func load() -> DaemonConfig? {
-        guard let text = try? String(contentsOf: configPath, encoding: .utf8) else { return nil }
-        return parse(toml: text)
+        let path = configPath
+        let modificationDate = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate
+        cacheLock.lock()
+        if cachedModificationDate == modificationDate {
+            let cached = cachedConfig
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        // Only the first caller after a file change does I/O and parsing.
+        // Polling clients consume SnapshotStore.config rather than calling
+        // this directly, so this is normally reached at refresh boundaries.
+        let parsed = (try? String(contentsOf: path, encoding: .utf8))
+            .flatMap { Self.parse(toml: $0) }
+        cacheLock.lock()
+        cachedModificationDate = modificationDate
+        cachedConfig = parsed
+        cacheLock.unlock()
+        return parsed
+    }
+
+    public static func invalidateCache() {
+        cacheLock.lock()
+        cachedModificationDate = nil
+        cachedConfig = nil
+        cacheLock.unlock()
     }
 
     public static func parse(toml: String) -> DaemonConfig? {
