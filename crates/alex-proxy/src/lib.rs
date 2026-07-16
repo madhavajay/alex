@@ -59,6 +59,74 @@ pub struct SubstitutionConfig {
     pub fallbacks: BTreeMap<String, Vec<String>>,
 }
 
+/// Opt-in escalation policy. It deliberately lives beside the legacy
+/// substitution list so existing `fallbacks` configurations keep working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtectionPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reroute_on_auth: bool,
+    #[serde(default = "default_protection_retries")]
+    pub retries: u32,
+    #[serde(default = "default_auto_return")]
+    pub auto_return: bool,
+    #[serde(default)]
+    pub equivalencies: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl Default for ProtectionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reroute_on_auth: false,
+            retries: default_protection_retries(),
+            auto_return: default_auto_return(),
+            equivalencies: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_protection_retries() -> u32 {
+    1
+}
+fn default_auto_return() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    UpstreamToClient,
+    ClientToProxy,
+}
+impl Default for Direction {
+    fn default() -> Self {
+        Self::UpstreamToClient
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorFixture {
+    pub name: String,
+    pub provider: String,
+    pub status: u16,
+    pub error_kind: String,
+    pub body: String,
+    #[serde(default)]
+    pub direction: Direction,
+    pub created_ms: i64,
+    #[serde(default)]
+    pub source_trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingInjection {
+    #[serde(flatten)]
+    fixture: ErrorFixture,
+    count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct DarioActive {
     pub generation_id: String,
@@ -246,6 +314,9 @@ pub struct AppState {
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     substitution: SubstitutionConfig,
+    protection: std::sync::RwLock<ProtectionPolicy>,
+    fixture_dir: std::sync::RwLock<Option<PathBuf>>,
+    pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -514,7 +585,27 @@ pub fn build_state_with_substitution(
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
         substitution,
+        protection: std::sync::RwLock::new(ProtectionPolicy::default()),
+        fixture_dir: std::sync::RwLock::new(None),
+        pending_injections: std::sync::Mutex::new(HashMap::new()),
     })
+}
+
+pub fn set_protection_policy(state: &Arc<AppState>, policy: ProtectionPolicy) {
+    if let Ok(mut slot) = state.protection.write() {
+        *slot = policy;
+    }
+}
+
+pub fn set_fixture_dir(state: &Arc<AppState>, dir: PathBuf) {
+    // First-run seeding is deliberately idempotent and never overwrites an
+    // operator's library.
+    if let Err(error) = starter_fixtures(&dir) {
+        tracing::warn!(%error, "could not seed error fixtures");
+    }
+    if let Ok(mut slot) = state.fixture_dir.write() {
+        *slot = Some(dir);
+    }
 }
 
 /// Replaces the daemon's notification channels after config has been loaded.
@@ -595,6 +686,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/storage/prune", post(admin_storage_prune))
         .route("/admin/reset", post(admin_reset))
         .route("/admin/traces", get(admin_traces))
+        .route(
+            "/admin/fixtures",
+            get(admin_fixtures).post(admin_fixture_save),
+        )
+        .route(
+            "/admin/fixtures/{name}",
+            get(admin_fixture_get).delete(admin_fixture_delete),
+        )
+        .route(
+            "/admin/sessions/{session_id}/inject",
+            post(admin_session_inject),
+        )
+        .route(
+            "/admin/sessions/{session_id}/injections",
+            get(admin_session_injections).delete(admin_session_injections_clear),
+        )
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/accounts/analytics", get(admin_account_analytics))
         .route(
@@ -2043,6 +2150,318 @@ async fn admin_traces(
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+fn fixture_root(state: &AppState) -> Result<PathBuf, String> {
+    state
+        .fixture_dir
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| "fixture storage is not configured".into())
+}
+
+fn fixture_path(root: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("fixture name may contain only letters, digits, '-' and '_'".into());
+    }
+    Ok(root.join(format!("{name}.json")))
+}
+
+fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    if std::fs::read_dir(root)
+        .map_err(|e| e.to_string())?
+        .next()
+        .is_some()
+    {
+        return Ok(());
+    }
+    let rows = [
+        (
+            "anthropic-relogin-401",
+            "anthropic",
+            401,
+            "authentication_error",
+            r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}"#,
+        ),
+        (
+            "anthropic-overloaded-429",
+            "anthropic",
+            429,
+            "rate_limit_error",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Overloaded"}}"#,
+        ),
+        (
+            "upstream-503",
+            "unknown",
+            503,
+            "http_status_503",
+            r#"{"error":{"type":"http_status_503","message":"Upstream unavailable"}}"#,
+        ),
+        (
+            "openai-capacity-429",
+            "openai",
+            429,
+            "rate_limit_error",
+            r#"{"error":{"type":"rate_limit_error","message":"Capacity exceeded"}}"#,
+        ),
+    ];
+    for (name, provider, status, error_kind, body) in rows {
+        let fixture = ErrorFixture {
+            name: name.into(),
+            provider: provider.into(),
+            status,
+            error_kind: error_kind.into(),
+            body: body.into(),
+            direction: Direction::UpstreamToClient,
+            created_ms: now_ms(),
+            source_trace_id: None,
+        };
+        let path = fixture_path(root, name)?;
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&fixture).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_fixture(state: &AppState, name: &str) -> Result<ErrorFixture, String> {
+    let root = fixture_root(state)?;
+    starter_fixtures(&root)?;
+    let path = fixture_path(&root, name)?;
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| format!("fixture '{name}' not found"))?)
+        .map_err(|e| e.to_string())
+}
+
+async fn admin_fixtures(State(state): State<Arc<AppState>>) -> Response {
+    let root = match fixture_root(&state).and_then(|root| {
+        starter_fixtures(&root)?;
+        Ok(root)
+    }) {
+        Ok(root) => root,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let mut fixtures = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(fixture) =
+            serde_json::from_slice::<ErrorFixture>(&std::fs::read(entry.path()).unwrap_or_default())
+        {
+            fixtures.push(fixture);
+        }
+    }
+    fixtures.sort_by(|a, b| a.name.cmp(&b.name));
+    axum::Json(json!({"fixtures": fixtures})).into_response()
+}
+
+async fn admin_fixture_get(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match load_fixture(&state, &name) {
+        Ok(fixture) => axum::Json(fixture).into_response(),
+        Err(e) if e.contains("not found") => error_response(StatusCode::NOT_FOUND, &e),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+async fn admin_fixture_save(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let name = match body["name"].as_str() {
+        Some(name) => name.to_string(),
+        None => return error_response(StatusCode::BAD_REQUEST, "missing fixture name"),
+    };
+    let root = match fixture_root(&state).and_then(|root| {
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        Ok(root)
+    }) {
+        Ok(root) => root,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let fixture = if let Some(trace_id) = body["from_trace_id"].as_str() {
+        let kind = body["kind"].as_str().unwrap_or("resp");
+        if kind != "resp" {
+            return error_response(StatusCode::BAD_REQUEST, "only kind='resp' is supported");
+        }
+        let row = match state.store.get_trace(trace_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return error_response(StatusCode::NOT_FOUND, "source trace not found"),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        let bytes = match row["resp_body_path"].as_str().and_then(read_gz_file) {
+            Some(body) => body,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "source trace has no captured response body",
+                )
+            }
+        };
+        ErrorFixture {
+            name: name.clone(),
+            provider: row["upstream_provider"]
+                .as_str()
+                .unwrap_or("unknown")
+                .into(),
+            status: row["status"].as_u64().unwrap_or(500) as u16,
+            error_kind: row["error_kind"]
+                .as_str()
+                .unwrap_or("http_status_500")
+                .into(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            direction: Direction::UpstreamToClient,
+            created_ms: now_ms(),
+            source_trace_id: Some(trace_id.into()),
+        }
+    } else {
+        let status = match body["status"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| (400..600).contains(n))
+        {
+            Some(status) => status,
+            None => return error_response(StatusCode::BAD_REQUEST, "status must be 400-599"),
+        };
+        ErrorFixture {
+            name: name.clone(),
+            provider: body["provider"].as_str().unwrap_or("unknown").into(),
+            status,
+            error_kind: body["error_kind"].as_str().unwrap_or("http_status").into(),
+            body: match body["body"].as_str() {
+                Some(body) => body.into(),
+                None => return error_response(StatusCode::BAD_REQUEST, "missing fixture body"),
+            },
+            direction: serde_json::from_value(body["direction"].clone()).unwrap_or_default(),
+            created_ms: now_ms(),
+            source_trace_id: None,
+        }
+    };
+    let path = match fixture_path(&root, &name) {
+        Ok(path) => path,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    match serde_json::to_vec_pretty(&fixture)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()))
+    {
+        Ok(()) => (StatusCode::CREATED, axum::Json(fixture)).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+async fn admin_fixture_delete(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let result = fixture_root(&state)
+        .and_then(|root| fixture_path(&root, &name))
+        .and_then(|path| std::fs::remove_file(path).map_err(|_| "fixture not found".into()));
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e == "fixture not found" => error_response(StatusCode::NOT_FOUND, &e),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+async fn admin_session_inject(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let fixture = if let Some(name) = body["fixture"].as_str() {
+        match load_fixture(&state, name) {
+            Ok(fixture) => fixture,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+        }
+    } else if let Some(inline) = body.get("inline") {
+        let status = match inline["status"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| (400..600).contains(n))
+        {
+            Some(status) => status,
+            None => {
+                return error_response(StatusCode::BAD_REQUEST, "inline.status must be 400-599")
+            }
+        };
+        ErrorFixture {
+            name: "inline".into(),
+            provider: inline["provider"].as_str().unwrap_or("unknown").into(),
+            status,
+            error_kind: inline["error_kind"]
+                .as_str()
+                .unwrap_or("http_status")
+                .into(),
+            body: match inline["body"].as_str() {
+                Some(value) => value.into(),
+                None => return error_response(StatusCode::BAD_REQUEST, "missing inline.body"),
+            },
+            direction: serde_json::from_value(body["direction"].clone()).unwrap_or_default(),
+            created_ms: now_ms(),
+            source_trace_id: None,
+        }
+    } else {
+        return error_response(StatusCode::BAD_REQUEST, "supply fixture or inline");
+    };
+    let count = body["count"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(1)
+        .max(1);
+    let pending = PendingInjection { fixture, count };
+    state
+        .pending_injections
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(session_id.clone())
+        .or_default()
+        .push(pending.clone());
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({"session_id": session_id, "pending": pending})),
+    )
+        .into_response()
+}
+
+async fn admin_session_injections(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let pending = state
+        .pending_injections
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    axum::Json(json!({"session_id": session_id, "injections": pending})).into_response()
+}
+
+async fn admin_session_injections_clear(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    state
+        .pending_injections
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&session_id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `/admin/traces` and `/traces/search` are also consumed as session-like
@@ -5813,6 +6232,62 @@ fn configured_fallback(
         .and_then(|(provider, model)| provider.map(|provider| (provider, model)))
 }
 
+fn policy_covers(class: ErrorClass, policy: &ProtectionPolicy) -> bool {
+    policy.enabled
+        && (reroutable_error_class(class) || (class == ErrorClass::Auth && policy.reroute_on_auth))
+}
+
+fn protection_equivalent(
+    policy: &ProtectionPolicy,
+    requested_model: &str,
+    current_provider: Provider,
+    attempted_models: &HashSet<String>,
+) -> Option<(Provider, String)> {
+    if !policy.enabled {
+        return None;
+    }
+    policy
+        .equivalencies
+        .get(requested_model)?
+        .iter()
+        .find_map(|(provider, model)| {
+            let candidate_provider = match provider.as_str() {
+                "anthropic" => Provider::Anthropic,
+                "openai" => Provider::Openai,
+                "xai" => Provider::Xai,
+                "gemini" => Provider::Gemini,
+                "openrouter" => Provider::Openrouter,
+                _ => return None,
+            };
+            (candidate_provider != current_provider && !attempted_models.contains(model))
+                .then(|| (candidate_provider, model.clone()))
+        })
+}
+
+fn take_pending_injection(
+    state: &AppState,
+    session: Option<&str>,
+    run_id: Option<&str>,
+) -> Option<PendingInjection> {
+    let mut map = state
+        .pending_injections
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = session.or(run_id)?;
+    let queue = map.get_mut(key)?;
+    let mut item = queue.first()?.clone();
+    if item.count > 1 {
+        queue[0].count -= 1;
+    } else {
+        queue.remove(0);
+    }
+    if queue.is_empty() {
+        map.remove(key);
+    }
+    item.count = item.count.min(1);
+    Some(item)
+}
+
 /// `Vault` deliberately has a degraded-mode selector for ordinary requests
 /// (it can pick the soonest-expiring cooldown when every account is down).
 /// A retry must not use that escape hatch: failover only moves to a genuinely
@@ -6019,17 +6494,33 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
     let substitution_disabled = no_substitute(&headers);
-    if let Some(value) = headers
+    let pending_injection =
+        take_pending_injection(&state, trace.session_id.as_deref(), trace.run_id.as_deref());
+    let simulation = headers
         .get("x-alexandria-simulate-error")
         .and_then(|value| value.to_str().ok())
-    {
-        if !local_key_request && run_key.as_ref().map_or(true, |key| key.kind != "harness") {
+        .map(|value| parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None)))
+        .or_else(|| {
+            pending_injection.map(|pending| {
+                Ok((
+                    pending.fixture.status,
+                    pending.fixture.error_kind,
+                    Some(pending.fixture.body.into_bytes()),
+                    Some(pending.fixture.name),
+                ))
+            })
+        });
+    if let Some(simulation) = simulation {
+        if headers.get("x-alexandria-simulate-error").is_some()
+            && !local_key_request
+            && run_key.as_ref().map_or(true, |key| key.kind != "harness")
+        {
             return error_response(
                 StatusCode::FORBIDDEN,
                 "x-alexandria-simulate-error requires a local or harness run key",
             );
         }
-        let (status, kind) = match parse_simulated_error(value) {
+        let (status, kind, injected_body, fixture_name) = match simulation {
             Ok(value) => value,
             Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
         };
@@ -6044,16 +6535,38 @@ async fn proxy(
         );
         trace.error = Some(format!("{kind}: {message}"));
         trace.tags = merge_trace_note(trace.tags.take(), "simulated", "true");
+        if fixture_name.is_some() {
+            trace.injected = true;
+            trace.fixture_name = fixture_name;
+            trace.tags = merge_trace_note(trace.tags.take(), "injected", "true");
+        }
         // Simulation deliberately never dispatches upstream traffic, but it
         // follows the real account/model selection policy so failover can be
         // tested with local or harness credentials alone.
         let class = classify_error(provider.as_str(), Some(status), Some(&kind));
-        if reroutable_error_class(class) && !substitution_disabled {
+        let protection = state
+            .protection
+            .read()
+            .map(|policy| policy.clone())
+            .unwrap_or_default();
+        if (reroutable_error_class(class) || policy_covers(class, &protection))
+            && !substitution_disabled
+        {
             let mut attempted_accounts = HashSet::new();
             let mut attempted_models = HashSet::from([routed_model.clone()]);
             let mut attempts = Vec::<Value>::new();
             let mut current_provider = provider;
             let mut current_model = routed_model.clone();
+            // A forced simulation never opens an upstream socket, but retain
+            // the policy's retry rung in the trace so the lab can prove the
+            // exact escalation plan deterministically.
+            if protection.enabled {
+                for retry in 0..protection.retries {
+                    attempts.push(
+                        json!({"rung": "retry_same", "retry": retry + 1, "model": current_model}),
+                    );
+                }
+            }
             let prefer_oauth = format != ClientFormat::OpenaiChat;
             let mut account = state
                 .vault
@@ -6063,6 +6576,11 @@ async fn proxy(
             while let Some(current_account) = account {
                 attempted_accounts.insert(current_account.id.clone());
                 attempts.push(json!({"account_id": current_account.id, "model": current_model}));
+                // Cross-provider auth protection must not hide the fact that
+                // the original managed subscription needs a fresh login.
+                if class == ErrorClass::Auth {
+                    emit_reauth_notification_for_account(&state, &current_account);
+                }
                 let _ = state
                     .vault
                     .mark_cooldown(&current_account.id, now_ms() + 60_000)
@@ -6091,12 +6609,25 @@ async fn proxy(
                     account = Some(next);
                     continue;
                 }
-                let Some((fallback_provider, fallback_model)) = configured_fallback(
-                    &state.substitution,
-                    &requested_model,
-                    &current_model,
-                    &attempted_models,
-                ) else {
+                let fallback = if reroutable_error_class(class) {
+                    configured_fallback(
+                        &state.substitution,
+                        &requested_model,
+                        &current_model,
+                        &attempted_models,
+                    )
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    protection_equivalent(
+                        &protection,
+                        &requested_model,
+                        current_provider,
+                        &attempted_models,
+                    )
+                });
+                let Some((fallback_provider, fallback_model)) = fallback else {
                     bind_trace_account(&state.store, &mut trace, &current_account);
                     break;
                 };
@@ -6134,7 +6665,8 @@ async fn proxy(
             }
         }
         trace.ts_response_ms = Some(now_ms());
-        let response_body = simulated_error_body(format, status, &kind, &message);
+        let response_body =
+            injected_body.unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
         finalize_trace(&state, trace, &body, None, Some(&response_body));
         return Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
@@ -6335,7 +6867,12 @@ async fn proxy(
                 Some(resp.status().as_u16()),
                 None,
             );
-            if reroutable_error_class(error_class)
+            let protection = state
+                .protection
+                .read()
+                .map(|policy| policy.clone())
+                .unwrap_or_default();
+            if (reroutable_error_class(error_class) || policy_covers(error_class, &protection))
                 && !substitution_disabled
                 && account.kind != "dario"
             {
@@ -6435,12 +6972,25 @@ async fn proxy(
                         "no untried failover account available"
                     ),
                 }
-                if let Some((fallback_provider, fallback_model)) = configured_fallback(
-                    &state.substitution,
-                    &requested_model,
-                    &current_model,
-                    &attempted_models,
-                ) {
+                let fallback = if reroutable_error_class(error_class) {
+                    configured_fallback(
+                        &state.substitution,
+                        &requested_model,
+                        &current_model,
+                        &attempted_models,
+                    )
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    protection_equivalent(
+                        &protection,
+                        &requested_model,
+                        current_provider,
+                        &attempted_models,
+                    )
+                });
+                if let Some((fallback_provider, fallback_model)) = fallback {
                     let mut retry_body_json = original_body_json.clone();
                     match plan_upstream(
                         &state,
@@ -9444,6 +9994,109 @@ mod tests {
             state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn fixture_round_trip_injects_into_session_and_records_trace_fields() {
+        let state = test_state("fixture-session-injection");
+        let root = tmpdir("fixtures");
+        set_fixture_dir(&state, root.join("fixtures"));
+        let saved = admin_fixture_save(
+            State(state.clone()),
+            axum::Json(json!({
+                "name": "captured-auth", "provider": "anthropic", "status": 401,
+                "error_kind": "authentication_error",
+                "body": r#"{"type":"error","error":{"type":"authentication_error","message":"captured"}}"#
+            })),
+        ).await;
+        assert_eq!(saved.status(), StatusCode::CREATED);
+        let (_, fixture) = response_json(
+            admin_fixture_get(State(state.clone()), Path("captured-auth".into())).await,
+        )
+        .await;
+        assert_eq!(fixture["name"], "captured-auth");
+        let injected = admin_session_inject(
+            State(state.clone()),
+            Path("session-lab".into()),
+            axum::Json(json!({"fixture": "captured-auth"})),
+        )
+        .await;
+        assert_eq!(injected.status(), StatusCode::CREATED);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-session-id", HeaderValue::from_static("session-lab"));
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["message"], "captured");
+        let row = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row["injected"], true);
+        assert_eq!(row["fixture_name"], "captured-auth");
+    }
+
+    #[tokio::test]
+    async fn auth_protection_is_opt_in_and_uses_the_cross_provider_equivalency() {
+        let state = test_state("auth-protection-equivalency");
+        set_protection_policy(
+            &state,
+            ProtectionPolicy {
+                enabled: true,
+                reroute_on_auth: true,
+                retries: 1,
+                auto_return: true,
+                equivalencies: BTreeMap::from([(
+                    "claude-fable-5".into(),
+                    BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+                )]),
+            },
+        );
+        let mut anthropic = test_openai_account("anthropic-original");
+        anthropic.id = "anthropic-oauth-original".into();
+        anthropic.provider = Provider::Anthropic;
+        state.vault.upsert(anthropic).await.unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-fallback", Provider::Openai))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("401:authentication_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-fable-5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["substitution_reason"], "auth");
+        assert_eq!(trace["original_model"], "claude-fable-5");
+        assert_eq!(trace["served_model"], "gpt-5.6-sol");
     }
 
     async fn simulated_capacity_request(state: Arc<AppState>, no_substitute: bool) -> Response {

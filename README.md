@@ -302,6 +302,35 @@ The Rust daemon includes the operational behavior needed for long-running agent 
 - subscription utilization and reset-window visibility; and
 - local spooling when a remote trace destination is unavailable.
 
+### Error simulation lab and opt-in protection
+
+Capture a real error body as a named fixture, then inject it into the next
+request for a live session without exposing a simulation header to the harness:
+
+```bash
+alex fixtures list
+alex simulate inject <session-id> anthropic-relogin-401
+alex simulate pending <session-id>
+```
+
+Fixtures live under `<data_dir>/fixtures`; the daemon seeds a small starter
+library on first use. The admin API is local-key gated. Cross-provider
+protection is opt-in; ordinary account failover remains limited to capacity and
+server errors. The symmetric Claude/OpenAI example can be installed with
+`alex protection preset anthropic-openai` (it does not enable protection):
+
+```toml
+# [protection]
+# enabled = true
+# reroute_on_auth = true # explicitly permit auth/subscription failover
+# retries = 1
+# auto_return = true
+#
+# [protection.equivalencies]
+# "claude-fable-5" = { openai = "gpt-5.6-sol" }
+# "gpt-5.6-sol" = { anthropic = "claude-fable-5" }
+```
+
 ## Platforms and alternative installation
 
 macOS and Linux are the supported platforms. Windows x86-64 CLI builds are published with releases, but they are experimental. First-class Windows support, including service integration, is coming soon.

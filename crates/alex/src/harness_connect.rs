@@ -5133,6 +5133,7 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),

@@ -131,6 +131,21 @@ enum Command {
         #[command(subcommand)]
         command: NotifyCommand,
     },
+    /// Manage captured upstream error fixtures
+    Fixtures {
+        #[command(subcommand)]
+        command: FixturesCommand,
+    },
+    /// Inject a fixture into the next request for a live session
+    Simulate {
+        #[command(subcommand)]
+        command: SimulateCommand,
+    },
+    /// Configure resilience protection presets
+    Protection {
+        #[command(subcommand)]
+        command: ProtectionCommand,
+    },
     /// Show subscription plans, limit-window utilization, and reset times
     Limits {
         #[arg(long)]
@@ -366,6 +381,58 @@ enum NotifyCommand {
         #[arg(long)]
         channel: Option<usize>,
     },
+}
+
+#[derive(Subcommand)]
+enum FixturesCommand {
+    List,
+    Show {
+        name: String,
+    },
+    Save {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "from-trace")]
+        from_trace: Option<String>,
+        #[arg(long)]
+        status: Option<u16>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    Rm {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SimulateCommand {
+    Inject {
+        session: String,
+        fixture: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        #[arg(long = "inline-status")]
+        inline_status: Option<u16>,
+        #[arg(long = "inline-kind")]
+        inline_kind: Option<String>,
+        #[arg(long = "inline-body")]
+        inline_body: Option<String>,
+    },
+    Pending {
+        session: String,
+    },
+    Clear {
+        session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProtectionCommand {
+    Preset { name: String },
 }
 
 #[derive(Subcommand)]
@@ -880,6 +947,9 @@ struct Config {
     /// this: it is always enabled for reroutable capacity/server failures.
     #[serde(default)]
     substitution: alex_proxy::SubstitutionConfig,
+    /// Opt-in retry/bond/cross-provider protection ladder.
+    #[serde(default)]
+    protection: alex_proxy::ProtectionPolicy,
     /// One-way notification channels. URLs may contain tokens and are never
     /// returned by the daemon admin API.
     #[serde(default)]
@@ -1086,6 +1156,7 @@ impl Config {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -2784,6 +2855,8 @@ async fn main() -> Result<()> {
                 config.substitution.clone(),
             );
             alex_proxy::set_notifications(&state, config.notification_settings());
+            alex_proxy::set_protection_policy(&state, config.protection.clone());
+            alex_proxy::set_fixture_dir(&state, config.data_dir.join("fixtures"));
             alex_proxy::set_daemon_updater(
                 &state,
                 Arc::new(SelfUpdateApplier {
@@ -3833,6 +3906,142 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Fixtures { command } => match command {
+            FixturesCommand::List => {
+                let response = daemon_get(&config, "/admin/fixtures", &[]).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            FixturesCommand::Show { name } => {
+                let response = daemon_get(&config, &format!("/admin/fixtures/{name}"), &[]).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            FixturesCommand::Rm { name } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::DELETE,
+                    &format!("/admin/fixtures/{name}"),
+                    None,
+                )
+                .await?;
+                if !status.is_success() {
+                    anyhow::bail!("fixture delete failed: {body}");
+                }
+            }
+            FixturesCommand::Save {
+                name,
+                provider,
+                from_trace,
+                status,
+                kind,
+                body,
+            } => {
+                let payload = if let Some(trace_id) = from_trace {
+                    json!({"name": name, "from_trace_id": trace_id, "kind": kind.unwrap_or_else(|| "resp".into())})
+                } else {
+                    let body =
+                        body.context("--body @file is required unless --from-trace is used")?;
+                    let body = if let Some(path) = body.strip_prefix('@') {
+                        std::fs::read_to_string(path)
+                            .with_context(|| format!("reading fixture body {path}"))?
+                    } else {
+                        body
+                    };
+                    json!({"name": name, "provider": provider, "status": status.context("--status is required")?, "error_kind": kind.context("--kind is required")?, "body": body})
+                };
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/fixtures",
+                    Some(payload),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("fixture save failed: {status}");
+                }
+            }
+        },
+        Command::Simulate { command } => match command {
+            SimulateCommand::Pending { session } => {
+                let response = daemon_get(
+                    &config,
+                    &format!("/admin/sessions/{session}/injections"),
+                    &[],
+                )
+                .await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+                );
+            }
+            SimulateCommand::Clear { session } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::DELETE,
+                    &format!("/admin/sessions/{session}/injections"),
+                    None,
+                )
+                .await?;
+                if !status.is_success() {
+                    anyhow::bail!("clear failed: {body}");
+                }
+            }
+            SimulateCommand::Inject {
+                session,
+                fixture,
+                count,
+                inline_status,
+                inline_kind,
+                inline_body,
+            } => {
+                let payload = if let Some(fixture) = fixture {
+                    json!({"fixture": fixture, "count": count})
+                } else {
+                    let body = inline_body.context(
+                        "fixture or --inline-status/--inline-kind/--inline-body is required",
+                    )?;
+                    json!({"count": count, "inline": {"status": inline_status.context("--inline-status is required")?, "error_kind": inline_kind.context("--inline-kind is required")?, "body": body}})
+                };
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    &format!("/admin/sessions/{session}/inject"),
+                    Some(payload),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("injection failed: {status}");
+                }
+            }
+        },
+        Command::Protection { command } => match command {
+            ProtectionCommand::Preset { name } => {
+                if name != "anthropic-openai" {
+                    anyhow::bail!("unknown protection preset '{name}'");
+                }
+                let mut config = config;
+                config.protection.equivalencies.insert(
+                    "claude-fable-5".into(),
+                    BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+                );
+                config.protection.equivalencies.insert(
+                    "gpt-5.6-sol".into(),
+                    BTreeMap::from([("anthropic".into(), "claude-fable-5".into())]),
+                );
+                save_config(&config)?;
+                println!(
+                    "wrote anthropic-openai equivalencies; protection.enabled remains {}",
+                    config.protection.enabled
+                );
+            }
+        },
         Command::Keys { command } => match command {
             KeysCommand::Mint {
                 kind,
@@ -4877,6 +5086,8 @@ impl AmpWsTraceState {
             original_model: None,
             served_model: None,
             substitution_reason: None,
+            injected: false,
+            fixture_name: None,
             attempts: None,
             original_account_id: None,
             served_account_id: None,
@@ -5667,6 +5878,8 @@ fn reconcile_agent_turn(
         original_model: None,
         served_model: None,
         substitution_reason: None,
+        injected: false,
+        fixture_name: None,
         attempts: None,
         original_account_id: None,
         served_account_id: None,
@@ -9784,6 +9997,7 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -10328,6 +10542,7 @@ mod tests {
             harness_tool_capture: BTreeMap::new(),
             account_policy: BTreeMap::new(),
             substitution: alex_proxy::SubstitutionConfig::default(),
+            protection: alex_proxy::ProtectionPolicy::default(),
             notifications: Vec::new(),
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
@@ -10380,6 +10595,8 @@ local_key = "alx-test"
         .unwrap();
         assert!(!config.substitution.enabled);
         assert!(config.substitution.fallbacks.is_empty());
+        assert!(!config.protection.enabled);
+        assert!(!config.protection.reroute_on_auth);
     }
 
     #[test]
