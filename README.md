@@ -26,7 +26,7 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **macOS menu bar app** — live gauges, re-auth windows, ping checks, window-reset alerts in `macos/` (AlexandriaBar)
 - **Harness smoke tests** — `alex harness run` executes frozen CLI harnesses (claude, codex, grok, …) in Docker against the proxy and verifies traces land
 - **Harness regression lane** — `scripts/harness-regression.sh` uses per-cell scoped keys and verifies persisted trace API data, rather than trusting a harness exit code
-- **Self-updating** — `alex update` fetches the release manifest, sha256-verifies the binary, and re-points the daemon to the new build; the restart gracefully drains in-flight requests before exiting. The menu bar app keeps itself current via Sparkle and surfaces daemon updates as a one-click "Update daemon…" menu item _(zero-downtime blue-green handover is planned)_
+- **Self-updating** — `alex update` fetches the release manifest, sha256-verifies the binary, and re-points the daemon to the new build. Today the swap **gracefully drains in-flight requests** before the restart, so nothing in flight is dropped (brand-new connections see a brief blip during the handover); **fully zero-downtime blue-green handover — new daemon takes over the socket before the old one exits — is coming soon.** The menu bar app keeps itself current via Sparkle and offers a one-click "Update daemon…" menu item
 - **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
 
 ## What it can do
