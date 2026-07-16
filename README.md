@@ -29,6 +29,29 @@ Point any coding harness (Claude Code, Codex CLI, grok, opencode, …) at it and
 - **Self-updating** — `alex update` fetches the release manifest, sha256-verifies the binary, and re-points the daemon to the new build. Today the swap **gracefully drains in-flight requests** before the restart, so nothing in flight is dropped (brand-new connections see a brief blip during the handover); **fully zero-downtime blue-green handover — new daemon takes over the socket before the old one exits — is coming soon.** The menu bar app keeps itself current via Sparkle and offers a one-click "Update daemon…" menu item
 - **Cross-platform CLI** — Linux, macOS, and Windows binaries on every release (`cargo install alex`)
 
+## One-liner: a coding agent on your subscriptions in seconds
+
+From a bare machine to a running coding agent wired to your alex proxy, in one command.
+It installs the harness if missing, points it at alex with a scoped key, and launches it —
+skipping any step that's already done:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/beta/v0.1.26/up.sh \
+  | sh -s -- --harness pi --url https://<your-alex-host>:4100 --key <scoped-key> --model alex/gpt-5.6-sol
+```
+
+If `alex` is already installed, `up.sh` just calls the built-in orchestrator directly:
+
+```bash
+alex up pi                                   # install Pi if needed, connect to the local daemon, launch
+alex up pi --model alex/fable-5              # pick the model
+alex up codex --url https://<host>:4100 --key <scoped-key>   # point a worker at a remote alex
+```
+
+The `--key` is a **model-only scoped key** (mint one with `POST /admin/run-keys`) — safe to paste
+onto another machine, since it can make model calls but nothing else. Over Tailscale the key rides
+the encrypted tailnet. Supported today: **Pi** and **Codex** (more to come).
+
 ## What it can do
 
 > Screenshots below are placeholders — drop real captures at the referenced `docs/img/…` paths.
