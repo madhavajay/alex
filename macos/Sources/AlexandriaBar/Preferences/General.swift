@@ -417,7 +417,7 @@ struct GeneralPreferencesPane: View {
 
 /// Setting row: 13px label + optional 11px hint, trailing control,
 /// 11px vertical padding.
-private struct SettingRow<Control: View>: View {
+struct SettingRow<Control: View>: View {
     let label: String
     var hint: String?
     @ViewBuilder let control: Control
@@ -443,7 +443,7 @@ private struct SettingRow<Control: View>: View {
 }
 
 /// Hairline divider between rows within a section (divide-y overlay(0.05)).
-private struct RowDivider: View {
+struct RowDivider: View {
     var body: some View {
         Rectangle()
             .fill(AlexTheme.Colors.hairline)
@@ -452,7 +452,7 @@ private struct RowDivider: View {
 }
 
 /// Full-width dim caption for section-level explanations and statuses.
-private struct SettingCaption: View {
+struct SettingCaption: View {
     let text: String
 
     init(_ text: String) {
@@ -469,12 +469,12 @@ private struct SettingCaption: View {
 }
 
 extension View {
-    fileprivate func settingsSectionSpacing() -> some View {
+    func settingsSectionSpacing() -> some View {
         self.padding(.top, 14).padding(.bottom, 4)
     }
 
     /// Mini macOS switch (§1.11 — do not hand-build).
-    fileprivate func settingsSwitch() -> some View {
+    func settingsSwitch() -> some View {
         self.toggleStyle(.switch)
             .controlSize(.mini)
             .labelsHidden()
@@ -488,7 +488,7 @@ extension View {
     }
 
     /// Mono inline text field (binary path).
-    fileprivate func settingsField() -> some View {
+    func settingsField() -> some View {
         self.textFieldStyle(.plain)
             .font(AlexTheme.Fonts.mono(11))
             .padding(.horizontal, 8)
