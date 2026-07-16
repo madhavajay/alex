@@ -133,6 +133,20 @@ pub(crate) struct HarnessSpec {
     pub(crate) config_dir: fn(&Path) -> PathBuf,
     pub(crate) version_args: &'static [&'static str],
     pub(crate) supports_connect: bool,
+    /// How `alex up` can install this harness when it is absent. Keeping this
+    /// in the catalog means adding another npm-backed harness is data-only.
+    pub(crate) install: Option<HarnessInstall>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HarnessInstall {
+    Npm { package: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstallCommand {
+    pub(crate) program: &'static str,
+    pub(crate) args: Vec<String>,
 }
 
 pub(crate) const HARNESSES: &[HarnessSpec] = &[
@@ -142,6 +156,9 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: pi_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: true,
+        install: Some(HarnessInstall::Npm {
+            package: "@earendil-works/pi-coding-agent",
+        }),
     },
     HarnessSpec {
         name: "claude",
@@ -149,6 +166,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: claude_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: true,
+        install: None,
     },
     HarnessSpec {
         name: "codex",
@@ -156,6 +174,9 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: codex_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: true,
+        install: Some(HarnessInstall::Npm {
+            package: "@openai/codex",
+        }),
     },
     HarnessSpec {
         name: "omp",
@@ -163,6 +184,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: omp_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "opencode",
@@ -170,6 +192,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: opencode_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "mini-swe-agent",
@@ -177,6 +200,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: mini_swe_agent_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "kimi",
@@ -184,6 +208,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: kimi_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "gemini",
@@ -191,6 +216,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: gemini_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "qwen",
@@ -198,6 +224,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: qwen_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "goose",
@@ -205,6 +232,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: goose_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "opensage",
@@ -212,6 +240,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: opensage_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "pydantic-ai",
@@ -219,6 +248,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: pydantic_ai_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "stirrup",
@@ -226,6 +256,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: stirrup_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "jcode",
@@ -233,6 +264,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: jcode_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "cursor",
@@ -240,6 +272,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: cursor_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "amp",
@@ -247,6 +280,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: amp_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: true,
+        install: None,
     },
     HarnessSpec {
         name: "droid",
@@ -254,6 +288,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: droid_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
     HarnessSpec {
         name: "grok",
@@ -261,6 +296,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: grok_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: true,
+        install: None,
     },
     HarnessSpec {
         name: "hermes",
@@ -268,6 +304,7 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         config_dir: hermes_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
+        install: None,
     },
 ];
 
@@ -439,10 +476,9 @@ pub(crate) async fn connect_with_preminted_key(
         (spec.config_dir)(&home)
     });
     if !config_dir.is_dir() {
-        bail!(
-            "{harness} config dir does not exist at {}; run {harness} once first, or pass --config-dir",
-            config_dir.display()
-        );
+        std::fs::create_dir_all(&config_dir).with_context(|| {
+            format!("create {harness} config directory {}", config_dir.display())
+        })?;
     }
 
     let base_url = base_url.trim_end_matches('/').to_string();
@@ -1393,6 +1429,36 @@ pub(crate) fn write_pi_connection_with_capture(
         unchanged,
         description: PI_INSTALL_DESCRIPTION,
     })
+}
+
+/// Set the model used by a connected harness's Alexandria profile. `alex up`
+/// calls this after connection so its explicit default wins over a harness's
+/// usual "first catalog entry" choice.
+pub(crate) fn set_default_model(harness: &str, config_dir: &Path, model: &str) -> Result<()> {
+    let model = short_alex_model_id(model);
+    match harness {
+        "pi" => {
+            let path = config_dir.join("settings.json");
+            let mut settings = if path.exists() {
+                let raw = std::fs::read_to_string(&path)?;
+                serde_json::from_str::<Value>(&raw)
+                    .with_context(|| format!("could not parse {}", path.display()))?
+            } else {
+                json!({})
+            };
+            let object = settings
+                .as_object_mut()
+                .with_context(|| format!("{} must contain a JSON object", path.display()))?;
+            object.insert("defaultProvider".into(), json!(PROVIDER_NAME));
+            object.insert(
+                "defaultModel".into(),
+                json!(model.strip_prefix("alex/").unwrap_or(&model)),
+            );
+            atomic_write_json(&path, &settings)
+        }
+        "codex" => set_codex_default_model(config_dir, &model),
+        _ => bail!("setting a default Alexandria model is not yet supported for {harness}"),
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2840,6 +2906,40 @@ pub(crate) fn set_codex_default_route(config_dir: &Path, route: &str) -> Result<
     Ok(route.to_string())
 }
 
+fn set_codex_default_model(config_dir: &Path, model: &str) -> Result<()> {
+    if !codex_config_connected(config_dir)? {
+        bail!("Codex is not connected to Alexandria");
+    }
+    let catalog = read_json_object(&config_dir.join(CODEX_CATALOG_FILE))?;
+    if !codex_catalog_model_ids(&catalog)?
+        .iter()
+        .any(|candidate| candidate == model)
+    {
+        bail!("{model} is not in Codex's Alexandria model catalog");
+    }
+    let state_path = config_dir.join(CODEX_STATE_FILE);
+    let mut state = read_codex_state(&state_path)?;
+    state.alex_model = Some(model.to_string());
+    atomic_write_json(&state_path, &serde_json::to_value(&state)?)?;
+    let profile_path = config_dir.join(CODEX_ALEX_PROFILE_FILE);
+    atomic_write_text(
+        &profile_path,
+        &codex_profile_source(PROVIDER_NAME, model, &config_dir.join(CODEX_CATALOG_FILE)),
+    )?;
+    let config_path = config_dir.join(CODEX_CONFIG_FILE);
+    let mut doc = read_codex_config(&config_path)?;
+    if doc.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_NAME) {
+        apply_codex_route(
+            &mut doc,
+            PROVIDER_NAME,
+            model,
+            &config_dir.join(CODEX_CATALOG_FILE),
+        );
+        atomic_write_text(&config_path, &doc.to_string())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn codex_config_connected(config_dir: &Path) -> Result<bool> {
     let path = config_dir.join(CODEX_CONFIG_FILE);
     if !path.exists() {
@@ -3313,6 +3413,20 @@ pub(crate) fn read_pi_api_key(config_dir: &Path) -> Option<String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Read only the credential Alexandria itself wrote. This is intentionally
+/// limited to connected harnesses and is used by `alex up` solely to prove a
+/// re-run can skip its connection step; it never prints the secret.
+pub(crate) fn configured_api_key(harness: &str, config_dir: &Path) -> Option<String> {
+    match harness {
+        "pi" => read_pi_api_key(config_dir),
+        "codex" => std::fs::read_to_string(config_dir.join(CODEX_KEY_FILE))
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty()),
+        _ => None,
+    }
 }
 
 pub(crate) fn read_pi_model_ids(config_dir: &Path) -> Vec<String> {
@@ -4202,6 +4316,74 @@ pub(crate) fn amp_spec() -> &'static HarnessSpec {
 
 pub(crate) fn spec_by_name(name: &str) -> Option<&'static HarnessSpec> {
     HARNESSES.iter().find(|spec| spec.name == name)
+}
+
+/// Resolve the exact installation command without executing it. This is kept
+/// separate both for dry-run callers and so catalog changes are easy to test.
+pub(crate) fn install_command(spec: &HarnessSpec, version: Option<&str>) -> Option<InstallCommand> {
+    match spec.install? {
+        HarnessInstall::Npm { package } => Some(InstallCommand {
+            program: "npm",
+            args: vec![
+                "install".into(),
+                "-g".into(),
+                match version.filter(|v| !v.trim().is_empty()) {
+                    Some(version) => format!("{package}@{}", version.trim()),
+                    None => package.to_string(),
+                },
+            ],
+        }),
+    }
+}
+
+/// Install a catalog harness only when it is missing (or does not satisfy a
+/// requested version pin). Returns true when an install was performed.
+pub(crate) async fn ensure_installed(spec: &HarnessSpec, version: Option<&str>) -> Result<bool> {
+    let detection = detect_harness_without_config(spec).await;
+    let pinned_matches = version
+        .filter(|v| !v.trim().is_empty())
+        .is_none_or(|wanted| {
+            detection
+                .version
+                .as_deref()
+                .is_some_and(|found| version_matches(found, wanted))
+        });
+    if detection.binary.is_some() && pinned_matches {
+        println!(
+            "install: {} already present{}",
+            spec.binary,
+            version.map(|v| format!(" ({v})")).unwrap_or_default()
+        );
+        return Ok(false);
+    }
+    let command = install_command(spec, version).with_context(|| {
+        format!(
+            "{} is not installed and alex has no installer for this harness",
+            spec.name
+        )
+    })?;
+    if find_on_path(command.program).is_none() {
+        bail!("{} is missing and requires npm to install it; install Node.js/npm, then rerun `alex up {}`", spec.name, spec.name);
+    }
+    println!("install: {} {}", command.program, command.args.join(" "));
+    let status = tokio::task::spawn_blocking(move || {
+        Command::new(command.program).args(&command.args).status()
+    })
+    .await
+    .context("wait for harness installer")??;
+    if !status.success() {
+        bail!("npm failed while installing {} ({status})", spec.name);
+    }
+    if find_on_path(spec.binary).is_none() {
+        bail!("installed {}, but '{}' is still not on PATH; restart the shell or fix npm's global bin directory", spec.name, spec.binary);
+    }
+    Ok(true)
+}
+
+fn version_matches(found: &str, wanted: &str) -> bool {
+    let found = found.trim().trim_start_matches('v');
+    let wanted = wanted.trim().trim_start_matches('v');
+    found == wanted || found.starts_with(&format!("{wanted}+"))
 }
 
 pub(crate) fn resolve_config_dir(
@@ -5833,5 +6015,20 @@ fi"#,
         assert!(source.contains("const CAPTURE_ENABLED = true"));
         assert!(source.contains("postToolEvent({ phase: 'start'"));
         assert!(source.contains("postToolEvent({ phase: 'end'"));
+    }
+
+    #[test]
+    fn npm_install_commands_are_catalog_driven_and_pin_versions() {
+        let pi = install_command(spec_by_name("pi").unwrap(), Some("0.80.3")).unwrap();
+        assert_eq!(pi.program, "npm");
+        assert_eq!(
+            pi.args,
+            ["install", "-g", "@earendil-works/pi-coding-agent@0.80.3"]
+        );
+        let codex = install_command(spec_by_name("codex").unwrap(), None).unwrap();
+        assert_eq!(codex.args, ["install", "-g", "@openai/codex"]);
+        assert!(install_command(spec_by_name("claude").unwrap(), None).is_none());
+        assert!(version_matches("v0.80.3", "0.80.3"));
+        assert!(!version_matches("0.80.2", "0.80.3"));
     }
 }
