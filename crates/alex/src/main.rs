@@ -9,10 +9,11 @@ use alex_auth::{
     now_ms, AccountPolicy, BundleSelection, Vault,
 };
 use alex_store::{KnownAccount, Store};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 mod dario;
 mod harness_connect;
@@ -149,6 +150,33 @@ enum Command {
     Wrap {
         #[command(subcommand)]
         command: WrapCommand,
+    },
+    /// Install, connect, configure, and launch a harness through Alexandria
+    Up {
+        /// Harness to bootstrap (pi is the default)
+        #[arg(default_value = "pi")]
+        harness: String,
+        /// Remote Alexandria base URL. Supplying this never starts a local daemon.
+        #[arg(long)]
+        url: Option<String>,
+        /// A model-only scoped run key (never an Alexandria local/admin key)
+        #[arg(long)]
+        key: Option<String>,
+        /// Alexandria model to make the harness default
+        #[arg(long, default_value = "alex/gpt-5.6-sol")]
+        model: String,
+        /// npm package version to install when the harness is absent
+        #[arg(long)]
+        version: Option<String>,
+        /// Configure only; do not exec the harness
+        #[arg(long)]
+        no_launch: bool,
+        /// Reserved for non-interactive bootstrap callers
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Arguments passed to the harness after `--`
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Check for and install a newer alex release
     Update {
@@ -3300,6 +3328,28 @@ async fn main() -> Result<()> {
         },
         Command::Env => {
             print_env(&config.host, config.port, &config.local_key);
+        }
+        Command::Up {
+            harness,
+            url,
+            key,
+            model,
+            version,
+            no_launch,
+            yes: _,
+            args,
+        } => {
+            up_cmd(
+                &config,
+                &harness,
+                url.as_deref(),
+                key.as_deref(),
+                &model,
+                version.as_deref(),
+                no_launch,
+                args,
+            )
+            .await?;
         }
         Command::Connect {
             harness,
@@ -8024,6 +8074,208 @@ async fn daemon_background(
     std::process::exit(1);
 }
 
+const UP_STATE_FILE: &str = "alexandria-up-state.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpStepPlan {
+    install: bool,
+    connect: bool,
+    launch: bool,
+}
+
+fn plan_up(installed: bool, connected: bool, configured: bool, no_launch: bool) -> UpStepPlan {
+    UpStepPlan {
+        install: !installed,
+        connect: !connected || !configured,
+        launch: !no_launch,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UpState {
+    source: String,
+    harness: String,
+    base_url: String,
+    model: String,
+}
+
+fn up_state_matches(config_dir: &Path, harness: &str, base_url: &str, model: &str) -> bool {
+    let path = config_dir.join(UP_STATE_FILE);
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(state) = serde_json::from_str::<UpState>(&raw) else {
+        return false;
+    };
+    state.source == "alex-up"
+        && state.harness == harness
+        && state.base_url == base_url.trim_end_matches('/')
+        && state.model == model
+}
+
+fn write_up_state(config_dir: &Path, harness: &str, base_url: &str, model: &str) -> Result<()> {
+    let state = UpState {
+        source: "alex-up".into(),
+        harness: harness.into(),
+        base_url: base_url.trim_end_matches('/').into(),
+        model: model.into(),
+    };
+    std::fs::write(
+        config_dir.join(UP_STATE_FILE),
+        format!("{}\n", serde_json::to_string_pretty(&state)?),
+    )?;
+    Ok(())
+}
+
+async fn daemon_healthy(base_url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{}/health", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn mint_up_key(config: &Config, harness: &str) -> Result<(String, String)> {
+    let body = json!({
+        "kind": "run",
+        "label": format!("alex-up:{harness}"),
+        "tags": {"source": "alex-up", "harness": harness},
+    });
+    let (status, response) =
+        daemon_send(config, reqwest::Method::POST, "/admin/run-keys", Some(body)).await?;
+    if !status.is_success() {
+        bail!(
+            "could not mint the model-only alex up key: {status}: {}",
+            ui::truncate(&response.to_string(), 300)
+        );
+    }
+    let id = response["id"]
+        .as_str()
+        .context("daemon did not return a run-key id")?
+        .to_string();
+    let key = response["key"]
+        .as_str()
+        .context("daemon did not return a run key")?
+        .to_string();
+    println!("key: minted model-only run key {id} (tags: source=alex-up, harness={harness})");
+    println!("key: {key}");
+    Ok((id, key))
+}
+
+async fn up_cmd(
+    config: &Config,
+    harness: &str,
+    url: Option<&str>,
+    supplied_key: Option<&str>,
+    model: &str,
+    version: Option<&str>,
+    no_launch: bool,
+    args: Vec<String>,
+) -> Result<()> {
+    let spec = harness_connect::spec_by_name(harness)
+        .with_context(|| format!("unknown harness '{harness}'"))?;
+    if !spec.supports_connect {
+        bail!("harness '{harness}' does not support Alexandria connection yet");
+    }
+    let remote = url.is_some();
+    let base_url = if let Some(url) = url {
+        let url = url.trim_end_matches('/');
+        if url.is_empty() {
+            bail!("--url must not be empty");
+        }
+        println!("target: remote Alexandria at {url} (will not start a local daemon)");
+        url.to_string()
+    } else {
+        let base = config.base_url();
+        if daemon_healthy(&base).await {
+            println!("target: local daemon already running at {base}");
+        } else {
+            println!("target: starting local daemon at {base}");
+            daemon_background(&config.host, config.port, None, None).await?;
+        }
+        base
+    };
+    let config_dir = harness_connect::resolve_config_dir(config, spec, None);
+    let status = harness_connect::harness_status(config, spec, None, true).await?;
+    let configured = status.connected && up_state_matches(&config_dir, harness, &base_url, model);
+    let plan = plan_up(status.installed, status.connected, configured, no_launch);
+    if !plan.connect {
+        println!("connect: existing alex-up configuration is current");
+    }
+    harness_connect::ensure_installed(spec, version).await?;
+
+    let (key_id, key) = match supplied_key {
+        Some(key) => {
+            if !key.starts_with("alxk-") {
+                bail!("--key must be a model-only scoped run key (expected alxk-...), never the Alexandria local/admin key");
+            }
+            println!("key: using supplied scoped run key");
+            ("rk-provided".to_string(), key.to_string())
+        }
+        None if remote => bail!("remote alex requires --key with a model-only scoped run key; alex up cannot mint on someone else's daemon"),
+        None if configured => {
+            let existing = harness_connect::configured_api_key(harness, &config_dir)
+                .context("alex up state exists but the harness key is missing; rerun with --key or reconnect")?;
+            println!("key: reusing the existing alex-up scoped key");
+            ("rk-existing".into(), existing)
+        }
+        None => mint_up_key(config, harness).await?,
+    };
+
+    // A supplied key may be new even when a state marker exists, so only skip
+    // configuration if its persisted key agrees with the requested one.
+    let key_matches = harness_connect::configured_api_key(harness, &config_dir)
+        .as_deref()
+        .is_some_and(|current| current == key);
+    if configured && key_matches {
+        println!("connect: already configured for {base_url} with default model {model}");
+    } else {
+        println!("connect: configuring {harness} for {base_url}");
+        harness_connect::connect_with_preminted_key(
+            harness,
+            Some(config_dir.clone()),
+            &base_url,
+            key,
+            Some(key_id),
+            false,
+            false,
+        )
+        .await?;
+        harness_connect::set_default_model(harness, &config_dir, model)?;
+        write_up_state(&config_dir, harness, &base_url, model)?;
+        println!("model: default set to {model}");
+    }
+    if no_launch {
+        println!("launch: skipped (--no-launch)");
+        return Ok(());
+    }
+    println!("launch: exec {}", spec.binary);
+    let binary = harness_connect::resolve_harness_binary(config, spec)
+        .with_context(|| format!("{harness} is not installed or not on PATH"))?;
+    // Pi's non-interactive mode does not consistently honour its persisted
+    // defaultProvider across releases, so pass the connected profile explicitly
+    // while retaining every user argument after it (including an override).
+    let mut launch_args = if harness == "pi" {
+        vec![
+            OsString::from("--provider"),
+            OsString::from("alexandria"),
+            OsString::from("--model"),
+            OsString::from(model),
+        ]
+    } else {
+        Vec::new()
+    };
+    launch_args.extend(args.into_iter().map(OsString::from));
+    launch_harness(&binary, &launch_args)
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -10751,6 +11003,34 @@ fi"#,
         assert_eq!(
             parse_dario_update_notice(r#"{"latest":"5","update_available":true}"#),
             Some("dario 5 available (running unknown) — alexandria dario update".into())
+        );
+    }
+
+    #[test]
+    fn up_step_planner_skips_satisfied_work() {
+        assert_eq!(
+            plan_up(true, true, true, false),
+            UpStepPlan {
+                install: false,
+                connect: false,
+                launch: true
+            }
+        );
+        assert_eq!(
+            plan_up(false, false, false, true),
+            UpStepPlan {
+                install: true,
+                connect: true,
+                launch: false
+            }
+        );
+        assert_eq!(
+            plan_up(true, true, false, true),
+            UpStepPlan {
+                install: false,
+                connect: true,
+                launch: false
+            }
         );
     }
 }
