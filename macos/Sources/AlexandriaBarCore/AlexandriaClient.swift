@@ -27,6 +27,23 @@ private struct OpenRouterKeyBody: Encodable {
     }
 }
 
+private struct FixtureInjectionBody: Encodable {
+    let fixture: String
+    let count: Int?
+    let direction: String?
+}
+
+private struct FixtureCaptureBody: Encodable {
+    let name: String
+    let fromTraceId: String
+    let kind: String
+
+    enum CodingKeys: String, CodingKey {
+        case name, kind
+        case fromTraceId = "from_trace_id"
+    }
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -392,6 +409,52 @@ public struct AlexandriaClient: Sendable {
             "admin/harnesses/\(encoded)/override", method: "PUT",
             body: body(HarnessOverride(binary: binary, configDir: configDir)))
         return try JSONDecoder().decode(Harness.self, from: data)
+    }
+
+    /// Lists response fixtures available for local error simulation.
+    public func errorSimulationFixtures() async throws -> [ErrorSimulationFixture] {
+        try await get("admin/fixtures", as: [ErrorSimulationFixture].self)
+    }
+
+    /// Queues one fixture for the next matching request in a trace session.
+    public func injectFixture(
+        sessionId: String,
+        fixture: String,
+        count: Int? = nil,
+        direction: String? = nil
+    ) async throws {
+        let encoded = encodedPathComponent(sessionId)
+        _ = try await request(
+            "admin/sessions/\(encoded)/inject",
+            method: "POST",
+            body: body(FixtureInjectionBody(
+                fixture: fixture, count: count, direction: direction)))
+    }
+
+    /// Removes all queued fixture injections for a trace session.
+    public func clearFixtureInjections(sessionId: String) async throws {
+        let encoded = encodedPathComponent(sessionId)
+        _ = try await request("admin/sessions/\(encoded)/injections", method: "DELETE")
+    }
+
+    /// Captures a recorded error response as a named replay fixture.
+    public func createErrorSimulationFixture(
+        name: String,
+        fromTraceId: String,
+        kind: String = "resp"
+    ) async throws {
+        _ = try await request(
+            "admin/fixtures",
+            method: "POST",
+            body: body(FixtureCaptureBody(name: name, fromTraceId: fromTraceId, kind: kind)))
+    }
+
+    public func protectionPolicy() async throws -> ProtectionPolicy {
+        try await get("admin/protection", as: ProtectionPolicy.self)
+    }
+
+    public func updateProtectionPolicy(_ policy: ProtectionPolicy) async throws {
+        _ = try await request("admin/protection", method: "PUT", body: body(policy))
     }
 
     public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
