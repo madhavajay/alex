@@ -61,6 +61,8 @@ struct MenuHeaderView: View {
     let daemonVersion: String
     let uptimeS: Int64
     let inFlight: Int
+    /// Triggers an on-demand Sparkle update check; nil hides the refresh control.
+    var onCheckUpdates: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 2) {
@@ -68,6 +70,15 @@ struct MenuHeaderView: View {
                 Text("Alex UI")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AlexTheme.Colors.foreground)
+                if let onCheckUpdates {
+                    Button(action: onCheckUpdates) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(AlexTheme.Colors.textFaint)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Check for updates")
+                }
                 Spacer()
                 HStack(spacing: 5) {
                     StatusDot(tint: AlexTheme.Colors.success, size: 5)
@@ -529,7 +540,6 @@ struct LimitsCardView: View {
     var onRefresh: (@MainActor () async -> Bool)? = nil
     var onPing: (() -> Void)? = nil
     var onOpenDario: (() -> Void)? = nil
-    @State private var darioHovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -792,43 +802,29 @@ struct LimitsCardView: View {
         .background(RoundedRectangle(cornerRadius: 5).fill(AlexTheme.Colors.overlay(0.07)))
     }
 
-    /// Dario agent chip under the Claude row (mock App.tsx:291-303).
+    /// Dario status as a plain line under the Claude row (not a flyout): a
+    /// status dot + version + phase/latency, matching the pre-restyle layout.
     @ViewBuilder
     private var agentChip: some View {
         if let dario,
            let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
         {
-            Button(action: { onOpenDario?() }) {
-                let tint = agentTint(active)
-                HStack(spacing: 6) {
-                    StatusDot(tint: tint, size: 5)
-                    Text("Dario")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(AlexTheme.Colors.textSecondary)
-                    Text("v\(active.version)")
-                        .font(AlexTheme.Fonts.mono(10))
-                        .foregroundStyle(AlexTheme.Colors.textFaint)
-                    Spacer()
-                    Text(agentStatusText(active))
-                        .font(.system(size: 9))
-                        .foregroundStyle(tint)
-                }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(AlexTheme.Colors.warningOrange.opacity(
-                            darioHovering ? 0.13 : 0.07)))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(AlexTheme.Colors.warningOrange.opacity(
-                            darioHovering ? 0.22 : 0.12)))
-                .contentShape(Rectangle())
+            let tint = agentTint(active)
+            HStack(spacing: 6) {
+                StatusDot(tint: tint, size: 5)
+                Text("Dario")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                Text("v\(active.version)")
+                    .font(AlexTheme.Fonts.mono(10))
+                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                Spacer()
+                Text(agentStatusText(active))
+                    .font(.system(size: 9))
+                    .foregroundStyle(tint)
             }
-            .buttonStyle(.plain)
-            .disabled(onOpenDario == nil)
-            .onHover { darioHovering = $0 }
             .padding(.leading, 21)
+            .padding(.vertical, 1)
         }
     }
 

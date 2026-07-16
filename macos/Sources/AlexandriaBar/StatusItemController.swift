@@ -103,7 +103,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             buildLimits()
             buildAccounts()
             buildHarnesses()
-            buildDario()
         }
         buildTraces()
         buildActions()
@@ -185,7 +184,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 appVersion: appVersion,
                 daemonVersion: health.version,
                 uptimeS: health.uptimeS,
-                inFlight: health.inFlight))
+                inFlight: health.inFlight,
+                onCheckUpdates: updaterController.canCheckForUpdates
+                    ? { [weak self] in self?.updaterController.checkForUpdates() }
+                    : nil))
         } else if store.lastRefresh == nil {
             addInfo("Alex UI — connecting…")
         } else {
@@ -480,25 +482,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         runPing(target: "openai", name: "Codex window start")
-    }
-
-    private func buildDario() {
-        guard let dario = store.dario else { return }
-        let active = dario.generations.first { $0.id == dario.activeGenerationId }
-        var title = "Dario"
-        if let active {
-            title += " · v\(active.version) · \(active.phase)"
-            if let probe = active.lastProbe, probe.ok, let ms = probe.latencyMs {
-                title += " · \(ms)ms"
-            }
-        }
-        let item = NSMenuItem(
-            title: title, action: #selector(runHandler(_:)), keyEquivalent: "")
-        item.target = self
-        item.image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil)
-        item.representedObject = MenuHandler { [weak self] in self?.openDario() }
-        menu.addItem(item)
-        menu.addItem(.separator())
     }
 
     /// The mock places Trace Browser access in a Traces section immediately
