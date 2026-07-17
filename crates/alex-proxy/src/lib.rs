@@ -1735,6 +1735,8 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "in_flight_requests": in_flight_requests(&state),
         "uptime_s": (now_ms() - state.started_ms) / 1000,
         "dario": state.dario.as_ref().and_then(|dario| dario.active()).is_some(),
+        "launchd_socket_activation": std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION")
+            .as_deref() == Some(std::ffi::OsStr::new("1")),
     }))
 }
 
