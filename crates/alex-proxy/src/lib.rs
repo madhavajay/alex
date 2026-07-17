@@ -2626,6 +2626,7 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                             && generation["last_probe"]["ok"].as_bool() == Some(true)
                     });
             let prompt_cache_degraded = !status["health_reason"].is_null();
+            let probe_returned_401 = dario_probe_returned_401(&status);
             let should_be_healthy =
                 status["route_enabled"].as_bool().unwrap_or(false) && anthropic_oauth_present;
             if let Some(obj) = status.as_object_mut() {
@@ -2647,7 +2648,12 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
                     json!(anthropic_credentials_present),
                 );
                 obj.insert("should_be_healthy".into(), json!(should_be_healthy));
-                if !anthropic_oauth_present {
+                if probe_returned_401 {
+                    obj.insert(
+                        "issue".into(),
+                        json!({"code": "reauth", "message": "Claude Code login needs re-auth", "fixable": true}),
+                    );
+                } else if !anthropic_oauth_present {
                     obj.insert(
                         "issue".into(),
                         json!({"code": "no_anthropic_creds", "message": "no active Anthropic OAuth credentials", "fixable": false}),
@@ -2659,6 +2665,18 @@ async fn admin_dario(State(state): State<Arc<AppState>>) -> Response {
         }
         None => error_response(StatusCode::NOT_FOUND, "dario mode is not enabled"),
     }
+}
+
+fn dario_probe_returned_401(status: &Value) -> bool {
+    let active_id = status["active_generation_id"].as_str();
+    status["generations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|generation| {
+            generation["id"].as_str() == active_id
+                && generation["last_probe"]["status"].as_u64() == Some(401)
+        })
 }
 
 async fn admin_dario_ping(State(state): State<Arc<AppState>>) -> Response {
@@ -4497,7 +4515,14 @@ pub async fn ping_provider(
         .await
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
-    let message = extract_reply(&text).unwrap_or_else(|| snippet(&text));
+    let message = annotate_anthropic_ping_message(
+        provider,
+        state
+            .dario
+            .as_ref()
+            .is_some_and(|dario| dario.routes_requests() && dario.active().is_none()),
+        extract_reply(&text).unwrap_or_else(|| snippet(&text)),
+    );
     PingResult {
         provider: provider.as_str(),
         account_id,
@@ -4505,6 +4530,18 @@ pub async fn ping_provider(
         status: Some(status),
         latency_ms: now_ms() - start,
         message,
+    }
+}
+
+fn annotate_anthropic_ping_message(
+    provider: Provider,
+    dario_down: bool,
+    message: String,
+) -> String {
+    if provider == Provider::Anthropic && dario_down {
+        "degraded — serving via direct fallback, Dario down".into()
+    } else {
+        message
     }
 }
 
@@ -8759,6 +8796,26 @@ fn emit_reauth_notification(state: &AppState, trace: &TraceRecord) {
     }
 }
 
+/// Dario authenticates inside its Claude Code child rather than through the
+/// proxy's OAuth path.  Its supervisor calls this when its readiness probe
+/// receives a confirmed 401; the shared dispatcher supplies the cooldown.
+pub fn emit_dario_reauth_notification(state: &AppState) {
+    if let Ok(notifications) = state.notifications.read() {
+        notifications.emit(notify::NotificationEvent {
+            level: notify::NotificationLevel::Warn,
+            category: "reauth".into(),
+            title: "Dario needs re-authentication".into(),
+            body: "Dario is down — your Claude Code login needs re-auth. Run `claude` login (or tap Reauth Dario).".into(),
+            account: notify::NotificationAccount {
+                provider: "anthropic".into(),
+                label: Some("Dario".into()),
+            },
+            action_url: Some("claude login".into()),
+            ts: now_ms(),
+        });
+    }
+}
+
 fn emit_reauth_notification_for_account(state: &AppState, account: &Account) {
     if account.kind != "oauth" {
         return;
@@ -9406,6 +9463,7 @@ mod tests {
         active: Option<DarioActive>,
         begin_succeeds: bool,
         routes_requests: bool,
+        status: Option<Value>,
     }
 
     impl DarioRouter for FakeDario {
@@ -9423,7 +9481,9 @@ mod tests {
         }
 
         fn status(&self) -> Value {
-            json!({"active": self.active.is_some()})
+            self.status
+                .clone()
+                .unwrap_or_else(|| json!({"active": self.active.is_some()}))
         }
 
         fn suspect(&self, _generation_id: &str) {}
@@ -9438,6 +9498,7 @@ mod tests {
             }),
             begin_succeeds: true,
             routes_requests: true,
+            status: None,
         })
     }
 
@@ -9589,6 +9650,7 @@ mod tests {
                 }),
                 begin_succeeds: true,
                 routes_requests: false,
+                status: None,
             })),
         );
         state.vault.upsert(anthropic_account()).await.unwrap();
@@ -9621,6 +9683,7 @@ mod tests {
                 active: None,
                 begin_succeeds: false,
                 routes_requests: true,
+                status: None,
             })),
         );
         state.vault.upsert(anthropic_account()).await.unwrap();
@@ -9652,6 +9715,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dario_401_probe_is_an_actionable_reauth_issue() {
+        let active = DarioActive {
+            generation_id: "logged-out-generation".into(),
+            base_url: "http://127.0.0.1:9191".into(),
+            api_key: "dario-key".into(),
+        };
+        let state = test_state_with_dario(
+            "dario-401-admin-status",
+            Some(Arc::new(FakeDario {
+                active: Some(active),
+                begin_succeeds: true,
+                routes_requests: true,
+                status: Some(json!({
+                    "active_generation_id": "logged-out-generation",
+                    "route_enabled": true,
+                    "health": "down",
+                    "health_reason": null,
+                    "generations": [{
+                        "id": "logged-out-generation",
+                        "last_probe": {"ok": false, "status": 401}
+                    }]
+                })),
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+
+        let (_, body) = response_json(admin_dario(State(state)).await).await;
+        assert_eq!(body["should_be_healthy"], true);
+        assert_eq!(body["generation_health"], "down");
+        assert_eq!(
+            body["issue"],
+            json!({
+                "code": "reauth",
+                "message": "Claude Code login needs re-auth",
+                "fixable": true,
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_ping_is_annotated_when_dario_falls_back_direct() {
+        assert_eq!(
+            annotate_anthropic_ping_message(Provider::Anthropic, true, "creds ok".into()),
+            "degraded — serving via direct fallback, Dario down"
+        );
+        assert_eq!(
+            annotate_anthropic_ping_message(Provider::Openai, true, "creds ok".into()),
+            "creds ok"
+        );
+    }
+
+    #[tokio::test]
     async fn dario_generation_race_fails_closed() {
         let state = test_state_with_dario(
             "dario-generation-race",
@@ -9663,6 +9778,7 @@ mod tests {
                 }),
                 begin_succeeds: false,
                 routes_requests: true,
+                status: None,
             })),
         );
         state.vault.upsert(anthropic_account()).await.unwrap();
@@ -12053,5 +12169,46 @@ mod tests {
             ..trace
         };
         assert!(reauth_notification_event(&state, &non_auth).is_none());
+    }
+
+    #[tokio::test]
+    async fn dario_401_notification_uses_reauth_guidance_and_is_debounced() {
+        let (url, received, server) = webhook_sink().await;
+        let state = test_state("dario-reauth-notification");
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    url,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        emit_dario_reauth_notification(&state);
+        emit_dario_reauth_notification(&state);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if received.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local webhook sink did not receive Dario reauth event");
+
+        let event = received.lock().unwrap()[0].clone();
+        server.abort();
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["label"], "Dario");
+        assert_eq!(
+            event["body"],
+            "Dario is down — your Claude Code login needs re-auth. Run `claude` login (or tap Reauth Dario)."
+        );
+        assert_ne!(event["action_url"], "alex auth login anthropic");
     }
 }

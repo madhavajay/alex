@@ -187,8 +187,19 @@ enum ProbeEscalation {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ProbeOutcome {
     Ready,
-    Unhealthy { status: u16, body_snippet: String },
-    Wedged { error: String },
+    /// Claude Code rejected its own stored session.  This must stay distinct
+    /// from a normal upstream/process failure so the caller can ask for the
+    /// right interactive recovery action.
+    Auth {
+        body_snippet: String,
+    },
+    Unhealthy {
+        status: u16,
+        body_snippet: String,
+    },
+    Wedged {
+        error: String,
+    },
 }
 
 impl ProbeOutcome {
@@ -198,6 +209,7 @@ impl ProbeOutcome {
 
     fn status(&self) -> Option<u16> {
         match self {
+            ProbeOutcome::Auth { .. } => Some(401),
             ProbeOutcome::Unhealthy { status, .. } => Some(*status),
             _ => None,
         }
@@ -212,6 +224,7 @@ impl ProbeOutcome {
 
     fn body_snippet(&self) -> Option<&str> {
         match self {
+            ProbeOutcome::Auth { body_snippet } => Some(body_snippet),
             ProbeOutcome::Unhealthy { body_snippet, .. } => Some(body_snippet),
             _ => None,
         }
@@ -220,6 +233,9 @@ impl ProbeOutcome {
     fn summary(&self) -> String {
         match self {
             ProbeOutcome::Ready => "ready".to_string(),
+            ProbeOutcome::Auth { body_snippet } => {
+                format!("authentication failed status=401 body={body_snippet}")
+            }
             ProbeOutcome::Unhealthy {
                 status,
                 body_snippet,
@@ -402,6 +418,10 @@ pub struct DarioSupervisor {
     respawn_in_flight: AtomicBool,
     respawn_next_at: AtomicI64,
     prompt_cache_issue: Mutex<Option<String>>,
+    /// A 401 is qualitatively different from a failed local process: the
+    /// Claude Code session used by Dario has been logged out.  The daemon
+    /// wires this to its notification dispatcher after the proxy state exists.
+    auth_failures: tokio::sync::broadcast::Sender<()>,
 }
 
 pub async fn bootstrap(
@@ -762,6 +782,7 @@ impl DarioSupervisor {
             .build()
             .context("building http client")?;
         let runtime = find_node_runtime(settings.node_bin.as_deref()).await?;
+        let (auth_failures, _) = tokio::sync::broadcast::channel(16);
         let supervisor = Arc::new(Self {
             settings,
             runtime,
@@ -775,6 +796,7 @@ impl DarioSupervisor {
             respawn_in_flight: AtomicBool::new(false),
             respawn_next_at: AtomicI64::new(0),
             prompt_cache_issue: Mutex::new(None),
+            auth_failures,
         });
         let _ = supervisor.weak_self.set(Arc::downgrade(&supervisor));
         supervisor.reap_orphans();
@@ -801,6 +823,13 @@ impl DarioSupervisor {
             base_url: format!("http://127.0.0.1:{}", gen.port),
             api_key: self.settings.api_key.clone(),
         })
+    }
+
+    /// Subscribe to confirmed Claude Code authentication failures.  Delivery
+    /// is intentionally best-effort because the notification dispatcher owns
+    /// the durable cooldown/debounce policy.
+    pub fn subscribe_auth_failures(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.auth_failures.subscribe()
     }
 
     pub fn begin_request(&self, generation_id: &str) -> Option<InFlightGuard> {
@@ -1330,6 +1359,7 @@ impl DarioSupervisor {
         .await;
         gen.record_probe(&outcome, latency_ms, now_ms());
         if !outcome.is_ready() {
+            self.notify_auth_failure(&outcome);
             self.persist_failed_probe(gen, &outcome).await;
             return Err(anyhow!(
                 "{} readiness probe failed: {}",
@@ -1361,6 +1391,7 @@ impl DarioSupervisor {
             }
             return;
         }
+        self.notify_auth_failure(&outcome);
         self.persist_failed_probe(gen, &outcome).await;
         tracing::warn!(
             generation = %gen.id,
@@ -1372,6 +1403,12 @@ impl DarioSupervisor {
             && gen.state() == GenState::Active
         {
             self.replace_unhealthy(gen).await;
+        }
+    }
+
+    fn notify_auth_failure(&self, outcome: &ProbeOutcome) {
+        if matches!(outcome, ProbeOutcome::Auth { .. }) {
+            let _ = self.auth_failures.send(());
         }
     }
 
@@ -1616,9 +1653,14 @@ async fn probe_messages_outcome(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            ProbeOutcome::Unhealthy {
-                status,
-                body_snippet: snippet(&text),
+            let body_snippet = snippet(&text);
+            if status == 401 {
+                ProbeOutcome::Auth { body_snippet }
+            } else {
+                ProbeOutcome::Unhealthy {
+                    status,
+                    body_snippet,
+                }
             }
         }
         Err(e) => ProbeOutcome::Wedged {
@@ -2796,18 +2838,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_unhealthy_on_401() {
+    async fn probe_auth_on_401() {
         let base = one_shot_server(401, "{\"error\":\"unauthorized\"}").await;
         let (outcome, _) = probe_messages(&base, "key", "model", FAST, FAST).await;
         match outcome {
-            ProbeOutcome::Unhealthy {
-                status,
-                body_snippet,
-            } => {
-                assert_eq!(status, 401);
+            ProbeOutcome::Auth { body_snippet } => {
                 assert!(body_snippet.contains("unauthorized"));
             }
-            other => panic!("expected Unhealthy, got {other:?}"),
+            other => panic!("expected Auth, got {other:?}"),
         }
     }
 

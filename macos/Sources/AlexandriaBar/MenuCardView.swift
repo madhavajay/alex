@@ -540,6 +540,7 @@ struct LimitsCardView: View {
     var onRefresh: (@MainActor () async -> Bool)? = nil
     var onPing: (() -> Void)? = nil
     var onOpenDario: (() -> Void)? = nil
+    var onReauthDario: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -802,34 +803,48 @@ struct LimitsCardView: View {
         .background(RoundedRectangle(cornerRadius: 5).fill(AlexTheme.Colors.overlay(0.07)))
     }
 
-    /// Dario status as a plain line under the Claude row (not a flyout): a
-    /// status dot + version + phase/latency, matching the pre-restyle layout.
+    /// Dario status and its re-auth affordance under the Claude row.
     @ViewBuilder
     private var agentChip: some View {
         if let dario {
             let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
                 ?? dario.generations.first
             let tint = active.map { agentTint($0) } ?? AlexTheme.Colors.destructive
-            Button(action: { onOpenDario?() }) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    StatusDot(tint: tint, size: 5)
-                    Text("Dario")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(AlexTheme.Colors.textSecondary)
-                    if let active {
-                        Text("v\(active.version)")
-                            .font(AlexTheme.Fonts.mono(10))
-                            .foregroundStyle(AlexTheme.Colors.textFaint)
+                    Button(action: { onOpenDario?() }) {
+                        HStack(spacing: 6) {
+                            StatusDot(tint: tint, size: 5)
+                            Text("Dario")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(AlexTheme.Colors.textSecondary)
+                            if let active {
+                                Text("v\(active.version)")
+                                    .font(AlexTheme.Fonts.mono(10))
+                                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                            }
+                            Spacer()
+                            Text(active.map { agentStatusText($0) } ?? "down")
+                                .font(.system(size: 9))
+                                .foregroundStyle(tint)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    Spacer()
-                    Text(active.map { agentStatusText($0) } ?? "down")
-                        .font(.system(size: 9))
-                        .foregroundStyle(tint)
+                    .buttonStyle(.plain)
+                    .disabled(onOpenDario == nil)
+                    if dario.issue?.code == "reauth" {
+                        Button("Reauth Dario", action: { onReauthDario?() })
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .disabled(onReauthDario == nil)
+                    }
                 }
-                .contentShape(Rectangle())
+                if let issue = dario.issue {
+                    Text(issue.message)
+                        .font(.system(size: 9))
+                        .foregroundStyle(AlexTheme.Colors.destructive)
+                }
             }
-            .buttonStyle(.plain)
-            .disabled(onOpenDario == nil)
             .padding(.leading, 21)
             .padding(.vertical, 1)
         }

@@ -313,6 +313,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 guard let self else { return }
                 self.menu.cancelTrackingWithoutAnimation()
                 self.openDario()
+            },
+            onReauthDario: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.reauthDario()
             })
         addHostedView(card)
         menu.addItem(.separator())
@@ -861,6 +866,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             darioWindow = DarioWindowController(store: store)
         }
         darioWindow?.show()
+    }
+
+    private func reauthDario() {
+        let binary = DaemonController.findBinary() ?? "alexandria"
+        TerminalLauncher.launchDarioReauth(daemonBinary: binary)
     }
 
     private func openPreferences(section: PreferencesSection = .general) {

@@ -136,12 +136,18 @@ struct DarioPreferencesSection: View {
                     Spacer(minLength: 8)
                     if issue.fixable {
                         PillButton(
-                            title: repairInFlight ? "Fixing…" : "Fix",
+                            title: repairInFlight
+                                ? "Opening…"
+                                : (issue.code == "reauth" ? "Reauth Dario" : "Fix"),
                             variant: .primary,
                             isEnabled: !repairInFlight,
                             isBusy: repairInFlight
                         ) {
-                            Task { await repair() }
+                            if issue.code == "reauth" {
+                                reauthDario()
+                            } else {
+                                Task { await repair() }
+                            }
                         }
                     }
                 }
@@ -293,6 +299,14 @@ struct DarioPreferencesSection: View {
         } catch {
             actionResult = "Fix failed: \(error.localizedDescription)"
         }
+    }
+
+    private func reauthDario() {
+        let binary = DaemonController.findBinary() ?? "alexandria"
+        repairInFlight = true
+        TerminalLauncher.launchDarioReauth(daemonBinary: binary)
+        actionResult = "Reauth opened in Terminal; repair runs after login."
+        repairInFlight = false
     }
 }
 
