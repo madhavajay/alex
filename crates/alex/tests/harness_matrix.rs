@@ -66,8 +66,45 @@ harness_matrix!(
     kimi_install_and_model_roundtrip,
     kimi_subagent_lineage_detected,
     kimi_tool_capture_logged,
-    "requires a live Kimi Code installation"
+    "connect/config-rewrite: harness_connect unit tests (kimi_connection_*); live: `npm i -g @moonshot-ai/kimi-code`, `alex connect kimi`, run an alex/* model inside Kimi"
 );
+
+/// Kimi Code *subscription/provider* coverage (distinct from the harness/agent
+/// matrix above). These exercise Alex acting as a Kimi client: import the
+/// already-authed creds, proactively refresh the 15-minute token, route the
+/// `kimi/*` models to `https://api.kimi.com/coding/v1`, and read usage.
+///
+/// Fast unit coverage runs in the normal suite:
+///   - device-flow state machine: alex-auth `kimi_device_poll_state_machine`
+///   - refresh decision:          alex-auth `kimi_refresh_decision_follows_expiry_margin`
+///   - creds import (secs->ms):   alex-auth `kimi_import_builds_oauth_account_with_seconds_expiry`
+///   - usage parsing:             alex-proxy `kimi_usage_payload_maps_windows_and_credits`
+/// The live/networked legs below stay `#[ignore]` so `cargo test` is green offline.
+mod kimi_subscription {
+    #[test]
+    #[ignore = "live: gated on ~/.kimi-code/credentials/kimi-code.json + KIMI_LIVE=1"]
+    fn import_creds_then_refresh_before_expiry() {
+        // `alex auth import kimi` adopts the CLI creds; a routed request after
+        // >15min proves proactive refresh via refresh_token (no 401).
+        unimplemented!("TODO: live Kimi provider — import creds, force expiry, assert auto-refresh");
+    }
+
+    #[test]
+    #[ignore = "live: gated on a Kimi subscription + KIMI_LIVE=1"]
+    fn route_kimi_model_chat_completion() {
+        // POST /v1/chat/completions with model=kimi/k3 through Alex and assert a
+        // non-empty completion from api.kimi.com/coding/v1.
+        unimplemented!("TODO: live Kimi provider — route kimi/k3 chat/completions");
+    }
+
+    #[test]
+    #[ignore = "live: gated on a Kimi subscription + KIMI_LIVE=1"]
+    fn usage_probe_surfaces_quota() {
+        // `alex status` / /admin/accounts shows Kimi quota windows fetched from
+        // GET /coding/v1/usages.
+        unimplemented!("TODO: live Kimi usage — assert quota windows recorded");
+    }
+}
 harness_matrix!(
     gemini_install_and_model_roundtrip,
     gemini_subagent_lineage_detected,

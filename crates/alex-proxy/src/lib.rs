@@ -39,6 +39,8 @@ use tokio_stream::wrappers::ReceiverStream;
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 const OPENAI_BASE: &str = "https://api.openai.com";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+/// Kimi Code (Moonshot AI) OpenAI-compatible coding endpoint.
+const KIMI_BASE: &str = "https://api.kimi.com/coding/v1";
 const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const XAI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION: &str = "0.2.77";
@@ -307,7 +309,11 @@ fn routing_limits_from_headers(
             Provider::Openai => OPENAI_LIMIT_HEADERS.contains(&name),
             Provider::Anthropic => name.starts_with("anthropic-ratelimit-"),
             Provider::Xai => name.starts_with("x-ratelimit-"),
-            Provider::Gemini | Provider::Openrouter | Provider::Exo | Provider::Amp => false,
+            Provider::Gemini
+            | Provider::Openrouter
+            | Provider::Exo
+            | Provider::Amp
+            | Provider::Kimi => false,
         };
         if allowed {
             if let Ok(value) = value.to_str() {
@@ -722,6 +728,164 @@ pub fn exo_catalog_models(state: &AppState) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Kimi Code models Alexandria routes to `https://api.kimi.com/coding/v1`.
+/// Advertised in `/v1/models` only when a Kimi account is present, so a harness
+/// pointed at Alex can select `kimi/k3` etc. from its model picker.
+pub const KIMI_CATALOG_MODELS: &[&str] = &[
+    "kimi/k3",
+    "kimi/kimi-for-coding",
+    "kimi/kimi-for-coding-highspeed",
+];
+
+pub async fn kimi_catalog_models(state: &AppState) -> Vec<String> {
+    let has_account = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .any(|a| a.provider == Provider::Kimi && a.status == "active");
+    if !has_account {
+        return Vec::new();
+    }
+    KIMI_CATALOG_MODELS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
+/// Kimi's usage/quota endpoint (discovered in the kimi node binary:
+/// `managedUsageUrl` -> `${base}/usages`, GET with a Bearer token).
+fn kimi_usage_url() -> String {
+    format!("{KIMI_BASE}/usages")
+}
+
+fn kimi_usage_num(raw: &Value, key: &str) -> Option<i64> {
+    raw.get(key).and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+/// Convert one Kimi usage row (`{limit, used, remaining, name|title, reset_at}`)
+/// into an Alexandria rate-window entry. Mirrors the kimi CLI's `toUsageRow`.
+fn kimi_usage_row(raw: &Value, default_label: &str) -> Option<Value> {
+    let limit = kimi_usage_num(raw, "limit");
+    let mut used = kimi_usage_num(raw, "used");
+    if used.is_none() {
+        if let (Some(remaining), Some(limit)) = (kimi_usage_num(raw, "remaining"), limit) {
+            used = Some(limit - remaining);
+        }
+    }
+    if used.is_none() && limit.is_none() {
+        return None;
+    }
+    let label = raw
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| raw.get("title").and_then(Value::as_str))
+        .unwrap_or(default_label)
+        .to_string();
+    let used_pct = match (used, limit) {
+        (Some(u), Some(l)) if l > 0 => Some((u as f64 / l as f64) * 100.0),
+        _ => None,
+    };
+    let resets_at = ["reset_at", "resetAt", "reset_time", "resetTime"]
+        .iter()
+        .find_map(|k| raw.get(*k).and_then(Value::as_str))
+        .map(String::from);
+    Some(json!({
+        "label": label,
+        "used": used,
+        "limit": limit,
+        "remaining": kimi_usage_num(raw, "remaining"),
+        "used_pct": used_pct,
+        "resets_at": resets_at,
+    }))
+}
+
+/// Parse the `/usages` payload into a routing-limits snapshot. Pure + tolerant so
+/// it can be unit-tested and degrades gracefully on an unexpected shape.
+pub fn parse_kimi_usage_payload(payload: &Value) -> Value {
+    let mut windows = Vec::new();
+    if let Some(row) = payload.get("usage").and_then(|u| kimi_usage_row(u, "Weekly limit")) {
+        windows.push(row);
+    }
+    if let Some(limits) = payload.get("limits").and_then(Value::as_array) {
+        for (idx, item) in limits.iter().enumerate() {
+            let detail = item.get("detail").filter(|d| d.is_object()).unwrap_or(item);
+            let default_label = format!("Limit #{}", idx + 1);
+            if let Some(row) = kimi_usage_row(detail, &default_label) {
+                windows.push(row);
+            }
+        }
+    }
+    let credits = payload
+        .get("boosterWallet")
+        .filter(|w| w.is_object())
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "provider": "kimi",
+        "source": "kimi /usages",
+        "windows": windows,
+        "credits": credits,
+    })
+}
+
+/// Fetch and record Kimi usage for the active account. Returns a short human
+/// summary for the health line. Degrades gracefully when usage is unavailable.
+async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, String) {
+    let account = match state.vault.account_for(Provider::Kimi, true).await {
+        Ok(account) => account,
+        Err(e) => return (false, None, e.to_string()),
+    };
+    let Some(token) = account.access_token.clone() else {
+        return (false, Some(account.id.clone()), "kimi account has no access token".into());
+    };
+    let resp = state
+        .http
+        .get(kimi_usage_url())
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/json")
+        .send()
+        .await;
+    match resp {
+        Ok(resp) => {
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return (
+                    true,
+                    Some(account.id.clone()),
+                    "creds ok (usage not reported)".into(),
+                );
+            }
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            if !status.is_success() {
+                return (false, Some(account.id.clone()), format!("usage HTTP {status}"));
+            }
+            let snapshot = parse_kimi_usage_payload(&body);
+            let summary = snapshot["windows"]
+                .as_array()
+                .and_then(|w| w.first())
+                .map(|row| {
+                    let label = row["label"].as_str().unwrap_or("limit");
+                    match (row["used"].as_i64(), row["limit"].as_i64()) {
+                        (Some(u), Some(l)) => format!("{label}: {u}/{l}"),
+                        _ => format!("{label} ok"),
+                    }
+                })
+                .unwrap_or_else(|| "creds ok".into());
+            let _ = state
+                .vault
+                .record_routing_limits(&account.id, snapshot)
+                .await;
+            (true, Some(account.id.clone()), summary)
+        }
+        Err(e) => (false, Some(account.id.clone()), format!("usage endpoint unreachable: {e}")),
+    }
 }
 
 fn exo_model_enabled(state: &AppState, model: &str) -> bool {
@@ -2117,6 +2281,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         ids.extend(models.iter().map(|id| format!("openrouter/{id}")));
     }
     ids.extend(exo_catalog_models(&state));
+    ids.extend(kimi_catalog_models(&state).await);
     for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
@@ -4081,7 +4246,7 @@ async fn traces_run_artifacts(
     }
 }
 
-const PAUSEABLE_PROVIDERS: [Provider; 7] = [
+const PAUSEABLE_PROVIDERS: [Provider; 8] = [
     Provider::Anthropic,
     Provider::Openai,
     Provider::Gemini,
@@ -4089,6 +4254,7 @@ const PAUSEABLE_PROVIDERS: [Provider; 7] = [
     Provider::Openrouter,
     Provider::Exo,
     Provider::Amp,
+    Provider::Kimi,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -4571,6 +4737,7 @@ pub struct PingModels {
     pub xai: String,
     pub gemini: String,
     pub openrouter: String,
+    pub kimi: String,
 }
 
 pub async fn ping_provider(
@@ -4657,6 +4824,19 @@ pub async fn ping_provider(
                 }
             }
         },
+        Provider::Kimi => {
+            // Kimi's usage endpoint doubles as a cheap credential check: it needs
+            // a valid Bearer token and returns the subscription's quota windows.
+            let (ok, account_id, message) = kimi_usage_probe(state).await;
+            return PingResult {
+                provider: "kimi",
+                account_id,
+                ok,
+                status: if ok { Some(200) } else { None },
+                latency_ms: now_ms() - start,
+                message,
+            };
+        }
         Provider::Amp => {
             let account_id = state
                 .vault
@@ -4847,6 +5027,7 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
                         | Provider::Gemini
                         | Provider::Openrouter
                         | Provider::Amp
+                        | Provider::Kimi
                 )
                 && !seen.contains(&a.provider)
             {
@@ -5800,6 +5981,61 @@ async fn plan_upstream(
                 )),
             }
         }
+        Provider::Kimi => {
+            let account = state
+                .vault
+                .account_for_excluding(provider, true, excluded_accounts)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            match format {
+                ClientFormat::OpenaiChat => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{KIMI_BASE}/chat/completions"),
+                        account,
+                        connection_account: None,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                        dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
+                    })
+                }
+                ClientFormat::AnthropicMessages => {
+                    let mut converted = translate::anthropic_to_openai_chat(body_json);
+                    converted["model"] = json!(routed_model);
+                    converted["stream"] = json!(false);
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{KIMI_BASE}/chat/completions"),
+                        account,
+                        connection_account: None,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                        dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
+                    })
+                }
+                ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "the Kimi upstream speaks OpenAI chat completions; POST to /v1/chat/completions or /v1/messages".to_string(),
+                )),
+            }
+        }
         Provider::Amp => Err((
             StatusCode::NOT_IMPLEMENTED,
             "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
@@ -6271,6 +6507,21 @@ fn upstream_headers(
         }
         (Provider::Exo, _) => {
             h.insert("authorization", HeaderValue::from_static("Bearer x"));
+        }
+        (Provider::Kimi, _) => {
+            let token = account
+                .access_token
+                .as_deref()
+                .or(account.api_key.as_deref())
+                .ok_or((
+                    StatusCode::BAD_GATEWAY,
+                    "kimi account has no access token".to_string(),
+                ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
         }
         (Provider::Xai, _) => {
             let token = account
@@ -7350,6 +7601,7 @@ fn protection_equivalent(
             "gemini" => Provider::Gemini,
             "openrouter" => Provider::Openrouter,
             "exo" => Provider::Exo,
+            "kimi" => Provider::Kimi,
             _ => return None,
         };
         (candidate_provider != current_provider && !attempted_models.contains(model))
@@ -9119,6 +9371,36 @@ fn reauth_notification_event_for_account(account: &Account) -> notify::Notificat
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn kimi_usage_payload_maps_windows_and_credits() {
+        let payload = json!({
+            "usage": {"limit": 1000, "used": 250, "name": "Weekly", "reset_at": "2026-07-20T00:00:00Z"},
+            "limits": [
+                {"detail": {"limit": 40, "remaining": 10, "title": "5h"}, "window": {}}
+            ],
+            "boosterWallet": {"balance": {"type": "BOOSTER", "amount": 5}, "currency": "USD"}
+        });
+        let snap = parse_kimi_usage_payload(&payload);
+        assert_eq!(snap["provider"], json!("kimi"));
+        let windows = snap["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["label"], json!("Weekly"));
+        assert_eq!(windows[0]["used"], json!(250));
+        assert_eq!(windows[0]["limit"], json!(1000));
+        assert_eq!(windows[0]["used_pct"], json!(25.0));
+        // Second window derives used from limit - remaining (40 - 10 = 30).
+        assert_eq!(windows[1]["label"], json!("5h"));
+        assert_eq!(windows[1]["used"], json!(30));
+        assert!(!snap["credits"].is_null());
+    }
+
+    #[test]
+    fn kimi_usage_payload_degrades_on_empty() {
+        let snap = parse_kimi_usage_payload(&json!({}));
+        assert_eq!(snap["windows"].as_array().unwrap().len(), 0);
+        assert!(snap["credits"].is_null());
+    }
 
     async fn collect_test_webhook(
         State(received): State<Arc<std::sync::Mutex<Vec<Value>>>>,

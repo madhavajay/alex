@@ -56,6 +56,11 @@ const AMP_PLUGIN_FILE: &str = "alexandria.ts";
 const AMP_KEY_FILE: &str = "alexandria-api-key";
 const AMP_STATE_FILE: &str = "alexandria-harness-state.json";
 const AMP_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
+const KIMI_CONFIG_FILE: &str = "config.toml";
+const KIMI_STATE_FILE: &str = "alexandria-harness-state.json";
+const KIMI_BACKUP_FILE: &str = "alexandria-original-config.toml";
+const KIMI_PROVIDER_NAME: &str = "alexandria";
+const KIMI_INSTALL_DESCRIPTION: &str = "Alexandria backs up your Kimi Code config.toml and adds an OpenAI-compatible provider named `alexandria` plus selectable models named alex/* that route through the local proxy. Those models use a local-only harness credential and static Alexandria headers; Kimi's own kimi/* models and subscription authentication are left untouched. `alex harness disconnect kimi` removes the added provider and models and restores the backup.";
 const PI_INSTALL_DESCRIPTION: &str = "Alexandria adds models named alex/* to Pi and installs a small session hook. The hook sets a local session header that the Alexandria proxy detects for tracing and removes before forwarding traffic upstream.";
 const CODEX_INSTALL_DESCRIPTION: &str = "Alexandria backs up your original Codex configuration and any existing openai/alex profile files, then creates two fixed profiles. `codex --profile openai` uses normal Codex authentication; `codex --profile alex` routes alex/* models through the local proxy. A lifecycle hook sends session and sub-agent events to Alexandria so related traces can be grouped; Alexandria-only headers and credentials are not forwarded upstream.";
 const CLAUDE_INSTALL_DESCRIPTION: &str = "Alexandria leaves your normal Claude Code configuration untouched and backs it up for reference. It creates a separate Alexandria settings profile that routes gateway models displayed as alex/* through the local proxy. Start it with `claude --settings ~/.claude/alexandria-settings.json`; plain `claude` continues to use your normal Claude authentication. Claude's native session, agent, and parent-agent headers provide exact nested traces, while lifecycle hooks add sub-agent names and timing.";
@@ -207,8 +212,10 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         binary: "kimi",
         config_dir: kimi_config_dir_for_home,
         version_args: &["--version"],
-        supports_connect: false,
-        install: None,
+        supports_connect: true,
+        install: Some(HarnessInstall::Npm {
+            package: "@moonshot-ai/kimi-code",
+        }),
     },
     HarnessSpec {
         name: "gemini",
@@ -425,6 +432,15 @@ struct AmpManagedState {
     previous_plugin: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct KimiManagedState {
+    managed_models: Vec<String>,
+    /// Whether Alexandria added the `[providers."alexandria"]` table (so
+    /// disconnect only removes a provider it created, never a user's own).
+    added_provider: bool,
+}
+
 pub(crate) async fn connect_cmd(
     config: &Config,
     harness: Option<String>,
@@ -438,6 +454,7 @@ pub(crate) async fn connect_cmd(
         Some("codex") => connect_codex(config, config_dir, json).await,
         Some("grok") => connect_grok(config, config_dir, json).await,
         Some("amp") => connect_amp(config, config_dir, json).await,
+        Some("kimi") => connect_kimi(config, config_dir, json).await,
         Some(name) => bail!(
             "unknown harness '{name}' (supported: {})",
             HARNESSES
@@ -557,6 +574,7 @@ fn write_preminted_connection(
             capture_enabled,
         ),
         "grok" => write_grok_connection(config_dir, base_url, key_id, api_key, models, version),
+        "kimi" => write_kimi_connection(config_dir, base_url, key_id, api_key, models, version),
         "amp" => write_amp_connection_with_capture(
             config_dir,
             base_url,
@@ -667,6 +685,7 @@ pub(crate) async fn disconnect_cmd(
         "codex" => disconnect_codex(config, config_dir).await,
         "grok" => disconnect_grok(config, config_dir).await,
         "amp" => disconnect_amp(config, config_dir).await,
+        "kimi" => disconnect_kimi(config, config_dir).await,
         name => bail!(
             "unknown harness '{name}' (supported: {})",
             HARNESSES
@@ -761,6 +780,7 @@ pub(crate) async fn harness_status(
         "codex" => codex_config_connected(&config_dir).unwrap_or(false),
         "grok" => grok_config_connected(&config_dir).unwrap_or(false),
         "amp" => amp_config_connected(&config_dir).unwrap_or(false),
+        "kimi" => kimi_config_connected(&config_dir).unwrap_or(false),
         _ => false,
     };
     let override_ = override_json(config.harness_overrides.get(spec.name));
@@ -771,6 +791,7 @@ pub(crate) async fn harness_status(
         "claude" => Some(CLAUDE_BACKUP_FILE),
         "codex" => Some(CODEX_BACKUP_FILE),
         "grok" => Some(GROK_BACKUP_FILE),
+        "kimi" => Some(KIMI_BACKUP_FILE),
         _ => None,
     };
     let backup_path = backup_file
@@ -1223,6 +1244,97 @@ async fn disconnect_grok(config: &Config, config_dir: Option<PathBuf>) -> Result
         );
     }
     println!("disconnected grok; revoked {revoked} harness key(s)");
+    Ok(())
+}
+
+async fn connect_kimi(config: &Config, config_dir: Option<PathBuf>, json_out: bool) -> Result<()> {
+    let detection = detect_harness(config, kimi_spec()).await;
+    detection.binary.as_ref().context(
+        "kimi is not installed or not on PATH; install it with `npm install -g @moonshot-ai/kimi-code`",
+    )?;
+    let config_dir = resolve_config_dir(config, kimi_spec(), config_dir);
+    if !config_dir.is_dir() {
+        bail!(
+            "kimi config dir does not exist at {}; run kimi once first, or pass --config-dir",
+            config_dir.display()
+        );
+    }
+    if !daemon_health(config).await {
+        bail!(
+            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            normalized_base_url(config)
+        );
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    revoke_harness_keys(config, &client, "kimi").await?;
+    let minted = mint_harness_key(config, &client, "kimi").await?;
+    let models = fetch_models(config, &client)
+        .await
+        .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
+    let summary = write_kimi_connection(
+        config_dir,
+        normalized_base_url(config),
+        minted.id,
+        minted.key,
+        models,
+        detection.version,
+    )?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "harness": "kimi",
+                "version": summary.version,
+                "config_path": summary.config_path,
+                "models": summary.models,
+                "key_id": summary.key_id,
+            }))?
+        );
+    } else {
+        println!("{}", ui::section("kimi connected"));
+        println!("key id: {}", ui::amber(&summary.key_id));
+        println!("models: {}", summary.models.len());
+        println!("config: {}", summary.config_path.display());
+        println!();
+        println!("kimi --model {}", summary.models[0]);
+        println!("or pick an alex/* model in Kimi's model picker; Kimi's own kimi/* models remain available");
+    }
+    Ok(())
+}
+
+async fn disconnect_kimi(config: &Config, config_dir: Option<PathBuf>) -> Result<()> {
+    let config_dir = resolve_config_dir(config, kimi_spec(), config_dir);
+    let was_connected = disconnect_kimi_config(&config_dir)?;
+    if !was_connected {
+        println!("kimi not connected");
+        return Ok(());
+    }
+
+    let mut revoked = 0usize;
+    if daemon_health(config).await {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        match revoke_harness_keys(config, &client, "kimi").await {
+            Ok(count) => revoked = count,
+            Err(e) => eprintln!(
+                "{}",
+                ui::amber(&format!(
+                    "removed local Kimi config, but could not revoke daemon keys: {e}"
+                ))
+            ),
+        }
+    } else {
+        eprintln!(
+            "{}",
+            ui::amber("removed local Kimi config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
+        );
+    }
+    println!("disconnected kimi; revoked {revoked} harness key(s)");
     Ok(())
 }
 
@@ -2112,6 +2224,189 @@ fn read_grok_state(path: &Path) -> Result<GrokManagedState> {
             path.display()
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// Kimi Code (Moonshot AI) bidirectional connect: add alex/* models to Kimi.
+// ---------------------------------------------------------------------------
+
+/// Rewrite `~/.kimi-code/config.toml` to add an OpenAI-compatible `alexandria`
+/// provider pointing at the local proxy plus alex/* models, backing up the
+/// original once. Reversible via [`disconnect_kimi_config`].
+pub(crate) fn write_kimi_connection(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    models: Vec<String>,
+    version: Option<String>,
+) -> Result<HarnessConnectSummary> {
+    let config_path = config_dir.join(KIMI_CONFIG_FILE);
+    let state_path = config_dir.join(KIMI_STATE_FILE);
+    let backup_path = config_dir.join(KIMI_BACKUP_FILE);
+    let display_models = short_alex_model_ids(models);
+    if display_models.is_empty() {
+        bail!("Alexandria did not return any Kimi-compatible models");
+    }
+    let before = read_kimi_model_ids(&config_dir);
+    let managed_before = state_path.exists();
+    let mut state = if managed_before {
+        read_kimi_state(&state_path)?
+    } else {
+        KimiManagedState::default()
+    };
+    let previous_managed: HashSet<String> = state.managed_models.iter().cloned().collect();
+
+    let original_config = if config_path.exists() {
+        std::fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+    let mut doc = DocumentMut::from_str(&original_config).with_context(|| {
+        format!(
+            "could not parse {}; aborting without changes",
+            config_path.display()
+        )
+    })?;
+    if !managed_before || !backup_path.exists() {
+        atomic_write_text(&backup_path, &original_config)?;
+    }
+
+    if doc.get("providers").is_none() {
+        doc["providers"] = Item::Table(Table::new());
+    }
+    let providers = doc["providers"]
+        .as_table_mut()
+        .with_context(|| "Kimi config.toml `providers` must be a table; aborting without changes")?;
+    if providers.contains_key(KIMI_PROVIDER_NAME) && !state.added_provider {
+        bail!(
+            "{} already defines providers.{}; Alexandria will not replace an unmanaged provider",
+            config_path.display(),
+            KIMI_PROVIDER_NAME
+        );
+    }
+    let mut provider_entry = Table::new();
+    provider_entry["type"] = value("openai");
+    provider_entry["api_key"] = value(&api_key);
+    provider_entry["base_url"] = value(format!("{}/v1", base_url.trim_end_matches('/')));
+    providers[KIMI_PROVIDER_NAME] = Item::Table(provider_entry);
+    state.added_provider = true;
+
+    if doc.get("models").is_none() {
+        doc["models"] = Item::Table(Table::new());
+    }
+    let model_configs = doc["models"]
+        .as_table_mut()
+        .with_context(|| "Kimi config.toml `models` must be a table; aborting without changes")?;
+    for model in &display_models {
+        if model_configs.contains_key(model) && !previous_managed.contains(model) {
+            bail!(
+                "{} already defines models.{}; Alexandria will not replace an unmanaged model",
+                config_path.display(),
+                model
+            );
+        }
+    }
+    for previous in &state.managed_models {
+        model_configs.remove(previous);
+    }
+    for model in &display_models {
+        let mut entry = Table::new();
+        entry["provider"] = value(KIMI_PROVIDER_NAME);
+        entry["model"] = value(model);
+        entry["max_context_size"] = value(200_000);
+        entry["display_name"] = value(model);
+        model_configs[model] = Item::Table(entry);
+    }
+    state.managed_models = display_models.clone();
+
+    atomic_write_json(&state_path, &serde_json::to_value(&state)?)?;
+    atomic_write_text(&config_path, &doc.to_string())?;
+
+    let (added, removed, unchanged) = model_id_diff(&before, &display_models);
+    Ok(HarnessConnectSummary {
+        key_id,
+        models: display_models,
+        config_path: config_path.clone(),
+        extension_path: config_path,
+        version,
+        base_url,
+        added,
+        removed,
+        unchanged,
+        description: KIMI_INSTALL_DESCRIPTION,
+    })
+}
+
+fn read_kimi_state(path: &Path) -> Result<KimiManagedState> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "could not parse Alexandria Kimi state {}; aborting without changes",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn read_kimi_model_ids(config_dir: &Path) -> Vec<String> {
+    read_kimi_state(&config_dir.join(KIMI_STATE_FILE))
+        .map(|state| state.managed_models)
+        .unwrap_or_default()
+}
+
+pub(crate) fn kimi_config_connected(config_dir: &Path) -> Result<bool> {
+    let state_path = config_dir.join(KIMI_STATE_FILE);
+    if !state_path.exists() {
+        return Ok(false);
+    }
+    let state = read_kimi_state(&state_path)?;
+    if state.managed_models.is_empty() {
+        return Ok(false);
+    }
+    let doc = read_grok_config(&config_dir.join(KIMI_CONFIG_FILE))?;
+    let Some(models) = doc.get("models").and_then(Item::as_table_like) else {
+        return Ok(false);
+    };
+    Ok(state.managed_models.iter().all(|model| {
+        models
+            .get(model)
+            .and_then(Item::as_table_like)
+            .and_then(|entry| entry.get("provider"))
+            .and_then(Item::as_str)
+            == Some(KIMI_PROVIDER_NAME)
+    }))
+}
+
+pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
+    let state_path = config_dir.join(KIMI_STATE_FILE);
+    if !state_path.exists() {
+        return Ok(false);
+    }
+    let state = read_kimi_state(&state_path)?;
+    let config_path = config_dir.join(KIMI_CONFIG_FILE);
+    let mut doc = read_grok_config(&config_path)?;
+    if let Some(models) = doc.get_mut("models").and_then(Item::as_table_mut) {
+        for model in &state.managed_models {
+            models.remove(model);
+        }
+        if models.is_empty() {
+            doc.as_table_mut().remove("models");
+        }
+    }
+    if state.added_provider {
+        if let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_mut) {
+            providers.remove(KIMI_PROVIDER_NAME);
+            if providers.is_empty() {
+                doc.as_table_mut().remove("providers");
+            }
+        }
+    }
+    atomic_write_text(&config_path, &doc.to_string())?;
+    if state_path.exists() {
+        std::fs::remove_file(&state_path)
+            .with_context(|| format!("could not remove {}", state_path.display()))?;
+    }
+    Ok(true)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4314,6 +4609,13 @@ pub(crate) fn amp_spec() -> &'static HarnessSpec {
         .expect("amp harness spec")
 }
 
+pub(crate) fn kimi_spec() -> &'static HarnessSpec {
+    HARNESSES
+        .iter()
+        .find(|spec| spec.name == "kimi")
+        .expect("kimi harness spec")
+}
+
 pub(crate) fn spec_by_name(name: &str) -> Option<&'static HarnessSpec> {
     HARNESSES.iter().find(|spec| spec.name == name)
 }
@@ -5634,6 +5936,114 @@ yolo = false
         );
         assert!(dir.join(GROK_BACKUP_FILE).exists());
         assert!(!dir.join(GROK_KEY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kimi_connection_adds_alex_provider_and_models_then_reverts() {
+        let dir = tmpdir("kimi-round-trip");
+        let config_path = dir.join(KIMI_CONFIG_FILE);
+        // A realistic Kimi config with the native managed provider + model.
+        let original_config = r#"default_model = "kimi-code/k3"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+api_key = ""
+base_url = "https://api.kimi.com/coding/v1"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+max_context_size = 262144
+display_name = "K3"
+"#;
+        std::fs::write(&config_path, original_config).unwrap();
+
+        let summary = write_kimi_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-kimi".into(),
+            "alxk-kimi".into(),
+            model_ids(),
+            Some("0.27.0".into()),
+        )
+        .unwrap();
+
+        assert_eq!(summary.models, vec!["alex/claude-opus-4-8", "alex/gpt-5.5"]);
+        assert!(kimi_config_connected(&dir).unwrap());
+        // Original config was backed up verbatim.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(KIMI_BACKUP_FILE)).unwrap(),
+            original_config
+        );
+
+        let config = read_grok_config(&config_path).unwrap();
+        // Kimi's own provider + model are untouched.
+        assert_eq!(
+            config["providers"]["managed:kimi-code"]["type"].as_str(),
+            Some("kimi")
+        );
+        assert_eq!(config["models"]["kimi-code/k3"]["model"].as_str(), Some("k3"));
+        // The alexandria OpenAI-compatible provider points at the local proxy.
+        let provider = &config["providers"][KIMI_PROVIDER_NAME];
+        assert_eq!(provider["type"].as_str(), Some("openai"));
+        assert_eq!(provider["api_key"].as_str(), Some("alxk-kimi"));
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:4100/v1")
+        );
+        // Each alex/* model routes through that provider.
+        for model in &summary.models {
+            let entry = &config["models"][model];
+            assert_eq!(entry["provider"].as_str(), Some(KIMI_PROVIDER_NAME));
+            assert_eq!(entry["model"].as_str(), Some(model.as_str()));
+            assert_eq!(entry["display_name"].as_str(), Some(model.as_str()));
+        }
+
+        // Disconnect removes only what Alexandria added and reverts the config.
+        assert!(disconnect_kimi_config(&dir).unwrap());
+        assert!(!kimi_config_connected(&dir).unwrap());
+        let restored = read_grok_config(&config_path).unwrap();
+        assert_eq!(
+            restored["providers"]["managed:kimi-code"]["type"].as_str(),
+            Some("kimi")
+        );
+        assert_eq!(
+            restored["models"]["kimi-code/k3"]["model"].as_str(),
+            Some("k3")
+        );
+        assert!(restored["providers"].get(KIMI_PROVIDER_NAME).is_none());
+        assert!(restored["models"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .all(|(model, _)| !model.starts_with("alex/")));
+        // Second disconnect is a no-op (state file already gone).
+        assert!(!disconnect_kimi_config(&dir).unwrap());
+        assert!(dir.join(KIMI_BACKUP_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kimi_connection_refuses_to_clobber_a_user_provider() {
+        let dir = tmpdir("kimi-guard");
+        let config_path = dir.join(KIMI_CONFIG_FILE);
+        // A user already has their own [providers.alexandria]; we must not touch it.
+        std::fs::write(
+            &config_path,
+            "[providers.alexandria]\ntype = \"openai\"\napi_key = \"user-key\"\nbase_url = \"https://example.test\"\n",
+        )
+        .unwrap();
+        let err = write_kimi_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-kimi".into(),
+            "alxk-kimi".into(),
+            model_ids(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unmanaged provider"));
     }
 
     #[cfg(unix)]

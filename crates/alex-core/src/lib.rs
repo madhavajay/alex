@@ -29,6 +29,9 @@ pub enum Provider {
     Exo,
     /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
     Amp,
+    /// Kimi Code (Moonshot AI) subscription — OAuth device flow, OpenAI-compatible
+    /// upstream at `https://api.kimi.com/coding/v1`.
+    Kimi,
 }
 
 impl Provider {
@@ -41,6 +44,7 @@ impl Provider {
             Provider::Openrouter => "openrouter",
             Provider::Exo => "exo",
             Provider::Amp => "amp",
+            Provider::Kimi => "kimi",
         }
     }
 
@@ -53,6 +57,7 @@ impl Provider {
             "openrouter" | "or" => Some(Provider::Openrouter),
             "exo" => Some(Provider::Exo),
             "amp" | "ampcode" => Some(Provider::Amp),
+            "kimi" | "kimi-code" | "moonshot" => Some(Provider::Kimi),
             _ => None,
         }
     }
@@ -95,6 +100,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("xai:", Provider::Xai),
     ("openrouter:", Provider::Openrouter),
     ("exo:", Provider::Exo),
+    ("kimi:", Provider::Kimi),
     ("claude/", Provider::Anthropic),
     ("anthropic/", Provider::Anthropic),
     ("openai/", Provider::Openai),
@@ -106,6 +112,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("xai/", Provider::Xai),
     ("openrouter/", Provider::Openrouter),
     ("exo/", Provider::Exo),
+    ("kimi/", Provider::Kimi),
 ];
 
 // Claude Code gateway discovery only accepts model ids beginning with
@@ -202,7 +209,11 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
                 "remaining": hi(h, "x-ratelimit-remaining-tokens"),
             },
         }),
-        Provider::Gemini | Provider::Openrouter | Provider::Exo | Provider::Amp => Value::Null,
+        Provider::Gemini
+        | Provider::Openrouter
+        | Provider::Exo
+        | Provider::Amp
+        | Provider::Kimi => Value::Null,
     }
 }
 
@@ -604,6 +615,20 @@ mod tests {
                 "anthropic/claude-3.5-sonnet".to_string()
             )
         );
+        assert_eq!(
+            route_model("kimi/k3"),
+            (Some(Provider::Kimi), "k3".to_string())
+        );
+        assert_eq!(
+            route_model("kimi:kimi-for-coding"),
+            (Some(Provider::Kimi), "kimi-for-coding".to_string())
+        );
+        assert_eq!(
+            route_model("alex/kimi/k3"),
+            (Some(Provider::Kimi), "k3".to_string())
+        );
+        assert_eq!(Provider::from_str_loose("kimi"), Some(Provider::Kimi));
+        assert_eq!(Provider::Kimi.as_str(), "kimi");
     }
 
     #[test]
