@@ -995,6 +995,26 @@ impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
     }
 }
 
+struct ConfigNotificationPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::NotificationConfigPersister for ConfigNotificationPersister {
+    fn persist(
+        &self,
+        settings: &alex_proxy::notify::NotificationSettings,
+    ) -> std::result::Result<(), String> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| "daemon config lock is unavailable".to_string())?;
+        config.notifications = settings.channels.clone();
+        config.notification_cooldown_seconds = settings.cooldown_seconds;
+        config.notification_timeout_seconds = settings.timeout_seconds;
+        save_config(&config).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone)]
 struct SelfUpdateApplier {
     config: Config,
@@ -2905,10 +2925,17 @@ async fn main() -> Result<()> {
                     enabled_models: config.exo_enabled_models.clone(),
                 },
             );
+            let daemon_config = Arc::new(std::sync::Mutex::new(config.clone()));
             alex_proxy::set_protection_policy_persister(
                 &state,
                 Arc::new(ConfigProtectionPolicyPersister {
-                    config: Arc::new(std::sync::Mutex::new(config.clone())),
+                    config: daemon_config.clone(),
+                }),
+            );
+            alex_proxy::set_notification_config_persister(
+                &state,
+                Arc::new(ConfigNotificationPersister {
+                    config: daemon_config,
                 }),
             );
             alex_proxy::set_exo_config_persister(
@@ -10750,6 +10777,46 @@ local_key = "alx-test"
             saved.protection.equivalencies["claude-fable-5"]["openai"],
             "gpt-5.6-sol"
         );
+    }
+
+    #[test]
+    fn notification_config_persister_writes_channels_and_old_toml_without_token_parses() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("notification-config-persist");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        let persister = ConfigNotificationPersister {
+            config: config.clone(),
+        };
+        let settings = alex_proxy::notify::NotificationSettings {
+            channels: vec![alex_proxy::notify::NotificationChannelConfig {
+                id: Some("telegram-1".into()),
+                format: alex_proxy::notify::WebhookFormat::Telegram,
+                token: Some("123:secret".into()),
+                chat_id: Some("42".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        alex_proxy::NotificationConfigPersister::persist(&persister, &settings).unwrap();
+        let (saved, fresh) = load_or_create_config().unwrap();
+        assert!(!fresh);
+        assert_eq!(saved.notifications[0].token.as_deref(), Some("123:secret"));
+
+        let mut legacy = test_config(home.clone());
+        legacy
+            .notifications
+            .push(alex_proxy::notify::NotificationChannelConfig {
+                format: alex_proxy::notify::WebhookFormat::Telegram,
+                url: "https://api.telegram.org/botlegacy/sendMessage".into(),
+                chat_id: Some("42".into()),
+                ..Default::default()
+            });
+        let raw = toml::to_string_pretty(&legacy).unwrap();
+        assert!(!raw.contains("token"));
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert!(parsed.notifications[0].token.is_none());
+        std::env::remove_var("ALEXANDRIA_HOME");
     }
 
     #[test]

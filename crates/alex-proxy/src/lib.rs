@@ -26,7 +26,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
@@ -107,6 +107,13 @@ impl Default for ExoConfig {
 /// Persists an Exo settings update owned by the daemon configuration.
 pub trait ExoConfigPersister: Send + Sync {
     fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String>;
+}
+
+/// Persists notification settings owned by the daemon configuration. Keeping
+/// this boundary in the binary lets the proxy hot-apply channels without
+/// knowing where config.toml lives.
+pub trait NotificationConfigPersister: Send + Sync {
+    fn persist(&self, settings: &notify::NotificationSettings) -> std::result::Result<(), String>;
 }
 
 impl Default for ProtectionPolicy {
@@ -346,6 +353,9 @@ pub struct AppState {
     pub reset_handler: std::sync::RwLock<Option<Arc<dyn ResetHandler>>>,
     pub plugins: Arc<PluginManager>,
     pub notifications: Arc<std::sync::RwLock<notify::NotificationDispatcher>>,
+    notification_settings: std::sync::RwLock<notify::NotificationSettings>,
+    notification_persister: std::sync::RwLock<Option<Arc<dyn NotificationConfigPersister>>>,
+    telegram_base: std::sync::RwLock<String>,
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -621,6 +631,9 @@ pub fn build_state_with_substitution(
         notifications: Arc::new(std::sync::RwLock::new(
             notify::NotificationDispatcher::default(),
         )),
+        notification_settings: std::sync::RwLock::new(notify::NotificationSettings::default()),
+        notification_persister: std::sync::RwLock::new(None),
+        telegram_base: std::sync::RwLock::new("https://api.telegram.org".into()),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
         substitution,
@@ -699,9 +712,40 @@ pub fn set_fixture_dir(state: &Arc<AppState>, dir: PathBuf) {
 /// Replaces the daemon's notification channels after config has been loaded.
 /// This is intentionally separate from `build_state` to keep its existing
 /// callers source-compatible (offline commands and tests have no channels).
-pub fn set_notifications(state: &Arc<AppState>, settings: notify::NotificationSettings) {
+pub fn set_notifications(state: &Arc<AppState>, mut settings: notify::NotificationSettings) {
+    // Legacy TOML channels predate runtime IDs. Give them deterministic IDs in
+    // memory; the next admin save persists the migration without requiring a
+    // restart or a config rewrite at boot.
+    for (index, channel) in settings.channels.iter_mut().enumerate() {
+        if channel.id.as_deref().unwrap_or_default().trim().is_empty() {
+            channel.id = Some(format!("channel-{index}"));
+        }
+    }
+    let dispatcher = notify::NotificationDispatcher::from_settings(settings.clone());
     if let Ok(mut notifications) = state.notifications.write() {
-        *notifications = notify::NotificationDispatcher::from_settings(settings);
+        *notifications = dispatcher;
+    }
+    if let Ok(mut current) = state.notification_settings.write() {
+        *current = settings;
+    }
+}
+
+/// Installs the daemon-owned config persistence hook for runtime notification
+/// channel updates.
+pub fn set_notification_config_persister(
+    state: &Arc<AppState>,
+    persister: Arc<dyn NotificationConfigPersister>,
+) {
+    if let Ok(mut slot) = state.notification_persister.write() {
+        *slot = Some(persister);
+    }
+}
+
+/// Overrides Telegram's API root. This is intentionally only an in-process
+/// setting so tests can use a local stub; it has no admin endpoint.
+pub fn set_telegram_base(state: &Arc<AppState>, base: impl Into<String>) {
+    if let Ok(mut current) = state.telegram_base.write() {
+        *current = base.into();
     }
 }
 
@@ -822,7 +866,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/exo", get(admin_exo).put(admin_exo_update))
         .route("/admin/exo/status", get(admin_exo_status))
         .route("/admin/exo/models", get(admin_exo_models))
-        .route("/admin/notifications", get(admin_notifications))
+        .route(
+            "/admin/notifications",
+            get(admin_notifications).post(admin_notifications_save),
+        )
+        .route(
+            "/admin/notifications/{id}",
+            delete(admin_notifications_delete),
+        )
+        .route(
+            "/admin/notifications/validate",
+            post(admin_notifications_validate),
+        )
+        .route(
+            "/admin/notifications/discover-chat",
+            post(admin_notifications_discover_chat),
+        )
         .route("/admin/notifications/test", post(admin_notifications_test))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
@@ -922,6 +981,317 @@ async fn admin_notifications(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(view).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct NotificationChannelRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    format: notify::WebhookFormat,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    min_level: notify::NotificationLevel,
+    #[serde(default)]
+    categories: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramTokenRequest {
+    format: notify::WebhookFormat,
+    token: String,
+}
+
+fn notification_channel_from_request(
+    request: NotificationChannelRequest,
+    require_delivery_target: bool,
+) -> std::result::Result<notify::NotificationChannelConfig, String> {
+    let kind = request.kind.unwrap_or_else(|| "webhook".into());
+    if kind != "webhook" {
+        return Err("only webhook notification channels are supported".into());
+    }
+    let token = request
+        .token
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned());
+    let url = request.url.unwrap_or_default().trim().to_owned();
+    if matches!(request.format, notify::WebhookFormat::Telegram) {
+        if token.is_none() {
+            return Err("telegram notification channels require token".into());
+        }
+        if require_delivery_target
+            && request
+                .chat_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            return Err("telegram notification channels require chat_id".into());
+        }
+    } else if require_delivery_target {
+        if url.is_empty() {
+            return Err("webhook notification channels require url".into());
+        }
+        let parsed = reqwest::Url::parse(&url).map_err(|_| "webhook url is invalid")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("webhook url must use http or https".into());
+        }
+    }
+    Ok(notify::NotificationChannelConfig {
+        id: request
+            .id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned()),
+        kind,
+        format: request.format,
+        url,
+        token,
+        bot_username: None,
+        chat_id: request
+            .chat_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned()),
+        min_level: request.min_level,
+        categories: request.categories,
+    })
+}
+
+fn notification_persister(state: &AppState) -> Option<Arc<dyn NotificationConfigPersister>> {
+    state
+        .notification_persister
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn persist_and_apply_notifications(
+    state: &Arc<AppState>,
+    settings: notify::NotificationSettings,
+) -> std::result::Result<(), Response> {
+    let Some(persister) = notification_persister(state) else {
+        return Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "notification persistence is not configured",
+        ));
+    };
+    if let Err(error) = persister.persist(&settings) {
+        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &error));
+    }
+    set_notifications(state, settings);
+    Ok(())
+}
+
+fn telegram_endpoint(base: &str, token: &str, method: &str) -> String {
+    format!("{}/bot{token}/{method}", base.trim_end_matches('/'))
+}
+
+async fn telegram_get_me(
+    state: &AppState,
+    token: &str,
+) -> std::result::Result<(String, String), ()> {
+    let base = state
+        .telegram_base
+        .read()
+        .map(|base| base.clone())
+        .unwrap_or_else(|_| "https://api.telegram.org".into());
+    let response = state
+        .http
+        .get(telegram_endpoint(&base, token, "getMe"))
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+    let body: Value = response.json().await.map_err(|_| ())?;
+    if body["ok"] != Value::Bool(true) {
+        return Err(());
+    }
+    let username = body["result"]["username"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if username.is_empty() {
+        return Err(());
+    }
+    let name = body["result"]["first_name"]
+        .as_str()
+        .unwrap_or(&username)
+        .to_owned();
+    Ok((username, name))
+}
+
+async fn admin_notifications_save(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<NotificationChannelRequest>,
+) -> Response {
+    let mut channel = match notification_channel_from_request(request, true) {
+        Ok(channel) => channel,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    if matches!(channel.format, notify::WebhookFormat::Telegram) {
+        let token = channel.token.as_deref().expect("validated above");
+        match telegram_get_me(&state, token).await {
+            Ok((username, _)) => channel.bot_username = Some(username),
+            Err(()) => {
+                return axum::Json(json!({"ok": false, "error": "telegram validation failed"}))
+                    .into_response()
+            }
+        }
+    }
+    let mut settings = match state.notification_settings.read() {
+        Ok(settings) => settings.clone(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notification settings unavailable",
+            )
+        }
+    };
+    let id = channel
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    channel.id = Some(id.clone());
+    if let Some(index) = settings
+        .channels
+        .iter()
+        .position(|existing| existing.id.as_deref() == Some(id.as_str()))
+    {
+        settings.channels[index] = channel;
+    } else {
+        settings.channels.push(channel);
+    }
+    if let Err(response) = persist_and_apply_notifications(&state, settings) {
+        return response;
+    }
+    let view = state
+        .notifications
+        .read()
+        .ok()
+        .map(|dispatcher| dispatcher.admin_view())
+        .and_then(|view| view["channels"].as_array().cloned())
+        .and_then(|channels| channels.into_iter().find(|saved| saved["id"] == id));
+    axum::Json(json!({"ok": true, "channel": view})).into_response()
+}
+
+async fn admin_notifications_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut settings = match state.notification_settings.read() {
+        Ok(settings) => settings.clone(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notification settings unavailable",
+            )
+        }
+    };
+    let Some(index) = settings
+        .channels
+        .iter()
+        .position(|channel| channel.id.as_deref() == Some(id.as_str()))
+    else {
+        return error_response(StatusCode::NOT_FOUND, "notification channel not found");
+    };
+    settings.channels.remove(index);
+    if let Err(response) = persist_and_apply_notifications(&state, settings) {
+        return response;
+    }
+    axum::Json(json!({"ok": true, "id": id})).into_response()
+}
+
+async fn admin_notifications_validate(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<TelegramTokenRequest>,
+) -> Response {
+    if !matches!(request.format, notify::WebhookFormat::Telegram) || request.token.trim().is_empty()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "validate requires format telegram and token",
+        );
+    }
+    match telegram_get_me(&state, request.token.trim()).await {
+        Ok((bot_username, bot_name)) => {
+            axum::Json(json!({"ok": true, "bot_username": bot_username, "bot_name": bot_name}))
+                .into_response()
+        }
+        Err(()) => {
+            axum::Json(json!({"ok": false, "error": "telegram validation failed"})).into_response()
+        }
+    }
+}
+
+async fn admin_notifications_discover_chat(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<TelegramTokenRequest>,
+) -> Response {
+    if !matches!(request.format, notify::WebhookFormat::Telegram) || request.token.trim().is_empty()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "discover-chat requires format telegram and token",
+        );
+    }
+    let base = state
+        .telegram_base
+        .read()
+        .map(|base| base.clone())
+        .unwrap_or_else(|_| "https://api.telegram.org".into());
+    let response = state
+        .http
+        .get(telegram_endpoint(&base, request.token.trim(), "getUpdates"))
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return axum::Json(json!({"ok": false, "error": "telegram discovery failed"}))
+            .into_response();
+    };
+    if !response.status().is_success() {
+        return axum::Json(json!({"ok": false, "error": "telegram discovery failed"}))
+            .into_response();
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        return axum::Json(json!({"ok": false, "error": "telegram discovery failed"}))
+            .into_response();
+    };
+    let mut chats = Vec::new();
+    let mut seen = HashSet::new();
+    for update in body["result"].as_array().into_iter().flatten() {
+        for key in ["message", "edited_message", "channel_post"] {
+            let chat = &update[key]["chat"];
+            let Some(chat_id) = chat["id"].as_i64() else {
+                continue;
+            };
+            if !seen.insert(chat_id) {
+                continue;
+            }
+            let chat_name = chat["title"]
+                .as_str()
+                .or_else(|| chat["username"].as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let first = chat["first_name"].as_str()?;
+                    let last = chat["last_name"].as_str().unwrap_or_default();
+                    Some(format!("{first} {last}").trim().to_owned())
+                })
+                .unwrap_or_else(|| chat_id.to_string());
+            chats.push(json!({"chat_id": chat_id.to_string(), "chat_name": chat_name}));
+        }
+    }
+    axum::Json(json!({"ok": true, "chats": chats})).into_response()
+}
+
 async fn admin_notifications_test(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
@@ -938,15 +1308,41 @@ async fn admin_notifications_test(
             }
         },
     };
-    if let Ok(notifications) = state.notifications.read() {
-        notifications.emit_test(channel, now_ms());
-        axum::Json(json!({"accepted": true, "channel": channel})).into_response()
-    } else {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "notification dispatcher unavailable",
-        )
+    let inline = body.0.get("format").is_some()
+        || body.0.get("url").is_some()
+        || body.0.get("token").is_some();
+    if inline {
+        let request = match serde_json::from_value::<NotificationChannelRequest>(body.0) {
+            Ok(request) => request,
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid inline notification channel",
+                )
+            }
+        };
+        let channel = match notification_channel_from_request(request, true) {
+            Ok(channel) => channel,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+        };
+        let dispatcher =
+            notify::NotificationDispatcher::from_settings(notify::NotificationSettings {
+                channels: vec![channel],
+                ..Default::default()
+            });
+        return axum::Json(json!({"channels": dispatcher.test(None, now_ms()).await}))
+            .into_response();
     }
+    let dispatcher = match state.notifications.read() {
+        Ok(notifications) => notifications.clone(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notification dispatcher unavailable",
+            )
+        }
+    };
+    axum::Json(json!({"channels": dispatcher.test(channel, now_ms()).await})).into_response()
 }
 
 async fn admin_reset(
@@ -8415,6 +8811,31 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    async fn collect_test_webhook(
+        State(received): State<Arc<std::sync::Mutex<Vec<Value>>>>,
+        axum::Json(payload): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        received.lock().unwrap().push(payload);
+        axum::Json(json!({}))
+    }
+
+    async fn webhook_sink() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(collect_test_webhook))
+            .with_state(received.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), received, server)
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "alex-proxy-{name}-{}-{}",
@@ -8481,6 +8902,20 @@ mod tests {
     impl ExoConfigPersister for RecordingExoPersister {
         fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String> {
             self.configs.lock().unwrap().push(config.clone());
+            Ok(())
+        }
+    }
+
+    struct RecordingNotificationPersister {
+        settings: std::sync::Mutex<Vec<notify::NotificationSettings>>,
+    }
+
+    impl NotificationConfigPersister for RecordingNotificationPersister {
+        fn persist(
+            &self,
+            settings: &notify::NotificationSettings,
+        ) -> std::result::Result<(), String> {
+            self.settings.lock().unwrap().push(settings.clone());
             Ok(())
         }
     }
@@ -11423,6 +11858,175 @@ mod tests {
         server.abort();
         assert!(!listing.contains(secret));
         assert!(!listing.contains(&format!("http://{sink_address}")));
+    }
+
+    #[tokio::test]
+    async fn notification_save_get_test_and_delete_hot_apply_without_secrets() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("notification-runtime-save");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+
+        let saved = response_json(
+            admin_notifications_save(
+                State(state.clone()),
+                axum::Json(NotificationChannelRequest {
+                    id: None,
+                    kind: None,
+                    format: notify::WebhookFormat::Generic,
+                    url: Some(format!("{url}?token=very-secret-webhook-token")),
+                    token: None,
+                    chat_id: None,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                }),
+            )
+            .await,
+        )
+        .await
+        .1;
+        let id = saved["channel"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(saved["channel"]["format"], "generic");
+        assert!(saved.to_string().contains(&id));
+        assert!(!saved.to_string().contains("very-secret-webhook-token"));
+        assert!(saved["channel"].get("url").is_none());
+
+        let tested = response_json(
+            admin_notifications_test(State(state.clone()), axum::Json(json!({}))).await,
+        )
+        .await
+        .1;
+        assert_eq!(tested["channels"][0]["id"], id);
+        assert_eq!(tested["channels"][0]["ok"], true);
+        assert_eq!(received.lock().unwrap()[0]["category"], "test");
+
+        let listing = response_json(admin_notifications(State(state.clone())).await)
+            .await
+            .1;
+        let listing_text = listing.to_string();
+        assert_eq!(listing["channels"][0]["id"], id);
+        assert!(!listing_text.contains("very-secret-webhook-token"));
+        assert!(!listing_text.contains(&url));
+
+        let deleted =
+            response_json(admin_notifications_delete(State(state.clone()), Path(id.clone())).await)
+                .await
+                .1;
+        assert_eq!(deleted["ok"], true);
+        assert_eq!(
+            response_json(admin_notifications_test(State(state), axum::Json(json!({}))).await)
+                .await
+                .1["channels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(persister.settings.lock().unwrap().len(), 2);
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn inline_notification_test_delivers_without_persisting() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("notification-inline-test");
+        let response = response_json(
+            admin_notifications_test(
+                State(state.clone()),
+                axum::Json(json!({"format": "generic", "url": url})),
+            )
+            .await,
+        )
+        .await
+        .1;
+        assert_eq!(response["channels"][0]["ok"], true);
+        assert_eq!(received.lock().unwrap()[0]["category"], "test");
+        assert!(state
+            .notification_settings
+            .read()
+            .unwrap()
+            .channels
+            .is_empty());
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn telegram_validate_and_discover_use_local_stub_and_hide_token_on_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stub = tokio::spawn(async move {
+            for (expected_path, response) in [
+                (
+                    "/botgood-token/getMe",
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 67\r\n\r\n{\"ok\":true,\"result\":{\"username\":\"YourBot\",\"first_name\":\"Your Bot\"}}".as_slice(),
+                ),
+                (
+                    "/botbad-token/getMe",
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".as_slice(),
+                ),
+                (
+                    "/botgood-token/getUpdates",
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 67\r\n\r\n{\"ok\":true,\"result\":[{\"message\":{\"chat\":{\"id\":42,\"title\":\"Ops\"}}}]}".as_slice(),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 1024];
+                let count = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                assert!(request.starts_with(&format!("GET {expected_path} ")));
+                socket.write_all(response).await.unwrap();
+            }
+        });
+        let state = test_state("telegram-validation-stub");
+        set_telegram_base(&state, format!("http://{address}"));
+
+        let valid = response_json(
+            admin_notifications_validate(
+                State(state.clone()),
+                axum::Json(TelegramTokenRequest {
+                    format: notify::WebhookFormat::Telegram,
+                    token: "good-token".into(),
+                }),
+            )
+            .await,
+        )
+        .await
+        .1;
+        assert_eq!(valid["bot_username"], "YourBot", "{valid}");
+        assert_eq!(valid["bot_name"], "Your Bot");
+        let invalid = response_json(
+            admin_notifications_validate(
+                State(state.clone()),
+                axum::Json(TelegramTokenRequest {
+                    format: notify::WebhookFormat::Telegram,
+                    token: "bad-token".into(),
+                }),
+            )
+            .await,
+        )
+        .await
+        .1;
+        assert_eq!(invalid["ok"], false);
+        assert!(!invalid.to_string().contains("bad-token"));
+        let chats = response_json(
+            admin_notifications_discover_chat(
+                State(state),
+                axum::Json(TelegramTokenRequest {
+                    format: notify::WebhookFormat::Telegram,
+                    token: "good-token".into(),
+                }),
+            )
+            .await,
+        )
+        .await
+        .1;
+        assert_eq!(
+            chats["chats"][0],
+            json!({"chat_id": "42", "chat_name": "Ops"})
+        );
+        stub.await.unwrap();
     }
 
     #[tokio::test]
