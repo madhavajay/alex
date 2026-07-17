@@ -29,6 +29,13 @@ pub const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 pub const GEMINI_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+// Kimi Code (Moonshot AI) public device-flow client. Extracted from the kimi
+// node binary (`~/.kimi-code/bin/kimi`, KIMI_CODE_FLOW_CONFIG.clientId). The
+// oauth host and API base are overridable via env for self-hosted deployments.
+pub const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+pub const KIMI_OAUTH_HOST: &str = "https://auth.kimi.com";
+pub const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
+pub const KIMI_API_BASE: &str = "https://api.kimi.com/coding/v1";
 const ANTHROPIC_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const XAI_USERINFO_URL: &str = "https://auth.x.ai/oauth2/userinfo";
 const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
@@ -1084,6 +1091,7 @@ impl Vault {
                 "openrouter accounts use a long-lived API key; re-run `alex auth openrouter-key`"
             )),
             (Provider::Exo, _) => Err(anyhow!("exo is configured locally and has no account to refresh")),
+            (Provider::Kimi, Some(rt)) => self.refresh_kimi(&rt).await,
             (Provider::Amp, _) => Err(anyhow!(
                 "amp accounts use a long-lived API key; re-run `alex auth import amp` or `alex auth amp-key`"
             )),
@@ -1149,6 +1157,9 @@ impl Vault {
             }
             Provider::Openrouter => {}
             Provider::Exo => {}
+            Provider::Kimi => {
+                let _ = import_kimi(self).await;
+            }
         };
         let fresh = self.accounts.read().await.get(&stale.id).cloned()?;
         let changed = fresh.access_token != stale.access_token;
@@ -1238,6 +1249,23 @@ impl Vault {
         if let Ok(mut guard) = self.refresh_endpoint_override.write() {
             *guard = url;
         }
+    }
+
+    /// Refresh a Kimi Code access token (15-minute TTL) against the token
+    /// endpoint using the stored refresh token. Mirrors the exact form body the
+    /// kimi node binary posts for `grant_type=refresh_token`.
+    async fn refresh_kimi(&self, refresh_token: &str) -> Result<RefreshedTokens> {
+        let resp = self
+            .http
+            .post(crate::login::kimi_token_url())
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", KIMI_CLIENT_ID),
+            ])
+            .send()
+            .await?;
+        parse_token_response(resp).await
     }
 
     pub async fn set_account_meta(&self, id: &str, key: &str, value: Value) -> Result<()> {
@@ -1393,8 +1421,11 @@ pub async fn import_all(vault: &Vault, source: &str) -> Result<Vec<ImportOutcome
     if source == "all" || source == "amp" || source == "ampcode" {
         outcomes.push(import_amp(vault).await);
     }
+    if source == "all" || source == "kimi" || source == "kimi-code" {
+        outcomes.push(import_kimi(vault).await);
+    }
     if outcomes.is_empty() {
-        bail!("unknown source '{source}' (expected claude|codex|gemini|grok|xai|amp|all)");
+        bail!("unknown source '{source}' (expected claude|codex|gemini|grok|xai|amp|kimi|all)");
     }
     Ok(outcomes)
 }
@@ -1603,6 +1634,116 @@ async fn import_gemini(vault: &Vault) -> ImportOutcome {
 }
 
 /// Import Amp API key from `~/.local/share/amp/secrets.json` (CLI login material).
+/// Resolve the Kimi Code data directory (`$KIMI_CODE_HOME`, else `~/.kimi-code`),
+/// matching how the kimi node runtime resolves it.
+pub fn kimi_home() -> PathBuf {
+    std::env::var_os("KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| home().join(".kimi-code"))
+}
+
+/// Path to the Kimi Code credential file written by `kimi` after its own login.
+pub fn kimi_credentials_path() -> PathBuf {
+    kimi_home().join("credentials").join("kimi-code.json")
+}
+
+/// Shape of `~/.kimi-code/credentials/kimi-code.json`. Only fields Alex needs.
+#[derive(Debug, Deserialize)]
+struct KimiCredentialFile {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Unix expiry in SECONDS (kimi writes seconds, not millis).
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Build a Kimi account from an already-parsed credential file. Kept pure so it
+/// can be unit-tested without touching disk or the network. Never logs tokens.
+pub fn kimi_account_from_credentials(access_token: String, refresh_token: Option<String>, expires_at_s: Option<i64>, expires_in_s: Option<i64>, scope: Option<String>) -> Account {
+    let expires_at_ms = expires_at_s
+        .map(|s| s * 1000)
+        .or_else(|| expires_in_s.map(|s| now_ms() + s * 1000))
+        .or_else(|| jwt_exp_ms(&access_token));
+    let mut account = Account {
+        id: named_account_id(Provider::Kimi, "oauth", "default"),
+        provider: Provider::Kimi,
+        kind: "oauth".into(),
+        name: default_account_name(),
+        description: None,
+        paused: false,
+        label: Some("kimi (kimi-code)".into()),
+        access_token: Some(access_token.clone()),
+        refresh_token,
+        id_token: None,
+        api_key: None,
+        expires_at_ms,
+        last_refresh_ms: Some(now_ms()),
+        account_meta: json!({
+            "source": "kimi-code",
+            "scope": scope.unwrap_or_else(|| "kimi-code".into()),
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: None,
+    };
+    if let Some(email) = account.email() {
+        persist_account_email(&mut account, &email);
+    }
+    account
+}
+
+/// Import the credentials the Kimi Code CLI already stored, so an authed user is
+/// adopted with no re-login. Reads shape only; the raw tokens are never logged.
+pub async fn import_kimi(vault: &Vault) -> ImportOutcome {
+    let mut outcome = ImportOutcome {
+        source: "kimi".into(),
+        imported: vec![],
+        note: None,
+    };
+    let path = kimi_credentials_path();
+    if !path.exists() {
+        outcome.note = Some(format!(
+            "no {} — run `kimi` and log in, or `alex auth login kimi`",
+            path.display()
+        ));
+        return outcome;
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        outcome.note = Some("could not read kimi-code.json".into());
+        return outcome;
+    };
+    let creds: KimiCredentialFile = match serde_json::from_str(&raw) {
+        Ok(creds) => creds,
+        Err(e) => {
+            outcome.note = Some(format!("could not parse kimi-code.json: {e}"));
+            return outcome;
+        }
+    };
+    if creds.access_token.is_empty() {
+        outcome.note = Some("kimi-code.json has no access_token".into());
+        return outcome;
+    }
+    let account = kimi_account_from_credentials(
+        creds.access_token,
+        creds.refresh_token,
+        creds.expires_at,
+        creds.expires_in,
+        creds.scope,
+    );
+    let id = account.id.clone();
+    match vault.upsert(account).await {
+        Ok(()) => outcome.imported.push(id),
+        Err(e) => outcome.note = Some(format!("failed to save: {e}")),
+    }
+    outcome
+}
+
 pub async fn import_amp(vault: &Vault) -> ImportOutcome {
     let mut outcome = ImportOutcome {
         source: "amp".into(),
@@ -1920,6 +2061,56 @@ mod tests {
             Some("invalid_grant")
         );
         assert_eq!(oauth_error_code("upstream 502 html"), None);
+    }
+
+    #[test]
+    fn kimi_import_builds_oauth_account_with_seconds_expiry() {
+        // expires_at is in unix SECONDS; the account must store millis.
+        let expires_at_s = now_ms() / 1000 + 900;
+        let account = kimi_account_from_credentials(
+            "access-token-shape".into(),
+            Some("refresh-token-shape".into()),
+            Some(expires_at_s),
+            Some(900),
+            Some("kimi-code".into()),
+        );
+        assert_eq!(account.provider, Provider::Kimi);
+        assert_eq!(account.kind, "oauth");
+        assert_eq!(account.id, "kimi-oauth");
+        assert_eq!(account.expires_at_ms, Some(expires_at_s * 1000));
+        assert_eq!(account.refresh_token.as_deref(), Some("refresh-token-shape"));
+        assert_eq!(account.account_meta["scope"], json!("kimi-code"));
+    }
+
+    #[test]
+    fn kimi_refresh_decision_follows_expiry_margin() {
+        // Freshly minted (15 min out) => no refresh needed.
+        let fresh = kimi_account_from_credentials(
+            "a".into(),
+            Some("r".into()),
+            Some(now_ms() / 1000 + 900),
+            None,
+            None,
+        );
+        assert!(!fresh.needs_refresh());
+        // Inside the refresh margin (about to expire) => must refresh.
+        let stale = kimi_account_from_credentials(
+            "a".into(),
+            Some("r".into()),
+            Some((now_ms() + REFRESH_MARGIN_MS / 2) / 1000),
+            None,
+            None,
+        );
+        assert!(stale.needs_refresh());
+        // Already expired => must refresh.
+        let expired = kimi_account_from_credentials(
+            "a".into(),
+            Some("r".into()),
+            Some(now_ms() / 1000 - 60),
+            None,
+            None,
+        );
+        assert!(expired.needs_refresh());
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -11,13 +11,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    fetch_provider_email, import_amp, import_grok, jwt_exp_ms, named_account_id, normalize_email,
-    now_ms, persist_account_email, save_amp_api_key, Account, Vault, ANTHROPIC_CLIENT_ID,
-    ANTHROPIC_TOKEN_URL, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
+    fetch_provider_email, import_amp, import_grok, import_kimi, jwt_exp_ms, named_account_id,
+    normalize_email, now_ms, persist_account_email, save_amp_api_key, Account, Vault,
+    ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL, KIMI_CLIENT_ID, KIMI_OAUTH_HOST, OPENAI_CLIENT_ID,
+    OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
 use alex_core::Provider;
 
-pub const PROVIDERS: &[&str] = &["claude", "codex", "grok", "gemini", "amp"];
+pub const PROVIDERS: &[&str] = &["claude", "codex", "grok", "gemini", "amp", "kimi"];
 
 pub const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const ANTHROPIC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
@@ -36,6 +37,32 @@ pub const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth
 const OPENAI_JWT_CLAIM: &str = "https://api.openai.com/auth";
 pub const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
 pub const XAI_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+/// Where the user visits to approve a Kimi device login (the kimi CLI opens
+/// this too). The `user_code` is appended as a query parameter.
+pub const KIMI_DEVICE_VERIFICATION_URL: &str = "https://www.kimi.com/code/authorize_device";
+/// Device identity header the kimi binary attaches to its OAuth calls.
+const KIMI_DEVICE_PLATFORM: &str = "kimi_code_cli";
+
+/// Kimi's OAuth host, honoring the same env overrides as the kimi CLI.
+pub fn kimi_oauth_host() -> String {
+    for var in ["KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim().trim_end_matches('/');
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    KIMI_OAUTH_HOST.to_string()
+}
+
+pub fn kimi_device_authorization_url() -> String {
+    format!("{}/api/oauth/device_authorization", kimi_oauth_host())
+}
+
+pub fn kimi_token_url() -> String {
+    format!("{}/api/oauth/token", kimi_oauth_host())
+}
 pub const GEMINI_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GEMINI_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile openid";
 pub const GEMINI_CALLBACK_PATH: &str = "/oauth2callback";
@@ -330,7 +357,8 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
         "grok" | "xai" => Provider::Xai,
         "gemini" | "google" => Provider::Gemini,
         "amp" | "ampcode" => Provider::Amp,
-        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp)"),
+        "kimi" | "kimi-code" => Provider::Kimi,
+        other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp|kimi)"),
     };
     validate_account_name(name)?;
     // Amp login is an idempotent key import/upsert, not a fresh OAuth account.
@@ -346,6 +374,7 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
         "grok" | "xai" => login_grok(vault).await,
         "gemini" | "google" => login_gemini(vault).await,
         "amp" | "ampcode" => login_amp(vault).await,
+        "kimi" | "kimi-code" => login_kimi(vault).await,
         _ => unreachable!(),
     }
 }
@@ -1131,6 +1160,193 @@ async fn login_grok(vault: &Vault) -> Result<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kimi Code (Moonshot AI) device authorization grant (RFC 8628)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KimiDeviceStart {
+    pub device_code: String,
+    pub user_code: String,
+    #[serde(default)]
+    pub verification_uri: Option<String>,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    #[serde(default = "default_kimi_device_expires_in")]
+    pub expires_in: i64,
+    #[serde(default = "default_device_interval")]
+    pub interval: i64,
+}
+
+fn default_kimi_device_expires_in() -> i64 {
+    900
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct KimiTokens {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum KimiDevicePoll {
+    Pending,
+    SlowDown,
+    Done(Box<KimiTokens>),
+    Failed(String),
+}
+
+/// The verification URL the user opens. Prefer the server-provided complete URL;
+/// otherwise reconstruct the canonical Kimi one with the user_code appended.
+pub fn kimi_verification_url(start: &KimiDeviceStart) -> String {
+    if let Some(url) = start
+        .verification_uri_complete
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        return url.to_string();
+    }
+    if let Some(url) = start.verification_uri.as_deref().filter(|u| !u.is_empty()) {
+        return format!("{url}?user_code={}", start.user_code);
+    }
+    format!(
+        "{KIMI_DEVICE_VERIFICATION_URL}?user_code={}",
+        start.user_code
+    )
+}
+
+pub async fn kimi_device_start(http: &reqwest::Client) -> Result<KimiDeviceStart> {
+    let resp = http
+        .post(kimi_device_authorization_url())
+        .header("X-Msh-Platform", KIMI_DEVICE_PLATFORM)
+        .form(&[("client_id", KIMI_CLIENT_ID)])
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        bail!("kimi device authorization failed ({status}): {text}");
+    }
+    let mut start: KimiDeviceStart =
+        serde_json::from_str(&text).context("bad kimi device authorization response")?;
+    start.interval = start.interval.clamp(1, 30);
+    Ok(start)
+}
+
+/// Pure state-machine decode of a Kimi device token poll. Unit-tested; never
+/// logs token material.
+pub fn parse_kimi_device_poll(status: u16, body: &str) -> KimiDevicePoll {
+    if (200..300).contains(&status) {
+        return match serde_json::from_str::<KimiTokens>(body) {
+            Ok(tokens) if !tokens.access_token.is_empty() => {
+                KimiDevicePoll::Done(Box::new(tokens))
+            }
+            Ok(_) => KimiDevicePoll::Failed("kimi token response missing access_token".into()),
+            Err(e) => KimiDevicePoll::Failed(format!("bad kimi token response: {e}")),
+        };
+    }
+    if status >= 500 {
+        return KimiDevicePoll::Failed(format!("kimi token endpoint server error ({status})"));
+    }
+    let err = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_default();
+    match err.as_str() {
+        "authorization_pending" => KimiDevicePoll::Pending,
+        "slow_down" => KimiDevicePoll::SlowDown,
+        "access_denied" => KimiDevicePoll::Failed("authorization denied".into()),
+        "expired_token" => KimiDevicePoll::Failed("device code expired".into()),
+        other => KimiDevicePoll::Failed(format!(
+            "kimi token exchange failed ({status}): {}",
+            if other.is_empty() { body } else { other }
+        )),
+    }
+}
+
+pub async fn kimi_device_poll_once(
+    http: &reqwest::Client,
+    device_code: &str,
+) -> KimiDevicePoll {
+    let resp = http
+        .post(kimi_token_url())
+        .header("X-Msh-Platform", KIMI_DEVICE_PLATFORM)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code),
+            ("client_id", KIMI_CLIENT_ID),
+        ])
+        .send()
+        .await;
+    match resp {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            parse_kimi_device_poll(status, &body)
+        }
+        Err(e) => KimiDevicePoll::Failed(format!("kimi token endpoint unreachable: {e}")),
+    }
+}
+
+pub async fn kimi_upsert_from_tokens(vault: &Vault, tokens: &KimiTokens) -> Result<String> {
+    let account = crate::kimi_account_from_credentials(
+        tokens.access_token.clone(),
+        tokens.refresh_token.clone(),
+        None,
+        tokens.expires_in,
+        tokens.scope.clone(),
+    );
+    let id = account.id.clone();
+    vault.upsert(account).await?;
+    Ok(id)
+}
+
+async fn login_kimi(vault: &Vault) -> Result<String> {
+    let http = reqwest::Client::new();
+    let start = match kimi_device_start(&http).await {
+        Ok(start) => start,
+        Err(e) => {
+            println!("kimi device flow unavailable ({e}); trying to import existing creds:");
+            let outcome = import_kimi(vault).await;
+            if outcome.imported.is_empty() {
+                bail!(
+                    "kimi import found nothing ({})",
+                    outcome
+                        .note
+                        .unwrap_or_else(|| "no ~/.kimi-code/credentials/kimi-code.json".into())
+                );
+            }
+            return Ok(outcome.imported.join(", "));
+        }
+    };
+    let url = kimi_verification_url(&start);
+    println!("open this url on any device to authorize kimi:\n\n  {url}\n");
+    println!("enter this code when asked: {}", start.user_code);
+    open_browser(&url);
+    let deadline = now_ms() + start.expires_in * 1000;
+    let mut interval = start.interval.max(1) as u64;
+    loop {
+        if now_ms() > deadline {
+            bail!("device code expired before authorization completed");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        match kimi_device_poll_once(&http, &start.device_code).await {
+            KimiDevicePoll::Pending => continue,
+            KimiDevicePoll::SlowDown => {
+                interval += 5;
+                continue;
+            }
+            KimiDevicePoll::Done(tokens) => return kimi_upsert_from_tokens(vault, &tokens).await,
+            KimiDevicePoll::Failed(e) => bail!("kimi device login failed: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,6 +1694,91 @@ mod tests {
         } else {
             assert!(cmd.is_none());
         }
+    }
+
+    #[test]
+    fn kimi_device_poll_state_machine() {
+        // RFC 8628 pending / slow_down keep polling.
+        assert_eq!(
+            parse_kimi_device_poll(400, r#"{"error":"authorization_pending"}"#),
+            KimiDevicePoll::Pending
+        );
+        assert_eq!(
+            parse_kimi_device_poll(429, r#"{"error":"slow_down"}"#),
+            KimiDevicePoll::SlowDown
+        );
+        // Terminal error codes stop the loop.
+        assert!(matches!(
+            parse_kimi_device_poll(400, r#"{"error":"access_denied"}"#),
+            KimiDevicePoll::Failed(e) if e.contains("denied")
+        ));
+        assert!(matches!(
+            parse_kimi_device_poll(400, r#"{"error":"expired_token"}"#),
+            KimiDevicePoll::Failed(e) if e.contains("expired")
+        ));
+        // 5xx is a transient server error, not a terminal auth failure.
+        assert!(matches!(
+            parse_kimi_device_poll(503, "upstream boom"),
+            KimiDevicePoll::Failed(e) if e.contains("server error")
+        ));
+        // Success carries tokens (never asserted against real secrets).
+        match parse_kimi_device_poll(
+            200,
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":900,"scope":"kimi-code"}"#,
+        ) {
+            KimiDevicePoll::Done(t) => {
+                assert_eq!(t.access_token, "at");
+                assert_eq!(t.refresh_token.as_deref(), Some("rt"));
+                assert_eq!(t.expires_in, Some(900));
+                assert_eq!(t.scope.as_deref(), Some("kimi-code"));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        // A 200 without an access_token is a failure, not a false success.
+        assert!(matches!(
+            parse_kimi_device_poll(200, r#"{"token_type":"Bearer"}"#),
+            KimiDevicePoll::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn kimi_verification_url_prefers_complete_then_reconstructs() {
+        let complete = KimiDeviceStart {
+            device_code: "dc".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: Some("https://www.kimi.com/code/authorize_device".into()),
+            verification_uri_complete: Some(
+                "https://www.kimi.com/code/authorize_device?user_code=ABCD-EFGH".into(),
+            ),
+            expires_in: 900,
+            interval: 5,
+        };
+        assert!(kimi_verification_url(&complete).ends_with("user_code=ABCD-EFGH"));
+        let bare = KimiDeviceStart {
+            device_code: "dc".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: None,
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 5,
+        };
+        assert_eq!(
+            kimi_verification_url(&bare),
+            "https://www.kimi.com/code/authorize_device?user_code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn kimi_oauth_host_honors_env_override() {
+        // Default when unset.
+        std::env::remove_var("KIMI_CODE_OAUTH_HOST");
+        std::env::remove_var("KIMI_OAUTH_HOST");
+        assert_eq!(kimi_oauth_host(), "https://auth.kimi.com");
+        assert_eq!(kimi_token_url(), "https://auth.kimi.com/api/oauth/token");
+        assert_eq!(
+            kimi_device_authorization_url(),
+            "https://auth.kimi.com/api/oauth/device_authorization"
+        );
     }
 
     #[test]

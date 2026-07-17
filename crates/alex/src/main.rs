@@ -1277,6 +1277,7 @@ impl Config {
             xai: self.ping_xai_model.clone(),
             gemini: self.ping_gemini_model.clone(),
             openrouter: self.ping_openrouter_model.clone(),
+            kimi: "k3".to_string(),
         }
     }
 
@@ -1525,6 +1526,7 @@ fn open_vault(config: &Config) -> Result<Vault> {
             "gemini" | "google" => alex_core::Provider::Gemini,
             "amp" | "ampcode" => alex_core::Provider::Amp,
             "openrouter" | "or" => alex_core::Provider::Openrouter,
+            "kimi" | "kimi-code" => alex_core::Provider::Kimi,
             _ => continue,
         };
         policies.push((p, v.clone()));
@@ -1594,6 +1596,7 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
         "gemini" | "google" => alex_core::Provider::Gemini,
         "amp" | "ampcode" => alex_core::Provider::Amp,
         "openrouter" | "or" => alex_core::Provider::Openrouter,
+        "kimi" | "kimi-code" => alex_core::Provider::Kimi,
         other => anyhow::bail!("unknown provider '{other}'"),
     })
 }
@@ -3786,6 +3789,7 @@ async fn main() -> Result<()> {
                                 | alex_core::Provider::Xai
                                 | alex_core::Provider::Gemini
                                 | alex_core::Provider::Openrouter
+                                | alex_core::Provider::Kimi
                         )
                         && !seen.contains(&a.provider)
                     {
@@ -7773,6 +7777,7 @@ async fn run_pings(
         alex_core::Provider::Openrouter => models.openrouter.clone(),
         alex_core::Provider::Exo => "exo-local".to_string(),
         alex_core::Provider::Amp => "amp".to_string(),
+        alex_core::Provider::Kimi => models.kimi.clone(),
     };
     if std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
