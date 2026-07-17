@@ -10669,6 +10669,10 @@ mod tests {
         }
     }
 
+    // launchd is macOS-only; on Windows CI the include_str!'d plist template is
+    // checked out with CRLF (git autocrlf), so the rendered `\n` assertion misses.
+    // Rendering is never exercised on Windows in production, so gate the test.
+    #[cfg(not(windows))]
     #[test]
     fn launchd_plist_rendering_preserves_path_and_escapes_values() {
         let plist = render_launchd_plist(
