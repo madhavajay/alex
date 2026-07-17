@@ -44,6 +44,18 @@ private struct FixtureCaptureBody: Encodable {
     }
 }
 
+private struct MintRunKeyBody: Encodable {
+    let kind = "run"
+    let label: String?
+    let tags: [String: String]
+    let ttlSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case kind, label, tags
+        case ttlSeconds = "ttl_seconds"
+    }
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -177,6 +189,35 @@ public struct AlexandriaClient: Sendable {
             throw ClientError.http(0, "credential response was not UTF-8")
         }
         return environment
+    }
+
+    /// Lists redacted inbound and outbound credential metadata. This response
+    /// never includes a key value.
+    public func credentials() async throws -> CredentialsResponse {
+        try await get("admin/credentials", as: CredentialsResponse.self)
+    }
+
+    /// Creates a one-time model-only run key. The returned secret must be
+    /// handled ephemerally by the caller and is never available from `credentials()`.
+    public func mintRunKey(
+        label: String?, model: String?, ttlSeconds: Int
+    ) async throws -> MintedRunKey {
+        let normalizedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var tags: [String: String] = [:]
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tags["model"] = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let data = try await request(
+            "admin/run-keys", method: "POST",
+            body: body(MintRunKeyBody(
+                label: normalizedLabel?.isEmpty == false ? normalizedLabel : nil,
+                tags: tags, ttlSeconds: ttlSeconds)))
+        return try JSONDecoder().decode(MintedRunKey.self, from: data)
+    }
+
+    public func revokeRunKey(id: String) async throws {
+        _ = try await request(
+            "admin/run-keys/\(encodedPathComponent(id))", method: "DELETE")
     }
 
     public func accounts() async throws -> [Account] {

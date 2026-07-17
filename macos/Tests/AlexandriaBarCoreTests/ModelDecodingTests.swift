@@ -15,6 +15,18 @@ import Testing
         #expect(h.uptimeS == 479)
     }
 
+    @Test func credentialsInventoryIsRedactedAndDecodesRunKeyMetadata() throws {
+        let json = #"""
+        {"inbound":{"admin_key":{"present":true},"local_key":{"present":true},"run_keys":[{"id":"rk-abc12345","key_fingerprint":"abc12345def67890","kind":"run","label":"VS Code","run_id":"job-7","tags":{"harness":"codex","model":"gpt-5","attempt":2},"created_ms":1783477000000,"expires_ms":1783563400000,"last_used_ms":null,"use_count":4,"revoked":false}]},"outbound":[{"kind":"oauth","id":"openai-main","provider":"openai","present":true,"active":true,"identity":"person@example.com","expires_at_ms":null,"source":"vault"},{"kind":"harness_login","name":"codex","present":false,"active":false,"identity":null,"expires_at_ms":null,"source":"harness_file"}]}
+        """#
+        let response = try decode(json, as: CredentialsResponse.self)
+        #expect(response.inbound.localKey.present)
+        #expect(response.inbound.runKeys[0].keyFingerprint == "abc12345def67890")
+        #expect(response.inbound.runKeys[0].tags["attempt"]?.displayValue == "2.0")
+        #expect(response.outbound[0].id == "openai-main")
+        #expect(response.outbound[1].id == "codex")
+    }
+
     @Test func accounts() throws {
         let json = #"""
         {"accounts":[
