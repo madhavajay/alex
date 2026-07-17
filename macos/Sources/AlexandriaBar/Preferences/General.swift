@@ -378,7 +378,7 @@ struct GeneralPreferencesPane: View {
             do {
                 let environment = try await AlexandriaClient(config: config)
                     .credentialsEnvironment()
-                copyToPasteboard(environment)
+                CredentialClipboard.copy(environment)
                 credentialCopyStatus = "Environment credential block copied."
             } catch {
                 NSSound.beep()
@@ -399,13 +399,8 @@ struct GeneralPreferencesPane: View {
           --data \(shellQuote(body)) \\
           \(shellQuote(endpoint))
         """
-        copyToPasteboard(command)
+        CredentialClipboard.copy(command)
         credentialCopyStatus = "Editable run-key curl command copied."
-    }
-
-    private func copyToPasteboard(_ value: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(value, forType: .string)
     }
 
     private func shellQuote(_ value: String) -> String {

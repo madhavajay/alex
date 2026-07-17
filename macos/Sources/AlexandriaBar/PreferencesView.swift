@@ -12,6 +12,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case general = "General"
     case providers = "Providers"
     case harnesses = "Harnesses"
+    case credentials = "Credentials"
     case dario = "Dario"
     case exo = "Exo"
     case protection = "Protection"
@@ -21,6 +22,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
         case .general: "gearshape"
         case .providers: "bolt"
         case .harnesses: "terminal"
+        case .credentials: "key"
         case .dario: "server.rack"
         case .exo: "cpu"
         case .protection: "shield"
@@ -114,6 +116,8 @@ struct PreferencesView: View {
                     ProvidersPreferencesSection(store: store, onAuthenticate: onAuthenticate)
                 case .harnesses:
                     HarnessesPreferencesSection(store: store)
+                case .credentials:
+                    CredentialsPreferencesSection(store: store)
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .exo:

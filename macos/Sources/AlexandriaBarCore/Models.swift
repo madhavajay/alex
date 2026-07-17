@@ -646,6 +646,135 @@ public struct ExoModelsResponse: Codable, Sendable {
     public let models: [ExoModel]
 }
 
+/// The redacted credential inventory returned by `/admin/credentials`.
+/// Secrets are deliberately absent from this type; a run-key secret is only
+/// represented by `MintedRunKey`, the one-time response from the mint route.
+public struct CredentialsResponse: Codable, Sendable, Equatable {
+    public let inbound: InboundCredentials
+    public let outbound: [OutboundCredential]
+}
+
+public struct InboundCredentials: Codable, Sendable, Equatable {
+    public let adminKey: CredentialPresence
+    public let localKey: CredentialPresence
+    public let runKeys: [CredentialRunKey]
+
+    enum CodingKeys: String, CodingKey {
+        case adminKey = "admin_key"
+        case localKey = "local_key"
+        case runKeys = "run_keys"
+    }
+}
+
+public struct CredentialPresence: Codable, Sendable, Equatable {
+    public let present: Bool
+}
+
+public struct CredentialRunKey: Codable, Sendable, Identifiable, Equatable {
+    public let id: String
+    public let keyFingerprint: String
+    public let kind: String
+    public let label: String?
+    public let runId: String?
+    public let tags: [String: CredentialTagValue]
+    public let createdMs: Int64
+    public let expiresMs: Int64?
+    public let lastUsedMs: Int64?
+    public let useCount: Int64
+    public let revoked: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, label, tags, revoked
+        case keyFingerprint = "key_fingerprint"
+        case runId = "run_id"
+        case createdMs = "created_ms"
+        case expiresMs = "expires_ms"
+        case lastUsedMs = "last_used_ms"
+        case useCount = "use_count"
+    }
+}
+
+/// Daemon tags allow arbitrary JSON values. Keeping them typed rather than
+/// assuming strings means an unusual tag cannot make the whole inventory fail
+/// to decode.
+public indirect enum CredentialTagValue: Codable, Sendable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case null
+    case array([CredentialTagValue])
+    case object([String: CredentialTagValue])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode(String.self) { self = .string(value) }
+        else if let value = try? container.decode([CredentialTagValue].self) { self = .array(value) }
+        else { self = .object(try container.decode([String: CredentialTagValue].self)) }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .string(value): try container.encode(value)
+        case let .number(value): try container.encode(value)
+        case let .bool(value): try container.encode(value)
+        case .null: try container.encodeNil()
+        case let .array(value): try container.encode(value)
+        case let .object(value): try container.encode(value)
+        }
+    }
+
+    public var displayValue: String {
+        switch self {
+        case let .string(value): value
+        case let .number(value): String(value)
+        case let .bool(value): String(value)
+        case .null: "null"
+        case let .array(value): "[\(value.map(\.displayValue).joined(separator: ", "))]"
+        case let .object(value): "{\(value.map { "\($0.key): \($0.value.displayValue)" }.sorted().joined(separator: ", "))}"
+        }
+    }
+}
+
+public struct OutboundCredential: Codable, Sendable, Equatable, Identifiable {
+    public let kind: String
+    public let credentialID: String?
+    public let name: String?
+    public let provider: String?
+    public let present: Bool
+    public let active: Bool
+    public let identity: String?
+    public let expiresAtMs: Int64?
+    public let source: String?
+
+    public var id: String { credentialID ?? name ?? provider ?? kind }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, name, provider, present, active, identity, source
+        case credentialID = "id"
+        case expiresAtMs = "expires_at_ms"
+    }
+}
+
+public struct MintedRunKey: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let key: String
+    public let kind: String
+    public let runId: String?
+    public let label: String?
+    public let tags: [String: String]
+    public let expiresMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case id, key, kind, label, tags
+        case runId = "run_id"
+        case expiresMs = "expires_ms"
+    }
+}
+
 public struct ExoModel: Codable, Sendable, Identifiable, Equatable {
     public let id: String
     public let name: String
