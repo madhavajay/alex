@@ -98,6 +98,20 @@ pub struct RemovedAccount {
     pub removed_ms: i64,
 }
 
+/// Result of the credential side of an account merge. The DB-side row
+/// reassignment is reported separately by the store.
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeOutcome {
+    /// The surviving account id (always `into`).
+    pub survivor_id: String,
+    /// The duplicate account id that was tombstoned.
+    pub removed_id: String,
+    /// Which of the two accounts supplied the surviving login. `None` means the
+    /// survivor kept its own credentials because they were already the freshest
+    /// valid ones.
+    pub adopted_credentials_from: Option<String>,
+}
+
 fn default_account_name() -> String {
     "default".to_string()
 }
@@ -184,6 +198,28 @@ impl Account {
                 None => true,
             }
     }
+}
+
+/// A comparable freshness rank for choosing which of two logins survives a
+/// merge. Higher is better: a present, unexpired credential outranks a missing
+/// or expired one, and among equals the more recently refreshed login wins.
+/// This mirrors the "active" test used by the credentials view.
+fn credential_rank(account: &Account) -> (bool, i64) {
+    let now = now_ms();
+    let has_secret = account
+        .access_token
+        .as_deref()
+        .is_some_and(|v| !v.is_empty())
+        || account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        || account.api_key.as_deref().is_some_and(|v| !v.is_empty());
+    let unexpired =
+        account.kind != "oauth" || account.expires_at_ms.map(|e| e > now).unwrap_or(true);
+    let valid = has_secret && unexpired;
+    let freshness = account.last_refresh_ms.or(account.expires_at_ms).unwrap_or(i64::MIN);
+    (valid, freshness)
 }
 
 pub(crate) fn normalize_email(value: &str) -> Option<String> {
@@ -707,6 +743,107 @@ impl Vault {
             std::fs::remove_file(&path)?;
         }
         Ok(true)
+    }
+
+    /// Validate an account merge without mutating anything. Confirms both ids
+    /// exist and, unless `allow_mismatch`, that they are the same provider and
+    /// resolve to the same email. Returns `(from, into)`.
+    pub async fn validate_merge(
+        &self,
+        from_id: &str,
+        into_id: &str,
+        allow_mismatch: bool,
+    ) -> Result<(Account, Account)> {
+        if from_id == into_id {
+            bail!("cannot merge account '{from_id}' into itself");
+        }
+        let (from, into) = {
+            let accounts = self.accounts.read().await;
+            let from = accounts
+                .get(from_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown account '{from_id}'"))?;
+            let into = accounts
+                .get(into_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown account '{into_id}'"))?;
+            (from, into)
+        };
+        if !allow_mismatch {
+            if from.provider != into.provider {
+                bail!(
+                    "provider mismatch: '{from_id}' is {} but '{into_id}' is {} (pass allow_mismatch to override)",
+                    from.provider.as_str(),
+                    into.provider.as_str()
+                );
+            }
+            match (from.email(), into.email()) {
+                (Some(a), Some(b)) if a == b => {}
+                (a, b) => bail!(
+                    "email mismatch: '{from_id}' is {} but '{into_id}' is {} (pass allow_mismatch to override)",
+                    a.as_deref().unwrap_or("<none>"),
+                    b.as_deref().unwrap_or("<none>")
+                ),
+            }
+        }
+        Ok((from, into))
+    }
+
+    /// Merge the credential side of a duplicate account into a survivor. The
+    /// survivor is always `into_id`: it keeps its id but adopts whichever of the
+    /// two logins is the freshest still-valid credential — after a re-auth that
+    /// is the newly added account. The duplicate is tombstoned through the
+    /// normal removal path, so any trace already re-keyed to the survivor is
+    /// unaffected. Reassigning the trace-database rows is the caller's
+    /// responsibility (see `Store::merge_accounts`); doing both is how the two
+    /// split histories become one.
+    pub async fn merge_accounts(
+        &self,
+        from_id: &str,
+        into_id: &str,
+        allow_mismatch: bool,
+    ) -> Result<MergeOutcome> {
+        let (from, into) = self.validate_merge(from_id, into_id, allow_mismatch).await?;
+        let mut survivor = into.clone();
+        let adopted = if credential_rank(&from) > credential_rank(&into) {
+            survivor.kind = from.kind.clone();
+            survivor.access_token = from.access_token.clone();
+            survivor.refresh_token = from.refresh_token.clone();
+            survivor.id_token = from.id_token.clone();
+            survivor.api_key = from.api_key.clone();
+            survivor.expires_at_ms = from.expires_at_ms;
+            survivor.last_refresh_ms = from.last_refresh_ms;
+            // Carry the fresh login's scopes/email so the adopted token keeps
+            // its capabilities, while preserving the survivor's other metadata
+            // (e.g. observed routing limits).
+            if let (Some(dst), Some(src)) = (
+                survivor.account_meta.as_object_mut(),
+                from.account_meta.as_object(),
+            ) {
+                for key in ["scopes", "email", "account_id"] {
+                    if let Some(value) = src.get(key) {
+                        dst.insert(key.to_string(), value.clone());
+                    }
+                }
+            } else if survivor.account_meta.is_null() {
+                survivor.account_meta = from.account_meta.clone();
+            }
+            // Adopting a fresh login supersedes a stale/expired or cooling
+            // survivor, so the unified account is immediately usable.
+            survivor.paused = false;
+            survivor.status = "active".into();
+            survivor.cooldown_until_ms = None;
+            Some(from_id.to_string())
+        } else {
+            None
+        };
+        self.upsert(survivor).await?;
+        self.remove(from_id).await?;
+        Ok(MergeOutcome {
+            survivor_id: into_id.to_string(),
+            removed_id: from_id.to_string(),
+            adopted_credentials_from: adopted,
+        })
     }
 
     /// Read non-secret removal tombstones. Corrupt individual sidecars are
@@ -1710,6 +1847,175 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    fn oauth_account(id: &str, provider: Provider, email: &str, expires_at_ms: i64) -> Account {
+        Account {
+            id: id.into(),
+            provider,
+            kind: "oauth".into(),
+            name: id.rsplit('-').next().unwrap_or("default").into(),
+            description: Some(email.into()),
+            paused: false,
+            label: None,
+            access_token: Some(format!("access-{id}")),
+            refresh_token: Some(format!("refresh-{id}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(expires_at_ms),
+            last_refresh_ms: Some(expires_at_ms),
+            account_meta: json!({"email": email, "scopes": ["user:inference"]}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_provider_or_email_mismatch_unless_overridden() {
+        let dir = temp_dir("merge-mismatch");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let now = now_ms();
+        vault
+            .upsert(oauth_account(
+                "anthropic-oauth",
+                Provider::Anthropic,
+                "me@madhavajay.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+        vault
+            .upsert(oauth_account(
+                "anthropic-oauth-other",
+                Provider::Anthropic,
+                "someone@else.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+        vault
+            .upsert(oauth_account(
+                "openai-oauth",
+                Provider::Openai,
+                "me@madhavajay.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+
+        // Different email, same provider → refused by default.
+        let email_err = vault
+            .validate_merge("anthropic-oauth-other", "anthropic-oauth", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(email_err.contains("email mismatch"), "{email_err}");
+        // Different provider → refused by default.
+        let provider_err = vault
+            .validate_merge("openai-oauth", "anthropic-oauth", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(provider_err.contains("provider mismatch"), "{provider_err}");
+        // Override allows it.
+        assert!(vault
+            .validate_merge("anthropic-oauth-other", "anthropic-oauth", true)
+            .await
+            .is_ok());
+        // Unknown ids are rejected.
+        assert!(vault
+            .validate_merge("nope", "anthropic-oauth", false)
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_keeps_survivor_id_and_adopts_the_fresh_login() {
+        let dir = temp_dir("merge-credentials");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let now = now_ms();
+        // Survivor's own login is expired; the re-authed duplicate is fresh.
+        vault
+            .upsert(oauth_account(
+                "anthropic-oauth",
+                Provider::Anthropic,
+                "me@madhavajay.com",
+                now - 3_600_000,
+            ))
+            .await
+            .unwrap();
+        vault
+            .upsert(oauth_account(
+                "anthropic-oauth-reauth",
+                Provider::Anthropic,
+                "me@madhavajay.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+
+        let outcome = vault
+            .merge_accounts("anthropic-oauth-reauth", "anthropic-oauth", false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.survivor_id, "anthropic-oauth");
+        assert_eq!(outcome.removed_id, "anthropic-oauth-reauth");
+        assert_eq!(
+            outcome.adopted_credentials_from.as_deref(),
+            Some("anthropic-oauth-reauth")
+        );
+
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 1, "duplicate is gone");
+        let survivor = &accounts[0];
+        assert_eq!(survivor.id, "anthropic-oauth");
+        // Kept its id but took the fresh, unexpired token.
+        assert_eq!(
+            survivor.access_token.as_deref(),
+            Some("access-anthropic-oauth-reauth")
+        );
+        assert!(survivor.expires_at_ms.unwrap() > now);
+        // The dup was tombstoned via the normal removal path.
+        assert!(vault
+            .removed_accounts()
+            .iter()
+            .any(|a| a.id == "anthropic-oauth-reauth"));
+
+        // If instead the survivor already holds the freshest login, its
+        // credentials are left untouched.
+        let dir2 = temp_dir("merge-keep-survivor");
+        let vault2 = Vault::open(dir2.clone()).unwrap();
+        vault2
+            .upsert(oauth_account(
+                "anthropic-oauth",
+                Provider::Anthropic,
+                "me@madhavajay.com",
+                now + 7_200_000,
+            ))
+            .await
+            .unwrap();
+        vault2
+            .upsert(oauth_account(
+                "anthropic-oauth-stale",
+                Provider::Anthropic,
+                "me@madhavajay.com",
+                now - 3_600_000,
+            ))
+            .await
+            .unwrap();
+        let outcome2 = vault2
+            .merge_accounts("anthropic-oauth-stale", "anthropic-oauth", false)
+            .await
+            .unwrap();
+        assert_eq!(outcome2.adopted_credentials_from, None);
+        assert_eq!(
+            vault2.list().await[0].access_token.as_deref(),
+            Some("access-anthropic-oauth")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     fn routing_limits(used_pct: f64, resets_at_s: i64) -> Value {
