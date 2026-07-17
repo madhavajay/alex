@@ -35,12 +35,36 @@ final class ChannelFeedDelegate: NSObject, SPUUpdaterDelegate {
         // Diagnostic (Reveal Log File): this proves whether Sparkle consults the
         // delegate and which feed it is handed. If this line appears with a beta
         // URL but the check still finds nothing, the fault is downstream in Sparkle.
+        guard let stableFeed else {
+            BarLog.info(.ui, "sparkle feedURL: no baked SUFeedURL; updates disabled")
+            return nil
+        }
+        // Cache-bust the feed on EVERY check. The appcast is served from GitHub
+        // Pages through a CDN with `max-age=600` across geographic edges, and the
+        // host honours conditional GETs — so a freshly published build can stay
+        // invisible for 10+ minutes (longer on a stale edge), which is exactly
+        // the "update is flaky / still says I'm on an old build" symptom. A
+        // unique query param forces a cache MISS every time (it is part of the
+        // CDN cache key but ignored by the static-file host), so Sparkle always
+        // sees the current appcast. Applies to both channels (resolved==beta URL,
+        // or the baked stable URL) so neither goes stale.
+        let effective = Self.cacheBusted(resolved ?? stableFeed)
         BarLog.info(
             .ui,
             "sparkle feedURL: channel=\(rawChannel ?? "nil")->\(channel.rawValue) "
-                + "baked=\(stableFeed ?? "nil") resolved=\(resolved ?? "nil(uses baked)")")
-        guard stableFeed != nil else { return nil }
-        return resolved
+                + "baked=\(stableFeed) resolved=\(resolved ?? "nil(uses baked)") effective=\(effective)")
+        return effective
+    }
+
+    /// Appends a unique `cb` query parameter so the CDN cannot serve a stale
+    /// cached appcast (or answer a conditional GET with 304). The value is a
+    /// millisecond timestamp — unique per check, ignored by the static host.
+    static func cacheBusted(_ urlString: String) -> String {
+        guard var components = URLComponents(string: urlString) else { return urlString }
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "cb", value: String(Int(Date().timeIntervalSince1970 * 1000))))
+        components.queryItems = items
+        return components.string ?? urlString
     }
 
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
