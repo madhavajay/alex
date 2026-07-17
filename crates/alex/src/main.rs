@@ -1546,10 +1546,13 @@ struct DarioGlue {
     routing_mode: String,
     routing_reason: String,
     last_error: Arc<std::sync::Mutex<Option<String>>>,
+    notification_state: Arc<std::sync::Mutex<Option<Arc<alex_proxy::AppState>>>>,
 }
 
 fn dario_issue(error: &str) -> serde_json::Value {
-    let (code, message) = if error.contains("cannot find Node runtime") {
+    let (code, message) = if dario_auth_error(error) {
+        ("reauth", "Claude Code login needs re-auth")
+    } else if error.contains("cannot find Node runtime") {
         (
             "node_not_found",
             "cannot find Node runtime — install Node.js or set dario_node_path",
@@ -1570,6 +1573,22 @@ fn dario_issue(error: &str) -> serde_json::Value {
     serde_json::json!({"code": code, "message": message, "fixable": code != "no_anthropic_creds"})
 }
 
+fn dario_auth_error(error: &str) -> bool {
+    error.contains("status=401") || error.contains("status 401")
+}
+
+fn dario_status_has_reauth_issue(status: &serde_json::Value) -> bool {
+    let active_id = status["active_generation_id"].as_str();
+    status["generations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|generation| {
+            generation["id"].as_str() == active_id
+                && generation["last_probe"]["status"].as_u64() == Some(401)
+        })
+}
+
 impl DarioGlue {
     fn clone_for_async(&self) -> Self {
         Self {
@@ -1580,6 +1599,7 @@ impl DarioGlue {
             routing_mode: self.routing_mode.clone(),
             routing_reason: self.routing_reason.clone(),
             last_error: self.last_error.clone(),
+            notification_state: self.notification_state.clone(),
         }
     }
 
@@ -1632,15 +1652,54 @@ impl DarioGlue {
                 *self.settings.write().unwrap() = settings;
                 *self.supervisor.write().unwrap() = Some(sup.clone());
                 *self.last_error.lock().unwrap() = None;
+                self.spawn_dario_auth_failure_listener(&sup);
                 Ok(sup)
             }
             Err(error) => {
                 let error = error.to_string();
                 *self.settings.write().unwrap() = settings;
                 *self.last_error.lock().unwrap() = Some(error.clone());
+                self.emit_dario_reauth_if_needed(&error);
                 Err(error)
             }
         }
+    }
+
+    fn set_notification_state(&self, state: Arc<alex_proxy::AppState>) {
+        *self.notification_state.lock().unwrap() = Some(state.clone());
+        if let Some(error) = self.last_error.lock().unwrap().as_deref() {
+            if dario_auth_error(error) {
+                alex_proxy::emit_dario_reauth_notification(&state);
+            }
+        }
+        if let Some(sup) = self.supervisor() {
+            self.spawn_dario_auth_failure_listener(&sup);
+        }
+    }
+
+    fn emit_dario_reauth_if_needed(&self, error: &str) {
+        if !dario_auth_error(error) {
+            return;
+        }
+        if let Some(state) = self.notification_state.lock().unwrap().clone() {
+            alex_proxy::emit_dario_reauth_notification(&state);
+        }
+    }
+
+    fn spawn_dario_auth_failure_listener(&self, supervisor: &Arc<dario::DarioSupervisor>) {
+        let Some(state) = self.notification_state.lock().unwrap().clone() else {
+            return;
+        };
+        let mut failures = supervisor.subscribe_auth_failures();
+        tokio::spawn(async move {
+            loop {
+                match failures.recv().await {
+                    Ok(()) => alex_proxy::emit_dario_reauth_notification(&state),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     fn spawn_initial_retry(self: &Arc<Self>) {
@@ -1682,6 +1741,23 @@ impl DarioGlue {
             }
         }
         if let Some(sup) = self.supervisor() {
+            if dario_status_has_reauth_issue(&sup.status()) {
+                return match sup.restart().await {
+                    Ok(result) => serde_json::json!({
+                        "fixed": true,
+                        "node_bin": node,
+                        "claude_bin": claude,
+                        "message": format!("Claude Code re-auth complete; started fresh generation {}", result["generation_id"].as_str().unwrap_or("")),
+                    }),
+                    Err(error) => serde_json::json!({
+                        "fixed": false,
+                        "node_bin": node,
+                        "claude_bin": claude,
+                        "fixable": true,
+                        "message": error.to_string(),
+                    }),
+                };
+            }
             match sup.ensure_active().await {
                 Ok(active) => {
                     return serde_json::json!({"fixed": true, "node_bin": node, "claude_bin": claude, "message": format!("saved Dario runtime paths; generation {} is ready", active.generation_id)})
@@ -1775,10 +1851,14 @@ impl alex_proxy::DarioRouter for DarioGlue {
         status["routing_reason"] = serde_json::json!(self.routing_reason);
         status["resolved_node_bin"] = status["runtime_path"].clone();
         status["resolved_claude_bin"] = status["claude_bin"].clone();
-        status["issue"] = status["health_reason"]
-            .as_str()
-            .map(dario_issue)
-            .unwrap_or(serde_json::Value::Null);
+        status["issue"] = if dario_status_has_reauth_issue(&status) {
+            serde_json::json!({"code": "reauth", "message": "Claude Code login needs re-auth", "fixable": true})
+        } else {
+            status["health_reason"]
+                .as_str()
+                .map(dario_issue)
+                .unwrap_or(serde_json::Value::Null)
+        };
         status
     }
 
@@ -2851,6 +2931,7 @@ async fn main() -> Result<()> {
                 routing_mode: dario_routing_mode.clone(),
                 routing_reason: dario_routing_reason.clone(),
                 last_error: Arc::new(std::sync::Mutex::new(initial_error.clone())),
+                notification_state: Arc::new(std::sync::Mutex::new(None)),
             });
             let (dario_router, supervisor) = match initial_supervisor {
                 Some(sup) => {
@@ -2895,6 +2976,7 @@ async fn main() -> Result<()> {
                 config.substitution.clone(),
             );
             alex_proxy::set_notifications(&state, config.notification_settings());
+            glue.set_notification_state(state.clone());
             alex_proxy::set_protection_policy(&state, config.protection.clone());
             alex_proxy::set_exo_config(
                 &state,
@@ -10192,6 +10274,24 @@ mod tests {
     fn dario_and_anthropic_ping_defaults_target_auto_and_sonnet() {
         assert_eq!(default_anthropic_upstream(), "auto");
         assert_eq!(default_ping_anthropic(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn dario_401_is_classified_as_reauth() {
+        assert_eq!(
+            dario_issue(
+                "generation-a readiness probe failed: unhealthy status=401 body=unauthorized"
+            ),
+            serde_json::json!({
+                "code": "reauth",
+                "message": "Claude Code login needs re-auth",
+                "fixable": true,
+            })
+        );
+        assert!(dario_status_has_reauth_issue(&serde_json::json!({
+            "active_generation_id": "generation-a",
+            "generations": [{"id": "generation-a", "last_probe": {"status": 401}}],
+        })));
     }
 
     #[test]

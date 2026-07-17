@@ -65,6 +65,13 @@ enum TerminalLauncher {
         }
     }
 
+    /// Claude Code login requires an interactive browser flow.  Keep it in a
+    /// visible terminal, then use the daemon CLI's existing repair endpoint to
+    /// roll Dario only after login succeeds.
+    static func launchDarioReauth(daemonBinary: String) {
+        launch(command: "claude login && \(shellQuote(daemonBinary)) dario fix")
+    }
+
     static var ghosttyIsRunning: Bool {
         !NSRunningApplication.runningApplications(
             withBundleIdentifier: TerminalApp.ghostty.bundleId
