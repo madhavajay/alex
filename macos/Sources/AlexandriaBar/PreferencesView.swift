@@ -15,7 +15,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case credentials = "Credentials"
     case dario = "Dario"
     case exo = "Exo"
-    case protection = "Protection"
+    case protection = "Failover"
     case notifications = "Notifications"
 
     var icon: String {

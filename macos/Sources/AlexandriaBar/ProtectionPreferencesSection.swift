@@ -42,7 +42,7 @@ struct ProtectionPreferencesSection: View {
     private var paneHeader: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 1) {
-                Text("Protection")
+                Text("Failover")
                     .font(AlexTheme.Fonts.panelTitle)
                     .foregroundStyle(AlexTheme.Colors.foreground)
                 Text("Provider fail-over and model equivalencies")

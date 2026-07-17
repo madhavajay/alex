@@ -172,7 +172,6 @@ private struct HarnessRowView: View {
     let store: SnapshotStore
     @State private var error: String?
     @State private var actionModel: HarnessActionSheetModel?
-    @State private var toolCaptureUpdating = false
     @State private var hovered = false
     @State private var confirmingDisconnect = false
 
@@ -182,7 +181,6 @@ private struct HarnessRowView: View {
                 iconTile
                 nameAndPath
                 Spacer(minLength: 8)
-                toolsColumn
                 actionsColumn
             }
             if let error {
@@ -248,30 +246,6 @@ private struct HarnessRowView: View {
         .frame(width: 160, alignment: .leading)
     }
 
-    // MARK: Col 1 — Tools toggle (App.tsx:511-514, fixed 80px)
-
-    @ViewBuilder
-    private var toolsColumn: some View {
-        HStack(spacing: 6) {
-            if HarnessCatalog.toolCaptureHarnesses.contains(harness.name), harness.connected {
-                Text("Tools")
-                    .font(.system(size: 11))
-                    .foregroundStyle(AlexTheme.Colors.textTertiary)
-                    .opacity(hovered ? 1 : 0.4)
-                Toggle(isOn: Binding(
-                    get: { harness.toolCaptureEnabled ?? false },
-                    set: { setToolCapture($0) })
-                ) { EmptyView() }
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .labelsHidden()
-                    .disabled(toolCaptureUpdating || actionModel != nil)
-                    .help("Opt in to storing this harness's tool arguments and results locally. Secrets are redacted before storage.")
-            }
-        }
-        .frame(width: 80, alignment: .trailing)
-    }
-
     // MARK: Col 2 — Config (always) + hover-revealed Delete (App.tsx:523-538)
 
     @ViewBuilder
@@ -334,15 +308,6 @@ private struct HarnessRowView: View {
         model.start()
     }
 
-    private func setToolCapture(_ enabled: Bool) {
-        guard let config = store.config else { return }
-        toolCaptureUpdating = true; error = nil
-        Task {
-            do { try await AlexandriaClient(config: config).setHarnessToolCapture(harness.name, enabled: enabled); await store.refresh() }
-            catch { self.error = error.localizedDescription }
-            toolCaptureUpdating = false
-        }
-    }
 }
 
 private struct HarnessActionSheetHost: View {
