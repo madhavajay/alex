@@ -12,9 +12,6 @@ predate this file — see the git history and GitHub releases.
   import an existing `~/.kimi-code` login; see Kimi usage; use `kimi/*` models
   (k3, kimi-for-coding, -highspeed) in any harness; and use `alex/*` models
   inside the Kimi harness. Kimi subscription + agent added to the e2e suite.
-- **Proactive re-auth notifications** — fire the Telegram/notification reauth
-  alert when a token expires while idle or a background refresh fails, not only
-  when a live request hits a 401.
 - **`alexandria` → `alex` rename** — project-wide rename with a one-time,
   no-data-loss upgrade migration (`~/.alexandria` → `~/.alex`,
   `com.alexandria.daemon` → `com.alex.daemon`, `ALEXANDRIA_*` → `ALEX_*` with
@@ -24,6 +21,10 @@ predate this file — see the git history and GitHub releases.
   platforms; pending live zero-downtime verification.
 
 ### Added (on `main`, for the next release)
+- **Proactive re-auth notifications** — the Telegram/notification reauth alert
+  now fires when a login expires while idle or a background token refresh fails
+  on a revoked token, not only when a live request hits a 401. Debounced, and
+  it never alarms on a token that can still silently refresh.
 - Homebrew **cask is now published on every release** from the release
   pipeline, so the tap can't drift out of date again.
 - `install-release.sh` recovers from a broken/renamed Homebrew cask record,
