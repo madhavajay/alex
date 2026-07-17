@@ -57,7 +57,7 @@ pub enum WebhookFormat {
 }
 
 impl WebhookFormat {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Generic => "generic",
             Self::Telegram => "telegram",
@@ -72,12 +72,22 @@ impl WebhookFormat {
 /// compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationChannelConfig {
+    /// Stable daemon-assigned identity used by the runtime admin API.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default)]
     pub format: WebhookFormat,
     #[serde(default)]
     pub url: String,
+    /// Telegram bot token. It is intentionally never included in an admin
+    /// view; Telegram delivery derives the sendMessage URL from this value.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Cached display value returned by Telegram getMe; not a credential.
+    #[serde(default)]
+    pub bot_username: Option<String>,
     #[serde(default)]
     pub chat_id: Option<String>,
     #[serde(default)]
@@ -89,9 +99,12 @@ pub struct NotificationChannelConfig {
 impl Default for NotificationChannelConfig {
     fn default() -> Self {
         Self {
+            id: None,
             kind: default_kind(),
             format: WebhookFormat::default(),
             url: String::new(),
+            token: None,
+            bot_username: None,
             chat_id: None,
             min_level: NotificationLevel::default(),
             categories: Vec::new(),
@@ -150,7 +163,8 @@ pub struct WebhookChannel {
 
 impl WebhookChannel {
     pub fn new(config: &NotificationChannelConfig) -> Result<Self> {
-        if config.url.trim().is_empty() {
+        let url = config.delivery_url();
+        if url.trim().is_empty() {
             return Err(anyhow!("webhook URL is empty"));
         }
         if matches!(config.format, WebhookFormat::Telegram)
@@ -159,7 +173,7 @@ impl WebhookChannel {
             return Err(anyhow!("telegram webhook requires chat_id"));
         }
         Ok(Self {
-            url: config.url.clone(),
+            url,
             format: config.format,
             chat_id: config.chat_id.clone(),
             client: reqwest::Client::new(),
@@ -169,6 +183,27 @@ impl WebhookChannel {
     pub fn payload(&self, event: &NotificationEvent) -> Value {
         payload_for(self.format, self.chat_id.as_deref(), event)
     }
+}
+
+impl NotificationChannelConfig {
+    /// Resolve the delivery URL at send time so Telegram tokens need not be
+    /// duplicated into the persisted URL field.
+    pub fn delivery_url(&self) -> String {
+        if matches!(self.format, WebhookFormat::Telegram) {
+            if let Some(token) = self
+                .token
+                .as_deref()
+                .filter(|token| !token.trim().is_empty())
+            {
+                return telegram_send_message_url(token);
+            }
+        }
+        self.url.clone()
+    }
+}
+
+pub fn telegram_send_message_url(token: &str) -> String {
+    format!("https://api.telegram.org/bot{token}/sendMessage")
 }
 
 #[async_trait]
@@ -303,21 +338,60 @@ impl NotificationDispatcher {
     }
 
     pub fn emit_test(&self, channel: Option<usize>, now_ms: i64) {
-        self.spawn_send(
-            NotificationEvent {
-                level: NotificationLevel::Info,
-                category: "test".into(),
-                title: "Alexandria notification test".into(),
-                body: "This is a synthetic notification test event.".into(),
-                account: NotificationAccount {
-                    provider: "alexandria".into(),
-                    label: None,
-                },
-                action_url: None,
-                ts: now_ms,
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let _ = dispatcher.test(channel, now_ms).await;
+        });
+    }
+
+    /// Send a synthetic event and wait for each selected delivery. Admin test
+    /// requests use this instead of the detached normal dispatch path so they
+    /// can report an honest per-channel result. Tests intentionally bypass
+    /// min_level/category filters.
+    pub async fn test(&self, only: Option<usize>, now_ms: i64) -> Vec<Value> {
+        let event = NotificationEvent {
+            level: NotificationLevel::Info,
+            category: "test".into(),
+            title: "Alexandria notification test".into(),
+            body: "This is a synthetic notification test event.".into(),
+            account: NotificationAccount {
+                provider: "alexandria".into(),
+                label: None,
             },
-            channel,
-        );
+            action_url: None,
+            ts: now_ms,
+        };
+        let mut results = Vec::new();
+        for (index, entry) in self.channels.iter().enumerate() {
+            if only.is_some_and(|wanted| wanted != index) {
+                continue;
+            }
+            let outcome = tokio::time::timeout(self.timeout, entry.channel.send(&event)).await;
+            let (ok, error) = match outcome {
+                Ok(Ok(())) => (true, None),
+                // reqwest errors can contain a token-bearing URL. Keep the
+                // externally visible result as deliberately generic as well.
+                Ok(Err(_)) => (false, Some("delivery failed")),
+                Err(_) => (false, Some("delivery timed out")),
+            };
+            if let Ok(mut statuses) = self.status.lock() {
+                if let Some(status) = statuses.get_mut(index) {
+                    if ok {
+                        status.last_sent_ms = Some(event.ts);
+                        status.last_error = None;
+                    } else {
+                        status.last_error = error.map(str::to_owned);
+                    }
+                }
+            }
+            results.push(json!({
+                "index": index,
+                "id": entry.config.id,
+                "ok": ok,
+                "error": error,
+            }));
+        }
+        results
     }
 
     fn should_emit(&self, event: &NotificationEvent) -> bool {
@@ -384,12 +458,16 @@ impl NotificationDispatcher {
                 let status = statuses.get(index).cloned().unwrap_or_default();
                 json!({
                     "index": index,
+                    "id": entry.config.id,
                     "kind": entry.channel.kind(),
                     "format": entry.config.format.as_str(),
-                    "host": redacted_host(&entry.config.url),
+                    "host": redacted_host(&entry.config.delivery_url()),
+                    "bot_username": entry.config.bot_username,
+                    "chat_id": entry.config.chat_id,
                     "supports_replies": entry.channel.supports_replies(),
                     "min_level": entry.config.min_level,
                     "categories": entry.config.categories,
+                    "last_sent": status.last_sent_ms,
                     "last_sent_ms": status.last_sent_ms,
                     "last_error": status.last_error,
                 })
@@ -474,6 +552,23 @@ mod tests {
             .admin_view()
             .to_string()
             .contains("TOP_SECRET")
+        );
+    }
+
+    #[test]
+    fn telegram_token_derives_send_message_url() {
+        let channel = NotificationChannelConfig {
+            format: WebhookFormat::Telegram,
+            token: Some("123:secret".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            channel.delivery_url(),
+            "https://api.telegram.org/bot123:secret/sendMessage"
+        );
+        assert!(
+            WebhookChannel::new(&channel).is_err(),
+            "chat_id is required"
         );
     }
 
