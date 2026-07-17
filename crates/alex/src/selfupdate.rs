@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{alexandria_home, current_uid, detect_service_state, Config, ServiceState};
+use crate::{alexandria_home, detect_service_state, Config, ServiceState};
 
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/madhavajay/alex/releases/latest/download/manifest.json";
@@ -646,6 +646,28 @@ fn check_host(config: &Config) -> &str {
     }
 }
 
+/// Poll a daemon health endpoint until it is ready.  Kept separate from a
+/// particular supervisor so both the standalone blue/green path and launchd
+/// can use the same readiness rule.
+pub(crate) async fn wait_for_daemon_health(
+    client: &reqwest::Client,
+    health_url: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(response) = client.get(health_url).send().await {
+            if response.status().is_success() {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn restart_daemon(config: &Config, exe: &Path) -> Result<()> {
     let health_url = format!("http://{}:{}/health", check_host(config), config.port);
     let client = reqwest::Client::builder()
@@ -659,20 +681,11 @@ async fn restart_daemon(config: &Config, exe: &Path) -> Result<()> {
     let state = detect_service_state();
     match state {
         ServiceState::LaunchdLoaded { .. } => {
-            println!("daemon is launchd-managed; restarting with launchctl");
-            let status = Command::new("launchctl")
-                .args([
-                    "kickstart",
-                    "-k",
-                    &format!("gui/{}/com.alexandria.daemon", current_uid()),
-                ])
-                .status()
-                .context("running launchctl kickstart")?;
-            if !status.success() {
-                anyhow::bail!("launchctl kickstart failed");
-            }
-            println!("daemon restarted");
-            Ok(())
+            println!("daemon is launchd-managed; starting graceful restart helper");
+            // This task runs inside the old daemon.  It cannot wait for its
+            // own graceful exit, so the helper owns the post-drain health
+            // check and hard-restart fallback.
+            crate::spawn_launchd_restart_helper(exe)
         }
         ServiceState::Systemd { active: true, .. } => {
             println!("daemon is systemd-managed; restarting with systemctl");
@@ -735,10 +748,8 @@ async fn blue_green_restart(config: &Config, exe: &Path) -> Result<()> {
                 log_path.display()
             );
         }
-        if let Ok(resp) = client.get(&health_url).send().await {
-            if resp.status().is_success() {
-                break;
-            }
+        if wait_for_daemon_health(&client, &health_url, Duration::ZERO).await {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -801,6 +812,43 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_poll_times_out_when_a_new_daemon_never_becomes_ready() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        assert!(
+            !wait_for_daemon_health(&client, "http://127.0.0.1:9/health", Duration::ZERO).await
+        );
+    }
+
+    #[tokio::test]
+    async fn health_poll_waits_until_the_new_daemon_is_ready() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        assert!(
+            wait_for_daemon_health(
+                &client,
+                &format!("http://{address}/health"),
+                Duration::from_secs(1),
+            )
+            .await
+        );
+    }
 
     #[test]
     fn manifest_parse_tolerates_unknown_and_missing_app() {
