@@ -69,7 +69,7 @@ struct PreferencesView: View {
                 .padding(.bottom, 12)
 
             VStack(spacing: 2) {
-                ForEach(PreferencesSection.allCases.filter { $0 != .exo }, id: \.self) { section in
+                ForEach(PreferencesSection.allCases, id: \.self) { section in
                     SettingsNavItem(
                         label: section.rawValue,
                         icon: section.icon,

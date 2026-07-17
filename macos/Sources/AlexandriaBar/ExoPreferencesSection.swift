@@ -141,8 +141,13 @@ struct ExoPreferencesSection: View {
     }
 
     private var exoLogo: Image {
-        if let url = Bundle.module.url(forResource: "exo", withExtension: "png", subdirectory: "logos"),
-           let image = NSImage(contentsOf: url) {
+        // NEVER Bundle.module here — it traps when the SwiftPM resource bundle
+        // can't be resolved in the hand-packaged .app and took the whole app
+        // down (0.1.27-beta.4 crash on opening this pane). Use the shared safe
+        // resolver, fall back to an SF Symbol when the asset is unavailable.
+        if let url = HarnessIconLoader.resourceBundle?.url(
+            forResource: "exo", withExtension: "png", subdirectory: "logos"),
+           let image = NSImage(contentsOf: url), image.isValid {
             Image(nsImage: image)
         } else {
             Image(systemName: "cpu")

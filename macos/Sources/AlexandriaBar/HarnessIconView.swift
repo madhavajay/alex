@@ -9,8 +9,10 @@ enum HarnessIconLoader {
 
     // Bundle.module traps when the SwiftPM resource bundle can't be resolved,
     // which took the whole app down from an icon lookup (0.1.19 Trace Browser
-    // crash). Resolve it by hand and treat a missing bundle as "no icon".
-    private static let resourceBundle: Bundle? = {
+    // crash, and again the Exo logo in 0.1.27-beta.4). Resolve it by hand and
+    // treat a missing bundle as "no icon". Shared: any bundled-image lookup must
+    // go through this, never Bundle.module.
+    static let resourceBundle: Bundle? = {
         let name = "AlexandriaBar_AlexandriaBar.bundle"
         let candidates = [
             Bundle.main.resourceURL,
