@@ -78,6 +78,24 @@ Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multi
 
 ![Alex Trace Browser showing model requests, tool calls, token usage, and latency](images/trace-browser.png)
 
+### Harness tracing support
+
+Alex records a trace for every request from any supported harness. **Session grouping** stitches a harness's
+requests into one conversation; **subagent tracing** additionally reconstructs the parent→child tree when a
+harness spawns subagents.
+
+| Harness | Session grouping | Subagent tracing |
+| --- | --- | --- |
+| `claude` (Claude Code) | Per-agent, via `x-claude-code-agent-id` | ✅ **Full** — parent/child lineage from `x-claude-code-parent-agent-id` (recorded as `SubagentStart`/`SubagentStop`) |
+| `codex` | Conversation affinity (`conversation_id`) | ⏳ Planned |
+| `pi` | Session id / request metadata | ⏳ Planned |
+| `gemini`, `grok`, `amp`, `cursor`, `droid`, `goose`, `kimi`, `qwen`, `opencode`, `mini-swe-agent`, `hermes`, `pydantic-ai`, `opensage`, `stirrup`, `jcode`, `omp` | Grouped by any session/`conversation_id` the tool sends, otherwise an `auto-<hash>` session per connection | ⏳ Planned |
+
+**Today, Claude Code is the only harness with true subagent tracing** — it's the only one that emits the agent
+lineage headers Alex needs. Harnesses that send no session id (e.g. Qwen Code driving a benchmark) get an
+`auto-<hash>` session per connection, so many parallel/retried runs surface as many short sessions rather than one
+grouped job. Broader subagent capture across harnesses is on the roadmap.
+
 ## What makes Alex different?
 
 Use subscriptions, not only API keys.
