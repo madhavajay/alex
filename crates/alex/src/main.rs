@@ -2857,7 +2857,9 @@ fn launchd_activated_listener(socket_name: &str) -> Result<Option<tokio::net::Tc
     listener
         .set_nonblocking(true)
         .context("setting launchd listener nonblocking")?;
-    tokio::net::TcpListener::from_std(listener).context("adopting launchd listener")
+    let listener =
+        tokio::net::TcpListener::from_std(listener).context("adopting launchd listener")?;
+    Ok(Some(listener))
 }
 
 #[cfg(not(target_os = "macos"))]
