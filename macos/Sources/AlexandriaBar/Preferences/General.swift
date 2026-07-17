@@ -480,7 +480,7 @@ extension View {
             .labelsHidden()
     }
 
-    fileprivate func settingsPicker() -> some View {
+    func settingsPicker() -> some View {
         self.pickerStyle(.menu)
             .controlSize(.small)
             .labelsHidden()
@@ -488,12 +488,12 @@ extension View {
     }
 
     /// Mono inline text field (binary path).
-    func settingsField() -> some View {
+    func settingsField(width: CGFloat? = 260) -> some View {
         self.textFieldStyle(.plain)
             .font(AlexTheme.Fonts.mono(11))
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
-            .frame(width: 260)
+            .frame(width: width)
             .background(
                 RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
                     .fill(AlexTheme.Colors.surfaceHover))
