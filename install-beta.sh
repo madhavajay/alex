@@ -117,6 +117,17 @@ install_cli() {
 # we therefore uninstall and reinstall to force the plist to re-pin to THIS
 # binary, rather than relying on restart.
 replace_daemon() {
+  # Evict stray, manually-started daemons first. `alex daemon` run in a terminal
+  # co-binds :4100 via SO_REUSEPORT and keeps serving the OLD binary across
+  # upgrades -- launchd's re-pin cannot see or stop them, so the daemon appears
+  # "stuck" on an old version forever. launchd relaunches its own managed daemon
+  # after service install, so clearing every running daemon here is safe.
+  if pgrep -f "alexandria daemon" >/dev/null 2>&1 || pgrep -f "alex daemon" >/dev/null 2>&1; then
+    say "Clearing stray daemon processes holding the port..."
+    pkill -f "alexandria daemon" >/dev/null 2>&1 || true
+    pkill -f "alex daemon" >/dev/null 2>&1 || true
+    sleep 1
+  fi
   if "$INSTALL_DIR/alex" service install >/dev/null 2>&1 </dev/null; then
     say "Daemon service registered."
     return
