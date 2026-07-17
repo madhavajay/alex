@@ -8,10 +8,6 @@ predate this file — see the git history and GitHub releases.
 ## [Unreleased]
 
 ### In progress (building, not yet in a beta)
-- **Kimi Code integration** — log in to Kimi via Alex (OAuth device flow) or
-  import an existing `~/.kimi-code` login; see Kimi usage; use `kimi/*` models
-  (k3, kimi-for-coding, -highspeed) in any harness; and use `alex/*` models
-  inside the Kimi harness. Kimi subscription + agent added to the e2e suite.
 - **`alexandria` → `alex` rename** — project-wide rename with a one-time,
   no-data-loss upgrade migration (`~/.alexandria` → `~/.alex`,
   `com.alexandria.daemon` → `com.alex.daemon`, `ALEXANDRIA_*` → `ALEX_*` with
@@ -21,6 +17,12 @@ predate this file — see the git history and GitHub releases.
   platforms; pending live zero-downtime verification.
 
 ### Added (on `main`, for the next release)
+- **Kimi Code integration** — log in to Kimi through Alex (`alex auth login
+  kimi`, OAuth device flow) or adopt an existing `~/.kimi-code` login (`alex
+  auth import kimi`); Kimi usage/quota shows in `alex status` and the menu;
+  use `kimi/k3`, `kimi/kimi-for-coding`, and `-highspeed` in any harness; and
+  `alex connect kimi` exposes your `alex/*` models inside the Kimi CLI's own
+  model picker (reversible). Tokens auto-refresh on their 15-minute cycle.
 - **Proactive re-auth notifications** — the Telegram/notification reauth alert
   now fires when a login expires while idle or a background token refresh fails
   on a revoked token, not only when a live request hits a 401. Debounced, and
