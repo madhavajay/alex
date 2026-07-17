@@ -20,8 +20,14 @@ final class AuthFlowModel {
     private(set) var stage: Stage = .starting
     private(set) var session: LoginSession?
     var pasteInput = ""
+    /// True while a "Use existing Kimi login" import is in flight.
+    private(set) var importing = false
     var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
     private var pollTask: Task<Void, Never>?
+
+    /// Kimi backs a one-click "use the CLI's existing login" import path, since
+    /// the user usually already authed `kimi` (`~/.kimi-code/credentials`).
+    var supportsExistingImport: Bool { provider == "kimi" }
 
     init(
         provider: String, accountName: String? = "default", autoIdentity: Bool = false,
@@ -111,6 +117,37 @@ final class AuthFlowModel {
         }
     }
 
+    /// Adopt the credentials the Kimi CLI already stored (equivalent of
+    /// `alex auth import kimi`) instead of running the device flow. This is the
+    /// fast path for a user who already logged into `kimi`. Tokens stay in the
+    /// daemon vault; nothing secret is surfaced here.
+    func useExistingKimiLogin() {
+        guard supportsExistingImport, !importing, let config = store.config else { return }
+        importing = true
+        pollTask?.cancel()
+        let client = AlexandriaClient(config: config)
+        Task { [weak self] in
+            defer { self?.importing = false }
+            do {
+                let outcomes = try await client.authImport(source: "kimi")
+                if let imported = outcomes.first(where: { !$0.imported.isEmpty }),
+                   let accountId = imported.imported.first {
+                    self?.stage = .done(accountId)
+                    if let self {
+                        await self.store.refresh()
+                        self.onAuthenticated?(self.provider)
+                    }
+                } else {
+                    let note = outcomes.first?.note
+                        ?? "No existing Kimi login found. Run `kimi` and sign in, or use the device code above."
+                    self?.stage = .failed(note)
+                }
+            } catch {
+                self?.stage = .failed(error.localizedDescription)
+            }
+        }
+    }
+
     func openAuthorizeUrl() {
         if let url = authorizeUrl.flatMap(URL.init(string:)) {
             NSWorkspace.shared.open(url)
@@ -133,6 +170,7 @@ enum AuthProviderCopy {
         case "gemini": "by Google"
         case "xai": "by xAI"
         case "amp": "by Sourcegraph"
+        case "kimi": "by Moonshot AI"
         case "openrouter": "by OpenRouter"
         default: "OAuth sign-in"
         }
@@ -494,6 +532,41 @@ struct AuthFlowView: View {
                 }
                 AuthWaitingBox("Waiting for the browser callback — keep this window open.")
             }
+            if model.supportsExistingImport {
+                existingLoginSection
+            }
+        }
+    }
+
+    /// One-click "adopt the CLI's existing login" affordance (Kimi): the user
+    /// usually already ran `kimi` and authed, so importing those credentials is
+    /// the fast path that avoids the device dance. Runs the daemon's
+    /// `import kimi`; tokens never surface in the UI.
+    @ViewBuilder
+    private var existingLoginSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Rectangle()
+                .fill(AlexTheme.Colors.overlay(0.06))
+                .frame(height: 1)
+            Text("Already signed in with the \(model.providerName) CLI?")
+                .font(.system(size: 12))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            HStack(spacing: 8) {
+                Button {
+                    model.useExistingKimiLogin()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.arrow.down")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Use existing \(model.providerName) login")
+                    }
+                }
+                .buttonStyle(AuthTintButtonStyle(accent: accent))
+                .disabled(model.importing)
+                if model.importing {
+                    ProgressView().controlSize(.small)
+                }
+            }
         }
     }
 
@@ -505,7 +578,7 @@ struct AuthFlowView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(AlexTheme.Colors.success)
             }
-            Text("The account identity was detected automatically and saved. Alexandria also requested its current Codex usage without sending a model prompt.")
+            Text(doneDetail)
                 .font(.system(size: 12))
                 .foregroundStyle(AlexTheme.Colors.textSecondary)
         }
@@ -516,6 +589,19 @@ struct AuthFlowView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(AlexTheme.Colors.success.opacity(0.18)))
+    }
+
+    /// The "account added" body copy. Codex is the one provider that also pulls
+    /// usage during login; other providers get a neutral confirmation.
+    private var doneDetail: String {
+        switch model.provider {
+        case "openai":
+            "The account identity was detected automatically and saved. Alexandria also requested its current Codex usage without sending a model prompt."
+        case "kimi":
+            "The Kimi account was saved to the local vault and is ready to route requests."
+        default:
+            "The account was detected automatically and saved to the local vault."
+        }
     }
 
     private func failedCard(_ error: String) -> some View {
@@ -533,8 +619,26 @@ struct AuthFlowView: View {
                 .foregroundStyle(AlexTheme.Colors.textSecondary)
                 .textSelection(.enabled)
                 .lineLimit(5)
-            Button("Try Again") { model.begin() }
-                .buttonStyle(AuthTintButtonStyle(accent: accent))
+            HStack(spacing: 8) {
+                Button("Try Again") { model.begin() }
+                    .buttonStyle(AuthTintButtonStyle(accent: accent))
+                if model.supportsExistingImport {
+                    Button {
+                        model.useExistingKimiLogin()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("Use existing \(model.providerName) login")
+                        }
+                    }
+                    .buttonStyle(AuthTintButtonStyle(accent: accent))
+                    .disabled(model.importing)
+                    if model.importing {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)

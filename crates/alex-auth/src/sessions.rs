@@ -7,10 +7,11 @@ use tokio::sync::Mutex;
 
 use crate::login::{
     anthropic_authorize_url, claude_exchange, codex_device_exchange_auto, codex_device_poll_once,
-    codex_device_start, codex_exchange_named, generate_pkce, openai_authorize_url,
-    wait_for_openai_callback, xai_device_poll_once, xai_device_start, xai_upsert_from_tokens,
-    CodexDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL,
-    OPENAI_REDIRECT_URI,
+    codex_device_start, codex_exchange_named, generate_pkce, kimi_device_poll_once_at,
+    kimi_device_start_at, kimi_oauth_host, kimi_upsert_from_tokens, kimi_verification_url,
+    openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
+    xai_upsert_from_tokens, CodexDevicePoll, KimiDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
+    OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
 use crate::{named_account_id, now_ms, Vault};
 
@@ -66,6 +67,11 @@ type SharedSession = Arc<Mutex<LoginSession>>;
 #[derive(Default)]
 pub struct LoginManager {
     sessions: Mutex<HashMap<String, SharedSession>>,
+    /// Optional OAuth-host override for the Kimi device flow. `None` (the
+    /// default, used in production) resolves the host via
+    /// `KIMI_*_OAUTH_HOST`/default at start time; tests set this to point the
+    /// flow at a local mock without racing process-wide env vars.
+    kimi_oauth_host: Option<String>,
 }
 
 fn random_id() -> String {
@@ -76,6 +82,16 @@ fn random_id() -> String {
 }
 
 impl LoginManager {
+    /// Test-only: build a manager whose Kimi device flow targets `host`
+    /// (a local mock) instead of the real Moonshot OAuth host.
+    #[cfg(test)]
+    fn with_kimi_oauth_host(host: impl Into<String>) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            kimi_oauth_host: Some(host.into()),
+        }
+    }
+
     pub async fn start(
         &self,
         vault: Arc<Vault>,
@@ -91,6 +107,7 @@ impl LoginManager {
                 self.start_codex(&id, vault.clone(), account_name).await?
             }
             "grok" | "xai" => self.start_grok(&id, vault.clone(), account_name).await?,
+            "kimi" | "kimi-code" => self.start_kimi(&id, vault.clone(), account_name).await?,
             "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
             "amp" | "ampcode" => {
                 // Amp uses CLI secrets / API key, not OAuth paste. Import now.
@@ -122,7 +139,9 @@ impl LoginManager {
                 let _ = &mut session;
                 Arc::new(Mutex::new(session))
             }
-            other => bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp)"),
+            other => {
+                bail!("unknown provider '{other}' (expected claude|codex|grok|gemini|amp|kimi)")
+            }
         };
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
@@ -466,6 +485,78 @@ impl LoginManager {
         Ok(shared)
     }
 
+    /// Kimi Code (Moonshot AI) RFC 8628 device authorization grant. Mirrors
+    /// `start_grok`: kick off the device flow, expose the `user_code` +
+    /// `authorize_device` URL in the session snapshot, then poll to completion
+    /// in the background and store the account. Never logs token material.
+    async fn start_kimi(
+        &self,
+        id: &str,
+        vault: Arc<Vault>,
+        account_name: &str,
+    ) -> Result<SharedSession> {
+        let oauth_host = self.kimi_oauth_host.clone().unwrap_or_else(kimi_oauth_host);
+        let http = reqwest::Client::new();
+        let start = kimi_device_start_at(&http, &oauth_host).await?;
+        let session = LoginSession {
+            id: id.to_string(),
+            provider: "kimi".into(),
+            mode: "device",
+            // The verification URL the user opens (server-provided complete URL,
+            // else the canonical Kimi one with the user_code appended).
+            authorize_url: Some(kimi_verification_url(&start)),
+            user_code: Some(start.user_code.clone()),
+            verification_uri: start.verification_uri.clone(),
+            verification_uri_complete: start.verification_uri_complete.clone(),
+            created_ms: now_ms(),
+            expires_at_ms: now_ms() + start.expires_in * 1000,
+            account_name: account_name.to_string(),
+            verifier: None,
+            phase: LoginPhase::Pending,
+        };
+        let shared = Arc::new(Mutex::new(session));
+        let worker = shared.clone();
+        let account_name = account_name.to_string();
+        tokio::spawn(async move {
+            let deadline = now_ms() + start.expires_in * 1000;
+            let mut interval = start.interval.max(1) as u64;
+            let phase = loop {
+                if now_ms() > deadline {
+                    break LoginPhase::Failed {
+                        error: "device code expired before authorization completed".into(),
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match kimi_device_poll_once_at(&http, &oauth_host, &start.device_code).await {
+                    KimiDevicePoll::Pending => continue,
+                    KimiDevicePoll::SlowDown => {
+                        interval += 5;
+                        continue;
+                    }
+                    KimiDevicePoll::Done(tokens) => {
+                        break match kimi_upsert_from_tokens(&vault, &tokens).await {
+                            Ok(account_id) => {
+                                match rename_login_account(&vault, &account_id, &account_name).await
+                                {
+                                    Ok(account_id) => LoginPhase::Done { account_id },
+                                    Err(e) => LoginPhase::Failed {
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            Err(e) => LoginPhase::Failed {
+                                error: e.to_string(),
+                            },
+                        };
+                    }
+                    KimiDevicePoll::Failed(e) => break LoginPhase::Failed { error: e },
+                }
+            };
+            worker.lock().await.phase = phase;
+        });
+        Ok(shared)
+    }
+
     async fn prune(&self) {
         let now = now_ms();
         self.sessions
@@ -575,6 +666,100 @@ mod tests {
         let (dir, vault) = temp_vault("unknown");
         let mgr = LoginManager::default();
         assert!(mgr.start(vault, "hal9000", "default").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Minimal RFC 8628 mock: `/api/oauth/device_authorization` hands out a
+    /// device+user code, `/api/oauth/token` returns tokens on the first poll.
+    /// Returns the `http://127.0.0.1:PORT` base to hand `with_kimi_oauth_host`.
+    async fn spawn_kimi_mock() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("");
+                let body = if target.contains("device_authorization") {
+                    r#"{"device_code":"dev-code-xyz","user_code":"WXYZ-1234","verification_uri":"https://www.kimi.com/code/authorize_device","expires_in":900,"interval":1}"#
+                } else if target.contains("token") {
+                    r#"{"access_token":"kimi-access-token","refresh_token":"kimi-refresh-token","expires_in":900,"scope":"kimi-code"}"#
+                } else {
+                    "{}"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn kimi_device_session_starts_and_authorizes() {
+        let (dir, vault) = temp_vault("kimi");
+        let host = spawn_kimi_mock().await;
+        let mgr = LoginManager::with_kimi_oauth_host(host);
+
+        // start → a device session exposing the user_code and authorize_device URL.
+        let snap = mgr.start(vault.clone(), "kimi", "default").await.unwrap();
+        assert_eq!(snap["mode"], "device");
+        assert_eq!(snap["state"], "pending");
+        assert_eq!(snap["provider"], "kimi");
+        assert_eq!(snap["user_code"], "WXYZ-1234");
+        let authorize_url = snap["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains("authorize_device"),
+            "authorize_url should point at the Kimi device page: {authorize_url}"
+        );
+        assert!(
+            authorize_url.contains("user_code=WXYZ-1234"),
+            "authorize_url should carry the user_code: {authorize_url}"
+        );
+        // The token must never leak into the session snapshot the UI reads.
+        assert!(!snap.to_string().contains("kimi-access-token"));
+
+        // poll → the background worker authorizes and stores the account.
+        let id = snap["login_id"].as_str().unwrap().to_string();
+        let mut done: Option<Value> = None;
+        for _ in 0..50 {
+            let status = mgr.status(&id).await.unwrap();
+            if status["state"] == "done" {
+                done = Some(status);
+                break;
+            }
+            assert_ne!(
+                status["state"], "failed",
+                "device login unexpectedly failed: {status}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let done = done.expect("device login did not reach 'done' in time");
+        let account_id = done["account_id"].as_str().unwrap();
+        assert_eq!(account_id, "kimi-oauth");
+        assert!(!done.to_string().contains("kimi-access-token"));
+
+        // The Kimi account is now in the vault with its (undisplayed) token.
+        let accounts = vault.list().await;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == "kimi-oauth")
+            .expect("kimi account should be stored");
+        assert_eq!(account.provider.as_str(), "kimi");
+        assert_eq!(account.access_token.as_deref(), Some("kimi-access-token"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

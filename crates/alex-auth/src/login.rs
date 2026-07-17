@@ -56,12 +56,23 @@ pub fn kimi_oauth_host() -> String {
     KIMI_OAUTH_HOST.to_string()
 }
 
+pub fn kimi_device_authorization_url_at(oauth_host: &str) -> String {
+    format!(
+        "{}/api/oauth/device_authorization",
+        oauth_host.trim_end_matches('/')
+    )
+}
+
 pub fn kimi_device_authorization_url() -> String {
-    format!("{}/api/oauth/device_authorization", kimi_oauth_host())
+    kimi_device_authorization_url_at(&kimi_oauth_host())
+}
+
+pub fn kimi_token_url_at(oauth_host: &str) -> String {
+    format!("{}/api/oauth/token", oauth_host.trim_end_matches('/'))
 }
 
 pub fn kimi_token_url() -> String {
-    format!("{}/api/oauth/token", kimi_oauth_host())
+    kimi_token_url_at(&kimi_oauth_host())
 }
 pub const GEMINI_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GEMINI_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile openid";
@@ -1221,8 +1232,18 @@ pub fn kimi_verification_url(start: &KimiDeviceStart) -> String {
 }
 
 pub async fn kimi_device_start(http: &reqwest::Client) -> Result<KimiDeviceStart> {
+    kimi_device_start_at(http, &kimi_oauth_host()).await
+}
+
+/// Same as [`kimi_device_start`] but against an explicit OAuth host. Lets the
+/// login-session manager (and tests) target a mock server without touching the
+/// process-wide `KIMI_*_OAUTH_HOST` env vars.
+pub async fn kimi_device_start_at(
+    http: &reqwest::Client,
+    oauth_host: &str,
+) -> Result<KimiDeviceStart> {
     let resp = http
-        .post(kimi_device_authorization_url())
+        .post(kimi_device_authorization_url_at(oauth_host))
         .header("X-Msh-Platform", KIMI_DEVICE_PLATFORM)
         .form(&[("client_id", KIMI_CLIENT_ID)])
         .send()
@@ -1273,8 +1294,17 @@ pub async fn kimi_device_poll_once(
     http: &reqwest::Client,
     device_code: &str,
 ) -> KimiDevicePoll {
+    kimi_device_poll_once_at(http, &kimi_oauth_host(), device_code).await
+}
+
+/// Same as [`kimi_device_poll_once`] but against an explicit OAuth host.
+pub async fn kimi_device_poll_once_at(
+    http: &reqwest::Client,
+    oauth_host: &str,
+    device_code: &str,
+) -> KimiDevicePoll {
     let resp = http
-        .post(kimi_token_url())
+        .post(kimi_token_url_at(oauth_host))
         .header("X-Msh-Platform", KIMI_DEVICE_PLATFORM)
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
