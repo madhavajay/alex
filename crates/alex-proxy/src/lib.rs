@@ -8906,6 +8906,7 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct RecordingNotificationPersister {
         settings: std::sync::Mutex<Vec<notify::NotificationSettings>>,
     }
