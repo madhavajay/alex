@@ -806,21 +806,23 @@ struct LimitsCardView: View {
     /// status dot + version + phase/latency, matching the pre-restyle layout.
     @ViewBuilder
     private var agentChip: some View {
-        if let dario,
-           let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
-        {
-            let tint = agentTint(active)
+        if let dario {
+            let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
+                ?? dario.generations.first
+            let tint = active.map { agentTint($0) } ?? AlexTheme.Colors.destructive
             Button(action: { onOpenDario?() }) {
                 HStack(spacing: 6) {
                     StatusDot(tint: tint, size: 5)
                     Text("Dario")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(AlexTheme.Colors.textSecondary)
-                    Text("v\(active.version)")
-                        .font(AlexTheme.Fonts.mono(10))
-                        .foregroundStyle(AlexTheme.Colors.textFaint)
+                    if let active {
+                        Text("v\(active.version)")
+                            .font(AlexTheme.Fonts.mono(10))
+                            .foregroundStyle(AlexTheme.Colors.textFaint)
+                    }
                     Spacer()
-                    Text(agentStatusText(active))
+                    Text(active.map { agentStatusText($0) } ?? "down")
                         .font(.system(size: 9))
                         .foregroundStyle(tint)
                 }

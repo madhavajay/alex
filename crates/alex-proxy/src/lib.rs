@@ -6324,6 +6324,27 @@ fn policy_covers(class: ErrorClass, policy: &ProtectionPolicy) -> bool {
         && (reroutable_error_class(class) || (class == ErrorClass::Auth && policy.reroute_on_auth))
 }
 
+/// Canonical names for the model aliases accepted by the Protection UI.
+/// This only affects matching a policy key; the configured equivalent is still
+/// routed exactly as written.
+fn canonical_model_alias(model: &str) -> &str {
+    // Clients/harnesses route by prefixed model ids (codex selects "alex/claude-fable-5",
+    // some catalogs expose "claude-alex/…", and cross-format calls carry "openai/"/"anthropic/").
+    // Strip the routing prefix before aliasing so equivalency keys match regardless of prefix.
+    let model = model
+        .strip_prefix("alex/")
+        .or_else(|| model.strip_prefix("claude-alex/"))
+        .or_else(|| model.strip_prefix("openai/"))
+        .or_else(|| model.strip_prefix("anthropic/"))
+        .unwrap_or(model);
+    match model {
+        "fable-5" | "claude-fable-5" => "claude-fable-5",
+        "sol" | "gpt-5.6-sol" => "gpt-5.6-sol",
+        "terra" | "gpt-5.6-terra" => "gpt-5.6-terra",
+        _ => model,
+    }
+}
+
 fn protection_equivalent(
     policy: &ProtectionPolicy,
     requested_model: &str,
@@ -6333,22 +6354,26 @@ fn protection_equivalent(
     if !policy.enabled {
         return None;
     }
-    policy
-        .equivalencies
-        .get(requested_model)?
-        .iter()
-        .find_map(|(provider, model)| {
-            let candidate_provider = match provider.as_str() {
-                "anthropic" => Provider::Anthropic,
-                "openai" => Provider::Openai,
-                "xai" => Provider::Xai,
-                "gemini" => Provider::Gemini,
-                "openrouter" => Provider::Openrouter,
-                _ => return None,
-            };
-            (candidate_provider != current_provider && !attempted_models.contains(model))
-                .then(|| (candidate_provider, model.clone()))
-        })
+    let equivalents = policy.equivalencies.get(requested_model).or_else(|| {
+        let requested_alias = canonical_model_alias(requested_model);
+        policy
+            .equivalencies
+            .iter()
+            .find(|(model, _)| canonical_model_alias(model) == requested_alias)
+            .map(|(_, equivalents)| equivalents)
+    })?;
+    equivalents.iter().find_map(|(provider, model)| {
+        let candidate_provider = match provider.as_str() {
+            "anthropic" => Provider::Anthropic,
+            "openai" => Provider::Openai,
+            "xai" => Provider::Xai,
+            "gemini" => Provider::Gemini,
+            "openrouter" => Provider::Openrouter,
+            _ => return None,
+        };
+        (candidate_provider != current_provider && !attempted_models.contains(model))
+            .then(|| (candidate_provider, model.clone()))
+    })
 }
 
 fn take_pending_injection(
@@ -10319,6 +10344,58 @@ mod tests {
             .remove(0);
         assert_eq!(trace["substituted"], true);
         assert_eq!(trace["substitution_reason"], "auth");
+        assert_eq!(trace["original_model"], "claude-fable-5");
+        assert_eq!(trace["served_model"], "gpt-5.6-sol");
+    }
+
+    #[tokio::test]
+    async fn protection_equivalency_accepts_short_model_aliases_for_capacity_failover() {
+        let state = test_state("protection-short-model-alias");
+        set_protection_policy(
+            &state,
+            ProtectionPolicy {
+                enabled: true,
+                reroute_on_auth: false,
+                retries: 1,
+                auto_return: true,
+                equivalencies: BTreeMap::from([(
+                    "fable-5".into(),
+                    BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+                )]),
+            },
+        );
+        let mut anthropic = test_openai_account("anthropic-original");
+        anthropic.id = "anthropic-oauth-original".into();
+        anthropic.provider = Provider::Anthropic;
+        state.vault.upsert(anthropic).await.unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-fallback", Provider::Openai))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("429:rate_limit_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-fable-5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["substitution_reason"], "capacity");
         assert_eq!(trace["original_model"], "claude-fable-5");
         assert_eq!(trace["served_model"], "gpt-5.6-sol");
     }

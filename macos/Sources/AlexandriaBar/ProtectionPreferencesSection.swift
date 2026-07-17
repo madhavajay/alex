@@ -158,38 +158,46 @@ struct ProtectionPreferencesSection: View {
     }
 
     private var equivalencyGrid: some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 7) {
-            GridRow {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
                 Text("Model")
+                    .frame(minWidth: 110, maxWidth: .infinity, alignment: .leading)
                 Text("")
+                    .frame(width: 10)
                 Text("Provider")
+                    .frame(width: 100, alignment: .leading)
                 Text("")
+                    .frame(width: 6)
                 Text("Equivalent model")
+                    .frame(minWidth: 110, maxWidth: .infinity, alignment: .leading)
                 Text("")
+                    .frame(width: 16)
             }
             .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(AlexTheme.Colors.textTertiary)
             .padding(.top, 10)
 
             ForEach($equivalencies) { $row in
-                GridRow {
+                HStack(spacing: 8) {
                     TextField("model", text: $row.model)
-                        .settingsField()
-                        .frame(width: 155)
+                        .settingsField(width: nil)
+                        .frame(minWidth: 110, maxWidth: .infinity)
                     Text("→")
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .frame(width: 10)
                     Picker("Provider", selection: $row.provider) {
                         ForEach(Self.providers, id: \.self) { provider in
                             Text(provider).tag(provider)
                         }
                     }
-                    .labelsHidden()
-                    .frame(width: 112)
+                    .settingsPicker()
+                    .frame(width: 100)
                     Text(":")
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .frame(width: 6)
                     TextField("equivalent model", text: $row.equivalentModel)
-                        .settingsField()
-                        .frame(width: 170)
+                        .settingsField(width: nil)
+                        .frame(minWidth: 110, maxWidth: .infinity)
                     Button {
                         removeEquivalency(row.id)
                     } label: {
@@ -197,6 +205,7 @@ struct ProtectionPreferencesSection: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .frame(width: 16)
                     .help("Remove equivalency")
                 }
             }
@@ -281,9 +290,9 @@ struct ProtectionPreferencesSection: View {
     private func loadAnthropicOpenAIPreset() {
         equivalencies = [
             ProtectionEquivalencyRow(
-                model: "fable-5", provider: "openai", equivalentModel: "gpt-5.6-sol"),
+                model: "claude-fable-5", provider: "openai", equivalentModel: "gpt-5.6-sol"),
             ProtectionEquivalencyRow(
-                model: "gpt-5.6-sol", provider: "anthropic", equivalentModel: "fable-5"),
+                model: "gpt-5.6-sol", provider: "anthropic", equivalentModel: "claude-fable-5"),
         ]
         actionResult = "Preset loaded — save to apply"
     }
