@@ -49,7 +49,13 @@ install_macos() {
   remove_legacy_app
 
   alex_bin="$(brew --prefix)/bin/alex"
-  "$alex_bin" service install
+  # A busy daemon (in-flight routed requests) makes `service install` exit 1 and
+  # asks for `alex service restart`. Don't let that abort the install or block
+  # the app launch — surface it and carry on.
+  if ! "$alex_bin" service install; then
+    say "Daemon was busy, so it kept running the old build."
+    say "Apply the update when idle with: alex service restart --force"
+  fi
   open -a Alex
 
   say "Alexandria is installed. The daemon is registered to run at login."
