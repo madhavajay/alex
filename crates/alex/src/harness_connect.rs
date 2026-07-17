@@ -5109,6 +5109,7 @@ mod tests {
             data_dir: tmpdir("data"),
             local_key: "alx-test".into(),
             heartbeat_minutes: crate::default_heartbeat_minutes(),
+            reauth_check_minutes: crate::default_reauth_check_minutes(),
             ping_anthropic_model: crate::default_ping_anthropic(),
             ping_openai_model: crate::default_ping_openai(),
             ping_xai_model: crate::default_ping_xai(),
