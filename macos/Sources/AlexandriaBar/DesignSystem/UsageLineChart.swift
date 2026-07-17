@@ -288,12 +288,17 @@ struct UsageLineChart: View {
 
 #if DEBUG
 #Preview("UsageLineChart") {
-    let hours = (0..<24).map { String(format: "%02d:00", $0) }
-    let primary = (0..<24).map { hour in
-        3.2e7 + 1.8e7 * sin(Double(hour) / 4) + Double(hour) * 2e5
+    // Explicit element types + an intermediate `h` keep each closure a trivial
+    // type-check. Without them the compiler tries to solve the whole #Preview as
+    // one expression and times out ("unable to type-check in reasonable time").
+    let hours: [String] = (0..<24).map { String(format: "%02d:00", $0) }
+    let primary: [Double] = (0..<24).map { hour in
+        let h = Double(hour)
+        return 3.2e7 + 1.8e7 * sin(h / 4) + h * 2e5
     }
-    let secondary = (0..<24).map { hour in
-        1.4e7 + 0.9e7 * cos(Double(hour) / 3)
+    let secondary: [Double] = (0..<24).map { hour in
+        let h = Double(hour)
+        return 1.4e7 + 0.9e7 * cos(h / 3)
     }
     return VStack(alignment: .leading, spacing: AlexTheme.Spacing.lg) {
         Text("Tokens routed over time")
