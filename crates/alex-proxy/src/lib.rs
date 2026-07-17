@@ -4196,8 +4196,9 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "description": a.description,
                 "email": email,
                 "paused": a.paused,
-                "path": a.path.map(|p| p.display().to_string()),
+                "path": a.path.as_ref().map(|p| p.display().to_string()),
                 "status": a.status,
+                "needs_reauth": a.needs_reauth(),
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
                 "routing": routing,
@@ -9108,10 +9109,116 @@ fn reauth_notification_event_for_account(account: &Account) -> notify::Notificat
         level: notify::NotificationLevel::Warn,
         category: "reauth".into(),
         title: format!("{} needs re-authentication", provider),
-        body: "Alexandria received an authentication error for this managed subscription. Re-authenticate it before retrying.".into(),
+        body: reauth_body_for(account.provider),
         account: notify::NotificationAccount { provider: provider.clone(), label },
-        action_url: Some(format!("alex auth login {provider}")),
+        action_url: Some(reauth_action_for(account.provider)),
         ts: now_ms(),
+    }
+}
+
+/// Provider-specific, secret-free guidance for the re-auth notification body.
+/// Anthropic keeps the Dario/Claude Code phrasing added in beta.5; the rest use
+/// the generic managed-subscription message. The body never contains tokens.
+fn reauth_body_for(provider: Provider) -> String {
+    match provider {
+        Provider::Anthropic => "Your Claude (Anthropic) login is logged out — its OAuth token expired and could not be refreshed. Re-authenticate with `alex auth login anthropic` (or `claude` login for Dario).".into(),
+        _ => "This managed subscription is logged out — its OAuth token expired and could not be refreshed. Re-authenticate it before retrying.".into(),
+    }
+}
+
+fn reauth_action_for(provider: Provider) -> String {
+    format!("alex auth login {}", provider.as_str())
+}
+
+/// Grace period after `expires_at_ms` before the watchdog treats an idle token
+/// as dead. Absorbs clock skew and the normal just-in-time refresh window so a
+/// token that is merely about to expire is never mistaken for a logout.
+const REAUTH_EXPIRY_GRACE_MS: i64 = 60_000;
+
+/// Proactive logout watchdog. Runs on a lightweight daemon timer (independent
+/// of the heartbeat/ping loop, so it fires even when heartbeats are disabled)
+/// and closes the gap where an OAuth token expires while the proxy is idle: no
+/// live request means the request-path re-auth notification never fires.
+///
+/// For each active managed OAuth account whose access token has expired past a
+/// small grace window it distinguishes a *silently refreshable* token (which it
+/// refreshes in place, no alert) from a genuinely *dead* one — no refresh token
+/// at all, or a refresh the provider rejects with invalid_grant — and only for
+/// the latter does it emit `emit_reauth_notification_for_account`. That reuses
+/// the exact same dispatcher (and its cooldown) as the live 401 path, so a
+/// persistently-dead account alerts about once per cooldown window rather than
+/// every tick, and the live/proactive events coalesce. The per-account
+/// needs-reauth flag is set on death and cleared on a successful refresh so the
+/// admin UI reflects it and the next fresh logout alerts again.
+pub async fn reauth_watch_once(state: &Arc<AppState>) {
+    let now = now_ms();
+    for account in state.vault.list().await {
+        // Only managed OAuth logins expire and need refreshing. API-key
+        // accounts (openrouter/amp/exo) never reach here; paused or non-active
+        // accounts are intentionally left alone.
+        if account.kind != "oauth" || account.paused || account.status != "active" {
+            continue;
+        }
+        let Some(expires_at) = account.expires_at_ms else {
+            // Unknown expiry: never claim a logout we cannot prove.
+            continue;
+        };
+        if expires_at > now - REAUTH_EXPIRY_GRACE_MS {
+            // Still valid (or only within the normal refresh margin). If it was
+            // previously flagged as logged out, a fresh login/refresh has
+            // recovered it: clear the flag so the next genuine logout alerts.
+            if account.needs_reauth() {
+                mark_account_needs_reauth(state, &account.id, false).await;
+            }
+            continue;
+        }
+        let has_refresh_token = account
+            .refresh_token
+            .as_deref()
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false);
+        if !has_refresh_token {
+            // Expired with nothing to refresh from: a confirmed logout.
+            mark_account_needs_reauth(state, &account.id, true).await;
+            emit_reauth_notification_for_account(state, &account);
+            continue;
+        }
+        // Has a refresh token: the only reliable way to tell a live login from a
+        // revoked one is to try. Success silently recovers the account (no
+        // alert); an invalid_grant is a confirmed logout; a transient failure is
+        // ignored so a network blip never cries wolf.
+        match state.vault.refresh(&account.id, true).await {
+            Ok(_) => {
+                // Silently recovered. Clear a prior flag (a refresh copies the
+                // old account_meta forward, so an earlier logout mark can
+                // survive the token swap and must be reset here).
+                if account.needs_reauth() {
+                    mark_account_needs_reauth(state, &account.id, false).await;
+                }
+            }
+            Err(error) if alex_auth::refresh_error_needs_reauth(&error) => {
+                mark_account_needs_reauth(state, &account.id, true).await;
+                emit_reauth_notification_for_account(state, &account);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    account = %account.id,
+                    "proactive reauth refresh failed transiently; not alerting: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Persist (or clear) the display-only needs-reauth flag on an account so the
+/// admin/accounts view and UI reflect the logout. Never stores credentials.
+async fn mark_account_needs_reauth(state: &AppState, account_id: &str, needs: bool) {
+    if let Err(error) = state
+        .vault
+        .set_account_meta(account_id, "needs_reauth", json!(needs))
+        .await
+    {
+        tracing::warn!(account = %account_id, %error, "could not update needs_reauth flag");
     }
 }
 
@@ -12837,5 +12944,245 @@ mod tests {
             "Dario is down — your Claude Code login needs re-auth. Run `claude` login (or tap Reauth Dario)."
         );
         assert_ne!(event["action_url"], "alex auth login anthropic");
+    }
+
+    fn expired_oauth_account(
+        provider: Provider,
+        name: &str,
+        refresh_token: Option<&str>,
+        expires_at_ms: i64,
+    ) -> Account {
+        Account {
+            id: format!("{}-oauth-{name}", provider.as_str()),
+            provider,
+            kind: "oauth".into(),
+            name: name.into(),
+            description: None,
+            paused: false,
+            label: Some(format!("{} (test)", provider.as_str())),
+            access_token: Some(format!("token-{name}")),
+            refresh_token: refresh_token.map(str::to_string),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(expires_at_ms),
+            last_refresh_ms: Some(expires_at_ms),
+            account_meta: json!({}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    fn reauth_channel(url: String) -> notify::NotificationSettings {
+        notify::NotificationSettings {
+            channels: vec![notify::NotificationChannelConfig {
+                url,
+                min_level: notify::NotificationLevel::Warn,
+                categories: vec!["reauth".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn first_event(
+        received: &Arc<std::sync::Mutex<Vec<Value>>>,
+        context: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = received.lock().unwrap().first().cloned() {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}"))
+    }
+
+    async fn needs_reauth_flag(state: &Arc<AppState>, id: &str) -> bool {
+        state
+            .vault
+            .list()
+            .await
+            .into_iter()
+            .find(|a| a.id == id)
+            .expect("account present")
+            .needs_reauth()
+    }
+
+    /// Local OAuth token endpoint that always rejects a refresh with a 400
+    /// invalid_grant, so the proactive path sees a confirmed logout.
+    async fn invalid_grant_token_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn reject() -> Response {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": "invalid_grant"})),
+            )
+                .into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(reject));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), server)
+    }
+
+    #[tokio::test]
+    async fn proactive_idle_expiry_without_refresh_token_emits_one_reauth_notification() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("proactive-expiry-dead");
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Anthropic,
+                "idle",
+                None,
+                now_ms() - 5 * 60_000,
+            ))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+
+        let event = first_event(
+            &received,
+            "idle-expired account with no refresh token did not alert",
+        )
+        .await;
+        sink.abort();
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["provider"], "anthropic");
+        assert_eq!(event["action_url"], "alex auth login anthropic");
+        // The delivered payload must never carry credential material (the
+        // access token value for this account is "token-idle").
+        let serialized = event.to_string();
+        assert!(!serialized.contains("token-idle"));
+        assert!(needs_reauth_flag(&state, "anthropic-oauth-idle").await);
+    }
+
+    #[tokio::test]
+    async fn proactive_refresh_invalid_grant_emits_reauth_notification() {
+        let (url, received, sink) = webhook_sink().await;
+        let (token_url, token_server) = invalid_grant_token_server().await;
+        let state = test_state("proactive-invalid-grant");
+        state.vault.set_refresh_endpoint_override(Some(token_url));
+        // Non-default name so a native re-import can never collide and mask the
+        // rejected refresh (import writes the `<provider>-oauth` default id).
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "expired-invalid",
+                Some("dead-refresh-token"),
+                now_ms() - 5 * 60_000,
+            ))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+
+        let event = first_event(
+            &received,
+            "refresh rejected with invalid_grant did not alert",
+        )
+        .await;
+        sink.abort();
+        token_server.abort();
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["provider"], "openai");
+        assert!(!event.to_string().contains("dead-refresh-token"));
+        assert!(needs_reauth_flag(&state, "openai-oauth-expired-invalid").await);
+    }
+
+    #[tokio::test]
+    async fn proactive_expiry_debounces_within_cooldown_window() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("proactive-debounce");
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "idle-dead",
+                None,
+                now_ms() - 5 * 60_000,
+            ))
+            .await
+            .unwrap();
+        // Default 30-minute cooldown: two back-to-back ticks must coalesce.
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+        reauth_watch_once(&state).await;
+
+        // Let any deliveries land before counting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+        assert_eq!(
+            count, 1,
+            "a persistently-expired account must alert once per cooldown window, not per tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_not_yet_expired_account_never_alerts() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("proactive-still-valid");
+        // Not yet expired and holding a refresh token: silently refreshable, so
+        // it is not a logout and must never alert.
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "fresh",
+                Some("good-refresh-token"),
+                now_ms() + 60 * 60_000,
+            ))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+        assert_eq!(count, 0, "a still-valid refreshable account must not alert");
+        assert!(!needs_reauth_flag(&state, "openai-oauth-fresh").await);
+    }
+
+    #[tokio::test]
+    async fn recovered_account_clears_needs_reauth_so_next_logout_alerts() {
+        let (url, _received, sink) = webhook_sink().await;
+        let state = test_state("proactive-recovery-clear");
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "recovered",
+                Some("good-refresh-token"),
+                now_ms() + 60 * 60_000,
+            ))
+            .await
+            .unwrap();
+        // Simulate a prior logout that flagged the account; the user has since
+        // re-authenticated (token is now valid again).
+        mark_account_needs_reauth(&state, "openai-oauth-recovered", true).await;
+        assert!(needs_reauth_flag(&state, "openai-oauth-recovered").await);
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+
+        sink.abort();
+        assert!(
+            !needs_reauth_flag(&state, "openai-oauth-recovered").await,
+            "a recovered account must have its needs-reauth flag cleared"
+        );
     }
 }

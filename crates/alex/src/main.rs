@@ -923,6 +923,11 @@ struct Config {
     local_key: String,
     #[serde(default = "default_heartbeat_minutes")]
     heartbeat_minutes: u64,
+    /// How often the proactive logout watchdog checks for managed OAuth logins
+    /// whose token expired while idle (and cannot silently refresh) so it can
+    /// fire the re-auth notification without a live request. 0 disables it.
+    #[serde(default = "default_reauth_check_minutes")]
+    reauth_check_minutes: u64,
     #[serde(default = "default_ping_anthropic")]
     ping_anthropic_model: String,
     #[serde(default = "default_ping_openai")]
@@ -1085,6 +1090,10 @@ fn default_heartbeat_minutes() -> u64 {
     15
 }
 
+fn default_reauth_check_minutes() -> u64 {
+    5
+}
+
 fn default_trace_body_retention_days() -> u64 {
     30
 }
@@ -1231,6 +1240,7 @@ impl Config {
             exo_enabled_models: Vec::new(),
             gemini_project: String::new(),
             heartbeat_minutes: default_heartbeat_minutes(),
+            reauth_check_minutes: default_reauth_check_minutes(),
             ping_anthropic_model: default_ping_anthropic(),
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
@@ -3106,6 +3116,27 @@ async fn main() -> Result<()> {
                 );
             } else {
                 eprintln!("heartbeat: disabled (set heartbeat_minutes in config.toml to enable)");
+            }
+            if config.reauth_check_minutes > 0 {
+                let watch_state = state.clone();
+                let minutes = config.reauth_check_minutes;
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(minutes * 60));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        alex_proxy::reauth_watch_once(&watch_state).await;
+                    }
+                });
+                eprintln!(
+                    "reauth watchdog: every {}m (set reauth_check_minutes = 0 to disable)",
+                    config.reauth_check_minutes
+                );
+            } else {
+                eprintln!(
+                    "reauth watchdog: disabled (set reauth_check_minutes in config.toml to enable)"
+                );
             }
             let body_days = config.trace_body_retention_days;
             let row_days = config.trace_row_retention_days;
@@ -9043,6 +9074,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
                     "kind": a.kind,
                     "label": a.label,
                     "status": a.status,
+                    "needs_reauth": a.needs_reauth(),
                     "expires_at_ms": a.expires_at_ms,
                     "last_heartbeat": heartbeat_for(&a.id),
                 })
@@ -10263,6 +10295,7 @@ mod tests {
             data_dir: home,
             local_key: "alx-local".into(),
             heartbeat_minutes: default_heartbeat_minutes(),
+            reauth_check_minutes: default_reauth_check_minutes(),
             ping_anthropic_model: default_ping_anthropic(),
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),
@@ -10832,6 +10865,7 @@ mod tests {
             data_dir: alexandria_home(),
             local_key: "alx-test".into(),
             heartbeat_minutes: default_heartbeat_minutes(),
+            reauth_check_minutes: default_reauth_check_minutes(),
             ping_anthropic_model: default_ping_anthropic(),
             ping_openai_model: default_ping_openai(),
             ping_xai_model: default_ping_xai(),

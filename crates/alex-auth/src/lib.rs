@@ -198,6 +198,17 @@ impl Account {
                 None => true,
             }
     }
+
+    /// Display-only flag set by the background logout watchdog when this managed
+    /// OAuth login is confirmed dead (its token expired and could not be
+    /// silently refreshed). It is a UI hint only; a successful refresh or a
+    /// fresh login clears it. It never holds credential material.
+    pub fn needs_reauth(&self) -> bool {
+        self.account_meta
+            .get("needs_reauth")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// A comparable freshness rank for choosing which of two logins survives a
@@ -542,6 +553,10 @@ pub struct Vault {
     rr_counter: AtomicUsize,
     policies: StdRwLock<Vec<(Provider, AccountPolicy)>>,
     http: reqwest::Client,
+    /// Test/diagnostic override for the OAuth token endpoint. Production code
+    /// never sets this; it lets tests point a refresh at a local mock so the
+    /// invalid_grant classification can be exercised without live upstreams.
+    refresh_endpoint_override: StdRwLock<Option<String>>,
 }
 
 impl Vault {
@@ -577,6 +592,7 @@ impl Vault {
             rr_counter: AtomicUsize::new(0),
             policies: StdRwLock::new(policies),
             http: reqwest::Client::new(),
+            refresh_endpoint_override: StdRwLock::new(None),
         })
     }
 
@@ -1151,7 +1167,7 @@ impl Vault {
     async fn refresh_anthropic(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(ANTHROPIC_TOKEN_URL)
+            .post(self.refresh_endpoint(ANTHROPIC_TOKEN_URL))
             .json(&json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -1165,7 +1181,7 @@ impl Vault {
     async fn refresh_openai(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(OPENAI_TOKEN_URL)
+            .post(self.refresh_endpoint(OPENAI_TOKEN_URL))
             .json(&json!({
                 "client_id": OPENAI_CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -1180,7 +1196,7 @@ impl Vault {
     async fn refresh_xai(&self, refresh_token: &str, client_id: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(XAI_TOKEN_URL)
+            .post(self.refresh_endpoint(XAI_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1194,7 +1210,7 @@ impl Vault {
     async fn refresh_gemini(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(GOOGLE_TOKEN_URL)
+            .post(self.refresh_endpoint(GOOGLE_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1204,6 +1220,24 @@ impl Vault {
             .send()
             .await?;
         parse_token_response(resp).await
+    }
+
+    /// Resolve the OAuth token endpoint, honouring a test/diagnostic override.
+    fn refresh_endpoint(&self, default: &str) -> String {
+        self.refresh_endpoint_override
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Point every provider's token-refresh POST at `url` (or clear with
+    /// `None`). Intended for tests that exercise the refresh-failure path
+    /// against a local mock; it is never set in normal operation.
+    pub fn set_refresh_endpoint_override(&self, url: Option<String>) {
+        if let Ok(mut guard) = self.refresh_endpoint_override.write() {
+            *guard = url;
+        }
     }
 
     pub async fn set_account_meta(&self, id: &str, key: &str, value: Value) -> Result<()> {
@@ -1230,11 +1264,57 @@ struct RefreshedTokens {
     expires_in: Option<i64>,
 }
 
+/// Stable marker embedded in the `Display` of a refresh error when the OAuth
+/// token endpoint rejected the refresh token itself (invalid_grant / 400 / 401
+/// / 403). That is a confirmed logout, not a transient upstream hiccup, so
+/// callers can decide to alert the user without matching provider-specific
+/// error bodies. It intentionally carries no credential material.
+pub const REFRESH_REAUTH_MARKER: &str = "reauth_required";
+
+/// Classify a [`Vault::refresh`] error. `true` means the account is logged out
+/// and must be re-authenticated (dead refresh token); `false` means a transient
+/// network / 5xx / rate-limit failure that may recover on its own. Callers use
+/// this to avoid crying wolf on a temporary blip.
+pub fn refresh_error_needs_reauth(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains(REFRESH_REAUTH_MARKER)
+        || text.contains("invalid_grant")
+        || text.contains("has no refresh token")
+}
+
+/// Extract an OAuth2 `error` code (RFC 6749 §5.2) from a token endpoint error
+/// body, if the body is JSON with a string `error` field.
+fn oauth_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+}
+
 async fn parse_token_response(resp: reqwest::Response) -> Result<RefreshedTokens> {
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
-        bail!("token refresh failed ({status}): {text}");
+        // A rejected refresh token (client-error status, or an explicit
+        // permanent OAuth error code) is a confirmed logout; tag it so callers
+        // can alert. Server errors / rate limits are transient and left
+        // untagged. The raw body is deliberately not echoed into the error.
+        let dead = matches!(status.as_u16(), 400 | 401 | 403)
+            || oauth_error_code(&text).is_some_and(|code| {
+                matches!(
+                    code.as_str(),
+                    "invalid_grant"
+                        | "invalid_request"
+                        | "invalid_client"
+                        | "unauthorized_client"
+                        | "unsupported_grant_type"
+                )
+            });
+        if dead {
+            bail!("token refresh rejected ({REFRESH_REAUTH_MARKER}, status {status})");
+        }
+        bail!("token refresh failed (status {status})");
     }
     serde_json::from_str(&text).context("bad token response")
 }
@@ -1815,6 +1895,32 @@ pub fn grok_accounts_from_json(raw: &str) -> Vec<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_error_classification_separates_logout_from_transient() {
+        // Confirmed logouts: rejected refresh token / missing refresh token.
+        assert!(refresh_error_needs_reauth(&anyhow!(
+            "token refresh rejected ({REFRESH_REAUTH_MARKER}, status 400 Bad Request)"
+        )));
+        assert!(refresh_error_needs_reauth(&anyhow!("invalid_grant")));
+        assert!(refresh_error_needs_reauth(&anyhow!(
+            "account anthropic-oauth has no refresh token"
+        )));
+        // Transient upstream failures must not be treated as a logout.
+        assert!(!refresh_error_needs_reauth(&anyhow!(
+            "token refresh failed (status 503 Service Unavailable)"
+        )));
+        assert!(!refresh_error_needs_reauth(&anyhow!("dns error")));
+    }
+
+    #[test]
+    fn oauth_error_code_reads_rfc6749_error_field() {
+        assert_eq!(
+            oauth_error_code(r#"{"error":"invalid_grant"}"#).as_deref(),
+            Some("invalid_grant")
+        );
+        assert_eq!(oauth_error_code("upstream 502 html"), None);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
