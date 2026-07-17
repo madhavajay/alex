@@ -605,6 +605,16 @@ enum AuthCommand {
     },
     /// List vault accounts
     List,
+    /// Merge a duplicate account into another, unifying split trace/usage history
+    Merge {
+        /// The duplicate account id to merge FROM (removed after the merge)
+        from: String,
+        /// The surviving account id to merge INTO (keeps its id and the valid login)
+        into: String,
+        /// Merge even if the two accounts differ in provider or email
+        #[arg(long)]
+        allow_mismatch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3552,6 +3562,43 @@ async fn main() -> Result<()> {
                             .unwrap_or_default()
                     );
                 }
+            }
+            AuthCommand::Merge {
+                from,
+                into,
+                allow_mismatch,
+            } => {
+                // The merge rewrites both the trace database and the in-memory
+                // vault, so it runs inside the daemon that owns both.
+                let base = config.base_url();
+                let key = config.local_key.as_str();
+                let response = reqwest::Client::new()
+                    .post(format!("{base}/admin/accounts/merge"))
+                    .header("x-api-key", key)
+                    .json(&json!({"from": from, "into": into, "allow_mismatch": allow_mismatch}))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("could not reach the alexandria daemon at {base} — is it running?")
+                    })?;
+                let status = response.status();
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                if !status.is_success() {
+                    anyhow::bail!(
+                        "merge failed ({status}): {}",
+                        body["error"].as_str().unwrap_or("unknown error")
+                    );
+                }
+                let rows = &body["rows"];
+                let moved = rows["traces_account_id"].as_u64().unwrap_or(0);
+                println!(
+                    "merged {from} into {} — {moved} traces re-keyed{}",
+                    body["merged_into"].as_str().unwrap_or(&into),
+                    body["adopted_credentials_from"]
+                        .as_str()
+                        .map(|src| format!(", adopted the login from {src}"))
+                        .unwrap_or_default()
+                );
             }
         },
         Command::Traces {

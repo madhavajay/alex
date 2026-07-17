@@ -523,6 +523,18 @@ pub struct PruneReport {
     pub dirs_removed: u64,
 }
 
+/// Rows re-keyed when a duplicate account is merged into a survivor. Every
+/// count is a reassignment, never a deletion, except `known_accounts_removed`
+/// which drops the now-redundant catalogue row for the dup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MergeCounts {
+    pub traces_account_id: u64,
+    pub traces_served_account_id: u64,
+    pub traces_original_account_id: u64,
+    pub heartbeats: u64,
+    pub known_accounts_removed: u64,
+}
+
 fn date_dir_name(name: &str) -> bool {
     name.len() == 10
         && name.bytes().enumerate().all(|(i, b)| match i {
@@ -907,6 +919,50 @@ impl Store {
             "UPDATE traces SET subscription_identity=?1 WHERE account_id=?2 AND subscription_identity IS NULL",
             params![identity, orphan_account_id],
         )? as u64)
+    }
+
+    /// Reassign every trace/heartbeat/catalogue reference from `from_id` to
+    /// `into_id` in a single transaction, unifying both histories under the
+    /// surviving id. No trace row is ever deleted — request and token history
+    /// from both accounts is preserved and simply re-keyed. The dup's
+    /// `known_accounts` catalogue row is dropped because its traces now belong
+    /// to the survivor (leaving it would double-count via the identity join in
+    /// `list_known_accounts`). Idempotent: re-running after a completed merge
+    /// reassigns zero rows. The whole operation commits or rolls back atomically.
+    pub fn merge_accounts(&self, from_id: &str, into_id: &str) -> Result<MergeCounts> {
+        if from_id == into_id {
+            anyhow::bail!("cannot merge account '{from_id}' into itself");
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let traces_account_id = tx.execute(
+            "UPDATE traces SET account_id=?2 WHERE account_id=?1",
+            params![from_id, into_id],
+        )? as u64;
+        let traces_served_account_id = tx.execute(
+            "UPDATE traces SET served_account_id=?2 WHERE served_account_id=?1",
+            params![from_id, into_id],
+        )? as u64;
+        let traces_original_account_id = tx.execute(
+            "UPDATE traces SET original_account_id=?2 WHERE original_account_id=?1",
+            params![from_id, into_id],
+        )? as u64;
+        let heartbeats = tx.execute(
+            "UPDATE heartbeats SET account_id=?2 WHERE account_id=?1",
+            params![from_id, into_id],
+        )? as u64;
+        let known_accounts_removed = tx.execute(
+            "DELETE FROM known_accounts WHERE account_id=?1",
+            params![from_id],
+        )? as u64;
+        tx.commit()?;
+        Ok(MergeCounts {
+            traces_account_id,
+            traces_served_account_id,
+            traces_original_account_id,
+            heartbeats,
+            known_accounts_removed,
+        })
     }
 
     pub fn list_traces(
@@ -2781,6 +2837,137 @@ mod tests {
         assert!(accounts
             .iter()
             .any(|a| a["id"] == "openai-oauth-personal" && a["removed"] == true));
+    }
+
+    #[test]
+    fn merging_same_email_duplicates_unifies_history_with_counts_adding_up() {
+        let store = Store::open(tmpdir("merge-accounts")).unwrap();
+        let identity = Some("anthropic:email:me@madhavajay.com".into());
+        // The survivor: the pre-existing "default" claude account.
+        let survivor = KnownAccount::new(
+            "anthropic-oauth",
+            "anthropic",
+            "default",
+            "oauth",
+            identity.clone(),
+            Some("me@madhavajay.com".into()),
+        );
+        // The duplicate: a second id created when the user re-authed the same
+        // Anthropic subscription under a different local name.
+        let dup = KnownAccount::new(
+            "anthropic-oauth-2",
+            "anthropic",
+            "reauth",
+            "oauth",
+            identity.clone(),
+            Some("me@madhavajay.com".into()),
+        );
+        store.upsert_known_account(&survivor).unwrap();
+        store.upsert_known_account(&dup).unwrap();
+
+        // Two traces on the survivor, three on the duplicate — history is split.
+        for id in ["s1", "s2"] {
+            let mut t = trace(id, 1_000, None);
+            t.account_id = Some("anthropic-oauth".into());
+            t.subscription_identity = identity.clone();
+            store.insert_trace(&t).unwrap();
+        }
+        for id in ["d1", "d2", "d3"] {
+            let mut t = trace(id, 2_000, None);
+            t.account_id = Some("anthropic-oauth-2".into());
+            t.subscription_identity = identity.clone();
+            store.insert_trace(&t).unwrap();
+        }
+        // A failover trace on the duplicate exercises served/original columns.
+        let mut failover = trace("d-failover", 2_500, None);
+        failover.account_id = Some("anthropic-oauth-2".into());
+        failover.served_account_id = Some("anthropic-oauth-2".into());
+        failover.original_account_id = Some("anthropic-oauth-2".into());
+        failover.subscription_identity = identity.clone();
+        store.insert_trace(&failover).unwrap();
+        // Heartbeats on both accounts.
+        store
+            .insert_heartbeat(1_000, "anthropic", Some("anthropic-oauth"), true, Some(200), 5, "ok")
+            .unwrap();
+        store
+            .insert_heartbeat(2_000, "anthropic", Some("anthropic-oauth-2"), true, Some(200), 6, "ok")
+            .unwrap();
+
+        let before = store.account_analytics(0, 60_000).unwrap();
+        let total_requests_before: i64 = before["by_account"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["requests"].as_i64().unwrap())
+            .sum();
+        assert_eq!(total_requests_before, 6);
+
+        let counts = store
+            .merge_accounts("anthropic-oauth-2", "anthropic-oauth")
+            .unwrap();
+        assert_eq!(counts.traces_account_id, 4, "4 dup traces re-keyed");
+        assert_eq!(counts.traces_served_account_id, 1);
+        assert_eq!(counts.traces_original_account_id, 1);
+        assert_eq!(counts.heartbeats, 1);
+        assert_eq!(counts.known_accounts_removed, 1);
+
+        // Every trace now points at the survivor — nothing left on the dup.
+        let conn = store.conn.lock().unwrap();
+        let dup_traces: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE account_id='anthropic-oauth-2'
+                   OR served_account_id='anthropic-oauth-2' OR original_account_id='anthropic-oauth-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dup_traces, 0, "no trace references the merged-away id");
+        let survivor_traces: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE account_id='anthropic-oauth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor_traces, 6, "both histories now sit on the survivor");
+        let dup_heartbeats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM heartbeats WHERE account_id='anthropic-oauth-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dup_heartbeats, 0);
+        drop(conn);
+
+        // The catalogue lists only the survivor, and its unified trace count is
+        // the sum of both accounts — no orphaned/double-counted rows.
+        let known = store.list_known_accounts().unwrap();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0]["id"], "anthropic-oauth");
+        assert_eq!(known[0]["trace_count"], 6);
+        assert!(store.orphaned_trace_groups().unwrap().is_empty());
+
+        // Usage rollups now attribute every request to the single survivor.
+        let after = store.account_analytics(0, 60_000).unwrap();
+        let by_account = after["by_account"].as_array().unwrap();
+        assert_eq!(by_account.len(), 1);
+        assert_eq!(by_account[0]["account_id"], "anthropic-oauth");
+        assert_eq!(by_account[0]["requests"], 6);
+
+        // Idempotent: a second merge of the same pair moves nothing.
+        let again = store
+            .merge_accounts("anthropic-oauth-2", "anthropic-oauth")
+            .unwrap();
+        assert_eq!(again, MergeCounts::default());
+    }
+
+    #[test]
+    fn merging_an_account_into_itself_is_rejected() {
+        let store = Store::open(tmpdir("merge-self")).unwrap();
+        assert!(store
+            .merge_accounts("anthropic-oauth", "anthropic-oauth")
+            .is_err());
     }
 
     #[test]

@@ -879,6 +879,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_provider_resume),
         )
         .route("/admin/accounts/analytics", get(admin_account_analytics))
+        .route("/admin/accounts/merge", post(admin_account_merge))
         .route(
             "/admin/routing/{provider}",
             get(admin_routing).put(admin_routing_update),
@@ -1532,6 +1533,82 @@ async fn admin_account_remove(
         Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct AccountMergeRequest {
+    from: String,
+    into: String,
+    #[serde(default)]
+    allow_mismatch: bool,
+}
+
+/// Unify a duplicate same-email account into a survivor, keeping BOTH histories.
+///
+/// Order matters for atomicity: validate first (read-only), then re-key the
+/// trace database in one transaction, then move the credential and tombstone the
+/// dup. If the credential step ever failed after the DB step, the survivor
+/// already owns every re-keyed row and re-running the merge is a safe, idempotent
+/// no-op on the database that finishes the credential move.
+async fn admin_account_merge(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<AccountMergeRequest>,
+) -> Response {
+    let AccountMergeRequest {
+        from,
+        into,
+        allow_mismatch,
+    } = body.0;
+    if from.trim().is_empty() || into.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "both 'from' and 'into' are required");
+    }
+    // 1. Validate credentials-side before touching any history.
+    let (_from_account, into_account) =
+        match state.vault.validate_merge(&from, &into, allow_mismatch).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let status = if e.to_string().starts_with("unknown account") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return error_response(status, &e.to_string());
+            }
+        };
+    // Ensure the survivor has a durable catalogue row so re-keyed traces resolve.
+    if let Err(e) = state.store.upsert_known_account(&known_account(&into_account)) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    // 2. Re-key every trace/heartbeat/catalogue reference in one transaction.
+    let counts = match state.store.merge_accounts(&from, &into) {
+        Ok(counts) => counts,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not reassign account history: {e}"),
+            )
+        }
+    };
+    // 3. Move the surviving credential and tombstone the duplicate login.
+    let outcome = match state.vault.merge_accounts(&from, &into, true).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "history was re-keyed to '{into}' but removing the duplicate login failed: {e}"
+                ),
+            )
+        }
+    };
+    let rows = serde_json::to_value(&counts).unwrap_or(Value::Null);
+    axum::Json(json!({
+        "merged_into": outcome.survivor_id,
+        "removed": outcome.removed_id,
+        "adopted_credentials_from": outcome.adopted_credentials_from,
+        "rows": rows,
+    }))
+    .into_response()
 }
 
 fn known_account(account: &Account) -> KnownAccount {
@@ -10124,6 +10201,186 @@ mod tests {
             router(state).oneshot(request).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn anthropic_account_full(id: &str, name: &str, email: &str, expires_at_ms: i64) -> Account {
+        Account {
+            id: id.into(),
+            provider: Provider::Anthropic,
+            kind: "oauth".into(),
+            name: name.into(),
+            description: Some(email.into()),
+            paused: false,
+            label: None,
+            access_token: Some(format!("token-{id}")),
+            refresh_token: Some(format!("refresh-{id}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(expires_at_ms),
+            last_refresh_ms: Some(expires_at_ms),
+            account_meta: json!({"email": email}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    fn account_trace(id: &str, account_id: &str) -> TraceRecord {
+        TraceRecord {
+            id: id.into(),
+            ts_request_ms: 1_000,
+            ts_response_ms: Some(1_250),
+            status: Some(200),
+            upstream_provider: Some("anthropic".into()),
+            routed_model: Some("claude-haiku-4-5".into()),
+            account_id: Some(account_id.into()),
+            subscription_identity: Some("anthropic:email:me@madhavajay.com".into()),
+            usage: alex_core::Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn account_merge_endpoint_unifies_history_and_keeps_survivor() {
+        let now = now_ms();
+        let state = test_state("account-merge-endpoint");
+        // Survivor's own login is stale; the re-authed duplicate is fresh.
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                "anthropic-oauth",
+                "default",
+                "me@madhavajay.com",
+                now - 3_600_000,
+            ))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                "anthropic-oauth-reauth",
+                "reauth",
+                "me@madhavajay.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+        // History is split: two traces on the survivor, three on the dup.
+        for id in ["s1", "s2"] {
+            state
+                .store
+                .insert_trace(&account_trace(id, "anthropic-oauth"))
+                .unwrap();
+        }
+        for id in ["d1", "d2", "d3"] {
+            state
+                .store
+                .insert_trace(&account_trace(id, "anthropic-oauth-reauth"))
+                .unwrap();
+        }
+
+        let (status, body) = response_json(
+            admin_account_merge(
+                State(state.clone()),
+                axum::Json(AccountMergeRequest {
+                    from: "anthropic-oauth-reauth".into(),
+                    into: "anthropic-oauth".into(),
+                    allow_mismatch: false,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["merged_into"], "anthropic-oauth");
+        assert_eq!(body["removed"], "anthropic-oauth-reauth");
+        assert_eq!(body["adopted_credentials_from"], "anthropic-oauth-reauth");
+        assert_eq!(body["rows"]["traces_account_id"], 3);
+
+        // Only the survivor remains, and it adopted the fresh login.
+        let accounts = state.vault.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "anthropic-oauth");
+        assert_eq!(
+            accounts[0].access_token.as_deref(),
+            Some("token-anthropic-oauth-reauth")
+        );
+        // Every request is now attributed to the one survivor.
+        let analytics = state.store.account_analytics(0, 60_000).unwrap();
+        let by_account = analytics["by_account"].as_array().unwrap();
+        assert_eq!(by_account.len(), 1);
+        assert_eq!(by_account[0]["account_id"], "anthropic-oauth");
+        assert_eq!(by_account[0]["requests"], 5);
+        assert!(state.store.orphaned_trace_groups().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_merge_endpoint_refuses_email_mismatch() {
+        let now = now_ms();
+        let state = test_state("account-merge-mismatch");
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                "anthropic-oauth",
+                "default",
+                "me@madhavajay.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                "anthropic-oauth-other",
+                "other",
+                "someone@else.com",
+                now + 3_600_000,
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_trace(&account_trace("x", "anthropic-oauth-other"))
+            .unwrap();
+
+        let (status, _) = response_json(
+            admin_account_merge(
+                State(state.clone()),
+                axum::Json(AccountMergeRequest {
+                    from: "anthropic-oauth-other".into(),
+                    into: "anthropic-oauth".into(),
+                    allow_mismatch: false,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Refusal must not have mutated anything.
+        assert_eq!(state.vault.list().await.len(), 2);
+        let trace = state.store.get_trace("x").unwrap().unwrap();
+        assert_eq!(trace["account_id"], "anthropic-oauth-other");
+
+        // The override merges it.
+        let (status, body) = response_json(
+            admin_account_merge(
+                State(state.clone()),
+                axum::Json(AccountMergeRequest {
+                    from: "anthropic-oauth-other".into(),
+                    into: "anthropic-oauth".into(),
+                    allow_mismatch: true,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"]["traces_account_id"], 1);
+        assert_eq!(state.vault.list().await.len(), 1);
     }
 
     #[tokio::test]
