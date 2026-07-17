@@ -472,6 +472,46 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/protection", method: "PUT", body: body(policy))
     }
 
+    public func notificationSettings() async throws -> NotificationSettingsResponse {
+        try await get("admin/notifications", as: NotificationSettingsResponse.self)
+    }
+
+    public func validateTelegramNotification(token: String) async throws -> NotificationValidationResponse {
+        let data = try await request(
+            "admin/notifications/validate", method: "POST",
+            body: body(TelegramNotificationTokenRequest(token: token)))
+        return try JSONDecoder().decode(NotificationValidationResponse.self, from: data)
+    }
+
+    public func discoverTelegramChats(token: String) async throws -> NotificationChatDiscoveryResponse {
+        let data = try await request(
+            "admin/notifications/discover-chat", method: "POST",
+            body: body(TelegramNotificationTokenRequest(token: token)))
+        return try JSONDecoder().decode(NotificationChatDiscoveryResponse.self, from: data)
+    }
+
+    @discardableResult
+    public func saveTelegramNotification(
+        _ channel: TelegramNotificationChannelRequest
+    ) async throws -> NotificationSaveResponse {
+        let data = try await request(
+            "admin/notifications", method: "POST", body: body(channel))
+        return try JSONDecoder().decode(NotificationSaveResponse.self, from: data)
+    }
+
+    public func testTelegramNotification(
+        _ channel: TelegramNotificationChannelRequest
+    ) async throws -> NotificationTestResponse {
+        let data = try await request(
+            "admin/notifications/test", method: "POST", body: body(channel))
+        return try JSONDecoder().decode(NotificationTestResponse.self, from: data)
+    }
+
+    public func removeNotification(id: String) async throws {
+        _ = try await request(
+            "admin/notifications/\(encodedPathComponent(id))", method: "DELETE")
+    }
+
     public func exoConfig() async throws -> ExoConfig {
         try await get("admin/exo", as: ExoConfig.self)
     }
