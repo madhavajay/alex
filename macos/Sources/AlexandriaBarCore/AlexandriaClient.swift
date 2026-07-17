@@ -191,6 +191,21 @@ public struct AlexandriaClient: Sendable {
         try await get("admin/limits", as: LimitsResponse.self).providers
     }
 
+    public func providerPauses() async throws -> [ProviderPause] {
+        try await get("admin/providers", as: ProvidersResponse.self).providers
+    }
+
+    public func pauseProvider(_ provider: String, mode: ProviderPauseMode) async throws {
+        _ = try await request(
+            "admin/providers/\(encodedPathComponent(provider))/pause",
+            method: "POST", body: body(["mode": mode.rawValue]))
+    }
+
+    public func resumeProvider(_ provider: String) async throws {
+        _ = try await request(
+            "admin/providers/\(encodedPathComponent(provider))/resume", method: "POST")
+    }
+
     public func analytics(sinceMinutes: Int = 60) async throws -> Analytics {
         try await get(
             "admin/analytics",

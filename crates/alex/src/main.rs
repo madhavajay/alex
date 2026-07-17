@@ -157,6 +157,11 @@ enum Command {
         #[command(subcommand)]
         command: RoutingCommand,
     },
+    /// Deliberately pause a provider to test failover or re-auth alerts
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     /// Manage the OS user service (launchd on macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
@@ -656,6 +661,41 @@ enum RoutingCommand {
         #[arg(long)]
         account: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    /// Show each provider's transient pause state
+    List,
+    /// Pause all traffic to one provider
+    Pause {
+        /// Provider: claude|codex|grok|gemini|amp (aliases accepted)
+        provider: String,
+        /// Simulate provider down or a logged-out subscription
+        #[arg(long, value_enum, default_value_t = ProviderPauseMode::Down)]
+        mode: ProviderPauseMode,
+    },
+    /// Resume traffic to one provider
+    Resume {
+        /// Provider: claude|codex|grok|gemini|amp (aliases accepted)
+        provider: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProviderPauseMode {
+    Down,
+    #[value(name = "logged_out")]
+    LoggedOut,
+}
+
+impl ProviderPauseMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::LoggedOut => "logged_out",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -3793,6 +3833,70 @@ async fn main() -> Result<()> {
             } else {
                 print_limits(&snap);
                 print_dario_update_notice();
+            }
+        }
+        Command::Provider { command } => {
+            let base = config.base_url();
+            let key = config.local_key.as_str();
+            let http = reqwest::Client::new();
+            let response = match &command {
+                ProviderCommand::List => {
+                    http.get(format!("{base}/admin/providers"))
+                        .header("x-api-key", key)
+                        .send()
+                        .await
+                }
+                ProviderCommand::Pause { provider, mode } => {
+                    let provider = provider_from_cli(&provider)?;
+                    http.post(format!(
+                        "{base}/admin/providers/{}/pause",
+                        provider.as_str()
+                    ))
+                    .header("x-api-key", key)
+                    .json(&json!({"mode": mode.as_str()}))
+                    .send()
+                    .await
+                }
+                ProviderCommand::Resume { provider } => {
+                    let provider = provider_from_cli(&provider)?;
+                    http.post(format!(
+                        "{base}/admin/providers/{}/resume",
+                        provider.as_str()
+                    ))
+                    .header("x-api-key", key)
+                    .send()
+                    .await
+                }
+            }
+            .with_context(|| {
+                format!("could not reach the alexandria daemon at {base} — is it running?")
+            })?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("provider command failed ({status}): {body}");
+            }
+            match &command {
+                ProviderCommand::List => {
+                    if let Some(providers) = body["providers"].as_array() {
+                        for provider in providers {
+                            let name = provider["provider"].as_str().unwrap_or("unknown");
+                            match provider["mode"].as_str() {
+                                Some(mode) => println!("{name}: paused ({mode})"),
+                                None => println!("{name}: active"),
+                            }
+                        }
+                    }
+                }
+                ProviderCommand::Pause { .. } => println!(
+                    "{} paused ({})",
+                    body["provider"].as_str().unwrap_or("provider"),
+                    body["mode"].as_str().unwrap_or("down")
+                ),
+                ProviderCommand::Resume { .. } => println!(
+                    "{} resumed",
+                    body["provider"].as_str().unwrap_or("provider")
+                ),
             }
         }
         Command::Routing { command } => {

@@ -290,6 +290,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             limits: store.limits,
             accounts: store.accounts,
             warnPct: store.limitWarnPct,
+            providerPauses: Dictionary(
+                uniqueKeysWithValues: store.providerPauses.map { ($0.provider, $0) }),
             heartbeats: heartbeatsById,
             routing: store.routingByProvider,
             dario: store.dario,
@@ -318,6 +320,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 guard let self else { return }
                 self.menu.cancelTrackingWithoutAnimation()
                 self.reauthDario()
+            },
+            onSetProviderPause: { [weak self] provider, mode in
+                guard let self, let config = self.store.config else { return }
+                Task { @MainActor in
+                    do {
+                        let client = AlexandriaClient(config: config)
+                        if let mode {
+                            try await client.pauseProvider(provider, mode: mode)
+                        } else {
+                            try await client.resumeProvider(provider)
+                        }
+                        await self.store.refresh()
+                    } catch {
+                        self.store.onRefresh?()
+                    }
+                }
             })
         addHostedView(card)
         menu.addItem(.separator())

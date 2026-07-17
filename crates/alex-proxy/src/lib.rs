@@ -364,6 +364,39 @@ pub struct AppState {
     protection_persister: std::sync::RwLock<Option<Arc<dyn ProtectionPolicyPersister>>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
+    /// Deliberately transient provider-wide fault injection for exercising
+    /// failover and re-auth notifications. It is intentionally not persisted.
+    paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PauseMode {
+    Down,
+    LoggedOut,
+}
+
+impl PauseMode {
+    fn status(self) -> u16 {
+        match self {
+            Self::Down => 503,
+            Self::LoggedOut => 401,
+        }
+    }
+
+    fn error_class(self) -> ErrorClass {
+        match self {
+            Self::Down => ErrorClass::Server,
+            Self::LoggedOut => ErrorClass::Auth,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::LoggedOut => "logged_out",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -641,6 +674,7 @@ pub fn build_state_with_substitution(
         protection_persister: std::sync::RwLock::new(None),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
+        paused_providers: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -835,6 +869,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin_session_injections).delete(admin_session_injections_clear),
         )
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/providers", get(admin_providers))
+        .route(
+            "/admin/providers/{provider}/pause",
+            post(admin_provider_pause),
+        )
+        .route(
+            "/admin/providers/{provider}/resume",
+            post(admin_provider_resume),
+        )
         .route("/admin/accounts/analytics", get(admin_account_analytics))
         .route(
             "/admin/routing/{provider}",
@@ -3959,6 +4002,85 @@ async fn traces_run_artifacts(
         .into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+const PAUSEABLE_PROVIDERS: [Provider; 7] = [
+    Provider::Anthropic,
+    Provider::Openai,
+    Provider::Gemini,
+    Provider::Xai,
+    Provider::Openrouter,
+    Provider::Exo,
+    Provider::Amp,
+];
+
+#[derive(Debug, Deserialize)]
+struct ProviderPauseRequest {
+    mode: PauseMode,
+}
+
+fn paused_provider_mode(state: &AppState, provider: Provider) -> Option<PauseMode> {
+    state
+        .paused_providers
+        .lock()
+        .ok()
+        .and_then(|paused| paused.get(provider.as_str()).copied())
+}
+
+fn provider_pause_view(provider: Provider, mode: Option<PauseMode>) -> Value {
+    let mut view = json!({
+        "provider": provider.as_str(),
+        "paused": mode.is_some(),
+    });
+    if let Some(mode) = mode {
+        view["mode"] = json!(mode.as_str());
+    }
+    view
+}
+
+async fn admin_providers(State(state): State<Arc<AppState>>) -> Response {
+    let providers = PAUSEABLE_PROVIDERS
+        .into_iter()
+        .map(|provider| provider_pause_view(provider, paused_provider_mode(&state, provider)))
+        .collect::<Vec<_>>();
+    axum::Json(json!({"providers": providers})).into_response()
+}
+
+async fn admin_provider_pause(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    axum::Json(request): axum::Json<ProviderPauseRequest>,
+) -> Response {
+    let provider = match routing_provider(&provider) {
+        Ok(provider) => provider,
+        Err(response) => return response,
+    };
+    let Ok(mut paused) = state.paused_providers.lock() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider pause state unavailable",
+        );
+    };
+    paused.insert(provider.as_str().into(), request.mode);
+    axum::Json(provider_pause_view(provider, Some(request.mode))).into_response()
+}
+
+async fn admin_provider_resume(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+) -> Response {
+    let provider = match routing_provider(&provider) {
+        Ok(provider) => provider,
+        Err(response) => return response,
+    };
+    let Ok(mut paused) = state.paused_providers.lock() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider pause state unavailable",
+        );
+    };
+    paused.remove(provider.as_str());
+    axum::Json(provider_pause_view(provider, None)).into_response()
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -7398,22 +7520,39 @@ async fn proxy(
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
     let substitution_disabled = no_substitute(&headers);
-    let pending_injection =
-        take_pending_injection(&state, trace.session_id.as_deref(), trace.run_id.as_deref());
-    let simulation = headers
-        .get("x-alexandria-simulate-error")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None)))
-        .or_else(|| {
-            pending_injection.map(|pending| {
-                Ok((
-                    pending.fixture.status,
-                    pending.fixture.error_kind,
-                    Some(pending.fixture.body.into_bytes()),
-                    Some(pending.fixture.name),
-                ))
+    let paused_mode = paused_provider_mode(&state, provider);
+    // A provider pause has precedence over a one-shot fixture: it represents
+    // the operator taking the provider out of service, while fixtures remain
+    // queued for after it is resumed.
+    let simulation = if let Some(mode) = paused_mode {
+        Some(Ok((
+            mode.status(),
+            "provider_paused".to_string(),
+            None,
+            None,
+            Some(mode),
+        )))
+    } else {
+        let pending_injection =
+            take_pending_injection(&state, trace.session_id.as_deref(), trace.run_id.as_deref());
+        headers
+            .get("x-alexandria-simulate-error")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None, None))
             })
-        });
+            .or_else(|| {
+                pending_injection.map(|pending| {
+                    Ok((
+                        pending.fixture.status,
+                        pending.fixture.error_kind,
+                        Some(pending.fixture.body.into_bytes()),
+                        Some(pending.fixture.name),
+                        None,
+                    ))
+                })
+            })
+    };
     if let Some(simulation) = simulation {
         if headers.get("x-alexandria-simulate-error").is_some()
             && !local_key_request
@@ -7424,21 +7563,35 @@ async fn proxy(
                 "x-alexandria-simulate-error requires a local or harness run key",
             );
         }
-        let (status, kind, injected_body, fixture_name) = match simulation {
+        let (status, kind, injected_body, fixture_name, pause_mode) = match simulation {
             Ok(value) => value,
             Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
         };
-        let message = format!("simulated upstream error: {kind}");
+        let message = if let Some(mode) = pause_mode {
+            format!("provider deliberately paused in {} mode", mode.as_str())
+        } else {
+            format!("simulated upstream error: {kind}")
+        };
         trace.status = Some(status as i64);
         trace.error_kind = Some(kind.clone());
         trace.error_code = Some(status.to_string());
         trace.error_class = Some(
-            classify_error(provider.as_str(), Some(status), Some(&kind))
+            pause_mode
+                .map(PauseMode::error_class)
+                .unwrap_or_else(|| classify_error(provider.as_str(), Some(status), Some(&kind)))
                 .as_str()
                 .into(),
         );
         trace.error = Some(format!("{kind}: {message}"));
-        trace.tags = merge_trace_note(trace.tags.take(), "simulated", "true");
+        trace.tags = merge_trace_note(
+            trace.tags.take(),
+            if pause_mode.is_some() {
+                "provider_paused"
+            } else {
+                "simulated"
+            },
+            pause_mode.map(PauseMode::as_str).unwrap_or("true"),
+        );
         if fixture_name.is_some() {
             trace.injected = true;
             trace.fixture_name = fixture_name;
@@ -7447,7 +7600,22 @@ async fn proxy(
         // Simulation deliberately never dispatches upstream traffic, but it
         // follows the real account/model selection policy so failover can be
         // tested with local or harness credentials alone.
-        let class = classify_error(provider.as_str(), Some(status), Some(&kind));
+        let class = pause_mode
+            .map(PauseMode::error_class)
+            .unwrap_or_else(|| classify_error(provider.as_str(), Some(status), Some(&kind)));
+        // This deliberately calls the same account-scoped re-auth dispatcher
+        // used while handling a real managed OAuth failure. The pause itself
+        // never contacts upstream or mutates credentials.
+        if pause_mode == Some(PauseMode::LoggedOut) {
+            if let Some(account) = state.vault.list_cached().into_iter().find(|account| {
+                account.provider == provider
+                    && account.kind == "oauth"
+                    && account.status == "active"
+                    && !account.paused
+            }) {
+                emit_reauth_notification_for_account(&state, &account);
+            }
+        }
         let protection = state
             .protection
             .read()
@@ -7572,10 +7740,17 @@ async fn proxy(
         let response_body =
             injected_body.unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
         finalize_trace(&state, trace, &body, None, Some(&response_body));
-        return Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
             .header("content-type", "application/json")
-            .header("x-alexandria-trace-id", &trace_id)
+            .header("x-alexandria-trace-id", &trace_id);
+        if let Some(mode) = pause_mode {
+            response = response.header(
+                "x-alexandria-paused",
+                format!("{}:{}", provider.as_str(), mode.as_str()),
+            );
+        }
+        return response
             .body(Body::from(response_body))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
@@ -11233,6 +11408,201 @@ mod tests {
             state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn provider_pause_admin_reports_state_and_resume_clears_it() {
+        let state = test_state("provider-pause-admin");
+        let paused = response_json(
+            admin_provider_pause(
+                State(state.clone()),
+                Path("openai".into()),
+                axum::Json(ProviderPauseRequest {
+                    mode: PauseMode::Down,
+                }),
+            )
+            .await,
+        )
+        .await
+        .1;
+        assert_eq!(
+            paused,
+            json!({"provider": "openai", "paused": true, "mode": "down"})
+        );
+
+        let (_, listed) = response_json(admin_providers(State(state.clone())).await).await;
+        assert_eq!(
+            listed["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|provider| provider["provider"] == "openai")
+                .unwrap(),
+            &paused
+        );
+
+        let resumed =
+            response_json(admin_provider_resume(State(state.clone()), Path("openai".into())).await)
+                .await
+                .1;
+        assert_eq!(resumed, json!({"provider": "openai", "paused": false}));
+        assert_eq!(paused_provider_mode(&state, Provider::Openai), None);
+    }
+
+    #[tokio::test]
+    async fn paused_logged_out_provider_emits_reauth_and_records_pause_marker() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("provider-pause-logged-out");
+        state
+            .vault
+            .upsert(test_openai_account("paused-reauth"))
+            .await
+            .unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    url,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        admin_provider_pause(
+            State(state.clone()),
+            Path("openai".into()),
+            axum::Json(ProviderPauseRequest {
+                mode: PauseMode::LoggedOut,
+            }),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()["x-alexandria-paused"],
+            "openai:logged_out"
+        );
+        let (_, body) = response_json(response).await;
+        assert_eq!(body["error"]["type"], "provider_paused");
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = received.lock().unwrap().first().cloned() {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local webhook sink did not receive paused-provider reauth alert");
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["provider"], "openai");
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["error_kind"], "provider_paused");
+        assert_eq!(trace["error_class"], "auth");
+        sink.abort();
+    }
+
+    async fn paused_down_request(state: Arc<AppState>, no_substitute: bool) -> Response {
+        admin_provider_pause(
+            State(state.clone()),
+            Path("openai".into()),
+            axum::Json(ProviderPauseRequest {
+                mode: PauseMode::Down,
+            }),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        if no_substitute {
+            headers.insert("x-alexandria-no-substitute", HeaderValue::from_static("1"));
+        }
+        proxy(
+            state,
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn paused_down_provider_reroutes_unless_no_substitute_is_set() {
+        let policy = ProtectionPolicy {
+            enabled: true,
+            reroute_on_auth: false,
+            retries: 0,
+            auto_return: true,
+            equivalencies: BTreeMap::from([(
+                "gpt-5.5".into(),
+                BTreeMap::from([("anthropic".into(), "claude-sonnet-5".into())]),
+            )]),
+        };
+        let state = test_state("provider-pause-down-reroute");
+        set_protection_policy(&state, policy.clone());
+        state
+            .vault
+            .upsert(test_api_account("openai-only", Provider::Openai))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("anthropic-fallback", Provider::Anthropic))
+            .await
+            .unwrap();
+        let response = paused_down_request(state.clone(), false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["x-alexandria-paused"], "openai:down");
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["error_kind"], "provider_paused");
+        assert_eq!(trace["error_class"], "server");
+        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["served_model"], "claude-sonnet-5");
+
+        let no_substitute = test_state("provider-pause-down-no-substitute");
+        set_protection_policy(&no_substitute, policy);
+        no_substitute
+            .vault
+            .upsert(test_api_account("openai-only", Provider::Openai))
+            .await
+            .unwrap();
+        no_substitute
+            .vault
+            .upsert(test_api_account("anthropic-fallback", Provider::Anthropic))
+            .await
+            .unwrap();
+        assert_eq!(
+            paused_down_request(no_substitute.clone(), true)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let trace = no_substitute
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["attempts"].is_null());
     }
 
     #[tokio::test]

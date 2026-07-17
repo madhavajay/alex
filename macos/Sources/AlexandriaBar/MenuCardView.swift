@@ -534,6 +534,7 @@ struct LimitsCardView: View {
     let limits: [ProviderLimits]
     let accounts: [Account]
     let warnPct: Double
+    var providerPauses: [String: ProviderPause] = [:]
     var heartbeats: [String: Heartbeat] = [:]
     var routing: [String: ProviderRoutingResponse] = [:]
     var dario: DarioStatus? = nil
@@ -541,6 +542,9 @@ struct LimitsCardView: View {
     var onPing: (() -> Void)? = nil
     var onOpenDario: (() -> Void)? = nil
     var onReauthDario: (() -> Void)? = nil
+    var onSetProviderPause: ((String, ProviderPauseMode?) -> Void)? = nil
+    @State private var providerAwaitingPause: String?
+    @State private var selectedPauseMode: ProviderPauseMode = .down
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -561,6 +565,25 @@ struct LimitsCardView: View {
         }
         .padding(.bottom, 4)
         .frame(width: MenuMetrics.width, alignment: .leading)
+        .confirmationDialog(
+            "Pause all traffic to \(ProviderInfo.displayName(providerAwaitingPause ?? "provider"))?",
+            isPresented: Binding(
+                get: { providerAwaitingPause != nil },
+                set: { if !$0 { providerAwaitingPause = nil } }),
+            titleVisibility: .visible
+        ) {
+            Picker("Mode", selection: $selectedPauseMode) {
+                Text("Simulate down (test failover)").tag(ProviderPauseMode.down)
+                Text("Simulate logged out (test re-auth alert)").tag(ProviderPauseMode.loggedOut)
+            }
+            Button("Pause", role: .destructive) {
+                if let provider = providerAwaitingPause {
+                    onSetProviderPause?(provider, selectedPauseMode)
+                }
+                providerAwaitingPause = nil
+            }
+            Button("Cancel", role: .cancel) { providerAwaitingPause = nil }
+        }
     }
 
     private var headerRow: some View {
@@ -620,6 +643,7 @@ struct LimitsCardView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
                 }
+                providerPauseControl(provider.provider)
             }
             if let error = provider.error {
                 errorText(error)
@@ -665,6 +689,7 @@ struct LimitsCardView: View {
                 if slots.count > 1, let strategy = routing[name]?.strategy {
                     modeChip(strategy)
                 }
+                providerPauseControl(name)
             }
             VStack(alignment: .leading, spacing: 7) {
                 ForEach(Array(slots.enumerated()), id: \.element.id) { index, account in
@@ -756,6 +781,28 @@ struct LimitsCardView: View {
                 .foregroundStyle(AlexTheme.Colors.textFaint)
             Spacer()
             trailing()
+        }
+    }
+
+    @ViewBuilder
+    private func providerPauseControl(_ provider: String) -> some View {
+        if let pause = providerPauses[provider], pause.paused {
+            HStack(spacing: 4) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 9, weight: .medium))
+                Text("Paused")
+                    .font(.system(size: 9, weight: .semibold))
+                MenuMiniButton(label: "Resume", systemImage: "play.fill") {
+                    onSetProviderPause?(provider, nil)
+                }
+            }
+            .foregroundStyle(AlexTheme.Colors.destructive)
+        } else {
+            MenuMiniButton(label: "Pause", systemImage: "pause.fill") {
+                selectedPauseMode = .down
+                providerAwaitingPause = provider
+            }
+            .help("Pause all traffic to this provider")
         }
     }
 
