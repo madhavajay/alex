@@ -37,7 +37,6 @@ toml = "0.8"
 toml_edit = "0.22"
 flate2 = "1"
 tar = "0.4"
-jpeg-decoder = { version = "0.3", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 tracing = "0.1"

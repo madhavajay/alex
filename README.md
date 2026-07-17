@@ -1,6 +1,10 @@
 # Alex a local LLM Proxy for all token providers, APIs and harnesses
 
 <p align="center">
+  <img src="images/header.jpg" alt="Alex connects terminal harnesses to LLM providers through one local proxy" width="100%">
+</p>
+
+<p align="center">
   <a href="https://crates.io/crates/alex"><img src="https://img.shields.io/crates/v/alex.svg" alt="crates.io"></a>
   <a href="https://github.com/madhavajay/alex/actions/workflows/ci.yml"><img src="https://github.com/madhavajay/alex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported"></a>
@@ -10,7 +14,7 @@
 
 <h2 align="center">Your tokens, your traces, your choice!</h2>
 
-## End-to-end Harness -> Provider traces
+## e2e Harness ↔️ Provider Traces
 
 ![Alex capturing a wrapped Amp session alongside its full conversation trace](images/amp.png)
 

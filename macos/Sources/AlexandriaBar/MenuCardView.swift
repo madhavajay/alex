@@ -966,7 +966,7 @@ struct LimitsCardView: View {
 }
 
 /// Provider → brand-icon lookup for the menu (the mock shows the harness brand
-/// logos for providers: Claude, Codex, Grok, Gemini, Amp).
+/// logos for providers: Claude, Codex, Grok, Gemini, Amp, OpenRouter).
 enum ProviderMenuIcon {
     static let harnessAlias: [String: String] = [
         "anthropic": "claude",
@@ -974,6 +974,7 @@ enum ProviderMenuIcon {
         "xai": "grok",
         "gemini": "gemini",
         "amp": "amp",
+        "openrouter": "openrouter",
     ]
 
     /// Brand tile backgrounds so dark logos stay legible (mock: Claude on

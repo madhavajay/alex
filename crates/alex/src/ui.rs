@@ -40,9 +40,8 @@ pub fn yellow(text: &str) -> String {
     paint(text, "33")
 }
 
-#[allow(dead_code)]
-pub fn magenta(text: &str) -> String {
-    paint(text, "35")
+pub fn purple(text: &str) -> String {
+    paint(text, "38;5;99")
 }
 
 pub fn cyan(text: &str) -> String {
@@ -57,24 +56,12 @@ pub fn amber(text: &str) -> String {
     paint(text, "38;5;178")
 }
 
-pub fn sand(text: &str) -> String {
-    paint(text, "38;5;180")
-}
-
 pub fn lapis(text: &str) -> String {
     paint(text, "38;5;69")
 }
 
 pub fn turquoise(text: &str) -> String {
     paint(text, "38;5;73")
-}
-
-pub fn ankh() -> &'static str {
-    if colors_enabled() {
-        "☥"
-    } else {
-        "-"
-    }
 }
 
 pub fn diamond() -> &'static str {
@@ -110,12 +97,12 @@ pub fn circle() -> &'static str {
 }
 
 pub fn section(title: &str) -> String {
-    gold(&bold(&format!("{} {title}", ankh())))
+    purple(&bold(&format!("{} {title}", diamond())))
 }
 
 pub fn divider(label: &str) -> String {
     if colors_enabled() {
-        gold(&format!("─── ☥ {label} ───"))
+        purple(&format!("─── ◆ {label} ───"))
     } else {
         format!("--- {label} ---")
     }

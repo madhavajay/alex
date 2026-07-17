@@ -832,9 +832,9 @@ pub fn print_run_summary(summary: &RunSummary, json: bool) -> Result<()> {
             ui::red(&summary.capture.missing.join(", "))
         );
     }
-    println!("session dir:  {}", ui::sand(&summary.session_dir));
-    println!("stdout:       {}", ui::sand(&summary.stdout_path));
-    println!("stderr:       {}", ui::sand(&summary.stderr_path));
+    println!("session dir:  {}", ui::purple(&summary.session_dir));
+    println!("stdout:       {}", ui::purple(&summary.stdout_path));
+    println!("stderr:       {}", ui::purple(&summary.stderr_path));
     println!(
         "command:      {}",
         ui::dim(&shell_display(&summary.command))
@@ -885,7 +885,7 @@ pub fn print_harnesses(data_dir: &Path, json: bool) -> Result<()> {
             ),
             ui::pad_right(&runner, 7),
             ui::pad_right(&tarball, 9),
-            ui::pad_right(&ui::sand(&package_label), 24),
+            ui::pad_right(&ui::purple(&package_label), 24),
             ui::dim(row.notes.as_deref().unwrap_or(""))
         );
     }

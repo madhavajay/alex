@@ -54,6 +54,7 @@ if [[ -d "$RES_BUNDLE" ]]; then
 fi
 
 ICON_SRC="Resources/icon.png"
+TRAY_ICON_SRC="Resources/icon_nobackground.png"
 if [[ -f "$ICON_SRC" ]]; then
   ICONSET="$DIST/AppIcon.iconset"
   rm -rf "$ICONSET"
@@ -66,6 +67,9 @@ if [[ -f "$ICON_SRC" ]]; then
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
   rm -rf "$ICONSET"
   cp "$ICON_SRC" "$APP/Contents/Resources/icon.png"
+fi
+if [[ -f "$TRAY_ICON_SRC" ]]; then
+  cp "$TRAY_ICON_SRC" "$APP/Contents/Resources/icon_nobackground.png"
 fi
 
 plist_escape() {

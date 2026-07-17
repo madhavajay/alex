@@ -159,7 +159,7 @@ public enum DaemonController {
     }
 
     public static func startDaemon() async -> CommandResult {
-        await run(args: ["daemon", "--background", "--nosplash"], timeout: 30)
+        await run(args: ["daemon", "--background"], timeout: 30)
     }
 
     public static func setDaemonHost(_ host: String) async -> CommandResult {
