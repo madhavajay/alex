@@ -897,6 +897,10 @@ struct Config {
     ping_gemini_model: String,
     #[serde(default = "default_ping_openrouter")]
     ping_openrouter_model: String,
+    #[serde(default = "default_exo_url")]
+    exo_url: String,
+    #[serde(default)]
+    exo_enabled_models: Vec<String>,
     #[serde(default)]
     gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
@@ -962,6 +966,22 @@ struct Config {
 
 struct ConfigProtectionPolicyPersister {
     config: Arc<std::sync::Mutex<Config>>,
+}
+
+struct ConfigExoPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::ExoConfigPersister for ConfigExoPersister {
+    fn persist(&self, exo: &alex_proxy::ExoConfig) -> std::result::Result<(), String> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| "daemon config lock is unavailable".to_string())?;
+        config.exo_url = exo.url.clone();
+        config.exo_enabled_models = exo.enabled_models.clone();
+        save_config(&config).map_err(|error| error.to_string())
+    }
 }
 
 impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
@@ -1049,6 +1069,10 @@ fn default_ping_openrouter() -> String {
     // paid anthropic/claude-3.5-sonnet, which billed real credits on every ping.
     // Bare id: the ping path has already resolved the provider to OpenRouter.
     "google/gemma-4-26b-a4b-it:free".into()
+}
+
+fn default_exo_url() -> String {
+    "http://localhost:52415".into()
 }
 
 fn default_anthropic_upstream() -> String {
@@ -1147,6 +1171,8 @@ impl Config {
             local_key: random_key("alx"),
             ping_gemini_model: default_ping_gemini(),
             ping_openrouter_model: default_ping_openrouter(),
+            exo_url: default_exo_url(),
+            exo_enabled_models: Vec::new(),
             gemini_project: String::new(),
             heartbeat_minutes: default_heartbeat_minutes(),
             ping_anthropic_model: default_ping_anthropic(),
@@ -2052,6 +2078,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
 
     fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
         let mut ids = state.store.pricing_models();
+        ids.extend(alex_proxy::exo_catalog_models(state));
         for (alias, _) in alex_core::model_aliases() {
             ids.push((*alias).to_string());
         }
@@ -2871,9 +2898,22 @@ async fn main() -> Result<()> {
             );
             alex_proxy::set_notifications(&state, config.notification_settings());
             alex_proxy::set_protection_policy(&state, config.protection.clone());
+            alex_proxy::set_exo_config(
+                &state,
+                alex_proxy::ExoConfig {
+                    url: config.exo_url.clone(),
+                    enabled_models: config.exo_enabled_models.clone(),
+                },
+            );
             alex_proxy::set_protection_policy_persister(
                 &state,
                 Arc::new(ConfigProtectionPolicyPersister {
+                    config: Arc::new(std::sync::Mutex::new(config.clone())),
+                }),
+            );
+            alex_proxy::set_exo_config_persister(
+                &state,
+                Arc::new(ConfigExoPersister {
                     config: Arc::new(std::sync::Mutex::new(config.clone())),
                 }),
             );
@@ -7469,6 +7509,7 @@ async fn run_pings(
         alex_core::Provider::Xai => models.xai.clone(),
         alex_core::Provider::Gemini => models.gemini.clone(),
         alex_core::Provider::Openrouter => models.openrouter.clone(),
+        alex_core::Provider::Exo => "exo-local".to_string(),
         alex_core::Provider::Amp => "amp".to_string(),
     };
     if std::io::stdout().is_terminal() {
@@ -9998,6 +10039,8 @@ mod tests {
             ping_xai_model: default_ping_xai(),
             ping_gemini_model: default_ping_gemini(),
             ping_openrouter_model: default_ping_openrouter(),
+            exo_url: default_exo_url(),
+            exo_enabled_models: Vec::new(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,
@@ -10543,6 +10586,8 @@ mod tests {
             ping_xai_model: default_ping_xai(),
             ping_gemini_model: default_ping_gemini(),
             ping_openrouter_model: default_ping_openrouter(),
+            exo_url: default_exo_url(),
+            exo_enabled_models: Vec::new(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,

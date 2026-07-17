@@ -26,6 +26,7 @@ pub enum Provider {
     Gemini,
     Xai,
     Openrouter,
+    Exo,
     /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
     Amp,
 }
@@ -38,6 +39,7 @@ impl Provider {
             Provider::Gemini => "gemini",
             Provider::Xai => "xai",
             Provider::Openrouter => "openrouter",
+            Provider::Exo => "exo",
             Provider::Amp => "amp",
         }
     }
@@ -49,6 +51,7 @@ impl Provider {
             "gemini" | "google" => Some(Provider::Gemini),
             "xai" | "grok" => Some(Provider::Xai),
             "openrouter" | "or" => Some(Provider::Openrouter),
+            "exo" => Some(Provider::Exo),
             "amp" | "ampcode" => Some(Provider::Amp),
             _ => None,
         }
@@ -91,6 +94,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok:", Provider::Xai),
     ("xai:", Provider::Xai),
     ("openrouter:", Provider::Openrouter),
+    ("exo:", Provider::Exo),
     ("claude/", Provider::Anthropic),
     ("anthropic/", Provider::Anthropic),
     ("openai/", Provider::Openai),
@@ -101,6 +105,7 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok/", Provider::Xai),
     ("xai/", Provider::Xai),
     ("openrouter/", Provider::Openrouter),
+    ("exo/", Provider::Exo),
 ];
 
 // Claude Code gateway discovery only accepts model ids beginning with
@@ -197,7 +202,7 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
                 "remaining": hi(h, "x-ratelimit-remaining-tokens"),
             },
         }),
-        Provider::Gemini | Provider::Openrouter | Provider::Amp => Value::Null,
+        Provider::Gemini | Provider::Openrouter | Provider::Exo | Provider::Amp => Value::Null,
     }
 }
 
@@ -585,6 +590,13 @@ mod tests {
         assert_eq!(route_model("google/gemini-3-pro").0, Some(Provider::Gemini));
         assert_eq!(route_model("grok/grok-4").0, Some(Provider::Xai));
         assert_eq!(route_model("xai/grok-4").0, Some(Provider::Xai));
+        assert_eq!(
+            route_model("exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
+            (
+                Some(Provider::Exo),
+                "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".to_string()
+            )
+        );
         assert_eq!(
             route_model("alexandria/openrouter/anthropic/claude-3.5-sonnet"),
             (

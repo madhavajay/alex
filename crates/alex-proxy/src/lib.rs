@@ -81,6 +81,34 @@ pub trait ProtectionPolicyPersister: Send + Sync {
     fn persist(&self, policy: &ProtectionPolicy) -> std::result::Result<(), String>;
 }
 
+/// Local Exo endpoint settings. Exo is account-less: its OpenAI-compatible
+/// server accepts the dummy bearer token used for requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExoConfig {
+    #[serde(default = "default_exo_url")]
+    pub url: String,
+    #[serde(default)]
+    pub enabled_models: Vec<String>,
+}
+
+fn default_exo_url() -> String {
+    "http://localhost:52415".into()
+}
+
+impl Default for ExoConfig {
+    fn default() -> Self {
+        Self {
+            url: default_exo_url(),
+            enabled_models: Vec::new(),
+        }
+    }
+}
+
+/// Persists an Exo settings update owned by the daemon configuration.
+pub trait ExoConfigPersister: Send + Sync {
+    fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String>;
+}
+
 impl Default for ProtectionPolicy {
     fn default() -> Self {
         Self {
@@ -272,7 +300,7 @@ fn routing_limits_from_headers(
             Provider::Openai => OPENAI_LIMIT_HEADERS.contains(&name),
             Provider::Anthropic => name.starts_with("anthropic-ratelimit-"),
             Provider::Xai => name.starts_with("x-ratelimit-"),
-            Provider::Gemini | Provider::Openrouter | Provider::Amp => false,
+            Provider::Gemini | Provider::Openrouter | Provider::Exo | Provider::Amp => false,
         };
         if allowed {
             if let Ok(value) = value.to_str() {
@@ -308,6 +336,8 @@ pub struct AppState {
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
     openrouter_models: std::sync::Mutex<Vec<String>>,
+    exo: std::sync::RwLock<ExoConfig>,
+    exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
     pub logins: alex_auth::sessions::LoginManager,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     trace_ingest_lock: tokio::sync::Mutex<()>,
@@ -579,6 +609,8 @@ pub fn build_state_with_substitution(
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
+        exo: std::sync::RwLock::new(ExoConfig::default()),
+        exo_persister: std::sync::RwLock::new(None),
         logins: alex_auth::sessions::LoginManager::default(),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         trace_ingest_lock: tokio::sync::Mutex::new(()),
@@ -613,6 +645,44 @@ pub fn set_protection_policy_persister(
     if let Ok(mut slot) = state.protection_persister.write() {
         *slot = Some(persister);
     }
+}
+
+/// Replaces Exo settings used for both routing and the published catalog.
+pub fn set_exo_config(state: &Arc<AppState>, config: ExoConfig) {
+    if let Ok(mut slot) = state.exo.write() {
+        *slot = config;
+    }
+}
+
+/// Installs the daemon-owned config persistence hook for Exo admin writes.
+pub fn set_exo_config_persister(state: &Arc<AppState>, persister: Arc<dyn ExoConfigPersister>) {
+    if let Ok(mut slot) = state.exo_persister.write() {
+        *slot = Some(persister);
+    }
+}
+
+/// Model identifiers exposed by enabled Exo models, including the explicit
+/// provider prefix and Alexandria's convenient local alias.
+pub fn exo_catalog_models(state: &AppState) -> Vec<String> {
+    state
+        .exo
+        .read()
+        .map(|config| {
+            config
+                .enabled_models
+                .iter()
+                .flat_map(|model| [format!("exo/{model}"), format!("alex/{model}")])
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn exo_model_enabled(state: &AppState, model: &str) -> bool {
+    state
+        .exo
+        .read()
+        .map(|config| config.enabled_models.iter().any(|id| id == model))
+        .unwrap_or(false)
 }
 
 pub fn set_fixture_dir(state: &Arc<AppState>, dir: PathBuf) {
@@ -749,6 +819,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_auth_openrouter_key),
         )
         .route("/admin/health", get(admin_health))
+        .route("/admin/exo", get(admin_exo).put(admin_exo_update))
+        .route("/admin/exo/status", get(admin_exo_status))
+        .route("/admin/exo/models", get(admin_exo_models))
         .route("/admin/notifications", get(admin_notifications))
         .route("/admin/notifications/test", post(admin_notifications_test))
         .route("/admin/analytics", get(admin_analytics))
@@ -1318,6 +1391,207 @@ async fn refresh_openrouter_models(state: &AppState) {
     }
 }
 
+fn normalize_exo_config(mut config: ExoConfig) -> Result<ExoConfig, String> {
+    let parsed = reqwest::Url::parse(config.url.trim())
+        .map_err(|_| "Exo URL must be an absolute http:// or https:// URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "Exo URL must be an absolute http:// or https:// endpoint without query or fragment"
+                .into(),
+        );
+    }
+    config.url = config.url.trim_end_matches('/').to_string();
+    let mut seen = HashSet::new();
+    config.enabled_models = config
+        .enabled_models
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && id.len() <= 512 && seen.insert(id.clone()))
+        .collect();
+    if config.enabled_models.len() > 500 {
+        return Err("at most 500 Exo models may be enabled".into());
+    }
+    Ok(config)
+}
+
+async fn exo_model_payload(state: &AppState) -> Result<Value, String> {
+    let config = state
+        .exo
+        .read()
+        .map_err(|_| "Exo settings are unavailable".to_string())?
+        .clone();
+    let response = state
+        .http
+        .get(format!("{}/v1/models", config.url))
+        .header("authorization", "Bearer x")
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Exo returned HTTP {}", response.status()));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("invalid Exo models response: {error}"))
+}
+
+fn exo_models_array(payload: &Value) -> Vec<Value> {
+    payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn admin_exo(State(state): State<Arc<AppState>>) -> Response {
+    match state.exo.read() {
+        Ok(config) => axum::Json(config.clone()).into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Exo settings are unavailable",
+        ),
+    }
+}
+
+async fn admin_exo_update(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<ExoConfig>,
+) -> Response {
+    let config = match normalize_exo_config(body) {
+        Ok(config) => config,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let persister = state
+        .exo_persister
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(persister) = persister else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Exo settings persistence is unavailable",
+        );
+    };
+    if let Err(error) = persister.persist(&config) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
+    set_exo_config(&state, config.clone());
+    axum::Json(config).into_response()
+}
+
+async fn admin_exo_status(State(state): State<Arc<AppState>>) -> Response {
+    let config = match state.exo.read() {
+        Ok(config) => config.clone(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Exo settings are unavailable",
+            )
+        }
+    };
+    match exo_model_payload(&state).await {
+        Ok(payload) => axum::Json(json!({"running": true, "url": config.url, "model_count": exo_models_array(&payload).len()})).into_response(),
+        Err(error) => axum::Json(json!({"running": false, "url": config.url, "model_count": 0, "error": error})).into_response(),
+    }
+}
+
+async fn admin_exo_models(State(state): State<Arc<AppState>>) -> Response {
+    let enabled = state
+        .exo
+        .read()
+        .map(|config| config.enabled_models.clone())
+        .unwrap_or_default();
+    match exo_model_payload(&state).await {
+        Ok(payload) => {
+            // Some Exo builds list every downloadable model and publish the
+            // currently loaded subset separately. Preserve that distinction
+            // when it is present; otherwise `running` remains omitted.
+            let running_ids: Option<HashSet<String>> = payload
+                .get("running_models")
+                .or_else(|| payload.get("loaded_models"))
+                .and_then(Value::as_array)
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| {
+                            model
+                                .as_str()
+                                .or_else(|| model.get("id").and_then(Value::as_str))
+                                .map(String::from)
+                        })
+                        .collect()
+                });
+            let models: Vec<Value> = exo_models_array(&payload)
+                .into_iter()
+                .filter_map(|model| {
+                    let id = model.get("id").and_then(Value::as_str)?.to_string();
+                    let running = model
+                        .get("running")
+                        .and_then(Value::as_bool)
+                        .or_else(|| {
+                            model
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(|status| status.eq_ignore_ascii_case("running"))
+                        })
+                        .or_else(|| running_ids.as_ref().map(|ids| ids.contains(&id)));
+                    let mut out = serde_json::Map::new();
+                    out.insert("id".into(), json!(id));
+                    out.insert(
+                        "name".into(),
+                        json!(model
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| model["id"].as_str().unwrap_or(""))),
+                    );
+                    for (output, candidates) in [
+                        ("family", &["family", "architecture"][..]),
+                        ("quantization", &["quantization", "quantization_level"][..]),
+                        (
+                            "context_length",
+                            &["context_length", "context_window", "max_context_length"][..],
+                        ),
+                    ] {
+                        if let Some(value) = candidates
+                            .iter()
+                            .find_map(|key| model.get(*key))
+                            .filter(|value| !value.is_null())
+                        {
+                            if output == "context_length" {
+                                if let Some(length) = value
+                                    .as_u64()
+                                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                                {
+                                    out.insert(output.into(), json!(length));
+                                }
+                            } else {
+                                out.insert(output.into(), value.clone());
+                            }
+                        }
+                    }
+                    out.insert(
+                        "enabled".into(),
+                        json!(enabled.iter().any(|value| value == &id)),
+                    );
+                    if let Some(running) = running {
+                        out.insert("running".into(), json!(running));
+                    }
+                    Some(Value::Object(out))
+                })
+                .collect();
+            axum::Json(json!({"models": models})).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, &error),
+    }
+}
+
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // OpenRouter is the sole dynamic provider catalog. Refresh only on an
     // explicit model-list request; Alexandria has no catalog refresh worker.
@@ -1326,6 +1600,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
     if let Ok(models) = state.openrouter_models.lock() {
         ids.extend(models.iter().map(|id| format!("openrouter/{id}")));
     }
+    ids.extend(exo_catalog_models(&state));
     for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
@@ -3747,6 +4022,28 @@ pub async fn ping_provider(
                 "messages": [{"role": "user", "content": prompt}],
             }),
         ),
+        Provider::Exo => match exo_model_payload(state).await {
+            Ok(payload) => {
+                return PingResult {
+                    provider: "exo",
+                    account_id: Some("exo-local".into()),
+                    ok: true,
+                    status: Some(200),
+                    latency_ms: now_ms() - start,
+                    message: format!("{} models available", exo_models_array(&payload).len()),
+                }
+            }
+            Err(error) => {
+                return PingResult {
+                    provider: "exo",
+                    account_id: Some("exo-local".into()),
+                    ok: false,
+                    status: None,
+                    latency_ms: now_ms() - start,
+                    message: error,
+                }
+            }
+        },
         Provider::Amp => {
             let account_id = state
                 .vault
@@ -4192,6 +4489,28 @@ fn dario_account(active: &DarioActive) -> Account {
         refresh_token: None,
         id_token: None,
         api_key: Some(active.api_key.clone()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: Value::Null,
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: None,
+    }
+}
+
+fn exo_account() -> Account {
+    Account {
+        id: "exo-local".into(),
+        provider: Provider::Exo,
+        kind: "local".into(),
+        name: "Exo local cluster".into(),
+        description: None,
+        paused: false,
+        label: Some("Exo local inference".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some("x".into()),
         expires_at_ms: None,
         last_refresh_ms: None,
         account_meta: Value::Null,
@@ -4823,6 +5142,32 @@ async fn plan_upstream(
                 )),
             }
         }
+        Provider::Exo => {
+            let url = state.exo.read().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Exo settings are unavailable".to_string()))?.url.clone();
+            let account = exo_account();
+            match format {
+                ClientFormat::OpenaiChat => {
+                    body_json["model"] = json!(routed_model);
+                    let body = serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan { url: format!("{url}/v1/chat/completions"), account, connection_account: None, body,
+                        upstream_format: "openai-chat", destream: false, respond_as: None, client_stream,
+                        extra_headers: vec![], dario_guard: None, dario_fallback_reason: None, via_dario: false, dario_generation: None })
+                }
+                ClientFormat::AnthropicMessages => {
+                    let mut converted = translate::anthropic_to_openai_chat(body_json);
+                    converted["model"] = json!(routed_model);
+                    converted["stream"] = json!(false);
+                    let body = serde_json::to_vec(&converted).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan { url: format!("{url}/v1/chat/completions"), account, connection_account: None, body,
+                        upstream_format: "openai-chat", destream: false, respond_as: Some(RespondAs::Anthropic), client_stream,
+                        extra_headers: vec![], dario_guard: None, dario_fallback_reason: None, via_dario: false, dario_generation: None })
+                }
+                ClientFormat::OpenaiResponses | ClientFormat::GeminiGenerate => Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "the Exo upstream speaks OpenAI chat completions; POST to /v1/chat/completions or /v1/messages".to_string(),
+                )),
+            }
+        }
         Provider::Amp => Err((
             StatusCode::NOT_IMPLEMENTED,
             "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
@@ -5291,6 +5636,9 @@ fn upstream_headers(
         }
         (Provider::Openrouter, _) => {
             h.extend(openrouter_auth_headers(account)?);
+        }
+        (Provider::Exo, _) => {
+            h.insert("authorization", HeaderValue::from_static("Bearer x"));
         }
         (Provider::Xai, _) => {
             let token = account
@@ -6369,6 +6717,7 @@ fn protection_equivalent(
             "xai" => Provider::Xai,
             "gemini" => Provider::Gemini,
             "openrouter" => Provider::Openrouter,
+            "exo" => Provider::Exo,
             _ => return None,
         };
         (candidate_provider != current_provider && !attempted_models.contains(model))
@@ -6600,7 +6949,17 @@ async fn proxy(
         return error_response(StatusCode::BAD_REQUEST, "missing 'model' in request body");
     }
     let (routed_provider, routed_model) = route_model(&requested_model);
-    let provider = routed_provider.unwrap_or_else(|| format.default_provider());
+    // `alex/<model>` is the local alias published for an enabled Exo model.
+    // An explicit `exo/<model>` must also be enabled; this prevents an
+    // arbitrary caller from using Alexandria as an unintended LAN proxy.
+    let provider = match routed_provider {
+        Some(Provider::Exo) if !exo_model_enabled(&state, &routed_model) => {
+            return error_response(StatusCode::NOT_FOUND, "Exo model is not enabled")
+        }
+        Some(provider) => provider,
+        None if exo_model_enabled(&state, &routed_model) => Provider::Exo,
+        None => format.default_provider(),
+    };
     trace.requested_model = Some(requested_model.clone());
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
@@ -8112,6 +8471,85 @@ mod tests {
             self.policies.lock().unwrap().push(policy.clone());
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingExoPersister {
+        configs: std::sync::Mutex<Vec<ExoConfig>>,
+    }
+
+    impl ExoConfigPersister for RecordingExoPersister {
+        fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String> {
+            self.configs.lock().unwrap().push(config.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn exo_admin_put_then_get_round_trips_and_hot_applies_catalog() {
+        let state = test_state("exo-admin-round-trip");
+        let persister = Arc::new(RecordingExoPersister::default());
+        set_exo_config_persister(&state, persister.clone());
+        let (status, saved) = response_json(
+            admin_exo_update(
+                State(state.clone()),
+                axum::Json(ExoConfig {
+                    url: "http://127.0.0.1:52415/".into(),
+                    enabled_models: vec!["mlx-community/llama".into()],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["url"], "http://127.0.0.1:52415");
+        assert_eq!(
+            exo_catalog_models(&state),
+            vec!["exo/mlx-community/llama", "alex/mlx-community/llama"]
+        );
+        let (status, fetched) = response_json(admin_exo(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched, saved);
+        assert_eq!(persister.configs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exo_prefix_and_enabled_alex_alias_target_exo_url() {
+        use axum::routing::post;
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let upstream = Router::new().route("/v1/chat/completions", post(move |axum::Json(body): axum::Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(body["model"].as_str().unwrap_or("").to_string());
+                axum::Json(json!({"id":"exo-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = test_state("exo-routing");
+        set_exo_config(
+            &state,
+            ExoConfig {
+                url: format!("http://{address}"),
+                enabled_models: vec!["mlx-community/llama".into()],
+            },
+        );
+        for model in ["exo/mlx-community/llama", "alex/mlx-community/llama"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+            let response = proxy(state.clone(), ClientFormat::OpenaiChat, "/v1/chat/completions", headers,
+                Bytes::from(serde_json::to_vec(&json!({"model": model, "stream": false, "messages": [{"role":"user","content":"hi"}]})).unwrap()), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            *received.lock().await,
+            vec!["mlx-community/llama", "mlx-community/llama"]
+        );
+        server.abort();
     }
 
     #[tokio::test]
