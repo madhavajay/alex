@@ -19,12 +19,29 @@ quit_apps() {
 remove_legacy_app() {
   legacy_name="AlexandriaBar"
   legacy="/Applications/${legacy_name}.app"
+  new_app="/Applications/Alex.app"
+  # Only remove the legacy app once the renamed app is present, so we never
+  # delete the freshly installed app on casks that still ship AlexandriaBar.app.
+  # (thanks @khoaguin, #5)
+  [ -e "$new_app" ] || return 0
   [ -e "$legacy" ] || return 0
   if [ -w "/Applications" ]; then
     rm -rf "$legacy"
   else
     sudo rm -rf "$legacy"
   fi
+}
+
+open_app() {
+  # Open whichever app the cask installed (renamed Alex.app or legacy
+  # AlexandriaBar.app). (thanks @khoaguin, #5)
+  for app in Alex AlexandriaBar; do
+    if [ -e "/Applications/${app}.app" ]; then
+      open -a "$app"
+      return 0
+    fi
+  done
+  open -a Alex
 }
 
 install_macos() {
@@ -56,7 +73,7 @@ install_macos() {
     say "Daemon was busy, so it kept running the old build."
     say "Apply the update when idle with: alex service restart --force"
   fi
-  open -a Alex
+  open_app
 
   say "Alexandria is installed. The daemon is registered to run at login."
   say "Next: alex auth import"
