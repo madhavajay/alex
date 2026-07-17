@@ -37,7 +37,15 @@ install_macos() {
   say "Installing the Alexandria CLI/daemon and menu-bar app with Homebrew…"
   quit_apps
   brew install madhavajay/alex/alex
-  brew install --cask madhavajay/alex/alexandria
+  # Recover from a broken/renamed cask record before installing. Casks from
+  # before the Alex rename referenced AlexandriaBar.app, which no longer exists,
+  # so brew's upgrade runs that dead uninstall and aborts ("App source
+  # '/Applications/AlexandriaBar.app' is not there"). Clear any stale record,
+  # then force-install the current cask (adopting an Alex.app a direct DMG may
+  # already have dropped).
+  brew uninstall --cask madhavajay/alex/alexandria --force >/dev/null 2>&1 || true
+  rm -rf "$(brew --prefix)/Caskroom/alexandria" 2>/dev/null || true
+  brew install --cask --force madhavajay/alex/alexandria
   remove_legacy_app
 
   alex_bin="$(brew --prefix)/bin/alex"
