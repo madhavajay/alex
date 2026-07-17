@@ -591,7 +591,24 @@ jobs:
             -e "s/{{SHA_LINUX}}/${sha_linux}/g" \
             packaging/homebrew/alex.rb.tmpl > dist/homebrew/alex.rb
 
-      - name: Push formula to Homebrew tap
+      - name: Render cask
+        if: steps.tap_key.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.manifest.outputs.version }}"
+          # Compute the DMG sha256 straight from the published release asset, so
+          # the cask can never drift from the actual DMG.
+          gh release download "v${version}" --pattern "Alex-${version}.dmg" --clobber -R "${{ github.repository }}"
+          sha_dmg="$(sha256sum "Alex-${version}.dmg" | awk '{print $1}')"
+          mkdir -p dist/homebrew
+          sed \
+            -e "s/{{VERSION}}/${version}/g" \
+            -e "s/{{SHA_DMG}}/${sha_dmg}/g" \
+            packaging/homebrew/alexandria.rb.tmpl > dist/homebrew/alexandria.rb
+
+      - name: Push formula + cask to Homebrew tap
         if: steps.tap_key.outputs.present == 'true'
         run: |
           set -euo pipefail
@@ -606,14 +623,15 @@ jobs:
           if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
             git checkout -B main
           fi
-          mkdir -p Formula
+          mkdir -p Formula Casks
           cp "$GITHUB_WORKSPACE/dist/homebrew/alex.rb" Formula/alex.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alexandria.rb" Casks/alexandria.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/alex.rb
+          git add Formula/alex.rb Casks/alexandria.rb
           if git diff --cached --quiet; then
-            echo "Formula/alex.rb is already up to date; skipping commit."
+            echo "Formula + cask are already up to date; skipping commit."
           else
-            git commit -m "alex ${version}"
+            git commit -m "alex ${version} (formula + cask)"
             git push origin HEAD:main
           fi

@@ -11,7 +11,22 @@ cask "alexandria" do
 
   app "Alex.app"
 
-  uninstall quit: "com.madhavajay.alex"
+  # Tolerate the app already being gone (replaced by a direct DMG install, or
+  # the pre-rename AlexandriaBar.app): quitting a not-running bundle id is a
+  # no-op and delete/trash do not error on missing paths.
+  uninstall quit:   "com.madhavajay.alex",
+            delete: [
+              "/Applications/Alex.app",
+              "/Applications/AlexandriaBar.app",
+            ]
+
+  zap trash: [
+    "~/Library/Application Support/com.madhavajay.alex",
+    "~/Library/Caches/com.madhavajay.alex",
+    "~/Library/Preferences/com.madhavajay.alex.plist",
+    "~/Library/HTTPStorages/com.madhavajay.alex",
+    "~/Library/Saved Application State/com.madhavajay.alex.savedState",
+  ]
 
   livecheck do
     url :stable
