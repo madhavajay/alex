@@ -19,6 +19,168 @@ public struct AccountsResponse: Codable, Sendable {
     public let accounts: [Account]
 }
 
+/// A delivery threshold for daemon runtime notifications.
+public enum NotificationLevel: String, Codable, Sendable, CaseIterable {
+    case info
+    case warn
+    case critical
+}
+
+/// Redacted notification settings returned by the local admin API. Tokens and
+/// webhook URLs are deliberately not part of this representation.
+public struct NotificationSettingsResponse: Codable, Sendable {
+    public let channels: [NotificationChannel]
+    public let cooldownSeconds: Int
+    public let timeoutSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case channels
+        case cooldownSeconds = "cooldown_seconds"
+        case timeoutSeconds = "timeout_seconds"
+    }
+}
+
+/// One redacted runtime notification channel.
+public struct NotificationChannel: Codable, Sendable {
+    public let index: Int
+    public let id: String?
+    public let kind: String
+    public let format: String
+    public let host: String?
+    public let botUsername: String?
+    public let chatID: String?
+    public let supportsReplies: Bool?
+    public let minLevel: NotificationLevel
+    public let categories: [String]
+    public let lastSentMs: Int64?
+    public let lastError: String?
+
+    public var stableID: String { id ?? "channel-\(index)" }
+
+    enum CodingKeys: String, CodingKey {
+        case index, id, kind, format, host, categories
+        case botUsername = "bot_username"
+        case chatID = "chat_id"
+        case supportsReplies = "supports_replies"
+        case minLevel = "min_level"
+        case lastSentMs = "last_sent_ms"
+        case lastError = "last_error"
+    }
+}
+
+/// The credential-bearing request used only while creating or testing a
+/// Telegram channel. Do not persist or render this value outside a secure field.
+public struct TelegramNotificationChannelRequest: Encodable, Sendable {
+    public let format = "telegram"
+    public let token: String
+    public let chatID: String
+    public let minLevel: NotificationLevel
+    public let categories: [String]
+
+    public init(token: String, chatID: String, minLevel: NotificationLevel, categories: [String]) {
+        self.token = token
+        self.chatID = chatID
+        self.minLevel = minLevel
+        self.categories = categories
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case format, token, categories
+        case chatID = "chat_id"
+        case minLevel = "min_level"
+    }
+}
+
+/// A short-lived Telegram token request used for validation and chat discovery.
+public struct TelegramNotificationTokenRequest: Encodable, Sendable {
+    public let format = "telegram"
+    public let token: String
+
+    public init(token: String) {
+        self.token = token
+    }
+}
+
+public struct NotificationValidationResponse: Codable, Sendable {
+    public let ok: Bool
+    public let botUsername: String?
+    public let botName: String?
+    public let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, error
+        case botUsername = "bot_username"
+        case botName = "bot_name"
+    }
+}
+
+public struct NotificationChat: Codable, Sendable, Identifiable {
+    public let chatID: String
+    public let chatName: String
+
+    public var id: String { chatID }
+
+    enum CodingKeys: String, CodingKey {
+        case chatID = "chat_id"
+        case chatName = "chat_name"
+    }
+}
+
+/// Supports both the runtime API's `{ ok, chats }` response and the original
+/// bare-array contract.
+public struct NotificationChatDiscoveryResponse: Decodable, Sendable {
+    public let ok: Bool
+    public let chats: [NotificationChat]
+    public let error: String?
+
+    private enum CodingKeys: String, CodingKey { case ok, chats, error }
+
+    public init(from decoder: Decoder) throws {
+        if let chats = try? [NotificationChat](from: decoder) {
+            self.ok = true
+            self.chats = chats
+            self.error = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.ok = try container.decodeIfPresent(Bool.self, forKey: .ok) ?? true
+        self.chats = try container.decodeIfPresent([NotificationChat].self, forKey: .chats) ?? []
+        self.error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+public struct NotificationTestResult: Codable, Sendable {
+    public let ok: Bool
+    public let error: String?
+}
+
+/// Supports the runtime API's `{ channels: [...] }` response and a direct
+/// per-channel result.
+public struct NotificationTestResponse: Decodable, Sendable {
+    public let channels: [NotificationTestResult]
+
+    private enum CodingKeys: String, CodingKey { case channels }
+
+    public init(from decoder: Decoder) throws {
+        if let channels = try? [NotificationTestResult](from: decoder) {
+            self.channels = channels
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let channels = try container.decodeIfPresent([NotificationTestResult].self, forKey: .channels) {
+            self.channels = channels
+        } else {
+            self.channels = [try NotificationTestResult(from: decoder)]
+        }
+    }
+}
+
+public struct NotificationSaveResponse: Codable, Sendable {
+    public let ok: Bool
+    public let channel: NotificationChannel?
+    public let error: String?
+}
+
 public struct Account: Codable, Sendable, Identifiable {
     public let id: String
     public let provider: String
