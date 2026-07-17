@@ -13,6 +13,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case providers = "Providers"
     case harnesses = "Harnesses"
     case dario = "Dario"
+    case exo = "Exo"
     case protection = "Protection"
 
     var icon: String {
@@ -21,6 +22,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
         case .providers: "bolt"
         case .harnesses: "terminal"
         case .dario: "server.rack"
+        case .exo: "cpu"
         case .protection: "shield"
         }
     }
@@ -114,6 +116,8 @@ struct PreferencesView: View {
                     HarnessesPreferencesSection(store: store)
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
+                case .exo:
+                    ExoPreferencesSection(store: store)
                 case .protection:
                     ProtectionPreferencesSection(store: store)
                 }

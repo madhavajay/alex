@@ -16,7 +16,7 @@ struct ProtectionPreferencesSection: View {
     @State private var loadError: String?
     @State private var actionResult: String?
 
-    private static let providers = ["anthropic", "openai", "xai", "openrouter", "gemini"]
+    private static let providers = ["anthropic", "openai", "xai", "openrouter", "exo", "gemini"]
 
     var body: some View {
         VStack(spacing: 0) {

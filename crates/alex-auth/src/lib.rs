@@ -930,6 +930,7 @@ impl Vault {
             (Provider::Openrouter, _) => Err(anyhow!(
                 "openrouter accounts use a long-lived API key; re-run `alex auth openrouter-key`"
             )),
+            (Provider::Exo, _) => Err(anyhow!("exo is configured locally and has no account to refresh")),
             (Provider::Amp, _) => Err(anyhow!(
                 "amp accounts use a long-lived API key; re-run `alex auth import amp` or `alex auth amp-key`"
             )),
@@ -994,6 +995,7 @@ impl Vault {
                 let _ = import_amp(self).await;
             }
             Provider::Openrouter => {}
+            Provider::Exo => {}
         };
         let fresh = self.accounts.read().await.get(&stale.id).cloned()?;
         let changed = fresh.access_token != stale.access_token;

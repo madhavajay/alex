@@ -457,6 +457,24 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/protection", method: "PUT", body: body(policy))
     }
 
+    public func exoConfig() async throws -> ExoConfig {
+        try await get("admin/exo", as: ExoConfig.self)
+    }
+
+    public func exoStatus() async throws -> ExoStatus {
+        try await get("admin/exo/status", as: ExoStatus.self)
+    }
+
+    public func exoModels() async throws -> [ExoModel] {
+        try await get("admin/exo/models", as: ExoModelsResponse.self).models
+    }
+
+    @discardableResult
+    public func updateExoConfig(_ config: ExoConfig) async throws -> ExoConfig {
+        let data = try await request("admin/exo", method: "PUT", body: body(config))
+        return try JSONDecoder().decode(ExoConfig.self, from: data)
+    }
+
     public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
         try await get(
             "traces/sessions",

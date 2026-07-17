@@ -615,6 +615,52 @@ public struct ImportOutcome: Codable, Sendable {
     public let note: String?
 }
 
+public struct ExoConfig: Codable, Sendable, Equatable {
+    public var url: String
+    public var enabledModels: [String]
+
+    public init(url: String = "http://localhost:52415", enabledModels: [String] = []) {
+        self.url = url
+        self.enabledModels = enabledModels
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case url
+        case enabledModels = "enabled_models"
+    }
+}
+
+public struct ExoStatus: Codable, Sendable, Equatable {
+    public let running: Bool
+    public let url: String
+    public let modelCount: Int
+    public let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case running, url, error
+        case modelCount = "model_count"
+    }
+}
+
+public struct ExoModelsResponse: Codable, Sendable {
+    public let models: [ExoModel]
+}
+
+public struct ExoModel: Codable, Sendable, Identifiable, Equatable {
+    public let id: String
+    public let name: String
+    public let family: String?
+    public let quantization: String?
+    public let contextLength: Int?
+    public var enabled: Bool
+    public let running: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, family, quantization, enabled, running
+        case contextLength = "context_length"
+    }
+}
+
 public enum ProviderInfo {
     public static func displayName(_ provider: String) -> String {
         switch provider {
@@ -624,6 +670,7 @@ public enum ProviderInfo {
         case "gemini": "Gemini"
         case "amp": "Amp"
         case "openrouter": "OpenRouter"
+        case "exo": "Exo"
         default: provider.capitalized
         }
     }
@@ -640,14 +687,14 @@ public enum ProviderInfo {
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai", "gemini", "amp", "openrouter": provider
+        case "anthropic", "openai", "gemini", "amp", "openrouter", "exo": provider
         case "xai": "grok"
         default: nil
         }
     }
 
     public static var supportedProviders: [String] {
-        ["anthropic", "openai", "gemini", "xai", "openrouter", "amp"]
+        ["anthropic", "openai", "gemini", "xai", "openrouter", "exo", "amp"]
     }
 
     public static func usesAPIKeySheet(_ provider: String) -> Bool {

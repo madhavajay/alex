@@ -4873,18 +4873,20 @@ fn allowed_model_id(id: &str) -> bool {
     if allowed_model_prefix(id) && !id.contains('/') {
         return true;
     }
-    let Some(model) = id.strip_prefix("openrouter/") else {
+    let Some(model) = ["openrouter/", "exo/", "alex/"]
+        .iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
+    else {
         return false;
     };
-    model.contains('/')
-        && model.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment != "."
-                && segment != ".."
-                && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+'))
-        })
+    model.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+'))
+    })
 }
 
 fn allowed_model_prefix(id: &str) -> bool {
@@ -5112,6 +5114,8 @@ mod tests {
             ping_xai_model: crate::default_ping_xai(),
             ping_gemini_model: crate::default_ping_gemini(),
             ping_openrouter_model: crate::default_ping_openrouter(),
+            exo_url: crate::default_exo_url(),
+            exo_enabled_models: Vec::new(),
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
             dario_mode_migrated: true,
@@ -5846,6 +5850,8 @@ fi"#,
             "gemini-2.5-flash".into(),
             "openrouter/anthropic/claude-opus-4.8".into(),
             "openrouter/meta-llama/llama-4:free".into(),
+            "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".into(),
+            "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".into(),
             "alexandria/openrouter/anthropic/claude-opus-4.8".into(),
             "openrouter/../secret".into(),
             "openrouter/provider/model with space".into(),
@@ -5859,7 +5865,9 @@ fi"#,
                 "codex-mini",
                 "gemini-2.5-flash",
                 "openrouter/anthropic/claude-opus-4.8",
-                "openrouter/meta-llama/llama-4:free"
+                "openrouter/meta-llama/llama-4:free",
+                "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+                "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
             ]
         );
     }
