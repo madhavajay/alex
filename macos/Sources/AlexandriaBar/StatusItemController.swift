@@ -62,7 +62,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         let daemonUp = store.daemonUp || store.lastRefresh == nil
         let severity = store.worstSeverity
-        button.image = IconRenderer.statusIcon(severity: severity, daemonUp: daemonUp)
+        button.image = IconRenderer.statusIcon()
 
         let dotColor: NSColor? = if !daemonUp {
             .systemRed
@@ -73,7 +73,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         } else {
             nil
         }
-        if IconRenderer.style == "logo", let dotColor {
+        if let dotColor {
             button.imagePosition = .imageLeading
             button.attributedTitle = NSAttributedString(string: "●", attributes: [
                 .foregroundColor: dotColor,

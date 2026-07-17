@@ -42,6 +42,9 @@ import Testing
             HarnessIcon.assetName(harness: nil, tags: ["harness": "pydantic-ai-harness"])
                 == "pydantic-ai-harness.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "jcode"]) == "jcode.png")
+        #expect(
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "openrouter"])
+                == "openrouter.png")
     }
 
     @Test func tagAliases() {

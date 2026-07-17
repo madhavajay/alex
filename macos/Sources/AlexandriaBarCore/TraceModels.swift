@@ -1370,6 +1370,7 @@ public enum HarnessIcon {
         "oh-my-pi": "oh-my-pi.png",
         "pydantic-ai-harness": "pydantic-ai-harness.png",
         "jcode": "jcode.png",
+        "openrouter": "openrouter.png",
     ]
 
     static let aliases: [String: String] = [

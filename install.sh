@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--service] [--upgrade] [--prefix DIR] [--nosplash]
+Usage: ./install.sh [--service] [--upgrade] [--prefix DIR]
 
   (none)     build --release and install the alex binary (+ alexandria symlink) system-wide
   --service  also install + load the launchd agent (macOS) so it runs at login
@@ -11,8 +11,6 @@ Usage: ./install.sh [--service] [--upgrade] [--prefix DIR] [--nosplash]
              same port (SO_REUSEPORT), wait until it is healthy, then SIGTERM
              the old one so it drains in-flight requests (incl. SSE) and exits
   --prefix   install dir (default: /usr/local/bin, falls back to ~/.local/bin)
-  --nosplash skip the Pharos animation (also: ALEXANDRIA_NO_LIGHT=1)
-
 One daemon per machine. During --upgrade two daemons briefly share the port;
 new connections land on either until the old one stops accepting, then all
 traffic flows to the new binary. The old daemon's dario generation drains and
@@ -31,7 +29,6 @@ while [ $# -gt 0 ]; do
     --service) SERVICE=1 ;;
     --upgrade) UPGRADE=1 ;;
     --prefix) PREFIX="$2"; shift ;;
-    --nosplash) ALEXANDRIA_NO_LIGHT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown flag: $1" >&2; usage; exit 2 ;;
   esac
@@ -54,62 +51,33 @@ fi
 BIN="$PREFIX/alex"
 ALIAS_BIN="$PREFIX/alexandria"
 
-ANIM_PID=""
-ANIM_LOG=""
 say() {
-  if [ -n "$ANIM_LOG" ]; then echo "$1" >> "$ANIM_LOG"; else echo "$1"; fi
+  echo "$1"
 }
-anim_start() {
-  [ -t 1 ] || return 0
-  [ -z "${NO_COLOR:-}" ] || return 0
-  [ "${ALEXANDRIA_NO_LIGHT:-0}" != "1" ] || return 0
-  command -v "$BIN" >/dev/null 2>&1 || [ -x "$BIN" ] || return 0
-  "$BIN" light --help 2>/dev/null | grep -q -- --follow || return 0
-  ANIM_LOG=$(mktemp -t alx-install)
-  "$BIN" light --forever --follow "$ANIM_LOG" &
-  ANIM_PID=$!
-}
-anim_stop() {
-  if [ -n "$ANIM_PID" ]; then
-    sleep 0.6
-    kill -TERM "$ANIM_PID" 2>/dev/null || true
-    wait "$ANIM_PID" 2>/dev/null || true
-    ANIM_PID=""
-    [ -n "$ANIM_LOG" ] && cat "$ANIM_LOG" && rm -f "$ANIM_LOG"
-    ANIM_LOG=""
-  fi
-}
-trap anim_stop EXIT
 
-anim_start
-say "☥ building release binary…"
+say "◆ building release binary…"
 BUILD_LOG=$(mktemp -t alx-build)
 if ! cargo build --release > "$BUILD_LOG" 2>&1; then
-  anim_stop
   echo "build failed:" >&2
   tail -30 "$BUILD_LOG" >&2
   exit 1
 fi
-say "☥ build complete — installing to $PREFIX"
+say "◆ build complete — installing to $PREFIX"
 mkdir -p "$PREFIX" 2>/dev/null || true
 if [ -w "$PREFIX" ]; then
   install -m 0755 target/release/alex "$BIN"
   ln -sf "$BIN" "$ALIAS_BIN"
 else
-  anim_stop
   sudo install -m 0755 target/release/alex "$BIN"
   sudo ln -sf "$BIN" "$ALIAS_BIN"
 fi
-if [ -z "$ANIM_PID" ] && [ "$UPGRADE" = "0" ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${ALEXANDRIA_NO_LIGHT:-0}" != "1" ]; then
-  "$BIN" light --loops 1 || true
-fi
-say "☥ installed $BIN"
+say "◆ installed $BIN"
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
   *) echo "note: $PREFIX is not on your PATH" ;;
 esac
 
-say "☥ preparing Dario runtime…"
+say "◆ preparing Dario runtime…"
 if ! "$BIN" dario bootstrap; then
   echo "warning: Dario could not be prepared; install Node.js 18+ and npm, pnpm, or Bun, then run: $BIN dario bootstrap" >&2
 fi
@@ -136,7 +104,7 @@ if [ "$SERVICE" = "1" ]; then
 fi
 
 if [ "$UPGRADE" = "1" ]; then
-  say "☥ zero-downtime upgrade on $CHECK_HOST:$PORT"
+  say "◆ zero-downtime upgrade on $CHECK_HOST:$PORT"
   if ! command -v lsof >/dev/null; then
     echo "lsof not found — cannot discover the old daemon; restart it manually" >&2
     exit 1
@@ -188,7 +156,7 @@ if [ "$UPGRADE" = "1" ]; then
       kill -TERM "$pid" 2>/dev/null || true
     done
   fi
-  say "☥ upgrade complete — old instance drains in-flight requests then exits"
+  say "◆ upgrade complete — old instance drains in-flight requests then exits"
   anim_stop
   sleep 1
   curl -fsS --max-time 5 "http://$CHECK_HOST:$PORT/health" && echo

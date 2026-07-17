@@ -110,7 +110,6 @@ public struct ResetResponse: Codable, Sendable, Equatable {
 public enum AppSettingsReset {
     public static let keys = [
         "refreshSeconds",
-        "menuIconStyle",
         "notifyEnabled",
         "limitWarnPct",
         "terminalApp",

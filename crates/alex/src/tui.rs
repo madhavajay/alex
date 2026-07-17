@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 const GOLD: Color = Color::Indexed(220);
 const AMBER: Color = Color::Indexed(178);
-const SAND: Color = Color::Indexed(180);
+const PURPLE: Color = Color::Indexed(99);
 const LAPIS: Color = Color::Indexed(69);
 const TURQUOISE: Color = Color::Indexed(73);
 
@@ -485,10 +485,10 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
     };
     let mut spans = vec![
         Span::styled(
-            " ☥ ALEXANDRIA ",
+            " ◆ ALEXANDRIA ",
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("v{version} "), Style::default().fg(SAND)),
+        Span::styled(format!("v{version} "), Style::default().fg(PURPLE)),
         Span::styled(format!("@ {base} "), Style::default().fg(LAPIS)),
         if snap.up {
             Span::styled(
@@ -509,7 +509,7 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
         },
         Span::styled(
             format!("  {}", chrono::Local::now().format("%H:%M:%S")),
-            Style::default().fg(SAND),
+            Style::default().fg(PURPLE),
         ),
     ];
     if let Some(t) = snap.last_ok_at {
@@ -518,7 +518,7 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
                 "  refreshed {} ago",
                 humanize_s(t.elapsed().as_secs() as i64)
             ),
-            Style::default().fg(SAND).add_modifier(Modifier::DIM),
+            Style::default().fg(PURPLE).add_modifier(Modifier::DIM),
         ));
     }
     if !snap.up && snap.ever {
@@ -539,13 +539,13 @@ fn draw_tabs(f: &mut Frame, area: Rect, tab: usize) {
         .map(|(i, t)| {
             if i == tab {
                 Line::from(Span::styled(
-                    format!("☥ {t}"),
+                    format!("◆ {t}"),
                     Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
                 ))
             } else {
                 Line::from(Span::styled(
                     format!("{} {t}", i + 1),
-                    Style::default().fg(SAND),
+                    Style::default().fg(PURPLE),
                 ))
             }
         });
@@ -675,7 +675,7 @@ fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " sessions endpoint unavailable — daemon update required · showing raw traces",
-                Style::default().fg(SAND).add_modifier(Modifier::DIM),
+                Style::default().fg(PURPLE).add_modifier(Modifier::DIM),
             )),
             c[0],
         );
@@ -705,18 +705,18 @@ fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(SAND).add_modifier(Modifier::DIM)
+            Style::default().fg(PURPLE).add_modifier(Modifier::DIM)
         };
         Row::new(vec![
-            Cell::from(c.time).style(Style::default().fg(SAND)),
+            Cell::from(c.time).style(Style::default().fg(PURPLE)),
             Cell::from(c.model).style(Style::default().fg(TURQUOISE)),
             Cell::from(c.provider).style(Style::default().fg(LAPIS)),
             Cell::from(c.fmt).style(fmt_style),
             Cell::from(c.status).style(Style::default().fg(status_color(c.status_class))),
             Cell::from(c.tokens_in),
             Cell::from(c.tokens_out),
-            Cell::from(c.cost).style(Style::default().fg(SAND)),
-            Cell::from(c.session).style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+            Cell::from(c.cost).style(Style::default().fg(PURPLE)),
+            Cell::from(c.session).style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
             Cell::from(c.error).style(Style::default().fg(Color::Red)),
         ])
     });
@@ -756,7 +756,7 @@ fn draw_traces(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
 
 fn detail_lines(t: &Value) -> Vec<Line<'static>> {
     let key = |k: &str| Span::styled(format!("{k}: "), Style::default().fg(GOLD));
-    let val = |v: String| Span::styled(v, Style::default().fg(SAND));
+    let val = |v: String| Span::styled(v, Style::default().fg(PURPLE));
     let latency = match (jint(t, "ts_request_ms"), jint(t, "ts_response_ms")) {
         (Some(a), Some(b)) if b >= a => format!("{}ms", b - a),
         _ => "-".into(),
@@ -924,7 +924,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             "no sessions in the last 24h"
         };
         let p = Paragraph::new(msg)
-            .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+            .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
             .alignment(Alignment::Center);
         f.render_widget(p, inner);
         return;
@@ -950,13 +950,13 @@ fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
         let dim = kind.is_some();
         let id_cell = match kind {
             Some(k) => Cell::from(format!("{} [{k}]", c.id))
-                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+                .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
             None => Cell::from(c.id).style(Style::default().fg(TURQUOISE)),
         };
         let time_style = if dim {
-            Style::default().fg(SAND).add_modifier(Modifier::DIM)
+            Style::default().fg(PURPLE).add_modifier(Modifier::DIM)
         } else {
-            Style::default().fg(SAND)
+            Style::default().fg(PURPLE)
         };
         Row::new(vec![
             Cell::from(c.time).style(time_style),
@@ -965,7 +965,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             Cell::from(c.models).style(Style::default().fg(LAPIS)),
             Cell::from(c.turns),
             Cell::from(c.tokens),
-            Cell::from(c.cost).style(Style::default().fg(SAND)),
+            Cell::from(c.cost).style(Style::default().fg(PURPLE)),
             Cell::from(c.errors)
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         ])
@@ -1060,7 +1060,7 @@ fn cap_lines(lines: Vec<String>, max: usize) -> (Vec<String>, usize) {
 
 fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
     let w = width.max(8);
-    let dim = Style::default().fg(SAND).add_modifier(Modifier::DIM);
+    let dim = Style::default().fg(PURPLE).add_modifier(Modifier::DIM);
     let mut out = Vec::new();
     for t in turns {
         out.push(Line::from(Span::styled(turn_header_text(t), dim)));
@@ -1074,7 +1074,7 @@ fn transcript_lines(turns: &[Value], width: usize) -> Vec<Line<'static>> {
                 let prefix = if i == 0 { "❯ " } else { "  " };
                 out.push(Line::from(Span::styled(
                     format!("{prefix}{l}"),
-                    Style::default().fg(SAND),
+                    Style::default().fg(PURPLE),
                 )));
             }
             if hidden > 0 {
@@ -1118,7 +1118,7 @@ fn centered_msg(f: &mut Frame, area: Rect, block: Block, msg: &str) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let p = Paragraph::new(msg.to_string())
-        .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+        .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: false });
     f.render_widget(p, inner);
@@ -1134,7 +1134,7 @@ fn draw_transcript(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
                 "paused (f to follow)"
             };
             let title = format!(
-                "☥ session {} — {} turns · ${cost:.4} · {follow}",
+                "◆ session {} — {} turns · ${cost:.4} · {follow}",
                 truncate(id, 24),
                 turns.len(),
             );
@@ -1143,7 +1143,7 @@ fn draw_transcript(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             f.render_widget(block, area);
             if turns.is_empty() {
                 let p = Paragraph::new("no turns yet")
-                    .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+                    .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
                     .alignment(Alignment::Center);
                 f.render_widget(p, inner);
                 return;
@@ -1162,13 +1162,13 @@ fn draw_transcript(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &mut Ui) {
             centered_msg(
                 f,
                 area,
-                themed_block("☥ transcript"),
+                themed_block("◆ transcript"),
                 "daemon update required — transcript endpoint unavailable",
             );
         }
         TranscriptView::Empty => {
             let id = ui.watching.lock().unwrap().clone().unwrap_or_default();
-            let title = format!("☥ session {}", truncate(&id, 24));
+            let title = format!("◆ session {}", truncate(&id, 24));
             centered_msg(f, area, themed_block(&title), "loading transcript…");
         }
     }
@@ -1233,13 +1233,13 @@ fn limit_items(providers: &[Value]) -> Vec<LimitItem> {
         if let Some(plan) = p.get("plan").and_then(|v| v.as_str()) {
             head.push(Span::styled(
                 format!(" · plan: {plan}"),
-                Style::default().fg(SAND),
+                Style::default().fg(PURPLE),
             ));
         }
         if let Some(src) = p.get("source").and_then(|v| v.as_str()) {
             head.push(Span::styled(
                 format!(" · source: {src}"),
-                Style::default().fg(SAND).add_modifier(Modifier::DIM),
+                Style::default().fg(PURPLE).add_modifier(Modifier::DIM),
             ));
         }
         items.push(LimitItem::Text(Line::from(head)));
@@ -1291,7 +1291,7 @@ fn draw_limits(f: &mut Frame, area: Rect, snap: &Snapshot) {
     f.render_widget(block, area);
     if snap.limits.is_empty() {
         let p = Paragraph::new("no limit data")
-            .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+            .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
             .alignment(Alignment::Center);
         f.render_widget(p, inner);
         return;
@@ -1340,8 +1340,8 @@ fn draw_accounts(f: &mut Frame, area: Rect, snap: &Snapshot) {
         let expiry = match a.get("token_expires_in_s").and_then(|v| v.as_i64()) {
             Some(s) if s <= 0 => Cell::from("expired")
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Some(s) => Cell::from(humanize_s(s)).style(Style::default().fg(SAND)),
-            None => Cell::from("-").style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+            Some(s) => Cell::from(humanize_s(s)).style(Style::default().fg(PURPLE)),
+            None => Cell::from("-").style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
         };
         let hb = match a.get("last_heartbeat").filter(|h| h.is_object()) {
             Some(h) => {
@@ -1364,7 +1364,7 @@ fn draw_accounts(f: &mut Frame, area: Rect, snap: &Snapshot) {
                     Cell::from(format!("✗ {msg} · {age}")).style(Style::default().fg(Color::Red))
                 }
             }
-            None => Cell::from("-").style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+            None => Cell::from("-").style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
         };
         let status = jstr(a, "status");
         let status_style = match status.as_str() {
@@ -1374,9 +1374,9 @@ fn draw_accounts(f: &mut Frame, area: Rect, snap: &Snapshot) {
         };
         Row::new(vec![
             Cell::from(jstr(a, "provider")).style(Style::default().fg(LAPIS)),
-            Cell::from(jstr(a, "id")).style(Style::default().fg(SAND)),
+            Cell::from(jstr(a, "id")).style(Style::default().fg(PURPLE)),
             Cell::from(jstr(a, "kind"))
-                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+                .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
             Cell::from(status).style(status_style),
             expiry,
             hb,
@@ -1406,7 +1406,7 @@ fn phase_style(phase: &str) -> Style {
         "dead" => Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
-        _ => Style::default().fg(SAND),
+        _ => Style::default().fg(PURPLE),
     }
 }
 
@@ -1417,7 +1417,7 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
     match &snap.dario {
         DarioView::Unknown => {
             let p = Paragraph::new("no data yet")
-                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+                .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
                 .alignment(Alignment::Center);
             f.render_widget(p, inner);
         }
@@ -1430,7 +1430,7 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
             ])
             .split(inner);
             let p = Paragraph::new(msg)
-                .style(Style::default().fg(SAND).add_modifier(Modifier::DIM))
+                .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM))
                 .alignment(Alignment::Center);
             f.render_widget(p, v[1]);
         }
@@ -1496,10 +1496,10 @@ fn draw_dario(f: &mut Frame, area: Rect, snap: &Snapshot) {
                             }
                         }
                         None => Cell::from("-")
-                            .style(Style::default().fg(SAND).add_modifier(Modifier::DIM)),
+                            .style(Style::default().fg(PURPLE).add_modifier(Modifier::DIM)),
                     };
                     Row::new(vec![
-                        Cell::from(jstr(g, "id")).style(Style::default().fg(SAND)),
+                        Cell::from(jstr(g, "id")).style(Style::default().fg(PURPLE)),
                         Cell::from(jstr(g, "version")).style(Style::default().fg(TURQUOISE)),
                         Cell::from(phase.clone()).style(phase_style(&phase)),
                         Cell::from(
@@ -1566,19 +1566,19 @@ fn draw_bottom(f: &mut Frame, area: Rect, snap: &Snapshot, ui: &Ui) {
     let line = Line::from(vec![
         Span::styled(
             key_hints(snap, ui),
-            Style::default().fg(SAND).add_modifier(Modifier::DIM),
+            Style::default().fg(PURPLE).add_modifier(Modifier::DIM),
         ),
         Span::styled("│ ", Style::default().fg(AMBER)),
         Span::styled(
             format!("60m: {req} req · ${cost:.4} · "),
-            Style::default().fg(SAND),
+            Style::default().fg(PURPLE),
         ),
         Span::styled(
             format!("{errors} err"),
             if errors > 0 {
                 Style::default().fg(Color::Red)
             } else {
-                Style::default().fg(SAND)
+                Style::default().fg(PURPLE)
             },
         ),
     ]);

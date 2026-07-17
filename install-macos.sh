@@ -12,7 +12,7 @@ Installs the full Alexandria macOS experience:
   --bar-only   only build/install the menu bar app
   --no-bar     only run install.sh (skip the menu bar app)
   everything else is passed through to ./install.sh
-  (--service, --upgrade, --prefix DIR, --nosplash)
+  (--service, --upgrade, --prefix DIR)
 EOF
 }
 
@@ -42,7 +42,7 @@ fi
 
 if [ "$NO_BAR" = "0" ]; then
   LEGACY_APP_NAME="AlexandriaBar"
-  echo "☥ building Alex (menu bar app)…"
+  echo "◆ building Alex (menu bar app)…"
   (cd macos && ./Scripts/package_app.sh)
   for app in AlexandriaBar Alex; do
     osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
@@ -54,5 +54,5 @@ if [ "$NO_BAR" = "0" ]; then
   cp -R macos/dist/Alex.app ~/Applications/
   rm -rf ~/Applications/"${LEGACY_APP_NAME}.app"
   open ~/Applications/Alex.app
-  echo "☥ Alex installed to ~/Applications and launched"
+  echo "◆ Alex installed to ~/Applications and launched"
 fi

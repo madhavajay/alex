@@ -18,7 +18,6 @@ use serde_json::json;
 mod dario;
 mod harness_connect;
 mod harness_e2e;
-mod light;
 mod reset;
 mod selfupdate;
 mod tui;
@@ -43,9 +42,6 @@ enum Command {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
-        /// Skip the first-run splash animation
-        #[arg(long)]
-        nosplash: bool,
         /// Detach and run in the background, logging to ~/.alexandria/daemon.log
         #[arg(long)]
         background: bool,
@@ -221,16 +217,6 @@ enum Command {
         /// Persist the release channel in config.toml, then use it (stable or beta)
         #[arg(long, value_name = "CHANNEL")]
         set_channel: Option<String>,
-    },
-    /// Play the Pharos of Alexandria in your terminal (truecolor blocks)
-    Light {
-        #[arg(long, default_value_t = 2)]
-        loops: u32,
-        #[arg(long)]
-        forever: bool,
-        /// Tail this file and show its last lines under the animation
-        #[arg(long)]
-        follow: Option<PathBuf>,
     },
     /// Print client connection exports (fast; reads config only). Alias: creds
     #[command(alias = "creds")]
@@ -2773,14 +2759,13 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     }
-    let (config, fresh_install) = load_or_create_config()?;
+    let (config, _) = load_or_create_config()?;
 
     match command {
         Command::Daemon {
             host,
             port,
             background,
-            nosplash,
         } => {
             let mut config = config.clone();
             let host_was_overridden = host.is_some();
@@ -2791,13 +2776,6 @@ async fn main() -> Result<()> {
             }
             let host = host_val;
             let port = port_val;
-            if fresh_install
-                && !nosplash
-                && std::env::var("ALEXANDRIA_NO_LIGHT").is_err()
-                && std::io::IsTerminal::is_terminal(&std::io::stdout())
-            {
-                let _ = light::run(1, false, None).await;
-            }
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             if vault.list().await.is_empty() {
@@ -3641,7 +3619,7 @@ async fn main() -> Result<()> {
             let ok = results.iter().filter(|r| r.ok).count();
             let summary = format!("{ok}/{} providers healthy", results.len());
             if ok == results.len() {
-                println!("{} {}", ui::gold(ui::ankh()), ui::bold(&summary));
+                println!("{} {}", ui::gold(ui::diamond()), ui::bold(&summary));
             } else {
                 println!("{} {}", ui::red("✗"), ui::red(&ui::bold(&summary)));
             }
@@ -3802,13 +3780,6 @@ async fn main() -> Result<()> {
         }
         Command::Status { json } => {
             run_status(&config, json).await?;
-        }
-        Command::Light {
-            loops,
-            forever,
-            follow,
-        } => {
-            light::run(loops, forever, follow).await?;
         }
         Command::Credentials { json, host } => {
             let base = match host {
@@ -6490,7 +6461,7 @@ fn render_traces_table(rows: &[serde_json::Value]) {
         };
         println!(
             "{} {} {} {} {} {} {}  {}{}{}",
-            ui::pad_right(&ui::sand(&when), 12),
+            ui::pad_right(&ui::purple(&when), 12),
             ui::pad_right(&model, 28),
             ui::pad_right(r["upstream_provider"].as_str().unwrap_or("-"), 9),
             ui::pad_left(&ui::status_color(r["status"].as_i64()), 4),
@@ -6798,7 +6769,7 @@ fn traces_du_cmd(config: &Config, json: bool) -> Result<()> {
     for d in &days {
         println!(
             "{} {} {}",
-            ui::pad_right(&ui::sand(d["date"].as_str().unwrap_or("-")), 12),
+            ui::pad_right(&ui::purple(d["date"].as_str().unwrap_or("-")), 12),
             ui::pad_left(&d["files"].as_u64().unwrap_or(0).to_string(), 7),
             ui::pad_left(&ui::human_bytes(d["bytes"].as_u64().unwrap_or(0)), 10)
         );
@@ -6977,12 +6948,12 @@ async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
         println!(
             "{} {} {} {} {} {} {}",
             ui::pad_right(&ui::amber(r["id"].as_str().unwrap_or("-")), 12),
-            ui::pad_right(&ui::sand(r["kind"].as_str().unwrap_or("run")), 8),
+            ui::pad_right(&ui::purple(r["kind"].as_str().unwrap_or("run")), 8),
             ui::pad_right(
                 &ui::turquoise(&ui::truncate(r["run_id"].as_str().unwrap_or("-"), 18)),
                 18
             ),
-            ui::pad_right(&ui::sand(&ui::truncate(&tags, 26)), 26),
+            ui::pad_right(&ui::purple(&ui::truncate(&tags, 26)), 26),
             ui::pad_left(&r["use_count"].as_i64().unwrap_or(0).to_string(), 5),
             ui::pad_right(&expires, 10),
             ui::dim(r["label"].as_str().unwrap_or(""))
@@ -7008,7 +6979,7 @@ async fn keys_revoke_cmd(config: &Config, id: &str) -> Result<()> {
             ui::truncate(&resp.to_string(), 300)
         );
     }
-    println!("{} revoked {}", ui::gold(ui::ankh()), ui::amber(id));
+    println!("{} revoked {}", ui::gold(ui::diamond()), ui::amber(id));
     Ok(())
 }
 
@@ -7068,7 +7039,7 @@ fn print_limits(snap: &serde_json::Value) {
         let head = format!("{marker} {}  {}", ui::amber(name), ui::bold(plan));
         let source = p["source"]
             .as_str()
-            .map(|s| ui::sand(&format!("via {s}")))
+            .map(|s| ui::purple(&format!("via {s}")))
             .unwrap_or_default();
         println!("{} {}", ui::pad_right(&head, 54), source);
         if let Some(err) = p["error"].as_str() {
@@ -7082,7 +7053,7 @@ fn print_limits(snap: &serde_json::Value) {
             "out_of_credits" => {
                 println!("   {}", ui::red("OUT OF CREDITS"));
                 if let Some(url) = quota["top_up_url"].as_str().filter(|url| !url.is_empty()) {
-                    println!("   {}", ui::sand(&format!("top up: {url}")));
+                    println!("   {}", ui::purple(&format!("top up: {url}")));
                 }
             }
             "unlimited" => println!("   {}", ui::green("Unlimited credits")),
@@ -7124,7 +7095,7 @@ fn print_limits(snap: &serde_json::Value) {
                     println!(
                         "   {}  {}",
                         ui::pad_right(label, label_width),
-                        ui::sand(&format!("${usd:.2} remaining"))
+                        ui::purple(&format!("${usd:.2} remaining"))
                     );
                     printed = true;
                     continue;
@@ -7173,7 +7144,7 @@ fn print_limits(snap: &serde_json::Value) {
                         "   {}  {}  {used:>3.0}%   {}",
                         ui::pad_right(kind, 8),
                         ui::gauge(used, 24),
-                        ui::sand(&format!("{r} of {l} remaining"))
+                        ui::purple(&format!("{r} of {l} remaining"))
                     );
                     printed = true;
                 }
@@ -7310,7 +7281,7 @@ fn print_dario_status(body: &serde_json::Value) -> Result<()> {
                 9
             ),
             ui::pad_right(&probe, 24),
-            ui::sand(&age)
+            ui::purple(&age)
         );
     }
     Ok(())
@@ -7432,7 +7403,7 @@ fn ping_done_line(r: &alex_proxy::PingResult) -> String {
         ui::pad_right(&ui::amber(&ui::bold(r.provider)), 10),
         ui::progress_bar(100.0, 12, bar_color),
         ui::status_color(r.status.map(i64::from)),
-        ui::pad_left(&ui::sand(&format!("{}ms", r.latency_ms)), 7),
+        ui::pad_left(&ui::purple(&format!("{}ms", r.latency_ms)), 7),
         ui::dim(&flat)
     )
 }
@@ -8008,7 +7979,7 @@ fn service_install(config: &Config) -> Result<()> {
                 }
                 println!(
                     "{} {}",
-                    ui::gold(ui::ankh()),
+                    ui::gold(ui::diamond()),
                     ui::bold("launchd service installed and serving")
                 );
                 println!("  {}", ui::dim(&dst.to_string_lossy()));
@@ -8049,7 +8020,7 @@ fn service_install(config: &Config) -> Result<()> {
         }
         println!(
             "{} {}",
-            ui::gold(ui::ankh()),
+            ui::gold(ui::diamond()),
             ui::bold("systemd user service installed and started")
         );
         println!("  {}", ui::dim(&dst.to_string_lossy()));
@@ -8137,7 +8108,7 @@ fn service_restart(config: &Config, force: bool) -> Result<()> {
             })?;
             println!(
                 "{} {}",
-                ui::gold(ui::ankh()),
+                ui::gold(ui::diamond()),
                 ui::bold("launchd service replaced and serving")
             );
             Ok(())
@@ -8364,7 +8335,7 @@ fn print_dario_update_notice() {
     if let Some(notice) = parse_dario_update_notice(&raw) {
         println!(
             "{}",
-            ui::dim(&ui::sand(&format!("{} {notice}", ui::ankh())))
+            ui::dim(&ui::purple(&format!("{} {notice}", ui::diamond())))
         );
     }
 }
@@ -8401,7 +8372,10 @@ async fn daemon_background(
     if healthy(client.clone(), base.clone()).await {
         println!(
             "{}",
-            ui::gold(&format!("{} daemon already running at {base}", ui::ankh()))
+            ui::gold(&format!(
+                "{} daemon already running at {base}",
+                ui::diamond()
+            ))
         );
         return Ok(());
     }
@@ -8431,7 +8405,7 @@ async fn daemon_background(
         "{}",
         ui::gold(&format!(
             "{} daemon started in the background (pid {}) — log: ~/.alexandria/daemon.log",
-            ui::ankh(),
+            ui::diamond(),
             child.id()
         ))
     );
@@ -8717,7 +8691,7 @@ fn pick_provider(accounts: &[alex_auth::Account]) -> Result<Option<String>> {
     writeln!(
         out,
         "{} {}",
-        ui::gold(ui::ankh()),
+        ui::gold(ui::diamond()),
         ui::bold("choose a provider to authenticate")
     )?;
     let guard = RawModeGuard::new()?;
@@ -8770,11 +8744,6 @@ fn pick_provider(accounts: &[alex_auth::Account]) -> Result<Option<String>> {
 }
 
 async fn run_status(config: &Config, json: bool) -> Result<()> {
-    if !json && ui::colors_enabled() {
-        if let Some(banner) = light::logo_banner(ui::term_width()) {
-            println!("{banner}");
-        }
-    }
     let base = config.base_url();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -8880,14 +8849,14 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     if binaries.is_empty() {
         println!(
             "  {} {}",
-            ui::pad_right(&ui::sand("binary"), 10),
+            ui::pad_right(&ui::purple("binary"), 10),
             ui::dim("alexandria not found on PATH")
         );
     } else {
         let mut first = true;
         for p in &binaries {
             let label = if first {
-                ui::sand("binary")
+                ui::purple("binary")
             } else {
                 String::new()
             };
@@ -8903,7 +8872,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     }
     println!(
         "  {} {}",
-        ui::pad_right(&ui::sand("version"), 10),
+        ui::pad_right(&ui::purple("version"), 10),
         env!("CARGO_PKG_VERSION")
     );
     let sdot = if service_managed(&service) {
@@ -8919,7 +8888,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     };
     println!(
         "  {} {sdot} {}",
-        ui::pad_right(&ui::sand("service"), 10),
+        ui::pad_right(&ui::purple("service"), 10),
         service_state_label(&service)
     );
     if let ServiceState::Systemd { .. } = service {
@@ -8949,7 +8918,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             };
             println!(
                 "  {} {} {}{}",
-                ui::pad_right(&ui::sand("process"), 10),
+                ui::pad_right(&ui::purple("process"), 10),
                 ui::green(ui::dot()),
                 ui::green(&format!("running v{version}")),
                 ui::dim(&detail)
@@ -8965,7 +8934,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         None => {
             println!(
                 "  {} {} {}",
-                ui::pad_right(&ui::sand("process"), 10),
+                ui::pad_right(&ui::purple("process"), 10),
                 ui::red(ui::dot()),
                 ui::red("not running")
             );
@@ -8978,7 +8947,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     }
     println!(
         "  {} {}  {}",
-        ui::pad_right(&ui::sand("endpoint"), 10),
+        ui::pad_right(&ui::purple("endpoint"), 10),
         ui::bold(&ui::lapis(&base)),
         ui::bold(&ui::lapis(&format!("{base}/v1")))
     );
@@ -9040,7 +9009,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             ui::pad_right(&ui::amber(a.provider.as_str()), 10),
             ui::pad_right(&a.kind, 8),
             ui::pad_right(&expiry, 20),
-            ui::pad_right(&ui::sand(a.label.as_deref().unwrap_or("")), 24)
+            ui::pad_right(&ui::purple(a.label.as_deref().unwrap_or("")), 24)
         );
     }
 
