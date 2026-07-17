@@ -32,6 +32,7 @@ public final class SnapshotStore {
     public private(set) var accounts: [Account] = []
     public private(set) var healthAccounts: [HealthAccount] = []
     public private(set) var limits: [ProviderLimits] = []
+    public private(set) var providerPauses: [ProviderPause] = []
     public private(set) var analytics: Analytics?
     public private(set) var accountAnalytics: AccountAnalyticsResponse?
     public private(set) var codexRouting: CodexRoutingResponse?
@@ -106,6 +107,7 @@ public final class SnapshotStore {
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
+            providerPauses = []
             lastError = "no config at ~/.alexandria/config.toml"
             return
         }
@@ -126,6 +128,7 @@ public final class SnapshotStore {
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
+            providerPauses = []
             lastError = error.localizedDescription
             return
         }
@@ -137,6 +140,7 @@ public final class SnapshotStore {
         async let accountsR = try? client.accounts()
         async let healthR = try? client.accountHealth()
         async let limitsR = try? client.limits()
+        async let providerPausesR = try? client.providerPauses()
         async let analyticsR = try? client.analytics(sinceMinutes: 60)
         async let accountAnalyticsR = try? client.accountAnalytics(
             sinceMinutes: accountAnalyticsSinceMinutes,
@@ -150,6 +154,7 @@ public final class SnapshotStore {
         healthAccounts = await healthR ?? []
         let oldLimits = limits
         limits = await limitsR ?? []
+        providerPauses = await providerPausesR ?? []
         analytics = await analyticsR
         if accountAnalyticsRequestGeneration == self.accountAnalyticsRequestGeneration,
            let fetchedAccountAnalytics = await accountAnalyticsR

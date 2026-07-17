@@ -99,6 +99,25 @@ public struct LimitsResponse: Codable, Sendable {
     public let providers: [ProviderLimits]
 }
 
+/// Transient, provider-wide fault injection configured through `/admin/providers`.
+/// It is intentionally separate from per-account `paused` routing state.
+public enum ProviderPauseMode: String, Codable, Sendable, CaseIterable {
+    case down
+    case loggedOut = "logged_out"
+}
+
+public struct ProviderPause: Codable, Sendable, Identifiable {
+    public let provider: String
+    public let paused: Bool
+    public let mode: ProviderPauseMode?
+
+    public var id: String { provider }
+}
+
+public struct ProvidersResponse: Codable, Sendable {
+    public let providers: [ProviderPause]
+}
+
 public struct ProviderLimits: Codable, Sendable {
     public let provider: String
     public let plan: String?
