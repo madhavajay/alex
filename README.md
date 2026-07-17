@@ -331,6 +331,30 @@ server errors. The symmetric Claude/OpenAI example can be installed with
 # "gpt-5.6-sol" = { anthropic = "claude-fable-5" }
 ```
 
+Even with protection enabled, a single request can demand the exact model it
+asked for: send `x-alexandria-no-substitute: 1` to disable both account failover
+and cross-provider substitution for that call, so the real model is used and the
+real error (if any) is returned unchanged. This is intended for **benchmark
+suites** that must run against a specific model (e.g. `claude-fable-5`) and must
+never be silently rerouted.
+
+### Optional request headers
+
+Any harness pointed at Alex can set these per request:
+
+- `x-alexandria-no-substitute: 1` — pin the model: disable failover and
+  cross-provider substitution, returning the real response or the real error
+  (benchmarks).
+- `x-session-id: <id>` — group requests into one session/transcript.
+- `x-alexandria-run-id: <id>` — attach your own external run id for correlation.
+- `x-alexandria-trace-tag`, `x-alexandria-job`, `x-alexandria-task`,
+  `x-alexandria-phase` — tag traces for later filtering and analytics.
+- `x-alexandria-harness`, `x-alexandria-harness-version` — label the calling
+  harness in traces.
+- `x-alexandria-simulate-error: STATUS[:kind]` — return a synthetic error with no
+  upstream call, for testing harness and failover behavior (local/harness-key
+  gated).
+
 ## Platforms and alternative installation
 
 macOS and Linux are the supported platforms. Windows x86-64 CLI builds are published with releases, but they are experimental. First-class Windows support, including service integration, is coming soon.
