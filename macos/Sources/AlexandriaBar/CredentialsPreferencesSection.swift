@@ -251,48 +251,62 @@ struct CredentialsPreferencesSection: View {
         }
     }
 
-    private func runKeyTable(_ keys: [CredentialRunKey]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
-                GridRow {
-                    tableHeader("Label")
-                    tableHeader("Fingerprint")
-                    tableHeader("Tags")
-                    tableHeader("Created")
-                    tableHeader("Expires")
-                    tableHeader("Last used")
-                    tableHeader("Uses")
-                    Text("")
-                }
-                ForEach(keys) { key in
-                    GridRow {
-                        Text(key.label?.isEmpty == false ? key.label! : key.kind)
-                            .lineLimit(1)
-                        Text(shortFingerprint(key.keyFingerprint))
-                            .font(AlexTheme.Fonts.metaMono)
-                        Text(tagSummary(key))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(width: 110, alignment: .leading)
-                        Text(dateText(key.createdMs))
-                        Text(key.revoked ? "Revoked" : optionalDateText(key.expiresMs))
-                        Text(optionalDateText(key.lastUsedMs, never: "Never"))
-                        Text("\(key.useCount)")
-                        PillButton(
-                            title: key.revoked ? "Revoked" : "Revoke", variant: .danger,
-                            horizontalPadding: 9, verticalPadding: 4, cornerRadius: 6,
-                            isEnabled: !key.revoked && !isRevoking.contains(key.id)
-                        ) {
-                            Task { await revoke(key) }
-                        }
-                    }
-                    .font(.system(size: 10))
-                    .foregroundStyle(AlexTheme.Colors.textSecondary)
-                }
-            }
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+    // Fixed column widths so a LazyVStack of HStack rows still reads as a table.
+    // A `Grid` lays out EVERY row eagerly, which hung the main thread for ~9s once
+    // enough run keys accumulated (each harness connect mints one). LazyVStack —
+    // inside the section's ScrollView — only lays out visible rows, so the pane
+    // stays responsive no matter how many keys exist.
+    private static let keyCols: [CGFloat] = [96, 92, 110, 90, 90, 90, 38]
+
+    private func keyHeaderRow() -> some View {
+        HStack(spacing: 10) {
+            tableHeader("Label").frame(width: Self.keyCols[0], alignment: .leading)
+            tableHeader("Fingerprint").frame(width: Self.keyCols[1], alignment: .leading)
+            tableHeader("Tags").frame(width: Self.keyCols[2], alignment: .leading)
+            tableHeader("Created").frame(width: Self.keyCols[3], alignment: .leading)
+            tableHeader("Expires").frame(width: Self.keyCols[4], alignment: .leading)
+            tableHeader("Last used").frame(width: Self.keyCols[5], alignment: .leading)
+            tableHeader("Uses").frame(width: Self.keyCols[6], alignment: .leading)
+            Text("").frame(width: 66)
         }
+    }
+
+    private func keyRow(_ key: CredentialRunKey) -> some View {
+        HStack(spacing: 10) {
+            Text(key.label?.isEmpty == false ? key.label! : key.kind)
+                .lineLimit(1).frame(width: Self.keyCols[0], alignment: .leading)
+            Text(shortFingerprint(key.keyFingerprint))
+                .font(AlexTheme.Fonts.metaMono).frame(width: Self.keyCols[1], alignment: .leading)
+            Text(tagSummary(key))
+                .lineLimit(1).truncationMode(.tail).frame(width: Self.keyCols[2], alignment: .leading)
+            Text(dateText(key.createdMs)).frame(width: Self.keyCols[3], alignment: .leading)
+            Text(key.revoked ? "Revoked" : optionalDateText(key.expiresMs))
+                .frame(width: Self.keyCols[4], alignment: .leading)
+            Text(optionalDateText(key.lastUsedMs, never: "Never"))
+                .frame(width: Self.keyCols[5], alignment: .leading)
+            Text("\(key.useCount)").frame(width: Self.keyCols[6], alignment: .leading)
+            PillButton(
+                title: key.revoked ? "Revoked" : "Revoke", variant: .danger,
+                horizontalPadding: 9, verticalPadding: 4, cornerRadius: 6,
+                isEnabled: !key.revoked && !isRevoking.contains(key.id)
+            ) {
+                Task { await revoke(key) }
+            }
+            .frame(width: 66, alignment: .leading)
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(AlexTheme.Colors.textSecondary)
+    }
+
+    private func runKeyTable(_ keys: [CredentialRunKey]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 8) {
+            keyHeaderRow()
+            ForEach(keys) { key in
+                keyRow(key)
+            }
+        }
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func outboundStatusSection(_ outbound: [OutboundCredential]) -> some View {

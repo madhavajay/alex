@@ -13,6 +13,10 @@ struct NotificationsPreferencesSection: View {
     @State private var instructionsExpanded = true
     @State private var discoveredChats: [NotificationChat] = []
     @State private var connectedBot: String?
+    // True once a channel is saved: the daemon redacts the token from its API,
+    // so on reload we show a masked "saved" indicator instead of a blank field
+    // (which read as data loss). Replace reveals the SecureField for a new token.
+    @State private var hasSavedToken = false
     @State private var validationResult: String?
     @State private var discoveryResult: String?
     @State private var actionResult: String?
@@ -113,15 +117,37 @@ struct NotificationsPreferencesSection: View {
         .font(.system(size: 12, weight: .medium))
         .padding(.vertical, 10)
 
-        SettingRow(label: "Bot token", hint: "Stored by the daemon only after you save") {
+        SettingRow(
+            label: "Bot token",
+            hint: hasSavedToken
+                ? "A token is saved (hidden). Replace to change it."
+                : "Stored by the daemon only after you save"
+        ) {
             HStack(spacing: 8) {
-                SecureField("123456:ABC…", text: $token)
-                    .settingsField(width: 240)
-                PillButton(
-                    title: isValidating ? "Validating…" : "Validate", variant: .bordered,
-                    isEnabled: !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isValidating,
-                    isBusy: isValidating
-                ) { Task { await validate() } }
+                if hasSavedToken {
+                    Text(verbatim: "•••••••••••••••")
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .settingsField(width: 240)
+                    if let bot = connectedBot, !bot.isEmpty {
+                        Text(verbatim: "✓ @\(bot)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(AlexTheme.Colors.success)
+                    }
+                    PillButton(title: "Replace", variant: .bordered, isEnabled: true) {
+                        hasSavedToken = false
+                        token = ""
+                        connectedBot = nil
+                    }
+                } else {
+                    SecureField("123456:ABC…", text: $token)
+                        .settingsField(width: 240)
+                    PillButton(
+                        title: isValidating ? "Validating…" : "Validate", variant: .bordered,
+                        isEnabled: !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isValidating,
+                        isBusy: isValidating
+                    ) { Task { await validate() } }
+                }
             }
         }
         if let validationResult {
@@ -274,6 +300,13 @@ struct NotificationsPreferencesSection: View {
         }
         do {
             channels = try await client.notificationSettings().channels
+            // Populate the form from an existing channel so it reads as "saved",
+            // not empty. The token stays server-side (redacted) — show it masked.
+            if let saved = channels.first {
+                hasSavedToken = true
+                connectedBot = saved.botUsername
+                if let cid = saved.chatID, !cid.isEmpty { chatID = cid }
+            }
         } catch is CancellationError {
         } catch {
             loadError = error.localizedDescription
