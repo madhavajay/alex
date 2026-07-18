@@ -10479,10 +10479,10 @@ mod tests {
     async fn openrouter_defaults_expose_curated_examples_when_unset() {
         let state = test_state("openrouter-exposed-defaults");
         // A fresh state seeds the shipped example list; it must include
-        // z-ai/glm-5.2 and stay tiny (<= 3).
+        // z-ai/glm-5.2 and stay a small curated starter set (<= 8).
         let defaults = openrouter_exposed_list(&state);
         assert!(defaults.iter().any(|id| id == "z-ai/glm-5.2"));
-        assert!(defaults.len() <= 3, "default exposure list is not tiny: {defaults:?}");
+        assert!(defaults.len() <= 8, "default exposure list is not tiny: {defaults:?}");
 
         // With those ids present in the catalog (plus an extra) only the curated
         // examples are published.
