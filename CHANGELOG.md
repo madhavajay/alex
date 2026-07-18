@@ -7,6 +7,72 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.28-beta.6] - 2026-07-18
+
+### Added
+- **Tappable Telegram re-auth links** — when a provider logs out, the reauth
+  alert now carries a tappable device-flow link: tap it, approve on the
+  provider's site, and the daemon completes the re-login by itself (no codes
+  to paste). Fires automatically from the reauth watchdog and the request
+  path; trigger it manually with the new "Re-authenticate via Notification"
+  button in Settings → Providers or `POST /admin/auth/reauth-notify`. If a
+  link expires unused, the next watchdog tick sends a fresh one (never two
+  concurrent flows for the same account).
+- **Refusal handling + harness×provider test suite** — upstream refusals /
+  empty completions surface as a clear non-empty assistant message with a
+  clean stop instead of a silent empty 200; traces are marked
+  `upstream_refusal`; harnesses stop retry-looping. Covered by offline
+  fixtures for every client format plus env-gated live e2e.
+- **OpenRouter curation** — pick exactly which OpenRouter models your
+  harnesses see (known-catalog → exposed two-list picker, alphabetical
+  everywhere); ships with a small curated starter set.
+- **Exo as a first-class provider** — Exo now appears as a provider row
+  (status/health/models) instead of a separate sidebar tab; all cluster
+  config lives in the provider detail pane.
+- **Providers pane arrow-key navigation**, and failover model-equivalency now
+  covers every provider (kimi and amp included, derived from the canonical
+  catalog so it can't drift).
+
+### Fixed
+- **Named logins no longer clobber the default account** — `alex auth login
+  <provider> --name work` saves under the named account; previously it could
+  silently overwrite and tombstone your default login.
+- **Harness disconnect always revokes keys** — disconnecting while the daemon
+  is down now revokes the harness keys from the local store instead of
+  leaving them valid forever.
+- **Dario menu line can no longer vanish** — it is a first-class menu section
+  that always renders while Dario is enabled, red "down" when unhealthy or
+  unreachable; transient status errors keep the last-known state instead of
+  hiding the row; one shared health evaluator drives the menu, Dario window,
+  preferences, and alerts.
+- **Dario prompt-cache warm no longer permanently misses** for models with
+  suffixed ids (e.g. `[1m]`): Rust and the capture preload now agree on the
+  cache key. Also: never signals pid 0, quotes spaced install paths in
+  NODE_OPTIONS (Application Support), and reports an instant child death with
+  the stderr log path instead of a blind 60s timeout.
+- **Proxy reliability** — a hung upstream can no longer wedge the daemon
+  (120s response-head timeout; usage fetches get 15s timeouts); re-auth
+  notifications fire for retained upstream 401s; queued error-injection
+  fixtures are no longer consumed by simulate-header requests; unsaved
+  routing edits survive the 60s snapshot poll; session delete removes >500
+  traces and reports failures instead of beeping.
+- **Installer/script fixes** — `install.sh` no longer dies on exit (undefined
+  `anim_stop`); upgrade path refuses to kill non-Alex listeners on port 4100
+  and anchors daemon pkill matches; DMG mounts are detached on failure;
+  `install-macos.sh` stamps the real version; the harness regression suite's
+  DARIO-RECOVER cell refuses to `kill -9` a remote-reported pid locally.
+
+### Changed
+- **Releases fail loudly** — tag releases hard-fail when signing/Sparkle/tap
+  secrets are missing (no more green-but-unsigned releases); the stable
+  workflow only triggers on exact `vX.Y.Z` tags; macOS `swift test` gates
+  packaging; manual signed builds require an explicit tag and never overwrite
+  published assets without opt-in.
+- Internal dedup: one RFC 8628 device-flow driver, one `Vault::update`
+  mutation API with atomic 0600 credential writes, one usage-cache fetcher,
+  one mac-signing composite action + reusable DMG/appcast workflow, shared
+  installer library; ui/ mock zips (5.7MB) removed.
+
 ### In progress (building, not yet in a beta)
 - **`alexandria` → `alex` rename** — project-wide rename with a one-time,
   no-data-loss upgrade migration (`~/.alexandria` → `~/.alex`,
