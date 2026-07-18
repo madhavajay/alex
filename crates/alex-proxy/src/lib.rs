@@ -2830,6 +2830,111 @@ fn usage_backoff_ms(failures: u32, retry_after_ms: Option<i64>) -> i64 {
     exp.max(retry_after_ms.unwrap_or(0))
 }
 
+enum UsageCacheSource {
+    Entry,
+    Snapshot {
+        entry: Option<Value>,
+        fetched_at_ms: i64,
+    },
+}
+
+enum UsageFailureLog {
+    Silent,
+    Status {
+        status: u16,
+        message: &'static str,
+    },
+    StatusWithBackoff {
+        status: u16,
+        message: &'static str,
+    },
+    Error {
+        error: String,
+        message: &'static str,
+    },
+}
+
+enum UsageFetchOutcome {
+    Fresh(Option<Value>),
+    Failed {
+        retry_after_ms: Option<i64>,
+        fallback: Option<Value>,
+        log: UsageFailureLog,
+    },
+}
+
+async fn cached_usage_fetch<F, Fut>(
+    cache: &std::sync::Mutex<UsageCache>,
+    ttl_ms: i64,
+    source: UsageCacheSource,
+    fetch: F,
+) -> Option<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = UsageFetchOutcome>,
+{
+    {
+        let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+        let (entry, fetched_at_ms) = match &source {
+            UsageCacheSource::Entry => (&cache.entry, cache.fetched_at_ms),
+            UsageCacheSource::Snapshot {
+                entry,
+                fetched_at_ms,
+            } => (entry, *fetched_at_ms),
+        };
+        if entry.is_some() && now_ms() < fetched_at_ms + ttl_ms {
+            return entry.clone();
+        }
+        if now_ms() < cache.cooldown_until_ms {
+            return entry.clone();
+        }
+    }
+
+    match fetch().await {
+        UsageFetchOutcome::Fresh(entry) => {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.fetched_at_ms = now_ms();
+            cache.cooldown_until_ms = 0;
+            cache.failures = 0;
+            cache.entry = entry.clone();
+            entry
+        }
+        UsageFetchOutcome::Failed {
+            retry_after_ms,
+            fallback,
+            log,
+        } => {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.failures += 1;
+            let cooldown = usage_backoff_ms(cache.failures, retry_after_ms);
+            cache.cooldown_until_ms = now_ms() + cooldown;
+            match log {
+                UsageFailureLog::Silent => {}
+                UsageFailureLog::Status { status, message } => {
+                    tracing::debug!(status, "{}", message);
+                }
+                UsageFailureLog::StatusWithBackoff { status, message } => {
+                    tracing::debug!(
+                        status,
+                        failures = cache.failures,
+                        cooldown_ms = cooldown,
+                        "{}",
+                        message
+                    );
+                }
+                UsageFailureLog::Error { error, message } => {
+                    tracing::debug!(error = %error, "{}", message);
+                }
+            }
+            let cached = match &source {
+                UsageCacheSource::Entry => cache.entry.clone(),
+                UsageCacheSource::Snapshot { entry, .. } => entry.clone(),
+            };
+            cached.or(fallback)
+        }
+    }
+}
+
 async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     let account = state
         .vault
@@ -2840,85 +2945,74 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         return None;
     }
     let token = account.access_token.as_deref()?.to_string();
-    {
-        let cache = state.anthropic_usage.lock().unwrap();
-        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
-            return cache.entry.clone();
-        }
-        if now_ms() < cache.cooldown_until_ms {
-            return cache.entry.clone();
-        }
-    }
-    let result = state
-        .http
-        .get(format!("{ANTHROPIC_BASE}/api/oauth/usage"))
-        .header("authorization", format!("Bearer {token}"))
-        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
-        .header("accept", "application/json")
-        .header("user-agent", "claude-cli/2.1.202 (external, cli)")
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await;
-    match result {
-        Ok(resp) if resp.status().is_success() => {
-            let raw: Value = resp.json().await.unwrap_or(Value::Null);
-            let mut windows = Vec::new();
-            for (name, key) in [
-                ("5h", "five_hour"),
-                ("7d", "seven_day"),
-                ("7d opus", "seven_day_opus"),
-                ("7d sonnet", "seven_day_sonnet"),
-            ] {
-                let w = &raw[key];
-                if w.is_object() {
-                    windows.push(json!({
-                        "window": name,
-                        "used_pct": w["utilization"],
-                        "resets_at": w["resets_at"],
-                    }));
+    cached_usage_fetch(
+        &state.anthropic_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let result = state
+                .http
+                .get(format!("{ANTHROPIC_BASE}/api/oauth/usage"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
+                .header("accept", "application/json")
+                .header("user-agent", "claude-cli/2.1.202 (external, cli)")
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let raw: Value = resp.json().await.unwrap_or(Value::Null);
+                    let mut windows = Vec::new();
+                    for (name, key) in [
+                        ("5h", "five_hour"),
+                        ("7d", "seven_day"),
+                        ("7d opus", "seven_day_opus"),
+                        ("7d sonnet", "seven_day_sonnet"),
+                    ] {
+                        let w = &raw[key];
+                        if w.is_object() {
+                            windows.push(json!({
+                                "window": name,
+                                "used_pct": w["utilization"],
+                                "resets_at": w["resets_at"],
+                            }));
+                        }
+                    }
+                    UsageFetchOutcome::Fresh(Some(json!({
+                        "provider": "anthropic",
+                        "source": "oauth usage endpoint",
+                        "plan": account.label,
+                        "windows": windows,
+                        "extra_usage": raw["extra_usage"],
+                    })))
                 }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retry_after_ms = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .map(|s| s.clamp(30, 3600) * 1000);
+                    UsageFetchOutcome::Failed {
+                        retry_after_ms,
+                        fallback: None,
+                        log: UsageFailureLog::StatusWithBackoff {
+                            status,
+                            message: "anthropic usage endpoint unavailable; backing off",
+                        },
+                    }
+                }
+                Err(_) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Silent,
+                },
             }
-            let entry = json!({
-                "provider": "anthropic",
-                "source": "oauth usage endpoint",
-                "plan": account.label,
-                "windows": windows,
-                "extra_usage": raw["extra_usage"],
-            });
-            let mut cache = state.anthropic_usage.lock().unwrap();
-            cache.fetched_at_ms = now_ms();
-            cache.cooldown_until_ms = 0;
-            cache.failures = 0;
-            cache.entry = Some(entry.clone());
-            Some(entry)
-        }
-        Ok(resp) => {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .map(|s| s.clamp(30, 3600) * 1000);
-            let mut cache = state.anthropic_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, retry_after);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            tracing::debug!(
-                status = resp.status().as_u16(),
-                failures = cache.failures,
-                cooldown_ms = cooldown,
-                "anthropic usage endpoint unavailable; backing off"
-            );
-            cache.entry.clone()
-        }
-        Err(_) => {
-            let mut cache = state.anthropic_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, None);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            cache.entry.clone()
-        }
-    }
+        },
+    )
+    .await
 }
 
 const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
@@ -2931,82 +3025,77 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         .as_deref()
         .or(account.access_token.as_deref())?
         .to_string();
-    {
-        let cache = state.amp_usage.lock().unwrap();
-        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
-            return cache.entry.clone();
-        }
-        if now_ms() < cache.cooldown_until_ms {
-            return cache.entry.clone();
-        }
-    }
-    let body = json!({ "method": "userDisplayBalanceInfo", "params": {} });
-    let result = state
-        .http
-        .post(AMP_USAGE_URL)
-        .header("authorization", format!("Bearer {token}"))
-        .header("accept", "application/json")
-        .header("content-type", "application/json")
-        .header("user-agent", "alexandria-amp-usage")
-        .json(&body)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await;
-    match result {
-        Ok(resp) if resp.status().is_success() => {
-            let raw = resp.text().await.unwrap_or_default();
-            match parse_usage_api_response(&raw) {
-                Ok(snap) => {
-                    let entry = usage_to_limits_entry(&snap, account.label.as_deref());
-                    let mut cache = state.amp_usage.lock().unwrap();
-                    cache.fetched_at_ms = now_ms();
-                    cache.cooldown_until_ms = 0;
-                    cache.failures = 0;
-                    cache.entry = Some(entry.clone());
-                    Some(entry)
+    cached_usage_fetch(
+        &state.amp_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let body = json!({ "method": "userDisplayBalanceInfo", "params": {} });
+            let result = state
+                .http
+                .post(AMP_USAGE_URL)
+                .header("authorization", format!("Bearer {token}"))
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("user-agent", "alexandria-amp-usage")
+                .json(&body)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let raw = resp.text().await.unwrap_or_default();
+                    match parse_usage_api_response(&raw) {
+                        Ok(snap) => UsageFetchOutcome::Fresh(Some(usage_to_limits_entry(
+                            &snap,
+                            account.label.as_deref(),
+                        ))),
+                        Err(e) => {
+                            let error = e.to_string();
+                            UsageFetchOutcome::Failed {
+                                retry_after_ms: None,
+                                fallback: Some(json!({
+                                    "provider": "amp",
+                                    "source": "amp usage API",
+                                    "error": e,
+                                    "plan": account.label,
+                                })),
+                                log: UsageFailureLog::Error {
+                                    error,
+                                    message: "amp usage parse failed",
+                                },
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, "amp usage parse failed");
-                    let mut cache = state.amp_usage.lock().unwrap();
-                    cache.failures += 1;
-                    let cooldown = usage_backoff_ms(cache.failures, None);
-                    cache.cooldown_until_ms = now_ms() + cooldown;
-                    cache.entry.clone().or_else(|| {
-                        Some(json!({
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    UsageFetchOutcome::Failed {
+                        retry_after_ms: None,
+                        fallback: Some(json!({
                             "provider": "amp",
                             "source": "amp usage API",
-                            "error": e,
+                            "error": format!("HTTP {status}"),
                             "plan": account.label,
-                        }))
-                    })
+                        })),
+                        log: UsageFailureLog::Status {
+                            status,
+                            message: "amp usage endpoint unavailable; backing off",
+                        },
+                    }
                 }
+                Err(e) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Error {
+                        error: e.to_string(),
+                        message: "amp usage request failed",
+                    },
+                },
             }
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let mut cache = state.amp_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, None);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            tracing::debug!(status, "amp usage endpoint unavailable; backing off");
-            cache.entry.clone().or_else(|| {
-                Some(json!({
-                    "provider": "amp",
-                    "source": "amp usage API",
-                    "error": format!("HTTP {status}"),
-                    "plan": account.label,
-                }))
-            })
-        }
-        Err(e) => {
-            let mut cache = state.amp_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, None);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            tracing::debug!(error = %e, "amp usage request failed");
-            cache.entry.clone()
-        }
-    }
+        },
+    )
+    .await
 }
 
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
@@ -3017,135 +3106,128 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         return None;
     }
     let token = account.access_token.as_deref()?.to_string();
-    {
-        let cache = state.xai_usage.lock().unwrap();
-        if cache.entry.is_some() && now_ms() < cache.fetched_at_ms + USAGE_CACHE_TTL_MS {
-            return cache.entry.clone();
-        }
-        if now_ms() < cache.cooldown_until_ms {
-            return cache.entry.clone();
-        }
-    }
+    cached_usage_fetch(
+        &state.xai_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let result = state
+                .http
+                .post(GROK_CREDITS_ENDPOINT)
+                .header("authorization", format!("Bearer {token}"))
+                .header("origin", "https://grok.com")
+                .header("referer", "https://grok.com/?_s=usage")
+                .header("accept", "*/*")
+                .header("content-type", "application/grpc-web+proto")
+                .header("x-grpc-web", "1")
+                .header("x-user-agent", "connect-es/2.1.1")
+                .header("user-agent", "Alexandria")
+                .body(GROK_CREDITS_REQUEST_BODY.to_vec())
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
 
-    let result = state
-        .http
-        .post(GROK_CREDITS_ENDPOINT)
-        .header("authorization", format!("Bearer {token}"))
-        .header("origin", "https://grok.com")
-        .header("referer", "https://grok.com/?_s=usage")
-        .header("accept", "*/*")
-        .header("content-type", "application/grpc-web+proto")
-        .header("x-grpc-web", "1")
-        .header("x-user-agent", "connect-es/2.1.1")
-        .header("user-agent", "Alexandria")
-        .body(GROK_CREDITS_REQUEST_BODY.to_vec())
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await;
-
-    match result {
-        Ok(resp) if resp.status().is_success() => {
-            let headers_for_grpc: Vec<(String, String)> = resp
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str();
-                    if key.starts_with("grpc-") {
-                        v.to_str()
-                            .ok()
-                            .map(|val| (key.to_string(), val.to_string()))
-                    } else {
-                        None
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let headers_for_grpc: Vec<(String, String)> = resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            let key = k.as_str();
+                            if key.starts_with("grpc-") {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (key.to_string(), val.to_string()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if let Err(e) = validate_grpc_status_headers(headers_for_grpc) {
+                        return UsageFetchOutcome::Failed {
+                            retry_after_ms: None,
+                            fallback: None,
+                            log: UsageFailureLog::Error {
+                                error: e.to_string(),
+                                message: "xai grok credits grpc header status failed",
+                            },
+                        };
                     }
-                })
-                .collect();
-            if let Err(e) = validate_grpc_status_headers(headers_for_grpc) {
-                tracing::debug!(error = %e, "xai grok credits grpc header status failed");
-                let mut cache = state.xai_usage.lock().unwrap();
-                cache.failures += 1;
-                let cooldown = usage_backoff_ms(cache.failures, None);
-                cache.cooldown_until_ms = now_ms() + cooldown;
-                return cache.entry.clone();
-            }
-            let body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::debug!(error = %e, "xai grok credits body read failed");
-                    let mut cache = state.xai_usage.lock().unwrap();
-                    cache.failures += 1;
-                    let cooldown = usage_backoff_ms(cache.failures, None);
-                    cache.cooldown_until_ms = now_ms() + cooldown;
-                    return cache.entry.clone();
-                }
-            };
-            let now_s = now_ms() / 1000;
-            match parse_grpc_web_response(&body, now_s) {
-                Ok(snap) => {
-                    let label = window_label(snap.resets_at_s, now_s);
-                    let mut window = json!({
-                        "window": label,
-                        "used_pct": snap.used_percent,
-                    });
-                    if let Some(ts) = snap.resets_at_s {
-                        window["resets_at_s"] = json!(ts);
-                    }
-                    let entry = json!({
-                        "provider": "xai",
-                        "source": "grok web billing",
-                        "plan": account.label,
-                        "windows": [window],
-                        "credits": {
-                            "has_credits": snap.used_percent < 100.0,
-                            "unlimited": false,
-                            "used_pct": snap.used_percent,
+                    let body = match resp.bytes().await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            return UsageFetchOutcome::Failed {
+                                retry_after_ms: None,
+                                fallback: None,
+                                log: UsageFailureLog::Error {
+                                    error: e.to_string(),
+                                    message: "xai grok credits body read failed",
+                                },
+                            };
+                        }
+                    };
+                    let now_s = now_ms() / 1000;
+                    match parse_grpc_web_response(&body, now_s) {
+                        Ok(snap) => {
+                            let label = window_label(snap.resets_at_s, now_s);
+                            let mut window = json!({
+                                "window": label,
+                                "used_pct": snap.used_percent,
+                            });
+                            if let Some(ts) = snap.resets_at_s {
+                                window["resets_at_s"] = json!(ts);
+                            }
+                            UsageFetchOutcome::Fresh(Some(json!({
+                                "provider": "xai",
+                                "source": "grok web billing",
+                                "plan": account.label,
+                                "windows": [window],
+                                "credits": {
+                                    "has_credits": snap.used_percent < 100.0,
+                                    "unlimited": false,
+                                    "used_pct": snap.used_percent,
+                                },
+                            })))
+                        }
+                        Err(e) => UsageFetchOutcome::Failed {
+                            retry_after_ms: None,
+                            fallback: None,
+                            log: UsageFailureLog::Error {
+                                error: e.to_string(),
+                                message: "xai grok credits parse failed",
+                            },
                         },
-                    });
-                    let mut cache = state.xai_usage.lock().unwrap();
-                    cache.fetched_at_ms = now_ms();
-                    cache.cooldown_until_ms = 0;
-                    cache.failures = 0;
-                    cache.entry = Some(entry.clone());
-                    Some(entry)
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, "xai grok credits parse failed");
-                    let mut cache = state.xai_usage.lock().unwrap();
-                    cache.failures += 1;
-                    let cooldown = usage_backoff_ms(cache.failures, None);
-                    cache.cooldown_until_ms = now_ms() + cooldown;
-                    cache.entry.clone()
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retry_after_ms = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .map(|s| s.clamp(30, 3600) * 1000);
+                    UsageFetchOutcome::Failed {
+                        retry_after_ms,
+                        fallback: None,
+                        log: UsageFailureLog::StatusWithBackoff {
+                            status,
+                            message: "xai grok web billing unavailable; backing off",
+                        },
+                    }
                 }
+                Err(e) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Error {
+                        error: e.to_string(),
+                        message: "xai grok web billing request failed",
+                    },
+                },
             }
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .map(|s| s.clamp(30, 3600) * 1000);
-            let mut cache = state.xai_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, retry_after);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            tracing::debug!(
-                status,
-                failures = cache.failures,
-                cooldown_ms = cooldown,
-                "xai grok web billing unavailable; backing off"
-            );
-            cache.entry.clone()
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "xai grok web billing request failed");
-            let mut cache = state.xai_usage.lock().unwrap();
-            cache.failures += 1;
-            let cooldown = usage_backoff_ms(cache.failures, None);
-            cache.cooldown_until_ms = now_ms() + cooldown;
-            cache.entry.clone()
-        }
-    }
+        },
+    )
+    .await
 }
 
 /// Kimi usage for the Providers snapshot. The 15-minute heartbeat records the
@@ -3169,37 +3251,36 @@ async fn kimi_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         .as_ref()
         .and_then(|v| v["observed_at_ms"].as_i64())
         .unwrap_or(0);
-    // Serve a recorded snapshot while it is fresh; only touch the network when
-    // there is nothing to show yet or it has aged past the usage TTL.
-    if current.is_some() && now_ms() < observed_at + USAGE_CACHE_TTL_MS {
-        return current;
-    }
-    {
-        let cache = state.kimi_usage.lock().unwrap();
-        if now_ms() < cache.cooldown_until_ms {
-            return current;
-        }
-    }
-    let (ok, _, _) = kimi_usage_probe(state).await;
-    if ok {
-        // The probe records fresh routing limits; read them back.
-        let updated = state
-            .vault
-            .account_for(Provider::Kimi, true)
-            .await
-            .ok()
-            .and_then(|a| recorded(&a));
-        let mut cache = state.kimi_usage.lock().unwrap();
-        cache.failures = 0;
-        cache.cooldown_until_ms = 0;
-        cache.fetched_at_ms = now_ms();
-        cache.entry = updated.clone().or_else(|| current.clone());
-        return updated.or(current);
-    }
-    let mut cache = state.kimi_usage.lock().unwrap();
-    cache.failures += 1;
-    cache.cooldown_until_ms = now_ms() + usage_backoff_ms(cache.failures, None);
-    current
+    // Kimi's value lives in account metadata, but the shared helper still owns
+    // its snapshot TTL, cooldown, and success/failure bookkeeping.
+    cached_usage_fetch(
+        &state.kimi_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Snapshot {
+            entry: current.clone(),
+            fetched_at_ms: observed_at,
+        },
+        || async move {
+            let (ok, _, _) = kimi_usage_probe(state).await;
+            if !ok {
+                return UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Silent,
+                };
+            }
+
+            // The probe records fresh routing limits; read them back.
+            let updated = state
+                .vault
+                .account_for(Provider::Kimi, true)
+                .await
+                .ok()
+                .and_then(|a| recorded(&a));
+            UsageFetchOutcome::Fresh(updated.or(current))
+        },
+    )
+    .await
 }
 
 pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
@@ -6990,7 +7071,13 @@ mod run_key_tests {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::{key_fingerprint, usage_backoff_ms};
+    use super::{
+        cached_usage_fetch, key_fingerprint, now_ms, usage_backoff_ms, UsageCache,
+        UsageCacheSource, UsageFailureLog, UsageFetchOutcome,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn fingerprint_is_first_8_sha256_bytes_hex() {
@@ -7011,6 +7098,57 @@ mod usage_tests {
     fn retry_after_wins_when_larger() {
         assert_eq!(usage_backoff_ms(1, Some(600_000)), 600_000);
         assert_eq!(usage_backoff_ms(5, Some(1_000)), 960_000);
+    }
+
+    #[tokio::test]
+    async fn cached_fetch_skips_fresh_entries() {
+        let cache = Mutex::new(UsageCache {
+            fetched_at_ms: now_ms(),
+            entry: Some(json!({ "provider": "cached" })),
+            ..UsageCache::default()
+        });
+        let fetched = Arc::new(AtomicBool::new(false));
+        let fetched_in_closure = fetched.clone();
+
+        let entry = cached_usage_fetch(
+            &cache,
+            300_000,
+            UsageCacheSource::Entry,
+            || async move {
+                fetched_in_closure.store(true, Ordering::SeqCst);
+                UsageFetchOutcome::Fresh(Some(json!({ "provider": "network" })))
+            },
+        )
+        .await;
+
+        assert_eq!(entry.unwrap()["provider"], "cached");
+        assert!(!fetched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cached_fetch_applies_retry_after_and_returns_fallback() {
+        let cache = Mutex::new(UsageCache::default());
+        let before = now_ms();
+
+        let entry = cached_usage_fetch(
+            &cache,
+            300_000,
+            UsageCacheSource::Entry,
+            || async {
+                UsageFetchOutcome::Failed {
+                    retry_after_ms: Some(600_000),
+                    fallback: Some(json!({ "error": "unavailable" })),
+                    log: UsageFailureLog::Silent,
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(entry.unwrap()["error"], "unavailable");
+        let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(cache.failures, 1);
+        assert!(cache.cooldown_until_ms >= before + 600_000);
+        assert!(cache.entry.is_none(), "fallbacks are not cached as fresh data");
     }
 }
 
