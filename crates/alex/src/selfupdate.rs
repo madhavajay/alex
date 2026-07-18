@@ -57,6 +57,18 @@ impl UpdateChannel {
             other => anyhow::bail!("unknown update channel '{other}' (expected stable or beta)"),
         }
     }
+
+    /// The channel a build should follow when the user has not explicitly
+    /// chosen one (B2). A build whose own version is a pre-release
+    /// (`-beta`/`-rc`/`-alpha`) defaults to beta, so it actually checks the
+    /// beta feed instead of comparing against the older latest *stable* and
+    /// falsely reporting "up to date". A stable build defaults to stable.
+    pub fn default_for_version(version: &str) -> Self {
+        match parse_version(version) {
+            Some(v) if !v.is_stable() => UpdateChannel::Beta,
+            _ => UpdateChannel::Stable,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +114,9 @@ pub struct UpdateCheck {
     pub current: String,
     pub latest: String,
     pub update_available: bool,
+    /// The backstop verdict (B5). When `Unconfirmed` we offer the resolved
+    /// latest but never claim the user is on it.
+    pub(crate) decision: UpdateDecision,
     pub notes_url: Option<String>,
     pub channel: Channel,
     pub update_channel: UpdateChannel,
@@ -142,34 +157,156 @@ pub fn platform_key() -> Result<&'static str> {
     }
 }
 
-/// Parsed version ordered so that a stable release ranks above any of its
-/// betas: `0.1.24-beta.2` < `0.1.24`, and `0.1.23` < `0.1.24-beta.1`.
-/// The fourth component is `(1, 0)` for stable and `(0, n)` for `-beta.n`.
-fn parse_version(version: &str) -> Option<(u64, u64, u64, (u8, u64))> {
-    let trimmed = version.trim().strip_prefix('v').unwrap_or(version.trim());
-    let (base, pre) = match trimmed.split_once('-') {
+/// Ordered pre-release stages. Unknown labels sort below the recognized ones,
+/// and a stable release outranks every pre-release, so `0.1.24-beta.2` <
+/// `0.1.24` and `0.1.24-alpha.9` < `0.1.24-beta.1` < `0.1.24-rc.1` < `0.1.24`.
+const STAGE_UNKNOWN_PRE: u8 = 0;
+const STAGE_ALPHA: u8 = 1;
+const STAGE_BETA: u8 = 2;
+const STAGE_RC: u8 = 3;
+const STAGE_STABLE: u8 = 4;
+
+/// A parsed, orderable version. `release` is the dotted numeric core with
+/// trailing zeros trimmed (so `0.1.0` == `0.1`); `stage`/`pre_num` order the
+/// pre-release suffix. Deriving `Ord` compares `release`, then `stage`, then
+/// `pre_num` — exactly the precedence we want (base dominates; a final release
+/// beats its betas; a higher beta number is newer).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ParsedVersion {
+    release: Vec<u64>,
+    stage: u8,
+    pre_num: u64,
+}
+
+impl ParsedVersion {
+    fn is_stable(&self) -> bool {
+        self.stage == STAGE_STABLE
+    }
+}
+
+/// Trim surrounding whitespace and a leading `v`/`V` so `v0.1.28` and
+/// `0.1.28 ` are recognized as the same tag.
+fn normalize_tag(version: &str) -> &str {
+    let trimmed = version.trim();
+    trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed)
+}
+
+/// The first contiguous run of ASCII digits in `s`, or 0 when there is none.
+/// Lets `beta.10`, `beta10`, and `beta.3-dirty` all yield their number.
+fn first_number(s: &str) -> u64 {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().unwrap_or(0)
+}
+
+/// Robust version parser (B1). Tolerates a leading `v`, ignores `+build`
+/// metadata, accepts `-alpha`/`-beta`/`-rc` with or without a number and with
+/// trailing junk (`-beta.3-dirty`), and accepts extra dotted numeric
+/// components (`0.1.2.3`). Returns `None` only when the numeric core is
+/// genuinely absent or non-numeric (e.g. `garbage`, ``). A `None` here never
+/// becomes a false "up to date": `decide_update` treats an unparseable side
+/// whose tag differs as an unconfirmable difference, not as "latest".
+fn parse_version(version: &str) -> Option<ParsedVersion> {
+    let core = normalize_tag(version);
+    // Drop build metadata: everything from the first '+'.
+    let core = core.split('+').next().unwrap_or(core);
+    let (base, pre) = match core.split_once('-') {
         Some((base, pre)) => (base, Some(pre)),
-        None => (trimmed, None),
+        None => (core, None),
     };
-    let mut parts = base.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
+    if base.is_empty() {
         return None;
     }
-    let rank = match pre {
-        None => (1, 0),
+    let mut release = Vec::new();
+    for part in base.split('.') {
+        release.push(part.parse::<u64>().ok()?);
+    }
+    // Trim trailing zeros so 0.1.0 == 0.1 and 0.1.24 == 0.1.24.0.
+    while release.len() > 1 && *release.last().unwrap() == 0 {
+        release.pop();
+    }
+    let (stage, pre_num) = match pre {
+        None => (STAGE_STABLE, 0),
         Some(pre) => {
-            let n = pre.strip_prefix("beta.")?.parse().ok()?;
-            (0, n)
+            let low = pre.to_ascii_lowercase();
+            let stage = if low.starts_with("rc") {
+                STAGE_RC
+            } else if low.starts_with("beta") {
+                STAGE_BETA
+            } else if low.starts_with("alpha") {
+                STAGE_ALPHA
+            } else {
+                STAGE_UNKNOWN_PRE
+            };
+            (stage, first_number(pre))
         }
     };
-    Some((major, minor, patch, rank))
+    Some(ParsedVersion {
+        release,
+        stage,
+        pre_num,
+    })
 }
 
 fn compare_versions(current: &str, latest: &str) -> Option<Ordering> {
     Some(parse_version(latest)?.cmp(&parse_version(current)?))
+}
+
+/// The conclusion of an update check. `Unconfirmed` is the user-trust backstop
+/// (B5): whenever we cannot *prove* the running tag is the newest, we must not
+/// claim "you're on the latest".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateDecision {
+    /// A strictly newer version is available.
+    Available,
+    /// Confirmed newest: identical tags, or the running build is strictly
+    /// newer than the resolved latest (a local/dev build ahead of the
+    /// channel — no newer tag exists).
+    UpToDate,
+    /// The tags differ but the comparator cannot order them (one side is
+    /// unparseable). Never reported as "latest"; surfaced as an offer/flag.
+    Unconfirmed,
+}
+
+impl UpdateDecision {
+    /// Whether an update should be offered. Both a real newer version and an
+    /// unconfirmable difference are offered — the alternative (staying silent)
+    /// is the exact false "up to date" the user rejected.
+    pub(crate) fn update_available(self) -> bool {
+        matches!(self, UpdateDecision::Available | UpdateDecision::Unconfirmed)
+    }
+}
+
+/// The hard backstop (B5). Decide whether `latest` supersedes `current`, never
+/// returning `UpToDate` when the two tags differ and cannot be ordered.
+pub(crate) fn decide_update(current: &str, latest: &str) -> UpdateDecision {
+    if normalize_tag(current) == normalize_tag(latest) {
+        return UpdateDecision::UpToDate;
+    }
+    match compare_versions(current, latest) {
+        Some(Ordering::Greater) => UpdateDecision::Available,
+        // Equal despite differing text (e.g. only `+build` metadata differs),
+        // or the running build is strictly newer than the channel's latest.
+        Some(Ordering::Equal) | Some(Ordering::Less) => UpdateDecision::UpToDate,
+        // Tags differ and cannot be ordered: never claim "latest".
+        None => UpdateDecision::Unconfirmed,
+    }
+}
+
+/// True when a daemon reporting `reported` on /health is serving the intended
+/// `target` build (post-update verification, B3). Uses the same comparator so
+/// a `v`-prefix or `+build` metadata never causes a spurious mismatch.
+fn version_matches(reported: &str, target: &str) -> bool {
+    if normalize_tag(reported) == normalize_tag(target) {
+        return true;
+    }
+    matches!(compare_versions(reported, target), Some(Ordering::Equal))
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,14 +324,23 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
-/// Pick the newest release (stable or beta) that carries a manifest.json,
-/// so a beta user is offered the final release once it ships.
-fn select_release_manifest_url(releases: &[GithubRelease]) -> Option<(String, String)> {
+/// Pick the newest release carrying a manifest.json that `channel` is allowed
+/// to install. Beta users also see the final stable (so they roll onto it once
+/// it ships); a stable user is NEVER offered a pre-release, even when a beta is
+/// the newest tag on GitHub. Draft releases and releases without a manifest are
+/// skipped.
+fn select_release_for_channel(
+    releases: &[GithubRelease],
+    channel: UpdateChannel,
+) -> Option<(String, String)> {
     releases
         .iter()
         .filter(|r| !r.draft)
         .filter_map(|r| {
             let version = parse_version(&r.tag_name)?;
+            if channel == UpdateChannel::Stable && !version.is_stable() {
+                return None;
+            }
             let manifest = r.assets.iter().find(|a| a.name == "manifest.json")?;
             Some((
                 version,
@@ -204,6 +350,12 @@ fn select_release_manifest_url(releases: &[GithubRelease]) -> Option<(String, St
         })
         .max_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, tag, url)| (tag, url))
+}
+
+/// The beta channel's release selection: newest of stable-or-beta, so a beta
+/// user is offered the final release once it ships.
+fn select_release_manifest_url(releases: &[GithubRelease]) -> Option<(String, String)> {
+    select_release_for_channel(releases, UpdateChannel::Beta)
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
@@ -287,20 +439,20 @@ pub async fn check(channel: Channel, update_channel: UpdateChannel) -> Result<Up
         })?;
     let current = env!("CARGO_PKG_VERSION").to_string();
     let latest = manifest.components.cli.version;
-    let update_available = match compare_versions(&current, &latest) {
-        Some(Ordering::Greater) => true,
-        Some(_) => false,
-        None => {
-            eprintln!(
-                "warning: could not parse update version(s): current={current}, latest={latest}; treating as up to date"
-            );
-            false
-        }
-    };
+    let decision = decide_update(&current, &latest);
+    if decision == UpdateDecision::Unconfirmed {
+        // B5: we could not order the tags, but they differ. Never claim the
+        // user is on the latest — offer/flag GitHub's newest for the channel.
+        eprintln!(
+            "warning: could not confirm alex {current} is the latest; GitHub's newest for this channel is {latest}. Offering it rather than claiming you are up to date."
+        );
+    }
+    let update_available = decision.update_available();
     Ok(UpdateCheck {
         current,
         latest,
         update_available,
+        decision,
         notes_url: manifest.components.cli.notes_url,
         channel,
         update_channel,
@@ -322,6 +474,9 @@ pub async fn daemon_update_status_value(
         "current": update.current,
         "latest": update.latest,
         "update_available": update.update_available,
+        // B5: false when the tags differ but could not be ordered, so a UI can
+        // avoid a confident "you're on the latest".
+        "confirmed": update.decision != UpdateDecision::Unconfirmed,
         "notes_url": update.notes_url,
         "update_channel": update.update_channel.as_str(),
         "checked_at_ms": now_ms(),
@@ -347,6 +502,7 @@ fn update_body(update: &UpdateCheck, applying: bool) -> serde_json::Value {
         "current": update.current,
         "latest": update.latest,
         "update_available": update.update_available,
+        "confirmed": update.decision != UpdateDecision::Unconfirmed,
         "notes_url": update.notes_url,
         "update_channel": update.update_channel.as_str(),
     })
@@ -388,7 +544,7 @@ pub(crate) async fn daemon_apply_update(
         tokio::spawn(async move {
             let result = async {
                 install_unix(&task_exe, &task_update).await?;
-                restart_daemon(&config, &task_exe).await
+                restart_daemon(&config, &task_exe, &task_update.latest).await
             }
             .await;
             if let Err(e) = result {
@@ -471,7 +627,7 @@ pub async fn run_update(
         if no_restart {
             println!("daemon restart skipped (--no-restart)");
         } else {
-            restart_daemon(config, &exe).await?;
+            restart_daemon(config, &exe, &update.latest).await?;
         }
         Ok(())
     }
@@ -485,6 +641,7 @@ fn print_check(update: &UpdateCheck, json_output: bool) -> Result<()> {
                 "current": update.current,
                 "latest": update.latest,
                 "update_available": update.update_available,
+                "confirmed": update.decision != UpdateDecision::Unconfirmed,
                 "notes_url": update.notes_url,
                 "channel": update.channel.as_str(),
                 "update_channel": update.update_channel.as_str(),
@@ -495,7 +652,14 @@ fn print_check(update: &UpdateCheck, json_output: bool) -> Result<()> {
             UpdateChannel::Stable => "",
             UpdateChannel::Beta => " [beta channel]",
         };
-        if update.update_available {
+        if update.decision == UpdateDecision::Unconfirmed {
+            // B5: we cannot prove the current build is newest, and the tags
+            // differ — do NOT print "up to date".
+            println!(
+                "alex {}: could not confirm you are on the latest{suffix}; GitHub's newest for this channel is {}",
+                update.current, update.latest
+            );
+        } else if update.update_available {
             if let Some(notes) = &update.notes_url {
                 println!(
                     "alex {} → {} available{suffix} (notes: {notes})",
@@ -668,7 +832,7 @@ pub(crate) async fn wait_for_daemon_health(
     }
 }
 
-async fn restart_daemon(config: &Config, exe: &Path) -> Result<()> {
+async fn restart_daemon(config: &Config, exe: &Path, target_version: &str) -> Result<()> {
     let health_url = format!("http://{}:{}/health", check_host(config), config.port);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -684,7 +848,8 @@ async fn restart_daemon(config: &Config, exe: &Path) -> Result<()> {
             println!("daemon is launchd-managed; starting graceful restart helper");
             // This task runs inside the old daemon.  It cannot wait for its
             // own graceful exit, so the helper owns the post-drain health
-            // check and hard-restart fallback.
+            // check and hard-restart fallback. The helper runs from the new
+            // binary and verifies the served version there (B3).
             crate::spawn_launchd_restart_helper(exe)
         }
         ServiceState::Systemd { active: true, .. } => {
@@ -696,15 +861,76 @@ async fn restart_daemon(config: &Config, exe: &Path) -> Result<()> {
             if !status.success() {
                 anyhow::bail!("systemctl --user restart alexandria failed");
             }
-            println!("daemon restarted");
+            // B3: don't trust the exit code alone — confirm the daemon now
+            // answering /health is actually the new build.
+            if wait_for_daemon_health(&client, &health_url, Duration::from_secs(30)).await {
+                verify_served_version(&client, &health_url, target_version).await?;
+                println!("daemon restarted; verified it is now serving {target_version}");
+            } else {
+                anyhow::bail!("systemd restarted alexandria but it did not become healthy in time");
+            }
             Ok(())
         }
-        _ => blue_green_restart(config, exe).await,
+        _ => blue_green_restart(config, exe, target_version).await,
     }
 }
 
+/// Poll `/health` and confirm the daemon is serving `target_version` (B3).
+/// The new daemon is already healthy by the time this is called, so a short
+/// retry only absorbs a stray old daemon still answering during the drain
+/// window; a persistent mismatch is a real failure (a stray daemon owns the
+/// port), surfaced with a clear, actionable error.
+async fn verify_served_version(
+    client: &reqwest::Client,
+    health_url: &str,
+    target_version: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_reported = String::new();
+    loop {
+        match fetch_health_version(client, health_url).await {
+            Ok(reported) => {
+                if version_matches(&reported, target_version) {
+                    return Ok(());
+                }
+                last_reported = reported;
+            }
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "post-update check: daemon is serving {last_reported}, expected {target_version}; \
+                 a stray daemon may still own the port — stop it and restart with `alex daemon --background`"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn fetch_health_version(client: &reqwest::Client, health_url: &str) -> Result<String> {
+    let health: serde_json::Value = client
+        .get(health_url)
+        .send()
+        .await
+        .context("querying /health for post-update version check")?
+        .error_for_status()
+        .context("querying /health for post-update version check")?
+        .json()
+        .await
+        .context("parsing /health for post-update version check")?;
+    Ok(health
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
 #[cfg(unix)]
-async fn blue_green_restart(config: &Config, exe: &Path) -> Result<()> {
+async fn blue_green_restart(config: &Config, exe: &Path, target_version: &str) -> Result<()> {
     let old_pids = listener_pids(config.port)?;
     if old_pids.is_empty() {
         println!("no running daemon found; starting fresh");
@@ -756,24 +982,55 @@ async fn blue_green_restart(config: &Config, exe: &Path) -> Result<()> {
 
     if old_pids.is_empty() {
         println!("daemon healthy");
-        return Ok(());
+    } else {
+        println!(
+            "new daemon healthy; draining old daemon(s): {}",
+            old_pids.join(" ")
+        );
     }
-    println!(
-        "new daemon healthy; draining old daemon(s): {}",
-        old_pids.join(" ")
-    );
-    for pid in old_pids {
-        if pid == new_pid.to_string() {
-            continue;
-        }
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
-    }
-    println!("daemon restarted; old instance drains in-flight requests then exits");
+
+    // Reclaim the port (B6). TERM every daemon still listening that is NOT the
+    // new one — including stray, manually-started daemons that co-bound via
+    // SO_REUSEPORT and were never in `old_pids` — then KILL any straggler that
+    // ignores TERM. If one survived it would keep serving old code and the
+    // post-update check below would (correctly) fail.
+    reclaim_port(config.port, &new_pid.to_string()).await;
+
+    // Post-update verification (B3): confirm the port is now owned by the new
+    // build, not a survivor.
+    verify_served_version(&client, &health_url, target_version).await?;
+    println!("daemon restarted; verified it is now serving {target_version}");
     Ok(())
 }
 
+/// TERM, then KILL, every listener on `port` except `keep_pid` (B6).
+#[cfg(unix)]
+async fn reclaim_port(port: u16, keep_pid: &str) {
+    let listeners = listener_pids(port).unwrap_or_default();
+    for pid in pids_to_reclaim(&listeners, keep_pid) {
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    }
+    // Give graceful shutdown a moment, then force-close anything still bound.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stragglers = pids_to_reclaim(&listener_pids(port).unwrap_or_default(), keep_pid);
+    for pid in &stragglers {
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+}
+
+/// The listeners that must be reclaimed: everything except the daemon we just
+/// started. Pure so the "never kill the new daemon" rule is unit-tested.
+#[cfg(unix)]
+fn pids_to_reclaim(listeners: &[String], keep_pid: &str) -> Vec<String> {
+    listeners
+        .iter()
+        .filter(|pid| pid.as_str() != keep_pid)
+        .cloned()
+        .collect()
+}
+
 #[cfg(not(unix))]
-async fn blue_green_restart(_config: &Config, _exe: &Path) -> Result<()> {
+async fn blue_green_restart(_config: &Config, _exe: &Path, _target_version: &str) -> Result<()> {
     Ok(())
 }
 
@@ -918,9 +1175,18 @@ mod tests {
             compare_versions("0.1.24-beta.2", "v0.1.24-beta.2"),
             Some(Ordering::Equal)
         );
-        // unknown prerelease labels are rejected, treated as unparseable
-        assert_eq!(compare_versions("0.1.24", "0.1.25-rc.1"), None);
-        assert_eq!(compare_versions("0.1.24", "0.1.25-beta"), None);
+        // B1 fix: these two previously asserted `None` (the parser bug). `rc.1`
+        // and a number-less `-beta` are now parsed, and both are a NEWER base
+        // (0.1.25 > 0.1.24), so they must be offered — never a false "up to
+        // date". The genuinely-unparseable case (`garbage`) still returns None.
+        assert_eq!(
+            compare_versions("0.1.24", "0.1.25-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.1.24", "0.1.25-beta"),
+            Some(Ordering::Greater)
+        );
     }
 
     #[test]
@@ -1017,5 +1283,306 @@ mod tests {
             "x86_64-pc-windows-msvc",
         ]
         .contains(&key));
+    }
+
+    // ----------------------------------------------------------------------
+    // B1 — robust parser: none of these malformed-but-real tags may be lost,
+    // and none may collapse to a false "up to date".
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn parse_version_handles_malformed_but_real_tags() {
+        // rc / alpha / beta suffixes all parse and order below stable.
+        assert!(parse_version("0.1.25-rc.1").is_some());
+        assert!(parse_version("0.1.25-alpha.2").is_some());
+        // `-beta` with no number parses (number defaults to 0).
+        let beta_none = parse_version("0.1.25-beta").unwrap();
+        assert_eq!(beta_none.stage, STAGE_BETA);
+        assert_eq!(beta_none.pre_num, 0);
+        assert_eq!(parse_version("0.1.25-beta.0"), Some(beta_none));
+
+        // `+build` metadata is ignored: a build-stamped stable equals the plain
+        // stable, and stays a stable release.
+        let plain = parse_version("0.1.28").unwrap();
+        assert_eq!(parse_version("0.1.28+build.9"), Some(plain.clone()));
+        assert!(parse_version("0.1.28+build.9").unwrap().is_stable());
+
+        // Trailing junk after the pre-release number is tolerated.
+        assert_eq!(
+            parse_version("0.1.24-beta.3-dirty"),
+            parse_version("0.1.24-beta.3")
+        );
+
+        // Extra dotted numeric components parse and order after the shorter tag.
+        assert!(parse_version("0.1.2.3").is_some());
+        assert_eq!(
+            compare_versions("0.1.2", "0.1.2.3"),
+            Some(Ordering::Greater)
+        );
+        // Trailing zeros are equivalent (0.1.0 == 0.1 == 0.1.0.0).
+        assert_eq!(parse_version("0.1.0"), parse_version("0.1"));
+        assert_eq!(parse_version("0.1.24.0"), parse_version("0.1.24"));
+
+        // Leading v/V tolerated.
+        assert_eq!(parse_version("v0.1.28"), parse_version("0.1.28"));
+        assert_eq!(parse_version("V0.1.28"), parse_version("0.1.28"));
+
+        // Genuinely unparseable → None (the decision layer, not the parser,
+        // turns this into a safe "unable to confirm").
+        assert!(parse_version("garbage").is_none());
+        assert!(parse_version("").is_none());
+        assert!(parse_version("x.y.z").is_none());
+        assert!(parse_version("0..1").is_none());
+    }
+
+    #[test]
+    fn pre_release_stage_ordering_alpha_beta_rc_stable() {
+        // alpha < beta < rc < stable, all on the same base.
+        assert_eq!(
+            compare_versions("0.1.24-alpha.9", "0.1.24-beta.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.1.24-beta.9", "0.1.24-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.1.24-rc.9", "0.1.24"),
+            Some(Ordering::Greater)
+        );
+        // A higher base always wins regardless of pre-release stage.
+        assert_eq!(
+            compare_versions("0.1.24", "0.1.25-alpha.1"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // B5 — the hard backstop: differing tags that cannot be ordered must never
+    // be reported as "up to date".
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn decide_update_backstop_never_false_latest() {
+        // Identical tag (incl. v-prefix / build metadata) → confirmed latest.
+        assert_eq!(decide_update("0.1.28", "0.1.28"), UpdateDecision::UpToDate);
+        assert_eq!(
+            decide_update("v0.1.28", "0.1.28"),
+            UpdateDecision::UpToDate
+        );
+        assert_eq!(
+            decide_update("0.1.28", "0.1.28+build.5"),
+            UpdateDecision::UpToDate
+        );
+
+        // A strictly newer latest → available.
+        assert_eq!(
+            decide_update("0.1.28", "0.1.29"),
+            UpdateDecision::Available
+        );
+        // Row-8 shape: an rc tag is the newest → offered, not a false latest.
+        assert_eq!(
+            decide_update("0.1.28", "0.1.29-rc.1"),
+            UpdateDecision::Available
+        );
+
+        // Running build strictly newer than the channel head (dev/ahead) →
+        // up to date (no newer tag exists), which does not violate the rule.
+        assert_eq!(
+            decide_update("0.1.29", "0.1.28"),
+            UpdateDecision::UpToDate
+        );
+
+        // THE user-trust cases: tags differ but one side is unparseable. Must
+        // NOT be UpToDate — offered/flagged instead.
+        assert_eq!(
+            decide_update("0.1.28", "garbage-2026"),
+            UpdateDecision::Unconfirmed
+        );
+        assert_eq!(
+            decide_update("garbage", "0.1.28"),
+            UpdateDecision::Unconfirmed
+        );
+        assert!(decide_update("0.1.28", "garbage-2026").update_available());
+        // And crucially: never claims the user is on the latest.
+        assert_ne!(
+            decide_update("0.1.28", "garbage-2026"),
+            UpdateDecision::UpToDate
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Channel-semantics matrix (spec rows 1-8), encoded end-to-end:
+    // resolve the channel's latest, then decide.
+    // ----------------------------------------------------------------------
+
+    /// Mirror of select_release_for_channel over two published heads: stable
+    /// sees only stable; beta sees the newer of stable/beta (rolls onto final).
+    fn resolve_latest(channel: UpdateChannel, latest_stable: &str, latest_beta: &str) -> String {
+        match channel {
+            UpdateChannel::Stable => latest_stable.to_string(),
+            UpdateChannel::Beta => match compare_versions(latest_stable, latest_beta) {
+                Some(Ordering::Greater) => latest_beta.to_string(),
+                _ => latest_stable.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn channel_semantics_matrix() {
+        struct Row {
+            current: &'static str,
+            channel: UpdateChannel,
+            latest_stable: &'static str,
+            latest_beta: &'static str,
+            expect_available: bool,
+            expect_latest: &'static str,
+        }
+
+        // Row 4's channel is DERIVED from the (beta) build version per B2 — a
+        // beta build must not default to the stable channel.
+        let row4_channel = UpdateChannel::default_for_version("0.1.28-beta.2");
+        assert_eq!(row4_channel, UpdateChannel::Beta, "B2: beta build → beta channel");
+
+        let rows = [
+            // 1: stable build, stable channel → stable update, NOT the beta.
+            Row { current: "0.1.27", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.28" },
+            // 2: stable build, beta channel → the newer beta.
+            Row { current: "0.1.27", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.29-beta.1" },
+            // 3: beta build, beta channel → newer beta.
+            Row { current: "0.1.28-beta.2", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            // 4: beta build, channel defaulted (→ beta per B2) → newer beta, NOT "up to date".
+            Row { current: "0.1.28-beta.2", channel: row4_channel, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            // 5: beta build, beta channel, final shipped → roll onto the final (final > its betas).
+            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28" },
+            // 6: stable build, stable channel, same version → up to date.
+            Row { current: "0.1.28", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28" },
+            // 7: beta build, beta channel, same beta → up to date.
+            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28-beta.3" },
+        ];
+
+        for (i, row) in rows.iter().enumerate() {
+            let n = i + 1;
+            let latest = resolve_latest(row.channel, row.latest_stable, row.latest_beta);
+            assert_eq!(
+                latest, row.expect_latest,
+                "row {n}: resolved latest for {:?}",
+                row.channel
+            );
+            let decision = decide_update(row.current, &latest);
+            assert_eq!(
+                decision.update_available(),
+                row.expect_available,
+                "row {n}: update_available for current={} latest={latest} decision={decision:?}",
+                row.current
+            );
+            // No matrix row may ever land on Unconfirmed — they are all
+            // well-formed tags — so any "available" here is a real offer.
+            assert_ne!(decision, UpdateDecision::Unconfirmed, "row {n}");
+        }
+
+        // Row 8: the newest tag on GitHub is an rc. Whatever the current build,
+        // it must be offered/flagged, never a false "up to date".
+        let decision = decide_update("0.1.28", "0.1.29-rc.1");
+        assert!(decision.update_available(), "row 8: rc must be offered");
+        assert_ne!(decision, UpdateDecision::UpToDate, "row 8");
+    }
+
+    #[test]
+    fn stable_channel_is_never_offered_a_beta() {
+        // Even when a beta is by far the newest head, a stable-channel resolve
+        // returns the stable head, so the decision is "up to date".
+        let latest = resolve_latest(UpdateChannel::Stable, "0.1.28", "0.1.29-beta.5");
+        assert_eq!(latest, "0.1.28");
+        assert_eq!(
+            decide_update("0.1.28", &latest),
+            UpdateDecision::UpToDate
+        );
+
+        // select_release_for_channel filters the same way: stable skips every
+        // pre-release even when it is the newest tag present.
+        let releases: Vec<GithubRelease> = serde_json::from_str(
+            r#"[
+              {"tag_name": "v0.1.28", "draft": false,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/stable/manifest.json"}]},
+              {"tag_name": "v0.1.29-beta.5", "draft": false,
+               "assets": [{"name": "manifest.json", "browser_download_url": "https://example.test/beta5/manifest.json"}]}
+            ]"#,
+        )
+        .unwrap();
+        let (stable_tag, _) =
+            select_release_for_channel(&releases, UpdateChannel::Stable).unwrap();
+        assert_eq!(stable_tag, "v0.1.28");
+        // Beta channel, in contrast, sees the newer beta.
+        let (beta_tag, _) = select_release_for_channel(&releases, UpdateChannel::Beta).unwrap();
+        assert_eq!(beta_tag, "v0.1.29-beta.5");
+    }
+
+    // ----------------------------------------------------------------------
+    // B2 — a pre-release build defaults to the beta channel (daemon side).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn default_channel_derived_from_build_version() {
+        assert_eq!(
+            UpdateChannel::default_for_version("0.1.28"),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            UpdateChannel::default_for_version("0.1.28-beta.2"),
+            UpdateChannel::Beta
+        );
+        assert_eq!(
+            UpdateChannel::default_for_version("0.1.28-rc.1"),
+            UpdateChannel::Beta
+        );
+        assert_eq!(
+            UpdateChannel::default_for_version("0.1.28-alpha.1"),
+            UpdateChannel::Beta
+        );
+        // A garbage/dev version is not a recognized pre-release → stay stable.
+        assert_eq!(
+            UpdateChannel::default_for_version("garbage"),
+            UpdateChannel::Stable
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // B3 — post-update verification: served version must equal the target.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn version_matches_ignores_v_prefix_and_build_metadata() {
+        assert!(version_matches("0.1.28", "0.1.28"));
+        assert!(version_matches("v0.1.28", "0.1.28"));
+        assert!(version_matches("0.1.28+build.9", "0.1.28"));
+        assert!(version_matches("0.1.28-beta.3", "0.1.28-beta.3"));
+        // A stray OLD daemon must be detected as a mismatch.
+        assert!(!version_matches("0.1.27", "0.1.28"));
+        assert!(!version_matches("0.1.28-beta.2", "0.1.28-beta.3"));
+        assert!(!version_matches("", "0.1.28"));
+    }
+
+    // ----------------------------------------------------------------------
+    // B6 — port reclaim: kill every listener except the new daemon.
+    // ----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn pids_to_reclaim_keeps_only_the_new_daemon() {
+        let listeners = vec![
+            "1001".to_string(),
+            "1002".to_string(),
+            "2000".to_string(),
+        ];
+        // The new daemon (2000) is spared; the two strays are reclaimed.
+        assert_eq!(
+            pids_to_reclaim(&listeners, "2000"),
+            vec!["1001".to_string(), "1002".to_string()]
+        );
+        // If the new daemon is the only listener, nothing is killed.
+        assert!(pids_to_reclaim(&["2000".to_string()], "2000").is_empty());
+        // Nothing listening → nothing to reclaim.
+        assert!(pids_to_reclaim(&[], "2000").is_empty());
     }
 }

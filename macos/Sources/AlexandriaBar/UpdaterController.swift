@@ -3,6 +3,15 @@ import Foundation
 import Sparkle
 import AlexandriaBarCore
 
+/// Bridges the shared `AlexVersion` comparator (a 1:1 port of the daemon's
+/// Rust ordering) into Sparkle's `SUVersionComparison` protocol, so Sparkle
+/// orders our `-beta.N`/`-rc.N` versions identically to `alex update` (B4).
+final class AlexVersionComparator: NSObject, SUVersionComparison {
+    func compareVersion(_ versionA: String, toVersion versionB: String) -> ComparisonResult {
+        AlexVersion.compare(versionA, versionB)
+    }
+}
+
 /// Swaps the Sparkle feed to the beta appcast when the user opts into the
 /// beta channel. Returning nil keeps the SUFeedURL baked into Info.plist,
 /// so switching back to stable always works.
@@ -29,7 +38,13 @@ final class ChannelFeedDelegate: NSObject, SPUUpdaterDelegate {
 
     func feedURLString(for updater: SPUUpdater) -> String? {
         let rawChannel = UserDefaults.standard.string(forKey: UpdateChannelSetting.defaultsKey)
-        let channel = UpdateChannelSetting.from(rawChannel)
+        // B2: a pre-release build with no explicit channel choice must resolve
+        // to beta, so refresh checks the beta appcast instead of the older
+        // latest stable and falsely reporting "up to date".
+        let runningVersion =
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let channel = UpdateChannelSetting.resolved(
+            rawStored: rawChannel, runningVersion: runningVersion)
         let stableFeed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
         let resolved = stableFeed.flatMap { channel.feedURLString(stableFeed: $0) }
         // Diagnostic (Reveal Log File): this proves whether Sparkle consults the
@@ -54,6 +69,16 @@ final class ChannelFeedDelegate: NSObject, SPUUpdaterDelegate {
             "sparkle feedURL: channel=\(rawChannel ?? "nil")->\(channel.rawValue) "
                 + "baked=\(stableFeed) resolved=\(resolved ?? "nil(uses baked)") effective=\(effective)")
         return effective
+    }
+
+    /// B4: hand Sparkle a version comparator that matches the daemon's Rust
+    /// ordering exactly, instead of relying on `SUStandardVersionComparator`
+    /// (whose handling of our `-beta.N`/`-rc.N` SemVer scheme is not
+    /// guaranteed to agree). `AlexVersion` is a 1:1 port of the Rust
+    /// comparator, so `alex update` and Sparkle can never disagree about which
+    /// build is newer.
+    func versionComparator(for updater: SPUUpdater) -> (any SUVersionComparison)? {
+        AlexVersionComparator()
     }
 
     /// Appends a unique `cb` query parameter so the CDN cannot serve a stale
