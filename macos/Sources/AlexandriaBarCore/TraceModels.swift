@@ -1371,6 +1371,13 @@ public enum HarnessIcon {
         "pydantic-ai-harness": "pydantic-ai-harness.png",
         "jcode": "jcode.png",
         "openrouter": "openrouter.png",
+        // OpenRouter sub-provider brand icons (models are openrouter/<sub>/<model>).
+        "tencent": "tencent.png",
+        "xiaomi": "xiaomi.png",
+        "deepseek": "deepseek.png",
+        "minimax": "minimax.png",
+        "nvidia": "nvidia.png",
+        "z-ai": "z-ai.png",
     ]
 
     static let aliases: [String: String] = [
