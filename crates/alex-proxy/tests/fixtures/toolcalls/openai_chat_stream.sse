@@ -1,0 +1,14 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"4876ae0e-6539-9222-9088-ee891b5ba31a","object":"chat.completion.chunk","created":1783564098,"model":"grok-4.5-build","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+: keepalive
+
+data: {"id":"4876ae0e-6539-9222-9088-ee891b5ba31a","object":"chat.completion.chunk","created":1783564098,"model":"grok-4.5-build","choices":[{"index":0,"delta":{"content":"I'll write a short self-description "}}]}
+
+data: {"id":"4876ae0e-6539-9222-9088-ee891b5ba31a","object":"chat.completion.chunk","created":1783564098,"model":"grok-4.5-build","choices":[{"index":0,"delta":{"content":"to `/app/whoami.txt`."}}]}
+
+data: {"id":"4876ae0e-6539-9222-9088-ee891b5ba31a","object":"chat.completion.chunk","created":1783564099,"model":"grok-4.5-build","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call-5b4680af-a422-4045-87d2-1f47354ddec1-0","function":{"name":"write","arguments":"{\"content\":\"I am Grok, an AI assistant built by xAI.\\n\",\"file_path\":\"/app/whoami.txt\"}"},"index":0,"type":"function"}]}}]}
+
+data: [DONE]
+

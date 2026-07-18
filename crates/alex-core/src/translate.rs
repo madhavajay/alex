@@ -1313,7 +1313,8 @@ fn tool_call_json(id: &Value, name: &Value, args: &Value) -> Value {
 
 pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value> {
     let trimmed = resp_text.trim_start();
-    let is_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    let is_sse =
+        trimmed.starts_with("event:") || trimmed.starts_with("data:") || trimmed.starts_with(':');
     match upstream_format {
         "anthropic" => {
             let msg = if is_sse {
@@ -1407,13 +1408,45 @@ pub fn assistant_tool_calls(upstream_format: &str, resp_text: &str) -> Vec<Value
             })
             .unwrap_or_default()
         }
+        "gemini" => {
+            let responses = if is_sse {
+                sse_datas(resp_text).collect::<Vec<_>>()
+            } else {
+                serde_json::from_str(resp_text).ok().into_iter().collect()
+            };
+            responses
+                .into_iter()
+                .flat_map(|response| {
+                    response["candidates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|candidate| {
+                            candidate["content"]["parts"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|part| part["functionCall"].is_object())
+                                .map(|part| {
+                                    tool_call_json(
+                                        &part["functionCall"]["id"],
+                                        &part["functionCall"]["name"],
+                                        &part["functionCall"]["args"],
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
 
 pub fn assistant_reply_text(upstream_format: &str, resp_text: &str) -> Option<String> {
     let trimmed = resp_text.trim_start();
-    let is_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    let is_sse =
+        trimmed.starts_with("event:") || trimmed.starts_with("data:") || trimmed.starts_with(':');
     match upstream_format {
         "anthropic" => {
             let msg = if is_sse {

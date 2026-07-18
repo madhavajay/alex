@@ -1,0 +1,32 @@
+{
+  "model": "gpt-5.5",
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Answer this question in your own words: Who are you? Write your answer to /app/whoami.txt."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "update_topic",
+          "description": "Manages your narrative flow.",
+          "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+              "strategic_intent": {"type": "string"},
+              "title": {"type": "string"}
+            },
+            "required": ["strategic_intent"]
+          }
+        }
+      ]
+    }
+  ],
+  "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}}
+}

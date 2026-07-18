@@ -58,10 +58,26 @@ def lineage(args):
 
 def tools(args):
     transcript = load(args.transcript)
-    rows = [tool for turn in transcript.get("turns", []) for tool in turn.get("executed_tools", [])]
-    if not rows:
+    turns = transcript.get("turns", [])
+    tool_turns = [turn for turn in turns if turn.get("executed_tools")]
+    if not tool_turns:
         fail("no executed_tools rows in /traces/sessions/{id}/transcript")
-    row = rows[0]
+    turn = tool_turns[0]
+    if not isinstance(turn.get("user"), str) or not turn["user"].strip():
+        fail("tool transcript turn has no non-empty outgoing user/tool-result half")
+    blocks = turn.get("assistant_blocks") or []
+    has_assistant = isinstance(turn.get("assistant"), str) and bool(turn["assistant"].strip())
+    has_assistant_block = any(
+        (block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"].strip())
+        or (block.get("type") == "tool_call" and isinstance(block.get("name"), str) and block["name"].strip())
+        for block in blocks
+        if isinstance(block, dict)
+    )
+    if not has_assistant and not has_assistant_block:
+        fail("tool transcript turn has no non-empty model half after display reconstruction")
+    if not turn.get("tool_calls"):
+        fail("tool transcript turn has no assistant tool_calls entry")
+    row = turn["executed_tools"][0]
     for key in ("id", "session_id", "turn_id", "tool_call_id", "tool_name", "args_body_path", "result_body_path"):
         if not row.get(key):
             fail(f"tool row {key} is missing")

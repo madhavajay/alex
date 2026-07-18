@@ -7370,10 +7370,11 @@ mod trace_api_tests {
     use super::{
         account_plot_series, openai_responses_user_history_signature, session_from_metadata,
         trace_extras, trace_harness, trace_reasoning_fields, transcript_assistant_blocks,
-        transcript_tab_counts, transcript_turn, truncate_chars,
+        transcript_tab_counts, transcript_turn, truncate_chars, Store,
     };
     use axum::http::{HeaderMap, HeaderValue};
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
 
     #[test]
     fn metadata_session_variants() {
@@ -7524,6 +7525,166 @@ mod trace_api_tests {
         assert_eq!(turn["reasoning_effort"], "minimal");
         assert_eq!(turn["billing_bucket"], "subscription");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
+    }
+
+    struct RemoveTestDir(PathBuf);
+
+    impl Drop for RemoveTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_transcript_both_sides(
+        dialect: &str,
+        request: &str,
+        response: &str,
+        expected_tool: &str,
+    ) {
+        let request_json: Value = serde_json::from_str(request)
+            .unwrap_or_else(|error| panic!("{dialect}: request fixture is invalid JSON: {error}"));
+        assert!(
+            request_json["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{dialect}: request fixture must define at least one tool"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-transcript-{dialect}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).expect("open temporary trace store");
+        let trace_id = format!("both-sides-{dialect}");
+        let request_path = store
+            .write_body(&trace_id, "request.json", request.as_bytes())
+            .expect("gzip-write request body");
+        let response_path = store
+            .write_body(&trace_id, "response.body", response.as_bytes())
+            .expect("gzip-write response body");
+        let format = dialect.strip_suffix("-stream").unwrap_or(dialect);
+        let row = json!({
+            "id": trace_id,
+            "ts_request_ms": 1_783_564_098_000_i64,
+            "ts_response_ms": 1_783_564_099_000_i64,
+            "requested_model": "fixture-model",
+            "routed_model": "fixture-model",
+            "upstream_provider": "fixture-provider",
+            "status": 200,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cost_usd": 0.001,
+            "billing_bucket": "subscription",
+            "account_id": "fixture-account",
+            "error": null,
+            "client_format": format,
+            "upstream_format": format,
+            "req_body_path": request_path,
+            "resp_body_path": response_path,
+        });
+
+        let direct_calls = alex_core::translate::assistant_tool_calls(format, response);
+        assert!(
+            direct_calls
+                .iter()
+                .any(|call| call["name"] == expected_tool),
+            "{dialect}: translate::assistant_tool_calls did not return {expected_tool}: {direct_calls:?}"
+        );
+
+        let turn = transcript_turn(&row);
+        assert!(
+            turn["user"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "{dialect}: outgoing user/tool-result half was blank: {turn}"
+        );
+        let assistant_text = turn["assistant"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty());
+        let displayable_block = turn["assistant_blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|block| match block["type"].as_str() {
+                Some("text") => block["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                Some("tool_call") => block["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.trim().is_empty()),
+                _ => false,
+            });
+        assert!(
+            assistant_text || displayable_block,
+            "{dialect}: model half was blank after display reconstruction: {turn}"
+        );
+        let displayed_calls = turn["tool_calls"].as_array();
+        assert!(
+            displayed_calls.is_some_and(|calls| !calls.is_empty()),
+            "{dialect}: transcript has no displayed tool call: {turn}"
+        );
+        assert!(
+            displayed_calls
+                .into_iter()
+                .flatten()
+                .any(|call| call["name"] == expected_tool),
+            "{dialect}: transcript did not display expected tool {expected_tool}: {turn}"
+        );
+    }
+
+    #[test]
+    fn transcript_both_sides_anthropic_tool_call() {
+        assert_transcript_both_sides(
+            "anthropic",
+            include_str!("../tests/fixtures/toolcalls/anthropic_request.json"),
+            include_str!("../tests/fixtures/toolcalls/anthropic_response.json"),
+            "Bash",
+        );
+    }
+
+    #[test]
+    fn transcript_both_sides_openai_chat_json_tool_call() {
+        assert_transcript_both_sides(
+            "openai-chat",
+            include_str!("../tests/fixtures/toolcalls/openai_chat_request.json"),
+            include_str!("../tests/fixtures/toolcalls/openai_chat_response.json"),
+            "write",
+        );
+    }
+
+    #[test]
+    fn transcript_both_sides_openai_chat_sse_tool_call() {
+        assert_transcript_both_sides(
+            "openai-chat-stream",
+            include_str!("../tests/fixtures/toolcalls/openai_chat_request.json"),
+            include_str!("../tests/fixtures/toolcalls/openai_chat_stream.sse"),
+            "write",
+        );
+    }
+
+    #[test]
+    fn transcript_both_sides_openai_responses_tool_call() {
+        assert_transcript_both_sides(
+            "openai-responses",
+            include_str!("../tests/fixtures/toolcalls/openai_responses_request.json"),
+            include_str!("../tests/fixtures/toolcalls/openai_responses_response.json"),
+            "exec_command",
+        );
+    }
+
+    #[test]
+    fn transcript_both_sides_gemini_tool_call() {
+        assert_transcript_both_sides(
+            "gemini",
+            include_str!("../tests/fixtures/toolcalls/gemini_request.json"),
+            include_str!("../tests/fixtures/toolcalls/gemini_response.json"),
+            "update_topic",
+        );
     }
 
     #[test]

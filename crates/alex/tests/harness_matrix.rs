@@ -19,9 +19,10 @@ macro_rules! harness_matrix {
 
         #[test]
         #[ignore = $reason]
+        #[doc = "Coverage is provided by alex-proxy's transcript_both_sides_* matrix and scripts/harness-regression.sh I10A-I10D live cells."]
         fn $tools() {
-            // execute a tool; assert tool_calls, executed_tools, and body endpoints
-            unimplemented!("TODO: live harness matrix tool capture");
+            // Catalog marker only. The shared offline and live matrix coverage
+            // above avoids duplicating credentialed harness setup in Rust.
         }
     };
 }
