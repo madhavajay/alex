@@ -158,6 +158,14 @@ command as `ALEX_INTEGRATION_GROK_IMAGE`/`_COMMAND` or
 `ALEX_INTEGRATION_GEMINI_IMAGE`/`_COMMAND`; the fixture must configure the
 appropriate native base-URL variables and static `x-alexandria-harness` tag.
 
+`I10A`–`I10D` are the tool-call/both-sides transcript matrix for Claude over
+Anthropic, Codex over OpenAI Responses, Kimi over OpenRouter Chat Completions,
+and Gemini over native `generateContent`. Supply the matching
+`ALEX_INTEGRATION_{CLAUDE,CODEX,KIMI,GEMINI}_TOOL_IMAGE` and `_TOOL_COMMAND`
+variables. Optional model overrides are
+`ALEX_INTEGRATION_{ANTHROPIC,RESPONSES,CHAT,GEMINI}_TOOL_MODEL`. Each command
+must force one real tool call; missing accounts, images, or commands are SKIPs.
+
 The lineage shape consumed by the future UI is the object returned in each
 `/traces/sessions` row: `session_id`, `parent_session_id`, `lineage_turn_id`,
 `agent_type`, `child_count`, `subagent_started_ms`, and

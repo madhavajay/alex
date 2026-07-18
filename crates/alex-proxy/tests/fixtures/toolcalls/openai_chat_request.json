@@ -1,0 +1,31 @@
+{
+  "model": "xai/grok-4.5",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an interactive CLI tool that helps users with software engineering tasks."
+    },
+    {
+      "role": "user",
+      "content": "Write a short self-description to /app/whoami.txt."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "write",
+        "description": "Writes a file to the local filesystem.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+          },
+          "required": ["file_path", "content"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}

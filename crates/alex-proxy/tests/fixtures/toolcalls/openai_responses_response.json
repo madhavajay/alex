@@ -1,0 +1,31 @@
+{
+  "id": "resp_cove_responses_tool",
+  "object": "response",
+  "status": "completed",
+  "model": "gpt-5.5",
+  "output": [
+    {
+      "id": "msg_cove_responses_tool",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "phase": "commentary",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "I'll write a short identity answer directly to the requested file.",
+          "annotations": []
+        }
+      ]
+    },
+    {
+      "id": "fc_cove_responses_tool",
+      "type": "function_call",
+      "status": "completed",
+      "call_id": "call_mN0a3ODkfOp3OVa9dpAYUuOE",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"printf 'I am Codex, an AI coding assistant.\\n' > /app/whoami.txt\"}"
+    }
+  ],
+  "usage": {"input_tokens": 7955, "output_tokens": 73, "total_tokens": 8028}
+}

@@ -60,8 +60,14 @@ preflight() {
   [ -f "$TMP/pre.$provider" ] && return 1
   if ! active_account "$provider"; then echo "no active $provider account" > "$TMP/pre.$provider"; return 1; fi
   case "$provider" in
-    openai) endpoint=/v1/responses; body="{\"model\":\"$model\",\"max_output_tokens\":16,\"input\":\"Reply with only OK\"}" ;;
+    openai) endpoint=/v1/responses; body="{\"model\":\"$model\",\"max_output_tokens\":16,\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Reply with only OK\"}]}]}" ;;
     anthropic) endpoint=/v1/messages; body="{\"model\":\"$model\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with only OK\"}]}" ;;
+    kimi|openrouter) endpoint=/v1/chat/completions; body="{\"model\":\"$model\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with only OK\"}]}" ;;
+    gemini)
+      local native_model="${model#gemini/}"
+      endpoint="/v1beta/models/$native_model:generateContent"
+      body='{"contents":[{"role":"user","parts":[{"text":"Reply with only OK"}]}],"generationConfig":{"maxOutputTokens":16}}'
+      ;;
     *) echo "no cheap preflight for $provider" > "$TMP/pre.$provider"; return 1 ;;
   esac
   code=$(curl -sS --max-time 90 -o "$TMP/pre.$provider.body" -w '%{http_code}' -H "x-api-key: $KEY" -H 'content-type: application/json' -d "$body" "$BASE$endpoint" || true)
@@ -158,6 +164,8 @@ run_fixture() {
     -e "ALEXANDRIA_BASE_URL=http://host.docker.internal:$PORT" -e "ALEXANDRIA_RUN_ID=$run_id" -e "ALEXANDRIA_HARNESS=$harness" \
     -e "OPENAI_BASE_URL=http://host.docker.internal:$PORT/v1" -e "OPENAI_API_BASE=http://host.docker.internal:$PORT/v1" -e "OPENAI_API_KEY=$(cat "$TMP/run.key")" \
     -e "ANTHROPIC_BASE_URL=http://host.docker.internal:$PORT" -e "ANTHROPIC_API_KEY=$(cat "$TMP/run.key")" \
+    -e "GOOGLE_GEMINI_BASE_URL=http://host.docker.internal:$PORT" -e "GOOGLE_GENAI_API_VERSION=v1beta" \
+    -e "GEMINI_API_KEY=$(cat "$TMP/run.key")" -e "GEMINI_API_KEY_AUTH_MECHANISM=bearer" -e "GOOGLE_GENAI_USE_GCA=false" \
     "$image" sh -lc "$command" >"$TMP/$id.fixture.out" 2>"$TMP/$id.fixture.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     if quota_error "$TMP/$id.fixture.err"; then result "$id" SKIP "provider unavailable: $(tail -c 180 "$TMP/$id.fixture.err")"; else result "$id" FAIL "fixture exit $rc: $(tail -c 180 "$TMP/$id.fixture.err")"; fi
@@ -202,6 +210,12 @@ main() {
   run_builtin I1 codex openai gpt-5.6-luna
   run_builtin I2 claude anthropic claude-haiku-4-5
   run_fixture I3 pi openai gpt-5.6-luna ALEX_INTEGRATION_PI_IMAGE ALEX_INTEGRATION_PI_COMMAND tools
+  # One real tool round-trip per client wire dialect. Each remains optional:
+  # missing accounts, images, or fixture commands produce a visible SKIP.
+  run_fixture I10A claude anthropic "${ALEX_INTEGRATION_ANTHROPIC_TOOL_MODEL:-claude-haiku-4-5}" ALEX_INTEGRATION_CLAUDE_TOOL_IMAGE ALEX_INTEGRATION_CLAUDE_TOOL_COMMAND tools
+  run_fixture I10B codex openai "${ALEX_INTEGRATION_RESPONSES_TOOL_MODEL:-gpt-5.6-luna}" ALEX_INTEGRATION_CODEX_TOOL_IMAGE ALEX_INTEGRATION_CODEX_TOOL_COMMAND tools
+  run_fixture I10C kimi openrouter "${ALEX_INTEGRATION_CHAT_TOOL_MODEL:-openrouter/z-ai/glm-5.2}" ALEX_INTEGRATION_KIMI_TOOL_IMAGE ALEX_INTEGRATION_KIMI_TOOL_COMMAND tools
+  run_fixture I10D gemini gemini "${ALEX_INTEGRATION_GEMINI_TOOL_MODEL:-gemini-3-pro}" ALEX_INTEGRATION_GEMINI_TOOL_IMAGE ALEX_INTEGRATION_GEMINI_TOOL_COMMAND tools
   run_fixture I4 codex openai gpt-5.6-luna ALEX_INTEGRATION_CODEX_SUBAGENT_IMAGE ALEX_INTEGRATION_CODEX_SUBAGENT_COMMAND lineage
   # The command must invoke `pi --print --no-session '…'` from the parent Pi
   # process. The child inherits ALEXANDRIA_SESSION_ID from its parent.

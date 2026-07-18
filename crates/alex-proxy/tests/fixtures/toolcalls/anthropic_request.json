@@ -1,0 +1,53 @@
+{
+  "model": "opus-4.8",
+  "max_tokens": 32000,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Answer this question in your own words: Who are you? Write your answer to /app/whoami.txt."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "text", "text": "I'll answer the question and write it to the file."},
+        {
+          "type": "tool_use",
+          "id": "toolu_01NARtGspenbF8nZA1Af65Xo",
+          "name": "Write",
+          "input": {"file_path": "/app/whoami.txt", "new_string": "I am Claude, an AI coding assistant."}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01NARtGspenbF8nZA1Af65Xo",
+          "is_error": true,
+          "content": "Error: No such tool available: Write. Use one of the available tools instead."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "execute shell commands",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "The command to execute"},
+          "description": {"type": "string", "description": "What the command does"}
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
