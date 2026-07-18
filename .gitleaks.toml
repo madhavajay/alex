@@ -34,7 +34,7 @@ keywords = ["sk-ant-"]
 description = "Test fixtures, docs, and obvious placeholders"
 # Example/placeholder values used in tests and docs are not real secrets.
 paths = [
-  '''.*/tests/.*''',
+  '''(?i).*/tests?/.*''',          # tests/ and macos Tests/
   '''.*_test\.rs''',
   '''.*/testdata/.*''',
   '''.*\.md''',
@@ -49,5 +49,11 @@ regexes = [
   '''REDACTED''',
   '''example''',
   '''your[-_]?token[-_]?here''',
+  # Known-safe values that are not private secrets (audited 2026-07-18):
+  '''abc12345def67890''',          # test key-FINGERPRINT (not a secret) in ModelDecodingTests
+  '''AKIA1234567890ABCDEF''',      # sequential fake AWS key: input for the secret-REDACTOR test
+  # Rivet PUBLIC gateway token that the Amp CLI hardcodes (pk_ = publishable),
+  # documented as a public token in wrap-harnesses.json — not a private credential.
+  '''pk_9tm4qz3zrMerdZXTlBRLRsmJIzSQIPH24meKBqiL6vVpscTvc4w1YPiBgymXf9Az''',
 ]
 stopwords = ["example", "placeholder", "redacted", "dummy", "sample", "test"]
