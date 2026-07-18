@@ -1,11 +1,31 @@
 # Alex / Alexandria docs
 
-Reference and design docs. Task tracking lives in the root [`TODO.md`](../TODO.md);
-release notes in [`CHANGELOG.md`](../CHANGELOG.md).
+Implementation reference derived from the current Rust code. For planned work
+use the root [`TODO.md`](../TODO.md); for released changes use
+[`CHANGELOG.md`](../CHANGELOG.md).
+
+## System reference
 
 | Doc | What it covers |
-|---|---|
-| [build-signed.md](build-signed.md) | Signed macOS build: `build-signed.sh`, Developer ID signing, notarization, and the GitHub secrets the release workflow expects. |
-| [harnesses.md](harnesses.md) | Harness integration and session tracing — provider headers, dynamic header hooks, lifecycle hooks, and sub-agent lineage techniques. |
-| [amp-wrap.md](amp-wrap.md) | `alex wrap amp` — self-contained reverse-wrap capture for the Sourcegraph Amp CLI (lives in `crates/alex-wrap`). |
-| [credentials-plan.md](credentials-plan.md) | Design/roadmap for the credential vault (multi-account, budgets, model allow-lists, copy/reveal, audit). Open items are tracked in `TODO.md` §13. |
+| --- | --- |
+| [Overview](overview.md) | Crate responsibilities, request/data flow, authentication scopes, and the local state model. |
+| [CLI reference](cli.md) | Complete `alex` command tree, important flags, defaults, and runnable examples. |
+| [Providers and routing](providers-and-routing.md) | Provider implementations, vault accounts, selection policies, reserves, model routing, affinity, and failover. |
+| [API and formats](api-and-formats.md) | Model ingress, control/trace routes, the four API dialects, Anthropic-pivot translation, SSE, usage, and cost. |
+| [Configuration](configuration.md) | Full `config.toml` key/default reference, environment variables, and on-disk layout. |
+| [Dario](dario.md) | Dario routing modes, three-block prompt rewrite, header handling, generations, health, and fallback behavior. |
+| [Traces](traces.md) | Trace rows and gzip bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
+
+## Harnesses and capture
+
+| Doc | What it covers |
+| --- | --- |
+| [Harness integration](harnesses.md) | Provider headers, dynamic hooks, lifecycle events, session/sub-agent identity, current connection behavior, and regression fixtures. |
+| [Amp wrap](amp-wrap.md) | `alex wrap amp`, reverse HTTP/WebSocket capture, Amp auth/billing, remote trace upload, and protocol diagnostics. |
+
+## Build and design records
+
+| Doc | What it covers |
+| --- | --- |
+| [Signed macOS build](build-signed.md) | `build-signed.sh`, Developer ID signing, notarization, and release-workflow secrets. |
+| [Credential plan](credentials-plan.md) | Credential-vault design/roadmap context; open implementation work remains tracked in `TODO.md`. |
