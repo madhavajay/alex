@@ -224,6 +224,28 @@ public final class SnapshotStore {
         scheduleBoundaryRefresh()
     }
 
+    /// Reload just the harness snapshot after a harness mutation. Wait for an
+    /// in-flight full poll so its older response cannot overwrite this result.
+    public func refreshHarnesses(using client: AlexandriaClient) async {
+        while refreshing {
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        do {
+            if let fetched = try await client.harnesses() {
+                harnesses = fetched
+                harnessesSupported = true
+            } else {
+                harnesses = []
+                harnessesSupported = false
+            }
+        } catch {
+            harnesses = []
+            harnessesSupported = nil
+        }
+        onRefresh?()
+    }
+
     /// Refreshes only the per-account chart data and leaves the rest of the
     /// snapshot untouched. The selected range is retained for later polling
     /// refreshes so a full snapshot cannot silently switch the chart to 24h.

@@ -289,6 +289,30 @@ import Testing
         #expect(harnesses == nil)
     }
 
+    @Test @MainActor func harnessSnapshotRefreshAppliesLatestConnectionState() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/harnesses")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"harnesses":[{"name":"kimi","installed":true,"config_dir_exists":true,"connected":false,"supports_connect":true,"daemon_reachable":true}]}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        let store = SnapshotStore()
+
+        await store.refreshHarnesses(using: client)
+
+        #expect(store.harnessesSupported == true)
+        #expect(store.harnesses.map(\.name) == ["kimi"])
+        #expect(store.harnesses[0].connected == false)
+    }
+
     @Test func daemonUpdateApplyPostsAndDecodesAccepted() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/update")

@@ -682,7 +682,7 @@ final class HarnessActionWindowModel {
                 case .refresh:
                     self?.phase = .executing([])
                     let result = try await client.refreshHarnessConfig(name)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successConfig([], result)
                 case .connect:
                     let plan = try await client.connectHarnessPlan(name)
@@ -712,11 +712,11 @@ final class HarnessActionWindowModel {
                 switch kind {
                 case .connect:
                     let result = try await client.connectHarness(name)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successConfig(steps, result)
                 case .disconnect:
                     let result = try await client.disconnectHarness(name)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successDisconnect(steps, result)
                 case .refresh:
                     break
@@ -1056,7 +1056,7 @@ final class HarnessActionSheetModel: Identifiable {
                     self?.phase = .executing([])
                     let result = try await client.refreshHarnessConfig(name)
                     await self?.applyToolCaptureIfNeeded(client)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successConfig([], result)
                 case .connect:
                     let plan = try await client.connectHarnessPlan(name)
@@ -1087,11 +1087,11 @@ final class HarnessActionSheetModel: Identifiable {
                 case .connect:
                     let result = try await client.connectHarness(name)
                     await self?.applyToolCaptureIfNeeded(client)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successConfig(steps, result)
                 case .disconnect:
                     let result = try await client.disconnectHarness(name)
-                    await self?.store.refresh()
+                    await self?.store.refreshHarnesses(using: client)
                     self?.phase = .successDisconnect(steps, result)
                 case .refresh:
                     break

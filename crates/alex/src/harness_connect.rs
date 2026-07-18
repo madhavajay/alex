@@ -2319,11 +2319,19 @@ pub(crate) fn kimi_config_connected(config_dir: &Path) -> Result<bool> {
 
 pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
     let state_path = config_dir.join(KIMI_STATE_FILE);
+    let config_path = config_dir.join(KIMI_CONFIG_FILE);
     if !state_path.exists() {
-        return Ok(false);
+        if !config_path.exists() {
+            return Ok(false);
+        }
+        let mut doc = read_grok_config(&config_path)?;
+        let changed = clear_stale_kimi_default_selection(config_dir, &mut doc)?;
+        if changed {
+            atomic_write_text(&config_path, &doc.to_string())?;
+        }
+        return Ok(changed);
     }
     let state = read_kimi_state(&state_path)?;
-    let config_path = config_dir.join(KIMI_CONFIG_FILE);
     let mut doc = read_grok_config(&config_path)?;
     if let Some(models) = doc.get_mut("models").and_then(Item::as_table_mut) {
         for model in &state.managed_models {
@@ -2341,12 +2349,63 @@ pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
             }
         }
     }
+    clear_stale_kimi_default_selection(config_dir, &mut doc)?;
     atomic_write_text(&config_path, &doc.to_string())?;
     if state_path.exists() {
         std::fs::remove_file(&state_path)
             .with_context(|| format!("could not remove {}", state_path.display()))?;
     }
     Ok(true)
+}
+
+/// Kimi persists a model chosen as its default in the same config file as the
+/// additive Alexandria provider. Restore a native selection without replacing
+/// unrelated configuration changes made since Alexandria connected.
+fn clear_stale_kimi_default_selection(config_dir: &Path, doc: &mut DocumentMut) -> Result<bool> {
+    let stale_model = doc
+        .get("default_model")
+        .and_then(Item::as_str)
+        .is_some_and(is_alex_kimi_model);
+    if !stale_model {
+        return Ok(false);
+    }
+
+    let backup_path = config_dir.join(KIMI_BACKUP_FILE);
+    let backup_default = if backup_path.exists() {
+        read_grok_config(&backup_path)?
+            .get("default_model")
+            .and_then(Item::as_str)
+            .filter(|model| !is_alex_kimi_model(model))
+            .map(String::from)
+    } else {
+        None
+    };
+    let surviving_default = doc
+        .get("models")
+        .and_then(Item::as_table)
+        .and_then(|models| {
+            let native_models: Vec<&str> = models
+                .iter()
+                .map(|(model, _)| model)
+                .filter(|model| !is_alex_kimi_model(model))
+                .collect();
+            native_models
+                .iter()
+                .find(|model| model.starts_with("kimi-code/"))
+                .or_else(|| native_models.first())
+                .map(|model| (*model).to_string())
+        });
+
+    if let Some(native_default) = backup_default.or(surviving_default) {
+        doc["default_model"] = value(native_default);
+    } else {
+        doc.as_table_mut().remove("default_model");
+    }
+    Ok(true)
+}
+
+fn is_alex_kimi_model(model: &str) -> bool {
+    model.starts_with("alex/") || model.starts_with("alexandria/")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6023,6 +6082,106 @@ display_name = "K3"
         // Second disconnect is a no-op (state file already gone).
         assert!(!disconnect_kimi_config(&dir).unwrap());
         assert!(dir.join(KIMI_BACKUP_FILE).exists());
+    }
+
+    #[test]
+    fn kimi_disconnect_restores_native_default_from_backup() {
+        let dir = tmpdir("kimi-restore-backup-default");
+        std::fs::write(
+            dir.join(KIMI_BACKUP_FILE),
+            r#"default_model = "kimi-code/k3"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(KIMI_STATE_FILE),
+            r#"{"managed_models":["alex/gpt-5.6-sol"],"added_provider":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(KIMI_CONFIG_FILE),
+            r#"default_model = "alex/gpt-5.6-sol"
+theme = "dark"
+
+[providers.alexandria]
+type = "openai"
+base_url = "http://127.0.0.1:4100/v1"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."alex/gpt-5.6-sol"]
+provider = "alexandria"
+model = "alex/gpt-5.6-sol"
+"#,
+        )
+        .unwrap();
+
+        assert!(disconnect_kimi_config(&dir).unwrap());
+        let config = read_grok_config(&dir.join(KIMI_CONFIG_FILE)).unwrap();
+        let default_model = config["default_model"].as_str().unwrap();
+        println!("final default_model: {default_model}");
+        assert_eq!(default_model, "kimi-code/k3");
+        assert_eq!(config["theme"].as_str(), Some("dark"));
+        assert!(config["models"].get("alex/gpt-5.6-sol").is_none());
+        assert!(config.get("providers").is_none());
+    }
+
+    #[test]
+    fn kimi_disconnect_without_backup_prefers_surviving_kimi_model() {
+        let dir = tmpdir("kimi-fallback-native-model");
+        std::fs::write(
+            dir.join(KIMI_STATE_FILE),
+            r#"{"managed_models":["alex/gpt-5.6-sol"],"added_provider":false}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(KIMI_CONFIG_FILE),
+            r#"default_model = "alex/gpt-5.6-sol"
+
+[models."custom/native"]
+provider = "custom"
+model = "native"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."alex/gpt-5.6-sol"]
+provider = "alexandria"
+model = "alex/gpt-5.6-sol"
+"#,
+        )
+        .unwrap();
+
+        assert!(disconnect_kimi_config(&dir).unwrap());
+        let config = read_grok_config(&dir.join(KIMI_CONFIG_FILE)).unwrap();
+        assert_eq!(config["default_model"].as_str(), Some("kimi-code/k3"));
+    }
+
+    #[test]
+    fn kimi_disconnect_restores_default_after_state_is_gone() {
+        let dir = tmpdir("kimi-stale-selection-no-state");
+        std::fs::write(
+            dir.join(KIMI_BACKUP_FILE),
+            r#"default_model = "kimi-code/k3"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(KIMI_CONFIG_FILE),
+            r#"default_model = "alexandria/gpt-5.6-sol"
+theme = "dark"
+"#,
+        )
+        .unwrap();
+
+        assert!(disconnect_kimi_config(&dir).unwrap());
+        let config = read_grok_config(&dir.join(KIMI_CONFIG_FILE)).unwrap();
+        assert_eq!(config["default_model"].as_str(), Some("kimi-code/k3"));
+        assert_eq!(config["theme"].as_str(), Some("dark"));
+        assert!(!disconnect_kimi_config(&dir).unwrap());
     }
 
     #[cfg(unix)]
