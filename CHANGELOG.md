@@ -36,6 +36,28 @@ predate this file — see the git history and GitHub releases.
   the daemon is busy. Adopt `open_app` and a `remove_legacy_app` guard —
   thanks **@khoaguin** (#5).
 
+## [0.1.28-beta.4] - 2026-07-18
+
+### Fixed — update reliability (the big one)
+- **No more false "you have the latest version."** Root-caused and fixed both
+  independent causes: the daemon's version parser rejected anything but
+  `X.Y.Z`/`X.Y.Z-beta.N` (so `rc`/`alpha`/`+build` tags silently became "up to
+  date"), and a `-beta` app build defaulted to the **stable** update channel —
+  so it checked the stable feed (older than the installed beta) and declared
+  itself current. A beta build now defaults to the beta channel, and the parser
+  handles the full range of tags.
+- **Hard backstop:** if the running tag differs from the channel's latest tag
+  and the two can't be ordered, the updater never claims you're current — it
+  offers/flags the other version instead.
+- **Post-update verification:** after a restart the daemon confirms the *running*
+  version equals the intended one; a mismatch (stray daemon / launchd pin) is
+  surfaced instead of silently "succeeding," and the update path now reclaims
+  the port from stray daemons.
+- The daemon and app version comparators are now aligned (a shared scheme:
+  stable > rc > beta, higher `-beta.N` newer), covered by an edge-case matrix of
+  tests on both sides.
+- Kimi Code icon refreshed to the current brand mark.
+
 ## [0.1.28-beta.3] - 2026-07-18
 
 ### Fixed
