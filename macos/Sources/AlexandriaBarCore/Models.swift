@@ -194,6 +194,9 @@ public enum AccountHealth: String, Codable, Sendable {
     case unreachable
     /// 401/403/dead token — needs re-authentication.
     case authFailed = "auth_failed"
+    /// A probe errored without a trustworthy reachability verdict. The
+    /// account must not be presented as usable after that failed attempt.
+    case unknownAfterError = "unknown-after-error"
     /// Never probed yet: neutral, do not claim green.
     case unknown
 
@@ -202,6 +205,47 @@ public enum AccountHealth: String, Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = AccountHealth(rawValue: raw) ?? .unknown
+    }
+}
+
+/// User-facing account state derived from every auth and probe signal already
+/// available to the app. Keeping this in Core prevents the menu and Settings
+/// from disagreeing about whether a credential is genuinely usable.
+public enum AccountDisplayState: String, Sendable, Equatable {
+    case active
+    case needsReauth
+    case degraded
+    case unreachable
+    case unknown
+
+    public static func derive(
+        status: String,
+        kind: String,
+        needsReauth: Bool?,
+        expiresInS: Int64?,
+        health: AccountHealth?,
+        lastPingOK: Bool? = nil,
+        lastPingStatus: Int? = nil
+    ) -> AccountDisplayState {
+        let pingStatusFailed = lastPingStatus.map { !(200...299).contains($0) } ?? false
+        if needsReauth == true
+            || status != "active"
+            || (kind == "oauth" && expiresInS.map { $0 <= 0 } == true)
+            || health == .authFailed
+            || health == .unknownAfterError
+            || lastPingOK == false
+            || pingStatusFailed
+        {
+            return .needsReauth
+        }
+
+        switch health {
+        case .degraded: return .degraded
+        case .unreachable: return .unreachable
+        case .unknown: return .unknown
+        case .healthy, .none: return .active
+        case .authFailed, .unknownAfterError: return .needsReauth
+        }
     }
 }
 
@@ -246,7 +290,7 @@ public struct Account: Codable, Sendable, Identifiable {
         case expiresInS = "expires_in_s"
     }
 
-    public var isExpired: Bool { (expiresInS ?? 1) < 0 }
+    public var isExpired: Bool { expiresInS.map { $0 <= 0 } ?? false }
 
     /// The reachability the UI dot must follow. A confirmed logout always wins;
     /// otherwise the daemon's probe-derived `health`, defaulting to `.unknown`
@@ -254,6 +298,20 @@ public struct Account: Codable, Sendable, Identifiable {
     public var healthState: AccountHealth {
         if needsReauth == true { return .authFailed }
         return health ?? .unknown
+    }
+
+    public func displayState(
+        lastPingOK: Bool? = nil, lastPingStatus: Int? = nil
+    ) -> AccountDisplayState {
+        let hasExplicitPing = lastPingOK != nil || lastPingStatus != nil
+        return AccountDisplayState.derive(
+            status: status,
+            kind: kind,
+            needsReauth: needsReauth,
+            expiresInS: expiresInS,
+            health: health,
+            lastPingOK: hasExplicitPing ? lastPingOK : lastProbe?.ok,
+            lastPingStatus: hasExplicitPing ? lastPingStatus : lastProbe?.status)
     }
 }
 

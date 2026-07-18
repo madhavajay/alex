@@ -7,9 +7,10 @@ private struct AuthLoginStartBody: Encodable {
     let provider: String
     let name: String?
     let autoIdentity: Bool
+    let force: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case provider, name
+        case provider, name, force
         case autoIdentity = "auto_identity"
     }
 }
@@ -17,9 +18,10 @@ private struct AuthLoginStartBody: Encodable {
 private struct ReauthNotifyBody: Encodable {
     let provider: String
     let accountId: String?
+    let force: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case provider
+        case provider, force
         case accountId = "account_id"
     }
 }
@@ -403,12 +405,16 @@ public struct AlexandriaClient: Sendable {
     public func authLoginStart(
         provider: String,
         name: String? = "default",
-        autoIdentity: Bool = false
+        autoIdentity: Bool = false,
+        force: Bool = false
     ) async throws -> LoginSession {
+        // BACKEND: POST /admin/auth/login/start must replace the account's
+        // pending login when the existing request body includes `force: true`.
         let data = try await request(
             "admin/auth/login/start", method: "POST",
             body: body(AuthLoginStartBody(
-                provider: provider, name: name, autoIdentity: autoIdentity)))
+                provider: provider, name: name, autoIdentity: autoIdentity,
+                force: force ? true : nil)))
         return try JSONDecoder().decode(LoginSession.self, from: data)
     }
 
@@ -418,11 +424,15 @@ public struct AlexandriaClient: Sendable {
 
     public func reauthNotify(
         provider: String,
-        accountId: String? = nil
+        accountId: String? = nil,
+        force: Bool = false
     ) async throws -> ReauthNotifyResponse {
+        // BACKEND: POST /admin/auth/reauth-notify must replace the account's
+        // pending login when the existing request body includes `force: true`.
         let data = try await request(
             "admin/auth/reauth-notify", method: "POST",
-            body: body(ReauthNotifyBody(provider: provider, accountId: accountId)))
+            body: body(ReauthNotifyBody(
+                provider: provider, accountId: accountId, force: force ? true : nil)))
         return try JSONDecoder().decode(ReauthNotifyResponse.self, from: data)
     }
 

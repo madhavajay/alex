@@ -44,6 +44,9 @@ public final class SnapshotStore {
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
     public private(set) var harnessesSupported: Bool?
+    /// The daemon does not currently list active login sessions. Retain IDs
+    /// returned to this app so provider detail can resume/status/complete them.
+    public private(set) var pendingLoginSessions: [String: LoginSession] = [:]
     public private(set) var recentSessions: [TraceSession] = []
     public private(set) var alerts: [StoreAlert] = []
     public private(set) var lastRefresh: Date?
@@ -62,6 +65,24 @@ public final class SnapshotStore {
     private var accountAnalyticsRequestGeneration = 0
 
     public init() {}
+
+    public func pendingLoginSession(accountId: String, provider: String) -> LoginSession? {
+        pendingLoginSessions[accountId] ?? pendingLoginSessions["provider:\(provider)"]
+    }
+
+    public func rememberLoginSession(
+        _ session: LoginSession, accountId: String? = nil, provider: String? = nil
+    ) {
+        let providerKey = "provider:\(provider ?? session.provider)"
+        let key = accountId ?? session.accountId ?? providerKey
+        if session.isPending {
+            pendingLoginSessions[key] = session
+            if key != providerKey { pendingLoginSessions.removeValue(forKey: providerKey) }
+        } else {
+            pendingLoginSessions.removeValue(forKey: key)
+            pendingLoginSessions.removeValue(forKey: providerKey)
+        }
+    }
 
     public var limitWarnPct: Double {
         let v = UserDefaults.standard.double(forKey: "limitWarnPct")
