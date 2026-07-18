@@ -9,9 +9,9 @@ use crate::login::{
     anthropic_authorize_url, claude_exchange, codex_device_exchange_auto, codex_device_poll_once,
     codex_device_start, codex_exchange_named, generate_pkce, kimi_device_poll_once_at,
     kimi_device_start_at, kimi_oauth_host, kimi_upsert_from_tokens, kimi_verification_url,
-    openai_authorize_url, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
-    xai_upsert_from_tokens, CodexDevicePoll, KimiDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
-    OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
+    openai_authorize_url, poll_device_flow, validate_account_name, wait_for_openai_callback,
+    xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, DeviceFlowError,
+    OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
 use crate::{now_ms, Vault};
 
@@ -112,7 +112,7 @@ impl LoginManager {
             "amp" | "ampcode" => {
                 // Amp uses CLI secrets / API key, not OAuth paste. Import now.
                 let imported = crate::import_amp(&vault).await;
-                let mut session = LoginSession {
+                let session = LoginSession {
                     id: id.clone(),
                     provider: "amp".into(),
                     mode: "import",
@@ -136,7 +136,6 @@ impl LoginManager {
                         }
                     },
                 };
-                let _ = &mut session;
                 Arc::new(Mutex::new(session))
             }
             other => {
@@ -300,35 +299,25 @@ impl LoginManager {
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         tokio::spawn(async move {
-            let deadline = now_ms() + DEVICE_TTL_MS;
-            let phase = loop {
-                if now_ms() > deadline {
-                    break LoginPhase::Failed {
-                        error: "Codex device code expired before authorization completed".into(),
-                    };
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(start.interval_s)).await;
-                match codex_device_poll_once(&http, &start).await {
-                    CodexDevicePoll::Pending => continue,
-                    CodexDevicePoll::Done {
-                        authorization_code,
-                        code_verifier,
-                    } => {
-                        break match codex_device_exchange_auto(
-                            &vault,
-                            &authorization_code,
-                            &code_verifier,
-                        )
+            let phase = match poll_device_flow(now_ms() + DEVICE_TTL_MS, start.interval_s, || {
+                codex_device_poll_once(&http, &start)
+            })
+            .await
+            {
+                Ok((authorization_code, code_verifier)) => {
+                    match codex_device_exchange_auto(&vault, &authorization_code, &code_verifier)
                         .await
-                        {
-                            Ok(account_id) => LoginPhase::Done { account_id },
-                            Err(error) => LoginPhase::Failed {
-                                error: error.to_string(),
-                            },
-                        }
+                    {
+                        Ok(account_id) => LoginPhase::Done { account_id },
+                        Err(error) => LoginPhase::Failed {
+                            error: error.to_string(),
+                        },
                     }
-                    CodexDevicePoll::Failed(error) => break LoginPhase::Failed { error },
                 }
+                Err(DeviceFlowError::Expired) => LoginPhase::Failed {
+                    error: "Codex device code expired before authorization completed".into(),
+                },
+                Err(DeviceFlowError::Failed(error)) => LoginPhase::Failed { error },
             };
             worker.lock().await.phase = phase;
         });
@@ -436,31 +425,23 @@ impl LoginManager {
         let worker = shared.clone();
         let account_name = account_name.to_string();
         tokio::spawn(async move {
-            let deadline = now_ms() + start.expires_in * 1000;
-            let mut interval = start.interval.max(1) as u64;
-            let phase = loop {
-                if now_ms() > deadline {
-                    break LoginPhase::Failed {
-                        error: "device code expired before authorization completed".into(),
-                    };
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                match xai_device_poll_once(&http, &start.device_code).await {
-                    XaiDevicePoll::Pending => continue,
-                    XaiDevicePoll::SlowDown => {
-                        interval += 5;
-                        continue;
-                    }
-                    XaiDevicePoll::Done(tokens) => {
-                        break match xai_upsert_from_tokens(&vault, &tokens, &account_name).await {
-                            Ok(account_id) => LoginPhase::Done { account_id },
-                            Err(e) => LoginPhase::Failed {
-                                error: e.to_string(),
-                            },
-                        };
-                    }
-                    XaiDevicePoll::Failed(e) => break LoginPhase::Failed { error: e },
-                }
+            let phase = match poll_device_flow(
+                now_ms() + start.expires_in * 1000,
+                start.interval.max(1) as u64,
+                || xai_device_poll_once(&http, &start.device_code),
+            )
+            .await
+            {
+                Ok(tokens) => match xai_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                    Ok(account_id) => LoginPhase::Done { account_id },
+                    Err(error) => LoginPhase::Failed {
+                        error: error.to_string(),
+                    },
+                },
+                Err(DeviceFlowError::Expired) => LoginPhase::Failed {
+                    error: "device code expired before authorization completed".into(),
+                },
+                Err(DeviceFlowError::Failed(error)) => LoginPhase::Failed { error },
             };
             worker.lock().await.phase = phase;
         });
@@ -500,31 +481,23 @@ impl LoginManager {
         let worker = shared.clone();
         let account_name = account_name.to_string();
         tokio::spawn(async move {
-            let deadline = now_ms() + start.expires_in * 1000;
-            let mut interval = start.interval.max(1) as u64;
-            let phase = loop {
-                if now_ms() > deadline {
-                    break LoginPhase::Failed {
-                        error: "device code expired before authorization completed".into(),
-                    };
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                match kimi_device_poll_once_at(&http, &oauth_host, &start.device_code).await {
-                    KimiDevicePoll::Pending => continue,
-                    KimiDevicePoll::SlowDown => {
-                        interval += 5;
-                        continue;
-                    }
-                    KimiDevicePoll::Done(tokens) => {
-                        break match kimi_upsert_from_tokens(&vault, &tokens, &account_name).await {
-                            Ok(account_id) => LoginPhase::Done { account_id },
-                            Err(e) => LoginPhase::Failed {
-                                error: e.to_string(),
-                            },
-                        };
-                    }
-                    KimiDevicePoll::Failed(e) => break LoginPhase::Failed { error: e },
-                }
+            let phase = match poll_device_flow(
+                now_ms() + start.expires_in * 1000,
+                start.interval.max(1) as u64,
+                || kimi_device_poll_once_at(&http, &oauth_host, &start.device_code),
+            )
+            .await
+            {
+                Ok(tokens) => match kimi_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                    Ok(account_id) => LoginPhase::Done { account_id },
+                    Err(error) => LoginPhase::Failed {
+                        error: error.to_string(),
+                    },
+                },
+                Err(DeviceFlowError::Expired) => LoginPhase::Failed {
+                    error: "device code expired before authorization completed".into(),
+                },
+                Err(DeviceFlowError::Failed(error)) => LoginPhase::Failed { error },
             };
             worker.lock().await.phase = phase;
         });
@@ -541,18 +514,6 @@ impl LoginManager {
                 Err(_) => true,
             });
     }
-}
-
-fn validate_account_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 32
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-    {
-        bail!("account name must match [a-z0-9_-]{{1,32}}");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
