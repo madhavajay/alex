@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 import AlexandriaBarCore
 
-/// Preferences → Exo. Exo is a local (or LAN/Tailscale) OpenAI-compatible
-/// inference cluster; checked models are published through Alexandria.
+/// Providers → Exo detail. Exo is a local (or LAN/Tailscale)
+/// OpenAI-compatible inference cluster; checked models are published through
+/// Alexandria.
 struct ExoPreferencesSection: View {
     let store: SnapshotStore
 

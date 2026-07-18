@@ -402,6 +402,85 @@ fn routing_limits_from_headers(
     (has_windows || has_plan).then_some(parsed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReauthLoginKey {
+    provider: Provider,
+    account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReauthLoginSlot {
+    Starting(u64),
+    Active {
+        generation: u64,
+        login_id: String,
+        expires_at_ms: i64,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ReauthLoginTracker {
+    entries: HashMap<ReauthLoginKey, ReauthLoginSlot>,
+    next_generation: u64,
+}
+
+impl ReauthLoginTracker {
+    fn reserve_new(&mut self, key: ReauthLoginKey) -> Option<u64> {
+        if self.entries.contains_key(&key) {
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.entries
+            .insert(key, ReauthLoginSlot::Starting(generation));
+        Some(generation)
+    }
+
+    fn reserve_replacement(
+        &mut self,
+        key: &ReauthLoginKey,
+        login_id: &str,
+    ) -> Option<u64> {
+        let replace = matches!(
+            self.entries.get(key),
+            Some(ReauthLoginSlot::Active { login_id: active, .. }) if active == login_id
+        );
+        if !replace {
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.entries
+            .insert(key.clone(), ReauthLoginSlot::Starting(generation));
+        Some(generation)
+    }
+
+    fn activate(
+        &mut self,
+        key: &ReauthLoginKey,
+        generation: u64,
+        login_id: String,
+        expires_at_ms: i64,
+    ) {
+        if self.entries.get(key) == Some(&ReauthLoginSlot::Starting(generation)) {
+            self.entries.insert(
+                key.clone(),
+                ReauthLoginSlot::Active {
+                    generation,
+                    login_id,
+                    expires_at_ms,
+                },
+            );
+        }
+    }
+
+    fn abandon(&mut self, key: &ReauthLoginKey, generation: u64) {
+        if self.entries.get(key) == Some(&ReauthLoginSlot::Starting(generation)) {
+            self.entries.remove(key);
+        }
+    }
+}
+
 pub struct AppState {
     pub local_key: Arc<std::sync::RwLock<String>>,
     pub vault: Arc<Vault>,
@@ -429,6 +508,7 @@ pub struct AppState {
     exo: std::sync::RwLock<ExoConfig>,
     exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
     pub logins: alex_auth::sessions::LoginManager,
+    reauth_logins: tokio::sync::Mutex<ReauthLoginTracker>,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     trace_ingest_lock: tokio::sync::Mutex<()>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
@@ -742,6 +822,7 @@ pub fn build_state_with_substitution(
         exo: std::sync::RwLock::new(ExoConfig::default()),
         exo_persister: std::sync::RwLock::new(None),
         logins: alex_auth::sessions::LoginManager::default(),
+        reauth_logins: tokio::sync::Mutex::new(ReauthLoginTracker::default()),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         trace_ingest_lock: tokio::sync::Mutex::new(()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1369,6 +1450,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/vault/export", post(admin_vault_export))
         .route("/admin/credentials", get(admin_credentials))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
+        .route(
+            "/admin/auth/reauth-notify",
+            post(admin_auth_reauth_notify),
+        )
         .route(
             "/admin/auth/login/complete",
             post(admin_auth_login_complete),
@@ -2256,6 +2341,34 @@ async fn admin_auth_login_start(
     {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn admin_auth_reauth_notify(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(provider_name) = body.0["provider"].as_str() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
+    };
+    let Some(provider) = Provider::from_str_loose(provider_name) else {
+        return error_response(StatusCode::BAD_REQUEST, "unknown provider");
+    };
+    let account_id = body.0["account_id"].as_str();
+    let account = state.vault.list().await.into_iter().find(|account| {
+        account.provider == provider
+            && account.kind == "oauth"
+            && account_id.is_none_or(|wanted| account.id == wanted)
+    });
+    let Some(account) = account else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "no matching managed OAuth account",
+        );
+    };
+    match start_reauth_and_notify(&state, provider, &account).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
     }
 }
 
@@ -5696,7 +5809,7 @@ fn probe_health(result: &PingResult) -> ProbeHealth {
 /// — it is a failover condition, not a logout. A healthy probe clears a prior
 /// logout flag so a recovered account stops showing red and the next genuine
 /// logout alerts again.
-async fn record_probe_outcome(state: &AppState, result: &PingResult) {
+async fn record_probe_outcome(state: &Arc<AppState>, result: &PingResult) {
     let Some(account_id) = result.account_id.as_deref() else {
         return;
     };
@@ -5743,6 +5856,7 @@ async fn record_probe_outcome(state: &AppState, result: &PingResult) {
             {
                 mark_account_needs_reauth(state, account_id, false).await;
             }
+            clear_active_reauth(state, account_id).await;
         }
         // Unreachable/down is a failover condition, never a re-auth: leave the
         // flag exactly as it is so a network blip never clears nor raises it.
@@ -10036,7 +10150,7 @@ fn extract_final_response(text: &str) -> Option<Value> {
 }
 
 fn finalize_trace(
-    state: &AppState,
+    state: &Arc<AppState>,
     mut trace: TraceRecord,
     client_body: &[u8],
     upstream_body: Option<&[u8]>,
@@ -10088,13 +10202,11 @@ fn finalize_trace(
 /// It also covers a forced OAuth refresh failure: the retained upstream 401 is
 /// finalized as the existing `auth` class. The dispatcher only schedules work,
 /// so notification delivery cannot delay this request or stream finalization.
-fn emit_reauth_notification(state: &AppState, trace: &TraceRecord) {
-    let Some(event) = reauth_notification_event(state, trace) else {
+fn emit_reauth_notification(state: &Arc<AppState>, trace: &TraceRecord) {
+    let Some(account) = reauth_account_for_trace(state, trace) else {
         return;
     };
-    if let Ok(notifications) = state.notifications.read() {
-        notifications.emit(event);
-    }
+    emit_reauth_notification_for_account(state, &account);
 }
 
 /// Dario authenticates inside its Claude Code child rather than through the
@@ -10117,7 +10229,7 @@ pub fn emit_dario_reauth_notification(state: &AppState) {
     }
 }
 
-fn emit_reauth_notification_for_account(state: &AppState, account: &Account) {
+fn emit_plain_reauth_notification_for_account(state: &AppState, account: &Account) {
     if account.kind != "oauth" {
         return;
     }
@@ -10126,24 +10238,51 @@ fn emit_reauth_notification_for_account(state: &AppState, account: &Account) {
     }
 }
 
-fn reauth_notification_event(
-    state: &AppState,
-    trace: &TraceRecord,
-) -> Option<notify::NotificationEvent> {
+fn emit_reauth_notification_for_account(state: &Arc<AppState>, account: &Account) {
+    if account.kind != "oauth" {
+        return;
+    }
+    let telegram_enabled = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.has_enabled_telegram())
+        .unwrap_or(false);
+    if !telegram_enabled {
+        emit_plain_reauth_notification_for_account(state, account);
+        return;
+    }
+    let state = state.clone();
+    let account = account.clone();
+    tokio::spawn(async move {
+        if let Err(error) = start_reauth_and_notify(&state, account.provider, &account).await {
+            tracing::warn!(
+                provider = account.provider.as_str(),
+                account = %account.id,
+                %error,
+                "could not start notification re-auth flow"
+            );
+        }
+    });
+}
+
+fn reauth_account_for_trace(state: &AppState, trace: &TraceRecord) -> Option<Account> {
     if trace.error_class.as_deref() != Some("auth") {
         return None;
     }
-    let Some(account_id) = trace.account_id.as_deref() else {
-        return None;
-    };
-    let Some(account) = state
+    let account_id = trace.account_id.as_deref()?;
+    state
         .vault
         .list_cached()
         .into_iter()
         .find(|account| account.id == account_id && account.kind == "oauth")
-    else {
-        return None;
-    };
+}
+
+#[cfg(test)]
+fn reauth_notification_event(
+    state: &AppState,
+    trace: &TraceRecord,
+) -> Option<notify::NotificationEvent> {
+    let account = reauth_account_for_trace(state, trace)?;
     Some(reauth_notification_event_for_account(&account))
 }
 
@@ -10179,6 +10318,174 @@ fn reauth_body_for(provider: Provider) -> String {
 
 fn reauth_action_for(provider: Provider) -> String {
     format!("alex auth login {}", provider.as_str())
+}
+
+fn reauth_account_label(account: &Account) -> String {
+    account
+        .email()
+        .or(account.label.clone())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| account.name.clone())
+}
+
+fn reauth_notify_result(
+    snapshot: Option<Value>,
+    notified: bool,
+    reused: bool,
+    fallback: bool,
+) -> Value {
+    let mut result = snapshot.unwrap_or_else(|| json!({}));
+    if !result.is_object() {
+        result = json!({"session": result});
+    }
+    result["notification_sent"] = json!(notified);
+    result["reused"] = json!(reused);
+    result["fallback"] = json!(fallback);
+    result
+}
+
+fn reauth_session_is_reusable(snapshot: Option<&Value>) -> bool {
+    let state = snapshot.and_then(|value| value["state"].as_str());
+    // LoginManager owns the polling task and flips an expired session to
+    // `failed`. Treat it as active until that transition so a new provider
+    // flow never overlaps the old worker by a watchdog scheduling race.
+    state == Some("pending") || state == Some("done")
+}
+
+/// Start (or reuse) the account's LoginManager session and put its fresh,
+/// single-use browser URL in Telegram. The tracker reservation is installed
+/// before the provider network call, preventing request-path and watchdog
+/// detections from creating concurrent device flows for the same account.
+pub async fn start_reauth_and_notify(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+) -> std::result::Result<Value, String> {
+    if account.provider != provider || account.kind != "oauth" {
+        return Err("re-authentication requires the matching managed OAuth account".into());
+    }
+    let telegram_enabled = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.has_enabled_telegram())
+        .unwrap_or(false);
+    if !telegram_enabled {
+        emit_plain_reauth_notification_for_account(state, account);
+        return Ok(reauth_notify_result(None, false, false, true));
+    }
+
+    let key = ReauthLoginKey {
+        provider,
+        account_id: account.id.clone(),
+    };
+    let existing = state
+        .reauth_logins
+        .lock()
+        .await
+        .entries
+        .get(&key)
+        .cloned();
+    let generation = match existing {
+        Some(ReauthLoginSlot::Starting(_)) => {
+            return Ok(reauth_notify_result(None, false, true, false));
+        }
+        Some(ReauthLoginSlot::Active {
+            login_id,
+            ..
+        }) => {
+            let snapshot = state.logins.status(&login_id).await;
+            if reauth_session_is_reusable(snapshot.as_ref()) {
+                return Ok(reauth_notify_result(snapshot, false, true, false));
+            }
+            let mut tracker = state.reauth_logins.lock().await;
+            let Some(generation) = tracker.reserve_replacement(&key, &login_id) else {
+                return Ok(reauth_notify_result(None, false, true, false));
+            };
+            generation
+        }
+        None => {
+            let mut tracker = state.reauth_logins.lock().await;
+            let Some(generation) = tracker.reserve_new(key.clone()) else {
+                return Ok(reauth_notify_result(None, false, true, false));
+            };
+            generation
+        }
+    };
+
+    let snapshot = match state
+        .logins
+        .start_reauth(state.vault.clone(), provider.as_str(), &account.name)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .abandon(&key, generation);
+            emit_plain_reauth_notification_for_account(state, account);
+            return Err(error.to_string());
+        }
+    };
+    let Some(login_id) = snapshot["login_id"].as_str().map(str::to_owned) else {
+        state
+            .reauth_logins
+            .lock()
+            .await
+            .abandon(&key, generation);
+        emit_plain_reauth_notification_for_account(state, account);
+        return Err("login session omitted login_id".into());
+    };
+    let expires_at_ms = snapshot["expires_at_ms"]
+        .as_i64()
+        .unwrap_or_else(|| now_ms() + 15 * 60 * 1000);
+    state.reauth_logins.lock().await.activate(
+        &key,
+        generation,
+        login_id,
+        expires_at_ms,
+    );
+
+    let Some(url) = snapshot["verification_uri_complete"]
+        .as_str()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        emit_plain_reauth_notification_for_account(state, account);
+        return Err("login session omitted verification_uri_complete".into());
+    };
+    let label = reauth_account_label(account);
+    let title = format!("{} needs re-authentication", provider.as_str());
+    let body = format!(
+        "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
+    );
+    let notification_account = notify::NotificationAccount {
+        provider: provider.as_str().into(),
+        label: Some(label),
+    };
+    let notified = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.send_custom(title, body, notification_account))
+        .unwrap_or(false);
+    if !notified {
+        emit_plain_reauth_notification_for_account(state, account);
+    }
+    Ok(reauth_notify_result(
+        Some(snapshot),
+        notified,
+        false,
+        !notified,
+    ))
+}
+
+async fn clear_active_reauth(state: &AppState, account_id: &str) {
+    state
+        .reauth_logins
+        .lock()
+        .await
+        .entries
+        .retain(|key, _| key.account_id != account_id);
 }
 
 /// Grace period after `expires_at_ms` before the watchdog treats an idle token
@@ -10221,6 +10528,7 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
             if account.needs_reauth() {
                 mark_account_needs_reauth(state, &account.id, false).await;
             }
+            clear_active_reauth(state, &account.id).await;
             continue;
         }
         let has_refresh_token = account
@@ -10231,7 +10539,9 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         if !has_refresh_token {
             // Expired with nothing to refresh from: a confirmed logout.
             mark_account_needs_reauth(state, &account.id, true).await;
-            emit_reauth_notification_for_account(state, &account);
+            if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await {
+                tracing::warn!(account = %account.id, %error, "could not start watchdog re-auth flow");
+            }
             continue;
         }
         // Has a refresh token: the only reliable way to tell a live login from a
@@ -10246,10 +10556,14 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
                 if account.needs_reauth() {
                     mark_account_needs_reauth(state, &account.id, false).await;
                 }
+                clear_active_reauth(state, &account.id).await;
             }
             Err(error) if alex_auth::refresh_error_needs_reauth(&error) => {
                 mark_account_needs_reauth(state, &account.id, true).await;
-                emit_reauth_notification_for_account(state, &account);
+                if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await
+                {
+                    tracing::warn!(account = %account.id, %error, "could not start watchdog re-auth flow");
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -10277,6 +10591,39 @@ async fn mark_account_needs_reauth(state: &AppState, account_id: &str, needs: bo
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn reauth_login_tracker_dedupes_pending_and_replaces_expired_session() {
+        let key = ReauthLoginKey {
+            provider: Provider::Xai,
+            account_id: "xai-oauth-work".into(),
+        };
+        let mut tracker = ReauthLoginTracker::default();
+        let first = tracker.reserve_new(key.clone()).expect("first flow reserved");
+        assert!(tracker.reserve_new(key.clone()).is_none());
+        tracker.activate(&key, first, "login-old".into(), 1_000);
+        assert!(tracker.reserve_new(key.clone()).is_none());
+
+        let fresh = tracker
+            .reserve_replacement(&key, "login-old")
+            .expect("expired flow replaced on a later watchdog tick");
+        assert_ne!(fresh, first);
+        assert!(tracker.reserve_new(key.clone()).is_none());
+        tracker.activate(&key, fresh, "login-fresh".into(), 2_000);
+        assert!(matches!(
+            tracker.entries.get(&key),
+            Some(ReauthLoginSlot::Active { login_id, .. }) if login_id == "login-fresh"
+        ));
+    }
+
+    #[test]
+    fn reauth_session_retries_only_after_failure_or_expiry() {
+        let pending = json!({"state": "pending"});
+        let failed = json!({"state": "failed"});
+        assert!(reauth_session_is_reusable(Some(&pending)));
+        assert!(!reauth_session_is_reusable(Some(&failed)));
+        assert!(reauth_session_is_reusable(Some(&json!({"state": "done"}))));
+    }
 
     #[test]
     fn kimi_usage_payload_maps_windows_and_credits() {
@@ -11698,6 +12045,45 @@ mod tests {
             router(state).oneshot(request).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn reauth_notify_route_requires_local_key_and_falls_back_without_telegram() {
+        use tower::ServiceExt;
+
+        let state = test_state("reauth-notify-auth");
+        state
+            .vault
+            .upsert(test_openai_account("work"))
+            .await
+            .unwrap();
+        let body = r#"{"provider":"openai","account_id":"openai-oauth-work"}"#;
+        let unauthorized = axum::http::Request::post("/admin/auth/reauth-notify")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let authorized = axum::http::Request::post("/admin/auth/reauth-notify")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(body))
+            .unwrap();
+        let response = router(state).oneshot(authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["notification_sent"], false);
+        assert_eq!(payload["fallback"], true);
     }
 
     fn anthropic_account_full(id: &str, name: &str, email: &str, expires_at_ms: i64) -> Account {

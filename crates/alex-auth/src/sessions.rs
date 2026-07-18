@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto, codex_device_poll_once,
-    codex_device_start, codex_exchange_named, generate_pkce, kimi_device_poll_once_at,
+    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
+    codex_device_exchange_named, codex_device_poll_once, codex_device_start, codex_exchange_named,
+    generate_pkce, kimi_device_poll_once_at,
     kimi_device_start_at, kimi_oauth_host, kimi_upsert_from_tokens, kimi_verification_url,
     openai_authorize_url, poll_device_flow, validate_account_name, wait_for_openai_callback,
     xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, DeviceFlowError,
@@ -153,7 +154,43 @@ impl LoginManager {
             bail!("automatic identity login is currently supported only for Codex");
         }
         let id = random_id();
-        let shared = self.start_codex_device(&id, vault).await?;
+        let shared = self.start_codex_device(&id, vault, None).await?;
+        let snapshot = shared.lock().await.snapshot();
+        self.sessions.lock().await.insert(id, shared);
+        Ok(snapshot)
+    }
+
+    /// Start the most hands-off login variant available for a re-auth alert.
+    /// Codex uses its polling device flow while the other providers retain
+    /// their existing LoginManager flow. Every returned snapshot exposes the
+    /// actionable browser URL as `verification_uri_complete`, allowing a
+    /// notification caller to treat the session shapes uniformly.
+    pub async fn start_reauth(
+        &self,
+        vault: Arc<Vault>,
+        provider: &str,
+        account_name: &str,
+    ) -> Result<Value> {
+        self.prune().await;
+        validate_account_name(account_name)?;
+        let id = random_id();
+        let shared = match provider {
+            "codex" | "openai" | "chatgpt" => {
+                self.start_codex_device(&id, vault, Some(account_name.to_string()))
+                    .await?
+            }
+            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, account_name))),
+            "grok" | "xai" => self.start_grok(&id, vault, account_name).await?,
+            "kimi" | "kimi-code" => self.start_kimi(&id, vault, account_name).await?,
+            "gemini" | "google" => self.start_gemini(&id, vault, account_name).await?,
+            other => bail!("provider '{other}' does not support managed re-authentication"),
+        };
+        {
+            let mut session = shared.lock().await;
+            if session.verification_uri_complete.is_none() {
+                session.verification_uri_complete = session.authorize_url.clone();
+            }
+        }
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
         Ok(snapshot)
@@ -276,7 +313,12 @@ impl LoginManager {
         Ok(shared)
     }
 
-    async fn start_codex_device(&self, id: &str, vault: Arc<Vault>) -> Result<SharedSession> {
+    async fn start_codex_device(
+        &self,
+        id: &str,
+        vault: Arc<Vault>,
+        account_name: Option<String>,
+    ) -> Result<SharedSession> {
         const DEVICE_TTL_MS: i64 = 15 * 60 * 1000;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -289,15 +331,19 @@ impl LoginManager {
             authorize_url: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
             user_code: Some(start.user_code.clone()),
             verification_uri: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
-            verification_uri_complete: None,
+            verification_uri_complete: Some(format!(
+                "{OPENAI_DEVICE_VERIFICATION_URL}?user_code={}",
+                start.user_code
+            )),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + DEVICE_TTL_MS,
-            account_name: String::new(),
+            account_name: account_name.clone().unwrap_or_default(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
+        let requested_account_name = account_name;
         tokio::spawn(async move {
             let phase = match poll_device_flow(now_ms() + DEVICE_TTL_MS, start.interval_s, || {
                 codex_device_poll_once(&http, &start)
@@ -305,9 +351,19 @@ impl LoginManager {
             .await
             {
                 Ok((authorization_code, code_verifier)) => {
-                    match codex_device_exchange_auto(&vault, &authorization_code, &code_verifier)
+                    let exchanged = if let Some(account_name) = requested_account_name.as_deref() {
+                        codex_device_exchange_named(
+                            &vault,
+                            &authorization_code,
+                            &code_verifier,
+                            account_name,
+                        )
                         .await
-                    {
+                    } else {
+                        codex_device_exchange_auto(&vault, &authorization_code, &code_verifier)
+                            .await
+                    };
+                    match exchanged {
                         Ok(account_id) => LoginPhase::Done { account_id },
                         Err(error) => LoginPhase::Failed {
                             error: error.to_string(),
@@ -414,7 +470,12 @@ impl LoginManager {
                 .or_else(|| Some(start.verification_uri.clone())),
             user_code: Some(start.user_code.clone()),
             verification_uri: Some(start.verification_uri.clone()),
-            verification_uri_complete: start.verification_uri_complete.clone(),
+            verification_uri_complete: Some(
+                start
+                    .verification_uri_complete
+                    .clone()
+                    .unwrap_or_else(|| format!("{}?user_code={}", start.verification_uri, start.user_code)),
+            ),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
             account_name: account_name.to_string(),
@@ -470,7 +531,7 @@ impl LoginManager {
             authorize_url: Some(kimi_verification_url(&start)),
             user_code: Some(start.user_code.clone()),
             verification_uri: start.verification_uri.clone(),
-            verification_uri_complete: start.verification_uri_complete.clone(),
+            verification_uri_complete: Some(kimi_verification_url(&start)),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
             account_name: account_name.to_string(),
@@ -565,6 +626,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn reauth_snapshot_normalizes_actionable_url() {
+        let (dir, vault) = temp_vault("reauth-url");
+        let mgr = LoginManager::default();
+        let snap = mgr
+            .start_reauth(vault, "anthropic", "default")
+            .await
+            .unwrap();
+        assert_eq!(snap["state"], "pending");
+        assert_eq!(
+            snap["verification_uri_complete"],
+            snap["authorize_url"],
+            "notification callers always receive one actionable URL field"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Minimal RFC 8628 mock: `/api/oauth/device_authorization` hands out a
     /// device+user code, `/api/oauth/token` returns tokens on the first poll.
     /// Returns the `http://127.0.0.1:PORT` base to hand `with_kimi_oauth_host`.
@@ -637,6 +715,7 @@ mod tests {
             authorize_url.contains("user_code=WXYZ-1234"),
             "authorize_url should carry the user_code: {authorize_url}"
         );
+        assert_eq!(snap["verification_uri_complete"], authorize_url);
         // The token must never leak into the session snapshot the UI reads.
         assert!(!snap.to_string().contains("kimi-access-token"));
 

@@ -853,6 +853,25 @@ public struct LoginSession: Codable, Sendable, Identifiable {
     }
 }
 
+public struct ReauthNotifyResponse: Codable, Sendable, Equatable {
+    public let loginId: String?
+    public let provider: String?
+    public let state: String?
+    public let verificationUriComplete: String?
+    public let expiresAtMs: Int64?
+    public let notificationSent: Bool
+    public let reused: Bool
+    public let fallback: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case provider, state, reused, fallback
+        case loginId = "login_id"
+        case verificationUriComplete = "verification_uri_complete"
+        case expiresAtMs = "expires_at_ms"
+        case notificationSent = "notification_sent"
+    }
+}
+
 public struct ImportOutcomes: Codable, Sendable {
     public let outcomes: [ImportOutcome]
 }
@@ -1100,14 +1119,14 @@ public enum ProviderInfo {
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai", "gemini", "amp", "openrouter", "exo": provider
+        case "anthropic", "openai", "gemini", "amp", "kimi", "openrouter", "exo": provider
         case "xai": "grok"
         default: nil
         }
     }
 
     public static var supportedProviders: [String] {
-        ["anthropic", "openai", "gemini", "xai", "openrouter", "exo", "amp"]
+        ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"]
     }
 
     public static func usesAPIKeySheet(_ provider: String) -> Bool {

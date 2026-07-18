@@ -14,6 +14,16 @@ private struct AuthLoginStartBody: Encodable {
     }
 }
 
+private struct ReauthNotifyBody: Encodable {
+    let provider: String
+    let accountId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case accountId = "account_id"
+    }
+}
+
 private struct OpenRouterKeyBody: Encodable {
     let key: String?
     let httpReferer: String?
@@ -404,6 +414,16 @@ public struct AlexandriaClient: Sendable {
 
     public func authLoginStatus(id: String) async throws -> LoginSession {
         try await get("admin/auth/login/\(id)", as: LoginSession.self)
+    }
+
+    public func reauthNotify(
+        provider: String,
+        accountId: String? = nil
+    ) async throws -> ReauthNotifyResponse {
+        let data = try await request(
+            "admin/auth/reauth-notify", method: "POST",
+            body: body(ReauthNotifyBody(provider: provider, accountId: accountId)))
+        return try JSONDecoder().decode(ReauthNotifyResponse.self, from: data)
     }
 
     public func authLoginComplete(id: String, input: String) async throws -> LoginSession {

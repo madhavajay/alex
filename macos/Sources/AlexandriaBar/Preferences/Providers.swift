@@ -37,9 +37,6 @@ private enum ProvidersChartRange: String, CaseIterable {
 struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool) -> Void
-    /// Deep-link to another Preferences tab (used by "Add Exo", which is a local
-    /// cluster configured by endpoint URL rather than an OAuth/key login).
-    var onOpenSection: (PreferencesSection) -> Void = { _ in }
     @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
@@ -74,23 +71,20 @@ struct ProvidersPreferencesSection: View {
             })
     }
 
-    /// Providers that get a detail panel in the sidebar. Exo is intentionally
-    /// omitted: it is a local cluster with its own Preferences tab and no
-    /// per-account credentials, so it lives in the Add menu (deep-linking to
-    /// that tab) rather than as a usage/routing panel here.
+    /// Canonical providers plus any provider returned by a newer daemon.
     private var providers: [String] {
-        Array(Set(["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "amp"] + store.accounts.map(\.provider))).sorted {
+        Array(Set(ProviderInfo.supportedProviders + store.accounts.map(\.provider))).sorted {
             ProviderInfo.displayName($0) < ProviderInfo.displayName($1)
         }
     }
 
     /// Every provider the Add menu can start a setup flow for, in a stable
-    /// display order. Reconciled against `ProviderInfo.supportedProviders`
-    /// (+ kimi). Setup type varies by provider — see `addAccount`:
+    /// display order from `ProviderInfo.supportedProviders`. Setup type varies
+    /// by provider — see `addAccount`:
     /// OAuth-login (anthropic/openai/gemini/xai/kimi), API-key or CLI import
     /// (openrouter/amp), and local endpoint config (exo).
     private var connectableProviders: [String] {
-        ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "amp", "exo"]
+        ProviderInfo.supportedProviders
     }
 
     private var usageByAccount: [String: AccountUsage] {
@@ -206,7 +200,13 @@ struct ProvidersPreferencesSection: View {
                     ForEach(providers, id: \.self) { provider in
                         ProviderSidebarRow(
                             provider: provider,
-                            count: store.accounts.filter { $0.provider == provider }.count,
+                            count: provider == "exo"
+                                ? store.exoModels.filter(\.enabled).count
+                                : store.accounts.filter { $0.provider == provider }.count,
+                            statusText: provider == "exo"
+                                ? (store.exoStatus?.running == true ? "Online" : "Offline")
+                                : nil,
+                            statusTint: providerStatusTint(provider),
                             selected: selectedProvider == provider
                         ) {
                             selectedProvider = provider
@@ -221,6 +221,40 @@ struct ProvidersPreferencesSection: View {
                 .padding(12)
         }
         .frame(width: 180)
+        .focusable()
+        .onMoveCommand { direction in
+            switch direction {
+            case .up: moveProviderSelection(by: -1)
+            case .down: moveProviderSelection(by: 1)
+            default: break
+            }
+        }
+    }
+
+    private func moveProviderSelection(by offset: Int) {
+        guard !providers.isEmpty else { return }
+        let current = selectedProvider.flatMap { providers.firstIndex(of: $0) } ?? 0
+        let next = min(max(current + offset, 0), providers.count - 1)
+        selectedProvider = providers[next]
+    }
+
+    private func providerStatusTint(_ provider: String) -> Color {
+        if provider == "exo" {
+            guard let status = store.exoStatus else {
+                return AlexTheme.ProviderBrand.brand(for: provider).accent
+            }
+            return status.running ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
+        }
+        let accounts = store.accounts.filter { $0.provider == provider && !$0.paused }
+        if accounts.contains(where: {
+            $0.healthState == .authFailed || $0.healthState == .unreachable
+        }) {
+            return AlexTheme.Colors.destructive
+        }
+        if accounts.contains(where: { $0.healthState == .healthy }) {
+            return AlexTheme.Colors.success
+        }
+        return AlexTheme.ProviderBrand.brand(for: provider).accent
     }
 
     @ViewBuilder
@@ -250,8 +284,8 @@ struct ProvidersPreferencesSection: View {
     private func addAccount(_ provider: String) {
         switch provider {
         case "exo":
-            // Local cluster: no login. Deep-link to its endpoint/config tab.
-            onOpenSection(.exo)
+            // Local cluster: no login. Select its first-class provider detail.
+            selectedProvider = "exo"
         case _ where ProviderInfo.usesAPIKeySheet(provider):
             // API-key providers (openrouter) capture a long-lived key.
             providerToAdd = provider
@@ -285,6 +319,8 @@ struct ProvidersPreferencesSection: View {
 private struct ProviderSidebarRow: View {
     let provider: String
     let count: Int
+    let statusText: String?
+    let statusTint: Color
     let selected: Bool
     let action: () -> Void
     @State private var hovering = false
@@ -294,12 +330,17 @@ private struct ProviderSidebarRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                StatusDot(tint: accent, size: 8)
+                StatusDot(tint: statusTint, size: 8)
                 Text(ProviderInfo.displayName(provider))
                     .font(.system(size: 12, weight: selected ? .semibold : .regular))
                     .foregroundStyle(
                         selected ? AlexTheme.Colors.foreground : AlexTheme.Colors.textSecondary)
                 Spacer(minLength: 4)
+                if let statusText {
+                    Text(statusText)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(statusTint)
+                }
                 if count > 0 {
                     Text("\(count)")
                         .font(AlexTheme.Fonts.mono(10, weight: .medium))
@@ -359,28 +400,32 @@ private struct ProviderPreferencesDetail: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                usageHeader
+        if provider == "exo" {
+            ExoPreferencesSection(store: store)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    usageHeader
 
-                if let analytics = store.accountAnalytics, !accounts.isEmpty {
-                    UsageChartCard(
-                        analytics: analytics,
-                        accounts: accounts,
-                        rangeSelection: $chartRangeSelection,
-                        rangeEnabled: chartRangeEnabled,
-                        isLoading: accountAnalyticsLoading,
-                        colorFor: accountColor)
+                    if let analytics = store.accountAnalytics, !accounts.isEmpty {
+                        UsageChartCard(
+                            analytics: analytics,
+                            accounts: accounts,
+                            rangeSelection: $chartRangeSelection,
+                            rangeEnabled: chartRangeEnabled,
+                            isLoading: accountAnalyticsLoading,
+                            colorFor: accountColor)
+                    }
+
+                    accountsSection
+
+                    ProviderRoutingPreferencesSection(
+                        store: store, provider: provider, accounts: accounts, routing: routing)
                 }
-
-                accountsSection
-
-                ProviderRoutingPreferencesSection(
-                    store: store, provider: provider, accounts: accounts, routing: routing)
+                .padding(20)
             }
-            .padding(20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var usageHeader: some View {
@@ -702,6 +747,9 @@ private struct SubscriptionAccountRow: View {
     @State private var deleting = false
     @State private var busy = false
     @State private var error: String?
+    @State private var notificationFeedback: String?
+    @State private var notificationFailed = false
+    @State private var notificationBusy = false
 
     /// Quota windows: openai keeps its routing-fed windows (richer, includes
     /// reset selection); other providers fall back to per-account limits.
@@ -728,6 +776,12 @@ private struct SubscriptionAccountRow: View {
                 Text(error)
                     .font(.system(size: 10))
                     .foregroundStyle(AlexTheme.Colors.destructive)
+            }
+            if let notificationFeedback {
+                Text(notificationFeedback)
+                    .font(.system(size: 10))
+                    .foregroundStyle(notificationFailed
+                        ? AlexTheme.Colors.destructive : AlexTheme.Colors.success)
             }
         }
         .padding(16)
@@ -889,6 +943,17 @@ private struct SubscriptionAccountRow: View {
                 ) {
                     reauthenticate()
                 }
+                if account.kind == "oauth" {
+                    PillButton(
+                        title: notificationBusy
+                            ? "Sending…" : "Re-authenticate via Notification",
+                        horizontalPadding: 12, verticalPadding: 5,
+                        cornerRadius: 7, showsBorder: true,
+                        isEnabled: !notificationBusy, isBusy: notificationBusy
+                    ) {
+                        reauthenticateViaNotification()
+                    }
+                }
             }
             Spacer()
             PillButton(
@@ -942,6 +1007,32 @@ private struct SubscriptionAccountRow: View {
                 self.error = error.localizedDescription
             }
             busy = false
+        }
+    }
+
+    private func reauthenticateViaNotification() {
+        guard let config = store.config else { return }
+        notificationBusy = true
+        notificationFeedback = nil
+        notificationFailed = false
+        Task {
+            do {
+                let response = try await AlexandriaClient(config: config).reauthNotify(
+                    provider: account.provider, accountId: account.id)
+                if response.notificationSent {
+                    notificationFeedback = "Fresh re-authentication link sent"
+                } else if response.reused {
+                    notificationFeedback = "A re-authentication session is already pending"
+                } else {
+                    notificationFeedback = "No Telegram channel is enabled; standard alert used"
+                }
+            } catch {
+                notificationFailed = true
+                notificationFeedback = error.localizedDescription
+            }
+            notificationBusy = false
+            try? await Task.sleep(for: .seconds(4))
+            notificationFeedback = nil
         }
     }
 }

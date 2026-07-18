@@ -15,6 +15,22 @@ import Testing
         #expect(h.uptimeS == 479)
     }
 
+    @Test func reauthNotificationResponse() throws {
+        let json = #"{"login_id":"login-new","provider":"xai","state":"pending","verification_uri_complete":"https://auth.example/device?code=fresh","expires_at_ms":1783477900000,"notification_sent":true,"reused":false,"fallback":false}"#
+        let response = try decode(json, as: ReauthNotifyResponse.self)
+        #expect(response.loginId == "login-new")
+        #expect(response.verificationUriComplete?.contains("code=fresh") == true)
+        #expect(response.notificationSent)
+        #expect(!response.reused)
+        #expect(!response.fallback)
+    }
+
+    @Test func canonicalProviderCatalogIncludesEveryProvider() {
+        #expect(Set(ProviderInfo.supportedProviders) == Set([
+            "anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"
+        ]))
+    }
+
     @Test func credentialsInventoryIsRedactedAndDecodesRunKeyMetadata() throws {
         let json = #"""
         {"inbound":{"admin_key":{"present":true},"local_key":{"present":true},"run_keys":[{"id":"rk-abc12345","key_fingerprint":"abc12345def67890","kind":"run","label":"VS Code","run_id":"job-7","tags":{"harness":"codex","model":"gpt-5","attempt":2},"created_ms":1783477000000,"expires_ms":1783563400000,"last_used_ms":null,"use_count":4,"revoked":false}]},"outbound":[{"kind":"oauth","id":"openai-main","provider":"openai","present":true,"active":true,"identity":"person@example.com","expires_at_ms":null,"source":"vault"},{"kind":"harness_login","name":"codex","present":false,"active":false,"identity":null,"expires_at_ms":null,"source":"harness_file"}]}
@@ -392,6 +408,7 @@ import Testing
         #expect(ProviderInfo.loginArg("xai") == "grok")
         #expect(ProviderInfo.pingArg("xai") == "grok")
         #expect(ProviderInfo.pingArg("gemini") == "gemini")
+        #expect(ProviderInfo.pingArg("kimi") == "kimi")
         #expect(ProviderInfo.pingArg("unknown") == nil)
     }
 
