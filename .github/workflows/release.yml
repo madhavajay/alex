@@ -137,7 +137,6 @@ jobs:
               gh release upload "$tag" "$asset_dir"/* --clobber
             fi
           fi
-
   windows-asset:
     needs: [meta, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
@@ -225,6 +224,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
@@ -288,68 +291,39 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up CLI signing keychain
+        if: steps.cli_signing.outputs.available == 'true'
+        id: signing_keychain
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          apple_signing_identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          apple_team_id: ${{ secrets.APPLE_TEAM_ID }}
+          signing_certificate_p12_data: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          signing_certificate_password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+
       - name: Sign CLI binaries
         if: steps.cli_signing.outputs.available == 'true'
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ steps.signing_keychain.outputs.identity }}
         run: |
           set -euo pipefail
-          keychain_password="$(uuidgen)"
-          keychain="$RUNNER_TEMP/alex-cli-signing.keychain-db"
-          p12="$RUNNER_TEMP/alex-cli-signing.p12"
-          original_default_keychain="$(security default-keychain | tr -d '"')"
-
-          cleanup() {
-            security default-keychain -s "$original_default_keychain" >/dev/null 2>&1 || true
-            security delete-keychain "$keychain" >/dev/null 2>&1 || true
-            rm -f "$p12"
-          }
-          trap cleanup EXIT
-
-          if ! printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 --decode > "$p12" 2>/dev/null; then
-            printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 -D > "$p12"
-          fi
-
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security default-keychain -s "$keychain"
-          existing_keychains="$(security list-keychains -d user | tr -d '"')"
-          # shellcheck disable=SC2086
-          security list-keychains -d user -s "$keychain" $existing_keychains
-          security import "$p12" -k "$keychain" \
-            -P "$SIGNING_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null 2>&1 || true
-
-          identity_list="$(security find-identity -p codesigning -v "$keychain" || true)"
-          codesign_identity=""
-          if [[ "${APPLE_SIGNING_IDENTITY:-}" =~ ^[A-Fa-f0-9]{40}$ ]]; then
-            codesign_identity="$APPLE_SIGNING_IDENTITY"
-          elif [[ -n "${APPLE_TEAM_ID:-}" ]]; then
-            codesign_identity="$(awk -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($0, team) { print $2; exit }' <<<"$identity_list")"
-          fi
-          if [[ -z "$codesign_identity" ]]; then
-            codesign_identity="$(awk '/Developer ID Application/ { print $2; exit }' <<<"$identity_list")"
-          fi
-          if [[ -z "$codesign_identity" ]]; then
-            echo "no Developer ID Application identity found after import:" >&2
-            printf '%s\n' "$identity_list" >&2
-            exit 1
-          fi
-
           for bin in \
             "$RUNNER_TEMP/alex-cli-aarch64/bin/alex" \
             "$RUNNER_TEMP/alex-cli-aarch64/bin/alexandria" \
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alex" \
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alexandria"
           do
-            codesign --force --options runtime --timestamp --sign "$codesign_identity" "$bin"
+            codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
+
+      - name: Clean up CLI signing keychain
+        if: always() && steps.cli_signing.outputs.available == 'true'
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          cleanup: "true"
+          keychain: ${{ steps.signing_keychain.outputs.keychain }}
+          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Package CLI binaries
         run: |
@@ -434,156 +408,16 @@ jobs:
   stable-app:
     needs: [meta, manifest, swift-test]
     if: ${{ !cancelled() && needs.manifest.result == 'success' && needs.swift-test.result == 'success' }}
-    runs-on: namespace-profile-mac-medium
-    timeout-minutes: 40
-    concurrency:
-      group: gh-pages-deploy
-      cancel-in-progress: false
     permissions:
       contents: write
-    env:
-      BUNDLE_ID: com.madhavajay.alex
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.tag }}
-
-      - name: Check app signing secrets
-        id: app_signing
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          missing=()
-          for key in \
-            APPLE_ID \
-            APPLE_PASSWORD \
-            APPLE_TEAM_ID \
-            APPLE_SIGNING_IDENTITY \
-            SIGNING_CERTIFICATE_P12_DATA \
-            SIGNING_CERTIFICATE_PASSWORD
-          do
-            if [[ -z "${!key:-}" ]]; then
-              missing+=("$key")
-            fi
-          done
-          if [[ "${#missing[@]}" -gt 0 ]]; then
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              # A tag release must never succeed without its signed, notarized DMG.
-              printf 'Missing required app signing secret(s): %s\n' "${missing[*]}" >&2
-              exit 1
-            fi
-            printf 'Skipping stable DMG for workflow_dispatch; missing secret(s): %s\n' "${missing[*]}"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build signed DMG
-        if: steps.app_signing.outputs.available == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-          SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
-          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
-        run: |
-          set -euo pipefail
-          ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
-          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
-          ./build-signed.sh --clean --notarize
-          ./check-gatekeeper.sh macos/dist/*.dmg
-
-      - name: Upload DMG and refresh manifest
-        if: steps.app_signing.outputs.available == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
-          dmg="$(ls -t macos/dist/*.dmg | head -1)"
-          gh release upload "$tag" "$dmg" --clobber
-
-          rm -rf dist/app-manifest-assets
-          mkdir -p dist/app-manifest-assets
-          gh release download "$tag" --pattern manifest.json --dir dist/app-manifest-assets --clobber
-          cp "$dmg" dist/app-manifest-assets/
-          python3 scripts/gen-manifest.py \
-            --tag "$tag" \
-            --repo "${{ github.repository }}" \
-            --assets-dir dist/app-manifest-assets \
-            --merge-existing dist/app-manifest-assets/manifest.json \
-            --out manifest.json
-          cat manifest.json
-          gh release upload "$tag" manifest.json --clobber
-
-      - name: Check Sparkle signing key
-        id: sparkle_key
-        if: steps.app_signing.outputs.available == 'true'
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              # A tag release must update the signed appcast so app users see it.
-              echo "SPARKLE_ED_PRIVATE_KEY is required for a stable tag release." >&2
-              exit 1
-            fi
-            echo "Skipping stable appcast for workflow_dispatch; SPARKLE_ED_PRIVATE_KEY is not configured."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Generate stable appcast
-        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
-          rm -rf sparkle updates appcast.xml
-          mkdir -p sparkle updates
-          curl -fsSL \
-            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
-            -o sparkle.tar.xz
-          tar -xJf sparkle.tar.xz -C sparkle
-          generate_appcast="$(find sparkle -path '*/bin/generate_appcast' -type f | head -1)"
-          if [[ -z "$generate_appcast" ]]; then
-            echo "Unable to locate generate_appcast in Sparkle 2.9.4 archive." >&2
-            exit 1
-          fi
-          chmod +x "$generate_appcast"
-          cp macos/dist/*.dmg updates/
-          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
-            --ed-key-file - \
-            --download-url-prefix "https://github.com/madhavajay/alex/releases/download/${tag}/" \
-            -o appcast.xml \
-            updates/
-
-      - name: Publish stable appcast to GitHub Pages
-        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p site
-          cp appcast.xml site/appcast.xml
-
-      - name: Deploy GitHub Pages
-        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
-        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
-        with:
-          github_token: ${{ github.token }}
-          publish_branch: gh-pages
-          publish_dir: ./site
-          keep_files: true
+    uses: ./.github/workflows/dmg-appcast.yml
+    with:
+      channel: stable
+      tag: ${{ needs.meta.outputs.tag }}
+      overwrite: true
+      hard_fail_missing_secrets: ${{ github.event_name == 'push' }}
+      require_existing_manifest: true
+    secrets: inherit
 
   tap-formula:
     needs: manifest

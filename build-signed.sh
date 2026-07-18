@@ -73,6 +73,7 @@ TRAP_P12=""
 TEMP_KEYCHAIN=""
 DMG_STAGE=""
 ORIGINAL_DEFAULT_KEYCHAIN=""
+NOTARY_RESULT=""
 cleanup() {
   if [[ -n "$DMG_STAGE" && -d "$DMG_STAGE" ]]; then
     rm -rf "$DMG_STAGE" || true
@@ -85,6 +86,9 @@ cleanup() {
       security default-keychain -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
     fi
     security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$NOTARY_RESULT" && -f "$NOTARY_RESULT" ]]; then
+    rm -f "$NOTARY_RESULT" || true
   fi
 }
 trap cleanup EXIT
@@ -147,7 +151,7 @@ if [[ "$NEEDS_IMPORT" == "true" ]]; then
     -P "$SIGNING_CERTIFICATE_PASSWORD" \
     -T /usr/bin/codesign -T /usr/bin/security >/dev/null
   if [[ -n "${KEYCHAIN_PASSWORD:-}" ]]; then
-    security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$IMPORT_KEYCHAIN" >/dev/null 2>&1 || true
+    security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$IMPORT_KEYCHAIN" >/dev/null 2>&1
   fi
 else
   if grep -q "Developer ID Application" <<<"$CERT_LIST"; then
@@ -204,6 +208,25 @@ fi
 echo "Using signing identity: $APPLE_SIGNING_IDENTITY"
 echo "Using bundle identifier: $BUNDLE_ID"
 
+submit_for_notarization() {
+  local artifact="$1"
+  local verdict
+  NOTARY_RESULT="$(mktemp "${TMPDIR:-/tmp}/alexandria-notary-XXXXXX.json")"
+  xcrun notarytool submit "$artifact" \
+    --apple-id "$APPLE_ID" \
+    --password "$APPLE_PASSWORD" \
+    --team-id "$APPLE_TEAM_ID" \
+    --wait \
+    --output-format json | tee "$NOTARY_RESULT"
+  verdict="$(plutil -extract status raw -o - "$NOTARY_RESULT")"
+  if [[ "$verdict" != "Accepted" ]]; then
+    echo "Apple notarization rejected $artifact (status: ${verdict:-unknown})." >&2
+    exit 1
+  fi
+  rm -f "$NOTARY_RESULT"
+  NOTARY_RESULT=""
+}
+
 if [[ "$CLEAN" == "true" ]]; then
   echo "Cleaning macOS build artifacts..."
   rm -rf "$DIST_DIR"
@@ -258,11 +281,7 @@ if [[ "$SHOULD_NOTARIZE" == "true" ]]; then
   rm -f "$APP_ZIP"
   echo "Submitting app bundle for notarization..."
   ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
-  xcrun notarytool submit "$APP_ZIP" \
-    --apple-id "$APPLE_ID" \
-    --password "$APPLE_PASSWORD" \
-    --team-id "$APPLE_TEAM_ID" \
-    --wait
+  submit_for_notarization "$APP_ZIP"
   rm -f "$APP_ZIP"
 
   echo "Stapling app notarization ticket..."
@@ -285,11 +304,7 @@ codesign --verify --verbose=2 "$DMG_PATH"
 
 if [[ "$SHOULD_NOTARIZE" == "true" ]]; then
   echo "Submitting DMG for notarization..."
-  xcrun notarytool submit "$DMG_PATH" \
-    --apple-id "$APPLE_ID" \
-    --password "$APPLE_PASSWORD" \
-    --team-id "$APPLE_TEAM_ID" \
-    --wait
+  submit_for_notarization "$DMG_PATH"
 
   echo "Stapling notarization ticket..."
   xcrun stapler staple "$DMG_PATH"

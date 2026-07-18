@@ -1,0 +1,130 @@
+name: macOS signing keychain
+description: Import a Developer ID certificate into an isolated keychain and resolve its identity.
+
+inputs:
+  signing_certificate_p12_data:
+    description: Base64-encoded Developer ID certificate.
+    required: false
+    default: ""
+  signing_certificate_password:
+    description: Password for the Developer ID certificate.
+    required: false
+    default: ""
+  apple_signing_identity:
+    description: Preferred identity SHA or name.
+    required: false
+    default: ""
+  apple_team_id:
+    description: Preferred Apple Developer team ID.
+    required: false
+    default: ""
+  cleanup:
+    description: Delete a keychain created by an earlier invocation.
+    required: false
+    default: "false"
+  keychain:
+    description: Keychain path to delete in cleanup mode.
+    required: false
+    default: ""
+  original_default_keychain:
+    description: Default keychain to restore in cleanup mode.
+    required: false
+    default: ""
+
+outputs:
+  identity:
+    description: Resolved Developer ID Application identity SHA.
+    value: ${{ steps.setup.outputs.identity }}
+  keychain:
+    description: Temporary keychain path.
+    value: ${{ steps.setup.outputs.keychain }}
+  original_default_keychain:
+    description: Default keychain active before setup.
+    value: ${{ steps.setup.outputs.original_default_keychain }}
+
+runs:
+  using: composite
+  steps:
+    - name: Import certificate and resolve identity
+      id: setup
+      if: inputs.cleanup != 'true'
+      shell: bash
+      env:
+        SIGNING_CERTIFICATE_P12_DATA: ${{ inputs.signing_certificate_p12_data }}
+        SIGNING_CERTIFICATE_PASSWORD: ${{ inputs.signing_certificate_password }}
+        APPLE_SIGNING_IDENTITY: ${{ inputs.apple_signing_identity }}
+        APPLE_TEAM_ID: ${{ inputs.apple_team_id }}
+      run: |
+        set -euo pipefail
+        keychain_password="$(uuidgen)"
+        keychain="$RUNNER_TEMP/alex-signing-$(uuidgen).keychain-db"
+        p12="$RUNNER_TEMP/alex-signing-$(uuidgen).p12"
+        original_default_keychain="$(security default-keychain | tr -d '"')"
+        setup_complete=false
+
+        cleanup_failed_setup() {
+          rm -f "$p12"
+          if [[ "$setup_complete" != "true" ]]; then
+            security default-keychain -s "$original_default_keychain" >/dev/null 2>&1 || true
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+          fi
+        }
+        trap cleanup_failed_setup EXIT
+
+        if ! printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 --decode > "$p12" 2>/dev/null; then
+          printf '%s' "$SIGNING_CERTIFICATE_P12_DATA" | base64 -D > "$p12"
+        fi
+
+        security create-keychain -p "$keychain_password" "$keychain"
+        security set-keychain-settings -lut 21600 "$keychain"
+        security unlock-keychain -p "$keychain_password" "$keychain"
+        security default-keychain -s "$keychain"
+        existing_keychains="$(security list-keychains -d user | tr -d '"')"
+        # shellcheck disable=SC2086
+        security list-keychains -d user -s "$keychain" $existing_keychains
+        security import "$p12" -k "$keychain" \
+          -P "$SIGNING_CERTIFICATE_PASSWORD" \
+          -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+        security set-key-partition-list \
+          -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null 2>&1
+
+        identity_list="$(security find-identity -p codesigning -v "$keychain" || true)"
+        codesign_identity=""
+        if [[ "$APPLE_SIGNING_IDENTITY" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+          codesign_identity="$APPLE_SIGNING_IDENTITY"
+        elif [[ -n "$APPLE_TEAM_ID" ]]; then
+          codesign_identity="$(awk -v team="(${APPLE_TEAM_ID})" '/Developer ID Application/ && index($0, team) { print $2; exit }' <<<"$identity_list")"
+        fi
+        if [[ -z "$codesign_identity" && -n "$APPLE_SIGNING_IDENTITY" ]]; then
+          codesign_identity="$(awk -v identity="$APPLE_SIGNING_IDENTITY" '/Developer ID Application/ && index($0, identity) { print $2; exit }' <<<"$identity_list")"
+        fi
+        if [[ -z "$codesign_identity" ]]; then
+          codesign_identity="$(awk '/Developer ID Application/ { print $2; exit }' <<<"$identity_list")"
+        fi
+        if [[ -z "$codesign_identity" ]]; then
+          echo "No Developer ID Application identity found after import:" >&2
+          printf '%s\n' "$identity_list" >&2
+          exit 1
+        fi
+
+        {
+          echo "identity=$codesign_identity"
+          echo "keychain=$keychain"
+          echo "original_default_keychain=$original_default_keychain"
+        } >> "$GITHUB_OUTPUT"
+        setup_complete=true
+
+    - name: Restore and delete signing keychain
+      if: inputs.cleanup == 'true'
+      shell: bash
+      env:
+        KEYCHAIN: ${{ inputs.keychain }}
+        ORIGINAL_DEFAULT_KEYCHAIN: ${{ inputs.original_default_keychain }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$ORIGINAL_DEFAULT_KEYCHAIN" ]]; then
+          security default-keychain -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "$KEYCHAIN" ]]; then
+          security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+        fi

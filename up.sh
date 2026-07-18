@@ -15,13 +15,14 @@ YES=0
 
 say() { printf '%s\n' "$*"; }
 
+# lib: install-common.sh
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
   else
-    say "A SHA-256 tool (sha256sum or shasum) is required." >&2
+    printf '%s\n' "A SHA-256 tool (sha256sum or shasum) is required." >&2
     exit 1
   fi
 }

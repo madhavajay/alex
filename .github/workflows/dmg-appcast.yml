@@ -1,0 +1,336 @@
+name: Build DMG and publish appcast
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: Sparkle channel (stable or beta).
+        required: true
+        type: string
+      tag:
+        description: Existing release tag to build.
+        required: true
+        type: string
+      overwrite:
+        description: Overwrite existing release assets.
+        required: true
+        type: boolean
+      notarize:
+        description: Submit the app and DMG for notarization.
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: Upload the DMG, manifest, and appcast.
+        required: false
+        default: true
+        type: boolean
+      hard_fail_missing_secrets:
+        description: Fail instead of skipping when signing secrets are unavailable.
+        required: false
+        default: true
+        type: boolean
+      require_existing_manifest:
+        description: Require manifest.json to exist before adding the DMG.
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      artifact_name:
+        description: Name of the uploaded DMG artifact.
+        value: ${{ jobs.dmg_appcast.outputs.artifact_name }}
+      version:
+        description: Version derived from the tag.
+        value: ${{ jobs.dmg_appcast.outputs.version }}
+    secrets:
+      APPLE_ID:
+        required: false
+      APPLE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      SIGNING_CERTIFICATE_P12_DATA:
+        required: false
+      SIGNING_CERTIFICATE_PASSWORD:
+        required: false
+      SPARKLE_ED_PRIVATE_KEY:
+        required: false
+
+jobs:
+  dmg_appcast:
+    name: Build signed DMG (${{ inputs.channel }})
+    runs-on: namespace-profile-mac-medium
+    timeout-minutes: 40
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+
+      - name: Validate channel and tag
+        id: meta
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            stable)
+              appcast_file=appcast.xml
+              [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "tag '$RELEASE_TAG' is not valid for the stable channel" >&2
+                exit 1
+              }
+              ;;
+            beta)
+              appcast_file=appcast-beta.xml
+              [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || {
+                echo "tag '$RELEASE_TAG' is not valid for the beta channel" >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "channel '$CHANNEL' is invalid (expected stable or beta)" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "version=${RELEASE_TAG#v}"
+            echo "appcast_file=$appcast_file"
+            echo "artifact_name=alexandria-macos-dmg"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check app signing secrets
+        id: app_signing
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            APPLE_SIGNING_IDENTITY \
+            SIGNING_CERTIFICATE_P12_DATA \
+            SIGNING_CERTIFICATE_PASSWORD
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            if [[ "${{ inputs.hard_fail_missing_secrets }}" == "true" ]]; then
+              # A tag release must never succeed without its signed, notarized DMG.
+              printf 'Missing required app signing secret(s): %s\n' "${missing[*]}" >&2
+              exit 1
+            fi
+            printf 'Skipping %s DMG for workflow_dispatch; missing secret(s): %s\n' \
+              "${{ inputs.channel }}" "${missing[*]}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up app signing keychain
+        if: steps.app_signing.outputs.available == 'true'
+        id: signing_keychain
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          apple_signing_identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          apple_team_id: ${{ secrets.APPLE_TEAM_ID }}
+          signing_certificate_p12_data: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          signing_certificate_password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+
+      - name: Build signed DMG
+        if: steps.app_signing.outputs.available == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing_keychain.outputs.identity }}
+          SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          ./scripts/stamp-version.sh "${{ steps.meta.outputs.version }}"
+          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
+          if [[ "${{ inputs.notarize }}" == "true" ]]; then
+            ./build-signed.sh --clean --notarize
+          else
+            ./build-signed.sh --clean --skip-notarize
+          fi
+
+      - name: Clean up app signing keychain
+        if: always() && steps.app_signing.outputs.available == 'true'
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          cleanup: "true"
+          keychain: ${{ steps.signing_keychain.outputs.keychain }}
+          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
+
+      - name: Check Gatekeeper
+        if: steps.app_signing.outputs.available == 'true' && inputs.notarize
+        run: ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Prepare release metadata
+        id: release
+        if: steps.app_signing.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          dmg="$(ls -t macos/dist/*.dmg | head -1)"
+          if [[ -z "$dmg" ]]; then
+            echo "Unable to resolve the built DMG path." >&2
+            exit 1
+          fi
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Publish DMG to GitHub Release
+        if: steps.app_signing.outputs.available == 'true' && inputs.notarize && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          DMG_PATH: ${{ steps.release.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          upload_args=()
+          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
+            upload_args+=(--clobber)
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
+          else
+            if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
+              --target "$(git rev-parse HEAD)" \
+              --title "Alexandria ${RELEASE_TAG}" \
+              --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
+              gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
+            fi
+          fi
+
+      - name: Refresh release manifest
+        if: steps.app_signing.outputs.available == 'true' && inputs.notarize && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          DMG_PATH: ${{ steps.release.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          rm -rf dist/app-manifest-assets
+          mkdir -p dist/app-manifest-assets
+          if ! gh release download "$RELEASE_TAG" \
+            --pattern manifest.json \
+            --dir dist/app-manifest-assets \
+            --clobber; then
+            if [[ "${{ inputs.require_existing_manifest }}" == "true" ]]; then
+              echo "manifest.json is required on ${RELEASE_TAG} before publishing the DMG." >&2
+              exit 1
+            fi
+            echo "No existing manifest.json found on ${RELEASE_TAG}; creating app-only manifest."
+          fi
+          cp "$DMG_PATH" dist/app-manifest-assets/
+
+          merge_args=()
+          if [[ -f dist/app-manifest-assets/manifest.json ]]; then
+            merge_args=(--merge-existing dist/app-manifest-assets/manifest.json)
+          fi
+          python3 scripts/gen-manifest.py \
+            --tag "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --assets-dir dist/app-manifest-assets \
+            "${merge_args[@]}" \
+            --out manifest.json
+          cat manifest.json
+          upload_args=()
+          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
+            upload_args+=(--clobber)
+          fi
+          gh release upload "$RELEASE_TAG" manifest.json "${upload_args[@]}"
+
+      - name: Check Sparkle signing key
+        id: sparkle_key
+        if: steps.app_signing.outputs.available == 'true' && inputs.notarize && inputs.publish_release
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
+            if [[ "${{ inputs.hard_fail_missing_secrets }}" == "true" ]]; then
+              # A published DMG must update the signed appcast so app users see it.
+              echo "SPARKLE_ED_PRIVATE_KEY is required for a ${{ inputs.channel }} release." >&2
+              exit 1
+            fi
+            echo "Skipping ${{ inputs.channel }} appcast for workflow_dispatch; SPARKLE_ED_PRIVATE_KEY is not configured."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Sparkle appcast
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          DMG_PATH: ${{ steps.release.outputs.dmg }}
+          APPCAST_FILE: ${{ steps.meta.outputs.appcast_file }}
+        run: |
+          set -euo pipefail
+          rm -rf sparkle updates "$APPCAST_FILE"
+          mkdir -p sparkle updates
+          curl -fsSL \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
+            -o sparkle.tar.xz
+          tar -xJf sparkle.tar.xz -C sparkle
+          generate_appcast="$(find sparkle -path '*/bin/generate_appcast' -type f | head -1)"
+          if [[ -z "$generate_appcast" ]]; then
+            echo "Unable to locate generate_appcast in Sparkle 2.9.4 archive." >&2
+            exit 1
+          fi
+          chmod +x "$generate_appcast"
+          cp "$DMG_PATH" updates/
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/madhavajay/alex/releases/download/${RELEASE_TAG}/" \
+            -o "$APPCAST_FILE" \
+            updates/
+
+      - name: Publish appcast to GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        env:
+          APPCAST_FILE: ${{ steps.meta.outputs.appcast_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          cp "$APPCAST_FILE" "site/$APPCAST_FILE"
+
+      - name: Deploy GitHub Pages
+        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ github.token }}
+          publish_branch: gh-pages
+          publish_dir: ./site
+          keep_files: true
+
+      - name: Upload DMG artifact
+        if: steps.app_signing.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: alexandria-macos-dmg
+          path: macos/dist/*.dmg
