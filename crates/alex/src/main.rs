@@ -2282,9 +2282,16 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         }
     }
 
-    fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
+    async fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
         let mut ids = state.store.pricing_models();
         ids.extend(alex_proxy::exo_catalog_models(state));
+        // Provider catalogs advertised in /v1/models must also reach the
+        // app-driven connect / refresh-config path; otherwise a provider added
+        // after a harness was connected (e.g. Kimi) never lands in that
+        // harness's model list on reconnect. Mirror the daemon `/v1/models`
+        // handler, which appends `kimi_catalog_models` when a Kimi account
+        // exists.
+        ids.extend(alex_proxy::kimi_catalog_models(state).await);
         for (alias, _) in alex_core::model_aliases() {
             ids.push((*alias).to_string());
         }
@@ -2360,7 +2367,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 ),
             );
         }
-        let models = state_models(&state);
+        let models = state_models(&state).await;
         let codex_catalog = if name == "codex" {
             let Some(binary) = status.binary.as_deref() else {
                 return error(
@@ -2471,7 +2478,25 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                     .copied()
                     .unwrap_or(false),
             ),
-            _ => unreachable!("connect-capable harness must have a writer"),
+            "kimi" => harness_connect::write_kimi_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                key,
+                models,
+                status.version,
+            ),
+            // A connect-capable harness without a writer is a programming error,
+            // but panicking here aborts the HTTP connection mid-request and the
+            // caller (the app) surfaces it as a "network connection lost". Return
+            // a clean 500 instead so the failure is legible and the connection
+            // stays intact.
+            other => {
+                return error(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("harness '{other}' has no connection writer"),
+                )
+            }
         };
         match result {
             Ok(summary) => {
@@ -2605,6 +2630,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "codex" => harness_connect::read_codex_api_key(&config_dir),
             "grok" => harness_connect::read_grok_api_key(&config_dir),
             "amp" => harness_connect::read_amp_api_key(&config_dir),
+            "kimi" => harness_connect::read_kimi_api_key(&config_dir),
             _ => harness_connect::read_pi_api_key(&config_dir),
         };
         let (key_status, key_id, api_key) = if let Some(key) = existing_key {
@@ -2617,7 +2643,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 }
             }
         };
-        let models = state_models(&state);
+        let models = state_models(&state).await;
         let status = match harness_connect::harness_status(&config, spec, None, true).await {
             Ok(status) => status,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -2686,6 +2712,15 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                     .get("amp")
                     .copied()
                     .unwrap_or(false),
+            )
+        } else if name == "kimi" {
+            harness_connect::write_kimi_connection(
+                config_dir,
+                state.base_url.clone(),
+                key_id,
+                api_key,
+                models,
+                status.version,
             )
         } else {
             harness_connect::write_pi_connection_with_capture(
@@ -11469,6 +11504,89 @@ local_key = "alx-test"
             .as_str()
             .unwrap()
             .contains("does not support connect"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn harness_router_connect_kimi_writes_config_and_carries_kimi_models() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("router-connect-kimi");
+        let bin_dir = tmpdir("router-connect-kimi-bin");
+        let binary = fake_executable(&bin_dir, "kimi", "echo kimi 0.27.0");
+        let config_dir = home.join("kimi-code");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        let mut config = test_config(home.clone());
+        config.harness_overrides.insert(
+            "kimi".into(),
+            HarnessOverride {
+                binary: Some(binary),
+                config_dir: Some(config_dir.clone()),
+            },
+        );
+        save_config(&config).unwrap();
+
+        let state = test_state("router-connect-kimi-state");
+        // An active Kimi account is what makes the daemon advertise kimi/*
+        // models; state_models must fold them in so they reach the harness.
+        state
+            .vault
+            .upsert(alex_auth::Account {
+                id: "kimi-router-test".into(),
+                provider: alex_core::Provider::Kimi,
+                kind: "oauth".into(),
+                name: "Kimi router test".into(),
+                description: None,
+                paused: false,
+                label: Some("Kimi".into()),
+                access_token: Some("test-token".into()),
+                refresh_token: None,
+                id_token: None,
+                api_key: None,
+                expires_at_ms: None,
+                last_refresh_ms: None,
+                account_meta: serde_json::Value::Null,
+                cooldown_until_ms: None,
+                status: "active".into(),
+                path: None,
+            })
+            .await
+            .unwrap();
+        let app = harness_admin_router(state.clone());
+
+        // Regression for the "network connection lost" panic: kimi is
+        // connect-capable but had no writer arm, so this endpoint hit
+        // `unreachable!()` and dropped the connection mid-request.
+        let (status, body) = router_json(
+            app.clone(),
+            Method::POST,
+            "/admin/harnesses/kimi/connect",
+            None,
+        )
+        .await;
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
+        assert!(body["models_total"].as_u64().unwrap() > 0);
+        assert!(body["path"].as_str().unwrap().ends_with("config.toml"));
+
+        // The freshly-added Kimi provider's models reached the connected harness.
+        let added: Vec<&str> = body["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert!(added.contains(&"alex/kimi/k3"), "added models: {added:?}");
+        let written = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        assert!(written.contains("alexandria"));
+        assert!(written.contains("alex/kimi/k3"));
+        assert!(state
+            .store
+            .list_run_keys(false)
+            .unwrap()
+            .iter()
+            .any(|k| k["label"] == "kimi"));
     }
 
     #[cfg(unix)]
