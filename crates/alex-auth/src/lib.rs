@@ -1105,6 +1105,12 @@ impl Vault {
                 if let Some(fresh) = self.reimport_native(&account).await {
                     return Ok(fresh);
                 }
+                if refresh_error_needs_reauth(&e) {
+                    if let Err(error) = self.set_account_meta(id, "needs_reauth", json!(true)).await
+                    {
+                        tracing::warn!(account = %id, %error, "could not mark account as needing re-authentication");
+                    }
+                }
                 return Err(e);
             }
         };
@@ -1124,6 +1130,9 @@ impl Vault {
             .map(|s| now_ms() + s * 1000)
             .or_else(|| updated.access_token.as_deref().and_then(jwt_exp_ms));
         updated.last_refresh_ms = Some(now_ms());
+        if let Some(meta) = updated.account_meta.as_object_mut() {
+            meta.remove("needs_reauth");
+        }
         if let Some(email) = updated.email() {
             persist_account_email(&mut updated, &email);
         } else {
@@ -2206,6 +2215,66 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    async fn invalid_grant_refresh_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = r#"{"error":"invalid_grant"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/token"), server)
+    }
+
+    #[tokio::test]
+    async fn anthropic_refresh_rejection_marks_needs_reauth_and_persists_it() {
+        let dir = temp_dir("anthropic-refresh-needs-reauth");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let account_id = "anthropic-oauth-refresh-marker";
+        vault
+            .upsert(oauth_account(
+                account_id,
+                Provider::Anthropic,
+                "refresh-marker@example.test",
+                now_ms() - 60_000,
+            ))
+            .await
+            .unwrap();
+        let (endpoint, server) = invalid_grant_refresh_server().await;
+        vault.set_refresh_endpoint_override(Some(endpoint));
+
+        let error = vault.refresh(account_id, true).await.unwrap_err();
+        assert!(refresh_error_needs_reauth(&error));
+        server.await.unwrap();
+
+        let marked = vault
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .unwrap();
+        assert!(marked.needs_reauth());
+        drop(vault);
+
+        let reopened = Vault::open(dir.clone()).unwrap();
+        assert!(reopened
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .unwrap()
+            .needs_reauth());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

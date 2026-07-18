@@ -10356,7 +10356,13 @@ fn emit_reauth_notification_for_account(state: &Arc<AppState>, account: &Account
     let telegram_enabled = state
         .notifications
         .read()
-        .map(|notifications| notifications.has_enabled_telegram())
+        .map(|notifications| {
+            if account.provider == Provider::Anthropic {
+                notifications.has_enabled_command_telegram()
+            } else {
+                notifications.has_enabled_telegram()
+            }
+        })
         .unwrap_or(false);
     if !telegram_enabled {
         emit_plain_reauth_notification_for_account(state, account);
@@ -10512,7 +10518,13 @@ async fn start_reauth_inner(
         let telegram_enabled = state
             .notifications
             .read()
-            .map(|notifications| notifications.has_enabled_telegram())
+            .map(|notifications| {
+                if provider == Provider::Anthropic {
+                    notifications.has_enabled_command_telegram()
+                } else {
+                    notifications.has_enabled_telegram()
+                }
+            })
             .unwrap_or(false);
         if !telegram_enabled {
             emit_plain_reauth_notification_for_account(state, account);
@@ -10772,14 +10784,23 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         if account.kind != "oauth" || account.paused || account.status != "active" {
             continue;
         }
+        // A permanent refresh failure can be discovered by a forced refresh or
+        // a live 401 before the cached access-token timestamp elapses. That
+        // explicit logout marker wins over the timestamp and must be alerted.
+        if account.provider == Provider::Anthropic && account.needs_reauth() {
+            if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await {
+                tracing::warn!(account = %account.id, %error, "could not start marked re-auth flow");
+            }
+            continue;
+        }
         let Some(expires_at) = account.expires_at_ms else {
             // Unknown expiry: never claim a logout we cannot prove.
             continue;
         };
         if expires_at > now - REAUTH_EXPIRY_GRACE_MS {
-            // Still valid (or only within the normal refresh margin). If it was
-            // previously flagged as logged out, a fresh login/refresh has
-            // recovered it: clear the flag so the next genuine logout alerts.
+            // Device-flow providers retain their existing timestamp-based
+            // recovery behavior. Anthropic's explicit marker was handled
+            // above because its paste flow must not be skipped.
             if account.needs_reauth() {
                 mark_account_needs_reauth(state, &account.id, false).await;
             }
@@ -10805,9 +10826,8 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         // ignored so a network blip never cries wolf.
         match state.vault.refresh(&account.id, true).await {
             Ok(_) => {
-                // Silently recovered. Clear a prior flag (a refresh copies the
-                // old account_meta forward, so an earlier logout mark can
-                // survive the token swap and must be reset here).
+                // Silently recovered. Vault::refresh clears a prior logout
+                // marker with the successful token swap.
                 if account.needs_reauth() {
                     mark_account_needs_reauth(state, &account.id, false).await;
                 }
@@ -10938,6 +10958,132 @@ mod tests {
                 Ok("anthropic-oauth-work".to_string())
             })
         }
+    }
+
+    struct CompletingPasteExchange {
+        account_id: String,
+    }
+
+    impl alex_auth::sessions::PasteCodeExchanger for CompletingPasteExchange {
+        fn exchange(
+            &self,
+            vault: Arc<Vault>,
+            _verifier: String,
+            _input: String,
+            _account_name: String,
+        ) -> alex_auth::sessions::PasteCodeExchangeFuture {
+            let account_id = self.account_id.clone();
+            Box::pin(async move {
+                let updated = vault
+                    .update(&account_id, |account| {
+                        account.access_token = Some("fresh-anthropic-access".into());
+                        account.refresh_token = Some("fresh-anthropic-refresh".into());
+                        account.expires_at_ms = Some(now_ms() + 60 * 60_000);
+                        account.last_refresh_ms = Some(now_ms());
+                    })
+                    .await?;
+                if !updated {
+                    anyhow::bail!("mock account disappeared");
+                }
+                Ok(account_id)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_anthropic_alert_binds_paste_and_completes_reauth() {
+        let (url, received, sink) = webhook_sink().await;
+        let (token_url, token_server) = invalid_grant_token_server().await;
+        let state = test_state("watchdog-anthropic-paste-complete");
+        state.vault.set_refresh_endpoint_override(Some(token_url));
+        let account_id = "anthropic-oauth-work";
+        let account = anthropic_account_full(
+            account_id,
+            "work",
+            "work@example.test",
+            now_ms() + 60 * 60_000,
+        );
+        state.vault.upsert(account).await.unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url,
+                    chat_id: Some("42".into()),
+                    allow_commands: true,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        state
+            .logins
+            .set_paste_code_exchanger(Arc::new(CompletingPasteExchange {
+                account_id: account_id.into(),
+            }));
+
+        let refresh_error = state.vault.refresh(account_id, true).await.unwrap_err();
+        assert!(alex_auth::refresh_error_needs_reauth(&refresh_error));
+        assert!(needs_reauth_flag(&state, account_id).await);
+        reauth_watch_once(&state).await;
+
+        let payload = first_event(
+            &received,
+            "watchdog did not send the Anthropic paste-mode Telegram alert",
+        )
+        .await;
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("work@example.test"));
+        assert!(text.contains("https://claude.ai/oauth/authorize"));
+        assert!(text.contains("After approving, paste the code#state here."));
+        assert!(matches!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::Pending(_)
+        ));
+        assert!(needs_reauth_flag(&state, account_id).await);
+
+        reauth_watch_once(&state).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "an active watchdog login must be reused, not duplicated"
+        );
+
+        let completed = complete_reauth_code(&state, "control", "mock-code#mock-state")
+            .await
+            .unwrap();
+        assert_eq!(completed["ok"], true);
+        assert_eq!(completed["provider"], "anthropic");
+        assert!(!needs_reauth_flag(&state, account_id).await);
+        let excluded: HashSet<String> = state
+            .vault
+            .list()
+            .await
+            .into_iter()
+            .filter(|account| account.id != account_id)
+            .map(|account| account.id)
+            .collect();
+        let working = state
+            .vault
+            .account_for_excluding(Provider::Anthropic, true, &excluded)
+            .await
+            .unwrap();
+        assert_eq!(working.id, account_id);
+        assert_eq!(
+            working.access_token.as_deref(),
+            Some("fresh-anthropic-access")
+        );
+        sink.abort();
+        token_server.abort();
     }
 
     #[tokio::test]
