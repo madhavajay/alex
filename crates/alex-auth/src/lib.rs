@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -414,16 +415,10 @@ fn account_proxy_eligible(account: &Account, policy: &AccountPolicy) -> bool {
         .any(|name| name == &account.name || name == &account.id)
 }
 
-fn sort_by_policy(
-    accounts: &mut Vec<Account>,
-    policy: &AccountPolicy,
-    prefer_oauth: bool,
-    rr: usize,
-) {
+fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oauth: bool) {
     let now_s = now_ms() / 1000;
     match policy.mode {
         AccountPolicyMode::RoundRobin => {
-            let _ = rr;
             accounts.sort_by_key(|a| {
                 (
                     oauth_rank(a, prefer_oauth),
@@ -665,36 +660,36 @@ impl Vault {
 
     pub async fn record_routing_limits(&self, id: &str, mut snapshot: Value) -> Result<()> {
         let now = now_ms();
-        let mut account = self
-            .accounts
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        if account
-            .account_meta
-            .get("routing_limits")
-            .or_else(|| account.account_meta.get("codex_limits"))
-            .and_then(|value| value.get("observed_at_ms"))
-            .and_then(Value::as_i64)
-            .map(|observed| now - observed < 30_000)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
         if let Some(object) = snapshot.as_object_mut() {
             object.insert("observed_at_ms".into(), json!(now));
         }
-        if !account.account_meta.is_object() {
-            account.account_meta = json!({});
+        if !self
+            .update(id, |account| {
+                if account
+                    .account_meta
+                    .get("routing_limits")
+                    .or_else(|| account.account_meta.get("codex_limits"))
+                    .and_then(|value| value.get("observed_at_ms"))
+                    .and_then(Value::as_i64)
+                    .map(|observed| now - observed < 30_000)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                if !account.account_meta.is_object() {
+                    account.account_meta = json!({});
+                }
+                account
+                    .account_meta
+                    .as_object_mut()
+                    .expect("account_meta initialized as object")
+                    .insert("routing_limits".into(), snapshot);
+            })
+            .await?
+        {
+            bail!("unknown account {id}");
         }
-        account
-            .account_meta
-            .as_object_mut()
-            .expect("account_meta initialized as object")
-            .insert("routing_limits".into(), snapshot);
-        self.upsert(account).await
+        Ok(())
     }
 
     pub async fn pause(&self, provider: Provider, name: &str, paused: bool) -> Result<()> {
@@ -706,21 +701,20 @@ impl Vault {
             .find(|a| a.provider == provider && a.name == name)
             .cloned()
             .ok_or_else(|| anyhow!("unknown {} account '{name}'", provider.as_str()))?;
-        let mut account = account;
-        account.paused = paused;
-        self.upsert(account).await
+        if !self
+            .update(&account.id, |account| account.paused = paused)
+            .await?
+        {
+            bail!("unknown {} account '{name}'", provider.as_str());
+        }
+        Ok(())
     }
 
     pub async fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
-        let mut account = self
-            .accounts
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        account.paused = paused;
-        self.upsert(account).await
+        if !self.update(id, |account| account.paused = paused).await? {
+            bail!("unknown account {id}");
+        }
+        Ok(())
     }
 
     pub async fn has_account_name(&self, provider: Provider, name: &str) -> bool {
@@ -738,6 +732,22 @@ impl Vault {
             .await
             .insert(account.id.clone(), account);
         Ok(())
+    }
+
+    /// Mutate an existing account while holding the write lock, then persist
+    /// the resulting account once. Returns `false` when `id` does not exist.
+    pub async fn update(&self, id: &str, f: impl FnOnce(&mut Account)) -> Result<bool> {
+        let mut accounts = self.accounts.write().await;
+        let Some(account) = accounts.get_mut(id) else {
+            return Ok(false);
+        };
+        let previous = account.clone();
+        f(account);
+        if let Err(error) = write_account_file(&self.dir, account) {
+            *account = previous;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub async fn remove(&self, id: &str) -> Result<bool> {
@@ -946,12 +956,7 @@ impl Vault {
                 .collect();
             let policy = self.policy(provider);
             v.retain(|account| account_proxy_eligible(account, &policy));
-            sort_by_policy(
-                &mut v,
-                &policy,
-                prefer_oauth,
-                self.rr_counter.load(Ordering::Relaxed),
-            );
+            sort_by_policy(&mut v, &policy, prefer_oauth);
             v
         };
         if candidates.is_empty() {
@@ -1027,30 +1032,26 @@ impl Vault {
     }
 
     pub async fn mark_cooldown(&self, id: &str, until_ms: i64) -> Result<()> {
-        let mut account = self
-            .accounts
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        account.cooldown_until_ms = Some(until_ms);
-        self.upsert(account).await
+        if !self
+            .update(id, |account| account.cooldown_until_ms = Some(until_ms))
+            .await?
+        {
+            bail!("unknown account {id}");
+        }
+        Ok(())
     }
 
     /// A successful health probe makes the account immediately eligible again.
     /// This prevents a transient capacity/server failure from becoming a
     /// sticky downgrade after the upstream has recovered.
     pub async fn clear_cooldown(&self, id: &str) -> Result<()> {
-        let mut account = self
-            .accounts
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        account.cooldown_until_ms = None;
-        self.upsert(account).await
+        if !self
+            .update(id, |account| account.cooldown_until_ms = None)
+            .await?
+        {
+            bail!("unknown account {id}");
+        }
+        Ok(())
     }
 
     pub async fn refresh(&self, id: &str, force: bool) -> Result<Account> {
@@ -1269,18 +1270,18 @@ impl Vault {
     }
 
     pub async fn set_account_meta(&self, id: &str, key: &str, value: Value) -> Result<()> {
-        let mut account = self
-            .accounts
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown account {id}"))?;
-        if !account.account_meta.is_object() {
-            account.account_meta = json!({});
+        if !self
+            .update(id, |account| {
+                if !account.account_meta.is_object() {
+                    account.account_meta = json!({});
+                }
+                account.account_meta[key] = value;
+            })
+            .await?
+        {
+            bail!("unknown account {id}");
         }
-        account.account_meta[key] = value;
-        self.upsert(account).await
+        Ok(())
     }
 }
 
@@ -1364,14 +1365,53 @@ fn account_path(dir: &Path, account: &Account) -> PathBuf {
 
 fn write_account_file(dir: &Path, account: &Account) -> Result<()> {
     let path = account_path(dir, account);
-    let data = serde_json::to_string_pretty(account)?;
-    std::fs::write(&path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    atomic_write_private(&path, &serde_json::to_vec_pretty(account)?)
+}
+
+pub(crate) fn atomic_write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("file has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    let mut temporary = None;
+    for _ in 0..16 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(())
+    let (temporary_path, mut file) = temporary
+        .ok_or_else(|| anyhow!("could not create temporary file beside {}", path.display()))?;
+    let result = (|| -> Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn read_routing_policies(dir: &Path) -> Result<Vec<(Provider, AccountPolicy)>> {
@@ -2166,6 +2206,60 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_account_updates_preserve_both_mutations() {
+        let dir = temp_dir("concurrent-update");
+        let vault = Arc::new(Vault::open(dir.clone()).unwrap());
+        vault
+            .upsert(api_key_account("openai-key-work", Provider::Openai))
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let pause_task = {
+            let vault = vault.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                vault.set_paused("openai-key-work", true).await.unwrap();
+            })
+        };
+        let meta_task = {
+            let vault = vault.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                vault
+                    .set_account_meta("openai-key-work", "updated_by", json!("second-task"))
+                    .await
+                    .unwrap();
+            })
+        };
+        barrier.wait().await;
+        pause_task.await.unwrap();
+        meta_task.await.unwrap();
+
+        let account = vault
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == "openai-key-work")
+            .unwrap();
+        assert!(account.paused);
+        assert_eq!(account.account_meta["updated_by"], json!("second-task"));
+
+        let reopened = Vault::open(dir.clone()).unwrap();
+        let persisted = reopened
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == "openai-key-work")
+            .unwrap();
+        assert!(persisted.paused);
+        assert_eq!(persisted.account_meta["updated_by"], json!("second-task"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::{now_ms, Account, Vault};
+use crate::{atomic_write_private, now_ms, Account, Vault};
 
 const BUNDLE_VERSION: u8 = 1;
 const SALT_LEN: usize = 16;
@@ -273,8 +273,7 @@ pub async fn import_bundle_in(
         if destination.exists() {
             std::fs::copy(&destination, destination.with_extension("bak"))?;
         }
-        std::fs::write(&destination, &credential.bytes)?;
-        set_mode(&destination, credential.mode);
+        atomic_write_private(&destination, &credential.bytes)?;
         summary.harness_credentials.push(format!(
             "{}/{}",
             credential.harness, credential.logical_name
@@ -294,14 +293,6 @@ fn file_mode(path: &Path) -> u32 {
 fn file_mode(_: &Path) -> u32 {
     0o600
 }
-#[cfg(unix)]
-fn set_mode(path: &Path, _: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn set_mode(_: &Path, _: u32) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

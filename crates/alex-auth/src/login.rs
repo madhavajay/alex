@@ -390,7 +390,7 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
     }
 }
 
-fn validate_account_name(name: &str) -> Result<()> {
+pub(crate) fn validate_account_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 32
         || !name
@@ -580,6 +580,45 @@ pub struct CodexDeviceStart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeviceFlowPoll<T> {
+    Pending,
+    SlowDown,
+    Done(T),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeviceFlowError {
+    Expired,
+    Failed(String),
+}
+
+pub(crate) async fn poll_device_flow<T, P, F, Fut>(
+    deadline_ms: i64,
+    initial_interval_s: u64,
+    mut poll_fn: F,
+) -> std::result::Result<T, DeviceFlowError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = P>,
+    P: Into<DeviceFlowPoll<T>>,
+{
+    let mut interval_s = initial_interval_s;
+    loop {
+        if now_ms() > deadline_ms {
+            return Err(DeviceFlowError::Expired);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval_s)).await;
+        match poll_fn().await.into() {
+            DeviceFlowPoll::Pending => continue,
+            DeviceFlowPoll::SlowDown => interval_s += 5,
+            DeviceFlowPoll::Done(value) => return Ok(value),
+            DeviceFlowPoll::Failed(error) => return Err(DeviceFlowError::Failed(error)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexDevicePoll {
     Pending,
     Done {
@@ -587,6 +626,19 @@ pub enum CodexDevicePoll {
         code_verifier: String,
     },
     Failed(String),
+}
+
+impl From<CodexDevicePoll> for DeviceFlowPoll<(String, String)> {
+    fn from(poll: CodexDevicePoll) -> Self {
+        match poll {
+            CodexDevicePoll::Pending => Self::Pending,
+            CodexDevicePoll::Done {
+                authorization_code,
+                code_verifier,
+            } => Self::Done((authorization_code, code_verifier)),
+            CodexDevicePoll::Failed(error) => Self::Failed(error),
+        }
+    }
 }
 
 pub async fn codex_device_start(client: &reqwest::Client) -> Result<CodexDeviceStart> {
@@ -1010,12 +1062,57 @@ fn default_device_interval() -> i64 {
     5
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DevicePollFailure {
+    Pending,
+    SlowDown,
+    Failed(String),
+}
+
+fn parse_device_poll_failure(provider: &str, status: u16, body: &str) -> DevicePollFailure {
+    let error = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(String::from))
+        .unwrap_or_default();
+    match error.as_str() {
+        "authorization_pending" => DevicePollFailure::Pending,
+        "slow_down" => DevicePollFailure::SlowDown,
+        "access_denied" => DevicePollFailure::Failed("authorization denied".into()),
+        "expired_token" => DevicePollFailure::Failed("device code expired".into()),
+        other => DevicePollFailure::Failed(format!(
+            "{provider} token exchange failed ({status}): {}",
+            if other.is_empty() { body } else { other }
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum XaiDevicePoll {
     Pending,
     SlowDown,
     Done(Box<XaiTokens>),
     Failed(String),
+}
+
+impl From<XaiDevicePoll> for DeviceFlowPoll<Box<XaiTokens>> {
+    fn from(poll: XaiDevicePoll) -> Self {
+        match poll {
+            XaiDevicePoll::Pending => Self::Pending,
+            XaiDevicePoll::SlowDown => Self::SlowDown,
+            XaiDevicePoll::Done(tokens) => Self::Done(tokens),
+            XaiDevicePoll::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+impl From<DevicePollFailure> for XaiDevicePoll {
+    fn from(poll: DevicePollFailure) -> Self {
+        match poll {
+            DevicePollFailure::Pending => Self::Pending,
+            DevicePollFailure::SlowDown => Self::SlowDown,
+            DevicePollFailure::Failed(error) => Self::Failed(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1050,20 +1147,7 @@ pub fn parse_xai_device_poll(status: u16, body: &str) -> XaiDevicePoll {
             Err(e) => XaiDevicePoll::Failed(format!("bad xai token response: {e}")),
         };
     }
-    let err = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"].as_str().map(String::from))
-        .unwrap_or_default();
-    match err.as_str() {
-        "authorization_pending" => XaiDevicePoll::Pending,
-        "slow_down" => XaiDevicePoll::SlowDown,
-        "access_denied" => XaiDevicePoll::Failed("authorization denied".into()),
-        "expired_token" => XaiDevicePoll::Failed("device code expired".into()),
-        other => XaiDevicePoll::Failed(format!(
-            "xai token exchange failed ({status}): {}",
-            if other.is_empty() { body } else { other }
-        )),
-    }
+    parse_device_poll_failure("xai", status, body).into()
 }
 
 pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> XaiDevicePoll {
@@ -1159,24 +1243,18 @@ async fn login_grok(vault: &Vault, account_name: &str) -> Result<String> {
     println!("open this url on any device to authorize:\n\n  {url}\n");
     println!("enter this code when asked: {}", start.user_code);
     open_browser(&url);
-    let deadline = now_ms() + start.expires_in * 1000;
-    let mut interval = start.interval.max(1) as u64;
-    loop {
-        if now_ms() > deadline {
-            bail!("device code expired before authorization completed");
+    let tokens = poll_device_flow(
+        now_ms() + start.expires_in * 1000,
+        start.interval.max(1) as u64,
+        || xai_device_poll_once(&http, &start.device_code),
+    )
+    .await;
+    match tokens {
+        Ok(tokens) => xai_upsert_from_tokens(vault, &tokens, account_name).await,
+        Err(DeviceFlowError::Expired) => {
+            bail!("device code expired before authorization completed")
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        match xai_device_poll_once(&http, &start.device_code).await {
-            XaiDevicePoll::Pending => continue,
-            XaiDevicePoll::SlowDown => {
-                interval += 5;
-                continue;
-            }
-            XaiDevicePoll::Done(tokens) => {
-                return xai_upsert_from_tokens(vault, &tokens, account_name).await
-            }
-            XaiDevicePoll::Failed(e) => bail!("xai device login failed: {e}"),
-        }
+        Err(DeviceFlowError::Failed(error)) => bail!("xai device login failed: {error}"),
     }
 }
 
@@ -1219,6 +1297,27 @@ pub enum KimiDevicePoll {
     SlowDown,
     Done(Box<KimiTokens>),
     Failed(String),
+}
+
+impl From<KimiDevicePoll> for DeviceFlowPoll<Box<KimiTokens>> {
+    fn from(poll: KimiDevicePoll) -> Self {
+        match poll {
+            KimiDevicePoll::Pending => Self::Pending,
+            KimiDevicePoll::SlowDown => Self::SlowDown,
+            KimiDevicePoll::Done(tokens) => Self::Done(tokens),
+            KimiDevicePoll::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+impl From<DevicePollFailure> for KimiDevicePoll {
+    fn from(poll: DevicePollFailure) -> Self {
+        match poll {
+            DevicePollFailure::Pending => Self::Pending,
+            DevicePollFailure::SlowDown => Self::SlowDown,
+            DevicePollFailure::Failed(error) => Self::Failed(error),
+        }
+    }
 }
 
 /// The verification URL the user opens. Prefer the server-provided complete URL;
@@ -1273,9 +1372,7 @@ pub async fn kimi_device_start_at(
 pub fn parse_kimi_device_poll(status: u16, body: &str) -> KimiDevicePoll {
     if (200..300).contains(&status) {
         return match serde_json::from_str::<KimiTokens>(body) {
-            Ok(tokens) if !tokens.access_token.is_empty() => {
-                KimiDevicePoll::Done(Box::new(tokens))
-            }
+            Ok(tokens) if !tokens.access_token.is_empty() => KimiDevicePoll::Done(Box::new(tokens)),
             Ok(_) => KimiDevicePoll::Failed("kimi token response missing access_token".into()),
             Err(e) => KimiDevicePoll::Failed(format!("bad kimi token response: {e}")),
         };
@@ -1283,26 +1380,10 @@ pub fn parse_kimi_device_poll(status: u16, body: &str) -> KimiDevicePoll {
     if status >= 500 {
         return KimiDevicePoll::Failed(format!("kimi token endpoint server error ({status})"));
     }
-    let err = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v["error"].as_str().map(String::from))
-        .unwrap_or_default();
-    match err.as_str() {
-        "authorization_pending" => KimiDevicePoll::Pending,
-        "slow_down" => KimiDevicePoll::SlowDown,
-        "access_denied" => KimiDevicePoll::Failed("authorization denied".into()),
-        "expired_token" => KimiDevicePoll::Failed("device code expired".into()),
-        other => KimiDevicePoll::Failed(format!(
-            "kimi token exchange failed ({status}): {}",
-            if other.is_empty() { body } else { other }
-        )),
-    }
+    parse_device_poll_failure("kimi", status, body).into()
 }
 
-pub async fn kimi_device_poll_once(
-    http: &reqwest::Client,
-    device_code: &str,
-) -> KimiDevicePoll {
+pub async fn kimi_device_poll_once(http: &reqwest::Client, device_code: &str) -> KimiDevicePoll {
     kimi_device_poll_once_at(http, &kimi_oauth_host(), device_code).await
 }
 
@@ -1369,24 +1450,18 @@ async fn login_kimi(vault: &Vault, account_name: &str) -> Result<String> {
     println!("open this url on any device to authorize kimi:\n\n  {url}\n");
     println!("enter this code when asked: {}", start.user_code);
     open_browser(&url);
-    let deadline = now_ms() + start.expires_in * 1000;
-    let mut interval = start.interval.max(1) as u64;
-    loop {
-        if now_ms() > deadline {
-            bail!("device code expired before authorization completed");
+    let tokens = poll_device_flow(
+        now_ms() + start.expires_in * 1000,
+        start.interval.max(1) as u64,
+        || kimi_device_poll_once(&http, &start.device_code),
+    )
+    .await;
+    match tokens {
+        Ok(tokens) => kimi_upsert_from_tokens(vault, &tokens, account_name).await,
+        Err(DeviceFlowError::Expired) => {
+            bail!("device code expired before authorization completed")
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        match kimi_device_poll_once(&http, &start.device_code).await {
-            KimiDevicePoll::Pending => continue,
-            KimiDevicePoll::SlowDown => {
-                interval += 5;
-                continue;
-            }
-            KimiDevicePoll::Done(tokens) => {
-                return kimi_upsert_from_tokens(vault, &tokens, account_name).await
-            }
-            KimiDevicePoll::Failed(e) => bail!("kimi device login failed: {e}"),
-        }
+        Err(DeviceFlowError::Failed(error)) => bail!("kimi device login failed: {error}"),
     }
 }
 
