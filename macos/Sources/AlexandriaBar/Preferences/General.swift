@@ -27,6 +27,9 @@ struct GeneralPreferencesPane: View {
     @State private var daemonChannel: String?
     @State private var applyingChannel = false
     @State private var channelStatus: String?
+    @State private var applyingDaemonUpdate = false
+    @State private var daemonUpdateTarget: String?
+    @State private var daemonUpdateStatus: String?
     @State private var launchAtLogin = false
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
@@ -61,6 +64,9 @@ struct GeneralPreferencesPane: View {
         .onChange(of: store.config?.host) {
             loadNetworkExposure()
             loadDaemonChannel()
+        }
+        .onChange(of: store.daemonUpdate) { _, update in
+            reconcileDaemonUpdate(update)
         }
     }
 
@@ -175,6 +181,24 @@ struct GeneralPreferencesPane: View {
         .padding(.vertical, 2)
         if let channelStatus {
             SettingCaption(channelStatus)
+        }
+        if let update = store.daemonUpdate, update.updateAvailable, let latest = update.latest {
+            RowDivider()
+            SettingRow(
+                label: "Daemon update",
+                hint: "\(update.current) → \(latest)"
+            ) {
+                PillButton(
+                    title: applyingDaemonUpdate ? "Updating…" : "Update",
+                    variant: .solidOrange,
+                    isEnabled: !applyingDaemonUpdate && store.config != nil
+                ) {
+                    applyDaemonUpdate(current: update.current, latest: latest)
+                }
+            }
+        }
+        if let daemonUpdateStatus {
+            SettingCaption(daemonUpdateStatus)
         }
         if UpdateChannelSetting.from(selectedChannel) == .beta {
             SettingCaption(
@@ -502,6 +526,51 @@ struct GeneralPreferencesPane: View {
             }
             applyingChannel = false
         }
+    }
+
+    private func applyDaemonUpdate(current: String, latest: String) {
+        guard let cfg = store.config else {
+            daemonUpdateStatus = "Daemon unreachable — update could not be started."
+            return
+        }
+        applyingDaemonUpdate = true
+        daemonUpdateTarget = latest
+        daemonUpdateStatus = "Updating daemon: \(current) → \(latest)"
+        Task {
+            do {
+                let response = try await AlexandriaClient(config: cfg).daemonUpdateApply()
+                if response.applying {
+                    await store.refresh()
+                } else {
+                    applyingDaemonUpdate = false
+                    daemonUpdateTarget = nil
+                    daemonUpdateStatus =
+                        "Daemon is already up to date at \(response.current ?? current)"
+                }
+            } catch AlexandriaClient.ClientError.daemonUpdateRejected(let reason) {
+                applyingDaemonUpdate = false
+                daemonUpdateTarget = nil
+                daemonUpdateStatus = reason
+            } catch {
+                applyingDaemonUpdate = false
+                daemonUpdateTarget = nil
+                daemonUpdateStatus = error.localizedDescription
+            }
+        }
+    }
+
+    private func reconcileDaemonUpdate(_ update: DaemonUpdateStatus?) {
+        guard applyingDaemonUpdate, let target = daemonUpdateTarget, let update else { return }
+        if versionsMatch(update.current, target), !update.updateAvailable {
+            applyingDaemonUpdate = false
+            daemonUpdateTarget = nil
+            daemonUpdateStatus = "Daemon updated to \(target)"
+        }
+    }
+
+    private func versionsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+            == rhs.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
     }
 
     private func copyGenericCredentials() {

@@ -8585,19 +8585,31 @@ fn graceful_or_hard_restart(
 }
 
 fn process_running(pid: i64) -> Result<bool> {
-    let status = std::process::Command::new("kill")
+    // Capture stderr: `kill -0` reports ESRCH as "No such process", but that
+    // is the successful end state while waiting for a graceful drain.
+    let output = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
-        .status()
+        .output()
         .context("checking daemon process")?;
-    Ok(status.success())
+    Ok(output.status.success())
 }
 
 async fn drain_launchd_daemon(pid: i64, timeout: std::time::Duration) -> Result<()> {
-    let status = std::process::Command::new("kill")
+    if !process_running(pid)? {
+        println!("old daemon already drained and exited");
+        return Ok(());
+    }
+    let output = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
-        .status()
+        .output()
         .context("signalling launchd daemon to drain")?;
-    if !status.success() {
+    if !output.status.success() {
+        // The daemon may exit between the liveness check and SIGTERM. That is
+        // still a completed graceful drain, not a reason to hard-restart.
+        if !process_running(pid)? {
+            println!("old daemon already drained and exited");
+            return Ok(());
+        }
         anyhow::bail!("could not signal launchd daemon to drain")
     }
     if !wait_for_process_exit(timeout, || process_running(pid)).await? {
@@ -8607,9 +8619,10 @@ async fn drain_launchd_daemon(pid: i64, timeout: std::time::Duration) -> Result<
         );
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
-            .status();
+            .output();
         anyhow::bail!("launchd daemon did not exit after the drain timeout")
     }
+    println!("old daemon drained and exited");
     Ok(())
 }
 
@@ -10918,6 +10931,14 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_treats_an_already_gone_pid_as_success() {
+        drain_launchd_daemon(i64::MAX, std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     #[test]

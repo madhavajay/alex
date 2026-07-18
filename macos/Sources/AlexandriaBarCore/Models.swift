@@ -784,12 +784,14 @@ public struct DaemonUpdateStatus: Codable, Sendable, Equatable {
     public let current: String
     public let latest: String?
     public let updateAvailable: Bool
+    public let updateChannel: String?
     public let notesUrl: String?
     public let checkedAtMs: Int64?
 
     enum CodingKeys: String, CodingKey {
         case current, latest
         case updateAvailable = "update_available"
+        case updateChannel = "update_channel"
         case notesUrl = "notes_url"
         case checkedAtMs = "checked_at_ms"
     }
@@ -814,12 +816,14 @@ public struct DaemonUpdateApplyResponse: Codable, Sendable, Equatable {
     public let current: String?
     public let latest: String?
     public let updateAvailable: Bool?
+    public let updateChannel: String?
     public let notesUrl: String?
     public let reason: String?
 
     enum CodingKeys: String, CodingKey {
         case applying, current, latest, reason
         case updateAvailable = "update_available"
+        case updateChannel = "update_channel"
         case notesUrl = "notes_url"
     }
 }
