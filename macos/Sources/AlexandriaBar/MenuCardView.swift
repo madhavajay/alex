@@ -1053,6 +1053,9 @@ enum ProviderMenuIcon {
         "gemini": "gemini",
         "amp": "amp",
         "openrouter": "openrouter",
+        // Use the same Kimi logo for the subscription/provider icon as the
+        // harness, instead of the drawn "K" chip fallback.
+        "kimi": "kimi-code",
     ]
 
     /// Brand tile backgrounds so dark logos stay legible (mock: Claude on
