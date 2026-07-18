@@ -380,12 +380,12 @@ pub async fn login_named(vault: &Vault, provider: &str, name: &str, force: bool)
         );
     }
     match provider {
-        "claude" | "anthropic" => login_claude(vault).await,
+        "claude" | "anthropic" => login_claude(vault, name).await,
         "codex" | "openai" | "chatgpt" => login_codex(vault, name).await,
-        "grok" | "xai" => login_grok(vault).await,
-        "gemini" | "google" => login_gemini(vault).await,
+        "grok" | "xai" => login_grok(vault, name).await,
+        "gemini" | "google" => login_gemini(vault, name).await,
         "amp" | "ampcode" => login_amp(vault).await,
-        "kimi" | "kimi-code" => login_kimi(vault).await,
+        "kimi" | "kimi-code" => login_kimi(vault, name).await,
         _ => unreachable!(),
     }
 }
@@ -453,7 +453,12 @@ async fn login_amp(vault: &Vault) -> Result<String> {
     save_amp_api_key(vault, key).await
 }
 
-pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Result<String> {
+pub async fn claude_exchange(
+    vault: &Vault,
+    verifier: &str,
+    input: &str,
+    account_name: &str,
+) -> Result<String> {
     let (code, state) = parse_authorization_input(input);
     let code = code.ok_or_else(|| anyhow!("no authorization code provided"))?;
     if let Some(s) = &state {
@@ -515,17 +520,16 @@ pub async fn claude_exchange(vault: &Vault, verifier: &str, input: &str) -> Resu
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    vault.upsert(account).await?;
-    Ok("anthropic-oauth".into())
+    save_named_login_account(vault, account, account_name).await
 }
 
-async fn login_claude(vault: &Vault) -> Result<String> {
+async fn login_claude(vault: &Vault, account_name: &str) -> Result<String> {
     let pkce = generate_pkce();
     let url = anthropic_authorize_url(&pkce.challenge, &pkce.verifier);
     println!("open this url to authorize:\n\n  {url}\n");
     open_browser(&url);
     let input = prompt_line("paste the authorization code (format: code#state): ").await?;
-    claude_exchange(vault, &pkce.verifier, &input).await
+    claude_exchange(vault, &pkce.verifier, &input, account_name).await
 }
 
 pub async fn codex_exchange(vault: &Vault, verifier: &str, code: &str) -> Result<String> {
@@ -923,6 +927,7 @@ pub async fn gemini_exchange(
     verifier: &str,
     redirect_uri: &str,
     code: &str,
+    account_name: &str,
 ) -> Result<String> {
     let resp = reqwest::Client::new()
         .post(crate::GOOGLE_TOKEN_URL)
@@ -965,8 +970,7 @@ pub async fn gemini_exchange(
         status: "active".into(),
         path: None,
     };
-    vault.upsert(account).await?;
-    Ok("gemini-oauth".into())
+    save_named_login_account(vault, account, account_name).await
 }
 
 pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
@@ -977,7 +981,7 @@ pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
     Ok((listener, port))
 }
 
-async fn login_gemini(vault: &Vault) -> Result<String> {
+async fn login_gemini(vault: &Vault, account_name: &str) -> Result<String> {
     let (listener, port) = bind_loopback().await?;
     let redirect_uri = format!("http://localhost:{port}{GEMINI_CALLBACK_PATH}");
     let pkce = generate_pkce();
@@ -987,7 +991,7 @@ async fn login_gemini(vault: &Vault) -> Result<String> {
     println!("waiting for the browser callback on {redirect_uri} ...");
     open_browser(&url);
     let code = wait_for_loopback_callback(&listener, &state, GEMINI_CALLBACK_PATH).await?;
-    gemini_exchange(vault, &pkce.verifier, &redirect_uri, &code).await
+    gemini_exchange(vault, &pkce.verifier, &redirect_uri, &code, account_name).await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1082,7 +1086,11 @@ pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> 
     }
 }
 
-pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result<String> {
+pub async fn xai_upsert_from_tokens(
+    vault: &Vault,
+    tokens: &XaiTokens,
+    account_name: &str,
+) -> Result<String> {
     // Prefer xAI's HTTPS OIDC userinfo response over locally decoded JWT
     // claims. The latter are not signature-verified here.
     let email =
@@ -1120,11 +1128,10 @@ pub async fn xai_upsert_from_tokens(vault: &Vault, tokens: &XaiTokens) -> Result
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    vault.upsert(account).await?;
-    Ok("xai-oauth".into())
+    save_named_login_account(vault, account, account_name).await
 }
 
-async fn login_grok(vault: &Vault) -> Result<String> {
+async fn login_grok(vault: &Vault, account_name: &str) -> Result<String> {
     let http = reqwest::Client::new();
     let start = match xai_device_start(&http).await {
         Ok(s) => s,
@@ -1165,7 +1172,9 @@ async fn login_grok(vault: &Vault) -> Result<String> {
                 interval += 5;
                 continue;
             }
-            XaiDevicePoll::Done(tokens) => return xai_upsert_from_tokens(vault, &tokens).await,
+            XaiDevicePoll::Done(tokens) => {
+                return xai_upsert_from_tokens(vault, &tokens, account_name).await
+            }
             XaiDevicePoll::Failed(e) => bail!("xai device login failed: {e}"),
         }
     }
@@ -1323,7 +1332,11 @@ pub async fn kimi_device_poll_once_at(
     }
 }
 
-pub async fn kimi_upsert_from_tokens(vault: &Vault, tokens: &KimiTokens) -> Result<String> {
+pub async fn kimi_upsert_from_tokens(
+    vault: &Vault,
+    tokens: &KimiTokens,
+    account_name: &str,
+) -> Result<String> {
     let account = crate::kimi_account_from_credentials(
         tokens.access_token.clone(),
         tokens.refresh_token.clone(),
@@ -1331,12 +1344,10 @@ pub async fn kimi_upsert_from_tokens(vault: &Vault, tokens: &KimiTokens) -> Resu
         tokens.expires_in,
         tokens.scope.clone(),
     );
-    let id = account.id.clone();
-    vault.upsert(account).await?;
-    Ok(id)
+    save_named_login_account(vault, account, account_name).await
 }
 
-async fn login_kimi(vault: &Vault) -> Result<String> {
+async fn login_kimi(vault: &Vault, account_name: &str) -> Result<String> {
     let http = reqwest::Client::new();
     let start = match kimi_device_start(&http).await {
         Ok(start) => start,
@@ -1371,7 +1382,9 @@ async fn login_kimi(vault: &Vault) -> Result<String> {
                 interval += 5;
                 continue;
             }
-            KimiDevicePoll::Done(tokens) => return kimi_upsert_from_tokens(vault, &tokens).await,
+            KimiDevicePoll::Done(tokens) => {
+                return kimi_upsert_from_tokens(vault, &tokens, account_name).await
+            }
             KimiDevicePoll::Failed(e) => bail!("kimi device login failed: {e}"),
         }
     }
@@ -1401,6 +1414,99 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    fn test_claude_account(token: &str) -> Account {
+        Account {
+            id: named_account_id(Provider::Anthropic, "oauth", "default"),
+            provider: Provider::Anthropic,
+            kind: "oauth".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
+            label: Some("claude (test)".into()),
+            access_token: Some(token.into()),
+            refresh_token: Some(format!("refresh-{token}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 60_000),
+            last_refresh_ms: Some(now_ms()),
+            account_meta: json!({"scopes": []}),
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn named_claude_save_preserves_existing_default_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "alexandria-named-claude-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let vault = Vault::open(dir.clone()).unwrap();
+        vault
+            .upsert(test_claude_account("default-token"))
+            .await
+            .unwrap();
+        let default_path = dir.join("anthropic-oauth.json");
+        let default_before = std::fs::read(&default_path).unwrap();
+
+        let named_id = save_named_login_account(&vault, test_claude_account("work-token"), "work")
+            .await
+            .unwrap();
+
+        assert_eq!(named_id, "anthropic-oauth-work");
+        assert_eq!(std::fs::read(&default_path).unwrap(), default_before);
+        assert!(dir.join("anthropic-oauth-work.json").exists());
+        assert!(!dir.join("removed-accounts").exists());
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.id == "anthropic-oauth")
+                .and_then(|account| account.access_token.as_deref()),
+            Some("default-token")
+        );
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.id == "anthropic-oauth-work")
+                .and_then(|account| account.access_token.as_deref()),
+            Some("work-token")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unnamed_kimi_upsert_uses_default_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "alexandria-default-kimi-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let vault = Vault::open(dir.clone()).unwrap();
+        let tokens = KimiTokens {
+            access_token: "default-token".into(),
+            refresh_token: Some("default-refresh".into()),
+            expires_in: Some(900),
+            scope: Some("kimi-code".into()),
+        };
+
+        let account_id = kimi_upsert_from_tokens(&vault, &tokens, "default")
+            .await
+            .unwrap();
+
+        assert_eq!(account_id, "kimi-oauth");
+        assert!(dir.join("kimi-oauth.json").exists());
+        assert!(!dir.join("kimi-oauth-default.json").exists());
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "kimi-oauth");
+        assert_eq!(accounts[0].name, "default");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

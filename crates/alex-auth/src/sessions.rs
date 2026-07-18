@@ -13,7 +13,7 @@ use crate::login::{
     xai_upsert_from_tokens, CodexDevicePoll, KimiDevicePoll, XaiDevicePoll, OPENAI_CALLBACK_ADDR,
     OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
-use crate::{named_account_id, now_ms, Vault};
+use crate::{now_ms, Vault};
 
 const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
 
@@ -189,17 +189,8 @@ impl LoginManager {
             .verifier
             .clone()
             .context("session has no verifier")?;
-        match claude_exchange(&vault, &verifier, input).await {
-            Ok(account_id) => {
-                match rename_login_account(&vault, &account_id, &session.account_name).await {
-                    Ok(account_id) => session.phase = LoginPhase::Done { account_id },
-                    Err(e) => {
-                        session.phase = LoginPhase::Failed {
-                            error: e.to_string(),
-                        }
-                    }
-                }
-            }
+        match claude_exchange(&vault, &verifier, input, &session.account_name).await {
+            Ok(account_id) => session.phase = LoginPhase::Done { account_id },
             Err(e) => {
                 session.phase = LoginPhase::Failed {
                     error: e.to_string(),
@@ -389,17 +380,16 @@ impl LoginManager {
             .await
             {
                 Ok(Ok(code)) => {
-                    match crate::login::gemini_exchange(&vault, &verifier, &redirect_uri, &code)
-                        .await
+                    match crate::login::gemini_exchange(
+                        &vault,
+                        &verifier,
+                        &redirect_uri,
+                        &code,
+                        &account_name,
+                    )
+                    .await
                     {
-                        Ok(account_id) => {
-                            match rename_login_account(&vault, &account_id, &account_name).await {
-                                Ok(account_id) => LoginPhase::Done { account_id },
-                                Err(e) => LoginPhase::Failed {
-                                    error: e.to_string(),
-                                },
-                            }
-                        }
+                        Ok(account_id) => LoginPhase::Done { account_id },
                         Err(e) => LoginPhase::Failed {
                             error: e.to_string(),
                         },
@@ -462,16 +452,8 @@ impl LoginManager {
                         continue;
                     }
                     XaiDevicePoll::Done(tokens) => {
-                        break match xai_upsert_from_tokens(&vault, &tokens).await {
-                            Ok(account_id) => {
-                                match rename_login_account(&vault, &account_id, &account_name).await
-                                {
-                                    Ok(account_id) => LoginPhase::Done { account_id },
-                                    Err(e) => LoginPhase::Failed {
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
+                        break match xai_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                            Ok(account_id) => LoginPhase::Done { account_id },
                             Err(e) => LoginPhase::Failed {
                                 error: e.to_string(),
                             },
@@ -534,16 +516,8 @@ impl LoginManager {
                         continue;
                     }
                     KimiDevicePoll::Done(tokens) => {
-                        break match kimi_upsert_from_tokens(&vault, &tokens).await {
-                            Ok(account_id) => {
-                                match rename_login_account(&vault, &account_id, &account_name).await
-                                {
-                                    Ok(account_id) => LoginPhase::Done { account_id },
-                                    Err(e) => LoginPhase::Failed {
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
+                        break match kimi_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                            Ok(account_id) => LoginPhase::Done { account_id },
                             Err(e) => LoginPhase::Failed {
                                 error: e.to_string(),
                             },
@@ -579,45 +553,6 @@ fn validate_account_name(name: &str) -> Result<()> {
         bail!("account name must match [a-z0-9_-]{{1,32}}");
     }
     Ok(())
-}
-
-async fn rename_login_account(
-    vault: &Vault,
-    account_id: &str,
-    account_name: &str,
-) -> Result<String> {
-    if account_name == "default" {
-        return Ok(account_id.to_string());
-    }
-    let mut account = vault
-        .list()
-        .await
-        .into_iter()
-        .find(|account| account.id == account_id)
-        .context("login completed but the saved account could not be found")?;
-    if vault.has_account_name(account.provider, account_name).await {
-        bail!(
-            "{} account '{account_name}' already exists",
-            account.provider.as_str()
-        );
-    }
-    let default_id = named_account_id(account.provider, &account.kind, "default");
-    let previous_default = vault
-        .list()
-        .await
-        .into_iter()
-        .find(|candidate| candidate.id == default_id && candidate.id != account.id);
-    account.name = account_name.to_string();
-    account.id = named_account_id(account.provider, &account.kind, account_name);
-    account.path = None;
-    let renamed_id = account.id.clone();
-    vault.upsert(account).await?;
-    if let Some(previous_default) = previous_default {
-        vault.upsert(previous_default).await?;
-    } else {
-        let _ = vault.remove(&default_id).await?;
-    }
-    Ok(renamed_id)
 }
 
 #[cfg(test)]
@@ -711,11 +646,23 @@ mod tests {
     #[tokio::test]
     async fn kimi_device_session_starts_and_authorizes() {
         let (dir, vault) = temp_vault("kimi");
+        vault
+            .upsert(crate::kimi_account_from_credentials(
+                "existing-default-token".into(),
+                Some("existing-default-refresh".into()),
+                None,
+                Some(900),
+                Some("kimi-code".into()),
+            ))
+            .await
+            .unwrap();
+        let default_path = dir.join("kimi-oauth.json");
+        let default_before = std::fs::read(&default_path).unwrap();
         let host = spawn_kimi_mock().await;
         let mgr = LoginManager::with_kimi_oauth_host(host);
 
         // start → a device session exposing the user_code and authorize_device URL.
-        let snap = mgr.start(vault.clone(), "kimi", "default").await.unwrap();
+        let snap = mgr.start(vault.clone(), "kimi", "work").await.unwrap();
         assert_eq!(snap["mode"], "device");
         assert_eq!(snap["state"], "pending");
         assert_eq!(snap["provider"], "kimi");
@@ -749,17 +696,28 @@ mod tests {
         }
         let done = done.expect("device login did not reach 'done' in time");
         let account_id = done["account_id"].as_str().unwrap();
-        assert_eq!(account_id, "kimi-oauth");
+        assert_eq!(account_id, "kimi-oauth-work");
         assert!(!done.to_string().contains("kimi-access-token"));
 
-        // The Kimi account is now in the vault with its (undisplayed) token.
+        // The named Kimi account is stored without changing or tombstoning the default.
+        assert_eq!(std::fs::read(&default_path).unwrap(), default_before);
+        assert!(dir.join("kimi-oauth-work.json").exists());
+        assert!(!dir.join("removed-accounts").exists());
         let accounts = vault.list().await;
         let account = accounts
             .iter()
-            .find(|a| a.id == "kimi-oauth")
+            .find(|a| a.id == "kimi-oauth-work")
             .expect("kimi account should be stored");
         assert_eq!(account.provider.as_str(), "kimi");
         assert_eq!(account.access_token.as_deref(), Some("kimi-access-token"));
+        let default = accounts
+            .iter()
+            .find(|a| a.id == "kimi-oauth")
+            .expect("default kimi account should remain stored");
+        assert_eq!(
+            default.access_token.as_deref(),
+            Some("existing-default-token")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
