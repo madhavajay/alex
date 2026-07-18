@@ -336,6 +336,30 @@ import Testing
         #expect(response.latest == "0.2.0")
     }
 
+    @Test func daemonUpdateStatusGetsAndDecodes() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/update")
+            #expect(request.httpMethod == "GET")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"current":"0.1.0","latest":"0.2.0","update_available":true,"update_channel":"beta"}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let response = try await client.daemonUpdateStatus()
+        #expect(response.current == "0.1.0")
+        #expect(response.latest == "0.2.0")
+        #expect(response.updateAvailable)
+        #expect(response.updateChannel == "beta")
+    }
+
     @Test func daemonUpdateApply409UsesReason() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/update")

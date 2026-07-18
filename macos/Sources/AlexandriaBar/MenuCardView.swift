@@ -147,17 +147,21 @@ struct MenuStatsBarView: View {
 /// pending, matching the mock's `both ? "Update Both" : "Update"`.
 struct MenuUpdateBannerView: View {
     var appVersion: String?
+    var daemonCurrentVersion: String?
     var daemonVersion: String?
+    var daemonApplying = false
+    var daemonMessage: String?
     var onUpdate: () -> Void
     var onLater: () -> Void
 
     private var orange: Color { AlexTheme.Colors.warningOrange }
     private var both: Bool { appVersion != nil && daemonVersion != nil }
+    private var hasPendingUpdate: Bool { appVersion != nil || daemonVersion != nil }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("UPDATE AVAILABLE")
+                Text(hasPendingUpdate ? "UPDATE AVAILABLE" : "DAEMON UPDATE")
                     .font(.system(size: 11, weight: .bold))
                     .tracking(0.55)
                     .foregroundStyle(orange)
@@ -165,13 +169,27 @@ struct MenuUpdateBannerView: View {
                     versionRow(label: "App", version: appVersion)
                 }
                 if let daemonVersion {
-                    versionRow(label: "Daemon", version: daemonVersion)
+                    daemonVersionRow(current: daemonCurrentVersion, latest: daemonVersion)
+                }
+                if let daemonMessage {
+                    Text(daemonMessage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer()
-            VStack(alignment: .trailing, spacing: 8) {
-                LaterButton(tint: orange, action: onLater)
-                UpdateButton(tint: orange, label: both ? "Update Both" : "Update", action: onUpdate)
+            if hasPendingUpdate {
+                VStack(alignment: .trailing, spacing: 8) {
+                    if !daemonApplying {
+                        LaterButton(tint: orange, action: onLater)
+                    }
+                    UpdateButton(
+                        tint: orange,
+                        label: daemonApplying ? "Updating…" : (both ? "Update Both" : "Update"),
+                        isEnabled: !daemonApplying,
+                        action: onUpdate)
+                }
             }
         }
         .padding(.horizontal, MenuMetrics.inset)
@@ -190,6 +208,17 @@ struct MenuUpdateBannerView: View {
                 .frame(width: 44, alignment: .leading)
             Text(version)
                 .font(AlexTheme.Fonts.mono(12, weight: .semibold))
+                .foregroundStyle(orange)
+        }
+    }
+
+    private func daemonVersionRow(current: String?, latest: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text("Daemon update available:")
+                .font(.system(size: 11))
+                .foregroundStyle(orange.opacity(0.65))
+            Text([current, latest].compactMap { $0 }.joined(separator: " → "))
+                .font(AlexTheme.Fonts.mono(11, weight: .semibold))
                 .foregroundStyle(orange)
         }
     }
@@ -215,6 +244,7 @@ struct MenuUpdateBannerView: View {
     private struct UpdateButton: View {
         let tint: Color
         var label: String = "Update"
+        var isEnabled = true
         let action: () -> Void
         @State private var hovering = false
 
@@ -231,6 +261,8 @@ struct MenuUpdateBannerView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(!isEnabled)
+            .opacity(isEnabled ? 1 : 0.7)
             .onHover { hovering = $0 }
         }
     }

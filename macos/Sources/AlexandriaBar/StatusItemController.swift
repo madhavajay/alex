@@ -209,11 +209,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// button that reads "Update Both" when both are pending.
     private func buildUpdateBanner() {
         let appVersion = pendingAppUpdateVersion
-        let daemonVersion = !daemonUpdateApplying ? pendingDaemonUpdateVersion : nil
-        guard appVersion != nil || daemonVersion != nil else { return }
+        let daemonVersion = daemonUpdateApplying ? daemonUpdateTarget : pendingDaemonUpdateVersion
+        guard appVersion != nil || daemonVersion != nil || daemonUpdateMessage != nil else { return }
         let banner = MenuUpdateBannerView(
             appVersion: appVersion,
+            daemonCurrentVersion: store.daemonUpdate?.current ?? store.health?.version,
             daemonVersion: daemonVersion,
+            daemonApplying: daemonUpdateApplying,
+            daemonMessage: daemonUpdateMessage,
             onUpdate: { [weak self] in
                 self?.menu.cancelTrackingWithoutAnimation()
                 self?.applyPendingUpdates(appVersion: appVersion, daemonVersion: daemonVersion)
@@ -824,7 +827,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 } else {
                     self?.daemonUpdateApplying = false
                     self?.daemonUpdateTarget = nil
-                    self?.notify(title: "Daemon already up to date", body: response.current ?? "")
+                    let current = response.current ?? latest
+                    self?.daemonUpdateMessage = "Daemon is already up to date at \(current)"
+                    self?.rebuildMenu()
+                    self?.notify(title: "Daemon already up to date", body: current)
                 }
                 await self?.store.refresh()
             } catch AlexandriaClient.ClientError.daemonUpdateRejected(let reason) {
@@ -854,7 +860,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func reconcileDaemonUpdateState() {
         if store.daemonUpdate?.updateAvailable == false {
-            daemonUpdateMessage = nil
             daemonUpdateDismissedVersion = nil
         }
         guard daemonUpdateApplying, let target = daemonUpdateTarget else { return }
@@ -865,7 +870,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if healthMatches || statusMatches {
             daemonUpdateApplying = false
             daemonUpdateTarget = nil
-            daemonUpdateMessage = nil
+            daemonUpdateMessage = "Daemon updated to \(target)"
             notify(title: "Daemon updated", body: "Alexandria \(target)")
         }
     }
