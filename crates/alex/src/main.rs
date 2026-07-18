@@ -11342,7 +11342,9 @@ local_key = "alx-test"
             .openrouter_exposed_models
             .iter()
             .any(|id| id == "z-ai/glm-5.2"));
-        assert!(unset.openrouter_exposed_models.len() <= 3);
+        // Curated starter set: OpenRouter's top-ranked models — small enough to
+        // read as an example, not an endorsement of everything.
+        assert!(unset.openrouter_exposed_models.len() <= 8);
 
         // Explicit empty list -> exposes nothing; never re-defaulted.
         let explicit_empty: Config = toml::from_str(
