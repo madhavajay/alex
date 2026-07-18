@@ -7,6 +7,32 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.28-beta.7] - 2026-07-18
+
+### Fixed
+- **Kimi disconnect/remove now leaves Kimi working.** If you had selected an
+  `alex/*` model as Kimi's default, removing the Kimi connection used to leave
+  Kimi pointing at a deleted model — every request then failed with `401 run
+  key expired or revoked` (or `No model configured`). Disconnect now restores
+  your native default (`kimi-code/k3` from the pre-connect backup, else a
+  surviving `kimi-code/*` model). Live-verified with the real Kimi CLI.
+- **Harnesses pane refreshes immediately** after connect/remove instead of
+  showing stale state until the next poll; the action button now reads
+  **Install** when a harness is disconnected and **Update** only when it is
+  connected.
+- **Release appcast publishing no longer hangs.** The Sparkle appcast is now
+  written to gh-pages via the GitHub Contents API instead of a full branch
+  clone, which repeatedly hung ~30 min on the macOS runner and left the
+  in-app updater showing an older version as "newest". (This is why beta.6's
+  appcast was slow to flip.)
+
+### Note
+- The `kimi → claude/fable-5` "bio" refusal some users hit is **not** an Alex
+  bug: it is Anthropic's server-side safety classifier reacting to genomics
+  filenames that Kimi includes in its injected working-directory listing.
+  Root-caused to a one-line repro; Alex already surfaces it cleanly. Use a
+  non-Anthropic model for that content.
+
 ## [0.1.28-beta.6] - 2026-07-18
 
 ### Added

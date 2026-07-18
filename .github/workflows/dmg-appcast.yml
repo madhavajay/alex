@@ -310,23 +310,32 @@ jobs:
             -o "$APPCAST_FILE" \
             updates/
 
-      - name: Publish appcast to GitHub Pages
+      # Update the single appcast file on gh-pages via the Contents API instead
+      # of cloning the branch. peaceiris/actions-gh-pages does a full
+      # `git clone` of gh-pages, which repeatedly hung for ~30min on the mac
+      # runner; a one-file PUT has nothing to clone and cannot hang. Other
+      # gh-pages files (the other channel's appcast, .nojekyll) are untouched,
+      # matching the previous keep_files: true behaviour.
+      - name: Deploy appcast to gh-pages (Contents API)
         if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
+        timeout-minutes: 5
         env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
           APPCAST_FILE: ${{ steps.meta.outputs.appcast_file }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          mkdir -p site
-          cp "$APPCAST_FILE" "site/$APPCAST_FILE"
-
-      - name: Deploy GitHub Pages
-        if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
-        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
-        with:
-          github_token: ${{ github.token }}
-          publish_branch: gh-pages
-          publish_dir: ./site
-          keep_files: true
+          repo="${{ github.repository }}"
+          # Current blob sha on gh-pages (empty when the file does not exist yet).
+          sha="$(gh api "repos/$repo/contents/$APPCAST_FILE?ref=gh-pages" --jq '.sha' 2>/dev/null || true)"
+          content_b64="$(base64 "$APPCAST_FILE" | tr -d '\n')"
+          args=(-X PUT "repos/$repo/contents/$APPCAST_FILE"
+            -f "message=appcast: ${RELEASE_TAG} (${APPCAST_FILE})"
+            -f "branch=gh-pages"
+            -f "content=$content_b64")
+          if [[ -n "$sha" ]]; then args+=(-f "sha=$sha"); fi
+          gh api "${args[@]}" --jq '.commit.sha'
 
       - name: Upload DMG artifact
         if: steps.app_signing.outputs.available == 'true'
