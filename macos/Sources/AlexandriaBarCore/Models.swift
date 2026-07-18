@@ -894,6 +894,40 @@ public struct ExoModelsResponse: Codable, Sendable {
     public let models: [ExoModel]
 }
 
+/// `GET /admin/openrouter/catalog`: the full OpenRouter model id list the
+/// picker offers. Never injected into harnesses on its own — the daemon fetches
+/// the whole catalog only so the UI can present it.
+public struct OpenRouterCatalogResponse: Codable, Sendable, Equatable {
+    public let models: [String]
+
+    public init(models: [String] = []) {
+        self.models = models
+    }
+}
+
+/// `GET/POST /admin/openrouter/exposed`: the user-curated model ids that are
+/// advertised and injected into connected harnesses. `available` mirrors the
+/// catalog so a single GET can render both transfer-list columns.
+public struct OpenRouterExposedResponse: Codable, Sendable, Equatable {
+    public let exposed: [String]
+    public let available: [String]
+
+    public init(exposed: [String] = [], available: [String] = []) {
+        self.exposed = exposed
+        self.available = available
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case exposed, available
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        exposed = try container.decodeIfPresent([String].self, forKey: .exposed) ?? []
+        available = try container.decodeIfPresent([String].self, forKey: .available) ?? []
+    }
+}
+
 /// The redacted credential inventory returned by `/admin/credentials`.
 /// Secrets are deliberately absent from this type; a run-key secret is only
 /// represented by `MintedRunKey`, the one-time response from the mint route.

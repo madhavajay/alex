@@ -944,6 +944,12 @@ struct Config {
     exo_url: String,
     #[serde(default)]
     exo_enabled_models: Vec<String>,
+    /// User-curated OpenRouter models advertised to `/v1/models` and injected
+    /// into harnesses. Absent (a pre-curation install that implicitly exposed
+    /// the entire catalog) defaults to a short list of examples; an explicit
+    /// empty list exposes nothing. Never re-defaults over a user's own choice.
+    #[serde(default = "alex_proxy::default_openrouter_exposed_models")]
+    openrouter_exposed_models: Vec<String>,
     #[serde(default)]
     gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
@@ -1021,6 +1027,24 @@ impl alex_proxy::ExoConfigPersister for ConfigExoPersister {
         let fresh = update_config_on_disk(|config| {
             config.exo_url = exo.url.clone();
             config.exo_enabled_models = exo.enabled_models.clone();
+        })
+        .map_err(|error| error.to_string())?;
+        sync_shared_config(&self.config, fresh);
+        Ok(())
+    }
+}
+
+struct ConfigOpenrouterExposedPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::OpenrouterExposedPersister for ConfigOpenrouterExposedPersister {
+    fn persist(&self, exposed: &[String]) -> std::result::Result<(), String> {
+        let exposed = exposed.to_vec();
+        // Read-modify-write the whole config so persisting the curated list
+        // never drops other sections (notifications, exo, protection, ...).
+        let fresh = update_config_on_disk(|config| {
+            config.openrouter_exposed_models = exposed.clone();
         })
         .map_err(|error| error.to_string())?;
         sync_shared_config(&self.config, fresh);
@@ -1290,6 +1314,7 @@ impl Config {
             ping_openrouter_model: default_ping_openrouter(),
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
+            openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
             gemini_project: String::new(),
             heartbeat_minutes: default_heartbeat_minutes(),
             reauth_check_minutes: default_reauth_check_minutes(),
@@ -2354,18 +2379,23 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
 
     async fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
         let mut ids = state.store.pricing_models();
-        ids.extend(alex_proxy::exo_catalog_models(state));
         // Provider catalogs advertised in /v1/models must also reach the
         // app-driven connect / refresh-config path; otherwise a provider added
-        // after a harness was connected (e.g. Kimi) never lands in that
-        // harness's model list on reconnect. Mirror the daemon `/v1/models`
-        // handler, which appends `kimi_catalog_models` when a Kimi account
-        // exists.
+        // after a harness was connected (e.g. Kimi, or a newly-curated
+        // OpenRouter model) never lands in that harness's model list on
+        // reconnect. Mirror the daemon `/v1/models` handler: refresh the
+        // OpenRouter catalog and fold in only the user-curated exposed subset.
+        alex_proxy::refresh_openrouter_models(state).await;
+        ids.extend(alex_proxy::openrouter_exposed_catalog(state));
+        ids.extend(alex_proxy::exo_catalog_models(state));
         ids.extend(alex_proxy::kimi_catalog_models(state).await);
         for (alias, _) in alex_core::model_aliases() {
             ids.push((*alias).to_string());
         }
-        let filtered = harness_connect::filter_model_ids(ids);
+        let mut filtered = harness_connect::filter_model_ids(ids);
+        // Advertise all providers' models alphabetically (case-insensitive) so
+        // the harness picker matches the daemon `/v1/models` ordering.
+        alex_proxy::sort_model_ids(&mut filtered);
         if filtered.is_empty() {
             vec![
                 "claude-opus-4-8".into(),
@@ -3283,6 +3313,10 @@ async fn main() -> Result<()> {
                     enabled_models: config.exo_enabled_models.clone(),
                 },
             );
+            alex_proxy::set_openrouter_exposed_models(
+                &state,
+                config.openrouter_exposed_models.clone(),
+            );
             let daemon_config = Arc::new(std::sync::Mutex::new(config.clone()));
             alex_proxy::set_protection_policy_persister(
                 &state,
@@ -3307,6 +3341,12 @@ async fn main() -> Result<()> {
                 Arc::new(ConfigExoPersister {
                     // Share the one daemon config handle so every persister
                     // mutates the same in-memory Config (no divergent clones).
+                    config: daemon_config.clone(),
+                }),
+            );
+            alex_proxy::set_openrouter_exposed_persister(
+                &state,
+                Arc::new(ConfigOpenrouterExposedPersister {
                     config: daemon_config.clone(),
                 }),
             );
@@ -10470,6 +10510,7 @@ mod tests {
             ping_openrouter_model: default_ping_openrouter(),
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
+            openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,
@@ -10903,6 +10944,7 @@ mod tests {
             ping_openrouter_model: default_ping_openrouter(),
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
+            openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,
@@ -11227,6 +11269,93 @@ local_key = "alx-test"
             reloaded.notifications[0].token.as_deref(),
             Some("123:secret")
         );
+    }
+
+    // The curated OpenRouter exposure list persists through the shared
+    // read-modify-write path and must survive an unrelated section write from a
+    // separate config handle (same regression class as the exo/notification
+    // persisters).
+    #[test]
+    fn openrouter_exposed_survives_unrelated_config_write() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("openrouter-exposed-persist");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        save_config(&test_config(home.clone())).unwrap();
+
+        // Persist a curated exposure list.
+        let exposed_config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        let exposed = ConfigOpenrouterExposedPersister {
+            config: exposed_config,
+        };
+        alex_proxy::OpenrouterExposedPersister::persist(
+            &exposed,
+            &["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+        )
+        .unwrap();
+
+        // An unrelated write from a SEPARATE handle that never saw the exposure
+        // list must not clobber it, because every persist reloads from disk.
+        let notif_config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        let notifications = ConfigNotificationPersister {
+            config: notif_config,
+        };
+        alex_proxy::NotificationConfigPersister::persist(
+            &notifications,
+            &telegram_channel("telegram-1", "123:secret"),
+        )
+        .unwrap();
+
+        let (reloaded, _) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(
+            reloaded.openrouter_exposed_models,
+            vec!["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+            "an unrelated notifications write dropped the OpenRouter exposure list"
+        );
+        assert_eq!(
+            reloaded.notifications.len(),
+            1,
+            "the exposure write dropped the notifications section"
+        );
+    }
+
+    // Migration: a pre-curation install has no `openrouter_exposed_models` key,
+    // so it must default to the shipped examples (implicitly exposing "all" was
+    // never intended); an explicit empty list is a real user choice and is kept.
+    #[test]
+    fn openrouter_exposed_defaults_when_unset_and_keeps_explicit_empty() {
+        // Absent key -> shipped example list, including z-ai/glm-5.2.
+        let unset: Config = toml::from_str(
+            r#"
+                host = "127.0.0.1"
+                port = 4100
+                data_dir = "/tmp/x"
+                local_key = "alx-local"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            unset.openrouter_exposed_models,
+            alex_proxy::default_openrouter_exposed_models()
+        );
+        assert!(unset
+            .openrouter_exposed_models
+            .iter()
+            .any(|id| id == "z-ai/glm-5.2"));
+        assert!(unset.openrouter_exposed_models.len() <= 3);
+
+        // Explicit empty list -> exposes nothing; never re-defaulted.
+        let explicit_empty: Config = toml::from_str(
+            r#"
+                host = "127.0.0.1"
+                port = 4100
+                data_dir = "/tmp/x"
+                local_key = "alx-local"
+                openrouter_exposed_models = []
+            "#,
+        )
+        .unwrap();
+        assert!(explicit_empty.openrouter_exposed_models.is_empty());
     }
 
     // Fix #4: a token persisted to config.toml must be reloaded into the runtime

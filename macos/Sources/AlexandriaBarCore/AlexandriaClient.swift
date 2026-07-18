@@ -27,6 +27,10 @@ private struct OpenRouterKeyBody: Encodable {
     }
 }
 
+private struct OpenRouterExposedBody: Encodable {
+    let exposed: [String]
+}
+
 private struct FixtureInjectionBody: Encodable {
     let fixture: String
     let count: Int?
@@ -583,6 +587,28 @@ public struct AlexandriaClient: Sendable {
     public func updateExoConfig(_ config: ExoConfig) async throws -> ExoConfig {
         let data = try await request("admin/exo", method: "PUT", body: body(config))
         return try JSONDecoder().decode(ExoConfig.self, from: data)
+    }
+
+    /// The full OpenRouter catalog for the settings picker. Not injected into
+    /// harnesses; only the curated exposed subset is.
+    public func openRouterCatalog() async throws -> [String] {
+        try await get("admin/openrouter/catalog", as: OpenRouterCatalogResponse.self).models
+    }
+
+    /// The curated exposed list plus the catalog it is drawn from, for the
+    /// two-list transfer picker.
+    public func openRouterExposed() async throws -> OpenRouterExposedResponse {
+        try await get("admin/openrouter/exposed", as: OpenRouterExposedResponse.self)
+    }
+
+    /// Persist the curated exposed list. Only these models reach `/v1/models`
+    /// and connected harnesses. Returns the normalized, sorted list.
+    @discardableResult
+    public func updateOpenRouterExposed(_ exposed: [String]) async throws -> [String] {
+        let data = try await request(
+            "admin/openrouter/exposed", method: "POST",
+            body: body(OpenRouterExposedBody(exposed: exposed)))
+        return try JSONDecoder().decode(OpenRouterExposedResponse.self, from: data).exposed
     }
 
     public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
