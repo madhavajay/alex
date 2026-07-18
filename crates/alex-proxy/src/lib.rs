@@ -4549,12 +4549,234 @@ async fn traces_sessions(
     }
 }
 
+#[derive(Default)]
+struct ReassembledToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    initial_arguments: Option<String>,
+}
+
+fn sse_json_payloads(body: &str) -> Vec<Value> {
+    fn push_payload(payloads: &mut Vec<Value>, data_lines: &mut Vec<String>) {
+        if data_lines.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(data_lines);
+        let payload = lines.join("\n");
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+        if let Ok(value) = serde_json::from_str(payload) {
+            payloads.push(value);
+        } else {
+            // Be liberal with captures that omitted the SSE blank-line event
+            // separators and stored one complete JSON payload per data line.
+            for payload in lines {
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str(payload) {
+                    payloads.push(value);
+                }
+            }
+        }
+    }
+
+    let mut payloads = Vec::new();
+    let mut data_lines = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            push_payload(&mut payloads, &mut data_lines);
+        } else if line.starts_with(':') {
+            continue;
+        } else if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_string());
+        }
+    }
+    push_payload(&mut payloads, &mut data_lines);
+    payloads
+}
+
+fn json_arguments(value: &Value) -> Option<String> {
+    match value {
+        Value::String(arguments) => Some(arguments.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Reconstruct display-only assistant blocks from a stored raw SSE body. A
+/// single JSON response is accepted too because OpenAI-compatible passthroughs
+/// can store either shape without Alexandria's normalized metadata.
+fn reassemble_sse_assistant_blocks(body: &str) -> Vec<Value> {
+    let mut payloads = sse_json_payloads(body);
+    if payloads.is_empty() {
+        if let Ok(response) = serde_json::from_str::<Value>(body) {
+            payloads.push(response);
+        }
+    }
+
+    let mut text = String::new();
+    let mut openai_tools: BTreeMap<usize, ReassembledToolCall> = BTreeMap::new();
+    let mut anthropic_tools: BTreeMap<usize, ReassembledToolCall> = BTreeMap::new();
+    let mut gemini_tools = Vec::new();
+
+    for payload in payloads {
+        // OpenAI Chat Completions streaming and non-streaming response shapes.
+        if let Some(choice) = payload["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+        {
+            if let Some(content) = choice["delta"]["content"].as_str() {
+                text.push_str(content);
+            }
+            for call in choice["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let index = call["index"].as_u64().unwrap_or(0) as usize;
+                let tool = openai_tools.entry(index).or_default();
+                if let Some(id) = call["id"].as_str() {
+                    tool.id.push_str(id);
+                }
+                if let Some(name) = call["function"]["name"].as_str() {
+                    tool.name.push_str(name);
+                }
+                if let Some(arguments) = call["function"]["arguments"].as_str() {
+                    tool.arguments.push_str(arguments);
+                }
+            }
+
+            if let Some(content) = choice["message"]["content"].as_str() {
+                text.push_str(content);
+            }
+            for (index, call) in choice["message"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let tool = openai_tools.entry(index).or_default();
+                if let Some(id) = call["id"].as_str() {
+                    tool.id.push_str(id);
+                }
+                if let Some(name) = call["function"]["name"].as_str() {
+                    tool.name.push_str(name);
+                }
+                if let Some(arguments) = json_arguments(&call["function"]["arguments"]) {
+                    tool.arguments.push_str(&arguments);
+                }
+            }
+        }
+
+        // Anthropic Messages events, for defensive handling of raw upstream SSE.
+        match payload["type"].as_str() {
+            Some("content_block_start") => {
+                let index = payload["index"].as_u64().unwrap_or(0) as usize;
+                let block = &payload["content_block"];
+                match block["type"].as_str() {
+                    Some("text") => text.push_str(block["text"].as_str().unwrap_or_default()),
+                    Some("tool_use") => {
+                        let tool = anthropic_tools.entry(index).or_default();
+                        tool.id = block["id"].as_str().unwrap_or_default().to_string();
+                        tool.name = block["name"].as_str().unwrap_or_default().to_string();
+                        tool.initial_arguments = json_arguments(&block["input"]);
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_delta") => match payload["delta"]["type"].as_str() {
+                Some("text_delta") => {
+                    text.push_str(payload["delta"]["text"].as_str().unwrap_or_default());
+                }
+                Some("input_json_delta") => {
+                    let index = payload["index"].as_u64().unwrap_or(0) as usize;
+                    anthropic_tools
+                        .entry(index)
+                        .or_default()
+                        .arguments
+                        .push_str(
+                            payload["delta"]["partial_json"]
+                                .as_str()
+                                .unwrap_or_default(),
+                        );
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+
+        // Gemini streaming and non-streaming candidate parts.
+        for candidate in payload["candidates"].as_array().into_iter().flatten() {
+            for part in candidate["content"]["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(part_text) = part["text"].as_str() {
+                    text.push_str(part_text);
+                }
+                if part["functionCall"].is_object() {
+                    gemini_tools.push(ReassembledToolCall {
+                        id: part["functionCall"]["id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: part["functionCall"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: json_arguments(&part["functionCall"]["args"])
+                            .unwrap_or_default(),
+                        initial_arguments: None,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({
+            "type": "text",
+            "text": truncate_chars(text, 8000),
+        }));
+    }
+    for mut tool in openai_tools
+        .into_values()
+        .chain(anthropic_tools.into_values())
+        .chain(gemini_tools)
+        .filter(|tool| !tool.name.is_empty())
+        .take(24)
+    {
+        if tool.arguments.is_empty() {
+            tool.arguments = tool.initial_arguments.unwrap_or_default();
+        }
+        let mut block = json!({
+            "type": "tool_call",
+            "name": tool.name,
+            "arguments": truncate_chars(tool.arguments, 600),
+        });
+        if !tool.id.is_empty() {
+            block["id"] = json!(tool.id);
+        }
+        blocks.push(block);
+    }
+    blocks.truncate(64);
+    blocks
+}
+
 fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
     let Ok(response) = serde_json::from_str::<Value>(resp_text) else {
-        return Vec::new();
+        return reassemble_sse_assistant_blocks(resp_text);
     };
     let mut tool_calls = 0usize;
-    response
+    let blocks: Vec<Value> = response
         .pointer("/_alexandria/assistant_blocks")
         .and_then(Value::as_array)
         .into_iter()
@@ -4586,7 +4808,12 @@ fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
             _ => None,
         })
         .take(64)
-        .collect()
+        .collect();
+    if blocks.is_empty() {
+        reassemble_sse_assistant_blocks(resp_text)
+    } else {
+        blocks
+    }
 }
 
 fn transcript_turn(row: &Value) -> Value {
@@ -4602,11 +4829,24 @@ fn transcript_turn(row: &Value) -> Value {
         .or(row["client_format"].as_str())
         .unwrap_or("")
         .to_string();
+    let assistant_blocks = resp_text
+        .as_deref()
+        .map(transcript_assistant_blocks)
+        .unwrap_or_default();
     let assistant = resp_text
         .as_deref()
         .and_then(|text| translate::assistant_reply_text(&fmt, text))
-        .map(|s| truncate_chars(s, 8000));
-    let tool_calls: Vec<Value> = resp_text
+        .map(|s| truncate_chars(s, 8000))
+        .or_else(|| {
+            let text = assistant_blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(text)
+        });
+    let mut tool_calls: Vec<Value> = resp_text
         .as_deref()
         .map(|text| translate::assistant_tool_calls(&fmt, text))
         .unwrap_or_default()
@@ -4620,10 +4860,13 @@ fn transcript_turn(row: &Value) -> Value {
             c
         })
         .collect();
-    let assistant_blocks = resp_text
-        .as_deref()
-        .map(transcript_assistant_blocks)
-        .unwrap_or_default();
+    if tool_calls.is_empty() {
+        tool_calls = assistant_blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_call")
+            .cloned()
+            .collect();
+    }
     json!({
         "trace_id": row["id"],
         "ts_request_ms": row["ts_request_ms"],
@@ -4675,6 +4918,12 @@ fn transcript_tab_counts(turns: &[Value]) -> Value {
         let has_model = turn["assistant"]
             .as_str()
             .is_some_and(|text| !text.is_empty())
+            || turn["assistant_blocks"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block["type"] == "text"
+                        && block["text"].as_str().is_some_and(|text| !text.is_empty())
+                })
+            })
             || has_tools
             || turn["error"].as_str().is_some_and(|text| !text.is_empty());
         if has_user {
@@ -7228,6 +7477,65 @@ mod trace_api_tests {
         assert_eq!(blocks[1]["name"], "Shell");
         assert_eq!(blocks[2]["type"], "text");
         assert_eq!(blocks[2]["text"], "Here are the files.");
+    }
+
+    #[test]
+    fn transcript_assistant_blocks_reassemble_openrouter_text_sse() {
+        let response = r#": OPENROUTER PROCESSING
+
+data: {"id":"gen-1","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"It's currently Sunday, 19 July 2026, "}}]}
+
+data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":"8:15:48 AM AEST."}}]}
+
+data: [DONE]
+
+"#;
+        let blocks = transcript_assistant_blocks(response);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(
+            blocks[0]["text"],
+            "It's currently Sunday, 19 July 2026, 8:15:48 AM AEST."
+        );
+    }
+
+    #[test]
+    fn transcript_assistant_blocks_reassemble_openai_streamed_tool_call() {
+        let response = r#"data: {"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"date\"}"}}]}}]}
+
+data: [DONE]
+
+"#;
+        let blocks = transcript_assistant_blocks(response);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_call");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "Bash");
+        assert_eq!(blocks[0]["arguments"], r#"{"command":"date"}"#);
+    }
+
+    #[test]
+    fn transcript_assistant_blocks_skip_sse_comments_and_done_sentinel() {
+        let response = ": OPENROUTER PROCESSING\n\n: keepalive\n\ndata: [DONE]\n\n";
+        assert!(transcript_assistant_blocks(response).is_empty());
+    }
+
+    #[test]
+    fn transcript_tab_counts_include_reassembled_text_blocks() {
+        let turns = vec![json!({
+            "user": null,
+            "assistant": null,
+            "tool_calls": [],
+            "assistant_blocks": [{"type": "text", "text": "streamed reply"}],
+        })];
+        assert_eq!(
+            transcript_tab_counts(&turns),
+            json!({"all": 1, "user": 0, "model": 1, "tools": 0, "agents": 0})
+        );
     }
 
     #[test]
