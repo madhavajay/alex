@@ -444,6 +444,71 @@ fn finish_to_stop(finish: Option<&str>) -> &'static str {
     }
 }
 
+/// Surfaced to the client when the upstream model *refuses* the request
+/// (Anthropic `stop_reason == "refusal"`). Foreign harnesses render this and
+/// stop retry-looping instead of choking on a silent empty 200.
+pub const UPSTREAM_REFUSAL_MESSAGE: &str =
+    "\u{26a0}\u{fe0f} The upstream model declined this request (refusal). \
+Try a different model for this harness.";
+
+/// Surfaced when the upstream completed but returned no renderable content
+/// (a terminal `end_turn`/`stop` with zero text and zero tool calls).
+pub const UPSTREAM_EMPTY_MESSAGE: &str =
+    "\u{26a0}\u{fe0f} The upstream model returned an empty response (no content). \
+Try a different model for this harness.";
+
+/// Detects an Anthropic-format completion that carries nothing the client can
+/// render — an explicit refusal (`stop_reason == "refusal"`) or a terminal stop
+/// with no text and no tool calls — and rewrites it *in place* into a clear,
+/// non-empty assistant message with `stop_reason == "end_turn"` (so every
+/// downstream client translation — chat / responses / gemini / anthropic and
+/// their SSE synths — yields usable, non-empty output and a `stop`/`STOP`
+/// finish reason).
+///
+/// This is the fix for the harness↔provider retry-loop: when a foreign harness
+/// routes to an Anthropic subscription model and Claude refuses, the raw
+/// response is an empty 200 that the harness retries forever. Rewriting it makes
+/// the failure visible and terminal.
+///
+/// Normal, renderable completions are left byte-for-byte unchanged (returns
+/// `None`). Returns `Some(text)` with the surfaced message when it patched.
+pub fn neutralize_anthropic_refusal(msg: &mut Value) -> Option<String> {
+    // A completion is renderable if it has at least one non-empty text block or
+    // any tool_use block. Anything else is a silent empty completion.
+    let has_content = msg["content"].as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| match b["type"].as_str() {
+            Some("text") => !b["text"].as_str().unwrap_or("").is_empty(),
+            Some("tool_use") => true,
+            _ => false,
+        })
+    });
+    if has_content {
+        return None;
+    }
+    let stop = msg["stop_reason"].as_str();
+    let is_refusal = stop == Some("refusal");
+    // Only rewrite terminal stops. A `null` stop_reason means the message was
+    // never completed (e.g. an interrupted reassembly), so we must not fabricate
+    // a "declined" completion for a partial success. `max_tokens` is left alone
+    // too — it is a distinct, harness-understood finish reason.
+    let terminal = matches!(
+        stop,
+        Some("refusal") | Some("end_turn") | Some("stop") | Some("stop_sequence")
+    );
+    if !terminal {
+        return None;
+    }
+    let text = if is_refusal {
+        UPSTREAM_REFUSAL_MESSAGE.to_string()
+    } else {
+        UPSTREAM_EMPTY_MESSAGE.to_string()
+    };
+    msg["content"] = json!([{ "type": "text", "text": text }]);
+    msg["stop_reason"] = json!("end_turn");
+    msg["stop_sequence"] = Value::Null;
+    Some(text)
+}
+
 pub fn anthropic_response_to_openai_chat(resp: &Value, model: &str) -> Value {
     let mut texts = Vec::new();
     let mut calls = Vec::new();
@@ -2911,5 +2976,284 @@ mod tests {
             assistant_tool_calls("openai-responses", &responses.to_string())[0]["id"],
             "call_2"
         );
+    }
+
+    // ---- Upstream refusal / empty-completion surfacing (harness retry-loop fix) ----
+
+    /// An Anthropic refusal: `stop_reason == "refusal"` with empty content, as
+    /// reassembled from the upstream (both the non-stream body and the SSE
+    /// `message_delta` land here).
+    fn anthropic_refusal_fixture() -> Value {
+        json!({
+            "id": "msg_refusal",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-fable-5",
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 42, "output_tokens": 0},
+        })
+    }
+
+    /// A realistic tool-call completion: Claude answers the "list the files"
+    /// turn with a `tool_use` block.
+    fn anthropic_tool_call_fixture() -> Value {
+        json!({
+            "id": "msg_tool",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-fable-5",
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "list_files",
+                 "input": {"path": "."}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 30, "output_tokens": 12},
+        })
+    }
+
+    /// A normal text completion.
+    fn anthropic_normal_fixture() -> Value {
+        json!({
+            "id": "msg_ok",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-fable-5",
+            "content": [{"type": "text", "text": "Here are the files."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 6},
+        })
+    }
+
+    /// The spec's contract: a client-visible OpenAI chat completion is USABLE
+    /// when it carries a non-empty assistant message OR at least one tool_call —
+    /// never a silent empty 200 (null/empty content and no tool_calls).
+    fn assert_usable_openai_chat(out: &Value) {
+        let msg = &out["choices"][0]["message"];
+        let has_text = msg["content"].as_str().is_some_and(|s| !s.trim().is_empty());
+        let has_tool_calls = msg["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty());
+        assert!(
+            has_text || has_tool_calls,
+            "empty/unusable completion (silent empty 200): {out}"
+        );
+    }
+
+    #[test]
+    fn refusal_fixture_surfaces_nonempty_explanatory_completion() {
+        let mut msg = anthropic_refusal_fixture();
+        let surfaced = neutralize_anthropic_refusal(&mut msg)
+            .expect("a refusal must be neutralized into a completion");
+        assert_eq!(surfaced, UPSTREAM_REFUSAL_MESSAGE);
+        // Downstream mapping produces a usable, non-empty completion with a
+        // clean `stop` finish_reason.
+        let out = anthropic_response_to_openai_chat(&msg, "claude-fable-5");
+        assert_usable_openai_chat(&out);
+        let content = out["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!content.is_empty(), "refusal produced empty content");
+        assert!(
+            content.contains("declined"),
+            "refusal text should explain the decline: {content}"
+        );
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_call_fixture_preserves_tool_calls_and_is_untouched() {
+        let mut msg = anthropic_tool_call_fixture();
+        let before = msg.clone();
+        // A renderable completion (tool_use) is never rewritten.
+        assert!(neutralize_anthropic_refusal(&mut msg).is_none());
+        assert_eq!(msg, before, "tool-call completion must be left untouched");
+        let out = anthropic_response_to_openai_chat(&msg, "claude-fable-5");
+        assert_usable_openai_chat(&out);
+        let call = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "toolu_1");
+        assert_eq!(call["function"]["name"], "list_files");
+        assert_eq!(call["function"]["arguments"], "{\"path\":\".\"}");
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn normal_fixture_preserves_content_and_is_untouched() {
+        let mut msg = anthropic_normal_fixture();
+        let before = msg.clone();
+        assert!(neutralize_anthropic_refusal(&mut msg).is_none());
+        assert_eq!(msg, before, "normal completion must be byte-for-byte unchanged");
+        let out = anthropic_response_to_openai_chat(&msg, "claude-fable-5");
+        assert_usable_openai_chat(&out);
+        assert_eq!(
+            out["choices"][0]["message"]["content"],
+            "Here are the files."
+        );
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn streaming_refusal_surfaces_nonempty_delta_and_done() {
+        let mut msg = anthropic_refusal_fixture();
+        neutralize_anthropic_refusal(&mut msg).expect("refusal neutralized");
+        // Streaming path: anthropic -> openai chat -> synthesized SSE.
+        let out = anthropic_response_to_openai_chat(&msg, "claude-fable-5");
+        let sse = synth_openai_chat_sse(&out);
+        assert!(
+            sse.contains(UPSTREAM_REFUSAL_MESSAGE),
+            "streamed refusal must carry the explanatory text as a content delta:\n{sse}"
+        );
+        // A real content delta chunk, not just the role frame.
+        assert!(
+            sse.contains("\"content\":"),
+            "streamed refusal must emit a content delta:\n{sse}"
+        );
+        assert!(
+            sse.trim_end().ends_with("data: [DONE]"),
+            "stream must terminate with [DONE]:\n{sse}"
+        );
+    }
+
+    #[test]
+    fn streaming_refusal_is_nonempty_across_every_client_sse_format() {
+        // Anthropic pivot is neutralized once; every client SSE synth must carry
+        // the text so no harness sees an empty stream.
+        let mut pivot = anthropic_refusal_fixture();
+        neutralize_anthropic_refusal(&mut pivot).expect("refusal neutralized");
+
+        let anthropic_sse = synth_anthropic_sse(&pivot);
+        assert!(anthropic_sse.contains(UPSTREAM_REFUSAL_MESSAGE));
+        assert!(anthropic_sse.contains("message_stop"));
+
+        let chat_sse = synth_openai_chat_sse(&anthropic_response_to_openai_chat(&pivot, "m"));
+        assert!(chat_sse.contains(UPSTREAM_REFUSAL_MESSAGE));
+
+        let responses_sse =
+            synth_openai_responses_sse(&anthropic_response_to_openai_responses(&pivot, "m"));
+        assert!(responses_sse.contains(UPSTREAM_REFUSAL_MESSAGE));
+
+        let gemini_sse = synth_gemini_sse(&anthropic_response_to_gemini(&pivot, "m"));
+        assert!(gemini_sse.contains(UPSTREAM_REFUSAL_MESSAGE));
+    }
+
+    #[test]
+    fn zero_content_end_turn_is_surfaced_as_empty_message() {
+        let mut msg = json!({
+            "id": "msg_empty", "type": "message", "role": "assistant",
+            "content": [], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        });
+        let surfaced = neutralize_anthropic_refusal(&mut msg)
+            .expect("a zero-content terminal stop must be surfaced");
+        assert_eq!(surfaced, UPSTREAM_EMPTY_MESSAGE);
+        let out = anthropic_response_to_openai_chat(&msg, "m");
+        assert_usable_openai_chat(&out);
+    }
+
+    #[test]
+    fn empty_text_block_still_counts_as_empty_and_is_surfaced() {
+        // An empty-string text block renders as nothing; treat it as empty.
+        let mut msg = json!({
+            "id": "m", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": ""}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        });
+        assert!(neutralize_anthropic_refusal(&mut msg).is_some());
+    }
+
+    #[test]
+    fn null_stop_partial_is_left_untouched() {
+        // A null stop_reason means the message was never completed — never
+        // fabricate a "declined" completion for a partial success.
+        let mut msg = json!({
+            "id": "m", "type": "message", "role": "assistant",
+            "content": [], "stop_reason": Value::Null,
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        });
+        assert!(neutralize_anthropic_refusal(&mut msg).is_none());
+    }
+
+    #[test]
+    fn max_tokens_empty_stop_is_left_untouched() {
+        // max_tokens is a distinct, harness-understood finish reason.
+        let mut msg = json!({
+            "id": "m", "type": "message", "role": "assistant",
+            "content": [], "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        });
+        assert!(neutralize_anthropic_refusal(&mut msg).is_none());
+    }
+
+    // ---- Realistic harness-interop request (the test that would have caught it) ----
+
+    /// A representative OpenAI-chat request from a foreign harness: a system
+    /// prompt, a declared tool, and a "list the files in this directory" turn.
+    fn harness_list_files_request() -> Value {
+        json!({
+            "model": "claude-fable-5",
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": "You are a coding agent. Use tools."},
+                {"role": "user", "content": "list the files in this directory"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "description": "List files in a directory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }],
+        })
+    }
+
+    #[test]
+    fn harness_interop_tool_call_request_yields_usable_tool_call() {
+        // 1) The harness request converts to an Anthropic upstream request with
+        //    the tool preserved (proves the request leg round-trips).
+        let req = harness_list_files_request();
+        let upstream_req = openai_chat_to_anthropic(&req);
+        assert_eq!(upstream_req["tools"][0]["name"], "list_files");
+        assert_eq!(
+            upstream_req["messages"].as_array().unwrap().last().unwrap()["content"],
+            "list the files in this directory"
+        );
+        // 2) Claude answers with a tool_use; translated back the client sees a
+        //    usable tool_call (never a silent empty 200).
+        let upstream_final = anthropic_tool_call_fixture();
+        let out = anthropic_response_to_openai_chat(&upstream_final, "claude-fable-5");
+        assert_usable_openai_chat(&out);
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "list_files"
+        );
+    }
+
+    #[test]
+    fn harness_interop_refusal_request_is_usable_not_empty() {
+        // Same realistic request, but Claude refuses Kimi's prompt. The bad
+        // combo must fail CLEARLY (a rendered message) instead of an empty 200
+        // the harness retries forever.
+        let _req = harness_list_files_request();
+        let mut upstream_final = anthropic_refusal_fixture();
+        let surfaced = surface_like_proxy(&mut upstream_final, "anthropic");
+        assert!(surfaced, "the proxy must surface the refusal");
+        let out = anthropic_response_to_openai_chat(&upstream_final, "claude-fable-5");
+        assert_usable_openai_chat(&out);
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// Mirrors the proxy's `surface_upstream_refusal` gate (anthropic-only) so
+    /// the interop test exercises the exact production condition.
+    fn surface_like_proxy(upstream_final: &mut Value, upstream_format: &str) -> bool {
+        if upstream_format != "anthropic" {
+            return false;
+        }
+        neutralize_anthropic_refusal(upstream_final).is_some()
     }
 }
