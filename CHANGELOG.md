@@ -16,7 +16,9 @@ predate this file — see the git history and GitHub releases.
   with drain + hard-restart fallback (zero dropped connections). Built on both
   platforms; pending live zero-downtime verification.
 
-### Added (on `main`, for the next release)
+## [0.1.28-beta.1] - 2026-07-18
+
+### Added
 - **Kimi Code integration** — log in to Kimi through Alex (`alex auth login
   kimi`, OAuth device flow) or adopt an existing `~/.kimi-code` login (`alex
   auth import kimi`); Kimi usage/quota shows in `alex status` and the menu;
@@ -29,10 +31,30 @@ predate this file — see the git history and GitHub releases.
   it never alarms on a token that can still silently refresh.
 - Homebrew **cask is now published on every release** from the release
   pipeline, so the tap can't drift out of date again.
-- `install-release.sh` recovers from a broken/renamed Homebrew cask record,
-  force-installs the current app, and launches the app even if the daemon is
-  busy. Adopts `open_app` (launch whichever app the cask installed) and a
-  `remove_legacy_app` guard — thanks **@khoaguin** (#5).
+- `install-release.sh`/`install-beta.sh` recover from a broken/renamed Homebrew
+  cask record, reclaim the port from stray daemons, and launch the app even if
+  the daemon is busy. Adopt `open_app` and a `remove_legacy_app` guard —
+  thanks **@khoaguin** (#5).
+
+## [0.1.28-beta.2] - 2026-07-18
+
+### Added
+- **Kimi login from the UI** — Settings → Providers → Kimi runs the device-flow
+  panel (shows the code + authorize URL), plus a one-click "Use existing Kimi
+  login" for an already-authed `~/.kimi-code`. The **Add-provider list is now
+  complete** — Claude, Codex, Gemini, Grok, Kimi, OpenRouter, Amp, and Exo —
+  each routing to its correct setup (OAuth / API-key / Exo's config).
+- **Unified update channel** — one Release-channel picker sets **both** the app
+  and the daemon by default (with an "either" scope), so beta/stable can no
+  longer diverge between them. New `GET/POST /admin/update/channel`.
+
+### Fixed
+- **Provider health is now based on real pings.** A provider whose probes fail
+  reads red (auth-failed / unreachable) in the menu and Providers pane instead
+  of showing "Active" from mere credential presence.
+- **Re-auth on any auth-class access failure** — a ping/heartbeat that returns
+  401/403 (a confirmed logout) now fires the Telegram re-auth alert too; a
+  transient 5xx/timeout stays "down" (failover) and never cries wolf.
 
 ## [0.1.27] - 2026-07-17
 
