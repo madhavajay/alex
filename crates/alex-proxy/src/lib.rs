@@ -117,12 +117,16 @@ pub trait ExoConfigPersister: Send + Sync {
 /// fresh install and defaults to a short list of examples (see
 /// `default_openrouter_exposed_models`); an explicit empty list exposes nothing.
 pub const DEFAULT_OPENROUTER_EXPOSED_MODELS: &[&str] = &[
-    // Bare OpenRouter ids (no `openrouter/` prefix). Verified present in the
-    // live OpenRouter catalog on 2026-07-18. Kept intentionally tiny so users
-    // see the pattern and curate their own list from the picker.
-    "anthropic/claude-sonnet-5",
-    "google/gemini-3.5-flash",
+    // Bare OpenRouter ids (no `openrouter/` prefix). A small starter set of
+    // OpenRouter's top-ranked models (verified present in the live catalog on
+    // 2026-07-18) so users see the pattern and curate their own from the picker.
+    "tencent/hy3:free",
+    "xiaomi/mimo-v2.5",
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "minimax/minimax-m3",
     "z-ai/glm-5.2",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ];
 
 /// The shipped example exposure list, owned here so the daemon config default
