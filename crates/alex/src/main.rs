@@ -46,6 +46,8 @@ enum Command {
         #[arg(long)]
         background: bool,
     },
+    #[command(name = "__launchd-restart-helper", hide = true)]
+    LaunchdRestartHelper,
     /// Credential vault operations
     Auth {
         #[command(subcommand)]
@@ -322,9 +324,9 @@ enum ServiceCommand {
         /// loopback (127.0.0.1), all (0.0.0.0), or a detected interface address
         target: String,
     },
-    /// Safely replace the loaded launchd service when it has no routed requests in flight
+    /// Gracefully drain and restart the loaded launchd service
     Restart {
-        /// Replace even when routed requests are in flight (those requests will be interrupted)
+        /// Use the legacy hard restart (routed requests may be interrupted)
         #[arg(long)]
         force: bool,
     },
@@ -2958,6 +2960,17 @@ fn parse_bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 async fn bind_daemon_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    bind_daemon_listener_named(host, port, "alexandria-primary").await
+}
+
+async fn bind_daemon_listener_named(
+    host: &str,
+    port: u16,
+    socket_name: &str,
+) -> Result<tokio::net::TcpListener> {
+    if let Some(listener) = launchd_activated_listener(socket_name)? {
+        return Ok(listener);
+    }
     let addr = parse_bind_socket_addr(host, port)?;
     let socket = if addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
@@ -2973,6 +2986,66 @@ async fn bind_daemon_listener(host: &str, port: u16) -> Result<tokio::net::TcpLi
     socket
         .listen(1024)
         .context("listening for daemon connections")
+}
+
+/// A launchd socket is opt-in.  A daemon started directly (including Linux,
+/// systemd, tests, and old launchd plists) always keeps the normal bind path.
+#[cfg(target_os = "macos")]
+fn launchd_socket_activation_requested() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_activated_listener(socket_name: &str) -> Result<Option<tokio::net::TcpListener>> {
+    use std::os::fd::FromRawFd;
+
+    if !launchd_socket_activation_requested() {
+        return Ok(None);
+    }
+
+    unsafe extern "C" {
+        fn launch_activate_socket(
+            name: *const std::ffi::c_char,
+            fds: *mut *mut std::ffi::c_int,
+            count: *mut usize,
+        ) -> std::ffi::c_int;
+        fn free(ptr: *mut std::ffi::c_void);
+        fn close(fd: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    let name = std::ffi::CString::new(socket_name).context("invalid launchd socket name")?;
+    let mut fds: *mut std::ffi::c_int = std::ptr::null_mut();
+    let mut count = 0usize;
+    let status = unsafe { launch_activate_socket(name.as_ptr(), &mut fds, &mut count) };
+    if status != 0 || fds.is_null() || count != 1 {
+        if !fds.is_null() {
+            for index in 0..count {
+                unsafe { close(*fds.add(index)) };
+            }
+            unsafe { free(fds.cast()) };
+        }
+        anyhow::bail!(
+            "launchd did not provide exactly one {socket_name} socket (status {status}, count {count})"
+        );
+    }
+    let fd = unsafe { *fds };
+    unsafe { free(fds.cast()) };
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener
+        .set_nonblocking(true)
+        .context("setting launchd listener nonblocking")?;
+    let listener =
+        tokio::net::TcpListener::from_std(listener).context("adopting launchd listener")?;
+    Ok(Some(listener))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_activated_listener(_socket_name: &str) -> Result<Option<tokio::net::TcpListener>> {
+    // This is intentionally a fallback, rather than an error: the same daemon
+    // binary is used by standalone and systemd deployments.
+    Ok(None)
 }
 
 /// Bind the configured listener, preserving a local daemon if a selected
@@ -3385,7 +3458,7 @@ async fn main() -> Result<()> {
             }
             let local_listener = if requires_explicit_loopback_listener(&bound_host) {
                 Some(
-                    bind_daemon_listener("127.0.0.1", port)
+                    bind_daemon_listener_named("127.0.0.1", port, "alexandria-local")
                         .await
                         .with_context(|| {
                             format!(
@@ -3448,6 +3521,9 @@ async fn main() -> Result<()> {
             if let Some(sup) = supervisor {
                 sup.shutdown().await;
             }
+        }
+        Command::LaunchdRestartHelper => {
+            restart_launchd_daemon(&config, false).await?;
         }
         Command::Vault { command } => match command {
             VaultCommand::Export {
@@ -4247,7 +4323,7 @@ async fn main() -> Result<()> {
         Command::Service { command } => match command {
             ServiceCommand::Install => service_install(&config)?,
             ServiceCommand::Bind { target } => service_set_bind(&config, &target)?,
-            ServiceCommand::Restart { force } => service_restart(&config, force)?,
+            ServiceCommand::Restart { force } => service_restart(&config, force).await?,
             ServiceCommand::Uninstall => service_uninstall()?,
             ServiceCommand::Status => {
                 println!("{}", service_state_label(&detect_service_state()));
@@ -8011,57 +8087,6 @@ const LAUNCHD_LABEL: &str = "com.alexandria.daemon";
 const LAUNCHD_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const LAUNCHD_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
-#[derive(Debug, PartialEq)]
-enum LaunchdInstallMode {
-    Bootstrap,
-    UpdatedRestartRequired,
-}
-
-fn launchd_install_mode(loaded: bool) -> LaunchdInstallMode {
-    if loaded {
-        LaunchdInstallMode::UpdatedRestartRequired
-    } else {
-        LaunchdInstallMode::Bootstrap
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum LaunchdRestartOutcome {
-    Replaced,
-    RefusedInFlight { status: InFlightStatus },
-    RolledBack { cause: String },
-    Failed { cause: String },
-}
-
-trait LaunchctlControl {
-    fn is_loaded(&mut self) -> Result<bool>;
-    fn bootout(&mut self, plist: &Path) -> Result<()>;
-    fn bootstrap(&mut self, plist: &Path) -> Result<()>;
-}
-
-trait LaunchdHealthProbe {
-    fn in_flight(&mut self) -> Result<InFlightStatus>;
-    fn wait_until_healthy(&mut self) -> bool;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct InFlightRequestSummary {
-    age_s: i64,
-    model: String,
-    session_id: Option<String>,
-    harness: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InFlightStatus {
-    count: i64,
-    requests: Vec<InFlightRequestSummary>,
-}
-
-trait LaunchdPlistRollback {
-    fn restore_previous(&mut self) -> Result<()>;
-}
-
 struct SystemLaunchctl {
     domain: String,
 }
@@ -8090,7 +8115,7 @@ impl SystemLaunchctl {
     }
 }
 
-impl LaunchctlControl for SystemLaunchctl {
+impl SystemLaunchctl {
     fn is_loaded(&mut self) -> Result<bool> {
         let output = std::process::Command::new("launchctl")
             .args(["print", &format!("{}/{LAUNCHD_LABEL}", self.domain)])
@@ -8099,172 +8124,9 @@ impl LaunchctlControl for SystemLaunchctl {
         Ok(output.status.success())
     }
 
-    fn bootout(&mut self, plist: &Path) -> Result<()> {
-        self.run("bootout", plist)
-    }
-
     fn bootstrap(&mut self, plist: &Path) -> Result<()> {
         self.run("bootstrap", plist)
     }
-}
-
-struct LocalLaunchdHealthProbe {
-    client: reqwest::blocking::Client,
-    base_url: String,
-    local_key: String,
-}
-
-impl LocalLaunchdHealthProbe {
-    fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .context("building daemon health client")?,
-            base_url: config.base_url(),
-            local_key: config.local_key.clone(),
-        })
-    }
-
-    fn health(&self) -> Result<serde_json::Value> {
-        let response = self
-            .client
-            .get(format!("{}/health", self.base_url))
-            .header("x-api-key", &self.local_key)
-            .send()
-            .context("querying daemon /health")?;
-        if !response.status().is_success() {
-            anyhow::bail!("daemon /health returned {}", response.status());
-        }
-        response.json().context("parsing daemon /health response")
-    }
-}
-
-impl LaunchdHealthProbe for LocalLaunchdHealthProbe {
-    fn in_flight(&mut self) -> Result<InFlightStatus> {
-        let health = self.health()?;
-        let count = health
-            .get("in_flight")
-            .and_then(serde_json::Value::as_i64)
-            .context("daemon /health did not include an in_flight count")?;
-        if count < 0 {
-            anyhow::bail!("daemon /health returned an invalid in_flight count ({count})");
-        }
-        let requests = serde_json::from_value(
-            health
-                .get("in_flight_requests")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-        )
-        .context("daemon /health returned invalid in-flight request details")?;
-        Ok(InFlightStatus { count, requests })
-    }
-
-    fn wait_until_healthy(&mut self) -> bool {
-        let deadline = std::time::Instant::now() + LAUNCHD_HEALTH_TIMEOUT;
-        loop {
-            if self
-                .health()
-                .map(|health| {
-                    health.get("status").and_then(serde_json::Value::as_str) == Some("ok")
-                        && health.get("service").and_then(serde_json::Value::as_str)
-                            == Some("alexandria")
-                })
-                .unwrap_or(false)
-            {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(LAUNCHD_HEALTH_POLL_INTERVAL);
-        }
-    }
-}
-
-struct FilesystemLaunchdRollback<'a> {
-    destination: &'a Path,
-    previous: &'a Path,
-}
-
-impl LaunchdPlistRollback for FilesystemLaunchdRollback<'_> {
-    fn restore_previous(&mut self) -> Result<()> {
-        let plist = std::fs::read(self.previous)
-            .with_context(|| format!("reading saved previous plist {}", self.previous.display()))?;
-        std::fs::write(self.destination, plist)
-            .with_context(|| format!("restoring previous plist {}", self.destination.display()))
-    }
-}
-
-/// Replace a loaded job only after the daemon reports that it is idle.  The
-/// launchctl and health operations are deliberately traits so this sequence is
-/// testable on platforms that do not have launchd.
-fn replace_loaded_launchd_service<C, H, F>(
-    launchctl: &mut C,
-    health: &mut H,
-    rollback: &mut F,
-    plist: &Path,
-    force: bool,
-    mut force_warning: Option<&mut dyn FnMut(&InFlightStatus)>,
-) -> LaunchdRestartOutcome
-where
-    C: LaunchctlControl,
-    H: LaunchdHealthProbe,
-    F: LaunchdPlistRollback,
-{
-    let in_flight = match health.in_flight() {
-        Ok(status) => status,
-        Err(error) => {
-            return LaunchdRestartOutcome::Failed {
-                cause: format!("could not determine in-flight routed requests: {error:#}"),
-            }
-        }
-    };
-    if in_flight.count > 0 && !force {
-        return LaunchdRestartOutcome::RefusedInFlight { status: in_flight };
-    }
-    if in_flight.count > 0 {
-        if let Some(warn) = force_warning.as_mut() {
-            warn(&in_flight);
-        }
-    }
-
-    if let Err(error) = launchctl.bootout(plist) {
-        return LaunchdRestartOutcome::Failed {
-            cause: format!("could not boot out the loaded daemon: {error:#}"),
-        };
-    }
-
-    let failure = match launchctl.bootstrap(plist) {
-        Ok(()) if health.wait_until_healthy() => return LaunchdRestartOutcome::Replaced,
-        Ok(()) => "the new daemon did not become healthy before the timeout".to_string(),
-        Err(error) => format!("bootstrapping the new daemon failed: {error:#}"),
-    };
-
-    // A successful bootstrap can still leave a broken job loaded.  Try to
-    // remove it before re-bootstrapping the previous plist.  A failed cleanup
-    // is not fatal by itself: the old bootstrap and health probe are the
-    // observable evidence that recovery succeeded.
-    let cleanup_error = launchctl.bootout(plist).err();
-    if let Err(error) = rollback.restore_previous() {
-        return LaunchdRestartOutcome::Failed {
-            cause: format!("{failure}; could not restore the previous plist: {error:#}"),
-        };
-    }
-    if let Err(error) = launchctl.bootstrap(plist) {
-        let cleanup = cleanup_error
-            .map(|error| format!("; cleanup also failed: {error:#}"))
-            .unwrap_or_default();
-        return LaunchdRestartOutcome::Failed {
-            cause: format!("{failure}; rollback bootstrap failed: {error:#}{cleanup}"),
-        };
-    }
-    if !health.wait_until_healthy() {
-        return LaunchdRestartOutcome::Failed {
-            cause: format!("{failure}; rollback daemon did not become healthy before the timeout"),
-        };
-    }
-    LaunchdRestartOutcome::RolledBack { cause: failure }
 }
 
 fn launchd_plist_path() -> Result<PathBuf> {
@@ -8272,10 +8134,6 @@ fn launchd_plist_path() -> Result<PathBuf> {
         .context("no home dir")?
         .join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist")))
-}
-
-fn launchd_previous_plist_path(plist: &Path) -> PathBuf {
-    plist.with_extension("plist.previous")
 }
 
 fn xml_escape(value: &str) -> String {
@@ -8330,8 +8188,34 @@ fn known_launchd_path_dirs(exe: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn render_launchd_plist(exe: &Path, inherited_path: &str, known_dirs: &[PathBuf]) -> String {
-    LAUNCHD_TEMPLATE
+fn render_launchd_sockets(config: &Config) -> Result<String> {
+    let socket = |name: &str, host: &str| -> Result<String> {
+        let addr = parse_bind_socket_addr(host, config.port)?;
+        let family = if addr.is_ipv4() { "IPv4" } else { "IPv6" };
+        Ok(format!(
+            "    <key>{}</key>\n    <dict>\n      <key>SockFamily</key>\n      <string>{family}</string>\n      <key>SockType</key>\n      <string>stream</string>\n      <key>SockProtocol</key>\n      <string>TCP</string>\n      <key>SockNodeName</key>\n      <string>{}</string>\n      <key>SockServiceName</key>\n      <string>{}</string>\n    </dict>",
+            xml_escape(name),
+            xml_escape(host.trim_matches(['[', ']'])),
+            config.port,
+        ))
+    };
+    let mut entries = vec![socket("alexandria-primary", &config.host)?];
+    if requires_explicit_loopback_listener(&config.host) {
+        entries.push(socket("alexandria-local", "127.0.0.1")?);
+    }
+    Ok(format!(
+        "  <key>Sockets</key>\n  <dict>\n{}\n  </dict>",
+        entries.join("\n")
+    ))
+}
+
+fn render_launchd_plist(
+    exe: &Path,
+    inherited_path: &str,
+    known_dirs: &[PathBuf],
+    config: &Config,
+) -> Result<String> {
+    Ok(LAUNCHD_TEMPLATE
         .replace(
             "/usr/local/bin/alexandria",
             &xml_escape(&exe.to_string_lossy()),
@@ -8340,23 +8224,7 @@ fn render_launchd_plist(exe: &Path, inherited_path: &str, known_dirs: &[PathBuf]
             "__ALEX_LAUNCHD_PATH__",
             &xml_escape(&render_launchd_path(inherited_path, known_dirs)),
         )
-}
-
-fn save_previous_launchd_plist_if_needed(destination: &Path, loaded: bool) -> Result<()> {
-    if !loaded {
-        return Ok(());
-    }
-    let previous = launchd_previous_plist_path(destination);
-    if previous.exists() || !destination.exists() {
-        return Ok(());
-    }
-    std::fs::copy(destination, &previous).with_context(|| {
-        format!(
-            "saving previous launchd plist {}",
-            previous.to_string_lossy()
-        )
-    })?;
-    Ok(())
+        .replace("__ALEX_LAUNCHD_SOCKETS__", &render_launchd_sockets(config)?))
 }
 
 fn current_uid() -> String {
@@ -8385,43 +8253,25 @@ fn service_install(config: &Config) -> Result<()> {
         let dst = launchd_plist_path()?;
         std::fs::create_dir_all(dst.parent().unwrap())?;
         let mut launchctl = SystemLaunchctl::new();
-        let mode = launchd_install_mode(launchctl.is_loaded()?);
-        save_previous_launchd_plist_if_needed(
-            &dst,
-            mode == LaunchdInstallMode::UpdatedRestartRequired,
-        )?;
+        let loaded = launchctl.is_loaded()?;
         let plist = render_launchd_plist(
             &exe,
             &std::env::var("PATH").unwrap_or_default(),
             &known_launchd_path_dirs(&exe),
-        );
+            config,
+        )?;
         std::fs::write(&dst, plist)?;
-        match mode {
-            LaunchdInstallMode::UpdatedRestartRequired => {
-                eprintln!("launchd plist updated, but the loaded daemon was left running.");
-                eprintln!("  The on-disk plist is newer than the loaded service.");
-                eprintln!(
-                    "  Apply it when there are no in-flight routed requests: alex service restart"
-                );
-                anyhow::bail!("launchd service was not replaced (exit 1)");
-            }
-            LaunchdInstallMode::Bootstrap => {
-                launchctl.bootstrap(&dst)?;
-                let mut health = LocalLaunchdHealthProbe::new(config)?;
-                if !health.wait_until_healthy() {
-                    anyhow::bail!(
-                        "launchd bootstrap completed, but the daemon did not become healthy within {}s",
-                        LAUNCHD_HEALTH_TIMEOUT.as_secs()
-                    );
-                }
-                println!(
-                    "{} {}",
-                    ui::gold(ui::diamond()),
-                    ui::bold("launchd service installed and serving")
-                );
-                println!("  {}", ui::dim(&dst.to_string_lossy()));
-            }
+        if loaded {
+            eprintln!("launchd plist updated; run `alex service restart` to load it.");
+            anyhow::bail!("launchd service plist updated but not yet loaded (exit 1)");
         }
+        launchctl.bootstrap(&dst)?;
+        println!(
+            "{} {}",
+            ui::gold(ui::diamond()),
+            ui::bold("launchd service installed and started")
+        );
+        println!("  {}", ui::dim(&dst.to_string_lossy()));
     } else if cfg!(target_os = "linux") {
         let dst = dirs::home_dir()
             .context("no home dir")?
@@ -8498,98 +8348,194 @@ fn service_set_bind(config: &Config, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn service_restart(config: &Config, force: bool) -> Result<()> {
+async fn service_restart(config: &Config, force: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("service restart supports macOS launchd only");
     }
 
-    let plist = launchd_plist_path()?;
-    let previous = launchd_previous_plist_path(&plist);
     let mut launchctl = SystemLaunchctl::new();
     if !launchctl.is_loaded()? {
         anyhow::bail!("no loaded launchd daemon to restart; run alex service install first");
     }
-    if !previous.exists() {
-        anyhow::bail!(
-            "no saved previous plist is available for rollback; run alex service install first"
-        );
-    }
+    restart_launchd_daemon(config, force).await
+}
 
-    let mut health = LocalLaunchdHealthProbe::new(config)?;
-    let mut rollback = FilesystemLaunchdRollback {
-        destination: &plist,
-        previous: &previous,
-    };
-    let mut force_warning = |status: &InFlightStatus| {
-        eprintln!(
-            "WARNING: forcing restart will interrupt {} routed request(s).",
-            status.count
-        );
-        print_in_flight_requests(status);
-    };
-    let force_warning = force.then_some(&mut force_warning as &mut dyn FnMut(&InFlightStatus));
-    match replace_loaded_launchd_service(
-        &mut launchctl,
-        &mut health,
-        &mut rollback,
-        &plist,
-        force,
-        force_warning,
-    ) {
-        LaunchdRestartOutcome::Replaced => {
-            std::fs::remove_file(&previous).with_context(|| {
-                format!(
-                    "removing saved previous plist {}",
-                    previous.to_string_lossy()
-                )
-            })?;
-            println!(
-                "{} {}",
-                ui::gold(ui::diamond()),
-                ui::bold("launchd service replaced and serving")
-            );
-            Ok(())
-        }
-        LaunchdRestartOutcome::RefusedInFlight { status } => {
-            eprintln!(
-                "launchd service was not replaced: {} routed request(s) are still in flight.",
-                status.count
-            );
-            print_in_flight_requests(&status);
-            eprintln!("  Wait for them to finish, then run: alex service restart");
-            eprintln!("  To interrupt them and restart anyway: alex service restart --force");
-            anyhow::bail!("refused to interrupt in-flight routed requests (exit 1)");
-        }
-        LaunchdRestartOutcome::RolledBack { cause } => {
-            eprintln!(
-                "launchd replacement failed; the previous daemon was restored and is serving."
-            );
-            eprintln!("  Cause: {cause}");
-            anyhow::bail!("launchd service rollback completed (exit 1)");
-        }
-        LaunchdRestartOutcome::Failed { cause } => {
-            eprintln!("launchd replacement failed; rollback did not restore a healthy daemon.");
-            eprintln!("  Cause: {cause}");
-            anyhow::bail!("launchd service restart failed (exit 1)");
+fn launchd_hard_restart() -> Result<()> {
+    let status = std::process::Command::new("launchctl")
+        .args([
+            "kickstart",
+            "-k",
+            &format!("gui/{}/{}", current_uid(), LAUNCHD_LABEL),
+        ])
+        .status()
+        .context("running launchctl kickstart -k fallback")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("launchctl kickstart -k fallback failed")
+    }
+}
+
+/// Run the restart coordinator out-of-process for daemon self-updates.  The
+/// coordinator must outlive the old daemon it signals; if it cannot be
+/// spawned, the old daemon is deliberately left untouched.
+pub(crate) fn spawn_launchd_restart_helper(exe: &Path) -> Result<()> {
+    std::process::Command::new(exe)
+        .arg("__launchd-restart-helper")
+        .stdin(std::process::Stdio::null())
+        // Inherit launchd's configured logs: a lifecycle fallback must be
+        // diagnosable after the daemon that requested it has exited.
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("starting launchd restart helper from {}", exe.display()))?;
+    Ok(())
+}
+
+async fn wait_for_local_health(config: &Config) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("building daemon health client")?;
+    Ok(selfupdate::wait_for_daemon_health(
+        &client,
+        &format!("{}/health", config.base_url()),
+        LAUNCHD_HEALTH_TIMEOUT,
+    )
+    .await)
+}
+
+async fn launchd_socket_activation_is_live(config: &Config) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("building daemon health client")?;
+    let response = client
+        .get(format!("{}/health", config.base_url()))
+        .header("x-api-key", &config.local_key)
+        .send()
+        .await
+        .context("querying daemon /health")?;
+    let health: serde_json::Value = response.json().await.context("parsing daemon /health")?;
+    Ok(health
+        .get("launchd_socket_activation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn drain_timeout_from(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+fn drain_timeout() -> std::time::Duration {
+    drain_timeout_from(
+        std::env::var("ALEXANDRIA_DRAIN_TIMEOUT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn graceful_or_hard_restart(
+    graceful: Result<()>,
+    hard_restart: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    match graceful {
+        Ok(()) => Ok(false),
+        Err(_) => {
+            hard_restart()?;
+            Ok(true)
         }
     }
 }
 
-fn print_in_flight_requests(status: &InFlightStatus) {
-    for request in &status.requests {
-        let session = request.session_id.as_deref().unwrap_or("unknown");
-        let harness = request.harness.as_deref().unwrap_or("unknown");
-        eprintln!(
-            "  - age {}s · model {} · session {} · harness {}",
-            request.age_s, request.model, session, harness
-        );
+fn process_running(pid: i64) -> Result<bool> {
+    let status = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .context("checking daemon process")?;
+    Ok(status.success())
+}
+
+async fn drain_launchd_daemon(pid: i64, timeout: std::time::Duration) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .context("signalling launchd daemon to drain")?;
+    if !status.success() {
+        anyhow::bail!("could not signal launchd daemon to drain")
     }
-    if status.count > status.requests.len() as i64 {
+    if !wait_for_process_exit(timeout, || process_running(pid)).await? {
         eprintln!(
-            "  - {} request detail(s) unavailable from this daemon",
-            status.count - status.requests.len() as i64
+            "launchd drain timed out after {}s; force-closing the old daemon",
+            timeout.as_secs()
         );
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+        anyhow::bail!("launchd daemon did not exit after the drain timeout")
     }
+    Ok(())
+}
+
+async fn wait_for_process_exit(
+    timeout: std::time::Duration,
+    mut is_running: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !is_running()? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(LAUNCHD_HEALTH_POLL_INTERVAL).await;
+    }
+}
+
+/// The only graceful launchd path.  The socket remains owned by launchd while
+/// axum stops accepting and drains, so TCP handshakes queue instead of seeing
+/// a refused connection.  Every error deliberately invokes the old hard
+/// kickstart as the always-up fallback.
+pub(crate) async fn restart_launchd_daemon(config: &Config, force: bool) -> Result<()> {
+    let opted_out = std::env::var_os("ALEXANDRIA_GRACEFUL_RESTART").as_deref()
+        == Some(std::ffi::OsStr::new("0"));
+    if force || opted_out {
+        eprintln!("using requested hard launchd restart");
+        return launchd_hard_restart();
+    }
+
+    let graceful = async {
+        if !launchd_socket_activation_is_live(config).await? {
+            anyhow::bail!("loaded daemon does not have an activated launchd socket")
+        }
+        let pid = match detect_service_state() {
+            ServiceState::LaunchdLoaded { pid: Some(pid) } => pid,
+            _ => anyhow::bail!("launchd did not report a running daemon pid"),
+        };
+        eprintln!("launchd socket activation is live; draining daemon pid {pid}");
+        drain_launchd_daemon(pid, drain_timeout()).await?;
+        if !wait_for_local_health(config).await? {
+            anyhow::bail!("replacement daemon did not become healthy before the timeout")
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &graceful {
+        eprintln!("graceful launchd restart failed: {error:#}; falling back to hard restart");
+    }
+    if graceful_or_hard_restart(graceful, launchd_hard_restart)
+        .context("graceful restart and hard fallback both failed")?
+    {
+        println!("daemon restarted via hard fallback");
+    } else {
+        println!("daemon restarted after graceful drain");
+    }
+    Ok(())
 }
 
 fn service_uninstall() -> Result<()> {
@@ -10805,82 +10751,11 @@ mod tests {
         assert_eq!(parse_launchctl_pid(""), None);
     }
 
-    struct FakeLaunchctl {
-        calls: Vec<&'static str>,
-        bootout_results: std::collections::VecDeque<bool>,
-        bootstrap_results: std::collections::VecDeque<bool>,
-    }
-
-    impl FakeLaunchctl {
-        fn succeeds() -> Self {
-            Self {
-                calls: Vec::new(),
-                bootout_results: [true].into(),
-                bootstrap_results: [true].into(),
-            }
-        }
-    }
-
-    impl LaunchctlControl for FakeLaunchctl {
-        fn is_loaded(&mut self) -> Result<bool> {
-            Ok(true)
-        }
-
-        fn bootout(&mut self, _: &Path) -> Result<()> {
-            self.calls.push("bootout");
-            if self.bootout_results.pop_front().unwrap_or(true) {
-                Ok(())
-            } else {
-                anyhow::bail!("fake bootout failure")
-            }
-        }
-
-        fn bootstrap(&mut self, _: &Path) -> Result<()> {
-            self.calls.push("bootstrap");
-            if self.bootstrap_results.pop_front().unwrap_or(true) {
-                Ok(())
-            } else {
-                anyhow::bail!("fake bootstrap failure")
-            }
-        }
-    }
-
-    struct FakeHealth {
-        in_flight: i64,
-        healthy_results: std::collections::VecDeque<bool>,
-    }
-
-    impl LaunchdHealthProbe for FakeHealth {
-        fn in_flight(&mut self) -> Result<InFlightStatus> {
-            Ok(InFlightStatus {
-                count: self.in_flight,
-                requests: Vec::new(),
-            })
-        }
-
-        fn wait_until_healthy(&mut self) -> bool {
-            self.healthy_results.pop_front().unwrap_or(false)
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeRollback {
-        restored: bool,
-    }
-
-    impl LaunchdPlistRollback for FakeRollback {
-        fn restore_previous(&mut self) -> Result<()> {
-            self.restored = true;
-            Ok(())
-        }
-    }
-
-    // launchd is macOS-only; on Windows CI the include_str!'d plist template is
-    // checked out with CRLF (git autocrlf), so the rendered `\n` assertion misses.
-    // Rendering is never exercised on Windows in production, so gate the test.
-    #[cfg(not(windows))]
     #[test]
-    fn launchd_plist_rendering_preserves_path_and_escapes_values() {
+    fn launchd_plist_renders_configured_socket_and_path() {
+        let mut config = test_config(tmpdir("launchd-plist"));
+        config.host = "127.0.0.1".into();
+        config.port = 4321;
         let plist = render_launchd_plist(
             Path::new("/Users/alex/bin/alex&ria"),
             "/usr/bin:/custom/bin",
@@ -10888,121 +10763,55 @@ mod tests {
                 PathBuf::from("/opt/homebrew/bin"),
                 PathBuf::from("/custom/bin"),
             ],
-        );
+            &config,
+        )
+        .unwrap();
         assert!(plist.contains("/Users/alex/bin/alex&amp;ria"));
-        assert!(plist.contains(
-            "<key>PATH</key>\n    <string>/usr/bin:/custom/bin:/opt/homebrew/bin</string>"
-        ));
-        assert_eq!(launchd_install_mode(false), LaunchdInstallMode::Bootstrap);
-        assert_eq!(
-            launchd_install_mode(true),
-            LaunchdInstallMode::UpdatedRestartRequired
-        );
+        assert!(plist.contains("alexandria-primary"));
+        assert!(plist.contains("<string>127.0.0.1</string>"));
+        assert!(plist.contains("<string>4321</string>"));
+    }
+
+    #[tokio::test]
+    async fn standalone_listener_binds_without_a_launchd_socket() {
+        let listener = bind_daemon_listener("127.0.0.1", 0).await.unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
     #[test]
-    fn launchd_restart_refuses_while_routed_requests_are_in_flight() {
-        let mut launchctl = FakeLaunchctl::succeeds();
-        let mut health = FakeHealth {
-            in_flight: 2,
-            healthy_results: [].into(),
-        };
-        let mut rollback = FakeRollback::default();
-        assert_eq!(
-            replace_loaded_launchd_service(
-                &mut launchctl,
-                &mut health,
-                &mut rollback,
-                Path::new("daemon.plist"),
-                false,
-                None,
-            ),
-            LaunchdRestartOutcome::RefusedInFlight {
-                status: InFlightStatus {
-                    count: 2,
-                    requests: Vec::new(),
-                },
-            }
-        );
-        assert!(launchctl.calls.is_empty());
-        assert!(!rollback.restored);
+    fn graceful_failure_always_runs_the_hard_restart_fallback() {
+        let called = std::cell::Cell::new(false);
+        let used_fallback = graceful_or_hard_restart(
+            Err(anyhow::anyhow!("new daemon never became healthy")),
+            || {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(used_fallback);
+        assert!(called.get());
     }
 
     #[test]
-    fn launchd_restart_force_replaces_while_routed_requests_are_in_flight() {
-        let mut launchctl = FakeLaunchctl::succeeds();
-        let mut health = FakeHealth {
-            in_flight: 2,
-            healthy_results: [true].into(),
-        };
-        let mut rollback = FakeRollback::default();
-        let mut interrupted = None;
-        let mut warning = |status: &InFlightStatus| interrupted = Some(status.count);
-        assert_eq!(
-            replace_loaded_launchd_service(
-                &mut launchctl,
-                &mut health,
-                &mut rollback,
-                Path::new("daemon.plist"),
-                true,
-                Some(&mut warning),
-            ),
-            LaunchdRestartOutcome::Replaced
-        );
-        assert_eq!(interrupted, Some(2));
-        assert_eq!(launchctl.calls, ["bootout", "bootstrap"]);
-        assert!(!rollback.restored);
+    fn drain_timeout_defaults_and_accepts_an_override() {
+        assert_eq!(drain_timeout_from(None).as_secs(), 30);
+        assert_eq!(drain_timeout_from(Some("7")).as_secs(), 7);
+        assert_eq!(drain_timeout_from(Some("invalid")).as_secs(), 30);
     }
 
-    #[test]
-    fn launchd_restart_boots_out_bootstraps_and_verifies_health() {
-        let mut launchctl = FakeLaunchctl::succeeds();
-        let mut health = FakeHealth {
-            in_flight: 0,
-            healthy_results: [true].into(),
-        };
-        let mut rollback = FakeRollback::default();
-        assert_eq!(
-            replace_loaded_launchd_service(
-                &mut launchctl,
-                &mut health,
-                &mut rollback,
-                Path::new("daemon.plist"),
-                false,
-                None,
-            ),
-            LaunchdRestartOutcome::Replaced
+    #[tokio::test]
+    async fn drain_wait_has_a_bounded_timeout_for_a_stuck_process() {
+        assert!(
+            !wait_for_process_exit(std::time::Duration::ZERO, || Ok(true))
+                .await
+                .unwrap()
         );
-        assert_eq!(launchctl.calls, ["bootout", "bootstrap"]);
-        assert!(!rollback.restored);
-    }
-
-    #[test]
-    fn launchd_restart_rolls_back_when_new_bootstrap_fails() {
-        let mut launchctl = FakeLaunchctl {
-            calls: Vec::new(),
-            bootout_results: [true, true].into(),
-            bootstrap_results: [false, true].into(),
-        };
-        let mut health = FakeHealth {
-            in_flight: 0,
-            healthy_results: [true].into(),
-        };
-        let mut rollback = FakeRollback::default();
-        let outcome = replace_loaded_launchd_service(
-            &mut launchctl,
-            &mut health,
-            &mut rollback,
-            Path::new("daemon.plist"),
-            false,
-            None,
+        assert!(
+            wait_for_process_exit(std::time::Duration::ZERO, || Ok(false))
+                .await
+                .unwrap()
         );
-        assert!(matches!(outcome, LaunchdRestartOutcome::RolledBack { .. }));
-        assert_eq!(
-            launchctl.calls,
-            ["bootout", "bootstrap", "bootout", "bootstrap"]
-        );
-        assert!(rollback.restored);
     }
 
     #[test]

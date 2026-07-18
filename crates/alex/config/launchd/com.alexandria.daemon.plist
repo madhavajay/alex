@@ -9,19 +9,19 @@
     <string>/usr/local/bin/alexandria</string>
     <string>daemon</string>
   </array>
+__ALEX_LAUNCHD_SOCKETS__
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <true/>
   <key>StandardOutPath</key>
   <string>/tmp/alexandria.daemon.out.log</string>
   <key>StandardErrorPath</key>
   <string>/tmp/alexandria.daemon.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION</key>
+    <string>1</string>
     <key>PATH</key>
     <string>__ALEX_LAUNCHD_PATH__</string>
     <key>RUST_LOG</key>
