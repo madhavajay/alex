@@ -444,6 +444,20 @@ impl NotificationDispatcher {
         })
     }
 
+    pub fn has_enabled_command_telegram(&self) -> bool {
+        self.channels.iter().any(|entry| {
+            matches!(entry.config.format, WebhookFormat::Telegram)
+                && entry.config.allow_commands
+                && NotificationLevel::Warn >= entry.config.min_level
+                && (entry.config.categories.is_empty()
+                    || entry
+                        .config
+                        .categories
+                        .iter()
+                        .any(|category| category == "reauth"))
+        })
+    }
+
     pub fn has_command_channel(&self, channel_id: &str) -> bool {
         self.channels.iter().any(|entry| {
             matches!(entry.config.format, WebhookFormat::Telegram)
@@ -807,6 +821,30 @@ mod tests {
             self.0.lock().unwrap().push(text.to_string());
             Ok(())
         }
+    }
+
+    #[test]
+    fn paste_reauth_requires_an_opted_in_command_telegram() {
+        let mut channel = NotificationChannelConfig {
+            format: WebhookFormat::Telegram,
+            url: "https://telegram.example.test/send".into(),
+            chat_id: Some("123".into()),
+            categories: vec!["reauth".into()],
+            ..Default::default()
+        };
+        let notification_only = NotificationDispatcher::from_settings(NotificationSettings {
+            channels: vec![channel.clone()],
+            ..Default::default()
+        });
+        assert!(notification_only.has_enabled_telegram());
+        assert!(!notification_only.has_enabled_command_telegram());
+
+        channel.allow_commands = true;
+        let command_enabled = NotificationDispatcher::from_settings(NotificationSettings {
+            channels: vec![channel],
+            ..Default::default()
+        });
+        assert!(command_enabled.has_enabled_command_telegram());
     }
 
     #[tokio::test]
