@@ -1078,6 +1078,49 @@ impl alex_proxy::DaemonUpdater for SelfUpdateApplier {
     }
 }
 
+/// Reads and persists the daemon's update channel (config.toml
+/// `update_channel`) behind the `/admin/update/channel` endpoint, using the
+/// same parse + persist as the CLI `--set-channel` so the two cannot diverge.
+struct ConfigUpdateChannelController {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::UpdateChannelController for ConfigUpdateChannelController {
+    fn current(&self) -> String {
+        self.config
+            .lock()
+            .map(|config| config.update_channel().as_str().to_string())
+            .unwrap_or_else(|_| selfupdate::UpdateChannel::default().as_str().to_string())
+    }
+
+    fn set(&self, channel: String) -> alex_proxy::UpdateChannelSetFuture {
+        let config = self.config.clone();
+        Box::pin(async move {
+            // Parse first so an unknown value is a client error (400), then
+            // persist through the shared helper (a disk failure is a 500).
+            let parsed = selfupdate::UpdateChannel::parse(&channel)
+                .map_err(|error| alex_proxy::UpdateChannelError::Invalid(error.to_string()))?;
+            {
+                let mut guard = config.lock().map_err(|_| {
+                    alex_proxy::UpdateChannelError::Failed(
+                        "daemon config lock is unavailable".to_string(),
+                    )
+                })?;
+                persist_update_channel(&mut guard, parsed)
+                    .map_err(|error| alex_proxy::UpdateChannelError::Failed(error.to_string()))?;
+            }
+            // Recompute the availability against the new channel so the next
+            // `/admin/update` and the endpoint response reflect it. A failed
+            // network check leaves the channel persisted and status unknown.
+            let status = selfupdate::daemon_update_status_value(parsed).await.ok();
+            Ok(alex_proxy::SetChannelOutcome {
+                channel: parsed.as_str().to_string(),
+                status,
+            })
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct HarnessOverride {
     #[serde(default)]
@@ -1457,6 +1500,20 @@ fn random_key(prefix: &str) -> String {
 fn save_config(config: &Config) -> Result<()> {
     let path = alexandria_home().join("config.toml");
     save_config_at(config, &path)
+}
+
+/// Persist an already-validated update channel to config.toml. This is the one
+/// writer shared by the CLI `alex update --set-channel` and the daemon
+/// `/admin/update/channel` endpoint, so the app picker and the daemon can never
+/// diverge on how the channel is normalized or stored. Callers parse the raw
+/// value with `selfupdate::UpdateChannel::parse` first, keeping the parse and
+/// the persist as the single source of truth for both paths.
+fn persist_update_channel(config: &mut Config, channel: selfupdate::UpdateChannel) -> Result<()> {
+    if config.update_channel != channel.as_str() {
+        config.update_channel = channel.as_str().to_string();
+        save_config(config)?;
+    }
+    Ok(())
 }
 
 fn save_config_at(config: &Config, path: &Path) -> Result<()> {
@@ -3058,7 +3115,13 @@ async fn main() -> Result<()> {
             alex_proxy::set_notification_config_persister(
                 &state,
                 Arc::new(ConfigNotificationPersister {
-                    config: daemon_config,
+                    config: daemon_config.clone(),
+                }),
+            );
+            alex_proxy::set_update_channel_controller(
+                &state,
+                Arc::new(ConfigUpdateChannelController {
+                    config: daemon_config.clone(),
                 }),
             );
             alex_proxy::set_exo_config_persister(
@@ -3078,10 +3141,17 @@ async fn main() -> Result<()> {
             if config.update_check_hours > 0 {
                 let update_status = state.update_status.clone();
                 let hours = config.update_check_hours;
-                let update_channel = config.update_channel();
+                // Read the channel from the shared config each tick so a channel
+                // change via `/admin/update/channel` (or the CLI) steers the next
+                // periodic check instead of a value captured once at startup.
+                let channel_config = daemon_config.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     loop {
+                        let update_channel = channel_config
+                            .lock()
+                            .map(|config| config.update_channel())
+                            .unwrap_or_default();
                         match selfupdate::daemon_update_status_value(update_channel).await {
                             Ok(status) => {
                                 *update_status.write().await = Some(status);
@@ -4094,10 +4164,7 @@ async fn main() -> Result<()> {
             let mut config = config;
             let update_channel = if let Some(value) = set_channel {
                 let parsed = selfupdate::UpdateChannel::parse(&value)?;
-                if config.update_channel != parsed.as_str() {
-                    config.update_channel = parsed.as_str().to_string();
-                    save_config(&config)?;
-                }
+                persist_update_channel(&mut config, parsed)?;
                 println!("update channel set to {} in config.toml", parsed.as_str());
                 parsed
             } else if let Some(value) = channel {

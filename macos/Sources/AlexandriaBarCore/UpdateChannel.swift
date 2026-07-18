@@ -31,3 +31,24 @@ public enum UpdateChannelSetting: String, CaseIterable, Sendable {
         return String(stableFeed.dropLast(suffix.count)) + "appcast-beta.xml"
     }
 }
+
+/// Which target(s) a Release-channel change applies to. The user was explicit:
+/// the default sets BOTH, so picking a channel in the UI can never again leave
+/// the daemon on a different channel than the app. `app` / `daemon` let an
+/// advanced user steer just one.
+public enum UpdateChannelScope: String, CaseIterable, Sendable {
+    case both
+    case app
+    case daemon
+
+    public var label: String {
+        switch self {
+        case .both: return "Both"
+        case .app: return "App"
+        case .daemon: return "Daemon"
+        }
+    }
+
+    public var appliesToApp: Bool { self != .daemon }
+    public var appliesToDaemon: Bool { self != .app }
+}

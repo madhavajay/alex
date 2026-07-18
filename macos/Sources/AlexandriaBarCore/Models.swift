@@ -795,6 +795,20 @@ public struct DaemonUpdateStatus: Codable, Sendable, Equatable {
     }
 }
 
+/// Response from `GET`/`POST /admin/update/channel`. The GET carries only
+/// `channel`; the POST also carries the update availability recomputed against
+/// the newly-set channel, so the UI can surface a pending daemon update.
+public struct DaemonChannelResponse: Codable, Sendable, Equatable {
+    public let channel: String
+    public let updateAvailable: Bool?
+    public let latest: String?
+
+    enum CodingKeys: String, CodingKey {
+        case channel, latest
+        case updateAvailable = "update_available"
+    }
+}
+
 public struct DaemonUpdateApplyResponse: Codable, Sendable, Equatable {
     public let applying: Bool
     public let current: String?
