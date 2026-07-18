@@ -108,10 +108,10 @@ struct DarioPreferencesSection: View {
         darioCard {
             SectionLabel(text: "Status", style: .prominent)
             HStack(spacing: 7) {
-                StatusDot(tint: health.tint, size: 7, glow: true)
+                StatusDot(tint: health.tint.color, size: 7, glow: true)
                 Text(health.label)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(health.tint)
+                    .foregroundStyle(health.tint.color)
                 Spacer()
                 Text(routingLine(status))
                     .font(.system(size: 11))
@@ -219,14 +219,7 @@ struct DarioPreferencesSection: View {
         }
     }
 
-    private var health: DarioPreferencesHealth {
-        if status?.issue != nil { return .down }
-        guard let generation = status.flatMap(activeGeneration(in:)) else {
-            return status?.shouldBeHealthy == true ? .down : .warning
-        }
-        if generation.lastProbe?.ok == false { return .down }
-        return generation.phase == "ready" ? .healthy : .warning
-    }
+    private var health: DarioHealthEvaluation { DarioHealth.evaluate(status) }
 
     private func routingLine(_ status: DarioAdminStatus) -> String {
         let mode = store.config?.anthropicUpstream ?? "direct"
@@ -307,26 +300,6 @@ struct DarioPreferencesSection: View {
         TerminalLauncher.launchDarioReauth(daemonBinary: binary)
         actionResult = "Reauth opened in Terminal; repair runs after login."
         repairInFlight = false
-    }
-}
-
-private enum DarioPreferencesHealth {
-    case healthy, warning, down
-
-    var tint: Color {
-        switch self {
-        case .healthy: AlexTheme.Colors.success
-        case .warning: AlexTheme.Colors.warningOrange
-        case .down: AlexTheme.Colors.destructive
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .healthy: "Healthy"
-        case .warning: "Starting"
-        case .down: "Down"
-        }
     }
 }
 

@@ -145,7 +145,7 @@ public final class SnapshotStore {
         async let accountAnalyticsR = try? client.accountAnalytics(
             sinceMinutes: accountAnalyticsSinceMinutes,
             bucketMinutes: accountAnalyticsBucketMinutes)
-        async let darioR = try? client.dario()
+        async let darioR = Self.fetchDario(using: client)
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnesses()
         async let recentSessionsR = try? client.traceSessions(since: "24h", limit: 12)
@@ -177,7 +177,16 @@ public final class SnapshotStore {
         }
         routingByProvider = routings
         codexRouting = routings["openai"]
-        dario = await darioR ?? nil
+        switch await darioR {
+        case .fetched(let fetched):
+            // A successful nil is the endpoint's explicit 404/disabled signal.
+            dario = fetched
+        case .failed:
+            // A rolling restart or other transient error must not make Dario
+            // disappear. Retain the last-known status; an enabled menu with no
+            // prior status is rendered as down by DarioHealth.
+            break
+        }
         daemonUpdate = await daemonUpdateR
         recentSessions = Array(
             (await recentSessionsR ?? [])
@@ -322,21 +331,41 @@ public final class SnapshotStore {
             }
         }
 
-        if let dario, let active = dario.generations.first(where: { $0.id == dario.activeGenerationId }) {
-            if active.phase != "ready" {
+        if config?.darioEnabled == true || dario != nil {
+            let evaluation = DarioHealth.evaluate(dario)
+            if evaluation.state != .ready {
+                let active = dario.flatMap { status in
+                    status.generations.first { $0.id == status.activeGenerationId }
+                        ?? status.generations.first
+                }
+                let body = dario?.issue?.message
+                    ?? active?.lastProbe?.error
+                    ?? active.map { "\($0.id) (v\($0.version))" }
+                    ?? "Dario status is unavailable"
                 out.append(StoreAlert(
-                    id: "dario-phase", severity: .warning,
-                    title: "Dario generation \(active.phase)",
-                    body: "\(active.id) (v\(active.version))"))
-            } else if let probe = active.lastProbe, !probe.ok {
-                out.append(StoreAlert(
-                    id: "dario-probe", severity: .warning,
-                    title: "Dario probe failing",
-                    body: probe.error ?? "probe failed"))
+                    id: "dario-health",
+                    severity: evaluation.state == .down ? .critical : .warning,
+                    title: "Dario \(evaluation.label)",
+                    body: body))
             }
         }
 
         return out
+    }
+
+    private enum DarioRefreshResult: Sendable {
+        case fetched(DarioStatus?)
+        case failed
+    }
+
+    nonisolated private static func fetchDario(
+        using client: AlexandriaClient
+    ) async -> DarioRefreshResult {
+        do {
+            return .fetched(try await client.dario())
+        } catch {
+            return .failed
+        }
     }
 
     /// Account IDs are shared by `/admin/accounts` and `/admin/health`; merge auth and

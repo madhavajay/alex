@@ -104,6 +104,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             buildAccounts()
             buildHarnesses()
         }
+        buildDario()
         buildTraces()
         buildActions()
     }
@@ -294,7 +295,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 uniqueKeysWithValues: store.providerPauses.map { ($0.provider, $0) }),
             heartbeats: heartbeatsById,
             routing: store.routingByProvider,
-            dario: store.dario,
             onRefresh: { [weak self] in
                 guard let self else { return false }
                 await self.store.refresh()
@@ -310,16 +310,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             onPing: { [weak self] in
                 self?.menu.cancelTrackingWithoutAnimation()
                 self?.runPing(target: "all", name: "All providers")
-            },
-            onOpenDario: { [weak self] in
-                guard let self else { return }
-                self.menu.cancelTrackingWithoutAnimation()
-                self.openDario()
-            },
-            onReauthDario: { [weak self] in
-                guard let self else { return }
-                self.menu.cancelTrackingWithoutAnimation()
-                self.reauthDario()
             },
             onSetProviderPause: { [weak self] provider, mode in
                 guard let self, let config = self.store.config else { return }
@@ -338,6 +328,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 }
             })
         addHostedView(card)
+        menu.addItem(.separator())
+    }
+
+    private func buildDario() {
+        guard store.config?.darioEnabled == true || store.dario != nil else { return }
+        addHostedView(DarioMenuSectionView(
+            status: store.daemonUp ? store.dario : nil,
+            onOpen: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openDario()
+            },
+            onReauth: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.reauthDario()
+            }))
         menu.addItem(.separator())
     }
 

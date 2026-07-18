@@ -968,7 +968,7 @@ private struct ProviderRoutingPreferencesSection: View {
         let accountKey = routing.accounts
             .sorted { $0.priority < $1.priority }
             .map {
-                "\($0.accountId):\($0.eligible):\($0.priority):\($0.reservePct ?? routing.reservePct):\($0.reserveBlocked):\($0.resetSelection?.resetsAtS ?? 0):\($0.observedAtMs ?? 0)"
+                "\($0.accountId):\($0.eligible):\($0.priority):\($0.reservePct ?? routing.reservePct)"
             }
             .joined(separator: "|")
         return "\(routing.strategy.rawValue)|\(routing.reservePct)|\(routing.allowMidThreadFailover)|\(accountKey)"
@@ -1021,6 +1021,7 @@ private struct ProviderRoutingPreferencesSection: View {
             }
         }
         .task(id: routingKey) {
+            guard !isDirty else { return }
             loadRouting()
         }
         .onChange(of: fallbackReservePct) { oldValue, newValue in
@@ -1432,6 +1433,7 @@ private struct ProviderRoutingPreferencesSection: View {
         Task {
             do {
                 try await AlexandriaClient(config: config).updateRouting(provider: provider, update)
+                savedSignature = currentSignature
                 await store.refresh()
             } catch {
                 self.error = error.localizedDescription

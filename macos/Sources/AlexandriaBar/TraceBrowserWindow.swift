@@ -1206,22 +1206,73 @@ final class TraceBrowserModel {
 
         Task {
             guard let client = client() else { return }
+            var completedSessionIds = Set<String>()
+            var deletionFailures = 0
+            var transcriptFailures = 0
+            var orphanCount = 0
             for session in toDelete {
-                do {
-                    let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                    for turn in transcript.turns {
-                        try await client.deleteTrace(id: turn.traceId)
+                var previousIds: Set<String>?
+                while true {
+                    let ids: Set<String>
+                    do {
+                        let transcript = try await client.traceTranscript(
+                            sessionId: session.sessionId)
+                        ids = Set(transcript.turns.map(\.traceId))
+                    } catch {
+                        transcriptFailures += 1
+                        break
                     }
-                } catch {
-                    NSSound.beep()
+                    if ids.isEmpty {
+                        completedSessionIds.insert(session.sessionId)
+                        break
+                    }
+                    if ids == previousIds {
+                        orphanCount += ids.count
+                        break
+                    }
+                    previousIds = ids
+
+                    var deletedThisPass = 0
+                    for id in ids {
+                        do {
+                            try await client.deleteTrace(id: id)
+                            deletedThisPass += 1
+                        } catch {
+                            deletionFailures += 1
+                        }
+                    }
+                    if deletedThisPass == 0 {
+                        orphanCount += ids.count
+                        break
+                    }
                 }
             }
-            if let sid = selectedSessionId, deletedIds.contains(sid) {
+            if let sid = selectedSessionId, completedSessionIds.contains(sid) {
                 selectionState.clear()
                 resetTurns()
             }
-            multiSelection.subtract(deletedIds)
+            multiSelection.subtract(completedSessionIds)
             await pollSessions()
+            if deletionFailures > 0 || transcriptFailures > 0 || orphanCount > 0 {
+                let failureAlert = NSAlert()
+                failureAlert.messageText = "Couldn’t delete all session traces"
+                var details: [String] = []
+                if deletionFailures > 0 {
+                    details.append("\(deletionFailures) trace deletion(s) failed")
+                }
+                if orphanCount > 0 {
+                    details.append("\(orphanCount) trace(s) remain")
+                }
+                if transcriptFailures > 0 {
+                    details.append(
+                        "\(transcriptFailures) transcript fetch(es) failed, so remaining traces could not be verified")
+                }
+                failureAlert.informativeText = details.joined(separator: ". ") + "."
+                failureAlert.alertStyle = .critical
+                failureAlert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                failureAlert.runModal()
+            }
             guard let anchorId, visibleRows.contains(where: { $0.id == anchorId }) else { return }
             requestScrollAnchor(anchorId)
             if selectedSessionId == nil, !isMultiSelected {

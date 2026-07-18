@@ -538,12 +538,80 @@ struct MenuRefreshButton: View {
     }
 }
 
+// MARK: - Dario section
+
+extension DarioHealthTint {
+    var color: Color {
+        switch self {
+        case .green: AlexTheme.Colors.success
+        case .orange: AlexTheme.Colors.warningOrange
+        case .red: AlexTheme.Colors.destructive
+        }
+    }
+}
+
+struct DarioMenuSectionView: View {
+    let status: DarioStatus?
+    let onOpen: () -> Void
+    let onReauth: () -> Void
+
+    private var health: DarioHealthEvaluation { DarioHealth.evaluate(status) }
+
+    private var active: DarioGeneration? {
+        guard let status else { return nil }
+        return status.generations.first { $0.id == status.activeGenerationId }
+            ?? status.generations.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            SectionLabel(text: "Dario", style: .menu)
+                .padding(.top, 9)
+            HStack(spacing: 7) {
+                Button(action: onOpen) {
+                    HStack(spacing: 7) {
+                        StatusDot(tint: health.tint.color, size: 6)
+                        Text("Dario")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(AlexTheme.Colors.foreground)
+                        if let active {
+                            Text("v\(active.version)")
+                                .font(AlexTheme.Fonts.mono(10))
+                                .foregroundStyle(AlexTheme.Colors.textFaint)
+                        }
+                        Spacer()
+                        Text(health.label)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(health.tint.color)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if status?.issue?.code == "reauth" {
+                    Button("Reauth", action: onReauth)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                }
+            }
+            if let issue = status?.issue {
+                Text(issue.message)
+                    .font(.system(size: 9))
+                    .foregroundStyle(AlexTheme.Colors.destructive)
+                    .padding(.leading, 13)
+            }
+        }
+        .padding(.horizontal, MenuMetrics.inset)
+        .padding(.bottom, 7)
+        .frame(width: MenuMetrics.width, alignment: .leading)
+    }
+}
+
 // MARK: - Providers card
 
 /// The Providers section of the status menu (mock App.tsx:710-744):
 /// section header with Refresh/Ping, then one row per provider with a brand
 /// icon (health-badged), quota bars, credit balances, the bonded multi-account
-/// layout for Codex, and the Dario agent chip under Claude.
+/// layout for Codex.
 struct LimitsCardView: View {
     let limits: [ProviderLimits]
     let accounts: [Account]
@@ -551,11 +619,8 @@ struct LimitsCardView: View {
     var providerPauses: [String: ProviderPause] = [:]
     var heartbeats: [String: Heartbeat] = [:]
     var routing: [String: ProviderRoutingResponse] = [:]
-    var dario: DarioStatus? = nil
     var onRefresh: (@MainActor () async -> Bool)? = nil
     var onPing: (() -> Void)? = nil
-    var onOpenDario: (() -> Void)? = nil
-    var onReauthDario: (() -> Void)? = nil
     var onSetProviderPause: ((String, ProviderPauseMode?) -> Void)? = nil
     @State private var providerAwaitingPause: String?
     @State private var selectedPauseMode: ProviderPauseMode = .down
@@ -685,9 +750,6 @@ struct LimitsCardView: View {
                 }
             }
             .padding(.leading, 21)
-            if provider.provider == "anthropic" {
-                agentChip
-            }
         }
         .padding(.horizontal, MenuMetrics.inset)
         .padding(.vertical, 7)
@@ -862,66 +924,6 @@ struct LimitsCardView: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(RoundedRectangle(cornerRadius: 5).fill(AlexTheme.Colors.overlay(0.07)))
-    }
-
-    /// Dario status and its re-auth affordance under the Claude row.
-    @ViewBuilder
-    private var agentChip: some View {
-        if let dario {
-            let active = dario.generations.first(where: { $0.id == dario.activeGenerationId })
-                ?? dario.generations.first
-            let tint = active.map { agentTint($0) } ?? AlexTheme.Colors.destructive
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Button(action: { onOpenDario?() }) {
-                        HStack(spacing: 6) {
-                            StatusDot(tint: tint, size: 5)
-                            Text("Dario")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(AlexTheme.Colors.textSecondary)
-                            if let active {
-                                Text("v\(active.version)")
-                                    .font(AlexTheme.Fonts.mono(10))
-                                    .foregroundStyle(AlexTheme.Colors.textFaint)
-                            }
-                            Spacer()
-                            Text(active.map { agentStatusText($0) } ?? "down")
-                                .font(.system(size: 9))
-                                .foregroundStyle(tint)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(onOpenDario == nil)
-                    if dario.issue?.code == "reauth" {
-                        Button("Reauth Dario", action: { onReauthDario?() })
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.mini)
-                            .disabled(onReauthDario == nil)
-                    }
-                }
-                if let issue = dario.issue {
-                    Text(issue.message)
-                        .font(.system(size: 9))
-                        .foregroundStyle(AlexTheme.Colors.destructive)
-                }
-            }
-            .padding(.leading, 21)
-            .padding(.vertical, 1)
-        }
-    }
-
-    private func agentTint(_ generation: DarioGeneration) -> Color {
-        if generation.lastProbe?.ok == false { return AlexTheme.Colors.destructive }
-        if generation.phase == "ready" { return AlexTheme.Colors.success }
-        return AlexTheme.Colors.warningOrange
-    }
-
-    private func agentStatusText(_ generation: DarioGeneration) -> String {
-        if let probe = generation.lastProbe, probe.ok, let ms = probe.latencyMs {
-            return "\(generation.phase) · \(ms)ms"
-        }
-        return generation.phase
     }
 
     @ViewBuilder

@@ -200,26 +200,6 @@ final class DarioModel {
 
 /// Local styling helpers for the Dario window (mock: ui/Dario/src/app/App.tsx).
 private enum DarioStyle {
-    static func phaseTint(_ phase: String) -> Color {
-        switch phase {
-        case "ready": AlexTheme.Colors.success
-        case "starting": AlexTheme.Colors.warningOrange
-        case "unhealthy": AlexTheme.Colors.destructive
-        case "draining": AlexTheme.Colors.warning
-        case "dead": AlexTheme.Colors.textTertiary
-        default: AlexTheme.Colors.textSecondary
-        }
-    }
-
-    static func phaseStatus(_ phase: String) -> DisplayStatus {
-        switch phase {
-        case "ready": .success
-        case "unhealthy": .error
-        case "starting", "draining": .running
-        default: .pending
-        }
-    }
-
     static func cacheStatusTint(_ status: String) -> Color {
         switch status.lowercased() {
         case "hit", "ready", "ok", "cached": AlexTheme.Colors.success
@@ -269,6 +249,16 @@ private enum DarioStyle {
             }
         }
         return result
+    }
+}
+
+private extension DarioHealthState {
+    var displayStatus: DisplayStatus {
+        switch self {
+        case .ready: .success
+        case .warming: .running
+        case .down: .error
+        }
     }
 }
 
@@ -345,8 +335,10 @@ struct DarioView: View {
                     .truncationMode(.middle)
             }
             if let active = model.activeGeneration {
+                let health = DarioHealth.evaluate(
+                    phase: active.phase, lastProbeOK: active.lastProbe?.ok)
                 StatusChip(
-                    tint: DarioStyle.phaseTint(active.phase), text: active.phase)
+                    tint: health.tint.color, text: health.label)
             }
             Spacer()
             if let result = model.actionResult {
@@ -491,7 +483,9 @@ private struct GenerationSection: View {
                           bold: isActive, truncation: .middle),
                     .text(generation.version, bold: isActive),
                     .text(generation.phase,
-                          tint: DarioStyle.phaseTint(generation.phase),
+                          tint: DarioHealth.evaluate(
+                              phase: generation.phase,
+                              lastProbeOK: generation.lastProbe?.ok).tint.color,
                           bold: generation.phase == "ready"),
                     .text(generation.port.map(String.init) ?? "–"),
                     .text(generation.pid.map(String.init) ?? "–"),
@@ -620,8 +614,10 @@ private struct LogSection: View {
                 selection: logTabSelection,
                 style: .solid)
             if let generation = model.selectedGeneration {
+                let health = DarioHealth.evaluate(
+                    phase: generation.phase, lastProbeOK: generation.lastProbe?.ok)
                 StatusDot(
-                    status: DarioStyle.phaseStatus(generation.phase), size: 5)
+                    status: health.state.displayStatus, size: 5)
                 Text(generation.id)
                     .font(AlexTheme.Fonts.mono(10))
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
