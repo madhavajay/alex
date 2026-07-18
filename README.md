@@ -1,7 +1,7 @@
 # Alex a local LLM Proxy for all token providers, APIs and harnesses
 
 <p align="center">
-  <img src="images/header.jpg" alt="Alex connects terminal harnesses to LLM providers through one local proxy" width="100%">
+  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/header.jpg" alt="Alex connects terminal harnesses to LLM providers through one local proxy" width="100%">
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 ## e2e Harness ↔️ Provider Traces
 
-![Alex capturing a wrapped Amp session alongside its full conversation trace](images/amp.png)
+![Alex capturing a wrapped Amp session alongside its full conversation trace](https://raw.githubusercontent.com/madhavajay/alex/main/images/amp.png)
 
 ## Quickstart
 
@@ -41,7 +41,7 @@ It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, and Grok su
 <table align="right">
   <tr>
     <td align="center">
-      <img src="images/menu.png" alt="Alex macOS menu showing providers, accounts, harnesses, usage, and recent traces" width="260">
+      <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/menu.png" alt="Alex macOS menu showing providers, accounts, harnesses, usage, and recent traces" width="260">
       <br>
       <sub>Inspired by <a href="https://x.com/steipete">@steipete</a>'s <a href="https://github.com/steipete/CodexBar">CodexBar</a></sub>
     </td>
@@ -76,7 +76,7 @@ Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multi
 
 <br clear="right">
 
-![Alex Trace Browser showing model requests, tool calls, token usage, and latency](images/trace-browser.png)
+![Alex Trace Browser showing model requests, tool calls, token usage, and latency](https://raw.githubusercontent.com/madhavajay/alex/main/images/trace-browser.png)
 
 ### Harness tracing support
 
@@ -108,9 +108,9 @@ Alex translates between Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 
 | Terminal | Description |
 | --- | --- |
-| <img src="images/claude.png" alt="OpenAI GPT-5.6 running in Claude Code through Alex" width="500"> | **GPT-5.6 in Claude Code.** Mix OpenAI models into an Anthropic-native harness. |
-| <img src="images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** You should be able to run Fable 5 in any harness. Your tokens your choice! |
-| <img src="images/pi.png" alt="A custom PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **PAM in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
+| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/claude.png" alt="OpenAI GPT-5.6 running in Claude Code through Alex" width="500"> | **GPT-5.6 in Claude Code.** Mix OpenAI models into an Anthropic-native harness. |
+| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** You should be able to run Fable 5 in any harness. Your tokens your choice! |
+| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/pi.png" alt="A custom PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **PAM in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
 
 A complete record of agent work.
 Requests, responses, token usage, latency, cost, sessions, subagents, requested tools, and executed tool results can all be captured locally and inspected as a coherent transcript.
@@ -131,7 +131,7 @@ pi --model alex/gpt-5.6-sol
 
 One proxy. Your subscriptions. Any harness. Every trace.
 
-![Alex capturing a wrapped Amp session alongside its full conversation trace](images/amp.png)
+![Alex capturing a wrapped Amp session alongside its full conversation trace](https://raw.githubusercontent.com/madhavajay/alex/main/images/amp.png)
 
 ## How to use Alex Wrap on AMP or Cursor
 
@@ -193,7 +193,7 @@ A model trace may contain a request such as `call_tool("edit_file", ...)`, but t
 
 ## Get proxy credentials from the UI or CLI
 
-![Proxy credential controls for copying an environment block or tagged run-key command](images/credentials.png)
+![Proxy credential controls for copying an environment block or tagged run-key command](https://raw.githubusercontent.com/madhavajay/alex/main/images/credentials.png)
 
 The macOS app can copy a complete environment block for generic API clients or a ready-to-edit command for minting a tagged run key. The CLI prints the same connection exports with `alex credentials`, also available as `alex creds`:
 
