@@ -850,7 +850,7 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "pi").await?;
+    revoke_stale_keys_best_effort(config, &client, "pi").await;
     let minted = mint_harness_key(config, &client, "pi").await?;
     let models = fetch_models(config, &client)
         .await
@@ -1075,7 +1075,7 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "codex").await?;
+    revoke_stale_keys_best_effort(config, &client, "codex").await;
     let minted = mint_harness_key(config, &client, "codex").await?;
     let available = fetch_models(config, &client)
         .await
@@ -1177,7 +1177,7 @@ async fn connect_grok(config: &Config, config_dir: Option<PathBuf>, json_out: bo
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "grok").await?;
+    revoke_stale_keys_best_effort(config, &client, "grok").await;
     let minted = mint_harness_key(config, &client, "grok").await?;
     let models = fetch_models(config, &client)
         .await
@@ -1269,7 +1269,7 @@ async fn connect_kimi(config: &Config, config_dir: Option<PathBuf>, json_out: bo
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "kimi").await?;
+    revoke_stale_keys_best_effort(config, &client, "kimi").await;
     let minted = mint_harness_key(config, &client, "kimi").await?;
     let models = fetch_models(config, &client)
         .await
@@ -1361,7 +1361,7 @@ async fn connect_amp(config: &Config, config_dir: Option<PathBuf>, json_out: boo
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "amp").await?;
+    revoke_stale_keys_best_effort(config, &client, "amp").await;
     let minted = mint_harness_key(config, &client, "amp").await?;
     let summary = write_amp_connection_with_capture(
         config_dir,
@@ -2352,6 +2352,22 @@ pub(crate) fn read_kimi_model_ids(config_dir: &Path) -> Vec<String> {
     read_kimi_state(&config_dir.join(KIMI_STATE_FILE))
         .map(|state| state.managed_models)
         .unwrap_or_default()
+}
+
+/// The Alexandria harness key Kimi stores inside its config.toml
+/// (`[providers."alexandria"].api_key`). Lets the daemon `refresh-config`
+/// endpoint reuse the existing key instead of minting (and orphaning) a new one
+/// on every refresh, matching how the other harnesses read their stored key.
+pub(crate) fn read_kimi_api_key(config_dir: &Path) -> Option<String> {
+    let doc = read_grok_config(&config_dir.join(KIMI_CONFIG_FILE)).ok()?;
+    doc.get("providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(KIMI_PROVIDER_NAME))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("api_key"))
+        .and_then(Item::as_str)
+        .filter(|key| !key.is_empty())
+        .map(String::from)
 }
 
 pub(crate) fn kimi_config_connected(config_dir: &Path) -> Result<bool> {
@@ -4416,6 +4432,25 @@ async fn mint_harness_key(
     Ok(MintedKey { id, key })
 }
 
+/// Best-effort cleanup of a harness's previous keys before minting a fresh one.
+/// A transient failure here (a momentary daemon blip between the health check
+/// and this admin call) must never abort the connect and leave the local
+/// harness config unwritten: the new key is minted immediately after, and any
+/// key left behind is revoked on the next connect. This mirrors the non-fatal
+/// treatment the disconnect paths already give the same call. A genuinely
+/// unreachable daemon still surfaces a clear error from the required
+/// `mint_harness_key` that follows.
+async fn revoke_stale_keys_best_effort(config: &Config, client: &reqwest::Client, harness: &str) {
+    if let Err(e) = revoke_harness_keys(config, client, harness).await {
+        eprintln!(
+            "{}",
+            ui::amber(&format!(
+                "could not revoke previous {harness} harness keys ({e}); continuing"
+            ))
+        );
+    }
+}
+
 async fn revoke_harness_keys(
     config: &Config,
     client: &reqwest::Client,
@@ -5175,7 +5210,13 @@ fn allowed_model_id(id: &str) -> bool {
     if allowed_model_prefix(id) && !id.contains('/') {
         return true;
     }
-    let Some(model) = ["openrouter/", "exo/", "alex/"]
+    // Provider-prefixed catalog ids the daemon advertises in /v1/models. Any new
+    // provider whose ids carry a `provider/` prefix (e.g. Kimi's `kimi/k3`) must
+    // be listed here, otherwise it is silently dropped from every connected
+    // harness's model list. `alexandria/*` is deliberately absent: it is only a
+    // duplicate alias of the bare/prefixed ids and would produce a second
+    // `alex/...` entry after `short_alex_model_ids` normalization.
+    let Some(model) = ["openrouter/", "exo/", "kimi/", "alex/"]
         .iter()
         .find_map(|prefix| id.strip_prefix(prefix))
     else {
@@ -6281,6 +6322,82 @@ fi"#,
                 "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
             ]
         );
+    }
+
+    #[test]
+    fn model_id_filter_keeps_kimi_provider_ids_and_drops_alexandria_alias() {
+        // The daemon advertises Kimi Code models with a `kimi/` prefix (plus an
+        // `alexandria/kimi/...` duplicate for non-Claude harnesses). The prefixed
+        // ids must survive so a newly-added Kimi provider reaches connected
+        // harnesses; the duplicate alias must not, or `short_alex_model_ids`
+        // would emit two `alex/kimi/k3` entries. Path-traversal ids stay barred.
+        let ids = vec![
+            "claude-opus-4-8".into(),
+            "kimi/k3".into(),
+            "kimi/kimi-for-coding".into(),
+            "kimi/kimi-for-coding-highspeed".into(),
+            "alexandria/kimi/k3".into(),
+            "kimi/../secret".into(),
+        ];
+        assert_eq!(
+            filter_model_ids(ids),
+            vec![
+                "claude-opus-4-8",
+                "kimi/k3",
+                "kimi/kimi-for-coding",
+                "kimi/kimi-for-coding-highspeed",
+            ]
+        );
+        // Every harness writer normalizes them to the `alex/kimi/...` ids that
+        // route back through the proxy to the Kimi provider.
+        assert_eq!(
+            short_alex_model_ids(vec!["kimi/k3".into()]),
+            vec!["alex/kimi/k3"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_connection_carries_kimi_provider_models() {
+        let dir = tmpdir("pi-kimi-models");
+        // Post-filter model list as `fetch_models` hands it to the writer: bare
+        // Alexandria ids plus Kimi's provider-prefixed ids.
+        let summary = write_pi_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-pi".into(),
+            "alxk-pi".into(),
+            vec![
+                "claude-opus-4-8".into(),
+                "kimi/k3".into(),
+                "kimi/kimi-for-coding".into(),
+            ],
+            Some("0.80.0".into()),
+        )
+        .unwrap();
+        assert!(summary.models.contains(&"alex/kimi/k3".to_string()));
+        let written = read_pi_model_ids(&dir);
+        assert!(written.contains(&"alex/kimi/k3".to_string()));
+        assert!(written.contains(&"alex/kimi/kimi-for-coding".to_string()));
+        assert!(written.contains(&"alex/claude-opus-4-8".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_connection_carries_kimi_provider_models() {
+        let dir = tmpdir("grok-kimi-models");
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let summary = write_grok_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-grok".into(),
+            "alxk-grok".into(),
+            vec!["claude-opus-4-8".into(), "kimi/k3".into()],
+            Some("1.0.0".into()),
+        )
+        .unwrap();
+        assert!(summary.models.contains(&"alex/kimi/k3".to_string()));
+        assert!(read_grok_model_ids(&dir).contains(&"alex/kimi/k3".to_string()));
     }
 
     #[test]
