@@ -7,6 +7,30 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.28-beta.8] - 2026-07-18
+
+### Added
+- **Text the daemon from Telegram — inbound commands.** Opt in per channel with
+  `allow_commands = true`, and only your configured `chat_id` is honored. Commands:
+  - `/status` — full status in chat: version + update-available, daemon/service
+    uptime, Dario health, and per-account status, %usage, and expiry.
+  - `/ping`, `/help`.
+  - `/reauth <provider>` — start a re-auth and get the link; `/reauth` alone lists
+    accounts that need it.
+- **Complete a paste-code re-auth from Telegram.** Device-flow providers (xAI,
+  Kimi, OpenAI) already finished on their own after you tapped the link. Anthropic
+  needs a `code#state` pasted back — now you can paste it straight into the chat
+  (or `/code <value>`) and the daemon completes the login. This closes the gap
+  where an Anthropic re-auth link could be sent but never finished. The command
+  bus is transport-independent with a reserved hook for a future natural-language
+  handler.
+
+### Security
+- Inbound commands are off by default (`allow_commands`), accepted only from the
+  allowlisted `chat_id`, and code submission additionally requires the channel to
+  be command-enabled; pasted codes are never logged and OAuth error bodies are
+  redacted before replying.
+
 ## [0.1.28-beta.7] - 2026-07-18
 
 ### Fixed
