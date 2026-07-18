@@ -1272,6 +1272,7 @@ impl DarioSupervisor {
         quarantine_fable_live_cache();
         let shims = self.prepare_runtime_shims()?;
         let node_options = node_options_with_require(&shims.fetch_capture_preload);
+        let known_models = alex_store::anthropic_catalog_models();
         let mut child_cmd = Command::new(&self.runtime.bin);
         child_cmd
             .arg(bin)
@@ -1287,8 +1288,11 @@ impl DarioSupervisor {
             )
             .env(
                 "ALEXANDRIA_DARIO_KNOWN_MODELS",
-                serde_json::to_string(&alex_store::anthropic_catalog_models())
-                    .expect("catalogue model names serialize"),
+                serde_json::to_string(&known_models).expect("catalogue model names serialize"),
+            )
+            .env(
+                "ALEXANDRIA_DARIO_PROMPT_CACHE_KEYS",
+                prompt_cache_keys_env(&known_models),
             )
             .env("ALEXANDRIA_DARIO_WORK_DIR", &work_dir)
             .env("NODE_OPTIONS", node_options)
@@ -1326,6 +1330,14 @@ impl DarioSupervisor {
         let health_url = format!("http://127.0.0.1:{}/health", gen.port);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(HEALTH_TIMEOUT_MS);
         loop {
+            gen.observe_exit();
+            if gen.child.lock().unwrap().is_none() {
+                return Err(anyhow!(
+                    "{} exited before becoming healthy; see stderr log {}",
+                    gen.id,
+                    gen.stderr_log.display()
+                ));
+            }
             let ok = matches!(
                 self.http
                     .get(&health_url)
@@ -1336,6 +1348,14 @@ impl DarioSupervisor {
             );
             if ok {
                 break;
+            }
+            gen.observe_exit();
+            if gen.child.lock().unwrap().is_none() {
+                return Err(anyhow!(
+                    "{} exited before becoming healthy; see stderr log {}",
+                    gen.id,
+                    gen.stderr_log.display()
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -1677,15 +1697,33 @@ fn snippet(text: &str) -> String {
     text[..end].to_string()
 }
 
+fn normalize_prompt_cache_model(model: &str) -> &str {
+    let model = model.trim();
+    if model.ends_with(']') {
+        if let Some(open) = model.rfind('[') {
+            if open + 1 < model.len() - 1 && !model[open + 1..model.len() - 1].contains(']') {
+                return &model[..open];
+            }
+        }
+    }
+    model
+}
+
 fn prompt_cache_key(model: &str) -> String {
+    let model = normalize_prompt_cache_model(model);
+    let mut previous_was_separator = false;
     let slug = model
         .to_ascii_lowercase()
         .chars()
-        .map(|c| {
+        .filter_map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
+                previous_was_separator = false;
+                Some(c)
+            } else if previous_was_separator {
+                None
             } else {
-                '-'
+                previous_was_separator = true;
+                Some('-')
             }
         })
         .collect::<String>()
@@ -1703,6 +1741,19 @@ fn prompt_cache_key(model: &str) -> String {
     format!("{slug}-{hash}")
 }
 
+fn prompt_cache_keys_env(models: &[String]) -> String {
+    let keys = models
+        .iter()
+        .map(|model| {
+            (
+                normalize_prompt_cache_model(model).to_string(),
+                Value::String(prompt_cache_key(model)),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    Value::Object(keys).to_string()
+}
+
 fn prompt_cache_is_warm(root: &Path, model: &str) -> bool {
     let path = root.join(format!("{}.json", prompt_cache_key(model)));
     let Ok(raw) = std::fs::read_to_string(path) else {
@@ -1711,7 +1762,7 @@ fn prompt_cache_is_warm(root: &Path, model: &str) -> bool {
     let Ok(entry) = serde_json::from_str::<Value>(&raw) else {
         return false;
     };
-    if entry["model"].as_str() != Some(model)
+    if entry["model"].as_str() != Some(normalize_prompt_cache_model(model))
         || entry["system_prompt"].as_str().is_none_or(str::is_empty)
     {
         return false;
@@ -1870,6 +1921,9 @@ const { syncBuiltinESMExports } = require('node:module');
 
 const captureDir = process.env.ALEXANDRIA_DARIO_CAPTURE_DIR || '';
 const promptCacheDir = process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_DIR || '';
+const promptCacheKeys = (() => {
+  try { return JSON.parse(process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_KEYS || '{}'); } catch { return {}; }
+})();
 // Rust supplies this from alex-store/models.json.  It is intentionally data,
 // not a second hand-maintained list: every catalogue Claude model is eligible
 // for capture and a new model is visible to this generation immediately.
@@ -1963,12 +2017,15 @@ function requestCaptureContext(req) {
 }
 
 function promptCacheKey(model) {
-  const slug = model
+  const normalized = String(model).trim().replace(/\[[^\]]+\]$/, '');
+  const supplied = promptCacheKeys[normalized];
+  if (typeof supplied === 'string' && supplied) return supplied;
+  const slug = normalized
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'model';
-  const hash = crypto.createHash('sha256').update(model).digest('hex').slice(0, 12);
+  const hash = crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 12);
   return `${slug}-${hash}`;
 }
 
@@ -2337,7 +2394,7 @@ fn make_executable(_path: &Path) -> Result<()> {
 }
 
 fn node_options_with_require(preload: &Path) -> String {
-    let require = format!("--require={}", preload.to_string_lossy());
+    let require = format!("--require=\"{}\"", preload.to_string_lossy());
     match std::env::var("NODE_OPTIONS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {require}"),
         _ => require,
@@ -2411,6 +2468,9 @@ fn process_alive(pid: i32) -> bool {
 }
 
 fn terminate_pid(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
     #[cfg(unix)]
     let _ = std::process::Command::new("kill")
         .arg("-TERM")
@@ -2429,6 +2489,9 @@ fn alloc_port() -> Result<u16> {
 }
 
 async fn send_sigterm(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     #[cfg(unix)]
     let _ = Command::new("kill")
         .arg("-TERM")
@@ -2610,6 +2673,39 @@ mod tests {
     fn claude_prompt_capture_uses_private_working_directory() {
         let preload = fetch_capture_preload();
         assert!(preload.contains("cwd: process.env.ALEXANDRIA_DARIO_WORK_DIR"));
+    }
+
+    #[test]
+    fn node_options_quotes_spaced_preload_path() {
+        let options = node_options_with_require(Path::new(
+            "/Users/alex/Library/Application Support/alexandria/dario-fetch-capture.cjs",
+        ));
+        assert!(options.ends_with(
+            "--require=\"/Users/alex/Library/Application Support/alexandria/dario-fetch-capture.cjs\""
+        ));
+    }
+
+    #[test]
+    fn rust_prompt_cache_keys_are_supplied_to_the_preload() {
+        let models = vec![
+            "claude-sonnet-4-5[1m]".to_string(),
+            "claude::sonnet".to_string(),
+        ];
+        let supplied: Value = serde_json::from_str(&prompt_cache_keys_env(&models)).unwrap();
+
+        for model in &models {
+            let normalized = normalize_prompt_cache_model(model);
+            assert_eq!(
+                supplied[normalized].as_str(),
+                Some(prompt_cache_key(model).as_str())
+            );
+        }
+        assert_eq!(
+            prompt_cache_key("claude-sonnet-4-5[1m]"),
+            prompt_cache_key("claude-sonnet-4-5")
+        );
+        assert!(prompt_cache_key("claude::sonnet").starts_with("claude-sonnet-"));
+        assert!(fetch_capture_preload().contains("promptCacheKeys[normalized]"));
     }
 
     #[test]
