@@ -3,6 +3,10 @@ name: Build Signed macOS App
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Existing stable tag to build (vX.Y.Z)"
+        required: true
+        type: string
       notarize:
         description: "Submit the DMG to Apple notarization"
         required: true
@@ -13,6 +17,11 @@ on:
         required: true
         default: true
         type: boolean
+      overwrite:
+        description: "Overwrite existing release assets"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -22,19 +31,43 @@ jobs:
     name: Build signed DMG
     runs-on: namespace-profile-mac-medium
     timeout-minutes: 30
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     env:
       BUNDLE_ID: com.madhavajay.alex
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+
+      - name: Validate release tag
+        id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Stable update channels must only be generated from an exact stable tag.
+            echo "tag '$RELEASE_TAG' is not a stable tag (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          if [[ "$RELEASE_TAG" != "v${version}" ]]; then
+            # Refuse to publish a tag whose embedded package version disagrees.
+            echo "tag '$RELEASE_TAG' does not match Cargo.toml version '$version'" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-list -n 1 "$RELEASE_TAG")" ]]; then
+            # Refuse to publish if checkout did not resolve to the requested tag.
+            echo "checked-out commit does not match tag '$RELEASE_TAG'" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Show toolchain
         run: |
@@ -42,7 +75,15 @@ jobs:
           xcodebuild -version
 
       - name: Validate signing secrets
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
+          set -euo pipefail
           missing=()
           for key in \
             APPLE_ID \
@@ -64,6 +105,12 @@ jobs:
 
       - name: Build signed DMG
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
           SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
         run: |
@@ -82,8 +129,9 @@ jobs:
         id: release
         if: ${{ inputs.notarize && inputs.publish_release }}
         run: |
-          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
-          tag="v${version}"
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          tag="${{ steps.meta.outputs.tag }}"
           dmg="$(ls -t macos/dist/*.dmg | head -1)"
 
           if [[ -z "$version" || -z "$dmg" ]]; then
@@ -105,14 +153,19 @@ jobs:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
           DMG_PATH: ${{ steps.release.outputs.dmg }}
         run: |
+          set -euo pipefail
+          upload_args=()
+          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
+            upload_args+=(--clobber)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber
+            gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
           else
             if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
-              --target "$GITHUB_SHA" \
+              --target "$(git rev-parse HEAD)" \
               --title "Alexandria ${RELEASE_TAG}" \
               --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
-              gh release upload "$RELEASE_TAG" "$DMG_PATH" --clobber
+              gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
             fi
           fi
 
@@ -123,8 +176,9 @@ jobs:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
-            echo "Skipping Sparkle appcast; SPARKLE_ED_PRIVATE_KEY is not configured."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+            # A published DMG must update the signed appcast so app users see it.
+            echo "SPARKLE_ED_PRIVATE_KEY is required when publishing a release." >&2
+            exit 1
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -165,7 +219,7 @@ jobs:
 
       - name: Deploy GitHub Pages
         if: ${{ inputs.notarize && inputs.publish_release && steps.sparkle_key.outputs.present == 'true' }}
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ github.token }}
           publish_branch: gh-pages
@@ -201,7 +255,11 @@ jobs:
             "${merge_args[@]}" \
             --out manifest.json
           cat manifest.json
-          gh release upload "$RELEASE_TAG" manifest.json --clobber
+          upload_args=()
+          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
+            upload_args+=(--clobber)
+          fi
+          gh release upload "$RELEASE_TAG" manifest.json "${upload_args[@]}"
 
       - name: Check tap deploy key
         id: tap_key
@@ -210,8 +268,9 @@ jobs:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           if [[ -z "${TAP_DEPLOY_KEY:-}" ]]; then
-            echo "Skipping Homebrew cask update; TAP_DEPLOY_KEY is not configured."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+            # A published DMG must update the tap instead of silently omitting its cask.
+            echo "TAP_DEPLOY_KEY is required when publishing a release." >&2
+            exit 1
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi

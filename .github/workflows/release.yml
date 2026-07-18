@@ -8,7 +8,7 @@ on:
         required: true
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 concurrency:
   group: release
@@ -16,7 +16,6 @@ concurrency:
 
 jobs:
   meta:
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-beta.') }}
     runs-on: namespace-profile-linux-medium
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -34,10 +33,21 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+  swift-test:
+    needs: meta
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: Test Swift app
+        working-directory: macos
+        run: swift test
+
   publish:
     needs: meta
     runs-on: namespace-profile-linux-medium
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.meta.result == 'success' }}
+    if: ${{ !cancelled() && needs.meta.result == 'success' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     permissions:
@@ -130,7 +140,7 @@ jobs:
 
   windows-asset:
     needs: [meta, publish]
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: namespace-profile-windows-medium
     permissions:
       contents: write
@@ -169,7 +179,7 @@ jobs:
 
   linux-musl-asset:
     needs: [meta, publish]
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: namespace-profile-linux-medium
     permissions:
       contents: write
@@ -209,16 +219,11 @@ jobs:
             dist/checksums.txt --clobber -R "${{ github.repository }}"
 
   macos-asset:
-    needs: [meta, publish]
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' }}
+    needs: [meta, publish, swift-test]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.swift-test.result == 'success' }}
     runs-on: namespace-profile-mac-medium
     permissions:
       contents: write
-    env:
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
     steps:
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -254,6 +259,10 @@ jobs:
 
       - name: Check CLI signing secrets
         id: cli_signing
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
@@ -268,7 +277,12 @@ jobs:
           done
 
           if [[ "${#missing[@]}" -gt 0 ]]; then
-            printf 'Skipping macOS CLI codesign; missing secret(s): %s\n' "${missing[*]}"
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              # A tag release must never publish unsigned macOS CLI archives.
+              printf 'Missing required macOS CLI signing secret(s): %s\n' "${missing[*]}" >&2
+              exit 1
+            fi
+            printf 'Skipping macOS CLI codesign for workflow_dispatch; missing secret(s): %s\n' "${missing[*]}"
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
@@ -276,6 +290,11 @@ jobs:
 
       - name: Sign CLI binaries
         if: steps.cli_signing.outputs.available == 'true'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           keychain_password="$(uuidgen)"
@@ -359,8 +378,9 @@ jobs:
       - meta
       - publish
       - windows-asset
+      - linux-musl-asset
       - macos-asset
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.publish.result == 'success' && needs.macos-asset.result == 'success' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.windows-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.macos-asset.result == 'success' }}
     runs-on: namespace-profile-linux-medium
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -412,20 +432,17 @@ jobs:
           gh release upload "v${{ needs.publish.outputs.version }}" manifest.json --clobber -R "${{ github.repository }}"
 
   stable-app:
-    needs: [meta, manifest]
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
+    needs: [meta, manifest, swift-test]
+    if: ${{ !cancelled() && needs.manifest.result == 'success' && needs.swift-test.result == 'success' }}
     runs-on: namespace-profile-mac-medium
     timeout-minutes: 40
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
       BUNDLE_ID: com.madhavajay.alex
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -433,6 +450,13 @@ jobs:
 
       - name: Check app signing secrets
         id: app_signing
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
@@ -449,7 +473,12 @@ jobs:
             fi
           done
           if [[ "${#missing[@]}" -gt 0 ]]; then
-            printf 'Skipping stable DMG; missing secret(s): %s\n' "${missing[*]}"
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              # A tag release must never succeed without its signed, notarized DMG.
+              printf 'Missing required app signing secret(s): %s\n' "${missing[*]}" >&2
+              exit 1
+            fi
+            printf 'Skipping stable DMG for workflow_dispatch; missing secret(s): %s\n' "${missing[*]}"
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
@@ -458,6 +487,12 @@ jobs:
       - name: Build signed DMG
         if: steps.app_signing.outputs.available == 'true'
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
           SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
         run: |
@@ -497,7 +532,12 @@ jobs:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
-            echo "Skipping stable appcast; SPARKLE_ED_PRIVATE_KEY is not configured."
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              # A tag release must update the signed appcast so app users see it.
+              echo "SPARKLE_ED_PRIVATE_KEY is required for a stable tag release." >&2
+              exit 1
+            fi
+            echo "Skipping stable appcast for workflow_dispatch; SPARKLE_ED_PRIVATE_KEY is not configured."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -538,7 +578,7 @@ jobs:
 
       - name: Deploy GitHub Pages
         if: steps.app_signing.outputs.available == 'true' && steps.sparkle_key.outputs.present == 'true'
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ github.token }}
           publish_branch: gh-pages
@@ -547,19 +587,24 @@ jobs:
 
   tap-formula:
     needs: manifest
-    if: ${{ !cancelled() && !contains(github.event.inputs.tag || github.ref_name, '-beta.') && needs.manifest.result == 'success' }}
+    if: ${{ !cancelled() && needs.manifest.result == 'success' }}
     runs-on: namespace-profile-linux-medium
-    env:
-      TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check tap deploy key
         id: tap_key
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${TAP_DEPLOY_KEY:-}" ]]; then
-            echo "Skipping Homebrew formula update; TAP_DEPLOY_KEY is not configured."
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              # A tag release must update the tap instead of silently omitting formulae.
+              echo "TAP_DEPLOY_KEY is required for a stable tag release." >&2
+              exit 1
+            fi
+            echo "Skipping Homebrew formula update for workflow_dispatch; TAP_DEPLOY_KEY is not configured."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -610,6 +655,8 @@ jobs:
 
       - name: Push formula + cask to Homebrew tap
         if: steps.tap_key.outputs.present == 'true'
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           version="${{ needs.manifest.outputs.version }}"
