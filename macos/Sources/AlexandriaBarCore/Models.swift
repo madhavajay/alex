@@ -181,6 +181,44 @@ public struct NotificationSaveResponse: Codable, Sendable {
     public let error: String?
 }
 
+/// Reachability an account's last heartbeat/ping implies, as reported by the
+/// daemon's `/admin/accounts` `health` field. This is distinct from `status`
+/// (credential presence): a live credential whose ping fails is not healthy.
+/// An older daemon omits `health`; the account then reads `.unknown`.
+public enum AccountHealth: String, Codable, Sendable {
+    /// Last probe succeeded.
+    case healthy
+    /// Reachable but impaired (e.g. serving via a fallback).
+    case degraded
+    /// Network / 5xx / timeout — a failover/down condition, not a logout.
+    case unreachable
+    /// 401/403/dead token — needs re-authentication.
+    case authFailed = "auth_failed"
+    /// Never probed yet: neutral, do not claim green.
+    case unknown
+
+    /// Tolerant decode: an unrecognized value from a newer daemon reads as
+    /// `.unknown` rather than failing the whole account decode.
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = AccountHealth(rawValue: raw) ?? .unknown
+    }
+}
+
+public struct AccountProbe: Codable, Sendable {
+    public let ok: Bool
+    public let status: Int?
+    public let latencyMs: Int64?
+    public let health: AccountHealth?
+    public let checkedAtMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, status, health
+        case latencyMs = "latency_ms"
+        case checkedAtMs = "checked_at_ms"
+    }
+}
+
 public struct Account: Codable, Sendable, Identifiable {
     public let id: String
     public let provider: String
@@ -192,16 +230,31 @@ public struct Account: Codable, Sendable, Identifiable {
     public let limits: AccountLimits?
     public let paused: Bool
     public let status: String
+    /// Probe-derived reachability. Older daemons omit it; nil then reads as
+    /// `.unknown` via `healthState`.
+    public let health: AccountHealth?
+    public let lastProbe: AccountProbe?
+    public let needsReauth: Bool?
     public let expiresAtMs: Int64?
     public let expiresInS: Int64?
 
     enum CodingKeys: String, CodingKey {
-        case id, provider, name, kind, label, description, email, limits, paused, status
+        case id, provider, name, kind, label, description, email, limits, paused, status, health
+        case lastProbe = "last_probe"
+        case needsReauth = "needs_reauth"
         case expiresAtMs = "expires_at_ms"
         case expiresInS = "expires_in_s"
     }
 
     public var isExpired: Bool { (expiresInS ?? 1) < 0 }
+
+    /// The reachability the UI dot must follow. A confirmed logout always wins;
+    /// otherwise the daemon's probe-derived `health`, defaulting to `.unknown`
+    /// so a never-probed account is not painted green.
+    public var healthState: AccountHealth {
+        if needsReauth == true { return .authFailed }
+        return health ?? .unknown
+    }
 }
 
 /// A quota snapshot tied to one credential rather than a provider-wide aggregate.

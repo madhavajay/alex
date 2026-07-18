@@ -810,7 +810,10 @@ fn kimi_usage_row(raw: &Value, default_label: &str) -> Option<Value> {
 /// it can be unit-tested and degrades gracefully on an unexpected shape.
 pub fn parse_kimi_usage_payload(payload: &Value) -> Value {
     let mut windows = Vec::new();
-    if let Some(row) = payload.get("usage").and_then(|u| kimi_usage_row(u, "Weekly limit")) {
+    if let Some(row) = payload
+        .get("usage")
+        .and_then(|u| kimi_usage_row(u, "Weekly limit"))
+    {
         windows.push(row);
     }
     if let Some(limits) = payload.get("limits").and_then(Value::as_array) {
@@ -843,7 +846,11 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
         Err(e) => return (false, None, e.to_string()),
     };
     let Some(token) = account.access_token.clone() else {
-        return (false, Some(account.id.clone()), "kimi account has no access token".into());
+        return (
+            false,
+            Some(account.id.clone()),
+            "kimi account has no access token".into(),
+        );
     };
     let resp = state
         .http
@@ -864,7 +871,11 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
             }
             let body: Value = resp.json().await.unwrap_or(Value::Null);
             if !status.is_success() {
-                return (false, Some(account.id.clone()), format!("usage HTTP {status}"));
+                return (
+                    false,
+                    Some(account.id.clone()),
+                    format!("usage HTTP {status}"),
+                );
             }
             let snapshot = parse_kimi_usage_payload(&body);
             let summary = snapshot["windows"]
@@ -884,7 +895,11 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
                 .await;
             (true, Some(account.id.clone()), summary)
         }
-        Err(e) => (false, Some(account.id.clone()), format!("usage endpoint unreachable: {e}")),
+        Err(e) => (
+            false,
+            Some(account.id.clone()),
+            format!("usage endpoint unreachable: {e}"),
+        ),
     }
 }
 
@@ -1724,23 +1739,32 @@ async fn admin_account_merge(
         allow_mismatch,
     } = body.0;
     if from.trim().is_empty() || into.trim().is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "both 'from' and 'into' are required");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "both 'from' and 'into' are required",
+        );
     }
     // 1. Validate credentials-side before touching any history.
-    let (_from_account, into_account) =
-        match state.vault.validate_merge(&from, &into, allow_mismatch).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                let status = if e.to_string().starts_with("unknown account") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                return error_response(status, &e.to_string());
-            }
-        };
+    let (_from_account, into_account) = match state
+        .vault
+        .validate_merge(&from, &into, allow_mismatch)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            let status = if e.to_string().starts_with("unknown account") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return error_response(status, &e.to_string());
+        }
+    };
     // Ensure the survivor has a durable catalogue row so re-keyed traces resolve.
-    if let Err(e) = state.store.upsert_known_account(&known_account(&into_account)) {
+    if let Err(e) = state
+        .store
+        .upsert_known_account(&known_account(&into_account))
+    {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
     // 2. Re-key every trace/heartbeat/catalogue reference in one transaction.
@@ -4364,6 +4388,11 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "paused": a.paused,
                 "path": a.path.as_ref().map(|p| p.display().to_string()),
                 "status": a.status,
+                // Reachability derived from the last heartbeat/ping, distinct
+                // from `status` (credential presence). The UI dot must follow
+                // this, not `status`, so a failing-ping provider reads red.
+                "health": account_health(&a),
+                "last_probe": a.account_meta.get("last_probe").cloned().unwrap_or(Value::Null),
                 "needs_reauth": a.needs_reauth(),
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
@@ -5066,9 +5095,135 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
             reply = %r.message,
             "heartbeat"
         );
+        // Reachability, not credential-presence, is what the status dot must
+        // reflect: persist the probe outcome and — for an auth-class failure —
+        // reuse the proactive re-auth dispatcher (same cooldown as the request
+        // path and the idle-expiry watchdog).
+        record_probe_outcome(state, &r).await;
         results.push(r);
     }
     results
+}
+
+/// Health an account's last probe implies. This is reachability, distinct from
+/// the credential-presence `status` field: a live credential that fails its
+/// ping is not "healthy". `Unknown` is never recorded — it is the read-side
+/// default for an account that has never been probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeHealth {
+    Healthy,
+    Unreachable,
+    AuthFailed,
+}
+
+impl ProbeHealth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unreachable => "unreachable",
+            Self::AuthFailed => "auth_failed",
+        }
+    }
+}
+
+/// Classify a probe result into a health state. The don't-cry-wolf boundary is
+/// the shared [`ErrorClass::Auth`] taxonomy: only a genuine auth failure
+/// (401/403/invalid token) is `AuthFailed`; every other failure — 5xx, 429,
+/// timeout, network, unknown — is `Unreachable` (a failover/down condition, not
+/// a re-auth condition). A ping travels through the proxy, which already forces
+/// one token refresh on a 401 before returning, so a 401 reaching here is a
+/// confirmed logout rather than a merely-stale token.
+fn probe_health(result: &PingResult) -> ProbeHealth {
+    if result.ok {
+        return ProbeHealth::Healthy;
+    }
+    match classify_error("", result.status, None) {
+        ErrorClass::Auth => ProbeHealth::AuthFailed,
+        _ => ProbeHealth::Unreachable,
+    }
+}
+
+/// Persist a probe outcome on its account and drive the auth-failure re-auth
+/// alert. Recording the last probe is what lets `/admin/accounts` (and the
+/// Swift status dot) report reachability instead of credential presence.
+///
+/// On an auth-class failure this reuses the exact proactive-reauth machinery
+/// (`mark_account_needs_reauth` + `emit_reauth_notification_for_account`, whose
+/// dispatcher cooldown debounces to one alert per provider per window). A
+/// transient/unreachable failure deliberately leaves the re-auth flag untouched
+/// — it is a failover condition, not a logout. A healthy probe clears a prior
+/// logout flag so a recovered account stops showing red and the next genuine
+/// logout alerts again.
+async fn record_probe_outcome(state: &AppState, result: &PingResult) {
+    let Some(account_id) = result.account_id.as_deref() else {
+        return;
+    };
+    let health = probe_health(result);
+    let last_probe = json!({
+        "ok": result.ok,
+        "status": result.status,
+        "latency_ms": result.latency_ms,
+        "health": health.as_str(),
+        "checked_at_ms": now_ms(),
+    });
+    if let Err(error) = state
+        .vault
+        .set_account_meta(account_id, "last_probe", last_probe)
+        .await
+    {
+        tracing::warn!(account = %account_id, %error, "could not persist probe health");
+    }
+    match health {
+        ProbeHealth::AuthFailed => {
+            mark_account_needs_reauth(state, account_id, true).await;
+            // Only managed OAuth logins have a re-auth alert; the emitter itself
+            // guards on kind, but fetch the fresh account so its provider/label
+            // drive the (secret-free) notification.
+            if let Some(account) = state
+                .vault
+                .list()
+                .await
+                .into_iter()
+                .find(|account| account.id == account_id)
+            {
+                emit_reauth_notification_for_account(state, &account);
+            }
+        }
+        ProbeHealth::Healthy => {
+            // A recovered account: clear any stale logout flag so it stops
+            // reading red and a future logout alerts afresh.
+            if state
+                .vault
+                .list()
+                .await
+                .into_iter()
+                .any(|account| account.id == account_id && account.needs_reauth())
+            {
+                mark_account_needs_reauth(state, account_id, false).await;
+            }
+        }
+        // Unreachable/down is a failover condition, never a re-auth: leave the
+        // flag exactly as it is so a network blip never clears nor raises it.
+        ProbeHealth::Unreachable => {}
+    }
+}
+
+/// The reachability health `/admin/accounts` reports for an account. A confirmed
+/// logout (`needs_reauth`, set by either the probe path or the idle-expiry
+/// watchdog) always wins so the dot is red regardless of the last ping; failing
+/// that it echoes the last probe's health, defaulting to `unknown` when the
+/// account has never been probed (never claim green without evidence).
+fn account_health(account: &Account) -> String {
+    if account.needs_reauth() {
+        return "auth_failed".to_string();
+    }
+    account
+        .account_meta
+        .get("last_probe")
+        .and_then(|probe| probe.get("health"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 async fn anthropic_messages(
@@ -9362,7 +9517,10 @@ fn reauth_notification_event_for_account(account: &Account) -> notify::Notificat
         category: "reauth".into(),
         title: format!("{} needs re-authentication", provider),
         body: reauth_body_for(account.provider),
-        account: notify::NotificationAccount { provider: provider.clone(), label },
+        account: notify::NotificationAccount {
+            provider: provider.clone(),
+            label,
+        },
         action_url: Some(reauth_action_for(account.provider)),
         ts: now_ms(),
     }
@@ -13267,10 +13425,7 @@ mod tests {
         }
     }
 
-    async fn first_event(
-        received: &Arc<std::sync::Mutex<Vec<Value>>>,
-        context: &str,
-    ) -> Value {
+    async fn first_event(received: &Arc<std::sync::Mutex<Vec<Value>>>, context: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(event) = received.lock().unwrap().first().cloned() {
@@ -13465,6 +13620,207 @@ mod tests {
         assert!(
             !needs_reauth_flag(&state, "openai-oauth-recovered").await,
             "a recovered account must have its needs-reauth flag cleared"
+        );
+    }
+
+    // ---- probe-derived health + reauth-on-auth-failure --------------------
+
+    /// A valid, active managed OAuth account for a provider. Probe health is
+    /// independent of token expiry, so this uses a far-future expiry to make the
+    /// intent ("live credential, but the ping decides health") explicit.
+    fn active_oauth_account(provider: Provider, name: &str) -> Account {
+        expired_oauth_account(
+            provider,
+            name,
+            Some("refresh-token"),
+            now_ms() + 60 * 60_000,
+        )
+    }
+
+    fn probe_result(account_id: &str, ok: bool, status: Option<u16>) -> PingResult {
+        PingResult {
+            provider: "xai",
+            account_id: Some(account_id.to_string()),
+            ok,
+            status,
+            latency_ms: 12,
+            message: "probe".into(),
+        }
+    }
+
+    async fn account_health_of(state: &Arc<AppState>, id: &str) -> String {
+        let account = state
+            .vault
+            .list()
+            .await
+            .into_iter()
+            .find(|a| a.id == id)
+            .expect("account present");
+        account_health(&account)
+    }
+
+    async fn admin_accounts_health(state: &Arc<AppState>, id: &str) -> String {
+        let (_, body) =
+            response_json(admin_accounts(State(state.clone())).await.into_response()).await;
+        body["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap_or_else(|| panic!("account {id} not in /admin/accounts"))["health"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn probe_401_marks_auth_failed_and_fires_one_reauth() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("probe-401-auth");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        // Two consecutive failing probes: the alert must debounce to one per
+        // cooldown window, not fire per probe.
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", false, Some(401))).await;
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", false, Some(401))).await;
+
+        let event = first_event(&received, "401 probe did not fire a reauth alert").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["provider"], "xai");
+        // The alert never carries credential material.
+        assert!(!event.to_string().contains("token-grok"));
+        assert_eq!(
+            count, 1,
+            "an auth-failed provider must alert once per window, not once per probe"
+        );
+        assert!(needs_reauth_flag(&state, "xai-oauth-grok").await);
+        assert_eq!(
+            account_health_of(&state, "xai-oauth-grok").await,
+            "auth_failed"
+        );
+        // The probe-derived health, not the still-"active" credential status,
+        // is what /admin/accounts reports.
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "auth_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_503_is_unreachable_and_never_fires_reauth() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("probe-503-down");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", false, Some(503))).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+
+        assert_eq!(
+            count, 0,
+            "a transient 5xx is a failover/down condition and must not fire a reauth alert"
+        );
+        assert!(!needs_reauth_flag(&state, "xai-oauth-grok").await);
+        assert_eq!(
+            account_health_of(&state, "xai-oauth-grok").await,
+            "unreachable"
+        );
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_is_unreachable_and_never_fires_reauth() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("probe-timeout-down");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        // A timed-out probe yields no HTTP status at all.
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", false, None)).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+
+        assert_eq!(count, 0, "a timeout must not fire a reauth alert");
+        assert!(!needs_reauth_flag(&state, "xai-oauth-grok").await);
+        assert_eq!(
+            account_health_of(&state, "xai-oauth-grok").await,
+            "unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_recovery_clears_needs_reauth_and_reports_healthy() {
+        let (url, _received, sink) = webhook_sink().await;
+        let state = test_state("probe-recovery");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        // First a confirmed auth failure flags the account...
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", false, Some(401))).await;
+        assert!(needs_reauth_flag(&state, "xai-oauth-grok").await);
+        assert_eq!(
+            account_health_of(&state, "xai-oauth-grok").await,
+            "auth_failed"
+        );
+
+        // ...then a healthy probe recovers it.
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", true, Some(200))).await;
+        sink.abort();
+
+        assert!(
+            !needs_reauth_flag(&state, "xai-oauth-grok").await,
+            "a recovered probe must clear the needs-reauth flag"
+        );
+        assert_eq!(account_health_of(&state, "xai-oauth-grok").await, "healthy");
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_probed_account_reports_unknown_not_healthy() {
+        let state = test_state("probe-unknown");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        // No probe has run: the credential is present ("active") but we must not
+        // claim green without evidence of reachability.
+        assert_eq!(account_health_of(&state, "xai-oauth-grok").await, "unknown");
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "unknown"
         );
     }
 }
