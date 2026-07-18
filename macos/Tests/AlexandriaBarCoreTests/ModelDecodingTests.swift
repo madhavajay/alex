@@ -57,6 +57,27 @@ import Testing
         #expect(accounts[1].lastHeartbeat == nil)
     }
 
+    @Test func accountProbeHealthDrivesStatusState() throws {
+        // xai has a live credential ("active") but its last ping returned 401:
+        // health must read authFailed, not healthy. gemini failed transiently
+        // (unreachable) and openai has never been probed (unknown → not green).
+        let json = #"""
+        {"accounts":[
+          {"id":"xai-oauth","provider":"xai","name":"default","kind":"oauth","paused":false,"status":"active","health":"auth_failed","needs_reauth":true,"last_probe":{"ok":false,"status":401,"latency_ms":88,"health":"auth_failed","checked_at_ms":1783477017897},"expires_at_ms":null,"expires_in_s":null},
+          {"id":"gemini-oauth","provider":"gemini","name":"default","kind":"oauth","paused":false,"status":"active","health":"unreachable","needs_reauth":false,"last_probe":{"ok":false,"status":503,"latency_ms":12,"health":"unreachable","checked_at_ms":1783477017897},"expires_at_ms":null,"expires_in_s":null},
+          {"id":"openai-oauth","provider":"openai","name":"default","kind":"oauth","paused":false,"status":"active","expires_at_ms":null,"expires_in_s":null}
+        ]}
+        """#
+        let accounts = try decode(json, as: AccountsResponse.self).accounts
+        #expect(accounts[0].healthState == .authFailed)
+        #expect(accounts[0].needsReauth == true)
+        #expect(accounts[0].lastProbe?.status == 401)
+        #expect(accounts[1].healthState == .unreachable)
+        // Never probed: absent health must not read as healthy.
+        #expect(accounts[2].health == nil)
+        #expect(accounts[2].healthState == .unknown)
+    }
+
     @Test func limitsHeterogeneous() throws {
         let json = #"""
         {"providers":[
