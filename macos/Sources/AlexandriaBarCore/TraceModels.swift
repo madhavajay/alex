@@ -1359,7 +1359,7 @@ public enum HarnessIcon {
         "qwen-code": "qwen-code.png",
         "gemini-cli": "gemini-cli.png",
         "mini-swe-agent": "mini-swe-agent.png",
-        "kimi-code": "kimi-code.jpg",
+        "kimi-code": "kimi-code.png",
         "goose": "goose.jpg",
         "hermes": "hermes.png",
         "droid-cli": "droid-cli.svg",

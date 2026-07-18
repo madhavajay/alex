@@ -22,7 +22,7 @@ import Testing
             HarnessIcon.assetName(harness: nil, tags: ["harness": "mini-swe-agent"])
                 == "mini-swe-agent.png")
         #expect(
-            HarnessIcon.assetName(harness: nil, tags: ["harness": "kimi-code"]) == "kimi-code.jpg")
+            HarnessIcon.assetName(harness: nil, tags: ["harness": "kimi-code"]) == "kimi-code.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "goose"]) == "goose.jpg")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "hermes"]) == "hermes.png")
         #expect(
@@ -55,7 +55,7 @@ import Testing
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "gemini"]) == "gemini-cli.png")
         #expect(
             HarnessIcon.assetName(harness: nil, tags: ["harness": "mini"]) == "mini-swe-agent.png")
-        #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "kimi"]) == "kimi-code.jpg")
+        #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "kimi"]) == "kimi-code.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "droid"]) == "droid-cli.svg")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "cursor"]) == "cursor-cli.png")
         #expect(HarnessIcon.assetName(harness: nil, tags: ["harness": "agent"]) == "cursor-cli.png")
@@ -91,7 +91,7 @@ import Testing
                 == "qwen-code.png")
         #expect(HarnessIcon.assetName(harness: "factory-cli/1.2.3", tags: nil) == "droid-cli.svg")
         #expect(
-            HarnessIcon.assetName(harness: "kimi-code-cli/0.20.2", tags: nil) == "kimi-code.jpg")
+            HarnessIcon.assetName(harness: "kimi-code-cli/0.20.2", tags: nil) == "kimi-code.png")
         #expect(HarnessIcon.assetName(harness: "omp", tags: nil) == "oh-my-pi.png")
         #expect(HarnessIcon.assetName(harness: "pydantic-ai", tags: nil) == "pydantic-ai-harness.png")
         #expect(HarnessIcon.assetName(harness: "jcode", tags: nil) == "jcode.png")
