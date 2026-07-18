@@ -82,6 +82,7 @@ jobs:
           ditto macos/dist/Alex.app "$stage/Alex.app"
           cp target/release/alex target/release/alexandria "$stage/bin/"
           cp packaging/ci-macos/install.sh packaging/ci-macos/README.md "$stage/"
+          cp scripts/lib/install-common.sh "$stage/"
           chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
 
           {

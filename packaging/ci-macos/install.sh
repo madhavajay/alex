@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$SCRIPT_DIR/install-common.sh" ]]; then
+  . "$SCRIPT_DIR/install-common.sh"
+else
+  . "$SCRIPT_DIR/../../scripts/lib/install-common.sh"
+fi
 APP_SOURCE="$SCRIPT_DIR/Alex.app"
 BIN_SOURCE="$SCRIPT_DIR/bin"
 APP_DEST="${ALEXANDRIA_APP_DEST:-/Applications/Alex.app}"
@@ -28,20 +33,12 @@ run_for_applications() {
   fi
 }
 
-stop_app() {
-  for app in AlexandriaBar Alex; do
-    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
-  done
-  pkill -x AlexandriaBar 2>/dev/null || true
-  pkill -x Alex 2>/dev/null || true
-}
-
 restart_service() {
   "$BIN_DEST/alex" service install
 }
 
 restore_previous() {
-  stop_app
+  quit_alex_apps
   if [[ ! -e "$APP_BACKUP" ]]; then
     echo "No saved app exists at $APP_BACKUP" >&2
     exit 1
@@ -80,7 +77,7 @@ install_ci_build() {
     exit 1
   fi
 
-  stop_app
+  quit_alex_apps
   mkdir -p "$BIN_DEST"
 
   if [[ -d "$APP_DEST" && ! -e "$APP_BACKUP" ]]; then
@@ -96,7 +93,7 @@ install_ci_build() {
   done
 
   run_for_applications ditto "$APP_SOURCE" "$APP_DEST"
-  run_for_applications rm -rf "$LEGACY_APP_DEST"
+  remove_legacy_app "$(dirname "$APP_DEST")" "$(basename "$APP_DEST")" "$(basename "$LEGACY_APP_DEST")"
   run_for_applications xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
   cp "$BIN_SOURCE/alex" "$BIN_SOURCE/alexandria" "$BIN_DEST/"
   chmod +x "$BIN_DEST/alex" "$BIN_DEST/alexandria"

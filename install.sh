@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# lib: install-common.sh (curl-to-sh entry; shared helpers stay inline.)
+
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--service] [--upgrade] [--prefix DIR]
@@ -53,6 +55,17 @@ ALIAS_BIN="$PREFIX/alexandria"
 
 say() {
   echo "$1"
+}
+
+is_alex_daemon_pid() {
+  ps -p "$1" -o command= 2>/dev/null | awk '
+    NR == 1 {
+      binary = $1
+      sub(/^.*\//, "", binary)
+      exit !((binary == "alex" || binary == "alexandria") && $2 == "daemon")
+    }
+    END { if (NR == 0) exit 1 }
+  '
 }
 
 say "◆ building release binary…"
@@ -109,7 +122,15 @@ if [ "$UPGRADE" = "1" ]; then
     echo "lsof not found — cannot discover the old daemon; restart it manually" >&2
     exit 1
   fi
-  OLD_PIDS=$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)
+  LISTENER_PIDS=$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)
+  OLD_PIDS=""
+  for pid in $LISTENER_PIDS; do
+    if ! is_alex_daemon_pid "$pid"; then
+      echo "refusing to replace non-Alexandria listener pid $pid on port $PORT" >&2
+      exit 1
+    fi
+    OLD_PIDS="${OLD_PIDS}${OLD_PIDS:+ }$pid"
+  done
   if [ -z "$OLD_PIDS" ]; then
     say "no running daemon found; starting fresh"
     nohup "$BIN" daemon >> "$HOME/.alexandria/daemon.log" 2>&1 &
@@ -153,6 +174,10 @@ if [ "$UPGRADE" = "1" ]; then
     say "new daemon healthy; draining old daemon(s): $OLD_PIDS"
     for pid in $OLD_PIDS; do
       [ "$pid" = "$NEW_PID" ] && continue
+      if ! is_alex_daemon_pid "$pid"; then
+        echo "not TERMing pid $pid: it is no longer an Alexandria daemon" >&2
+        continue
+      fi
       kill -TERM "$pid" 2>/dev/null || true
     done
   fi

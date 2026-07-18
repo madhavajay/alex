@@ -33,6 +33,7 @@ say() {
   printf '%s\n' "$*"
 }
 
+# lib: install-common.sh
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -42,6 +43,79 @@ sha256_file() {
     say "A SHA-256 tool (sha256sum or shasum) is required." >&2
     exit 1
   fi
+}
+
+quit_alex_apps() {
+  wait_steps="${1:-0}"
+  for app in AlexandriaBar Alex; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 </dev/null || true
+  done
+  for process in AlexandriaBar Alex; do
+    if pgrep -x "$process" >/dev/null 2>&1; then
+      printf 'Quitting the running %s...\n' "$process"
+      waited=0
+      while pgrep -x "$process" >/dev/null 2>&1 && [ "$waited" -lt "$wait_steps" ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+      done
+      if pgrep -x "$process" >/dev/null 2>&1; then
+        pkill -x "$process" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+}
+
+remove_legacy_app() {
+  app_dir="$1"
+  new_app_name="${2:-Alex.app}"
+  legacy_app_name="${3:-AlexandriaBar.app}"
+  [ -n "$app_dir" ] || return 1
+  [ -e "$app_dir/$new_app_name" ] || return 0
+  [ -e "$app_dir/$legacy_app_name" ] || return 0
+  if [ -w "$app_dir" ]; then
+    rm -rf "$app_dir/$legacy_app_name"
+  else
+    sudo rm -rf "$app_dir/$legacy_app_name"
+  fi
+}
+
+INSTALL_COMMON_MOUNT_POINT=""
+
+install_common_cleanup_mount() {
+  if [ -n "${INSTALL_COMMON_MOUNT_POINT:-}" ]; then
+    hdiutil detach "$INSTALL_COMMON_MOUNT_POINT" -quiet >/dev/null 2>&1 || true
+    rmdir "$INSTALL_COMMON_MOUNT_POINT" >/dev/null 2>&1 || true
+    INSTALL_COMMON_MOUNT_POINT=""
+  fi
+}
+
+install_app_from_dmg() {
+  dmg_path="$1"
+  app_name="$2"
+  install_dir="$3"
+  legacy_app_name="${4:-AlexandriaBar.app}"
+
+  [ -n "$install_dir" ] || {
+    printf '%s\n' "The app install directory is empty." >&2
+    return 1
+  }
+  INSTALL_COMMON_MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-install-XXXXXX")"
+  hdiutil attach "$dmg_path" -nobrowse -quiet -mountpoint "$INSTALL_COMMON_MOUNT_POINT" </dev/null
+
+  if [ ! -d "$INSTALL_COMMON_MOUNT_POINT/$app_name" ]; then
+    printf '%s\n' "$app_name was not found inside the DMG; the app was not installed." >&2
+    return 1
+  fi
+  mkdir -p "$install_dir"
+  if [ ! -w "$install_dir" ]; then
+    printf '%s\n' "$install_dir is not writable. Re-run as a user who can write to it." >&2
+    return 1
+  fi
+
+  rm -rf "$install_dir/$app_name"
+  ditto "$INSTALL_COMMON_MOUNT_POINT/$app_name" "$install_dir/$app_name"
+  remove_legacy_app "$install_dir" "$app_name" "$legacy_app_name"
+  install_common_cleanup_mount
 }
 
 # GitHub's releases/latest never points at a prerelease, so resolve from the full
@@ -122,10 +196,12 @@ replace_daemon() {
   # upgrades -- launchd's re-pin cannot see or stop them, so the daemon appears
   # "stuck" on an old version forever. launchd relaunches its own managed daemon
   # after service install, so clearing every running daemon here is safe.
-  if pgrep -f "alexandria daemon" >/dev/null 2>&1 || pgrep -f "alex daemon" >/dev/null 2>&1; then
+  alex_pattern="^$(printf '%s' "$INSTALL_DIR/alex" | sed 's/[][\\.^$*+?{}|()]/\\&/g')[[:space:]]+daemon([[:space:]]|$)"
+  alexandria_pattern="^$(printf '%s' "$INSTALL_DIR/alexandria" | sed 's/[][\\.^$*+?{}|()]/\\&/g')[[:space:]]+daemon([[:space:]]|$)"
+  if pgrep -f "$alex_pattern" >/dev/null 2>&1 || pgrep -f "$alexandria_pattern" >/dev/null 2>&1; then
     say "Clearing stray daemon processes holding the port..."
-    pkill -f "alexandria daemon" >/dev/null 2>&1 || true
-    pkill -f "alex daemon" >/dev/null 2>&1 || true
+    pkill -f "$alexandria_pattern" >/dev/null 2>&1 || true
+    pkill -f "$alex_pattern" >/dev/null 2>&1 || true
     sleep 1
   fi
   if "$INSTALL_DIR/alex" service install >/dev/null 2>&1 </dev/null; then
@@ -146,27 +222,6 @@ replace_daemon() {
   fi
 }
 
-# The app bundle cannot be replaced underneath a running process, and a stale
-# app keeps reporting the old version in the menu bar.
-quit_app() {
-  for app in AlexandriaBar Alex; do
-    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 </dev/null || true
-  done
-  for process in AlexandriaBar Alex; do
-    if pgrep -x "$process" >/dev/null 2>&1; then
-      say "Quitting the running ${process}..."
-    waited=0
-      while pgrep -x "$process" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
-      sleep 0.5
-      waited=$((waited + 1))
-    done
-      if pgrep -x "$process" >/dev/null 2>&1; then
-        pkill -x "$process" >/dev/null 2>&1 || true
-      fi
-    fi
-  done
-}
-
 install_app() {
   dmg_url="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/tags/$1" </dev/null \
     | awk -F'"' '/browser_download_url/ && /\.dmg/ { print $4; exit }')"
@@ -178,27 +233,8 @@ install_app() {
   say "Downloading the signed menu-bar app..."
   curl -fsSL "$dmg_url" -o "$2/Alex-beta.dmg" </dev/null
 
-  quit_app
-
-  mount_point="$(mktemp -d "${TMPDIR:-/tmp}/alex-beta-dmg.XXXXXX")"
-  hdiutil attach "$2/Alex-beta.dmg" -nobrowse -quiet -mountpoint "$mount_point" </dev/null
-
-  if [ ! -d "$mount_point/$APP_NAME" ]; then
-    hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
-    say "$APP_NAME was not found inside the DMG; the app was not installed." >&2
-    exit 1
-  fi
-  if [ ! -w "$APP_DIR" ]; then
-    hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
-    say "$APP_DIR is not writable. Re-run as a user who can write to it." >&2
-    exit 1
-  fi
-
-  rm -rf "${APP_DIR:?}/$APP_NAME"
-  ditto "$mount_point/$APP_NAME" "$APP_DIR/$APP_NAME"
-  rm -rf "${APP_DIR:?}/$LEGACY_APP_NAME"
-  hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
-  rmdir "$mount_point" 2>/dev/null || true
+  quit_alex_apps 20
+  install_app_from_dmg "$2/Alex-beta.dmg" "$APP_NAME" "$APP_DIR" "$LEGACY_APP_NAME"
 
   say "Installed $APP_NAME to $APP_DIR."
 
@@ -226,7 +262,7 @@ main() {
   base="https://github.com/$REPO/releases/download/$tag"
 
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alex-beta.XXXXXX")"
-  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  trap 'install_common_cleanup_mount; rm -rf "$tmp"' EXIT HUP INT TERM
 
   install_cli "$version" "$platform" "$asset" "$base" "$tmp"
 

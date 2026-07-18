@@ -15,8 +15,8 @@ RESULTS="$TMP/results"
 mkdir -p "$RESULTS"
 DAEMON_PID=""
 
-cfg_str() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG_FILE" | head -1; }
-cfg_num() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFIG_FILE" | head -1; }
+cfg_str() { [ ! -f "$CONFIG_FILE" ] || sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG_FILE" | head -1; }
+cfg_num() { [ ! -f "$CONFIG_FILE" ] || sed -n "s/^$1[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFIG_FILE" | head -1; }
 HOST="${HOST:-$(cfg_str host)}"; HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-$(cfg_num port)}"; PORT="${PORT:-4100}"
 KEY="$(cfg_str local_key)"; BASE="http://$HOST:$PORT"

@@ -18,6 +18,7 @@ EOF
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+. "$ROOT/scripts/lib/install-common.sh"
 
 if [ "$(uname)" != "Darwin" ]; then
   echo "install-macos.sh is for macOS — use ./install.sh on this platform" >&2
@@ -41,18 +42,18 @@ if [ "$BAR_ONLY" = "0" ]; then
 fi
 
 if [ "$NO_BAR" = "0" ]; then
-  LEGACY_APP_NAME="AlexandriaBar"
+  VERSION="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+  if [ -z "$VERSION" ]; then
+    echo "Could not derive the app version from Cargo.toml" >&2
+    exit 1
+  fi
   echo "◆ building Alex (menu bar app)…"
-  (cd macos && ./Scripts/package_app.sh)
-  for app in AlexandriaBar Alex; do
-    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
-  done
-  pkill -x AlexandriaBar 2>/dev/null || true
-  pkill -x Alex 2>/dev/null || true
+  (cd macos && VERSION="$VERSION" ./Scripts/package_app.sh)
+  quit_alex_apps
   mkdir -p ~/Applications
   rm -rf ~/Applications/Alex.app
   cp -R macos/dist/Alex.app ~/Applications/
-  rm -rf ~/Applications/"${LEGACY_APP_NAME}.app"
+  remove_legacy_app "$HOME/Applications"
   open ~/Applications/Alex.app
   echo "◆ Alex installed to ~/Applications and launched"
 fi

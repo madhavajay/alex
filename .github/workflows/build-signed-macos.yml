@@ -27,16 +27,12 @@ permissions:
   contents: write
 
 jobs:
-  build-signed-macos:
-    name: Build signed DMG
+  meta:
+    name: Validate release tag
     runs-on: namespace-profile-mac-medium
-    timeout-minutes: 30
-    concurrency:
-      group: gh-pages-deploy
-      cancel-in-progress: false
-    env:
-      BUNDLE_ID: com.madhavajay.alex
-
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,215 +70,57 @@ jobs:
           swift --version
           xcodebuild -version
 
-      - name: Validate signing secrets
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          missing=()
-          for key in \
-            APPLE_ID \
-            APPLE_PASSWORD \
-            APPLE_TEAM_ID \
-            APPLE_SIGNING_IDENTITY \
-            SIGNING_CERTIFICATE_P12_DATA \
-            SIGNING_CERTIFICATE_PASSWORD
-          do
-            if [[ -z "${!key:-}" ]]; then
-              missing+=("$key")
-            fi
-          done
+  dmg_appcast:
+    needs: meta
+    permissions:
+      contents: write
+    uses: ./.github/workflows/dmg-appcast.yml
+    with:
+      channel: stable
+      tag: ${{ needs.meta.outputs.tag }}
+      overwrite: ${{ inputs.overwrite }}
+      notarize: ${{ inputs.notarize }}
+      publish_release: ${{ inputs.publish_release }}
+      hard_fail_missing_secrets: true
+      require_existing_manifest: false
+    secrets: inherit
 
-          if [[ "${#missing[@]}" -gt 0 ]]; then
-            printf 'Missing required GitHub secret(s): %s\n' "${missing[*]}" >&2
-            exit 1
-          fi
-
-      - name: Build signed DMG
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
-          SPARKLE_FEED_URL: https://madhavajay.github.io/alex/appcast.xml
-          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
-        run: |
-          chmod +x build-signed.sh check-gatekeeper.sh install-dmg.sh macos/Scripts/package_app.sh
-          if [[ "${{ inputs.notarize }}" == "true" ]]; then
-            ./build-signed.sh --clean --notarize
-          else
-            ./build-signed.sh --clean --skip-notarize
-          fi
-
-      - name: Check Gatekeeper
-        if: ${{ inputs.notarize }}
-        run: ./check-gatekeeper.sh macos/dist/*.dmg
-
-      - name: Prepare release metadata
-        id: release
-        if: ${{ inputs.notarize && inputs.publish_release }}
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.version }}"
-          tag="${{ steps.meta.outputs.tag }}"
-          dmg="$(ls -t macos/dist/*.dmg | head -1)"
-
-          if [[ -z "$version" || -z "$dmg" ]]; then
-            echo "Unable to resolve release version or DMG path." >&2
-            exit 1
-          fi
-
-          {
-            echo "version=$version"
-            echo "tag=$tag"
-            echo "dmg=$dmg"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Publish DMG to GitHub Release
-        if: ${{ inputs.notarize && inputs.publish_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-          DMG_PATH: ${{ steps.release.outputs.dmg }}
-        run: |
-          set -euo pipefail
-          upload_args=()
-          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
-            upload_args+=(--clobber)
-          fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
-          else
-            if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
-              --target "$(git rev-parse HEAD)" \
-              --title "Alexandria ${RELEASE_TAG}" \
-              --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
-              gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
-            fi
-          fi
-
-      - name: Check Sparkle signing key
-        id: sparkle_key
-        if: ${{ inputs.notarize && inputs.publish_release }}
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
-            # A published DMG must update the signed appcast so app users see it.
-            echo "SPARKLE_ED_PRIVATE_KEY is required when publishing a release." >&2
-            exit 1
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Generate Sparkle appcast
-        if: ${{ inputs.notarize && inputs.publish_release && steps.sparkle_key.outputs.present == 'true' }}
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          DMG_PATH: ${{ steps.release.outputs.dmg }}
-        run: |
-          set -euo pipefail
-          rm -rf sparkle updates appcast.xml
-          mkdir -p sparkle updates
-          curl -fsSL \
-            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
-            -o sparkle.tar.xz
-          tar -xJf sparkle.tar.xz -C sparkle
-          generate_appcast="$(find sparkle -path '*/bin/generate_appcast' -type f | head -1)"
-          if [[ -z "$generate_appcast" ]]; then
-            echo "Unable to locate generate_appcast in Sparkle 2.9.4 archive." >&2
-            exit 1
-          fi
-          chmod +x "$generate_appcast"
-          cp "$DMG_PATH" updates/
-          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
-            --ed-key-file - \
-            --download-url-prefix "https://github.com/madhavajay/alex/releases/download/${RELEASE_TAG}/" \
-            -o appcast.xml \
-            updates/
-
-      - name: Publish appcast to GitHub Pages
-        if: ${{ inputs.notarize && inputs.publish_release && steps.sparkle_key.outputs.present == 'true' }}
-        run: |
-          set -euo pipefail
-          mkdir -p site
-          cp appcast.xml site/appcast.xml
-
-      - name: Deploy GitHub Pages
-        if: ${{ inputs.notarize && inputs.publish_release && steps.sparkle_key.outputs.present == 'true' }}
-        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+  tap-cask:
+    name: Publish Homebrew cask
+    needs: [meta, dmg_appcast]
+    if: ${{ !cancelled() && needs.dmg_appcast.result == 'success' && inputs.notarize && inputs.publish_release }}
+    runs-on: namespace-profile-mac-medium
+    steps:
+      - uses: actions/checkout@v4
         with:
-          github_token: ${{ github.token }}
-          publish_branch: gh-pages
-          publish_dir: ./site
-          keep_files: true
+          ref: ${{ needs.meta.outputs.tag }}
 
-      - name: Update release manifest
-        if: ${{ inputs.notarize && inputs.publish_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          DMG_PATH: ${{ steps.release.outputs.dmg }}
-        run: |
-          set -euo pipefail
-          rm -rf dist/app-manifest-assets
-          mkdir -p dist/app-manifest-assets
-          if ! gh release download "$RELEASE_TAG" \
-            --pattern manifest.json \
-            --dir dist/app-manifest-assets \
-            --clobber; then
-            echo "No existing manifest.json found on ${RELEASE_TAG}; creating app-only manifest."
-          fi
-          cp "$DMG_PATH" dist/app-manifest-assets/
-
-          merge_args=()
-          if [[ -f dist/app-manifest-assets/manifest.json ]]; then
-            merge_args=(--merge-existing dist/app-manifest-assets/manifest.json)
-          fi
-          python3 scripts/gen-manifest.py \
-            --tag "$RELEASE_TAG" \
-            --repo "${{ github.repository }}" \
-            --assets-dir dist/app-manifest-assets \
-            "${merge_args[@]}" \
-            --out manifest.json
-          cat manifest.json
-          upload_args=()
-          if [[ "${{ inputs.overwrite }}" == "true" ]]; then
-            upload_args+=(--clobber)
-          fi
-          gh release upload "$RELEASE_TAG" manifest.json "${upload_args[@]}"
+      - name: Download DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.dmg_appcast.outputs.artifact_name }}
+          path: macos/dist
 
       - name: Check tap deploy key
         id: tap_key
-        if: ${{ inputs.notarize && inputs.publish_release }}
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
+          set -euo pipefail
           if [[ -z "${TAP_DEPLOY_KEY:-}" ]]; then
             # A published DMG must update the tap instead of silently omitting its cask.
             echo "TAP_DEPLOY_KEY is required when publishing a release." >&2
             exit 1
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Render cask
-        if: ${{ inputs.notarize && inputs.publish_release && steps.tap_key.outputs.present == 'true' }}
-        env:
-          DMG_PATH: ${{ steps.release.outputs.dmg }}
+        if: steps.tap_key.outputs.present == 'true'
         run: |
           set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          sha_dmg="$(shasum -a 256 "$DMG_PATH" | awk '{ print $1 }')"
+          version="${{ needs.meta.outputs.version }}"
+          dmg="$(ls -t macos/dist/*.dmg | head -1)"
+          sha_dmg="$(shasum -a 256 "$dmg" | awk '{ print $1 }')"
           mkdir -p dist/homebrew
           sed \
             -e "s/{{VERSION}}/${version}/g" \
@@ -290,12 +128,12 @@ jobs:
             packaging/homebrew/alexandria.rb.tmpl > dist/homebrew/alexandria.rb
 
       - name: Push cask to Homebrew tap
-        if: ${{ inputs.notarize && inputs.publish_release && steps.tap_key.outputs.present == 'true' }}
+        if: steps.tap_key.outputs.present == 'true'
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
+          version="${{ needs.meta.outputs.version }}"
           key_file="$RUNNER_TEMP/homebrew-alex-deploy-key"
           printf '%s\n' "$TAP_DEPLOY_KEY" > "$key_file"
           chmod 600 "$key_file"
@@ -317,9 +155,3 @@ jobs:
             git commit -m "alexandria ${version}"
             git push origin HEAD:main
           fi
-
-      - name: Upload DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: alexandria-macos-dmg
-          path: macos/dist/*.dmg

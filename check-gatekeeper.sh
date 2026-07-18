@@ -4,6 +4,12 @@ set -euo pipefail
 err() { echo "ERROR: $*" >&2; }
 info() { echo "INFO: $*"; }
 
+CALLER_PWD="$PWD"
+APP_INPUT="${1:-}"
+if [[ -n "$APP_INPUT" && "$APP_INPUT" != /* ]]; then
+  APP_INPUT="$CALLER_PWD/$APP_INPUT"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
@@ -12,20 +18,21 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-APP_INPUT="${1:-}"
-if [[ -n "$APP_INPUT" ]]; then
-  APP_INPUT="$(cd "$(dirname "$APP_INPUT")" && pwd)/$(basename "$APP_INPUT")"
-fi
-
 MOUNT_POINT=""
 APP_PATH=""
 DMG_INPUT=""
+Q_HITS=""
+P_HITS=""
+STATUS=""
 
 cleanup() {
   if [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT" ]]; then
     hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
     rmdir "$MOUNT_POINT" >/dev/null 2>&1 || true
   fi
+  [[ -z "$Q_HITS" ]] || rm -f "$Q_HITS"
+  [[ -z "$P_HITS" ]] || rm -f "$P_HITS"
+  [[ -z "$STATUS" ]] || rm -f "$STATUS"
 }
 trap cleanup EXIT
 
