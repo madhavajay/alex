@@ -246,7 +246,7 @@ private struct HarnessRowView: View {
         .frame(width: 160, alignment: .leading)
     }
 
-    // MARK: Col 2 — Config (always) + hover-revealed Delete (App.tsx:523-538)
+    // MARK: Col 2 — Install/Update + hover-revealed Delete (App.tsx:523-538)
 
     @ViewBuilder
     private var actionsColumn: some View {
@@ -265,7 +265,9 @@ private struct HarnessRowView: View {
                     .allowsHitTesting(hovered)
                 }
                 if harness.supportsConnect {
-                    PillButton(title: "Config", variant: .standard) {
+                    PillButton(
+                        title: harness.connected ? "Update" : "Install", variant: .standard
+                    ) {
                         beginAction(harness.connected ? .refresh : .connect)
                     }
                 }
