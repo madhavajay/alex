@@ -390,6 +390,23 @@ cargo install alex                              # CLI from crates.io
 ./install.sh --service                          # build this checkout and install its service
 ```
 
+## Documentation
+
+In-depth reference docs live in [`docs/`](docs/) (see the [docs index](docs/README.md)):
+
+| Doc | What it covers |
+| --- | --- |
+| [Overview](docs/overview.md) | Crate responsibilities, request/data flow, auth scopes, and the local state model |
+| [CLI reference](docs/cli.md) | The complete `alex` command tree, flags, defaults, and examples |
+| [Providers and routing](docs/providers-and-routing.md) | Vault accounts, selection policies, reserves, model routing, and failover |
+| [API and formats](docs/api-and-formats.md) | Model ingress, the four API dialects, Anthropic-pivot translation, SSE, usage, and cost |
+| [Configuration](docs/configuration.md) | Full `config.toml` key/default reference and on-disk layout |
+| [Dario](docs/dario.md) | The Dario broker: routing modes, the three-block prompt rewrite, headers, and fallback |
+| [Traces](docs/traces.md) | Trace rows and bodies, redaction, transcripts, the browser API, scoped keys, and export |
+| [Harness integration](docs/harnesses.md) | Provider headers, lifecycle hooks, and session/sub-agent identity |
+| [Amp wrap](docs/amp-wrap.md) | `alex wrap amp` reverse HTTP/WebSocket capture for closed harnesses |
+| [Signed macOS build](docs/build-signed.md) | `build-signed.sh`, Developer ID signing, and notarization |
+
 ## Workspace
 
 | Crate | Purpose |
