@@ -111,6 +111,34 @@ pub trait ExoConfigPersister: Send + Sync {
     fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String>;
 }
 
+/// The curated OpenRouter models Alexandria advertises. OpenRouter's full
+/// catalog is hundreds of models; publishing all of them makes every connected
+/// harness's picker unusable, so exposure is user-curated. Absent config means a
+/// fresh install and defaults to a short list of examples (see
+/// `default_openrouter_exposed_models`); an explicit empty list exposes nothing.
+pub const DEFAULT_OPENROUTER_EXPOSED_MODELS: &[&str] = &[
+    // Bare OpenRouter ids (no `openrouter/` prefix). Verified present in the
+    // live OpenRouter catalog on 2026-07-18. Kept intentionally tiny so users
+    // see the pattern and curate their own list from the picker.
+    "anthropic/claude-sonnet-5",
+    "google/gemini-3.5-flash",
+    "z-ai/glm-5.2",
+];
+
+/// The shipped example exposure list, owned here so the daemon config default
+/// and the proxy stay in lockstep.
+pub fn default_openrouter_exposed_models() -> Vec<String> {
+    DEFAULT_OPENROUTER_EXPOSED_MODELS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
+/// Persists a curated OpenRouter exposure update owned by the daemon config.
+pub trait OpenrouterExposedPersister: Send + Sync {
+    fn persist(&self, exposed: &[String]) -> std::result::Result<(), String>;
+}
+
 /// Persists notification settings owned by the daemon configuration. Keeping
 /// this boundary in the binary lets the proxy hot-apply channels without
 /// knowing where config.toml lives.
@@ -386,7 +414,13 @@ pub struct AppState {
     /// Backoff guard for on-demand Kimi `/usages` probes triggered from the
     /// limits snapshot (the recorded routing-limits act as the value cache).
     pub kimi_usage: std::sync::Mutex<UsageCache>,
+    /// Full OpenRouter catalog fetched from `/models`. Kept whole for the admin
+    /// picker; only the curated `openrouter_exposed` subset is ever published.
     openrouter_models: std::sync::Mutex<Vec<String>>,
+    /// User-curated bare OpenRouter ids to advertise (see
+    /// `openrouter_exposed_catalog`). Seeded from config at daemon startup.
+    openrouter_exposed: std::sync::RwLock<Vec<String>>,
+    openrouter_exposed_persister: std::sync::RwLock<Option<Arc<dyn OpenrouterExposedPersister>>>,
     exo: std::sync::RwLock<ExoConfig>,
     exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
     pub logins: alex_auth::sessions::LoginManager,
@@ -698,6 +732,8 @@ pub fn build_state_with_substitution(
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
         kimi_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
+        openrouter_exposed: std::sync::RwLock::new(default_openrouter_exposed_models()),
+        openrouter_exposed_persister: std::sync::RwLock::new(None),
         exo: std::sync::RwLock::new(ExoConfig::default()),
         exo_persister: std::sync::RwLock::new(None),
         logins: alex_auth::sessions::LoginManager::default(),
@@ -753,6 +789,120 @@ pub fn set_exo_config_persister(state: &Arc<AppState>, persister: Arc<dyn ExoCon
     if let Ok(mut slot) = state.exo_persister.write() {
         *slot = Some(persister);
     }
+}
+
+/// Replaces the curated OpenRouter exposure list. The list is normalized
+/// (trimmed, de-duplicated, order-preserving) so callers may pass raw config.
+pub fn set_openrouter_exposed_models(state: &Arc<AppState>, exposed: Vec<String>) {
+    if let Ok(mut slot) = state.openrouter_exposed.write() {
+        *slot = normalize_openrouter_exposed(exposed);
+    }
+}
+
+/// Installs the daemon-owned config persistence hook for OpenRouter exposure.
+pub fn set_openrouter_exposed_persister(
+    state: &Arc<AppState>,
+    persister: Arc<dyn OpenrouterExposedPersister>,
+) {
+    if let Ok(mut slot) = state.openrouter_exposed_persister.write() {
+        *slot = Some(persister);
+    }
+}
+
+/// Overwrites the cached full OpenRouter catalog (bare ids). Used by the live
+/// refresh and by tests that need to seed a catalog without a network call.
+pub fn set_openrouter_catalog(state: &AppState, catalog: Vec<String>) {
+    if let Ok(mut cached) = state.openrouter_models.lock() {
+        *cached = catalog;
+    }
+}
+
+/// The full OpenRouter catalog (bare ids) for the admin picker, sorted
+/// case-insensitively. Never published to harnesses.
+pub fn openrouter_available_catalog(state: &AppState) -> Vec<String> {
+    let mut ids = state
+        .openrouter_models
+        .lock()
+        .map(|cached| cached.clone())
+        .unwrap_or_default();
+    sort_model_ids(&mut ids);
+    ids
+}
+
+/// The curated exposure list as configured (bare ids), independent of whether
+/// the catalog has been fetched yet, sorted case-insensitively.
+pub fn openrouter_exposed_list(state: &AppState) -> Vec<String> {
+    let mut ids = state
+        .openrouter_exposed
+        .read()
+        .map(|exposed| exposed.clone())
+        .unwrap_or_default();
+    sort_model_ids(&mut ids);
+    ids
+}
+
+/// The models actually published to `/v1/models` and injected into harnesses:
+/// the curated exposure list intersected with the live catalog, prefixed
+/// `openrouter/<id>`, sorted case-insensitively. Intersecting with the catalog
+/// means a removed or renamed model silently drops instead of advertising a
+/// dead id.
+pub fn openrouter_exposed_catalog(state: &AppState) -> Vec<String> {
+    let available: HashSet<String> = state
+        .openrouter_models
+        .lock()
+        .map(|cached| cached.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut ids: Vec<String> = state
+        .openrouter_exposed
+        .read()
+        .map(|exposed| {
+            exposed
+                .iter()
+                .filter(|id| available.contains(*id))
+                .map(|id| format!("openrouter/{id}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    sort_model_ids(&mut ids);
+    ids
+}
+
+/// Normalize a raw curated exposure list: trim, drop empties/oversized/invalid
+/// ids, and de-duplicate while preserving first-seen order.
+pub fn normalize_openrouter_exposed(exposed: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    exposed
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| is_valid_openrouter_id(id) && seen.insert(id.clone()))
+        .take(500)
+        .collect()
+}
+
+/// A publishable bare OpenRouter id: non-empty, bounded, and free of path
+/// traversal or whitespace so it is safe to prefix and advertise.
+fn is_valid_openrouter_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 200 {
+        return false;
+    }
+    id.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+'))
+    })
+}
+
+/// Case-insensitive, deterministic sort used everywhere model ids are
+/// advertised or injected, so every picker reads alphabetically.
+pub fn sort_model_ids(ids: &mut [String]) {
+    ids.sort_by(|a, b| {
+        a.to_ascii_lowercase()
+            .cmp(&b.to_ascii_lowercase())
+            .then_with(|| a.cmp(b))
+    });
 }
 
 /// Model identifiers exposed by enabled Exo models, including the explicit
@@ -1170,6 +1320,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/exo", get(admin_exo).put(admin_exo_update))
         .route("/admin/exo/status", get(admin_exo_status))
         .route("/admin/exo/models", get(admin_exo_models))
+        .route(
+            "/admin/openrouter/catalog",
+            get(admin_openrouter_catalog),
+        )
+        .route(
+            "/admin/openrouter/exposed",
+            get(admin_openrouter_exposed).post(admin_openrouter_exposed_update),
+        )
         .route(
             "/admin/notifications",
             get(admin_notifications).post(admin_notifications_save),
@@ -2195,7 +2353,9 @@ async fn connect_info(
     axum::Json(payload).into_response()
 }
 
-async fn refresh_openrouter_models(state: &AppState) {
+/// Refresh the cached full OpenRouter catalog. Kept whole for the admin picker;
+/// only the curated `openrouter_exposed_catalog` subset is ever advertised.
+pub async fn refresh_openrouter_models(state: &AppState) {
     let Ok(account) = state.vault.account_for(Provider::Openrouter, false).await else {
         return;
     };
@@ -2219,9 +2379,7 @@ async fn refresh_openrouter_models(state: &AppState) {
         return;
     };
     let models = alex_core::parse_openrouter_models_response(&payload);
-    if let Ok(mut cached) = state.openrouter_models.lock() {
-        *cached = models;
-    }
+    set_openrouter_catalog(state, models);
 }
 
 fn normalize_exo_config(mut config: ExoConfig) -> Result<ExoConfig, String> {
@@ -2425,19 +2583,71 @@ async fn admin_exo_models(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// The full OpenRouter catalog for the settings picker. Not published to
+/// harnesses; the daemon fetches the whole list only so the UI can offer it.
+async fn admin_openrouter_catalog(State(state): State<Arc<AppState>>) -> Response {
+    refresh_openrouter_models(&state).await;
+    axum::Json(json!({"models": openrouter_available_catalog(&state)})).into_response()
+}
+
+/// Read the curated OpenRouter exposure list plus the live catalog it is drawn
+/// from, so the picker can render both lists in one round trip.
+async fn admin_openrouter_exposed(State(state): State<Arc<AppState>>) -> Response {
+    refresh_openrouter_models(&state).await;
+    axum::Json(json!({
+        "exposed": openrouter_exposed_list(&state),
+        "available": openrouter_available_catalog(&state),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenrouterExposedUpdate {
+    #[serde(default, alias = "models")]
+    exposed: Vec<String>,
+}
+
+/// Persist a new curated OpenRouter exposure list. Only these models are
+/// advertised in `/v1/models` and injected into connected harnesses.
+async fn admin_openrouter_exposed_update(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<OpenrouterExposedUpdate>,
+) -> Response {
+    let exposed = normalize_openrouter_exposed(body.exposed);
+    let persister = state
+        .openrouter_exposed_persister
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(persister) = persister else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OpenRouter exposure persistence is unavailable",
+        );
+    };
+    if let Err(error) = persister.persist(&exposed) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
+    set_openrouter_exposed_models(&state, exposed);
+    axum::Json(json!({"exposed": openrouter_exposed_list(&state)})).into_response()
+}
+
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // OpenRouter is the sole dynamic provider catalog. Refresh only on an
     // explicit model-list request; Alexandria has no catalog refresh worker.
     refresh_openrouter_models(&state).await;
     let mut ids = state.store.pricing_models();
-    if let Ok(models) = state.openrouter_models.lock() {
-        ids.extend(models.iter().map(|id| format!("openrouter/{id}")));
-    }
+    // OpenRouter exposes only the user-curated subset, never its full catalog.
+    ids.extend(openrouter_exposed_catalog(&state));
     ids.extend(exo_catalog_models(&state));
     ids.extend(kimi_catalog_models(&state).await);
     for (alias, _) in alex_core::model_aliases() {
         ids.push((*alias).to_string());
     }
+    // Advertise every provider's models alphabetically (case-insensitive) so the
+    // picker is scrollable. Sort before deriving the `alexandria/*` duplicates
+    // and de-duplicating so both blocks share one order.
+    sort_model_ids(&mut ids);
     let claude_gateway = headers
         .get_all("x-alexandria-harness")
         .iter()
@@ -10095,6 +10305,18 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RecordingOpenrouterExposedPersister {
+        lists: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl OpenrouterExposedPersister for RecordingOpenrouterExposedPersister {
+        fn persist(&self, exposed: &[String]) -> std::result::Result<(), String> {
+            self.lists.lock().unwrap().push(exposed.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingNotificationPersister {
         settings: std::sync::Mutex<Vec<notify::NotificationSettings>>,
     }
@@ -10135,6 +10357,214 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fetched, saved);
         assert_eq!(persister.configs.lock().unwrap().len(), 1);
+    }
+
+    async fn model_ids(response: Response) -> Vec<String> {
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(String::from))
+            .collect()
+    }
+
+    fn is_case_insensitively_sorted(ids: &[String]) -> bool {
+        ids.windows(2)
+            .all(|pair| pair[0].to_ascii_lowercase() <= pair[1].to_ascii_lowercase())
+    }
+
+    #[test]
+    fn sort_model_ids_is_case_insensitive_and_deterministic() {
+        let mut ids = vec![
+            "openrouter/Zed".to_string(),
+            "alex/apple".to_string(),
+            "openrouter/z-ai/glm-5.2".to_string(),
+            "Banana".to_string(),
+            "banana".to_string(),
+        ];
+        sort_model_ids(&mut ids);
+        assert_eq!(
+            ids,
+            vec![
+                "alex/apple",
+                "Banana",
+                "banana",
+                "openrouter/z-ai/glm-5.2",
+                "openrouter/Zed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_publishes_only_curated_exposed_models() {
+        let state = test_state("openrouter-exposed-filter");
+        // Full catalog the daemon fetched (kept whole for the picker).
+        set_openrouter_catalog(
+            &state,
+            vec![
+                "z-ai/glm-5.2".into(),
+                "openai/gpt-4o".into(),
+                "meta-llama/llama-4:free".into(),
+            ],
+        );
+        // Curate a subset, plus one id that is not (or no longer) in the
+        // catalog — it must silently drop via the exposed ∩ catalog intersect.
+        set_openrouter_exposed_models(
+            &state,
+            vec!["z-ai/glm-5.2".into(), "removed/model".into()],
+        );
+
+        let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
+        assert!(
+            ids.contains(&"openrouter/z-ai/glm-5.2".to_string()),
+            "curated model missing: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "openrouter/openai/gpt-4o"),
+            "an un-curated catalog model leaked into /v1/models: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "openrouter/meta-llama/llama-4:free"),
+            "an un-curated catalog model leaked into /v1/models: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "openrouter/removed/model"),
+            "an exposed id absent from the catalog was still advertised: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_defaults_expose_curated_examples_when_unset() {
+        let state = test_state("openrouter-exposed-defaults");
+        // A fresh state seeds the shipped example list; it must include
+        // z-ai/glm-5.2 and stay tiny (<= 3).
+        let defaults = openrouter_exposed_list(&state);
+        assert!(defaults.iter().any(|id| id == "z-ai/glm-5.2"));
+        assert!(defaults.len() <= 3, "default exposure list is not tiny: {defaults:?}");
+
+        // With those ids present in the catalog (plus an extra) only the curated
+        // examples are published.
+        let mut catalog = default_openrouter_exposed_models();
+        catalog.push("some/other-model".into());
+        set_openrouter_catalog(&state, catalog);
+
+        let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
+        for example in default_openrouter_exposed_models() {
+            assert!(
+                ids.contains(&format!("openrouter/{example}")),
+                "default example {example} was not published: {ids:?}"
+            );
+        }
+        assert!(
+            !ids.iter().any(|id| id == "openrouter/some/other-model"),
+            "a non-example catalog model was published: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_advertised_list_is_alphabetical() {
+        let state = test_state("models-alphabetical");
+        set_openrouter_catalog(
+            &state,
+            vec!["z-ai/glm-5.2".into(), "anthropic/claude-sonnet-5".into()],
+        );
+        set_openrouter_exposed_models(
+            &state,
+            vec!["z-ai/glm-5.2".into(), "anthropic/claude-sonnet-5".into()],
+        );
+        // The Claude gateway path advertises one flat block (no alexandria/*
+        // duplicates), so the whole list must be alphabetical end to end.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        let ids = model_ids(models(State(state), headers).await.into_response()).await;
+        assert!(!ids.is_empty());
+        assert!(
+            is_case_insensitively_sorted(&ids),
+            "advertised model list is not alphabetical: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_admin_catalog_and_exposed_round_trip() {
+        let state = test_state("openrouter-admin-round-trip");
+        set_openrouter_catalog(
+            &state,
+            vec![
+                "z-ai/glm-5.2".into(),
+                "anthropic/claude-sonnet-5".into(),
+                "google/gemini-3.5-flash".into(),
+            ],
+        );
+        let persister = Arc::new(RecordingOpenrouterExposedPersister::default());
+        set_openrouter_exposed_persister(&state, persister.clone());
+
+        // Catalog endpoint returns the full list, alphabetically.
+        let (status, catalog) =
+            response_json(admin_openrouter_catalog(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let catalog_ids: Vec<String> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            catalog_ids,
+            vec![
+                "anthropic/claude-sonnet-5",
+                "google/gemini-3.5-flash",
+                "z-ai/glm-5.2",
+            ]
+        );
+
+        // POST a curated subset, including an invalid id that must be dropped.
+        let (status, saved) = response_json(
+            admin_openrouter_exposed_update(
+                State(state.clone()),
+                axum::Json(OpenrouterExposedUpdate {
+                    exposed: vec![
+                        "z-ai/glm-5.2".into(),
+                        "anthropic/claude-sonnet-5".into(),
+                        "bad model/../id".into(),
+                    ],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            saved["exposed"],
+            json!(["anthropic/claude-sonnet-5", "z-ai/glm-5.2"])
+        );
+        assert_eq!(persister.lists.lock().unwrap().len(), 1);
+
+        // GET reflects the persisted, sorted list.
+        let (status, fetched) =
+            response_json(admin_openrouter_exposed(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fetched["exposed"],
+            json!(["anthropic/claude-sonnet-5", "z-ai/glm-5.2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_exposed_update_without_persister_is_unavailable() {
+        let state = test_state("openrouter-exposed-no-persister");
+        let (status, _) = response_json(
+            admin_openrouter_exposed_update(
+                State(state),
+                axum::Json(OpenrouterExposedUpdate {
+                    exposed: vec!["z-ai/glm-5.2".into()],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

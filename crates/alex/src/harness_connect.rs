@@ -5460,6 +5460,7 @@ mod tests {
             ping_openrouter_model: crate::default_ping_openrouter(),
             exo_url: crate::default_exo_url(),
             exo_enabled_models: Vec::new(),
+            openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
             dario_mode_migrated: true,

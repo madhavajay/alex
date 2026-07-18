@@ -15,6 +15,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case credentials = "Credentials"
     case dario = "Dario"
     case exo = "Exo"
+    case openrouter = "OpenRouter"
     case protection = "Failover"
     case notifications = "Notifications"
 
@@ -26,6 +27,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
         case .credentials: "key"
         case .dario: "server.rack"
         case .exo: "cpu"
+        case .openrouter: "arrow.triangle.branch"
         case .protection: "shield"
         case .notifications: "paperplane"
         }
@@ -127,6 +129,8 @@ struct PreferencesView: View {
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .exo:
                     ExoPreferencesSection(store: store)
+                case .openrouter:
+                    OpenRouterPreferencesSection(store: store)
                 case .protection:
                     ProtectionPreferencesSection(store: store)
                 case .notifications:
