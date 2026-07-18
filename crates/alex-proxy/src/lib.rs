@@ -383,6 +383,9 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
+    /// Backoff guard for on-demand Kimi `/usages` probes triggered from the
+    /// limits snapshot (the recorded routing-limits act as the value cache).
+    pub kimi_usage: std::sync::Mutex<UsageCache>,
     openrouter_models: std::sync::Mutex<Vec<String>>,
     exo: std::sync::RwLock<ExoConfig>,
     exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
@@ -693,6 +696,7 @@ pub fn build_state_with_substitution(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
+        kimi_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
         exo: std::sync::RwLock::new(ExoConfig::default()),
         exo_persister: std::sync::RwLock::new(None),
@@ -806,8 +810,35 @@ fn kimi_usage_num(raw: &Value, key: &str) -> Option<i64> {
     })
 }
 
+/// Best-effort conversion of a Kimi reset timestamp (ISO-8601 string or an
+/// epoch number in seconds or milliseconds) into epoch seconds. The menu
+/// countdown can read the ISO `resets_at` directly, but routing's reset
+/// selection and reserve gating key on the numeric `resets_at_s`.
+fn kimi_reset_epoch_s(raw: &Value) -> Option<i64> {
+    let scale = |n: i64| if n > 1_000_000_000_000 { n / 1000 } else { n };
+    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
+        let Some(value) = raw.get(key) else { continue };
+        if let Some(n) = value.as_i64().or_else(|| value.as_f64().map(|f| f as i64)) {
+            return Some(scale(n));
+        }
+        if let Some(s) = value.as_str() {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return Some(dt.timestamp());
+            }
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(scale(n));
+            }
+        }
+    }
+    None
+}
+
 /// Convert one Kimi usage row (`{limit, used, remaining, name|title, reset_at}`)
 /// into an Alexandria rate-window entry. Mirrors the kimi CLI's `toUsageRow`.
+///
+/// The window's display name is emitted under the shared `window` key (not
+/// `label`) so the menu's `LimitWindow` decodes it and draws a progress bar,
+/// exactly like every other provider's windows.
 fn kimi_usage_row(raw: &Value, default_label: &str) -> Option<Value> {
     let limit = kimi_usage_num(raw, "limit");
     let mut used = kimi_usage_num(raw, "used");
@@ -834,12 +865,13 @@ fn kimi_usage_row(raw: &Value, default_label: &str) -> Option<Value> {
         .find_map(|k| raw.get(*k).and_then(Value::as_str))
         .map(String::from);
     Some(json!({
-        "label": label,
+        "window": label,
         "used": used,
         "limit": limit,
         "remaining": kimi_usage_num(raw, "remaining"),
         "used_pct": used_pct,
         "resets_at": resets_at,
+        "resets_at_s": kimi_reset_epoch_s(raw),
     }))
 }
 
@@ -919,7 +951,7 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
                 .as_array()
                 .and_then(|w| w.first())
                 .map(|row| {
-                    let label = row["label"].as_str().unwrap_or("limit");
+                    let label = row["window"].as_str().unwrap_or("limit");
                     match (row["used"].as_i64(), row["limit"].as_i64()) {
                         (Some(u), Some(l)) => format!("{label}: {u}/{l}"),
                         _ => format!("{label} ok"),
@@ -2854,6 +2886,60 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     }
 }
 
+/// Kimi usage for the Providers snapshot. The 15-minute heartbeat records the
+/// `/usages` windows onto the account; this surfaces them as a provider card
+/// and — when the recorded snapshot is missing (a freshly-added account) or has
+/// gone stale — refreshes it on demand so credit bars appear without waiting
+/// for the next heartbeat. A failure backoff keeps a broken usage endpoint from
+/// being hammered on every limits fetch.
+async fn kimi_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    fn recorded(account: &Account) -> Option<Value> {
+        account
+            .account_meta
+            .get("routing_limits")
+            .filter(|v| v.get("provider").and_then(Value::as_str) == Some("kimi"))
+            .cloned()
+    }
+
+    let account = state.vault.account_for(Provider::Kimi, true).await.ok()?;
+    let current = recorded(&account);
+    let observed_at = current
+        .as_ref()
+        .and_then(|v| v["observed_at_ms"].as_i64())
+        .unwrap_or(0);
+    // Serve a recorded snapshot while it is fresh; only touch the network when
+    // there is nothing to show yet or it has aged past the usage TTL.
+    if current.is_some() && now_ms() < observed_at + USAGE_CACHE_TTL_MS {
+        return current;
+    }
+    {
+        let cache = state.kimi_usage.lock().unwrap();
+        if now_ms() < cache.cooldown_until_ms {
+            return current;
+        }
+    }
+    let (ok, _, _) = kimi_usage_probe(state).await;
+    if ok {
+        // The probe records fresh routing limits; read them back.
+        let updated = state
+            .vault
+            .account_for(Provider::Kimi, true)
+            .await
+            .ok()
+            .and_then(|a| recorded(&a));
+        let mut cache = state.kimi_usage.lock().unwrap();
+        cache.failures = 0;
+        cache.cooldown_until_ms = 0;
+        cache.fetched_at_ms = now_ms();
+        cache.entry = updated.clone().or_else(|| current.clone());
+        return updated.or(current);
+    }
+    let mut cache = state.kimi_usage.lock().unwrap();
+    cache.failures += 1;
+    cache.cooldown_until_ms = now_ms() + usage_backoff_ms(cache.failures, None);
+    current
+}
+
 pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
     let mut providers: Vec<Value> = Vec::new();
     if let Some(entry) = anthropic_usage_entry(state).await {
@@ -2863,6 +2949,9 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
         providers.push(entry);
     }
     if let Some(entry) = amp_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = kimi_usage_entry(state).await {
         providers.push(entry);
     }
     // Captured response headers outlive their credential. Do not turn that
@@ -9760,14 +9849,39 @@ mod tests {
         assert_eq!(snap["provider"], json!("kimi"));
         let windows = snap["windows"].as_array().unwrap();
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0]["label"], json!("Weekly"));
+        // The window name lives under the shared `window` key so the menu's
+        // LimitWindow decodes it and draws a bar (previously `label`, which the
+        // Swift client could not decode — the bug that hid Kimi's usage).
+        assert_eq!(windows[0]["window"], json!("Weekly"));
         assert_eq!(windows[0]["used"], json!(250));
         assert_eq!(windows[0]["limit"], json!(1000));
         assert_eq!(windows[0]["used_pct"], json!(25.0));
+        // The ISO reset is also normalized to epoch seconds for routing/reset
+        // selection. 2026-07-20T00:00:00Z == 1784505600.
+        assert_eq!(windows[0]["resets_at_s"], json!(1_784_505_600));
         // Second window derives used from limit - remaining (40 - 10 = 30).
-        assert_eq!(windows[1]["label"], json!("5h"));
+        assert_eq!(windows[1]["window"], json!("5h"));
         assert_eq!(windows[1]["used"], json!(30));
         assert!(!snap["credits"].is_null());
+    }
+
+    #[test]
+    fn kimi_window_decodes_as_a_menu_limit_window() {
+        // Contract guard mirroring the Swift `LimitWindow`: `window` is a
+        // required string; `used_pct` drives the bar; `resets_at`/`resets_at_s`
+        // drive the reset countdown. If any of these keys regress the menu
+        // silently drops Kimi's credit bars again.
+        let payload = json!({
+            "usage": {"limit": 200, "used": 50, "name": "Weekly", "reset_at": "2026-07-20T00:00:00Z"},
+        });
+        let snap = parse_kimi_usage_payload(&payload);
+        let window = &snap["windows"][0];
+        assert!(window["window"].as_str().is_some(), "window name is a string");
+        assert!(window["used_pct"].as_f64().is_some(), "used_pct drives the bar");
+        assert!(
+            window["resets_at"].as_str().is_some() || window["resets_at_s"].as_i64().is_some(),
+            "a reset timestamp drives the countdown"
+        );
     }
 
     #[test]
@@ -9775,6 +9889,70 @@ mod tests {
         let snap = parse_kimi_usage_payload(&json!({}));
         assert_eq!(snap["windows"].as_array().unwrap().len(), 0);
         assert!(snap["credits"].is_null());
+    }
+
+    fn test_kimi_account() -> Account {
+        Account {
+            id: "kimi-oauth".into(),
+            provider: Provider::Kimi,
+            kind: "oauth".into(),
+            name: "default".into(),
+            description: None,
+            paused: false,
+            label: Some("kimi (test)".into()),
+            access_token: Some("kimi-token".into()),
+            refresh_token: None,
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(now_ms() + 3_600_000),
+            last_refresh_ms: Some(now_ms()),
+            account_meta: Value::Null,
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn kimi_recorded_usage_surfaces_as_a_provider_card() {
+        let state = test_state("kimi-usage-entry");
+        let mut account = test_kimi_account();
+        // Stand in for a heartbeat that has already recorded /usages windows.
+        account.account_meta = json!({
+            "routing_limits": {
+                "provider": "kimi",
+                "source": "kimi /usages",
+                "observed_at_ms": now_ms(),
+                "windows": [{
+                    "window": "Weekly",
+                    "used": 250,
+                    "limit": 1000,
+                    "used_pct": 25.0,
+                    "resets_at": "2026-07-20T00:00:00Z",
+                    "resets_at_s": 1_784_505_600i64,
+                }],
+                "credits": Value::Null,
+            }
+        });
+        state.vault.upsert(account).await.unwrap();
+
+        // A fresh recorded snapshot is served without a network probe.
+        let entry = kimi_usage_entry(&state).await.expect("kimi usage entry");
+        assert_eq!(entry["provider"], "kimi");
+        assert_eq!(entry["windows"][0]["window"], "Weekly");
+        assert_eq!(entry["windows"][0]["used_pct"], 25.0);
+
+        // And it reaches the Providers snapshot the menu renders, annotated with
+        // a quota decision — the path that was entirely missing before.
+        let snapshot = limits_snapshot(&state).await;
+        let kimi = snapshot["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["provider"] == "kimi")
+            .expect("kimi card present in limits snapshot");
+        assert_eq!(kimi["windows"][0]["window"], "Weekly");
+        assert!(kimi.get("quota").is_some(), "snapshot annotates a quota");
     }
 
     async fn collect_test_webhook(

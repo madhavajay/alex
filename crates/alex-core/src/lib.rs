@@ -199,16 +199,16 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
                 },
             })
         }
-        Provider::Xai => serde_json::json!({
-            "requests": {
-                "limit": hi(h, "x-ratelimit-limit-requests"),
-                "remaining": hi(h, "x-ratelimit-remaining-requests"),
-            },
-            "tokens": {
-                "limit": hi(h, "x-ratelimit-limit-tokens"),
-                "remaining": hi(h, "x-ratelimit-remaining-tokens"),
-            },
-        }),
+        // xAI's response carries only per-minute API rate-limit headers
+        // (`x-ratelimit-*`), not subscription usage. Surfacing those as a usage
+        // card is misleading: "120/120 requests" and "5m tokens" reset every
+        // minute and say nothing about SuperGrok consumption, and — having no
+        // `windows` — they render as bare text instead of a progress bar. Real
+        // Grok usage comes from the grok.com billing endpoint (see
+        // `xai_usage_entry`), which produces proper credit windows that draw as
+        // a bar. Emit an empty window set so the header fallback keeps the
+        // provider row (and its health dot) present without inventing numbers.
+        Provider::Xai => serde_json::json!({ "windows": [] }),
         Provider::Gemini
         | Provider::Openrouter
         | Provider::Exo
@@ -665,6 +665,44 @@ mod tests {
             route_model("cove/openai:gpt-5.1"),
             (Some(Provider::Openai), "gpt-5.1".to_string())
         );
+    }
+
+    #[test]
+    fn xai_rate_headers_do_not_masquerade_as_usage() {
+        // api.x.ai returns per-minute rate-limit ceilings. These are not
+        // subscription usage and must not be surfaced as a "120/120 requests /
+        // 5m tokens" pseudo-usage card. Real Grok usage flows through the
+        // grok.com billing path instead.
+        let headers = serde_json::json!({
+            "x-ratelimit-limit-requests": "120",
+            "x-ratelimit-remaining-requests": "120",
+            "x-ratelimit-limit-tokens": "5000000",
+            "x-ratelimit-remaining-tokens": "5000000",
+        });
+        let parsed = parse_limit_headers(Provider::Xai, &headers);
+        assert!(parsed.get("requests").is_none(), "must not emit request counts");
+        assert!(parsed.get("tokens").is_none(), "must not emit token counts");
+        assert_eq!(
+            parsed["windows"].as_array().map(Vec::len),
+            Some(0),
+            "no bogus windows from rate-limit headers"
+        );
+    }
+
+    #[test]
+    fn openai_headers_still_produce_a_windowed_usage_bar() {
+        // Guard the contract the menu relies on: providers with real usage
+        // windows render as bars. Only xai's meaningless rate headers were
+        // dropped above.
+        let headers = serde_json::json!({
+            "x-codex-plan-type": "plus",
+            "x-codex-primary-used-percent": "42",
+            "x-codex-primary-window-minutes": "300",
+        });
+        let parsed = parse_limit_headers(Provider::Openai, &headers);
+        assert_eq!(parsed["plan"], "plus");
+        assert_eq!(parsed["windows"][0]["window"], "5h");
+        assert_eq!(parsed["windows"][0]["used_pct"], 42.0);
     }
 
     #[test]
