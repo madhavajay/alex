@@ -329,7 +329,7 @@ jobs:
           repo="${{ github.repository }}"
           # Current blob sha on gh-pages (empty when the file does not exist yet).
           sha="$(gh api "repos/$repo/contents/$APPCAST_FILE?ref=gh-pages" --jq '.sha' 2>/dev/null || true)"
-          content_b64="$(base64 "$APPCAST_FILE" | tr -d '\n')"
+          content_b64="$(base64 < "$APPCAST_FILE" | tr -d '\n')"
           args=(-X PUT "repos/$repo/contents/$APPCAST_FILE"
             -f "message=appcast: ${RELEASE_TAG} (${APPCAST_FILE})"
             -f "branch=gh-pages"
