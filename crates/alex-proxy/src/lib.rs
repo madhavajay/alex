@@ -471,6 +471,9 @@ impl ReauthLoginTracker {
         let generation = self.next_generation;
         self.entries
             .insert(key.clone(), ReauthLoginSlot::Starting(generation));
+        self.awaiting_paste.retain(|_, awaiting| {
+            awaiting.provider != key.provider || awaiting.account_id != key.account_id
+        });
         Some(generation)
     }
 
@@ -480,7 +483,7 @@ impl ReauthLoginTracker {
         generation: u64,
         login_id: String,
         expires_at_ms: i64,
-    ) {
+    ) -> bool {
         if self.entries.get(key) == Some(&ReauthLoginSlot::Starting(generation)) {
             self.entries.insert(
                 key.clone(),
@@ -490,13 +493,33 @@ impl ReauthLoginTracker {
                     expires_at_ms,
                 },
             );
+            return true;
         }
+        false
     }
 
-    fn abandon(&mut self, key: &ReauthLoginKey, generation: u64) {
+    fn abandon(&mut self, key: &ReauthLoginKey, generation: u64) -> bool {
         if self.entries.get(key) == Some(&ReauthLoginSlot::Starting(generation)) {
             self.entries.remove(key);
+            return true;
         }
+        false
+    }
+
+    fn abandon_account(&mut self, key: &ReauthLoginKey) -> (bool, Option<String>) {
+        let slot = self.entries.remove(key);
+        let login_id = match slot.as_ref() {
+            Some(ReauthLoginSlot::Active { login_id, .. }) => Some(login_id.clone()),
+            _ => None,
+        };
+        let awaiting_before = self.awaiting_paste.len();
+        self.awaiting_paste.retain(|_, awaiting| {
+            awaiting.provider != key.provider || awaiting.account_id != key.account_id
+        });
+        (
+            slot.is_some() || self.awaiting_paste.len() != awaiting_before,
+            login_id,
+        )
     }
 
     fn bind_awaiting_paste(
@@ -1533,6 +1556,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/auth/reauth-notify",
             post(admin_auth_reauth_notify),
         )
+        .route(
+            "/admin/auth/reauth-cancel",
+            post(admin_auth_reauth_cancel),
+        )
         .route("/admin/auth/reauth/code", post(admin_auth_reauth_code))
         .route(
             "/admin/auth/login/complete",
@@ -2452,16 +2479,56 @@ async fn admin_auth_reauth_notify(
     let channel_id = body.0["channel_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
+    let force = body.0["force"].as_bool().unwrap_or(false);
     let result = match channel_id {
         Some(channel_id) => {
-            start_reauth_for_command(&state, provider, &account, channel_id).await
+            start_reauth_for_command(&state, provider, &account, channel_id, force).await
         }
-        None => start_reauth_and_notify(&state, provider, &account).await,
+        None => start_reauth_and_notify(&state, provider, &account, force).await,
     };
     match result {
         Ok(result) => axum::Json(result).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+async fn admin_auth_reauth_cancel(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(provider_name) = body.0["provider"].as_str() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
+    };
+    let Some(provider) = Provider::from_str_loose(provider_name) else {
+        return error_response(StatusCode::BAD_REQUEST, "unknown provider");
+    };
+    let account_id = match body.0["account_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(account_id) => account_id.to_string(),
+        None => {
+            let account = state
+                .vault
+                .list()
+                .await
+                .into_iter()
+                .find(|account| account.provider == provider && account.kind == "oauth");
+            let Some(account) = account else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "no matching managed OAuth account",
+                );
+            };
+            account.id
+        }
+    };
+    let key = ReauthLoginKey {
+        provider,
+        account_id,
+    };
+    let cancelled = abandon_reauth_session(&state, &key, false).await.cancelled;
+    axum::Json(json!({"cancelled": cancelled})).into_response()
 }
 
 async fn admin_auth_reauth_code(
@@ -10840,7 +10907,7 @@ fn emit_reauth_notification_for_account(state: &Arc<AppState>, account: &Account
     let state = state.clone();
     let account = account.clone();
     tokio::spawn(async move {
-        if let Err(error) = start_reauth_and_notify(&state, account.provider, &account).await {
+        if let Err(error) = start_reauth_and_notify(&state, account.provider, &account, false).await {
             tracing::warn!(
                 provider = account.provider.as_str(),
                 account = %account.id,
@@ -10942,6 +11009,36 @@ fn reauth_session_is_reusable(snapshot: Option<&Value>) -> bool {
         || state == Some("done")
 }
 
+struct ReauthAbandonResult {
+    cancelled: bool,
+    replacement_generation: Option<u64>,
+}
+
+/// Remove the tracker entry and every paste binding for an account, then
+/// abandon the underlying LoginManager session. Force replacement reserves the
+/// next tracker generation before yielding so watchdog/request races cannot
+/// install a competing flow in the gap.
+async fn abandon_reauth_session(
+    state: &AppState,
+    key: &ReauthLoginKey,
+    reserve_replacement: bool,
+) -> ReauthAbandonResult {
+    let (cancelled, login_id, replacement_generation) = {
+        let mut tracker = state.reauth_logins.lock().await;
+        let (cancelled, login_id) = tracker.abandon_account(key);
+        let replacement_generation = reserve_replacement
+            .then(|| tracker.reserve_new(key.clone()).expect("cleared re-auth slot"));
+        (cancelled, login_id, replacement_generation)
+    };
+    if let Some(login_id) = login_id {
+        state.logins.abandon(&login_id).await;
+    }
+    ReauthAbandonResult {
+        cancelled,
+        replacement_generation,
+    }
+}
+
 /// Start (or reuse) the account's LoginManager session and put its fresh,
 /// single-use browser URL in Telegram. The tracker reservation is installed
 /// before the provider network call, preventing request-path and watchdog
@@ -10950,8 +11047,9 @@ pub async fn start_reauth_and_notify(
     state: &Arc<AppState>,
     provider: Provider,
     account: &Account,
+    force: bool,
 ) -> std::result::Result<Value, String> {
-    start_reauth_inner(state, provider, account, None).await
+    start_reauth_inner(state, provider, account, None, force).await
 }
 
 /// Start or reuse a re-auth session for one command-enabled Telegram channel.
@@ -10962,6 +11060,7 @@ pub async fn start_reauth_for_command(
     provider: Provider,
     account: &Account,
     channel_id: &str,
+    force: bool,
 ) -> std::result::Result<Value, String> {
     let allowed = state
         .notifications
@@ -10971,7 +11070,7 @@ pub async fn start_reauth_for_command(
     if !allowed {
         return Err("telegram command channel is not enabled".into());
     }
-    start_reauth_inner(state, provider, account, Some(channel_id)).await
+    start_reauth_inner(state, provider, account, Some(channel_id), force).await
 }
 
 async fn start_reauth_inner(
@@ -10979,6 +11078,7 @@ async fn start_reauth_inner(
     provider: Provider,
     account: &Account,
     command_channel_id: Option<&str>,
+    force: bool,
 ) -> std::result::Result<Value, String> {
     if account.provider != provider || account.kind != "oauth" {
         return Err("re-authentication requires the matching managed OAuth account".into());
@@ -11005,47 +11105,58 @@ async fn start_reauth_inner(
         provider,
         account_id: account.id.clone(),
     };
-    let existing = state
-        .reauth_logins
-        .lock()
-        .await
-        .entries
-        .get(&key)
-        .cloned();
-    let generation = match existing {
-        Some(ReauthLoginSlot::Starting(_)) => {
-            return Ok(reauth_notify_result(None, false, true, false));
-        }
-        Some(ReauthLoginSlot::Active {
-            login_id,
-            ..
-        }) => {
-            let snapshot = state.logins.status(&login_id).await;
-            if reauth_session_is_reusable(snapshot.as_ref()) {
-                if let (Some(channel_id), Some(snapshot)) =
-                    (command_channel_id, snapshot.as_ref())
-                {
-                    state.reauth_logins.lock().await.bind_awaiting_paste(
-                        channel_id,
-                        &key,
-                        snapshot,
-                        now_ms(),
-                    );
-                }
-                return Ok(reauth_notify_result(snapshot, false, true, false));
+    let generation = if force {
+        abandon_reauth_session(state, &key, true)
+            .await
+            .replacement_generation
+            .expect("force replacement reserves a generation")
+    } else {
+        let existing = state
+            .reauth_logins
+            .lock()
+            .await
+            .entries
+            .get(&key)
+            .cloned();
+        match existing {
+            Some(ReauthLoginSlot::Starting(_)) => {
+                return Ok(reauth_notify_result(None, false, true, false));
             }
-            let mut tracker = state.reauth_logins.lock().await;
-            let Some(generation) = tracker.reserve_replacement(&key, &login_id) else {
-                return Ok(reauth_notify_result(None, false, true, false));
-            };
-            generation
-        }
-        None => {
-            let mut tracker = state.reauth_logins.lock().await;
-            let Some(generation) = tracker.reserve_new(key.clone()) else {
-                return Ok(reauth_notify_result(None, false, true, false));
-            };
-            generation
+            Some(ReauthLoginSlot::Active {
+                login_id,
+                ..
+            }) => {
+                let snapshot = state.logins.status(&login_id).await;
+                if reauth_session_is_reusable(snapshot.as_ref()) {
+                    if let (Some(channel_id), Some(snapshot)) =
+                        (command_channel_id, snapshot.as_ref())
+                    {
+                        state.reauth_logins.lock().await.bind_awaiting_paste(
+                            channel_id,
+                            &key,
+                            snapshot,
+                            now_ms(),
+                        );
+                    }
+                    return Ok(reauth_notify_result(snapshot, false, true, false));
+                }
+                let generation = {
+                    let mut tracker = state.reauth_logins.lock().await;
+                    let Some(generation) = tracker.reserve_replacement(&key, &login_id) else {
+                        return Ok(reauth_notify_result(None, false, true, false));
+                    };
+                    generation
+                };
+                state.logins.abandon(&login_id).await;
+                generation
+            }
+            None => {
+                let mut tracker = state.reauth_logins.lock().await;
+                let Some(generation) = tracker.reserve_new(key.clone()) else {
+                    return Ok(reauth_notify_result(None, false, true, false));
+                };
+                generation
+            }
         }
     };
 
@@ -11056,33 +11167,41 @@ async fn start_reauth_inner(
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            state
+            let abandoned = state
                 .reauth_logins
                 .lock()
                 .await
                 .abandon(&key, generation);
-            emit_plain_reauth_notification_for_account(state, account);
+            if abandoned {
+                emit_plain_reauth_notification_for_account(state, account);
+            }
             return Err(error.to_string());
         }
     };
     let Some(login_id) = snapshot["login_id"].as_str().map(str::to_owned) else {
-        state
+        let abandoned = state
             .reauth_logins
             .lock()
             .await
             .abandon(&key, generation);
-        emit_plain_reauth_notification_for_account(state, account);
+        if abandoned {
+            emit_plain_reauth_notification_for_account(state, account);
+        }
         return Err("login session omitted login_id".into());
     };
     let expires_at_ms = snapshot["expires_at_ms"]
         .as_i64()
         .unwrap_or_else(|| now_ms() + 15 * 60 * 1000);
-    state.reauth_logins.lock().await.activate(
+    let activated = state.reauth_logins.lock().await.activate(
         &key,
         generation,
-        login_id,
+        login_id.clone(),
         expires_at_ms,
     );
+    if !activated {
+        state.logins.abandon(&login_id).await;
+        return Err("re-authentication start was cancelled or superseded".into());
+    }
 
     let Some(url) = snapshot["verification_uri_complete"]
         .as_str()
@@ -11257,7 +11376,9 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         // a live 401 before the cached access-token timestamp elapses. That
         // explicit logout marker wins over the timestamp and must be alerted.
         if account.provider == Provider::Anthropic && account.needs_reauth() {
-            if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await {
+            if let Err(error) =
+                start_reauth_and_notify(state, account.provider, &account, false).await
+            {
                 tracing::warn!(account = %account.id, %error, "could not start marked re-auth flow");
             }
             continue;
@@ -11284,7 +11405,9 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         if !has_refresh_token {
             // Expired with nothing to refresh from: a confirmed logout.
             mark_account_needs_reauth(state, &account.id, true).await;
-            if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await {
+            if let Err(error) =
+                start_reauth_and_notify(state, account.provider, &account, false).await
+            {
                 tracing::warn!(account = %account.id, %error, "could not start watchdog re-auth flow");
             }
             continue;
@@ -11304,7 +11427,8 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
             }
             Err(error) if alex_auth::refresh_error_needs_reauth(&error) => {
                 mark_account_needs_reauth(state, &account.id, true).await;
-                if let Err(error) = start_reauth_and_notify(state, account.provider, &account).await
+                if let Err(error) =
+                    start_reauth_and_notify(state, account.provider, &account, false).await
                 {
                     tracing::warn!(account = %account.id, %error, "could not start watchdog re-auth flow");
                 }
@@ -11556,6 +11680,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_pending_reauth_reuses_unless_force_replaces_and_resends() {
+        use tower::ServiceExt;
+
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("watchdog-reauth-force-replace");
+        let account_id = "anthropic-oauth-force";
+        let mut account = anthropic_account_full(
+            account_id,
+            "force",
+            "force@example.test",
+            now_ms() - 5 * 60_000,
+        );
+        account.refresh_token = None;
+        state.vault.upsert(account).await.unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url,
+                    chat_id: Some("42".into()),
+                    allow_commands: true,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        reauth_watch_once(&state).await;
+        let first_message = first_event(&received, "watchdog re-auth link was not sent").await;
+
+        let request_body = json!({
+            "provider": "anthropic",
+            "account_id": account_id,
+        });
+        let reused_request = axum::http::Request::post("/admin/auth/reauth-notify")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(request_body.to_string()))
+            .unwrap();
+        let (status, reused) = response_json(
+            router(state.clone())
+                .oneshot(reused_request)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["notification_sent"], false);
+        let first_login_id = reused["login_id"].as_str().unwrap().to_string();
+        let first_url = reused["verification_uri_complete"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(received.lock().unwrap().len(), 1);
+
+        let forced_request = axum::http::Request::post("/admin/auth/reauth-notify")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(
+                json!({
+                    "provider": "anthropic",
+                    "account_id": account_id,
+                    "force": true,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, forced) = response_json(
+            router(state.clone())
+                .oneshot(forced_request)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(forced["reused"], false);
+        assert_eq!(forced["notification_sent"], true);
+        let forced_login_id = forced["login_id"].as_str().unwrap();
+        let forced_url = forced["verification_uri_complete"].as_str().unwrap();
+        assert_ne!(forced_login_id, first_login_id);
+        assert_ne!(forced_url, first_url);
+        assert!(state.logins.status(&first_login_id).await.is_none());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if received.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forced re-auth link was not sent");
+        let events = received.lock().unwrap();
+        let forced_message = events[1]["text"].as_str().unwrap();
+        assert_ne!(events[1], first_message);
+        assert!(forced_message.contains(forced_url));
+        drop(events);
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn reauth_cancel_is_key_gated_and_clears_watchdog_session() {
+        use tower::ServiceExt;
+
+        let (url, _received, sink) = webhook_sink().await;
+        let state = test_state("watchdog-reauth-cancel");
+        let account_id = "anthropic-oauth-cancel";
+        let mut account = anthropic_account_full(
+            account_id,
+            "cancel",
+            "cancel@example.test",
+            now_ms() - 5 * 60_000,
+        );
+        account.refresh_token = None;
+        state.vault.upsert(account.clone()).await.unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url,
+                    chat_id: Some("42".into()),
+                    allow_commands: true,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        reauth_watch_once(&state).await;
+
+        let key = ReauthLoginKey {
+            provider: Provider::Anthropic,
+            account_id: account_id.into(),
+        };
+        let old_login_id = match state.reauth_logins.lock().await.entries.get(&key) {
+            Some(ReauthLoginSlot::Active { login_id, .. }) => login_id.clone(),
+            other => panic!("expected active watchdog session, got {other:?}"),
+        };
+        assert!(matches!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::Pending(_)
+        ));
+        let body = json!({
+            "provider": "anthropic",
+            "account_id": account_id,
+        })
+        .to_string();
+
+        let unauthorized = axum::http::Request::post("/admin/auth/reauth-cancel")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(state.logins.status(&old_login_id).await.is_some());
+
+        let authorized = axum::http::Request::post("/admin/auth/reauth-cancel")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, cancelled) = response_json(
+            router(state.clone())
+                .oneshot(authorized)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cancelled, json!({"cancelled": true}));
+        assert!(state.logins.status(&old_login_id).await.is_none());
+        assert!(!state.reauth_logins.lock().await.entries.contains_key(&key));
+        assert_eq!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::None
+        );
+
+        let restarted = start_reauth_and_notify(
+            &state,
+            Provider::Anthropic,
+            &account,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted["reused"], false);
+        assert_ne!(restarted["login_id"], old_login_id);
+        sink.abort();
+    }
+
+    #[tokio::test]
     async fn paste_reauth_binds_channel_retries_redacted_and_clears_on_success() {
         let state = test_state("telegram-paste-reauth");
         state
@@ -11597,6 +11935,7 @@ mod tests {
             Provider::Anthropic,
             &account,
             "control",
+            false,
         )
         .await
         .unwrap();

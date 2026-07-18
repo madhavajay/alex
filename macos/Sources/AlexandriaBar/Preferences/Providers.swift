@@ -36,7 +36,7 @@ private enum ProvidersChartRange: String, CaseIterable {
 /// existing data wiring.
 struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
-    let onAuthenticate: (String, String?, Bool) -> Void
+    let onAuthenticate: (String, String?, Bool, Bool) -> Void
     @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
@@ -246,12 +246,15 @@ struct ProvidersPreferencesSection: View {
             return status.running ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
         }
         let accounts = store.accounts.filter { $0.provider == provider && !$0.paused }
-        if accounts.contains(where: {
-            $0.healthState == .authFailed || $0.healthState == .unreachable
-        }) {
+        let displays = accounts.map { account in
+            let heartbeat = store.healthAccounts.first { $0.id == account.id }?.lastHeartbeat
+            return account.displayState(
+                lastPingOK: heartbeat?.ok, lastPingStatus: heartbeat?.status)
+        }
+        if displays.contains(.needsReauth) || displays.contains(.unreachable) {
             return AlexTheme.Colors.destructive
         }
-        if accounts.contains(where: { $0.healthState == .healthy }) {
+        if displays.contains(.active) {
             return AlexTheme.Colors.success
         }
         return AlexTheme.ProviderBrand.brand(for: provider).accent
@@ -295,7 +298,7 @@ struct ProvidersPreferencesSection: View {
             // same window's import path. OAuth providers capture their account
             // email during login; the local account name stays the compatible
             // `default` identifier.
-            onAuthenticate(provider, nil, provider == "openai")
+            onAuthenticate(provider, nil, provider == "openai", false)
         }
     }
 
@@ -378,7 +381,7 @@ private struct ProviderPreferencesDetail: View {
     let chartRangeEnabled: [Bool]
     let accountAnalyticsLoading: Bool
     let onConnect: (String) -> Void
-    let onAuthenticate: (String, String?, Bool) -> Void
+    let onAuthenticate: (String, String?, Bool, Bool) -> Void
 
     private var accounts: [Account] { store.accounts.filter { $0.provider == provider } }
     private var routing: ProviderRoutingResponse? { store.routingByProvider[provider] }
@@ -474,7 +477,7 @@ private struct ProviderPreferencesDetail: View {
                         accentColor: accountColor(account.id),
                         store: store
                     ) {
-                        onAuthenticate(account.provider, account.name, false)
+                        onAuthenticate(account.provider, account.name, false, $0)
                     }
                 }
             }
@@ -736,6 +739,12 @@ private struct RequestShareBar: View {
 }
 
 private struct SubscriptionAccountRow: View {
+    private enum ReauthAction: String, Identifiable {
+        case window
+        case notification
+        var id: String { rawValue }
+    }
+
     let account: Account
     let usage: AccountUsage?
     let routing: CodexRoutingAccount?
@@ -743,13 +752,34 @@ private struct SubscriptionAccountRow: View {
     let warnUsedPct: Double
     let accentColor: Color
     let store: SnapshotStore
-    let reauthenticate: () -> Void
+    let reauthenticate: (Bool) -> Void
     @State private var deleting = false
     @State private var busy = false
     @State private var error: String?
     @State private var notificationFeedback: String?
     @State private var notificationFailed = false
     @State private var notificationBusy = false
+    @State private var pingBusy = false
+    @State private var pingFeedback: String?
+    @State private var pingFailed = false
+    @State private var overwriteAction: ReauthAction?
+    @State private var pendingCode = ""
+    @State private var pendingBusy = false
+    @State private var pendingFeedback: String?
+
+    private var heartbeat: Heartbeat? {
+        store.healthAccounts.first { $0.id == account.id }?.lastHeartbeat
+    }
+
+    private var displayState: AccountDisplayState {
+        account.displayState(
+            lastPingOK: heartbeat?.ok,
+            lastPingStatus: heartbeat?.status)
+    }
+
+    private var pendingSession: LoginSession? {
+        store.pendingLoginSession(accountId: account.id, provider: account.provider)
+    }
 
     /// Quota windows: openai keeps its routing-fed windows (richer, includes
     /// reset selection); other providers fall back to per-account limits.
@@ -772,6 +802,7 @@ private struct SubscriptionAccountRow: View {
             quotaBars
             routingSummary
             buttonRow
+            if let pendingSession { pendingReauthPanel(pendingSession) }
             if let error {
                 Text(error)
                     .font(.system(size: 10))
@@ -793,6 +824,18 @@ private struct SubscriptionAccountRow: View {
         } message: {
             Text("Alexandria will stop using and pinging this account.")
         }
+        .alert(item: $overwriteAction) { action in
+            Alert(
+                title: Text("Re-authentication already pending"),
+                message: Text("A re-authentication session is already pending. Overwrite it with a new one?"),
+                primaryButton: .destructive(Text("Overwrite")) {
+                    overwrite(action)
+                },
+                secondaryButton: .cancel())
+        }
+        .task(id: pendingSession?.loginId) {
+            await pollPendingSession()
+        }
     }
 
     private var header: some View {
@@ -804,21 +847,19 @@ private struct SubscriptionAccountRow: View {
                 if account.paused {
                     StatusBadge(text: "Paused", tint: AlexTheme.Colors.warningOrange)
                 } else {
-                    // Reflect real probe health, not just credential presence: a
-                    // provider whose pings fail reads red here too, matching the
-                    // menu dot. `.unknown` (never probed / pre-health daemon)
-                    // falls back to the credential-presence status.
-                    switch account.healthState {
-                    case .authFailed:
-                        StatusBadge(text: "Re-auth", tint: AlexTheme.Colors.destructive)
+                    // Core merges credential, expiry, health, and last-ping
+                    // evidence so Settings and the status menu stay aligned.
+                    switch displayState {
+                    case .needsReauth:
+                        StatusBadge(text: "Needs re-auth", tint: AlexTheme.Colors.destructive)
                     case .unreachable:
                         StatusBadge(text: "Unreachable", tint: AlexTheme.Colors.destructive)
                     case .degraded:
                         StatusBadge(text: "Degraded", tint: AlexTheme.Colors.warningOrange)
-                    case .healthy:
+                    case .active:
                         StatusBadge(text: "Active", tint: AlexTheme.Colors.success)
                     case .unknown:
-                        StatusBadge(text: account.status.capitalized)
+                        StatusBadge(text: "Unknown", tint: AlexTheme.Colors.warningOrange)
                     }
                 }
                 Spacer()
@@ -922,6 +963,7 @@ private struct SubscriptionAccountRow: View {
         }
     }
 
+    @ViewBuilder
     private var buttonRow: some View {
         HStack(spacing: 8) {
             PillButton(
@@ -941,7 +983,17 @@ private struct SubscriptionAccountRow: View {
                     title: "Re-authenticate", horizontalPadding: 12,
                     verticalPadding: 5, cornerRadius: 7, showsBorder: true
                 ) {
-                    reauthenticate()
+                    requestReauthentication(.window)
+                }
+                if let pingTarget = ProviderInfo.pingArg(account.provider) {
+                    PillButton(
+                        title: pingBusy ? "Pinging…" : "Ping",
+                        horizontalPadding: 12, verticalPadding: 5,
+                        cornerRadius: 7, showsBorder: true,
+                        isEnabled: !pingBusy, isBusy: pingBusy
+                    ) {
+                        ping(pingTarget)
+                    }
                 }
                 if account.kind == "oauth" {
                     PillButton(
@@ -951,7 +1003,7 @@ private struct SubscriptionAccountRow: View {
                         cornerRadius: 7, showsBorder: true,
                         isEnabled: !notificationBusy, isBusy: notificationBusy
                     ) {
-                        reauthenticateViaNotification()
+                        requestReauthentication(.notification)
                     }
                 }
             }
@@ -964,6 +1016,80 @@ private struct SubscriptionAccountRow: View {
                 deleting = true
             }
         }
+        if let pingFeedback {
+            Text(pingFeedback)
+                .font(.system(size: 10))
+                .foregroundStyle(pingFailed
+                    ? AlexTheme.Colors.destructive : AlexTheme.Colors.success)
+        }
+    }
+
+    private func pendingReauthPanel(_ session: LoginSession) -> some View {
+        let link = session.verificationUriComplete
+            ?? session.authorizeUrl
+            ?? session.verificationUri
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                StatusDot(tint: AlexTheme.Colors.warningOrange, size: 6)
+                Text("Re-authentication pending")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.foreground)
+                Spacer()
+                Text(session.loginId)
+                    .font(AlexTheme.Fonts.mono(9))
+                    .foregroundStyle(AlexTheme.Colors.textFaint)
+                    .textSelection(.enabled)
+            }
+            if let link, let url = URL(string: link) {
+                Link(link, destination: url)
+                    .font(AlexTheme.Fonts.mono(10))
+                    .lineLimit(2)
+            }
+            if let code = session.userCode, !code.isEmpty {
+                HStack(spacing: 6) {
+                    Text("User code")
+                        .font(.system(size: 10))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    Text(code)
+                        .font(AlexTheme.Fonts.mono(11))
+                        .textSelection(.enabled)
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("code#state", text: $pendingCode)
+                    .textFieldStyle(.roundedBorder)
+                    .font(AlexTheme.Fonts.mono(11))
+                    .onSubmit { submitPendingCode(session) }
+                PillButton(
+                    title: pendingBusy ? "Submitting…" : "Submit code",
+                    horizontalPadding: 10, verticalPadding: 5,
+                    cornerRadius: 7, showsBorder: true,
+                    isEnabled: !pendingBusy
+                ) {
+                    submitPendingCode(session)
+                }
+                PillButton(
+                    title: "Reset / cancel session",
+                    horizontalPadding: 10, verticalPadding: 5,
+                    cornerRadius: 7, showsBorder: true,
+                    isEnabled: !pendingBusy
+                ) {
+                    resetPendingSession()
+                }
+            }
+            if let pendingFeedback {
+                Text(pendingFeedback)
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(AlexTheme.Colors.warningOrange.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(AlexTheme.Colors.warningOrange.opacity(0.22)))
     }
 
     private func barColor(_ window: LimitWindow) -> Color {
@@ -1010,7 +1136,25 @@ private struct SubscriptionAccountRow: View {
         }
     }
 
-    private func reauthenticateViaNotification() {
+    private func requestReauthentication(_ action: ReauthAction) {
+        if pendingSession != nil {
+            overwriteAction = action
+            return
+        }
+        switch action {
+        case .window: reauthenticate(false)
+        case .notification: reauthenticateViaNotification(force: false)
+        }
+    }
+
+    private func overwrite(_ action: ReauthAction) {
+        switch action {
+        case .window: reauthenticate(true)
+        case .notification: reauthenticateViaNotification(force: true)
+        }
+    }
+
+    private func reauthenticateViaNotification(force: Bool) {
         guard let config = store.config else { return }
         notificationBusy = true
         notificationFeedback = nil
@@ -1018,21 +1162,128 @@ private struct SubscriptionAccountRow: View {
         Task {
             do {
                 let response = try await AlexandriaClient(config: config).reauthNotify(
-                    provider: account.provider, accountId: account.id)
+                    provider: account.provider, accountId: account.id, force: force)
+                if let loginId = response.loginId,
+                   let session = try? await AlexandriaClient(config: config)
+                       .authLoginStatus(id: loginId)
+                {
+                    store.rememberLoginSession(
+                        session, accountId: account.id, provider: account.provider)
+                }
                 if response.notificationSent {
                     notificationFeedback = "Fresh re-authentication link sent"
                 } else if response.reused {
-                    notificationFeedback = "A re-authentication session is already pending"
+                    overwriteAction = .notification
                 } else {
                     notificationFeedback = "No Telegram channel is enabled; standard alert used"
                 }
             } catch {
-                notificationFailed = true
-                notificationFeedback = error.localizedDescription
+                let message = error.localizedDescription
+                if message.localizedCaseInsensitiveContains("session")
+                    && message.localizedCaseInsensitiveContains("pending")
+                {
+                    overwriteAction = .notification
+                } else {
+                    notificationFailed = true
+                    notificationFeedback = message
+                }
             }
             notificationBusy = false
             try? await Task.sleep(for: .seconds(4))
             notificationFeedback = nil
+        }
+    }
+
+    private func ping(_ target: String) {
+        pingBusy = true
+        pingFeedback = nil
+        pingFailed = false
+        let startedAt = Date()
+        Task {
+            let result = await DaemonController.ping(target)
+            let latencyMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+            pingFailed = !result.ok
+            pingFeedback = result.ok
+                ? "Ping OK · \(latencyMs)ms"
+                : "Ping failed · \(latencyMs)ms"
+            await store.refresh()
+            pingBusy = false
+            try? await Task.sleep(for: .seconds(5))
+            pingFeedback = nil
+        }
+    }
+
+    private func submitPendingCode(_ session: LoginSession) {
+        let input = pendingCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty, !pendingBusy, let config = store.config else { return }
+        pendingBusy = true
+        pendingFeedback = nil
+        Task {
+            do {
+                let updated = try await AlexandriaClient(config: config)
+                    .authLoginComplete(id: session.loginId, input: input)
+                store.rememberLoginSession(
+                    updated, accountId: account.id, provider: account.provider)
+                pendingCode = ""
+                pendingFeedback = updated.isDone ? "Re-authentication complete" : updated.state
+                await store.refresh()
+            } catch {
+                pendingFeedback = error.localizedDescription
+            }
+            pendingBusy = false
+        }
+    }
+
+    private func resetPendingSession() {
+        guard !pendingBusy else { return }
+        pendingBusy = true
+        pendingFeedback = nil
+        guard let config = store.config else {
+            pendingBusy = false
+            return
+        }
+        Task {
+            do {
+                // No cancel endpoint exists today; reset is the specified
+                // force-restart on the existing notification login route.
+                let response = try await AlexandriaClient(config: config).reauthNotify(
+                    provider: account.provider, accountId: account.id, force: true)
+                guard let id = response.loginId else {
+                    pendingFeedback = "Daemon did not return a replacement login session"
+                    pendingBusy = false
+                    return
+                }
+                let session = try await AlexandriaClient(config: config).authLoginStatus(id: id)
+                store.rememberLoginSession(
+                    session, accountId: account.id, provider: account.provider)
+                pendingCode = ""
+                pendingFeedback = response.reused
+                    ? "Existing session is still pending"
+                    : "Pending session replaced"
+            } catch {
+                pendingFeedback = error.localizedDescription
+            }
+            pendingBusy = false
+        }
+    }
+
+    private func pollPendingSession() async {
+        guard let id = pendingSession?.loginId, let config = store.config else { return }
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            do {
+                let updated = try await AlexandriaClient(config: config).authLoginStatus(id: id)
+                store.rememberLoginSession(
+                    updated, accountId: account.id, provider: account.provider)
+                if !updated.isPending {
+                    await store.refresh()
+                    return
+                }
+            } catch {
+                pendingFeedback = error.localizedDescription
+                return
+            }
         }
     }
 }

@@ -36,6 +36,7 @@ import Testing
             #expect(json["provider"] as? String == "codex")
             #expect(json["auto_identity"] as? Bool == true)
             #expect(json["name"] == nil)
+            #expect(json["force"] == nil)
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             let payload = #"{"login_id":"login-test","provider":"codex","mode":"device","state":"pending","authorize_url":"https://auth.openai.com/codex/device","user_code":"ABCD-EFGH"}"#
@@ -64,6 +65,7 @@ import Testing
                 JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
             #expect(json["provider"] as? String == "xai")
             #expect(json["account_id"] as? String == "xai-oauth-work")
+            #expect(json["force"] == nil)
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             let payload = #"{"login_id":"login-fresh","provider":"xai","state":"pending","verification_uri_complete":"https://auth.example/device?code=fresh","notification_sent":true,"reused":false,"fallback":false}"#
@@ -81,6 +83,56 @@ import Testing
             provider: "xai", accountId: "xai-oauth-work")
         #expect(response.notificationSent)
         #expect(response.loginId == "login-fresh")
+    }
+
+    @Test func forcedReauthNotificationRequestsReplacement() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/reauth-notify")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["provider"] as? String == "anthropic")
+            #expect(json["account_id"] as? String == "anthropic-oauth")
+            #expect(json["force"] as? Bool == true)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"login_id":"login-replacement","provider":"anthropic","state":"pending","notification_sent":true,"reused":false,"fallback":false}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        _ = try await client.reauthNotify(
+            provider: "anthropic", accountId: "anthropic-oauth", force: true)
+    }
+
+    @Test func forcedLoginStartRequestsReplacement() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/login/start")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["provider"] as? String == "anthropic")
+            #expect(json["name"] as? String == "default")
+            #expect(json["force"] as? Bool == true)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"login_id":"login-replacement","provider":"anthropic","mode":"paste","state":"pending","authorize_url":"https://console.anthropic.com/oauth/authorize"}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        _ = try await client.authLoginStart(
+            provider: "anthropic", name: "default", force: true)
     }
 
     @Test func openRouterKeyPostsSecretAndAttributionInJSONBody() async throws {

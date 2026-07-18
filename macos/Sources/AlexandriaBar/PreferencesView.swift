@@ -41,7 +41,7 @@ final class PreferencesViewState {
 struct PreferencesView: View {
     @Bindable var state: PreferencesViewState
     let store: SnapshotStore
-    let onAuthenticate: (String, String?, Bool) -> Void
+    let onAuthenticate: (String, String?, Bool, Bool) -> Void
     let onOpenDario: () -> Void
 
     var body: some View {
@@ -218,10 +218,11 @@ final class PreferencesWindowController {
             let host = NSHostingController(rootView: PreferencesView(
                 state: state,
                 store: store,
-                onAuthenticate: { [weak self] provider, name, autoIdentity in
+                onAuthenticate: { [weak self] provider, name, autoIdentity, force in
                     guard let self else { return }
                     self.authWindows.show(
                         provider: provider, accountName: name, autoIdentity: autoIdentity,
+                        force: force,
                         store: self.store)
                 },
                 onOpenDario: onOpenDario))

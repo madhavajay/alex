@@ -31,21 +31,17 @@ enum MenuHealthStatus: Equatable {
     static let slowLatencyMs: Int64 = 300
 
     static func forAccount(_ account: Account, heartbeat: Heartbeat?) -> MenuHealthStatus {
-        // Reachability from the daemon's last probe is authoritative: a live
-        // credential ("active") whose ping fails must read red, not green.
-        switch account.healthState {
-        case .authFailed, .unreachable:
+        switch account.displayState(
+            lastPingOK: heartbeat?.ok, lastPingStatus: heartbeat?.status
+        ) {
+        case .needsReauth, .unreachable:
             return .error
         case .degraded:
             return .slow
-        case .healthy:
+        case .active:
             if let latency = heartbeat?.latencyMs, latency >= slowLatencyMs { return .slow }
             return .ok
         case .unknown:
-            // No probe verdict yet (or a pre-health daemon): fall back to the
-            // credential/heartbeat signals.
-            if account.status != "active" || heartbeat?.ok == false { return .error }
-            if account.isExpired { return .slow }
             guard let heartbeat else { return .pending }
             if let latency = heartbeat.latencyMs, latency >= slowLatencyMs { return .slow }
             return .ok

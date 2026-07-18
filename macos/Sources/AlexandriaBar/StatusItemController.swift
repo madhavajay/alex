@@ -453,9 +453,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         info("Email: \(account.email ?? "not supplied by provider")")
-        info("\(account.id) · \(account.kind) · \(account.status)")
+        let displayState = account.displayState(
+            lastPingOK: heartbeat?.ok, lastPingStatus: heartbeat?.status)
+        let displayStatus = switch displayState {
+        case .active: "Active"
+        case .needsReauth: "Needs re-auth"
+        case .degraded: "Degraded"
+        case .unreachable: "Unreachable"
+        case .unknown: "Unknown"
+        }
+        info("\(account.id) · \(account.kind) · \(displayStatus)")
         if let expires = account.expiresInS {
-            info(expires < 0
+            info(expires <= 0
                 ? "Token expired \(Format.duration(expires)) ago"
                 : "Token expires in \(Format.duration(expires))")
         }
