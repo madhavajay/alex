@@ -15,11 +15,14 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+mod commands;
 mod dario;
 mod harness_connect;
 mod harness_e2e;
 mod reset;
 mod selfupdate;
+mod status;
+mod telegram;
 mod tui;
 mod ui;
 
@@ -1003,8 +1006,8 @@ struct Config {
     /// Opt-in retry/bond/cross-provider protection ladder.
     #[serde(default)]
     protection: alex_proxy::ProtectionPolicy,
-    /// One-way notification channels. URLs may contain tokens and are never
-    /// returned by the daemon admin API.
+    /// Notification channels. Telegram inbound control is separately opt-in
+    /// per channel; URLs and tokens are never returned by the admin API.
     #[serde(default)]
     notifications: Vec<alex_proxy::notify::NotificationChannelConfig>,
     #[serde(default = "alex_proxy::notify::default_cooldown_seconds")]
@@ -3524,6 +3527,19 @@ async fn main() -> Result<()> {
                     "local clients and harnesses remain available at http://127.0.0.1:{port}"
                 );
             }
+            let command_dispatcher = state
+                .notifications
+                .read()
+                .map(|dispatcher| dispatcher.clone())
+                .unwrap_or_default();
+            let telegram_command_tasks =
+                telegram::spawn_command_pollers(&config, command_dispatcher);
+            if !telegram_command_tasks.is_empty() {
+                eprintln!(
+                    "telegram commands: enabled for {} allowlisted channel(s)",
+                    telegram_command_tasks.len()
+                );
+            }
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let shutdown_task = tokio::spawn(async move {
                 #[cfg(unix)]
@@ -3566,6 +3582,9 @@ async fn main() -> Result<()> {
                 primary.await
             };
             shutdown_task.abort();
+            for task in telegram_command_tasks {
+                task.abort();
+            }
             serve_result?;
             if let Some(sup) = supervisor {
                 sup.shutdown().await;
@@ -7925,7 +7944,32 @@ fn account_indicators(a: &alex_auth::Account) -> (String, String) {
     (dot, expiry)
 }
 
-#[derive(Debug, PartialEq)]
+fn status_account_indicators(a: &status::StatusAccount) -> (String, String) {
+    let remaining_ms = a.expires_at_ms.map(|expiry| expiry - now_ms());
+    let expired = remaining_ms.is_some_and(|remaining| remaining < 0);
+    let expiring = remaining_ms.is_some_and(|remaining| (0..30 * 60_000).contains(&remaining));
+    let active = a.status == "active";
+    let dot = if expired || !active {
+        ui::red(ui::dot())
+    } else if expiring {
+        ui::yellow(ui::dot())
+    } else {
+        ui::green(ui::dot())
+    };
+    let expiry = match remaining_ms {
+        Some(remaining) if remaining < 0 => {
+            ui::red(&format!("expired {} ago", ui::human_ms(-remaining)))
+        }
+        Some(remaining) if remaining < 30 * 60_000 => {
+            ui::yellow(&format!("expires in {}", ui::human_ms(remaining)))
+        }
+        Some(remaining) => format!("expires in {}", ui::human_ms(remaining)),
+        None => ui::dim("no expiry"),
+    };
+    (dot, expiry)
+}
+
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 enum ServiceState {
     LaunchdLoaded {
@@ -9218,60 +9262,23 @@ fn pick_provider(accounts: &[alex_auth::Account]) -> Result<Option<String>> {
 }
 
 async fn run_status(config: &Config, json: bool) -> Result<()> {
-    let base = config.base_url();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()?;
-    let key = config.local_key.as_str();
-    let health = fetch_json(&client, &format!("{base}/health"), key)
-        .await
-        .filter(|(s, _)| (200..300).contains(s))
-        .map(|(_, v)| v);
-    let running = health.is_some();
-    let service = detect_service_state();
-    let binaries = installed_binaries();
-    let current_exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok());
-    let vault = open_vault(config)?;
-    let accounts = vault.list().await;
-    let admin_health = if running {
-        fetch_json(&client, &format!("{base}/admin/health"), key)
-            .await
-            .filter(|(s, _)| (200..300).contains(s))
-            .map(|(_, v)| v)
-    } else {
-        None
-    };
-    let limits = if running {
-        fetch_json(&client, &format!("{base}/admin/limits"), key)
-            .await
-            .filter(|(s, _)| (200..300).contains(s))
-            .map(|(_, v)| v)
-    } else {
-        None
-    };
-    let dario = if running {
-        fetch_json(&client, &format!("{base}/admin/dario"), key).await
-    } else {
-        None
-    };
-    let heartbeat_for = |id: &str| -> serde_json::Value {
-        admin_health
-            .as_ref()
-            .and_then(|v| v["accounts"].as_array())
-            .and_then(|arr| arr.iter().find(|a| a["id"].as_str() == Some(id)))
-            .map(|a| a["last_heartbeat"].clone())
-            .unwrap_or(serde_json::Value::Null)
-    };
+    let summary = status::status_summary(config).await?;
+    let base = &summary.base_url;
+    let health = &summary.health;
+    let running = summary.daemon_up;
+    let service = &summary.service_state;
+    let binaries = &summary.binaries;
+    let accounts = &summary.accounts;
+    let limits = &summary.limits;
+    let dario = &summary.dario_response;
 
     if json {
         let binaries_json: Vec<serde_json::Value> = binaries
             .iter()
-            .map(|p| {
+            .map(|binary| {
                 serde_json::json!({
-                    "path": p.to_string_lossy(),
-                    "this_binary": current_exe.is_some() && p.canonicalize().ok() == current_exe,
+                    "path": binary.path.to_string_lossy(),
+                    "this_binary": binary.this_binary,
                 })
             })
             .collect();
@@ -9280,23 +9287,26 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             .map(|a| {
                 serde_json::json!({
                     "id": a.id,
-                    "provider": a.provider.as_str(),
+                    "provider": a.provider,
+                    "name": a.name,
                     "kind": a.kind,
                     "label": a.label,
                     "status": a.status,
-                    "needs_reauth": a.needs_reauth(),
+                    "health": a.health,
+                    "needs_reauth": a.needs_reauth,
+                    "usage_pct": a.usage_pct,
                     "expires_at_ms": a.expires_at_ms,
-                    "last_heartbeat": heartbeat_for(&a.id),
+                    "last_heartbeat": a.last_heartbeat,
                 })
             })
             .collect();
         let combined = serde_json::json!({
             "daemon": {
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": summary.version,
                 "binaries": binaries_json,
                 "service": {
-                    "state": service_state_label(&service),
-                    "managed": service_managed(&service),
+                    "state": summary.service,
+                    "managed": summary.service_managed,
                 },
                 "running": running,
                 "health": health,
@@ -9315,6 +9325,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
                 .as_ref()
                 .filter(|(s, _)| (200..300).contains(s))
                 .map(|(_, v)| v.clone()),
+            "update": summary.update,
         });
         println!("{}", serde_json::to_string_pretty(&combined)?);
         return Ok(());
@@ -9329,28 +9340,31 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         );
     } else {
         let mut first = true;
-        for p in &binaries {
+        for binary in binaries {
             let label = if first {
                 ui::purple("binary")
             } else {
                 String::new()
             };
             first = false;
-            let this = current_exe.is_some() && p.canonicalize().ok() == current_exe;
-            let suffix = if this {
+            let suffix = if binary.this_binary {
                 format!(" {}", ui::dim("(this binary)"))
             } else {
                 String::new()
             };
-            println!("  {} {}{suffix}", ui::pad_right(&label, 10), p.display());
+            println!(
+                "  {} {}{suffix}",
+                ui::pad_right(&label, 10),
+                binary.path.display()
+            );
         }
     }
     println!(
         "  {} {}",
         ui::pad_right(&ui::purple("version"), 10),
-        env!("CARGO_PKG_VERSION")
+        summary.version
     );
-    let sdot = if service_managed(&service) {
+    let sdot = if service_managed(service) {
         ui::green(ui::dot())
     } else {
         match service {
@@ -9364,7 +9378,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     println!(
         "  {} {sdot} {}",
         ui::pad_right(&ui::purple("service"), 10),
-        service_state_label(&service)
+        service_state_label(service)
     );
     if let ServiceState::Systemd { .. } = service {
         println!(
@@ -9373,7 +9387,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             ui::dim("unit: ~/.config/systemd/user/alexandria.service")
         );
     }
-    match &health {
+    match health {
         Some(h) => {
             let version = h["version"].as_str().unwrap_or("?");
             let mut details: Vec<String> = Vec::new();
@@ -9398,7 +9412,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
                 ui::green(&format!("running v{version}")),
                 ui::dim(&detail)
             );
-            if !service_managed(&service) {
+            if !service_managed(service) {
                 println!(
                     "  {} {}",
                     ui::pad_right("", 10),
@@ -9450,9 +9464,9 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     if accounts.is_empty() {
         println!("{}", ui::dim("no accounts — run `alexandria auth import`"));
     }
-    for a in &accounts {
-        let (dot, expiry) = account_indicators(a);
-        let hb = heartbeat_for(&a.id);
+    for a in accounts {
+        let (dot, expiry) = status_account_indicators(a);
+        let hb = &a.last_heartbeat;
         let hb_str = if hb.is_object() {
             let ok = hb["ok"].as_bool().unwrap_or(false);
             let age = hb["ts_ms"]
@@ -9481,7 +9495,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         println!(
             "{dot} {} {} {} {} {}  {hb_str}",
             ui::pad_right(&a.id, 18),
-            ui::pad_right(&ui::amber(a.provider.as_str()), 10),
+            ui::pad_right(&ui::amber(&a.provider), 10),
             ui::pad_right(&a.kind, 8),
             ui::pad_right(&expiry, 20),
             ui::pad_right(&ui::purple(a.label.as_deref().unwrap_or("")), 24)
@@ -9489,12 +9503,12 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     }
 
     println!();
-    match &limits {
+    match limits {
         Some(snap) => print_limits(snap),
         None => println!("{}", ui::dim("limits: skipped (daemon not running)")),
     }
 
-    match &dario {
+    match dario {
         Some((s, body)) if (200..300).contains(s) => {
             println!();
             print_dario_status(body)?;

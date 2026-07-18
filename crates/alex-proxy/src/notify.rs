@@ -90,6 +90,10 @@ pub struct NotificationChannelConfig {
     pub bot_username: Option<String>,
     #[serde(default)]
     pub chat_id: Option<String>,
+    /// Opt in to treating this Telegram chat as a daemon control channel.
+    /// Defaults off so existing notification-only bots never accept commands.
+    #[serde(default)]
+    pub allow_commands: bool,
     #[serde(default)]
     pub min_level: NotificationLevel,
     #[serde(default)]
@@ -106,6 +110,7 @@ impl Default for NotificationChannelConfig {
             token: None,
             bot_username: None,
             chat_id: None,
+            allow_commands: false,
             min_level: NotificationLevel::default(),
             categories: Vec::new(),
         }
@@ -151,6 +156,9 @@ pub trait NotificationChannel: Send + Sync {
         false
     }
     async fn send(&self, ev: &NotificationEvent) -> Result<()>;
+    async fn send_text(&self, _text: &str) -> Result<()> {
+        Err(anyhow!("notification channel does not support text replies"))
+    }
 }
 
 #[derive(Clone)]
@@ -206,18 +214,40 @@ pub fn telegram_send_message_url(token: &str) -> String {
     format!("https://api.telegram.org/bot{token}/sendMessage")
 }
 
+pub fn telegram_get_updates_url(token: &str) -> String {
+    format!("https://api.telegram.org/bot{token}/getUpdates")
+}
+
 #[async_trait]
 impl NotificationChannel for WebhookChannel {
     fn kind(&self) -> &str {
         "webhook"
     }
 
-    // TODO(two-way reauth): a receiver-capable Telegram channel can opt in
-    // here once the daemon owns a bot update webhook/long-poll lifecycle.
+    fn supports_replies(&self) -> bool {
+        matches!(self.format, WebhookFormat::Telegram)
+    }
+
     async fn send(&self, ev: &NotificationEvent) -> Result<()> {
         self.client
             .post(&self.url)
             .json(&self.payload(ev))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn send_text(&self, text: &str) -> Result<()> {
+        if !matches!(self.format, WebhookFormat::Telegram) {
+            return Err(anyhow!("notification channel is not Telegram"));
+        }
+        self.client
+            .post(&self.url)
+            .json(&json!({
+                "chat_id": self.chat_id.as_deref().unwrap_or_default(),
+                "text": text,
+            }))
             .send()
             .await?
             .error_for_status()?;
@@ -272,6 +302,13 @@ struct ChannelEntry {
 struct ChannelStatus {
     last_sent_ms: Option<i64>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomDelivery {
+    pub scheduled: bool,
+    /// Command-enabled Telegram channel IDs that received this message.
+    pub command_channel_ids: Vec<String>,
 }
 
 /// Fan-out dispatcher. The caller only updates a small debounce map; all HTTP
@@ -350,6 +387,20 @@ impl NotificationDispatcher {
         body: impl Into<String>,
         account: NotificationAccount,
     ) -> bool {
+        self.send_custom_scoped(title, body, account, None)
+            .scheduled
+    }
+
+    /// Send custom re-authentication text to all Telegram channels, or one
+    /// explicitly selected command channel. The returned IDs are safe runtime
+    /// channel identities, never chat IDs or bot tokens.
+    pub fn send_custom_scoped(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        account: NotificationAccount,
+        only_channel_id: Option<&str>,
+    ) -> CustomDelivery {
         let event = NotificationEvent {
             level: NotificationLevel::Warn,
             category: "reauth".into(),
@@ -359,17 +410,25 @@ impl NotificationDispatcher {
             action_url: None,
             ts: crate::now_ms(),
         };
-        let mut scheduled = false;
+        let mut delivery = CustomDelivery::default();
         for (index, entry) in self.channels.iter().enumerate() {
             if !matches!(entry.config.format, WebhookFormat::Telegram)
+                || only_channel_id.is_some_and(|wanted| {
+                    entry.config.id.as_deref() != Some(wanted) || !entry.config.allow_commands
+                })
                 || !accepts(&entry.config, &event)
             {
                 continue;
             }
-            scheduled = true;
+            delivery.scheduled = true;
+            if entry.config.allow_commands {
+                if let Some(id) = entry.config.id.clone() {
+                    delivery.command_channel_ids.push(id);
+                }
+            }
             self.spawn_send(event.clone(), Some(index));
         }
-        scheduled
+        delivery
     }
 
     pub fn has_enabled_telegram(&self) -> bool {
@@ -383,6 +442,32 @@ impl NotificationDispatcher {
                         .iter()
                         .any(|category| category == "reauth"))
         })
+    }
+
+    pub fn has_command_channel(&self, channel_id: &str) -> bool {
+        self.channels.iter().any(|entry| {
+            matches!(entry.config.format, WebhookFormat::Telegram)
+                && entry.config.allow_commands
+                && entry.config.id.as_deref() == Some(channel_id)
+        })
+    }
+
+    /// Reply to one inbound Telegram control channel through the same
+    /// configured sendMessage transport used by outbound notifications.
+    pub async fn send_telegram_reply(&self, channel_id: &str, text: &str) -> Result<()> {
+        let Some(entry) = self.channels.iter().find(|entry| {
+            matches!(entry.config.format, WebhookFormat::Telegram)
+                && entry.config.allow_commands
+                && entry.config.id.as_deref() == Some(channel_id)
+        }) else {
+            return Err(anyhow!("telegram command channel is unavailable"));
+        };
+        match tokio::time::timeout(self.timeout, entry.channel.send_text(text)).await {
+            Ok(Ok(())) => Ok(()),
+            // The underlying HTTP error may contain the token-bearing URL.
+            Ok(Err(_)) => Err(anyhow!("telegram reply delivery failed")),
+            Err(_) => Err(anyhow!("telegram reply timed out")),
+        }
     }
 
     pub fn emit_test(&self, channel: Option<usize>, now_ms: i64) {
@@ -512,6 +597,7 @@ impl NotificationDispatcher {
                     "host": redacted_host(&entry.config.delivery_url()),
                     "bot_username": entry.config.bot_username,
                     "chat_id": entry.config.chat_id,
+                    "allow_commands": entry.config.allow_commands,
                     "supports_replies": entry.channel.supports_replies(),
                     "min_level": entry.config.min_level,
                     "categories": entry.config.categories,
@@ -618,6 +704,7 @@ mod tests {
             WebhookChannel::new(&channel).is_err(),
             "chat_id is required"
         );
+        assert!(!channel.allow_commands, "inbound commands default off");
     }
 
     struct CountingChannel(AtomicUsize);
@@ -702,5 +789,49 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(render_event(&events[0]).contains(first_verification_uri_complete));
         assert!(events[1].body.contains("code=second"));
+    }
+
+    struct TextChannel(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl NotificationChannel for TextChannel {
+        fn kind(&self) -> &str {
+            "test"
+        }
+
+        async fn send(&self, _: &NotificationEvent) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, text: &str) -> Result<()> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_uses_only_an_opted_in_control_channel() {
+        let channel = Arc::new(TextChannel(Mutex::new(Vec::new())));
+        let dispatcher = NotificationDispatcher::from_entries(
+            vec![ChannelEntry {
+                config: NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: WebhookFormat::Telegram,
+                    chat_id: Some("123".into()),
+                    allow_commands: true,
+                    ..Default::default()
+                },
+                channel: channel.clone(),
+            }],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        dispatcher
+            .send_telegram_reply("control", "pong")
+            .await
+            .unwrap();
+        assert_eq!(*channel.0.lock().unwrap(), ["pong"]);
+        assert!(dispatcher.send_telegram_reply("foreign", "nope").await.is_err());
     }
 }

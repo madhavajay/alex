@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -65,7 +67,34 @@ impl LoginSession {
 
 type SharedSession = Arc<Mutex<LoginSession>>;
 
-#[derive(Default)]
+pub type PasteCodeExchangeFuture = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+
+/// Exchange boundary for paste-mode sessions. Production delegates to the
+/// existing Anthropic OAuth exchange; tests can replace it without network.
+pub trait PasteCodeExchanger: Send + Sync {
+    fn exchange(
+        &self,
+        vault: Arc<Vault>,
+        verifier: String,
+        input: String,
+        account_name: String,
+    ) -> PasteCodeExchangeFuture;
+}
+
+struct ClaudePasteCodeExchanger;
+
+impl PasteCodeExchanger for ClaudePasteCodeExchanger {
+    fn exchange(
+        &self,
+        vault: Arc<Vault>,
+        verifier: String,
+        input: String,
+        account_name: String,
+    ) -> PasteCodeExchangeFuture {
+        Box::pin(async move { claude_exchange(&vault, &verifier, &input, &account_name).await })
+    }
+}
+
 pub struct LoginManager {
     sessions: Mutex<HashMap<String, SharedSession>>,
     /// Optional OAuth-host override for the Kimi device flow. `None` (the
@@ -73,6 +102,17 @@ pub struct LoginManager {
     /// `KIMI_*_OAUTH_HOST`/default at start time; tests set this to point the
     /// flow at a local mock without racing process-wide env vars.
     kimi_oauth_host: Option<String>,
+    paste_code_exchanger: std::sync::RwLock<Arc<dyn PasteCodeExchanger>>,
+}
+
+impl Default for LoginManager {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            kimi_oauth_host: None,
+            paste_code_exchanger: std::sync::RwLock::new(Arc::new(ClaudePasteCodeExchanger)),
+        }
+    }
 }
 
 fn random_id() -> String {
@@ -90,6 +130,16 @@ impl LoginManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             kimi_oauth_host: Some(host.into()),
+            paste_code_exchanger: std::sync::RwLock::new(Arc::new(ClaudePasteCodeExchanger)),
+        }
+    }
+
+    /// Replace the paste-code exchange implementation. The daemon uses this
+    /// seam for deterministic offline tests; normal construction keeps the
+    /// real Anthropic exchange.
+    pub fn set_paste_code_exchanger(&self, exchanger: Arc<dyn PasteCodeExchanger>) {
+        if let Ok(mut slot) = self.paste_code_exchanger.write() {
+            *slot = exchanger;
         }
     }
 
@@ -218,14 +268,30 @@ impl LoginManager {
                 session.mode
             );
         }
-        if session.phase != LoginPhase::Pending {
+        if session.expires_at_ms <= now_ms() {
+            bail!("unknown or expired login session");
+        }
+        if matches!(session.phase, LoginPhase::Done { .. }) {
             return Ok(session.snapshot());
         }
         let verifier = session
             .verifier
             .clone()
             .context("session has no verifier")?;
-        match claude_exchange(&vault, &verifier, input, &session.account_name).await {
+        let exchanger = self
+            .paste_code_exchanger
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        match exchanger
+            .exchange(
+                vault,
+                verifier,
+                input.to_string(),
+                session.account_name.clone(),
+            )
+            .await
+        {
             Ok(account_id) => session.phase = LoginPhase::Done { account_id },
             Err(e) => {
                 session.phase = LoginPhase::Failed {
