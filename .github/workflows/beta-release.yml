@@ -58,7 +58,7 @@ jobs:
 
   swift-test:
     needs: meta
-    runs-on: macos-14
+    runs-on: namespace-profile-mac-medium
     steps:
       - uses: actions/checkout@v4
         with:
