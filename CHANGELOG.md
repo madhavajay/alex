@@ -36,6 +36,37 @@ predate this file — see the git history and GitHub releases.
   the daemon is busy. Adopt `open_app` and a `remove_legacy_app` guard —
   thanks **@khoaguin** (#5).
 
+## [0.1.28-beta.3] - 2026-07-18
+
+### Fixed
+- **Telegram bot token now persists.** A config writer holding a stale copy of
+  the whole config (the Exo/Dario sections) could overwrite `config.toml` and
+  silently drop the notifications section — wiping your bot token and killing
+  all alerts (including the grok-expiry reauth). Every config write is now a
+  read-modify-write that can't drop another section, and a token is kept even
+  if the daemon momentarily can't reach Telegram to validate it.
+- **Kimi models reach every harness.** `kimi/k3` (and siblings) were filtered
+  out of harness model lists, and `alex connect kimi` crashed the request
+  ("network connection lost") because the daemon had no Kimi writer. Both fixed:
+  reconnect/refresh now lands `alex/kimi/k3` in pi, codex, grok, amp, claude,
+  and Kimi. *(Verified end-to-end: routes real completions through `kimi/k3`,
+  `claude-fable-5`, and `gpt-5.6` in both directions.)*
+- **Grok no longer shows fake usage.** The "120/120 · 5m tokens" was per-minute
+  API rate-limit headers masquerading as subscription usage; suppressed. Real
+  Grok credit usage renders as a bar.
+- **Kimi credit bars appear.** Fixed the usage window key + added Kimi to the
+  usage snapshot, with an on-demand probe so a freshly-added account shows bars
+  without waiting for the 15-minute heartbeat.
+- **Settings no longer freezes loading Credentials** — the pane did synchronous
+  disk I/O and per-cell date formatting on the main thread; now off-main with a
+  timeout.
+
+### Added
+- **Blue-green daemon restart (opt-in, for testing)** — launchd socket-activation
+  graceful restart with drain and a hard-restart fallback. Ships so it can be
+  exercised live; the fallback means a plist reject can never leave you with no
+  daemon.
+
 ## [0.1.28-beta.2] - 2026-07-18
 
 ### Added
