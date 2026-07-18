@@ -1,0 +1,53 @@
+# gitleaks config for Alex — extends the built-in ruleset with Alex's own
+# credential formats, and allowlists test fixtures / obvious placeholders so the
+# gate blocks REAL leaks without false-flagging example values.
+title = "Alex gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "alex-inbound-key"
+description = "Alexandria inbound API key (alx-)"
+regex = '''alx-[0-9a-f]{40,}'''
+keywords = ["alx-"]
+
+[[rules]]
+id = "alex-run-key"
+description = "Alexandria scoped run key (alxk-)"
+regex = '''alxk-[0-9a-f]{40,}'''
+keywords = ["alxk-"]
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token"
+regex = '''[0-9]{8,10}:AA[A-Za-z0-9_-]{32,}'''
+keywords = ["bot", ":AA"]
+
+[[rules]]
+id = "anthropic-oauth-token"
+description = "Claude / Anthropic OAuth access or refresh token"
+regex = '''sk-ant-(oat|ort)[0-9]{2}-[A-Za-z0-9_-]{80,}'''
+keywords = ["sk-ant-"]
+
+[allowlist]
+description = "Test fixtures, docs, and obvious placeholders"
+# Example/placeholder values used in tests and docs are not real secrets.
+paths = [
+  '''.*/tests/.*''',
+  '''.*_test\.rs''',
+  '''.*/testdata/.*''',
+  '''.*\.md''',
+]
+regexes = [
+  # Obvious placeholders / test doubles (short, xxx, example, redacted, repeated).
+  '''alx-x{8,}''',
+  '''alx-0{8,}''',
+  '''alx-[0-9a-f]{0,20}\b''',      # too-short to be a real 24-byte key
+  '''bot123:''',
+  '''<redacted>''',
+  '''REDACTED''',
+  '''example''',
+  '''your[-_]?token[-_]?here''',
+]
+stopwords = ["example", "placeholder", "redacted", "dummy", "sample", "test"]
