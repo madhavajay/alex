@@ -2475,7 +2475,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                     "codex is not installed",
                 );
             };
-            match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models) {
+            match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models).await
+            {
                 Ok(catalog) => Some(catalog),
                 Err(e) => {
                     return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -2758,7 +2759,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 );
             };
             let catalog =
-                match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models) {
+                match harness_connect::codex_model_catalog(std::path::Path::new(binary), &models)
+                    .await
+                {
                     Ok(catalog) => catalog,
                     Err(e) => {
                         return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())

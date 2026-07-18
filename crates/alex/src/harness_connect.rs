@@ -506,9 +506,11 @@ pub(crate) async fn connect_with_preminted_key(
         .timeout(Duration::from_secs(5))
         .build()?;
     let models = fetch_models_with_harness_key(&base_url, &client, &api_key).await?;
-    let codex_catalog = (harness == "codex")
-        .then(|| codex_model_catalog(binary, &models))
-        .transpose()?;
+    let codex_catalog = if harness == "codex" {
+        Some(codex_model_catalog(binary, &models).await?)
+    } else {
+        None
+    };
     let summary = write_preminted_connection(
         harness,
         config_dir,
@@ -901,36 +903,34 @@ async fn disconnect_pi(config: &Config, config_dir: Option<PathBuf>) -> Result<(
         return Ok(());
     }
 
-    let revoked;
+    let revoked = revoke_disconnected_harness_keys(config, "pi").await?;
+    println!("disconnected pi; revoked {revoked} harness key(s)");
+    Ok(())
+}
+
+async fn revoke_disconnected_harness_keys(config: &Config, harness: &str) -> Result<usize> {
     if daemon_health(config).await {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
-        revoked = match revoke_harness_keys(config, &client, "pi").await {
-            Ok(count) => count,
+        match revoke_harness_keys(config, &client, harness).await {
+            Ok(count) => Ok(count),
             Err(e) => {
                 // A reachable daemon may still belong to a different local
                 // profile/key (notably reset's isolated config). The local
-                // store is authoritative for the config we just removed, so
-                // revoke its scoped Pi keys instead of leaving a credential
-                // alive merely because that best-effort admin request failed.
+                // store is authoritative for the config we just removed.
                 eprintln!(
                     "{}",
                     ui::amber(&format!(
-                        "daemon key revocation failed ({e}); revoking local pi harness keys"
+                        "daemon key revocation failed ({e}); revoking local {harness} harness keys"
                     ))
                 );
-                revoke_local_harness_keys(config, "pi")?
+                revoke_local_harness_keys(config, harness)
             }
-        };
+        }
     } else {
-        // Keep the CLI disconnect path complete even while the daemon is
-        // stopped. This is also what lets `alex reset --harnesses --yes`
-        // safely rotate local_key afterwards.
-        revoked = revoke_local_harness_keys(config, "pi")?;
+        revoke_local_harness_keys(config, harness)
     }
-    println!("disconnected pi; revoked {revoked} harness key(s)");
-    Ok(())
 }
 
 fn revoke_local_harness_keys(config: &Config, harness: &str) -> Result<usize> {
@@ -978,7 +978,7 @@ async fn connect_claude(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    revoke_harness_keys(config, &client, "claude").await?;
+    revoke_stale_keys_best_effort(config, &client, "claude").await;
     let minted = mint_harness_key(config, &client, "claude").await?;
     let models = fetch_models(config, &client)
         .await
@@ -1029,26 +1029,7 @@ async fn disconnect_claude(config: &Config, config_dir: Option<PathBuf>) -> Resu
         return Ok(());
     }
 
-    let mut revoked = 0usize;
-    if daemon_health(config).await {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
-        match revoke_harness_keys(config, &client, "claude").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local Claude config, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
-    } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local Claude config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
-    }
+    let revoked = revoke_disconnected_harness_keys(config, "claude").await?;
     println!("disconnected claude; revoked {revoked} harness key(s)");
     Ok(())
 }
@@ -1080,7 +1061,7 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
     let available = fetch_models(config, &client)
         .await
         .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
-    let catalog = codex_model_catalog(&binary, &available)?;
+    let catalog = codex_model_catalog(&binary, &available).await?;
     let summary = write_codex_connection_with_capture(
         config_dir,
         normalized_base_url(config),
@@ -1130,26 +1111,7 @@ async fn disconnect_codex(config: &Config, config_dir: Option<PathBuf>) -> Resul
         return Ok(());
     }
 
-    let mut revoked = 0usize;
-    if daemon_health(config).await {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
-        match revoke_harness_keys(config, &client, "codex").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local codex config, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
-    } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local codex config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
-    }
+    let revoked = revoke_disconnected_harness_keys(config, "codex").await?;
     println!("disconnected codex; revoked {revoked} harness key(s)");
     Ok(())
 }
@@ -1223,26 +1185,7 @@ async fn disconnect_grok(config: &Config, config_dir: Option<PathBuf>) -> Result
         return Ok(());
     }
 
-    let mut revoked = 0usize;
-    if daemon_health(config).await {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
-        match revoke_harness_keys(config, &client, "grok").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local Grok config, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
-    } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local Grok config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
-    }
+    let revoked = revoke_disconnected_harness_keys(config, "grok").await?;
     println!("disconnected grok; revoked {revoked} harness key(s)");
     Ok(())
 }
@@ -1314,26 +1257,7 @@ async fn disconnect_kimi(config: &Config, config_dir: Option<PathBuf>) -> Result
         return Ok(());
     }
 
-    let mut revoked = 0usize;
-    if daemon_health(config).await {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
-        match revoke_harness_keys(config, &client, "kimi").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local Kimi config, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
-    } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local Kimi config, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
-    }
+    let revoked = revoke_disconnected_harness_keys(config, "kimi").await?;
     println!("disconnected kimi; revoked {revoked} harness key(s)");
     Ok(())
 }
@@ -1406,44 +1330,44 @@ async fn disconnect_amp(config: &Config, config_dir: Option<PathBuf>) -> Result<
         return Ok(());
     }
 
-    let mut revoked = 0usize;
-    if daemon_health(config).await {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
-        match revoke_harness_keys(config, &client, "amp").await {
-            Ok(count) => revoked = count,
-            Err(e) => eprintln!(
-                "{}",
-                ui::amber(&format!(
-                    "removed local Amp plugin, but could not revoke daemon keys: {e}"
-                ))
-            ),
-        }
-    } else {
-        eprintln!(
-            "{}",
-            ui::amber("removed local Amp plugin, but the daemon is unreachable; harness keys remain, rerun disconnect with the daemon up")
-        );
-    }
+    let revoked = revoke_disconnected_harness_keys(config, "amp").await?;
     println!("disconnected amp; revoked {revoked} harness key(s)");
     Ok(())
 }
 
-pub(crate) fn codex_model_catalog(binary: &Path, available: &[String]) -> Result<Value> {
-    let output = Command::new(binary)
-        .args(["debug", "models", "--bundled"])
-        .output()
-        .with_context(|| {
-            format!(
-                "could not read bundled model catalog from {}",
-                binary.display()
-            )
-        })?;
+pub(crate) async fn codex_model_catalog(binary: &Path, available: &[String]) -> Result<Value> {
+    codex_model_catalog_with_timeout(binary, available, Duration::from_secs(5)).await
+}
+
+async fn codex_model_catalog_with_timeout(
+    binary: &Path,
+    available: &[String],
+    timeout: Duration,
+) -> Result<Value> {
+    let binary = binary.to_path_buf();
+    let display = binary.display().to_string();
+    let output = match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            Command::new(binary)
+                .args(["debug", "models", "--bundled"])
+                .output()
+        }),
+    )
+    .await
+    {
+        Err(_) => bail!("timed out reading bundled model catalog from {display}"),
+        Ok(Err(e)) => return Err(e).context("Codex model catalog task failed"),
+        Ok(Ok(Err(e))) => {
+            return Err(e)
+                .with_context(|| format!("could not read bundled model catalog from {display}"))
+        }
+        Ok(Ok(Ok(output))) => output,
+    };
     if !output.status.success() {
         bail!(
             "`{} debug models --bundled` failed: {}",
-            binary.display(),
+            display,
             ui::truncate(&String::from_utf8_lossy(&output.stderr), 300)
         );
     }
@@ -5848,6 +5772,41 @@ mod tests {
         assert!(!summary.extension_path.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_disconnect_with_unreachable_daemon_revokes_local_harness_keys() {
+        let dir = tmpdir("claude-disconnect-daemon-down");
+        let mut config = test_config();
+        config.port = 0;
+        let store = alex_store::Store::open(config.data_dir.clone()).unwrap();
+        store
+            .insert_run_key(
+                "rk-claude-local",
+                "claude-local-key-hash",
+                "harness",
+                None,
+                Some(r#"{"harness":"claude"}"#),
+                Some("claude"),
+                1,
+                None,
+            )
+            .unwrap();
+        write_claude_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-claude-local".into(),
+            "alxk-claude-local".into(),
+            model_ids(),
+            Some("2.1.202".into()),
+        )
+        .unwrap();
+
+        disconnect_claude(&config, Some(dir)).await.unwrap();
+
+        assert!(store.list_run_keys(false).unwrap().is_empty());
+        assert_eq!(store.list_run_keys(true).unwrap()[0]["revoked"], true);
+    }
+
     #[test]
     fn claude_disconnect_cleans_persisted_alexandria_model_after_state_is_gone() {
         let dir = tmpdir("claude-stale-selection");
@@ -6253,8 +6212,8 @@ trust_level = "trusted"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn codex_catalog_preserves_native_and_adds_all_alexandria_models() {
+    #[tokio::test]
+    async fn codex_catalog_preserves_native_and_adds_all_alexandria_models() {
         let dir = tmpdir("codex-catalog");
         let binary = fake_executable(
             &dir,
@@ -6267,6 +6226,7 @@ fi"#,
         );
         let catalog =
             codex_model_catalog(&binary, &["gpt-5.6-luna".into(), "claude-opus-4-8".into()])
+                .await
                 .unwrap();
         let slugs: Vec<&str> = catalog["models"]
             .as_array()
@@ -6288,6 +6248,27 @@ fi"#,
             catalog["models"][3]["description"],
             "Routed through Alexandria: claude-opus-4-8"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_catalog_timeout_returns_an_error() {
+        let dir = tmpdir("codex-catalog-timeout");
+        let binary = fake_executable(&dir, "codex-slow-catalog", "sleep 2");
+        let started = std::time::Instant::now();
+
+        let err = codex_model_catalog_with_timeout(
+            &binary,
+            &["gpt-5.6-luna".into()],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("timed out reading bundled model catalog"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
