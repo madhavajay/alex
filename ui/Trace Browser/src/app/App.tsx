@@ -275,7 +275,7 @@ function SessionListPanel({ sessions, selectedId, onSelect }: {
     return true;
   });
 
-  const total = flattenSessions(sessions).length;
+  const total = sessions.length;
 
   return (
     <>

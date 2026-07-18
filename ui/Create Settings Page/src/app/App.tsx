@@ -60,31 +60,7 @@ function IconGrok({ size = 32 }: { size?: number }) {
   );
 }
 
-function IconGoose({ size = 32 }: { size?: number }) {
-  return (
-    <SvgIcon size={size} bg="#FF9F0A">
-      <svg width={size * 0.6} height={size * 0.6} viewBox="0 0 20 20" fill="none">
-        <ellipse cx="10" cy="13" rx="5" ry="4" fill="white" />
-        <ellipse cx="10" cy="8" rx="3.5" ry="3.5" fill="white" />
-        <path d="M13 7.5L17 6L14.5 9.5" fill="#FF9F0A" />
-        <circle cx="11.2" cy="7.2" r="0.9" fill="#1c1c1e" />
-      </svg>
-    </SvgIcon>
-  );
-}
 
-function IconHermes({ size = 32 }: { size?: number }) {
-  return (
-    <SvgIcon size={size} bg="#FFD60A">
-      <svg width={size * 0.55} height={size * 0.55} viewBox="0 0 18 18" fill="none">
-        <line x1="9" y1="3" x2="9" y2="15" stroke="#1c1c1e" strokeWidth="1.6" strokeLinecap="round" />
-        <path d="M5.5 5.5C5.5 5.5 7 8 9 6.5C11 5 12.5 7.5 12.5 7.5" stroke="#1c1c1e" strokeWidth="1.4" strokeLinecap="round" fill="none" />
-        <path d="M5.5 10C5.5 10 7 12.5 9 11C11 9.5 12.5 12 12.5 12" stroke="#1c1c1e" strokeWidth="1.4" strokeLinecap="round" fill="none" />
-        <path d="M7 3C7 3 6.5 2 9 1.5C11.5 2 11 3 11 3" stroke="#1c1c1e" strokeWidth="1.2" strokeLinecap="round" fill="none" />
-      </svg>
-    </SvgIcon>
-  );
-}
 
 // Map harness id → icon renderer
 function HarnessIconFor({ id, size = 32 }: { id: string; size?: number }) {
@@ -109,10 +85,6 @@ function HarnessIconFor({ id, size = 32 }: { id: string; size?: number }) {
       return <AssetIcon src={piIcon} bg="#09090b" size={size} />;
     case "grok":
       return <IconGrok size={size} />;
-    case "goose":
-      return <IconGoose size={size} />;
-    case "hermes":
-      return <IconHermes size={size} />;
     default:
       return (
         <SvgIcon size={size} bg="#2c2c2e">

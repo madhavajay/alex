@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// App-wide design tokens derived from the Trace Browser design spec
-/// (ui/Enhance Trace Browser UI). Dark-mode values match the mock exactly;
+/// (ui/Trace Browser). Dark-mode values match the mock exactly;
 /// colors map onto Apple dynamic system colors where they coincide so a
 /// light appearance resolves sensibly without a rewrite.
 enum AlexTheme {

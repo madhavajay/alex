@@ -215,8 +215,8 @@ const providerEntries: ProviderEntry[] = [
   {
     type: "bonded", name: "Codex", model: "codex", color: "blue", mode: "round-robin",
     slots: [
-      { email: "me@madhavajay.com", quotas: [{ label: "98%", pct: 98, timeLeft: "6d 14h" }, { label: "100%", pct: 100, timeLeft: "" }] },
-      { email: "madhava@openmined.org", quotas: [{ label: "94%", pct: 94, timeLeft: "6d 14h" }, { label: "100%", pct: 100, timeLeft: "" }] },
+      { email: "user@example.com", quotas: [{ label: "98%", pct: 98, timeLeft: "6d 14h" }, { label: "100%", pct: 100, timeLeft: "" }] },
+      { email: "work@example.com", quotas: [{ label: "94%", pct: 94, timeLeft: "6d 14h" }, { label: "100%", pct: 100, timeLeft: "" }] },
     ],
   },
   { type: "single", id: "grok", name: "Grok", model: "grok", color: "purple", quotas: [{ label: "100%", pct: 100, timeLeft: "" }] },
@@ -757,12 +757,12 @@ export default function App() {
           {accountsOpen && (
             <div className="pb-[4px] px-1">
               {([
-                { label: "Amp", email: "me@madhavajay.com" },
-                { label: "Claude", email: "me@madhavajay.com" },
-                { label: "Claude", email: "me@madhavajay.com" },
-                { label: "Codex", email: "madhava@openmined.org" },
+                { label: "Amp", email: "user@example.com" },
+                { label: "Claude", email: "user@example.com" },
+                { label: "Claude", email: "user@example.com" },
+                { label: "Codex", email: "work@example.com" },
                 { label: "OpenRouter", email: "api key" },
-                { label: "Grok", email: "me@madhavajay.com" },
+                { label: "Grok", email: "user@example.com" },
               ] as const).map((acc, i) => (
                 <button key={i} className="w-full flex items-center gap-[8px] px-3 py-[5px] hover:bg-white/[0.06] transition-colors rounded-[6px] group">
                   <ProviderIcon name={acc.label} size={13} health={healthOf(acc.label)} />

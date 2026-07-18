@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   LineChart,
   Line,
@@ -25,8 +25,8 @@ const ACCOUNTS_BY_PROVIDER: Record<string, Account[]> = {
     {
       id: "acc-1",
       provider: "Codex",
-      name: "madhavajay.com",
-      email: "me@madhavajay.com",
+      name: "example.com",
+      email: "user@example.com",
       identifier: "openai-south-acct-69f8bb482efe488",
       status: "Active",
       plan: "7d",
@@ -41,8 +41,8 @@ const ACCOUNTS_BY_PROVIDER: Record<string, Account[]> = {
     {
       id: "acc-2",
       provider: "Codex",
-      name: "madhave@openmined.org",
-      email: "madhave@openmined.org",
+      name: "work@example.com",
+      email: "work@example.com",
       identifier: "openai-south-acct-8ce6b4257f4dae35",
       status: "Active",
       plan: "7d",
@@ -60,7 +60,7 @@ const ACCOUNTS_BY_PROVIDER: Record<string, Account[]> = {
       id: "acc-3",
       provider: "Claude",
       name: "personal",
-      email: "me@madhavajay.com",
+      email: "user@example.com",
       identifier: "anthropic-acct-a1b2c3d4e5f6",
       status: "Active",
       plan: "30d",
@@ -345,7 +345,9 @@ export default function App() {
 
   const provider = PROVIDERS.find((p) => p.id === selectedProvider)!;
   const accounts = ACCOUNTS_BY_PROVIDER[selectedProvider] ?? [];
-  const chartData = generateChartData(timeRange);
+  // Regenerate only when the range changes — the data is Math.random-based,
+  // so calling it every render redraws the chart on any state change.
+  const chartData = useMemo(() => generateChartData(timeRange), [timeRange]);
   const isDirty = JSON.stringify(routingConfig) !== JSON.stringify(savedConfig);
 
   function updateRouting(patch: Partial<RoutingConfig>) {
