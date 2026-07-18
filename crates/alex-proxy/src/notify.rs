@@ -337,6 +337,54 @@ impl NotificationDispatcher {
         self.spawn_send(event, None);
     }
 
+    /// Send account-specific re-authentication text to enabled Telegram
+    /// channels without touching the normal event debounce map. Device-flow
+    /// URLs are single-use, so suppressing a newly-created login because an
+    /// older alert has the same title would strand the user with a stale link.
+    ///
+    /// Returns whether at least one Telegram delivery was scheduled. Other
+    /// channel formats deliberately keep using the fixed event vocabulary.
+    pub fn send_custom(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        account: NotificationAccount,
+    ) -> bool {
+        let event = NotificationEvent {
+            level: NotificationLevel::Warn,
+            category: "reauth".into(),
+            title: title.into(),
+            body: body.into(),
+            account,
+            action_url: None,
+            ts: crate::now_ms(),
+        };
+        let mut scheduled = false;
+        for (index, entry) in self.channels.iter().enumerate() {
+            if !matches!(entry.config.format, WebhookFormat::Telegram)
+                || !accepts(&entry.config, &event)
+            {
+                continue;
+            }
+            scheduled = true;
+            self.spawn_send(event.clone(), Some(index));
+        }
+        scheduled
+    }
+
+    pub fn has_enabled_telegram(&self) -> bool {
+        self.channels.iter().any(|entry| {
+            matches!(entry.config.format, WebhookFormat::Telegram)
+                && NotificationLevel::Warn >= entry.config.min_level
+                && (entry.config.categories.is_empty()
+                    || entry
+                        .config
+                        .categories
+                        .iter()
+                        .any(|category| category == "reauth"))
+        })
+    }
+
     pub fn emit_test(&self, channel: Option<usize>, now_ms: i64) {
         let dispatcher = self.clone();
         tokio::spawn(async move {
@@ -600,5 +648,59 @@ mod tests {
         dispatcher.emit(event());
         tokio::task::yield_now().await;
         assert_eq!(channel.0.load(Ordering::SeqCst), 1);
+    }
+
+    struct RecordingChannel(Mutex<Vec<NotificationEvent>>);
+
+    #[async_trait]
+    impl NotificationChannel for RecordingChannel {
+        fn kind(&self) -> &str {
+            "test"
+        }
+
+        async fn send(&self, event: &NotificationEvent) -> Result<()> {
+            self.0.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_telegram_text_is_never_debounced() {
+        let channel = Arc::new(RecordingChannel(Mutex::new(Vec::new())));
+        let dispatcher = NotificationDispatcher::from_entries(
+            vec![ChannelEntry {
+                config: NotificationChannelConfig {
+                    format: WebhookFormat::Telegram,
+                    chat_id: Some("123".into()),
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                },
+                channel: channel.clone(),
+            }],
+            Duration::from_secs(30 * 60),
+            Duration::from_secs(1),
+        );
+        let account = NotificationAccount {
+            provider: "xai".into(),
+            label: Some("work".into()),
+        };
+        let first_verification_uri_complete =
+            "https://auth.example.test/device?code=first";
+        assert!(dispatcher.send_custom(
+            "Grok needs re-authentication",
+            format!("Tap {first_verification_uri_complete}"),
+            account.clone(),
+        ));
+        assert!(dispatcher.send_custom(
+            "Grok needs re-authentication",
+            "Tap https://auth.example.test/device?code=second",
+            account,
+        ));
+        tokio::task::yield_now().await;
+
+        let events = channel.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(render_event(&events[0]).contains(first_verification_uri_complete));
+        assert!(events[1].body.contains("code=second"));
     }
 }

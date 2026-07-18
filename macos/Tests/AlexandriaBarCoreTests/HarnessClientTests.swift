@@ -55,6 +55,34 @@ import Testing
         #expect(login.userCode == "ABCD-EFGH")
     }
 
+    @Test func reauthNotificationPostsProviderAndAccount() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/reauth-notify")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["provider"] as? String == "xai")
+            #expect(json["account_id"] as? String == "xai-oauth-work")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"login_id":"login-fresh","provider":"xai","state":"pending","verification_uri_complete":"https://auth.example/device?code=fresh","notification_sent":true,"reused":false,"fallback":false}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let response = try await client.reauthNotify(
+            provider: "xai", accountId: "xai-oauth-work")
+        #expect(response.notificationSent)
+        #expect(response.loginId == "login-fresh")
+    }
+
     @Test func openRouterKeyPostsSecretAndAttributionInJSONBody() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/auth/openrouter-key")

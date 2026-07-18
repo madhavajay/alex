@@ -695,6 +695,22 @@ pub async fn codex_device_exchange_auto(
     save_auto_codex_account(vault, account).await
 }
 
+pub async fn codex_device_exchange_named(
+    vault: &Vault,
+    authorization_code: &str,
+    code_verifier: &str,
+    account_name: &str,
+) -> Result<String> {
+    let tokens = exchange_codex_tokens(
+        code_verifier,
+        authorization_code,
+        OPENAI_DEVICE_REDIRECT_URI,
+    )
+    .await?;
+    let account = codex_account_from_tokens(tokens).await;
+    save_named_login_account(vault, account, account_name).await
+}
+
 async fn codex_account_from_tokens(tokens: TokenResponse) -> Account {
     let account_id = tokens
         .id_token

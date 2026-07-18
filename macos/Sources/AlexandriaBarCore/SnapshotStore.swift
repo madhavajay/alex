@@ -37,6 +37,9 @@ public final class SnapshotStore {
     public private(set) var accountAnalytics: AccountAnalyticsResponse?
     public private(set) var codexRouting: CodexRoutingResponse?
     public private(set) var routingByProvider: [String: ProviderRoutingResponse] = [:]
+    public private(set) var exoConfig: ExoConfig?
+    public private(set) var exoStatus: ExoStatus?
+    public private(set) var exoModels: [ExoModel] = []
     public private(set) var dario: DarioStatus?
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
@@ -107,6 +110,9 @@ public final class SnapshotStore {
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
+            exoConfig = nil
+            exoStatus = nil
+            exoModels = []
             providerPauses = []
             lastError = "no config at ~/.alexandria/config.toml"
             return
@@ -128,6 +134,9 @@ public final class SnapshotStore {
             daemonUpdate = nil
             codexRouting = nil
             routingByProvider = [:]
+            exoConfig = nil
+            exoStatus = nil
+            exoModels = []
             providerPauses = []
             lastError = error.localizedDescription
             return
@@ -149,6 +158,9 @@ public final class SnapshotStore {
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnesses()
         async let recentSessionsR = try? client.traceSessions(since: "24h", limit: 12)
+        async let exoConfigR = try? client.exoConfig()
+        async let exoStatusR = try? client.exoStatus()
+        async let exoModelsR = try? client.exoModels()
 
         accounts = await accountsR ?? []
         healthAccounts = await healthR ?? []
@@ -177,6 +189,9 @@ public final class SnapshotStore {
         }
         routingByProvider = routings
         codexRouting = routings["openai"]
+        exoConfig = await exoConfigR
+        exoStatus = await exoStatusR
+        exoModels = await exoModelsR ?? []
         switch await darioR {
         case .fetched(let fetched):
             // A successful nil is the endpoint's explicit 404/disabled signal.
