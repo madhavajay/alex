@@ -105,6 +105,100 @@ mod kimi_subscription {
         unimplemented!("TODO: live Kimi usage — assert quota windows recorded");
     }
 }
+/// Live, env-gated harness↔provider interop e2e (opt-in). The PERMANENT offline
+/// gate for the empty-response regression lives in alex-core `translate` tests
+/// (`refusal_fixture_surfaces_nonempty_explanatory_completion`,
+/// `tool_call_fixture_preserves_tool_calls_and_is_untouched`,
+/// `normal_fixture_preserves_content_and_is_untouched`,
+/// `streaming_refusal_surfaces_nonempty_delta_and_done`,
+/// `harness_interop_tool_call_request_yields_usable_tool_call`,
+/// `harness_interop_refusal_request_is_usable_not_empty`) and runs every CI.
+///
+/// This leg replays a REALISTIC tool-call request — a system prompt, a
+/// `list_files` tool, and a "list the files in this directory" user turn —
+/// through a *running* Alex daemon and asserts the client-visible result is
+/// USABLE (a non-empty assistant message OR a tool_call OR a clear refusal
+/// message) and NEVER a silent empty 200 that makes the harness retry forever.
+///
+/// Needs a running `alex` daemon and real creds for the routed model. Run with:
+///   ALEX_LIVE_INTEROP=1 \
+///   ALEX_BASE_URL=http://127.0.0.1:4100 \
+///   ALEX_API_KEY=alx-local \
+///   ALEX_INTEROP_MODEL=claude-fable-5 \
+///   cargo test -p alex --test harness_matrix -- --ignored harness_interop_live
+mod harness_interop_live {
+    #[test]
+    #[ignore = "live: set ALEX_LIVE_INTEROP=1 (+ ALEX_BASE_URL/ALEX_API_KEY/ALEX_INTEROP_MODEL) against a running alex daemon"]
+    fn harness_interop_live_tool_call_is_usable_not_empty() {
+        if std::env::var("ALEX_LIVE_INTEROP").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping harness_interop_live: set ALEX_LIVE_INTEROP=1 plus \
+                 ALEX_BASE_URL / ALEX_API_KEY / ALEX_INTEROP_MODEL to run"
+            );
+            return;
+        }
+        let base =
+            std::env::var("ALEX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:4100".into());
+        let key = std::env::var("ALEX_API_KEY").unwrap_or_else(|_| "alx-local".into());
+        let model =
+            std::env::var("ALEX_INTEROP_MODEL").unwrap_or_else(|_| "claude-fable-5".into());
+
+        let request = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": "You are a coding agent. Use the provided tools."},
+                {"role": "user", "content": "list the files in this directory"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "description": "List files in a directory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }],
+            "tool_choice": "auto",
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("build client");
+        let resp = client
+            .post(format!(
+                "{}/v1/chat/completions",
+                base.trim_end_matches('/')
+            ))
+            .header("x-api-key", key)
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .expect("request to alex failed");
+        assert_eq!(resp.status().as_u16(), 200, "expected a 200 from alex");
+        let body: serde_json::Value = resp.json().expect("alex returned non-JSON");
+
+        // USABLE = a non-empty assistant message OR at least one tool_call.
+        // A refusal is surfaced as non-empty explanatory text, so it passes too.
+        // A silent empty 200 (the retry-loop bug) fails here.
+        let msg = &body["choices"][0]["message"];
+        let has_text = msg["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_tool_calls = msg["tool_calls"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty());
+        assert!(
+            has_text || has_tool_calls,
+            "alex returned an empty/unusable completion (the retry-loop bug): {body}"
+        );
+    }
+}
+
 harness_matrix!(
     gemini_install_and_model_roundtrip,
     gemini_subagent_lineage_detected,

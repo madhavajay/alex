@@ -8936,12 +8936,17 @@ async fn proxy(
         } else {
             serde_json::from_str(&text).ok()
         };
-        let Some(upstream_final) = upstream_final else {
+        let Some(mut upstream_final) = upstream_final else {
             let msg = "could not reassemble upstream response for translation";
             trace.error = Some(msg.to_string());
             finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
             return error_response(StatusCode::BAD_GATEWAY, msg);
         };
+        // A refusal / empty completion would otherwise translate to a silent
+        // empty 200 and make foreign harnesses retry-loop. Rewrite it into a
+        // clear, non-empty completion (and mark the trace) before translating to
+        // the client format; normal completions are left untouched.
+        surface_upstream_refusal(&mut trace, &mut upstream_final, plan.upstream_format);
         let out = match (target, plan.upstream_format) {
             (RespondAs::Gemini, "gemini") => upstream_final.clone(),
             (RespondAs::Anthropic, "gemini") => {
@@ -9270,6 +9275,37 @@ impl ErrorClass {
             Self::Other => "other",
         }
     }
+}
+
+/// Turn an upstream Anthropic *refusal* / empty completion into a clear,
+/// non-empty client message and mark the trace, without breaking the HTTP 200.
+///
+/// The upstream refusal arrives as a valid 200 whose content is empty (Claude
+/// declined). Passed through verbatim, a foreign harness (e.g. Kimi) sees an
+/// empty completion and retries forever. This rewrites `upstream_final` in place
+/// so every downstream translation renders the explanation, and records
+/// `error_kind = "upstream_refusal"` so it is visible in the trace browser.
+/// Returns `true` when it patched a refusal/empty completion.
+fn surface_upstream_refusal(
+    trace: &mut TraceRecord,
+    upstream_final: &mut Value,
+    upstream_format: &str,
+) -> bool {
+    // Refusals are an Anthropic-format concept and every refusing subscription
+    // model is dispatched as an Anthropic upstream, so the reassembled
+    // `upstream_final` is an Anthropic message here.
+    if upstream_format != "anthropic" {
+        return false;
+    }
+    let Some(reason) = alex_core::translate::neutralize_anthropic_refusal(upstream_final) else {
+        return false;
+    };
+    trace.error_kind = Some("upstream_refusal".into());
+    trace.error = Some(format!(
+        "upstream model refusal/empty completion surfaced to client: {reason}"
+    ));
+    trace.error_class = Some(ErrorClass::Other.as_str().into());
+    true
 }
 
 /// The sole error taxonomy used by trace storage and later substitution work.
@@ -11353,6 +11389,51 @@ mod tests {
         );
         assert_eq!(trace["error_kind"], "overloaded_error");
         assert_eq!(trace["error_class"], "capacity");
+    }
+
+    #[test]
+    fn upstream_refusal_is_surfaced_nonempty_and_marks_the_trace_on_a_200() {
+        let mut trace = TraceRecord::default();
+        // Anthropic refusal as reassembled from the upstream: empty content.
+        let mut upstream_final = json!({
+            "id": "msg_refusal",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        });
+
+        let patched = surface_upstream_refusal(&mut trace, &mut upstream_final, "anthropic");
+        assert!(patched, "a refusal must be surfaced");
+
+        // The completion now carries clear, non-empty text with a clean stop.
+        let text = upstream_final["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("declined"), "refusal text missing: {text}");
+        assert_eq!(upstream_final["stop_reason"], "end_turn");
+
+        // The trace is marked without pretending the HTTP request failed.
+        assert_eq!(trace.error_kind.as_deref(), Some("upstream_refusal"));
+        assert_eq!(trace.error_class.as_deref(), Some("other"));
+        assert!(trace.error.as_deref().unwrap().contains("refusal"));
+    }
+
+    #[test]
+    fn a_normal_completion_is_never_marked_as_a_refusal() {
+        let mut trace = TraceRecord::default();
+        let mut upstream_final = json!({
+            "id": "msg_ok",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        });
+        let before = upstream_final.clone();
+        let patched = surface_upstream_refusal(&mut trace, &mut upstream_final, "anthropic");
+        assert!(!patched);
+        assert_eq!(upstream_final, before, "normal completion must be untouched");
+        assert!(trace.error_kind.is_none());
     }
 
     #[test]
