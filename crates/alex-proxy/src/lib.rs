@@ -50,6 +50,7 @@ const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
+const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -1080,6 +1081,7 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
         .get(kimi_usage_url())
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/json")
+        .timeout(Duration::from_secs(15))
         .send()
         .await;
     match resp {
@@ -2854,6 +2856,7 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
         .header("accept", "application/json")
         .header("user-agent", "claude-cli/2.1.202 (external, cli)")
+        .timeout(Duration::from_secs(15))
         .send()
         .await;
     match result {
@@ -2946,6 +2949,7 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         .header("content-type", "application/json")
         .header("user-agent", "alexandria-amp-usage")
         .json(&body)
+        .timeout(Duration::from_secs(15))
         .send()
         .await;
     match result {
@@ -8474,26 +8478,22 @@ async fn proxy(
             None,
             Some(mode),
         )))
+    } else if let Some(value) = headers.get("x-alexandria-simulate-error") {
+        value.to_str().ok().map(|value| {
+            parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None, None))
+        })
     } else {
-        let pending_injection =
-            take_pending_injection(&state, trace.session_id.as_deref(), trace.run_id.as_deref());
-        headers
-            .get("x-alexandria-simulate-error")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None, None))
-            })
-            .or_else(|| {
-                pending_injection.map(|pending| {
-                    Ok((
-                        pending.fixture.status,
-                        pending.fixture.error_kind,
-                        Some(pending.fixture.body.into_bytes()),
-                        Some(pending.fixture.name),
-                        None,
-                    ))
-                })
-            })
+        take_pending_injection(&state, trace.session_id.as_deref(), trace.run_id.as_deref()).map(
+            |pending| {
+                Ok((
+                    pending.fixture.status,
+                    pending.fixture.error_kind,
+                    Some(pending.fixture.body.into_bytes()),
+                    Some(pending.fixture.name),
+                    None,
+                ))
+            },
+        )
     };
     if let Some(simulation) = simulation {
         if headers.get("x-alexandria-simulate-error").is_some()
@@ -8824,14 +8824,24 @@ async fn proxy(
                     up_headers.insert(name, value);
                 }
             }
-            let resp = match state
-                .http
-                .post(&plan.url)
-                .headers(up_headers)
-                .body(plan.body.clone())
-                .send()
-                .await
-            {
+            let resp = tokio::time::timeout(
+                UPSTREAM_RESPONSE_HEAD_TIMEOUT,
+                state
+                    .http
+                    .post(&plan.url)
+                    .headers(up_headers)
+                    .body(plan.body.clone())
+                    .send(),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "upstream response headers timed out after {}s",
+                    UPSTREAM_RESPONSE_HEAD_TIMEOUT.as_secs()
+                )
+            })
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("upstream request failed: {e}");
@@ -9894,11 +9904,11 @@ fn finalize_trace(
     upstream_body: Option<&[u8]>,
     resp_body: Option<&[u8]>,
 ) {
-    emit_reauth_notification(state, &trace);
     let store = &state.store;
     if let Some(resp) = resp_body {
         capture_response_error(&mut trace, resp);
     }
+    emit_reauth_notification(state, &trace);
     match store.write_body(&trace.id, "request.json", client_body) {
         Ok(p) => trace.req_body_path = Some(p),
         Err(e) => tracing::warn!("failed to write request body: {e}"),
@@ -13429,6 +13439,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simulate_error_header_does_not_consume_queued_injection() {
+        let state = test_state("simulate-error-preserves-injection");
+        let injected = admin_session_inject(
+            State(state.clone()),
+            Path("session-lab".into()),
+            axum::Json(json!({
+                "inline": {
+                    "provider": "openai",
+                    "status": 401,
+                    "error_kind": "authentication_error",
+                    "body": r#"{"error":{"type":"authentication_error","message":"queued"}}"#
+                }
+            })),
+        )
+        .await;
+        assert_eq!(injected.status(), StatusCode::CREATED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-session-id", HeaderValue::from_static("session-lab"));
+        headers.insert(
+            "x-alexandria-simulate-error",
+            HeaderValue::from_static("429:rate_limit_error"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.5","messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let (_, pending) =
+            response_json(admin_session_injections(State(state), Path("session-lab".into())).await)
+                .await;
+        assert_eq!(pending["injections"].as_array().unwrap().len(), 1);
+        assert_eq!(pending["injections"][0]["count"], 1);
+    }
+
+    #[tokio::test]
     async fn auth_protection_is_opt_in_and_uses_the_cross_provider_equivalency() {
         let state = test_state("auth-protection-equivalency");
         set_protection_policy(
@@ -14406,6 +14459,48 @@ mod tests {
             ..trace
         };
         assert!(reauth_notification_event(&state, &non_auth).is_none());
+    }
+
+    #[tokio::test]
+    async fn finalized_retained_401_emits_reauth_notification() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("finalized-401-reauth-notification");
+        state
+            .vault
+            .upsert(test_openai_account("retained-401"))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+        let trace = TraceRecord {
+            id: "retained-401".into(),
+            ts_request_ms: now_ms(),
+            account_id: Some("openai-oauth-retained-401".into()),
+            upstream_provider: Some("openai".into()),
+            upstream_format: Some("openai-chat".into()),
+            status: Some(401),
+            ..Default::default()
+        };
+
+        finalize_trace(
+            &state,
+            trace,
+            b"{}",
+            None,
+            Some(br#"{"error":{"type":"authentication_error","message":"token expired"}}"#),
+        );
+
+        let event = first_event(
+            &received,
+            "retained upstream 401 did not emit a reauth notification",
+        )
+        .await;
+        sink.abort();
+        assert_eq!(event["category"], "reauth");
+        assert_eq!(event["account"]["provider"], "openai");
+        assert_eq!(
+            state.store.get_trace("retained-401").unwrap().unwrap()["error_class"],
+            "auth"
+        );
     }
 
     #[tokio::test]
