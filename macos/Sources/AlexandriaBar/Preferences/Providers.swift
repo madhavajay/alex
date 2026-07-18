@@ -37,6 +37,9 @@ private enum ProvidersChartRange: String, CaseIterable {
 struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool) -> Void
+    /// Deep-link to another Preferences tab (used by "Add Exo", which is a local
+    /// cluster configured by endpoint URL rather than an OAuth/key login).
+    var onOpenSection: (PreferencesSection) -> Void = { _ in }
     @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
@@ -71,10 +74,23 @@ struct ProvidersPreferencesSection: View {
             })
     }
 
+    /// Providers that get a detail panel in the sidebar. Exo is intentionally
+    /// omitted: it is a local cluster with its own Preferences tab and no
+    /// per-account credentials, so it lives in the Add menu (deep-linking to
+    /// that tab) rather than as a usage/routing panel here.
     private var providers: [String] {
-        Array(Set(["anthropic", "openai", "gemini", "xai", "openrouter"] + store.accounts.map(\.provider))).sorted {
+        Array(Set(["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "amp"] + store.accounts.map(\.provider))).sorted {
             ProviderInfo.displayName($0) < ProviderInfo.displayName($1)
         }
+    }
+
+    /// Every provider the Add menu can start a setup flow for, in a stable
+    /// display order. Reconciled against `ProviderInfo.supportedProviders`
+    /// (+ kimi). Setup type varies by provider — see `addAccount`:
+    /// OAuth-login (anthropic/openai/gemini/xai/kimi), API-key or CLI import
+    /// (openrouter/amp), and local endpoint config (exo).
+    private var connectableProviders: [String] {
+        ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "amp", "exo"]
     }
 
     private var usageByAccount: [String: AccountUsage] {
@@ -85,8 +101,11 @@ struct ProvidersPreferencesSection: View {
     /// account id. Codex is the exception: its automatic identity flow gives
     /// each upstream account a distinct generated local id.
     private var addableProviders: [String] {
-        providers.filter {
-            $0 == "openai" || !ProviderPresentation.hasAccount(for: $0, in: store.accounts)
+        connectableProviders.filter {
+            // openai supports multiple accounts; exo is reconfigurable (no
+            // account concept). Everything else hides once it has an account.
+            $0 == "openai" || $0 == "exo"
+                || !ProviderPresentation.hasAccount(for: $0, in: store.accounts)
         }
     }
 
@@ -229,11 +248,19 @@ struct ProvidersPreferencesSection: View {
     }
 
     private func addAccount(_ provider: String) {
-        if ProviderInfo.usesAPIKeySheet(provider) {
+        switch provider {
+        case "exo":
+            // Local cluster: no login. Deep-link to its endpoint/config tab.
+            onOpenSection(.exo)
+        case _ where ProviderInfo.usesAPIKeySheet(provider):
+            // API-key providers (openrouter) capture a long-lived key.
             providerToAdd = provider
-        } else {
-            // OAuth providers capture their account email during login. The
-            // local account name remains the compatible default identifier.
+        default:
+            // OAuth-login providers (anthropic/openai/gemini/xai/kimi) run the
+            // device/browser auth flow; amp adopts its CLI credentials via the
+            // same window's import path. OAuth providers capture their account
+            // email during login; the local account name stays the compatible
+            // `default` identifier.
             onAuthenticate(provider, nil, provider == "openai")
         }
     }

@@ -115,7 +115,10 @@ struct PreferencesView: View {
                 case .general:
                     GeneralPreferencesPane(store: store)
                 case .providers:
-                    ProvidersPreferencesSection(store: store, onAuthenticate: onAuthenticate)
+                    ProvidersPreferencesSection(
+                        store: store,
+                        onAuthenticate: onAuthenticate,
+                        onOpenSection: { state.section = $0 })
                 case .harnesses:
                     HarnessesPreferencesSection(store: store)
                 case .credentials:

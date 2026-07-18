@@ -174,6 +174,9 @@ enum AlexTheme {
                 tinted(0xFF9F0A)
             case "xai", "grok":
                 tinted(0xFF453A)
+            case "kimi", "kimi-code":
+                // Kimi (Moonshot AI) ink-violet brand accent.
+                tinted(0x6C5CE7)
             case "openrouter":
                 tinted(0xFF6961)
             case "cursor":

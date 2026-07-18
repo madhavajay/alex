@@ -979,6 +979,7 @@ public enum ProviderInfo {
         case "xai": "Grok"
         case "gemini": "Gemini"
         case "amp": "Amp"
+        case "kimi": "Kimi"
         case "openrouter": "OpenRouter"
         case "exo": "Exo"
         default: provider.capitalized
@@ -991,6 +992,7 @@ public enum ProviderInfo {
         case "openai": "codex"
         case "xai": "grok"
         case "amp": "amp"
+        case "kimi": "kimi"
         default: provider
         }
     }
