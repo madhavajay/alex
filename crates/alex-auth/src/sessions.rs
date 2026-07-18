@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -97,6 +97,7 @@ impl PasteCodeExchanger for ClaudePasteCodeExchanger {
 
 pub struct LoginManager {
     sessions: Mutex<HashMap<String, SharedSession>>,
+    workers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Optional OAuth-host override for the Kimi device flow. `None` (the
     /// default, used in production) resolves the host via
     /// `KIMI_*_OAUTH_HOST`/default at start time; tests set this to point the
@@ -109,6 +110,7 @@ impl Default for LoginManager {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            workers: Mutex::new(HashMap::new()),
             kimi_oauth_host: None,
             paste_code_exchanger: std::sync::RwLock::new(Arc::new(ClaudePasteCodeExchanger)),
         }
@@ -129,6 +131,7 @@ impl LoginManager {
     fn with_kimi_oauth_host(host: impl Into<String>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            workers: Mutex::new(HashMap::new()),
             kimi_oauth_host: Some(host.into()),
             paste_code_exchanger: std::sync::RwLock::new(Arc::new(ClaudePasteCodeExchanger)),
         }
@@ -252,6 +255,17 @@ impl LoginManager {
         Some(snapshot)
     }
 
+    /// Abandon a login session and stop its background polling/callback task,
+    /// if it has one. Paste sessions have no worker and are simply forgotten.
+    pub async fn abandon(&self, login_id: &str) -> bool {
+        let removed_session = self.sessions.lock().await.remove(login_id).is_some();
+        let removed_worker = self.workers.lock().await.remove(login_id);
+        if let Some(worker) = removed_worker.as_ref() {
+            worker.abort();
+        }
+        removed_session || removed_worker.is_some()
+    }
+
     pub async fn complete(&self, vault: Arc<Vault>, login_id: &str, input: &str) -> Result<Value> {
         let session = self
             .sessions
@@ -353,7 +367,7 @@ impl LoginManager {
         let worker = shared.clone();
         let verifier = pkce.verifier;
         let account_name = account_name.to_string();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
             let phase =
                 match tokio::time::timeout(deadline, wait_for_openai_callback(&listener, &state))
@@ -376,6 +390,10 @@ impl LoginManager {
                 };
             worker.lock().await.phase = phase;
         });
+        self.workers
+            .lock()
+            .await
+            .insert(id.to_string(), worker_task);
         Ok(shared)
     }
 
@@ -410,7 +428,7 @@ impl LoginManager {
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let requested_account_name = account_name;
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let phase = match poll_device_flow(now_ms() + DEVICE_TTL_MS, start.interval_s, || {
                 codex_device_poll_once(&http, &start)
             })
@@ -443,6 +461,10 @@ impl LoginManager {
             };
             worker.lock().await.phase = phase;
         });
+        self.workers
+            .lock()
+            .await
+            .insert(id.to_string(), worker_task);
         Ok(shared)
     }
 
@@ -478,7 +500,7 @@ impl LoginManager {
         let worker = shared.clone();
         let verifier = pkce.verifier;
         let account_name = account_name.to_string();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
             let phase = match tokio::time::timeout(
                 deadline,
@@ -515,6 +537,10 @@ impl LoginManager {
             };
             worker.lock().await.phase = phase;
         });
+        self.workers
+            .lock()
+            .await
+            .insert(id.to_string(), worker_task);
         Ok(shared)
     }
 
@@ -551,7 +577,7 @@ impl LoginManager {
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let account_name = account_name.to_string();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let phase = match poll_device_flow(
                 now_ms() + start.expires_in * 1000,
                 start.interval.max(1) as u64,
@@ -572,6 +598,10 @@ impl LoginManager {
             };
             worker.lock().await.phase = phase;
         });
+        self.workers
+            .lock()
+            .await
+            .insert(id.to_string(), worker_task);
         Ok(shared)
     }
 
@@ -607,7 +637,7 @@ impl LoginManager {
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let account_name = account_name.to_string();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let phase = match poll_device_flow(
                 now_ms() + start.expires_in * 1000,
                 start.interval.max(1) as u64,
@@ -628,18 +658,30 @@ impl LoginManager {
             };
             worker.lock().await.phase = phase;
         });
+        self.workers
+            .lock()
+            .await
+            .insert(id.to_string(), worker_task);
         Ok(shared)
     }
 
     async fn prune(&self) {
         let now = now_ms();
-        self.sessions
-            .lock()
-            .await
-            .retain(|_, s| match s.try_lock() {
+        let active_ids: HashSet<String> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_, s| match s.try_lock() {
                 Ok(s) => s.expires_at_ms > now - SESSION_TTL_MS,
                 Err(_) => true,
             });
+            sessions.keys().cloned().collect()
+        };
+        self.workers.lock().await.retain(|id, worker| {
+            let active = active_ids.contains(id);
+            if !active {
+                worker.abort();
+            }
+            active
+        });
     }
 }
 
@@ -706,6 +748,22 @@ mod tests {
             snap["authorize_url"],
             "notification callers always receive one actionable URL field"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn abandon_removes_a_pending_paste_session() {
+        let (dir, vault) = temp_vault("abandon-paste");
+        let mgr = LoginManager::default();
+        let snap = mgr
+            .start_reauth(vault, "anthropic", "default")
+            .await
+            .unwrap();
+        let login_id = snap["login_id"].as_str().unwrap();
+
+        assert!(mgr.abandon(login_id).await);
+        assert!(mgr.status(login_id).await.is_none());
+        assert!(!mgr.abandon(login_id).await);
         std::fs::remove_dir_all(&dir).ok();
     }
 
