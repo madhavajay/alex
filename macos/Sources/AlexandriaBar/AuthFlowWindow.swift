@@ -9,6 +9,7 @@ final class AuthFlowModel {
     enum Stage: Equatable {
         case starting
         case awaiting
+        case pendingConflict
         case done(String)
         case failed(String)
     }
@@ -45,7 +46,7 @@ final class AuthFlowModel {
 
     var authorizeUrl: String? { session?.authorizeUrl }
 
-    func begin() {
+    func begin(force: Bool = false) {
         stage = .starting
         session = nil
         pasteInput = ""
@@ -60,16 +61,28 @@ final class AuthFlowModel {
                 let session = try await client.authLoginStart(
                     provider: ProviderInfo.loginArg(self?.provider ?? ""),
                     name: self?.accountName,
-                    autoIdentity: self?.autoIdentity ?? false)
+                    autoIdentity: self?.autoIdentity ?? false,
+                    force: force)
                 self?.sessionUpdated(session)
             } catch {
-                self?.stage = .failed(error.localizedDescription)
+                let message = error.localizedDescription
+                if message.localizedCaseInsensitiveContains("session")
+                    && message.localizedCaseInsensitiveContains("pending")
+                {
+                    self?.stage = .pendingConflict
+                } else {
+                    self?.stage = .failed(message)
+                }
             }
         }
     }
 
     private func sessionUpdated(_ session: LoginSession) {
         self.session = session
+        let accountId = store.accounts.first {
+            $0.provider == provider && $0.name == accountName
+        }?.id
+        store.rememberLoginSession(session, accountId: accountId, provider: provider)
         switch session.state {
         case "done":
             stage = .done(session.accountId ?? "")
@@ -413,11 +426,38 @@ struct AuthFlowView: View {
             AuthWaitingBox("Starting login session…")
         case .awaiting:
             awaiting
+        case .pendingConflict:
+            pendingConflictCard
         case .done:
             doneCard
         case .failed(let error):
             failedCard(error)
         }
+    }
+
+    private var pendingConflictCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("A re-authentication session is already pending. Overwrite it with a new one?")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            HStack(spacing: 8) {
+                Button("Overwrite") { model.begin(force: true) }
+                    .buttonStyle(AuthTintButtonStyle(accent: accent))
+                Button("Cancel") {
+                    model.cancel()
+                    close()
+                }
+                .buttonStyle(AuthFooterButtonStyle())
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(AlexTheme.Colors.warningOrange.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(AlexTheme.Colors.warningOrange.opacity(0.18)))
     }
 
     @ViewBuilder
@@ -691,7 +731,7 @@ final class AuthWindowController {
 
     func show(
         provider: String, accountName: String? = "default", autoIdentity: Bool = false,
-        store: SnapshotStore,
+        force: Bool = false, store: SnapshotStore,
         onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
     ) {
         let isAddingAccount = accountName == nil || autoIdentity
@@ -719,7 +759,7 @@ final class AuthWindowController {
         window.isReleasedWhenClosed = false
         window.center()
         windows[key] = window
-        model.begin()
+        model.begin(force: force)
         DockIconManager.shared.track(window)
         window.makeKeyAndOrderFront(nil)
     }
