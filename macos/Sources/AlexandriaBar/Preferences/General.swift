@@ -13,9 +13,14 @@ struct GeneralPreferencesPane: View {
     @AppStorage("notifyEnabled") private var notifyEnabled = true
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
+    // B2: default the picker to the channel this build actually follows. A
+    // pre-release build defaults to beta, so the UI never shows "Stable" while
+    // the updater is (correctly) checking the beta appcast. An explicit user
+    // choice persists and overrides this default.
     @AppStorage(UpdateChannelSetting.defaultsKey) private var updateChannel =
-        UpdateChannelSetting.stable.rawValue
-    @State private var selectedChannel = UpdateChannelSetting.stable.rawValue
+        UpdateChannelSetting.defaultChannel(forRunningVersion: PreferencesView.appVersion).rawValue
+    @State private var selectedChannel =
+        UpdateChannelSetting.defaultChannel(forRunningVersion: PreferencesView.appVersion).rawValue
     @State private var channelScope: UpdateChannelScope = .both
     @State private var showChannelScope = false
     /// The daemon's live channel; nil while unknown or the daemon is unreachable.

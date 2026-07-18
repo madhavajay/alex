@@ -1149,7 +1149,13 @@ fn default_update_check_hours() -> u64 {
 }
 
 fn default_update_channel() -> String {
-    "stable".into()
+    // B2: a pre-release daemon build (its own version carries `-beta`/`-rc`)
+    // defaults to the beta channel, so it checks the beta feed instead of
+    // comparing against the older latest *stable* and falsely reporting "up to
+    // date". A stable build still defaults to stable.
+    selfupdate::UpdateChannel::default_for_version(env!("CARGO_PKG_VERSION"))
+        .as_str()
+        .to_string()
 }
 
 fn default_upstream_stream_idle_timeout_seconds() -> u64 {
@@ -8405,6 +8411,46 @@ async fn wait_for_local_health(config: &Config) -> Result<bool> {
     .await)
 }
 
+/// B3 (launchd path): after a graceful drain, confirm the daemon now answering
+/// /health is the build this helper was launched from (`CARGO_PKG_VERSION`).
+/// A mismatch means launchd relaunched an old, pinned binary — surface it
+/// loudly. Non-fatal: the graceful/hard fallback stays in control, and this is
+/// only fully exercisable live on the Mac.
+async fn warn_if_served_version_mismatch(config: &Config) {
+    let target = env!("CARGO_PKG_VERSION");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let reported = match client
+        .get(format!("{}/health", config.base_url()))
+        .header("x-api-key", &config.local_key)
+        .send()
+        .await
+        .ok()
+    {
+        Some(response) => response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from)),
+        None => None,
+    };
+    match reported {
+        Some(version) if version.trim_start_matches('v') == target.trim_start_matches('v') => {}
+        Some(version) => eprintln!(
+            "warning: after restart the daemon reports version {version} but this build is {target}; \
+             launchd may be pinned to an old binary. Re-run `alex service restart` or reinstall."
+        ),
+        None => eprintln!(
+            "warning: could not read the daemon version from /health after restart to confirm it is {target}."
+        ),
+    }
+}
+
 async fn launchd_socket_activation_is_live(config: &Config) -> Result<bool> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -8521,6 +8567,8 @@ pub(crate) async fn restart_launchd_daemon(config: &Config, force: bool) -> Resu
         if !wait_for_local_health(config).await? {
             anyhow::bail!("replacement daemon did not become healthy before the timeout")
         }
+        // B3: warn (non-fatally) if launchd relaunched an old, pinned binary.
+        warn_if_served_version_mismatch(config).await;
         Ok(())
     }
     .await;
