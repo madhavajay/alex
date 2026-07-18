@@ -74,6 +74,7 @@ dependencies = [
  "alex-store",
  "alex-wrap",
  "anyhow",
+ "async-trait",
  "axum",
  "base64",
  "chrono",

@@ -418,9 +418,28 @@ enum ReauthLoginSlot {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AwaitingPasteCode {
+    login_id: String,
+    provider: Provider,
+    account_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AwaitingPasteLookup {
+    None,
+    Expired,
+    Pending(AwaitingPasteCode),
+}
+
 #[derive(Debug, Default)]
 struct ReauthLoginTracker {
     entries: HashMap<ReauthLoginKey, ReauthLoginSlot>,
+    /// At most one paste-code flow per command channel. Binding here, beside
+    /// the account/session dedupe state, prevents Telegram transport state
+    /// from becoming a second source of OAuth truth.
+    awaiting_paste: HashMap<String, AwaitingPasteCode>,
     next_generation: u64,
 }
 
@@ -478,6 +497,66 @@ impl ReauthLoginTracker {
         if self.entries.get(key) == Some(&ReauthLoginSlot::Starting(generation)) {
             self.entries.remove(key);
         }
+    }
+
+    fn bind_awaiting_paste(
+        &mut self,
+        channel_id: &str,
+        key: &ReauthLoginKey,
+        snapshot: &Value,
+        now_ms: i64,
+    ) -> bool {
+        if snapshot["mode"].as_str() != Some("paste")
+            || snapshot["state"].as_str() != Some("pending")
+        {
+            return false;
+        }
+        let Some(login_id) = snapshot["login_id"].as_str() else {
+            return false;
+        };
+        let expires_at_ms = snapshot["expires_at_ms"].as_i64().unwrap_or(now_ms);
+        if expires_at_ms <= now_ms {
+            self.awaiting_paste.remove(channel_id);
+            return false;
+        }
+        self.awaiting_paste.insert(
+            channel_id.to_string(),
+            AwaitingPasteCode {
+                login_id: login_id.to_string(),
+                provider: key.provider,
+                account_id: key.account_id.clone(),
+                expires_at_ms,
+            },
+        );
+        true
+    }
+
+    fn awaiting_paste(&mut self, channel_id: &str, now_ms: i64) -> AwaitingPasteLookup {
+        let Some(awaiting) = self.awaiting_paste.get(channel_id).cloned() else {
+            return AwaitingPasteLookup::None;
+        };
+        if awaiting.expires_at_ms <= now_ms {
+            self.awaiting_paste.remove(channel_id);
+            AwaitingPasteLookup::Expired
+        } else {
+            AwaitingPasteLookup::Pending(awaiting)
+        }
+    }
+
+    fn clear_awaiting_channel(&mut self, channel_id: &str, login_id: &str) {
+        if self
+            .awaiting_paste
+            .get(channel_id)
+            .is_some_and(|awaiting| awaiting.login_id == login_id)
+        {
+            self.awaiting_paste.remove(channel_id);
+        }
+    }
+
+    fn clear_account(&mut self, account_id: &str) {
+        self.entries.retain(|key, _| key.account_id != account_id);
+        self.awaiting_paste
+            .retain(|_, awaiting| awaiting.account_id != account_id);
     }
 }
 
@@ -1454,6 +1533,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/auth/reauth-notify",
             post(admin_auth_reauth_notify),
         )
+        .route("/admin/auth/reauth/code", post(admin_auth_reauth_code))
         .route(
             "/admin/auth/login/complete",
             post(admin_auth_login_complete),
@@ -1553,6 +1633,8 @@ struct NotificationChannelRequest {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
+    allow_commands: bool,
+    #[serde(default)]
     min_level: notify::NotificationLevel,
     #[serde(default)]
     categories: Vec<String>,
@@ -1614,6 +1696,7 @@ fn notification_channel_from_request(
             .chat_id
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().to_owned()),
+        allow_commands: request.allow_commands,
         min_level: request.min_level,
         categories: request.categories,
     })
@@ -2366,7 +2449,35 @@ async fn admin_auth_reauth_notify(
             "no matching managed OAuth account",
         );
     };
-    match start_reauth_and_notify(&state, provider, &account).await {
+    let channel_id = body.0["channel_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
+    let result = match channel_id {
+        Some(channel_id) => {
+            start_reauth_for_command(&state, provider, &account, channel_id).await
+        }
+        None => start_reauth_and_notify(&state, provider, &account).await,
+    };
+    match result {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_auth_reauth_code(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let (Some(channel_id), Some(input)) = (
+        body.0["channel_id"].as_str(),
+        body.0["input"].as_str(),
+    ) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'channel_id' or 'input'");
+    };
+    if channel_id.trim().is_empty() || input.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "channel_id and input must not be empty");
+    }
+    match complete_reauth_code(&state, channel_id, input).await {
         Ok(result) => axum::Json(result).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
     }
@@ -10347,9 +10458,13 @@ fn reauth_notify_result(
 fn reauth_session_is_reusable(snapshot: Option<&Value>) -> bool {
     let state = snapshot.and_then(|value| value["state"].as_str());
     // LoginManager owns the polling task and flips an expired session to
-    // `failed`. Treat it as active until that transition so a new provider
-    // flow never overlaps the old worker by a watchdog scheduling race.
-    state == Some("pending") || state == Some("done")
+    // `failed` for device flows. Paste flows have no worker, so also enforce
+    // the snapshot expiry here rather than reusing an expired authorization.
+    (state == Some("pending")
+        && snapshot
+            .and_then(|value| value["expires_at_ms"].as_i64())
+            .is_some_and(|expires_at| expires_at > now_ms()))
+        || state == Some("done")
 }
 
 /// Start (or reuse) the account's LoginManager session and put its fresh,
@@ -10361,17 +10476,48 @@ pub async fn start_reauth_and_notify(
     provider: Provider,
     account: &Account,
 ) -> std::result::Result<Value, String> {
+    start_reauth_inner(state, provider, account, None).await
+}
+
+/// Start or reuse a re-auth session for one command-enabled Telegram channel.
+/// The command reply carries the URL, so this path does not emit a duplicate
+/// notification. Paste-mode state is bound to `channel_id` before returning.
+pub async fn start_reauth_for_command(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+    channel_id: &str,
+) -> std::result::Result<Value, String> {
+    let allowed = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.has_command_channel(channel_id))
+        .unwrap_or(false);
+    if !allowed {
+        return Err("telegram command channel is not enabled".into());
+    }
+    start_reauth_inner(state, provider, account, Some(channel_id)).await
+}
+
+async fn start_reauth_inner(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+    command_channel_id: Option<&str>,
+) -> std::result::Result<Value, String> {
     if account.provider != provider || account.kind != "oauth" {
         return Err("re-authentication requires the matching managed OAuth account".into());
     }
-    let telegram_enabled = state
-        .notifications
-        .read()
-        .map(|notifications| notifications.has_enabled_telegram())
-        .unwrap_or(false);
-    if !telegram_enabled {
-        emit_plain_reauth_notification_for_account(state, account);
-        return Ok(reauth_notify_result(None, false, false, true));
+    if command_channel_id.is_none() {
+        let telegram_enabled = state
+            .notifications
+            .read()
+            .map(|notifications| notifications.has_enabled_telegram())
+            .unwrap_or(false);
+        if !telegram_enabled {
+            emit_plain_reauth_notification_for_account(state, account);
+            return Ok(reauth_notify_result(None, false, false, true));
+        }
     }
 
     let key = ReauthLoginKey {
@@ -10395,6 +10541,16 @@ pub async fn start_reauth_and_notify(
         }) => {
             let snapshot = state.logins.status(&login_id).await;
             if reauth_session_is_reusable(snapshot.as_ref()) {
+                if let (Some(channel_id), Some(snapshot)) =
+                    (command_channel_id, snapshot.as_ref())
+                {
+                    state.reauth_logins.lock().await.bind_awaiting_paste(
+                        channel_id,
+                        &key,
+                        snapshot,
+                        now_ms(),
+                    );
+                }
                 return Ok(reauth_notify_result(snapshot, false, true, false));
             }
             let mut tracker = state.reauth_logins.lock().await;
@@ -10454,38 +10610,137 @@ pub async fn start_reauth_and_notify(
         emit_plain_reauth_notification_for_account(state, account);
         return Err("login session omitted verification_uri_complete".into());
     };
+    if let Some(channel_id) = command_channel_id {
+        state.reauth_logins.lock().await.bind_awaiting_paste(
+            channel_id,
+            &key,
+            &snapshot,
+            now_ms(),
+        );
+        return Ok(reauth_notify_result(Some(snapshot), false, false, false));
+    }
+
     let label = reauth_account_label(account);
     let title = format!("{} needs re-authentication", provider.as_str());
-    let body = format!(
-        "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
-    );
+    let body = reauth_link_body(snapshot["mode"].as_str(), &label, url);
     let notification_account = notify::NotificationAccount {
         provider: provider.as_str().into(),
         label: Some(label),
     };
-    let notified = state
+    let delivery = state
         .notifications
         .read()
-        .map(|notifications| notifications.send_custom(title, body, notification_account))
-        .unwrap_or(false);
-    if !notified {
+        .map(|notifications| {
+            notifications.send_custom_scoped(title, body, notification_account, None)
+        })
+        .unwrap_or_default();
+    if snapshot["mode"].as_str() == Some("paste") {
+        let mut tracker = state.reauth_logins.lock().await;
+        for channel_id in &delivery.command_channel_ids {
+            tracker.bind_awaiting_paste(channel_id, &key, &snapshot, now_ms());
+        }
+    }
+    if !delivery.scheduled {
         emit_plain_reauth_notification_for_account(state, account);
     }
     Ok(reauth_notify_result(
         Some(snapshot),
-        notified,
+        delivery.scheduled,
         false,
-        !notified,
+        !delivery.scheduled,
     ))
 }
 
-async fn clear_active_reauth(state: &AppState, account_id: &str) {
-    state
+fn reauth_link_body(mode: Option<&str>, label: &str, url: &str) -> String {
+    if mode == Some("paste") {
+        format!(
+            "Tap this link to re-authenticate {label}:\n{url}\n\nAfter approving, paste the code#state here."
+        )
+    } else {
+        format!(
+            "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
+        )
+    }
+}
+
+/// Complete the paste-mode session bound to a command channel. The submitted
+/// code is passed directly to LoginManager and is never logged or persisted in
+/// the tracker. Failures keep the binding so a corrected code can be retried.
+pub async fn complete_reauth_code(
+    state: &Arc<AppState>,
+    channel_id: &str,
+    input: &str,
+) -> std::result::Result<Value, String> {
+    let allowed = state
+        .notifications
+        .read()
+        .map(|notifications| notifications.has_command_channel(channel_id))
+        .unwrap_or(false);
+    if !allowed {
+        return Err("telegram command channel is not enabled".into());
+    }
+
+    let awaiting = state
         .reauth_logins
         .lock()
         .await
-        .entries
-        .retain(|key, _| key.account_id != account_id);
+        .awaiting_paste(channel_id, now_ms());
+    let awaiting = match awaiting {
+        AwaitingPasteLookup::None => return Ok(json!({"awaiting": false})),
+        AwaitingPasteLookup::Expired => {
+            return Ok(json!({"awaiting": false, "expired": true}))
+        }
+        AwaitingPasteLookup::Pending(awaiting) => awaiting,
+    };
+
+    let snapshot = match state
+        .logins
+        .complete(state.vault.clone(), &awaiting.login_id, input)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .clear_awaiting_channel(channel_id, &awaiting.login_id);
+            return Ok(json!({"awaiting": false, "expired": true}));
+        }
+    };
+    if snapshot["state"].as_str() == Some("done") {
+        clear_active_reauth(state, &awaiting.account_id).await;
+        mark_account_needs_reauth(state, &awaiting.account_id, false).await;
+        return Ok(json!({
+            "awaiting": false,
+            "ok": true,
+            "provider": awaiting.provider.as_str(),
+        }));
+    }
+
+    let error = redacted_paste_error(snapshot["error"].as_str());
+    Ok(json!({
+        "awaiting": true,
+        "ok": false,
+        "provider": awaiting.provider.as_str(),
+        "error": error,
+    }))
+}
+
+fn redacted_paste_error(error: Option<&str>) -> &'static str {
+    match error.unwrap_or_default() {
+        value if value.contains("state mismatch") => {
+            "OAuth state mismatch; paste the complete code#state and try again"
+        }
+        value if value.contains("no authorization code") => {
+            "No authorization code found; paste the complete code#state and try again"
+        }
+        _ => "OAuth exchange failed; paste a fresh code#state and try again",
+    }
+}
+
+async fn clear_active_reauth(state: &AppState, account_id: &str) {
+    state.reauth_logins.lock().await.clear_account(account_id);
 }
 
 /// Grace period after `expires_at_ms` before the watchdog treats an idle token
@@ -10591,6 +10846,7 @@ async fn mark_account_needs_reauth(state: &AppState, account_id: &str, needs: bo
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn reauth_login_tracker_dedupes_pending_and_replaces_expired_session() {
@@ -10617,10 +10873,167 @@ mod tests {
     }
 
     #[test]
+    fn only_paste_mode_records_channel_awaiting_state() {
+        let key = ReauthLoginKey {
+            provider: Provider::Anthropic,
+            account_id: "anthropic-oauth-work".into(),
+        };
+        let mut tracker = ReauthLoginTracker::default();
+        let paste = json!({
+            "login_id": "paste-login",
+            "mode": "paste",
+            "state": "pending",
+            "expires_at_ms": 10_000,
+        });
+        assert!(tracker.bind_awaiting_paste("control", &key, &paste, 1_000));
+        assert!(matches!(
+            tracker.awaiting_paste("control", 1_000),
+            AwaitingPasteLookup::Pending(AwaitingPasteCode { login_id, .. })
+                if login_id == "paste-login"
+        ));
+
+        let device = json!({
+            "login_id": "device-login",
+            "mode": "device",
+            "state": "pending",
+            "expires_at_ms": 10_000,
+        });
+        assert!(!tracker.bind_awaiting_paste("device-control", &key, &device, 1_000));
+        assert_eq!(
+            tracker.awaiting_paste("device-control", 1_000),
+            AwaitingPasteLookup::None
+        );
+    }
+
+    #[test]
+    fn reauth_link_instructions_branch_without_changing_device_wording() {
+        let paste = reauth_link_body(Some("paste"), "work", "https://auth.test");
+        assert!(paste.contains("After approving, paste the code#state here."));
+        let device = reauth_link_body(Some("device"), "work", "https://auth.test");
+        assert!(device.contains(
+            "Alexandria is waiting for authorization and will finish automatically."
+        ));
+        assert!(!device.contains("code#state"));
+    }
+
+    struct RetryPasteExchange {
+        attempts: AtomicUsize,
+        inputs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl alex_auth::sessions::PasteCodeExchanger for RetryPasteExchange {
+        fn exchange(
+            &self,
+            _vault: Arc<Vault>,
+            _verifier: String,
+            input: String,
+            _account_name: String,
+        ) -> alex_auth::sessions::PasteCodeExchangeFuture {
+            self.inputs.lock().unwrap().push(input);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt == 0 {
+                    anyhow::bail!("token exchange failed: SECRET_RESPONSE_BODY")
+                }
+                Ok("anthropic-oauth-work".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_reauth_binds_channel_retries_redacted_and_clears_on_success() {
+        let state = test_state("telegram-paste-reauth");
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                "anthropic-oauth-work",
+                "work",
+                "work@example.test",
+                now_ms() - 1,
+            ))
+            .await
+            .unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    token: Some("123:test".into()),
+                    chat_id: Some("42".into()),
+                    allow_commands: true,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let exchanger = Arc::new(RetryPasteExchange {
+            attempts: AtomicUsize::new(0),
+            inputs: std::sync::Mutex::new(Vec::new()),
+        });
+        state
+            .logins
+            .set_paste_code_exchanger(exchanger.clone());
+        let account = state.vault.list().await.remove(0);
+
+        let started = start_reauth_for_command(
+            &state,
+            Provider::Anthropic,
+            &account,
+            "control",
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["mode"], "paste");
+        assert!(matches!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::Pending(_)
+        ));
+        assert!(
+            complete_reauth_code(&state, "foreign-channel", "stolen-code#state")
+                .await
+                .is_err(),
+            "a non-command channel must never reach LoginManager::complete"
+        );
+        assert!(exchanger.inputs.lock().unwrap().is_empty());
+
+        let failed = complete_reauth_code(&state, "control", "bad-code#state")
+            .await
+            .unwrap();
+        assert_eq!(failed["awaiting"], true);
+        assert!(!failed.to_string().contains("SECRET_RESPONSE_BODY"));
+
+        let completed = complete_reauth_code(&state, "control", "good-code#state")
+            .await
+            .unwrap();
+        assert_eq!(completed["ok"], true);
+        assert_eq!(completed["provider"], "anthropic");
+        assert_eq!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::None
+        );
+        assert_eq!(
+            *exchanger.inputs.lock().unwrap(),
+            ["bad-code#state", "good-code#state"]
+        );
+    }
+
+    #[test]
     fn reauth_session_retries_only_after_failure_or_expiry() {
-        let pending = json!({"state": "pending"});
+        let pending = json!({"state": "pending", "expires_at_ms": now_ms() + 60_000});
+        let expired = json!({"state": "pending", "expires_at_ms": now_ms() - 1});
         let failed = json!({"state": "failed"});
         assert!(reauth_session_is_reusable(Some(&pending)));
+        assert!(!reauth_session_is_reusable(Some(&expired)));
         assert!(!reauth_session_is_reusable(Some(&failed)));
         assert!(reauth_session_is_reusable(Some(&json!({"state": "done"}))));
     }
@@ -14713,6 +15126,7 @@ mod tests {
                     url: Some(format!("{url}?token=very-secret-webhook-token")),
                     token: None,
                     chat_id: None,
+                    allow_commands: false,
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),
@@ -14886,6 +15300,7 @@ mod tests {
                     url: None,
                     token: Some("123:secret".into()),
                     chat_id: Some("42".into()),
+                    allow_commands: false,
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),
@@ -14943,6 +15358,7 @@ mod tests {
                     url: None,
                     token: Some("bad-token".into()),
                     chat_id: Some("42".into()),
+                    allow_commands: false,
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),
