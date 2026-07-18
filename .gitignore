@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 .env
 .env.local
+
+# Crabbox failure-capture bundles (local diagnostics only)
+.crabbox/
