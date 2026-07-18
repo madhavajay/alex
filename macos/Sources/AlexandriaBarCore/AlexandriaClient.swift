@@ -341,6 +341,20 @@ public struct AlexandriaClient: Sendable {
         try await get("admin/update", as: DaemonUpdateStatus.self)
     }
 
+    /// The channel the daemon currently follows (config.toml `update_channel`).
+    public func daemonUpdateChannel() async throws -> DaemonChannelResponse {
+        try await get("admin/update/channel", as: DaemonChannelResponse.self)
+    }
+
+    /// Persists the daemon's release channel (`stable`/`beta`) and returns it
+    /// with the update availability recomputed against the new channel.
+    public func setDaemonUpdateChannel(_ channel: String) async throws -> DaemonChannelResponse {
+        let data = try await request(
+            "admin/update/channel", method: "POST",
+            body: body(["channel": channel]))
+        return try JSONDecoder().decode(DaemonChannelResponse.self, from: data)
+    }
+
     public func daemonUpdateApply() async throws -> DaemonUpdateApplyResponse {
         do {
             let data = try await request("admin/update", method: "POST")

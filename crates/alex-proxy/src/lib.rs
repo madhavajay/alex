@@ -246,6 +246,41 @@ pub trait DaemonUpdater: Send + Sync {
     fn apply(&self) -> UpdateApplyFuture;
 }
 
+pub type UpdateChannelSetFuture = Pin<
+    Box<dyn Future<Output = std::result::Result<SetChannelOutcome, UpdateChannelError>> + Send + 'static>,
+>;
+
+/// Outcome of persisting a new daemon update channel.
+#[derive(Debug, Clone)]
+pub struct SetChannelOutcome {
+    /// The channel that is now persisted (normalized: "stable" | "beta").
+    pub channel: String,
+    /// The daemon update status recomputed against the new channel, when it
+    /// could be checked. `None` when the check could not run (e.g. offline);
+    /// the channel is still persisted.
+    pub status: Option<Value>,
+}
+
+#[derive(Debug)]
+pub enum UpdateChannelError {
+    /// The requested channel is not a recognized value; maps to 400.
+    Invalid(String),
+    /// Persistence or another internal step failed; maps to 500.
+    Failed(String),
+}
+
+/// Reads and writes the persisted daemon update channel (config.toml
+/// `update_channel`). Injected by the binary so the proxy can hot-apply a
+/// channel change through the exact persistence the CLI `--set-channel` uses,
+/// without the proxy needing to know where config.toml lives. Keeping this the
+/// only writer path is what stops the app picker and the daemon from diverging.
+pub trait UpdateChannelController: Send + Sync {
+    /// The channel currently persisted in config.toml ("stable" | "beta").
+    fn current(&self) -> String;
+    /// Validate, persist, and recompute the update status against `channel`.
+    fn set(&self, channel: String) -> UpdateChannelSetFuture;
+}
+
 /// Shared request shape for the destructive reset control-plane operation.
 /// Omitted booleans are false; omitted `dry_run` is true.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -356,6 +391,7 @@ pub struct AppState {
     trace_ingest_lock: tokio::sync::Mutex<()>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
     pub daemon_updater: std::sync::RwLock<Option<Arc<dyn DaemonUpdater>>>,
+    update_channel_controller: std::sync::RwLock<Option<Arc<dyn UpdateChannelController>>>,
     pub reset_handler: std::sync::RwLock<Option<Arc<dyn ResetHandler>>>,
     pub plugins: Arc<PluginManager>,
     pub notifications: Arc<std::sync::RwLock<notify::NotificationDispatcher>>,
@@ -665,6 +701,7 @@ pub fn build_state_with_substitution(
         trace_ingest_lock: tokio::sync::Mutex::new(()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
         daemon_updater: std::sync::RwLock::new(None),
+        update_channel_controller: std::sync::RwLock::new(None),
         reset_handler: std::sync::RwLock::new(None),
         plugins: Arc::new(PluginManager::empty()),
         notifications: Arc::new(std::sync::RwLock::new(
@@ -953,6 +990,18 @@ pub fn set_daemon_updater(state: &Arc<AppState>, updater: Arc<dyn DaemonUpdater>
     }
 }
 
+/// Installs the daemon-owned control for reading and persisting the update
+/// channel. Shared with the CLI `--set-channel` path so the app picker and the
+/// daemon can never end up on different channels.
+pub fn set_update_channel_controller(
+    state: &Arc<AppState>,
+    controller: Arc<dyn UpdateChannelController>,
+) {
+    if let Ok(mut slot) = state.update_channel_controller.write() {
+        *slot = Some(controller);
+    }
+}
+
 pub fn set_reset_handler(state: &Arc<AppState>, handler: Arc<dyn ResetHandler>) {
     if let Ok(mut slot) = state.reset_handler.write() {
         *slot = Some(handler);
@@ -1094,6 +1143,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
         .route("/admin/update", get(admin_update).post(admin_update_apply))
+        .route(
+            "/admin/update/channel",
+            get(admin_update_channel).post(admin_update_channel_set),
+        )
         .route("/admin/dario", get(admin_dario))
         .route("/admin/dario/ping", post(admin_dario_ping))
         .route("/admin/dario/prompt-caches", get(admin_dario_prompt_caches))
@@ -2882,6 +2935,63 @@ async fn admin_update_apply(State(state): State<Arc<AppState>>) -> Response {
             (StatusCode::CONFLICT, axum::Json(body)).into_response()
         }
         Err(UpdateApplyError::Failed(message)) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &message)
+        }
+    }
+}
+
+async fn admin_update_channel(State(state): State<Arc<AppState>>) -> Response {
+    let controller = state
+        .update_channel_controller
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(controller) = controller else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "update channel control is unavailable",
+        );
+    };
+    axum::Json(json!({ "channel": controller.current() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct UpdateChannelRequest {
+    channel: String,
+}
+
+async fn admin_update_channel_set(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<UpdateChannelRequest>,
+) -> Response {
+    let controller = state
+        .update_channel_controller
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(controller) = controller else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "update channel control is unavailable",
+        );
+    };
+    match controller.set(body.channel).await {
+        Ok(outcome) => {
+            let mut response = json!({ "channel": outcome.channel });
+            if let Some(status) = outcome.status {
+                // Hot-apply: the next `/admin/update` reflects the new channel
+                // immediately, without waiting for the periodic background check.
+                *state.update_status.write().await = Some(status.clone());
+                if let (Some(obj), Value::Object(fields)) = (response.as_object_mut(), status) {
+                    obj.extend(fields);
+                }
+            }
+            axum::Json(response).into_response()
+        }
+        Err(UpdateChannelError::Invalid(message)) => {
+            error_response(StatusCode::BAD_REQUEST, &message)
+        }
+        Err(UpdateChannelError::Failed(message)) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &message)
         }
     }
@@ -11471,6 +11581,127 @@ mod tests {
             body["reason"],
             "alex is managed by Homebrew - run `brew upgrade alex`"
         );
+    }
+
+    /// Mirrors the binary's `ConfigUpdateChannelController`: rejects unknown
+    /// channels, persists the normalized value, and recomputes a status against
+    /// it. `beta` advertises an available update and `stable` does not, so a
+    /// test can prove the status is recomputed against the newly-set channel.
+    struct FakeChannelController {
+        channel: std::sync::Mutex<String>,
+    }
+
+    impl UpdateChannelController for FakeChannelController {
+        fn current(&self) -> String {
+            self.channel.lock().unwrap().clone()
+        }
+
+        fn set(&self, channel: String) -> UpdateChannelSetFuture {
+            let normalized = match channel.trim().to_ascii_lowercase().as_str() {
+                "" | "stable" => "stable".to_string(),
+                "beta" => "beta".to_string(),
+                other => {
+                    let message =
+                        format!("unknown update channel '{other}' (expected stable or beta)");
+                    return Box::pin(async move { Err(UpdateChannelError::Invalid(message)) });
+                }
+            };
+            *self.channel.lock().unwrap() = normalized.clone();
+            let update_available = normalized == "beta";
+            let status = json!({
+                "current": "0.1.0",
+                "latest": if update_available { "0.2.0-beta.1" } else { "0.1.0" },
+                "update_available": update_available,
+                "update_channel": normalized,
+                "checked_at_ms": 1,
+            });
+            Box::pin(async move {
+                Ok(SetChannelOutcome {
+                    channel: normalized,
+                    status: Some(status),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_update_channel_gets_sets_and_recomputes() {
+        let state = test_state("admin-update-channel");
+        set_update_channel_controller(
+            &state,
+            Arc::new(FakeChannelController {
+                channel: std::sync::Mutex::new("stable".into()),
+            }),
+        );
+
+        // GET reflects the initially persisted channel.
+        let (status, body) = response_json(admin_update_channel(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"], "stable");
+
+        // POST beta persists it and returns the recomputed availability.
+        let (status, body) = response_json(
+            admin_update_channel_set(
+                State(state.clone()),
+                axum::Json(UpdateChannelRequest {
+                    channel: "beta".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"], "beta");
+        assert_eq!(body["update_channel"], "beta");
+        assert_eq!(body["update_available"], true);
+
+        // GET now returns the persisted beta channel.
+        let (_status, body) = response_json(admin_update_channel(State(state.clone())).await).await;
+        assert_eq!(body["channel"], "beta");
+
+        // The hot-apply means /admin/update recomputed against beta.
+        let (status, body) = response_json(admin_update(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["update_channel"], "beta");
+        assert_eq!(body["update_available"], true);
+
+        // An invalid channel is rejected with 400 and does not change state.
+        let (status, body) = response_json(
+            admin_update_channel_set(
+                State(state.clone()),
+                axum::Json(UpdateChannelRequest {
+                    channel: "nightly".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown update channel"));
+
+        let (_status, body) = response_json(admin_update_channel(State(state)).await).await;
+        assert_eq!(body["channel"], "beta");
+    }
+
+    #[tokio::test]
+    async fn admin_update_channel_unconfigured_is_unavailable() {
+        let state = test_state("admin-update-channel-unset");
+        let (status, _) = response_json(admin_update_channel(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = response_json(
+            admin_update_channel_set(
+                State(state),
+                axum::Json(UpdateChannelRequest {
+                    channel: "beta".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

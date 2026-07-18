@@ -15,6 +15,13 @@ struct GeneralPreferencesPane: View {
     @AppStorage("terminalApp") private var terminalApp = "auto"
     @AppStorage(UpdateChannelSetting.defaultsKey) private var updateChannel =
         UpdateChannelSetting.stable.rawValue
+    @State private var selectedChannel = UpdateChannelSetting.stable.rawValue
+    @State private var channelScope: UpdateChannelScope = .both
+    @State private var showChannelScope = false
+    /// The daemon's live channel; nil while unknown or the daemon is unreachable.
+    @State private var daemonChannel: String?
+    @State private var applyingChannel = false
+    @State private var channelStatus: String?
     @State private var launchAtLogin = false
     @State private var copyingCredentials = false
     @State private var credentialCopyStatus: String?
@@ -43,8 +50,13 @@ struct GeneralPreferencesPane: View {
         .onAppear {
             launchAtLogin = LaunchAtLogin.isEnabled
             loadNetworkExposure()
+            selectedChannel = updateChannel
+            loadDaemonChannel()
         }
-        .onChange(of: store.config?.host) { loadNetworkExposure() }
+        .onChange(of: store.config?.host) {
+            loadNetworkExposure()
+            loadDaemonChannel()
+        }
     }
 
     private var paneHeader: some View {
@@ -112,20 +124,56 @@ struct GeneralPreferencesPane: View {
         SectionLabel(text: "Updates")
             .settingsSectionSpacing()
         SettingRow(label: "Release channel") {
-            Picker("", selection: $updateChannel) {
-                ForEach(UpdateChannelSetting.allCases, id: \.rawValue) { channel in
-                    Text(channel.label).tag(channel.rawValue)
+            HStack(spacing: 8) {
+                if applyingChannel { ProgressView().controlSize(.small) }
+                Picker("", selection: channelBinding) {
+                    ForEach(UpdateChannelSetting.allCases, id: \.rawValue) { channel in
+                        Text(channel.label).tag(channel.rawValue)
+                    }
                 }
-            }
-            .settingsPicker()
-            .onChange(of: updateChannel) {
-                NotificationCenter.default.post(
-                    name: UpdateChannelSetting.changedNotification, object: nil)
+                .settingsPicker()
+                .disabled(applyingChannel)
             }
         }
-        if UpdateChannelSetting.from(updateChannel) == .beta {
+        SettingCaption(channelStateSummary)
+        if let daemonChannel, daemonChannel != updateChannel {
+            PillButton(
+                title: "Sync daemon to \(UpdateChannelSetting.from(updateChannel).label)",
+                variant: .bordered, isEnabled: !applyingChannel && store.config != nil
+            ) {
+                applyDaemonChannel(updateChannel)
+            }
+            .help("The app and daemon are on different channels. This sets the daemon to match the app.")
+            .padding(.vertical, 6)
+        }
+        if showChannelScope {
+            SettingRow(
+                label: "Apply to",
+                hint: "Choose which side this channel change updates."
+            ) {
+                Picker("", selection: $channelScope) {
+                    ForEach(UpdateChannelScope.allCases, id: \.rawValue) { scope in
+                        Text(scope.label).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 220)
+                .disabled(applyingChannel)
+            }
+        }
+        Button(showChannelScope ? "Use one control for both" : "Set app and daemon individually") {
+            showChannelScope.toggle()
+            if !showChannelScope { channelScope = .both }
+        }
+        .buttonStyle(.link)
+        .font(.system(size: 11))
+        .padding(.vertical, 2)
+        if let channelStatus {
+            SettingCaption(channelStatus)
+        }
+        if UpdateChannelSetting.from(selectedChannel) == .beta {
             SettingCaption(
-                "Beta builds are pre-release test versions. When the matching final release ships, the app updates to it automatically. The daemon channel is set separately: alex update --set-channel beta.")
+                "Beta builds are pre-release test versions. When the matching final release ships, the app updates to it automatically. Picking a channel here sets both the app and the daemon by default, so `alex update` and the daemon offer the matching build.")
         }
 
         SectionLabel(text: "Notifications")
@@ -367,6 +415,87 @@ struct GeneralPreferencesPane: View {
                     ? "Could not restart the daemon service."
                     : result.combined
             }
+        }
+    }
+
+    // MARK: - Release channel
+
+    /// Drives the picker without firing on programmatic loads: only a user's
+    /// selection runs `applyChannel`, so opening the pane never re-POSTs.
+    private var channelBinding: Binding<String> {
+        Binding(
+            get: { selectedChannel },
+            set: { newValue in
+                selectedChannel = newValue
+                applyChannel(newValue)
+            }
+        )
+    }
+
+    /// Shows each side's channel so divergence (the original bug) is visible.
+    private var channelStateSummary: String {
+        let app = UpdateChannelSetting.from(updateChannel).label
+        let daemon = daemonChannel.map { UpdateChannelSetting.from($0).label } ?? "unknown"
+        return "App: \(app) · Daemon: \(daemon)"
+    }
+
+    private func loadDaemonChannel() {
+        guard let cfg = store.config else {
+            daemonChannel = nil
+            return
+        }
+        Task {
+            do {
+                daemonChannel = try await AlexandriaClient(config: cfg)
+                    .daemonUpdateChannel().channel
+            } catch {
+                daemonChannel = nil
+            }
+        }
+    }
+
+    /// Applies the picked channel to the app and/or the daemon per the current
+    /// scope. Default scope is `both`, so one selection keeps them in lockstep.
+    private func applyChannel(_ newValue: String) {
+        channelStatus = nil
+        if channelScope.appliesToApp, updateChannel != newValue {
+            updateChannel = newValue
+            NotificationCenter.default.post(
+                name: UpdateChannelSetting.changedNotification, object: nil)
+        }
+        if channelScope.appliesToDaemon {
+            applyDaemonChannel(newValue)
+        } else {
+            channelStatus =
+                "App set to \(UpdateChannelSetting.from(newValue).label). Daemon left unchanged."
+        }
+    }
+
+    private func applyDaemonChannel(_ newValue: String) {
+        guard let cfg = store.config else {
+            channelStatus = "Daemon unreachable — applied to the app only."
+            return
+        }
+        applyingChannel = true
+        Task {
+            do {
+                let response = try await AlexandriaClient(config: cfg)
+                    .setDaemonUpdateChannel(newValue)
+                daemonChannel = response.channel
+                let label = UpdateChannelSetting.from(response.channel).label
+                channelStatus = channelScope == .daemon
+                    ? "Daemon set to \(label)."
+                    : "App and daemon set to \(label)."
+                // Re-check so a now-available daemon update surfaces immediately.
+                await store.refresh()
+            } catch {
+                NSSound.beep()
+                let current = daemonChannel.map { UpdateChannelSetting.from($0).label }
+                    ?? "its current channel"
+                channelStatus =
+                    "Could not set the daemon channel. It stays on \(current)."
+            }
+            applyingChannel = false
         }
     }
 
