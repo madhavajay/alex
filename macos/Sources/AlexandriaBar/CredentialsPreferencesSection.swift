@@ -9,6 +9,7 @@ struct CredentialsPreferencesSection: View {
     let store: SnapshotStore
 
     @State private var credentials: CredentialsResponse?
+    @State private var config: DaemonConfig?
     @State private var isLoading = true
     @State private var loadError: String?
     @State private var label = ""
@@ -311,7 +312,6 @@ struct CredentialsPreferencesSection: View {
         }
     }
 
-    private var config: DaemonConfig? { store.config ?? DaemonDiscovery.load() }
     private var baseURL: String { config?.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? "Not configured" }
     private var openAIBaseURL: String { baseURL == "Not configured" ? baseURL : "\(baseURL)/v1" }
     private var activeCredential: String? { mintedKey?.key ?? config?.localKey }
@@ -348,11 +348,19 @@ struct CredentialsPreferencesSection: View {
         return tags.isEmpty ? "—" : tags.joined(separator: " · ")
     }
 
-    private func dateText(_ milliseconds: Int64) -> String {
+    // A fresh DateFormatter is one of the most expensive Foundation objects to
+    // allocate. The active-keys table is a non-lazy Grid that calls this up to
+    // three times per row, so allocating per cell froze the main thread as soon
+    // as more than a handful of run keys existed. Share one formatter instead.
+    nonisolated(unsafe) private static let keyDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .short
         formatter.timeStyle = .short
-        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000))
+        return formatter
+    }()
+
+    private func dateText(_ milliseconds: Int64) -> String {
+        Self.keyDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000))
     }
 
     private func optionalDateText(_ milliseconds: Int64?, never: String = "Never") -> String {
@@ -365,20 +373,56 @@ struct CredentialsPreferencesSection: View {
         actionStatus = status
     }
 
+    /// Resolves the daemon config without touching the filesystem on the main
+    /// actor. `DaemonDiscovery.load()` reads and parses config.toml synchronously;
+    /// running it inside the view body (as the old computed `config` property did)
+    /// put disk I/O on every render. Prefer the store's cached value, and only
+    /// fall back to a detached load when the store has not polled yet.
+    private func resolvedConfig() async -> DaemonConfig? {
+        if let config = store.config { return config }
+        return await Task.detached { DaemonDiscovery.load() }.value
+    }
+
     private func refresh() async {
         isLoading = true
         loadError = nil
         defer { isLoading = false }
-        guard let config else {
+        guard let config = await resolvedConfig() else {
             loadError = "No Alexandria daemon configuration was found."
             return
         }
+        self.config = config
+        let client = AlexandriaClient(config: config)
         do {
-            credentials = try await AlexandriaClient(config: config).credentials()
+            // Backstop above the client's own 5s/10s URLSession timeouts so a
+            // wedged daemon can never leave the pane spinning indefinitely.
+            credentials = try await Self.withLoadTimeout(seconds: 10) {
+                try await client.credentials()
+            }
         } catch is CancellationError {
             return
         } catch {
             loadError = error.localizedDescription
+        }
+    }
+
+    /// Races `operation` against a timeout so the load always resolves. Used as a
+    /// defensive backstop for the credential inventory fetch.
+    private static func withLoadTimeout<T: Sendable>(
+        seconds: Double,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw CredentialsLoadError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw CredentialsLoadError.timedOut
+            }
+            return result
         }
     }
 
@@ -416,6 +460,13 @@ struct CredentialsPreferencesSection: View {
         } catch {
             actionStatus = "Could not revoke the key: \(error.localizedDescription)"
         }
+    }
+}
+
+private enum CredentialsLoadError: LocalizedError {
+    case timedOut
+    var errorDescription: String? {
+        "The Alexandria daemon did not respond in time. It may be starting up or unreachable."
     }
 }
 
