@@ -1015,24 +1015,26 @@ struct ConfigExoPersister {
 
 impl alex_proxy::ExoConfigPersister for ConfigExoPersister {
     fn persist(&self, exo: &alex_proxy::ExoConfig) -> std::result::Result<(), String> {
-        let mut config = self
-            .config
-            .lock()
-            .map_err(|_| "daemon config lock is unavailable".to_string())?;
-        config.exo_url = exo.url.clone();
-        config.exo_enabled_models = exo.enabled_models.clone();
-        save_config(&config).map_err(|error| error.to_string())
+        let exo = exo.clone();
+        let fresh = update_config_on_disk(|config| {
+            config.exo_url = exo.url.clone();
+            config.exo_enabled_models = exo.enabled_models.clone();
+        })
+        .map_err(|error| error.to_string())?;
+        sync_shared_config(&self.config, fresh);
+        Ok(())
     }
 }
 
 impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
     fn persist(&self, policy: &alex_proxy::ProtectionPolicy) -> std::result::Result<(), String> {
-        let mut config = self
-            .config
-            .lock()
-            .map_err(|_| "daemon config lock is unavailable".to_string())?;
-        config.protection = policy.clone();
-        save_config(&config).map_err(|error| error.to_string())
+        let policy = policy.clone();
+        let fresh = update_config_on_disk(|config| {
+            config.protection = policy.clone();
+        })
+        .map_err(|error| error.to_string())?;
+        sync_shared_config(&self.config, fresh);
+        Ok(())
     }
 }
 
@@ -1045,14 +1047,15 @@ impl alex_proxy::NotificationConfigPersister for ConfigNotificationPersister {
         &self,
         settings: &alex_proxy::notify::NotificationSettings,
     ) -> std::result::Result<(), String> {
-        let mut config = self
-            .config
-            .lock()
-            .map_err(|_| "daemon config lock is unavailable".to_string())?;
-        config.notifications = settings.channels.clone();
-        config.notification_cooldown_seconds = settings.cooldown_seconds;
-        config.notification_timeout_seconds = settings.timeout_seconds;
-        save_config(&config).map_err(|error| error.to_string())
+        let settings = settings.clone();
+        let fresh = update_config_on_disk(|config| {
+            config.notifications = settings.channels.clone();
+            config.notification_cooldown_seconds = settings.cooldown_seconds;
+            config.notification_timeout_seconds = settings.timeout_seconds;
+        })
+        .map_err(|error| error.to_string())?;
+        sync_shared_config(&self.config, fresh);
+        Ok(())
     }
 }
 
@@ -1097,18 +1100,16 @@ impl alex_proxy::UpdateChannelController for ConfigUpdateChannelController {
         let config = self.config.clone();
         Box::pin(async move {
             // Parse first so an unknown value is a client error (400), then
-            // persist through the shared helper (a disk failure is a 500).
+            // persist through the read-modify-write helper (a disk failure is a
+            // 500). Reloading from disk before writing is what stops a channel
+            // save from clobbering a freshly-added notification token.
             let parsed = selfupdate::UpdateChannel::parse(&channel)
                 .map_err(|error| alex_proxy::UpdateChannelError::Invalid(error.to_string()))?;
-            {
-                let mut guard = config.lock().map_err(|_| {
-                    alex_proxy::UpdateChannelError::Failed(
-                        "daemon config lock is unavailable".to_string(),
-                    )
-                })?;
-                persist_update_channel(&mut guard, parsed)
-                    .map_err(|error| alex_proxy::UpdateChannelError::Failed(error.to_string()))?;
-            }
+            let fresh = update_config_on_disk(|config| {
+                config.update_channel = parsed.as_str().to_string();
+            })
+            .map_err(|error| alex_proxy::UpdateChannelError::Failed(error.to_string()))?;
+            sync_shared_config(&config, fresh);
             // Recompute the availability against the new channel so the next
             // `/admin/update` and the endpoint response reflect it. A failed
             // network check leaves the channel persisted and status unknown.
@@ -1526,6 +1527,62 @@ fn save_config_at(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Serializes every in-daemon config write so a read-modify-write can never be
+/// interleaved by a second writer (which would let two writers each serialize a
+/// stale whole-Config and drop each other's sections).
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Parse the current config.toml from disk without the create-if-missing /
+/// heal-rewrite side effects of `load_or_create_config`. Used by the
+/// read-modify-write helper so a persist always starts from the authoritative
+/// on-disk state rather than a possibly-stale in-memory snapshot.
+fn read_config_from_disk() -> Result<Config> {
+    let path = alexandria_home().join("config.toml");
+    if !path.exists() {
+        // No file yet (first run / tests that never saved): fall back to the
+        // normal loader, which creates a default config.toml.
+        return Ok(load_or_create_config()?.0);
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let mut config: Config = toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
+    config.heal();
+    Ok(config)
+}
+
+/// The single safe primitive for persisting one section of config.toml from the
+/// running daemon.
+///
+/// THE BUG THIS PREVENTS: `save_config` serializes the *whole* `Config`. Before
+/// this helper, several writers (the notification persister, the update-channel
+/// controller, the exo persister, the Dario repair path, the harness handlers)
+/// each held their own in-memory `Config` and wrote it wholesale. Any writer
+/// whose snapshot predated another section's save would clobber config.toml and
+/// silently drop that section — e.g. saving the update channel or exo settings
+/// wiped a freshly-added Telegram bot token, breaking every notification.
+///
+/// By reloading the latest config from disk, applying only the requested
+/// mutation, and writing it back under a process-wide lock, no write can ever
+/// lose a section it didn't touch. Returns the freshly-persisted `Config` so
+/// callers can re-sync any in-memory handle they keep for runtime reads.
+fn update_config_on_disk(mutate: impl FnOnce(&mut Config)) -> Result<Config> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut config = read_config_from_disk()?;
+    mutate(&mut config);
+    save_config(&config)?;
+    Ok(config)
+}
+
+/// Refresh a daemon-held `Arc<Mutex<Config>>` with the just-persisted config so
+/// any runtime reads through that handle (e.g. the update-channel loop) see the
+/// latest full state rather than the stale snapshot captured at startup.
+fn sync_shared_config(shared: &Arc<std::sync::Mutex<Config>>, fresh: Config) {
+    if let Ok(mut guard) = shared.lock() {
+        *guard = fresh;
+    }
+}
+
 fn set_daemon_host(config: &mut Config, address: &str) -> Result<bool> {
     let address = address.trim();
     address
@@ -1853,11 +1910,16 @@ impl DarioGlue {
             return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": null, "fixable": true, "message": "cannot find Claude Code — install claude or set dario_claude_bin"});
         };
         {
-            let mut config = self.config.lock().unwrap();
-            config.dario_node_path = Some(node.clone());
-            config.dario_claude_bin = Some(claude.clone());
-            if let Err(error) = save_config(&config) {
-                return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": claude, "fixable": true, "message": format!("found Dario runtimes but could not save config: {error}")});
+            let node = node.clone();
+            let claude = claude.clone();
+            match update_config_on_disk(|config| {
+                config.dario_node_path = Some(node.clone());
+                config.dario_claude_bin = Some(claude.clone());
+            }) {
+                Ok(fresh) => sync_shared_config(&self.config, fresh),
+                Err(error) => {
+                    return serde_json::json!({"fixed": false, "node_bin": node, "claude_bin": claude, "fixable": true, "message": format!("found Dario runtimes but could not save config: {error}")})
+                }
             }
         }
         if let Some(sup) = self.supervisor() {
@@ -2728,24 +2790,22 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 format!("unknown harness '{name}'"),
             );
         };
-        let (mut config, _) = match load_or_create_config() {
-            Ok(v) => v,
+        let remove = body.binary.is_none() && body.config_dir.is_none();
+        let HarnessOverrideBody { binary, config_dir } = body;
+        // Read-modify-write so writing one harness override never clobbers other
+        // config sections (e.g. the notifications a concurrent save just added).
+        let config = match update_config_on_disk(move |config| {
+            if remove {
+                config.harness_overrides.remove(&name);
+            } else {
+                config
+                    .harness_overrides
+                    .insert(name, HarnessOverride { binary, config_dir });
+            }
+        }) {
+            Ok(config) => config,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        if body.binary.is_none() && body.config_dir.is_none() {
-            config.harness_overrides.remove(&name);
-        } else {
-            config.harness_overrides.insert(
-                name,
-                HarnessOverride {
-                    binary: body.binary,
-                    config_dir: body.config_dir,
-                },
-            );
-        }
-        if let Err(e) = save_config(&config) {
-            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-        }
         match harness_connect::harness_status(&config, spec, None, true).await {
             Ok(status) => axum::Json(status).into_response(),
             Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -2790,7 +2850,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         let Some(spec) = harness_connect::spec_by_name(&name) else {
             return error(axum::http::StatusCode::NOT_FOUND, "unknown harness");
         };
-        let (mut config, _) = match load_or_create_config() {
+        let (config, _) = match load_or_create_config() {
             Ok(value) => value,
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
@@ -2818,11 +2878,15 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         if let Err(e) = result {
             return error(axum::http::StatusCode::BAD_REQUEST, e.to_string());
         }
-        config.harness_tool_capture.insert(name, body.enabled);
-        if let Err(e) = save_config(&config) {
+        let enabled = body.enabled;
+        // Read-modify-write so this tool-capture flag write can't drop another
+        // section (notifications, update channel, ...) from a stale snapshot.
+        if let Err(e) = update_config_on_disk(move |config| {
+            config.harness_tool_capture.insert(name, enabled);
+        }) {
             return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
-        axum::Json(serde_json::json!({"tool_capture_enabled": body.enabled})).into_response()
+        axum::Json(serde_json::json!({"tool_capture_enabled": enabled})).into_response()
     }
 
     axum::Router::new()
@@ -3127,7 +3191,9 @@ async fn main() -> Result<()> {
             alex_proxy::set_exo_config_persister(
                 &state,
                 Arc::new(ConfigExoPersister {
-                    config: Arc::new(std::sync::Mutex::new(config.clone())),
+                    // Share the one daemon config handle so every persister
+                    // mutates the same in-memory Config (no divergent clones).
+                    config: daemon_config.clone(),
                 }),
             );
             alex_proxy::set_fixture_dir(&state, config.data_dir.join("fixtures"));
@@ -11115,6 +11181,7 @@ local_key = "alx-test"
         let home = tmpdir("notification-config-persist");
         std::env::set_var("ALEXANDRIA_HOME", &home);
         let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        save_config(&config.lock().unwrap()).unwrap();
         let persister = ConfigNotificationPersister {
             config: config.clone(),
         };
@@ -11147,6 +11214,164 @@ local_key = "alx-test"
         let parsed: Config = toml::from_str(&raw).unwrap();
         assert!(parsed.notifications[0].token.is_none());
         std::env::remove_var("ALEXANDRIA_HOME");
+    }
+
+    fn telegram_channel(id: &str, token: &str) -> alex_proxy::notify::NotificationSettings {
+        alex_proxy::notify::NotificationSettings {
+            channels: vec![alex_proxy::notify::NotificationChannelConfig {
+                id: Some(id.into()),
+                format: alex_proxy::notify::WebhookFormat::Telegram,
+                token: Some(token.into()),
+                chat_id: Some("42".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    // The exact beta.2 regression: a user adds a Telegram bot token, then sets
+    // the update channel via the unified picker, and the token vanishes. The
+    // update-channel controller must persist the channel WITHOUT dropping the
+    // notifications section.
+    #[test]
+    fn setting_update_channel_preserves_telegram_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("channel-vs-notification");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        // Make the beta status probe fail fast (dead local port) so the
+        // controller's cosmetic update check never touches the real network.
+        std::env::set_var("ALEX_UPDATE_RELEASES_URL", "http://127.0.0.1:1/none");
+
+        // The daemon's single shared config handle.
+        let shared = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        save_config(&shared.lock().unwrap()).unwrap();
+
+        // 1) Save a Telegram channel with a token.
+        let notifications = ConfigNotificationPersister {
+            config: shared.clone(),
+        };
+        alex_proxy::NotificationConfigPersister::persist(
+            &notifications,
+            &telegram_channel("telegram-1", "123:secret"),
+        )
+        .unwrap();
+
+        // 2) Set the update channel to beta through the real controller.
+        let controller = ConfigUpdateChannelController {
+            config: shared.clone(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(alex_proxy::UpdateChannelController::set(
+            &controller,
+            "beta".into(),
+        ));
+        assert!(outcome.is_ok(), "channel set failed: {outcome:?}");
+
+        // 3) Reload config.toml from disk: BOTH sections must be present.
+        let (reloaded, _) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEX_UPDATE_RELEASES_URL");
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(reloaded.update_channel, "beta");
+        assert_eq!(
+            reloaded.notifications.len(),
+            1,
+            "update channel write dropped the notifications section"
+        );
+        assert_eq!(
+            reloaded.notifications[0].token.as_deref(),
+            Some("123:secret"),
+            "the Telegram bot token vanished after setting the update channel"
+        );
+    }
+
+    // Reproduces the underlying cause: two config persisters that hold SEPARATE
+    // `Arc<Mutex<Config>>` handles (as the exo persister did in beta.2). Saving
+    // one section from a handle that never saw the other section must not wipe
+    // it. Pre-fix this dropped the token; the read-modify-write persist keeps it.
+    #[test]
+    fn writer_with_separate_config_handle_does_not_drop_notifications() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("separate-handles");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+        save_config(&test_config(home.clone())).unwrap();
+
+        // Two independent handles — exactly the divergence that caused the bug.
+        let notif_config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        let exo_config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+
+        let notifications = ConfigNotificationPersister {
+            config: notif_config,
+        };
+        alex_proxy::NotificationConfigPersister::persist(
+            &notifications,
+            &telegram_channel("telegram-1", "123:secret"),
+        )
+        .unwrap();
+
+        // The exo persister's handle never saw the token, yet its save must not
+        // clobber it, because the write reloads the latest config from disk.
+        let exo = ConfigExoPersister { config: exo_config };
+        alex_proxy::ExoConfigPersister::persist(
+            &exo,
+            &alex_proxy::ExoConfig {
+                url: "http://exo.local".into(),
+                enabled_models: vec!["m".into()],
+            },
+        )
+        .unwrap();
+
+        let (reloaded, _) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert_eq!(reloaded.exo_url, "http://exo.local");
+        assert_eq!(
+            reloaded.notifications.len(),
+            1,
+            "exo write from a separate handle dropped the notifications section"
+        );
+        assert_eq!(
+            reloaded.notifications[0].token.as_deref(),
+            Some("123:secret")
+        );
+    }
+
+    // Fix #4: a token persisted to config.toml must be reloaded into the runtime
+    // dispatcher on (re)start, so notifications keep working after a restart.
+    #[test]
+    fn restart_reloads_persisted_notifications_into_dispatcher() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("restart-reload-notifications");
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+
+        // Persist a channel to disk (as a prior session would have).
+        let shared = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
+        save_config(&shared.lock().unwrap()).unwrap();
+        let notifications = ConfigNotificationPersister {
+            config: shared.clone(),
+        };
+        alex_proxy::NotificationConfigPersister::persist(
+            &notifications,
+            &telegram_channel("telegram-1", "123:secret"),
+        )
+        .unwrap();
+
+        // Simulate a restart: load config fresh and feed it to a new dispatcher
+        // exactly as the daemon startup does.
+        let (reloaded, _) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        let state = test_state("restart-reload-notifications-state");
+        alex_proxy::set_notifications(&state, reloaded.notification_settings());
+
+        let view = state.notifications.read().unwrap().admin_view();
+        let channels = view["channels"].as_array().unwrap();
+        assert_eq!(
+            channels.len(),
+            1,
+            "restart did not reload the persisted Telegram channel"
+        );
+        assert_eq!(channels[0]["id"], "telegram-1");
     }
 
     #[test]

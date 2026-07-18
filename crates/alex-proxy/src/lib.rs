@@ -1367,35 +1367,53 @@ fn telegram_endpoint(base: &str, token: &str, method: &str) -> String {
     format!("{}/bot{token}/{method}", base.trim_end_matches('/'))
 }
 
+/// Why a Telegram `getMe` probe failed. The distinction matters: a `Rejected`
+/// token is genuinely bad and must not be saved, but an `Unreachable` result
+/// only means the daemon could not talk to api.telegram.org right now, so a
+/// possibly-valid token must NOT be discarded over a transient network blip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramProbeError {
+    /// Reached Telegram, but it refused the token (e.g. HTTP 401 / `ok:false`).
+    Rejected,
+    /// Could not reach api.telegram.org at all (DNS/connect/transport error).
+    Unreachable,
+}
+
 async fn telegram_get_me(
     state: &AppState,
     token: &str,
-) -> std::result::Result<(String, String), ()> {
+) -> std::result::Result<(String, String), TelegramProbeError> {
     let base = state
         .telegram_base
         .read()
         .map(|base| base.clone())
         .unwrap_or_else(|_| "https://api.telegram.org".into());
+    // A send() failure is a transport problem (DNS/connect/timeout): the daemon
+    // never got an answer from Telegram, so we cannot conclude the token is bad.
     let response = state
         .http
         .get(telegram_endpoint(&base, token, "getMe"))
         .timeout(Duration::from_secs(8))
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| TelegramProbeError::Unreachable)?;
+    // From here on Telegram answered, so any failure is about the token itself.
     if !response.status().is_success() {
-        return Err(());
+        return Err(TelegramProbeError::Rejected);
     }
-    let body: Value = response.json().await.map_err(|_| ())?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| TelegramProbeError::Rejected)?;
     if body["ok"] != Value::Bool(true) {
-        return Err(());
+        return Err(TelegramProbeError::Rejected);
     }
     let username = body["result"]["username"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
     if username.is_empty() {
-        return Err(());
+        return Err(TelegramProbeError::Rejected);
     }
     let name = body["result"]["first_name"]
         .as_str()
@@ -1412,13 +1430,27 @@ async fn admin_notifications_save(
         Ok(channel) => channel,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
+    // On an unreachable Telegram we still persist the token (defence against
+    // losing a valid token during a network blip) and surface this warning.
+    let mut unreachable_warning: Option<&'static str> = None;
     if matches!(channel.format, notify::WebhookFormat::Telegram) {
         let token = channel.token.as_deref().expect("validated above");
         match telegram_get_me(&state, token).await {
             Ok((username, _)) => channel.bot_username = Some(username),
-            Err(()) => {
+            // A genuinely bad token: reject so the user fixes it now.
+            Err(TelegramProbeError::Rejected) => {
                 return axum::Json(json!({"ok": false, "error": "telegram validation failed"}))
                     .into_response()
+            }
+            // Could not reach api.telegram.org: do NOT drop a possibly-valid
+            // token. Save it unvalidated and tell the caller to check later.
+            Err(TelegramProbeError::Unreachable) => {
+                tracing::warn!(
+                    "telegram getMe could not reach api.telegram.org; saving channel unvalidated"
+                );
+                unreachable_warning = Some(
+                    "saved, but could not reach api.telegram.org to validate the token \u{2014} check the daemon's network",
+                );
             }
         }
     }
@@ -1455,7 +1487,11 @@ async fn admin_notifications_save(
         .map(|dispatcher| dispatcher.admin_view())
         .and_then(|view| view["channels"].as_array().cloned())
         .and_then(|channels| channels.into_iter().find(|saved| saved["id"] == id));
-    axum::Json(json!({"ok": true, "channel": view})).into_response()
+    let mut body = json!({"ok": true, "channel": view});
+    if let Some(warning) = unreachable_warning {
+        body["warning"] = json!(warning);
+    }
+    axum::Json(body).into_response()
 }
 
 async fn admin_notifications_delete(
@@ -1501,9 +1537,15 @@ async fn admin_notifications_validate(
             axum::Json(json!({"ok": true, "bot_username": bot_username, "bot_name": bot_name}))
                 .into_response()
         }
-        Err(()) => {
+        Err(TelegramProbeError::Rejected) => {
             axum::Json(json!({"ok": false, "error": "telegram validation failed"})).into_response()
         }
+        Err(TelegramProbeError::Unreachable) => axum::Json(json!({
+            "ok": false,
+            "unreachable": true,
+            "error": "could not reach api.telegram.org to validate the token",
+        }))
+        .into_response(),
     }
 }
 
@@ -13547,6 +13589,101 @@ mod tests {
         assert_eq!(
             chats["chats"][0],
             json!({"chat_id": "42", "chat_name": "Ops"})
+        );
+        stub.await.unwrap();
+    }
+
+    // Fix #3: a transport failure reaching api.telegram.org must NOT discard a
+    // possibly-valid token. The channel is saved (with a warning) instead of
+    // returning an error that loses the user's token.
+    #[tokio::test]
+    async fn telegram_save_persists_token_when_api_is_unreachable() {
+        let state = test_state("telegram-unreachable-save");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+        // Point validation at a dead local port so getMe cannot connect.
+        set_telegram_base(&state, "http://127.0.0.1:1");
+
+        let (status, saved) = response_json(
+            admin_notifications_save(
+                State(state.clone()),
+                axum::Json(NotificationChannelRequest {
+                    id: None,
+                    kind: None,
+                    format: notify::WebhookFormat::Telegram,
+                    url: None,
+                    token: Some("123:secret".into()),
+                    chat_id: Some("42".into()),
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            saved["ok"], true,
+            "an unreachable Telegram must not fail the save: {saved}"
+        );
+        assert!(
+            saved.get("warning").is_some(),
+            "expected an unvalidated-save warning: {saved}"
+        );
+        let persisted = persister.settings.lock().unwrap();
+        assert_eq!(persisted.len(), 1, "the channel must be persisted");
+        assert_eq!(
+            persisted[0].channels[0].token.as_deref(),
+            Some("123:secret"),
+            "the token was dropped on a transient network failure"
+        );
+    }
+
+    // A genuinely bad token (Telegram answers 401) must still be rejected so the
+    // user fixes it immediately rather than saving a broken channel.
+    #[tokio::test]
+    async fn telegram_save_rejects_bad_token_when_api_is_reachable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stub = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 1024];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let state = test_state("telegram-bad-token-save");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+        set_telegram_base(&state, format!("http://{address}"));
+
+        let (status, saved) = response_json(
+            admin_notifications_save(
+                State(state.clone()),
+                axum::Json(NotificationChannelRequest {
+                    id: None,
+                    kind: None,
+                    format: notify::WebhookFormat::Telegram,
+                    url: None,
+                    token: Some("bad-token".into()),
+                    chat_id: Some("42".into()),
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["ok"], false, "a bad token must be rejected: {saved}");
+        assert!(
+            persister.settings.lock().unwrap().is_empty(),
+            "a rejected token must not be persisted"
         );
         stub.await.unwrap();
     }
