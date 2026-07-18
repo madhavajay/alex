@@ -750,7 +750,22 @@ private struct SubscriptionAccountRow: View {
                 if account.paused {
                     StatusBadge(text: "Paused", tint: AlexTheme.Colors.warningOrange)
                 } else {
-                    StatusBadge(text: account.status.capitalized)
+                    // Reflect real probe health, not just credential presence: a
+                    // provider whose pings fail reads red here too, matching the
+                    // menu dot. `.unknown` (never probed / pre-health daemon)
+                    // falls back to the credential-presence status.
+                    switch account.healthState {
+                    case .authFailed:
+                        StatusBadge(text: "Re-auth", tint: AlexTheme.Colors.destructive)
+                    case .unreachable:
+                        StatusBadge(text: "Unreachable", tint: AlexTheme.Colors.destructive)
+                    case .degraded:
+                        StatusBadge(text: "Degraded", tint: AlexTheme.Colors.warningOrange)
+                    case .healthy:
+                        StatusBadge(text: "Active", tint: AlexTheme.Colors.success)
+                    case .unknown:
+                        StatusBadge(text: account.status.capitalized)
+                    }
                 }
                 Spacer()
             }
