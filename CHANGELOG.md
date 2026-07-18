@@ -36,6 +36,22 @@ predate this file — see the git history and GitHub releases.
   the daemon is busy. Adopt `open_app` and a `remove_legacy_app` guard —
   thanks **@khoaguin** (#5).
 
+## [0.1.28-beta.5] - 2026-07-18
+
+### Fixed
+- **Settings no longer hangs on the Credentials page.** The "Active keys" table
+  was a non-lazy `Grid` that laid out every row eagerly, freezing the main
+  thread for ~9s once enough run keys accumulated (every harness connect mints
+  one). Now a `LazyVStack` that only lays out visible rows.
+- **Telegram token no longer looks lost.** After saving, the notifications pane
+  now shows the saved chat + `✓ @yourbot` and a masked `•••` token (with a
+  Replace button) instead of a blank field — the token was always saved; the
+  API redacts it, and the empty field just read as data loss.
+
+### Changed
+- Kimi Code icon is used consistently — the provider/subscription icon now uses
+  the same logo as the harness (was a drawn "K" chip).
+
 ## [0.1.28-beta.4] - 2026-07-18
 
 ### Fixed — update reliability (the big one)
