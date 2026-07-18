@@ -717,6 +717,13 @@ run_dario_probe_cell() {
 
 run_dario_recover_cell() {
   in_only DARIO-RECOVER || return 0
+  # The pid comes from the daemon's admin JSON; against a remote daemon it
+  # belongs to the remote machine, and kill-ing it here would hit an arbitrary
+  # LOCAL process.
+  if [ "$REMOTE" = "1" ]; then
+    write_result DARIO-RECOVER SKIP 0 "remote daemon: refusing to kill a remote-reported pid locally"
+    return 0
+  fi
   if ! dario_active; then
     write_result DARIO-RECOVER SKIP 0 "dario unavailable"
     return 0

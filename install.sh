@@ -157,9 +157,9 @@ if [ "$UPGRADE" = "1" ]; then
     done
   fi
   say "◆ upgrade complete — old instance drains in-flight requests then exits"
-  anim_stop
+
   sleep 1
   curl -fsS --max-time 5 "http://$CHECK_HOST:$PORT/health" && echo
 fi
-anim_stop
+
 "$BIN" --version
