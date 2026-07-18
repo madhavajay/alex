@@ -599,3 +599,31 @@ under `--jobs` (default = CPU count). Target: `wire` < 30 s, `harness` < 3 min w
   `alexandria harness pack --help` work.
 - [ ] Live `npm pack` + Docker harness run not yet exercised (needs network + live
       proxy credentials).
+
+## 13. Backlog (harvested from stale root handoffs — verify still-open before starting)
+
+Salvaged from `fri.md` (2026-07-13 session handoff) and `CREDENTIALS.md` before those
+files were removed. OpenRouter shipped since, so it is intentionally omitted. Confirm each
+is still unimplemented against current `main` before picking it up.
+
+### Trace Browser / model UI
+- [ ] Trace Browser **Copy Path** button (copy a trace's stored body path). *(confirmed missing)*
+- [ ] Mark in-stream SSE `overloaded_error` events inside HTTP 200 streams as trace errors
+      (a 200 that streams an error should not read as success). *(verify — error classifier
+      already knows `overloaded_error`, but the in-200-stream case may be unhandled)*
+- [ ] Transcript **model-switch divider** (show where a session changed model mid-conversation).
+- [ ] Per-model harness show/hide.
+- [ ] Hide/alias unverified `gpt-5.5-codex` model IDs from the exposed catalog.
+
+### CLI
+- [ ] `alex doctor` — environment/health self-check command. *(confirmed missing)*
+
+### Credentials vault — remaining from the credentials plan (now `docs/credentials-plan.md`)
+- [ ] Token/dollar **budgets** per credential (per-day/week/month/lifetime) with auto-pause +
+      failover at threshold, and menu-bar budget alerts.
+- [ ] Per-credential **model allow-list** enforcement in the proxy.
+- [ ] Credentials tab full CRUD: edit name/description, **copy-secret / reveal**, per-provider
+      "copy env exports".
+- [ ] **Audit log** (minted / revoked / paused / budget-hit / refresh-failed, timestamped).
+- [ ] **Encrypted vault export/import** — groundwork for peer credential sync.
+- [ ] Per-account scheduled **heartbeat/health** coverage (last result per account, not per provider).
