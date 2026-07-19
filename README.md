@@ -178,6 +178,28 @@ pi --model alex/gpt-5.6-sol
 
 ## Compatibility
 
+### Providers & subscriptions
+
+Alex holds the credential, refreshes it, and routes traffic for each provider below. Subscription providers use your existing plan's OAuth login — no API key required.
+
+| Provider | Plan / auth | Status |
+| --- | --- | --- |
+| Anthropic (Claude) | Claude subscription OAuth | ✅ Supported |
+| OpenAI (Codex / ChatGPT) | ChatGPT subscription OAuth | ✅ Supported |
+| Google Gemini | Gemini CLI OAuth import | ✅ Supported |
+| xAI (Grok) | Grok CLI subscription login | ✅ Supported |
+| Moonshot (Kimi) | Kimi subscription | ✅ Supported |
+| OpenRouter | API key | ✅ Supported |
+| Exo | Local / LAN cluster (no auth) | ✅ Supported |
+| Amp | Amp CLI credentials | ✅ Supported |
+| Hugging Face | — | ⏳ Coming soon |
+| Meta (Llama) | — | ⏳ Coming soon |
+| Groq | — | ⏳ Coming soon |
+| LM Studio | — | ⏳ Coming soon |
+| AWS Bedrock | — | ⏳ Coming soon |
+| Ollama | — | ⏳ Coming soon |
+| Cursor | — | ⏳ Coming soon |
+
 ### API formats
 
 Alex translates requests, responses, and streaming events between the API format sent by the client and the provider selected by the model name.
