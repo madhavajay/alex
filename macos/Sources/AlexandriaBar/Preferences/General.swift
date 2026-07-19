@@ -8,6 +8,7 @@ import AlexandriaBarCore
 /// design spec): section labels + hairline-divided setting rows.
 struct GeneralPreferencesPane: View {
     let store: SnapshotStore
+    let onRunOnboarding: () -> Void
     @AppStorage("refreshSeconds") private var refreshSeconds: Double = 60
     @AppStorage("limitWarnPct") private var limitWarnPct: Double = 90
     @AppStorage("notifyEnabled") private var notifyEnabled = true
@@ -93,6 +94,17 @@ struct GeneralPreferencesPane: View {
 
     @ViewBuilder
     private var generalSections: some View {
+        SettingRow(
+            label: "Run Onboarding Tutorial",
+            hint: "Walk from your first provider through traces, credentials, notifications, and failover"
+        ) {
+            PillButton(
+                title: "Run Tutorial", variant: .solidAccent,
+                systemImage: "sparkles", action: onRunOnboarding)
+        }
+        .padding(.top, 12)
+        RowDivider()
+
         SectionLabel(text: "System")
             .settingsSectionSpacing()
         if LaunchAtLogin.available {

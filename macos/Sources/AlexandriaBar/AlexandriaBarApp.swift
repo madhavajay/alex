@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 body: "A fresh \(window) rate-limit window is available.")
         }
         store.startPolling()
+        statusController.showOnboardingIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

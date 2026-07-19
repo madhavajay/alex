@@ -10,6 +10,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var prefsController: PreferencesWindowController?
     private var traceBrowser: TraceBrowserWindowController?
     private var darioWindow: DarioWindowController?
+    private var onboardingWindow: OnboardingWindowController?
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
     private let geminiKeyWindow = GeminiKeyWindowController()
@@ -51,6 +52,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     func snapshotDidChange() {
         reconcileDaemonUpdateState()
         updateIcon()
+    }
+
+    func showOnboardingIfNeeded() {
+        guard UserDefaults.standard.object(
+            forKey: OnboardingModel.completedDefaultsKey) == nil else { return }
+        showOnboarding()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -924,9 +931,46 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 onOpenDario: { [weak self] in self?.openDario() },
                 onOpenTraceBrowser: { [weak self] query in
                     self?.openTraceBrowser(query: query)
-                })
+                },
+                onRunOnboarding: { [weak self] in self?.showOnboarding() })
         }
         prefsController?.show(section: section)
+    }
+
+    private func showOnboarding() {
+        if onboardingWindow == nil {
+            onboardingWindow = OnboardingWindowController(
+                store: store,
+                authenticate: { [weak self] provider, completion in
+                    guard let self else { return }
+                    if provider == "openrouter" || provider == "exo" {
+                        self.openPreferences(section: .providers)
+                        let name = ProviderInfo.displayName(provider)
+                        completion(.failure(NSError(
+                            domain: "Alex.Onboarding.ProviderSetup", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "\(name) uses its Settings setup instead of browser authentication. Complete it there, then skip this step to continue."])))
+                        return
+                    }
+                    self.authWindows.show(
+                        provider: provider,
+                        accountName: nil,
+                        autoIdentity: provider == "openai",
+                        store: self.store,
+                        onAuthenticated: { authenticatedProvider in
+                            completion(.success(authenticatedProvider))
+                        },
+                        onFailed: { message in
+                            completion(.failure(NSError(
+                                domain: "Alex.Onboarding.Authentication", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: message])))
+                        })
+                },
+                openTraceBrowser: { [weak self] query in
+                    self?.openTraceBrowser(query: query)
+                })
+        }
+        onboardingWindow?.show()
     }
 }
 

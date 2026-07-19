@@ -46,6 +46,19 @@ enum HarnessIconLoader {
         cache[file] = image
         return image
     }
+
+    /// Safe lookup for non-logo app artwork. Like `image(harness:tags:)`, a
+    /// missing SwiftPM bundle degrades to nil instead of trapping.
+    static func image(resource name: String, extension ext: String, subdirectory: String) -> NSImage? {
+        guard let url = resourceBundle?.url(
+            forResource: name, withExtension: ext, subdirectory: subdirectory),
+              let image = NSImage(contentsOf: url), image.isValid
+        else {
+            BarLog.warn(.ui, "app artwork unavailable: \(subdirectory)/\(name).\(ext)")
+            return nil
+        }
+        return image
+    }
 }
 
 @MainActor

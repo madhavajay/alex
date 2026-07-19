@@ -98,6 +98,11 @@ private struct RunKeysRemovedResponse: Decodable {
     let removed: Int
 }
 
+private struct ModelCatalogResponse: Decodable {
+    struct Model: Decodable { let id: String }
+    let data: [Model]
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -219,6 +224,11 @@ public struct AlexandriaClient: Sendable {
 
     public func health() async throws -> DaemonHealth {
         try await get("health", as: DaemonHealth.self)
+    }
+
+    /// Models exposed by the daemon to OpenAI-compatible clients.
+    public func modelCatalog() async throws -> [String] {
+        try await get("v1/models", as: ModelCatalogResponse.self).data.map(\.id)
     }
 
     /// Returns the daemon-generated shell exports used by `alex credentials`.

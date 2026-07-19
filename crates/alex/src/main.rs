@@ -832,14 +832,16 @@ enum TracesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Export traces as NDJSON (optionally with inlined base64 bodies)
+    /// Back up trace history and captured bodies to a .tar.gz archive (offline)
     Export {
-        #[command(flatten)]
-        filter: TraceFilterArgs,
+        path: PathBuf,
+        /// Replace an existing archive
         #[arg(long)]
-        bodies: bool,
-        #[arg(long)]
-        out: Option<PathBuf>,
+        force: bool,
+    },
+    /// Restore missing trace history and captured bodies from a backup (offline)
+    Import {
+        path: PathBuf,
     },
     /// List legacy orphan groups, or attach one group after explicit confirmation (offline)
     Reattach {
@@ -4168,12 +4170,11 @@ async fn main() -> Result<()> {
             Some(TracesCommand::Search { filter, json }) => {
                 traces_search_cmd(&config, &filter, json).await?;
             }
-            Some(TracesCommand::Export {
-                filter,
-                bodies,
-                out,
-            }) => {
-                traces_export_cmd(&config, &filter, bodies, out).await?;
+            Some(TracesCommand::Export { path, force }) => {
+                traces_backup_export_cmd(&config, &path, force)?;
+            }
+            Some(TracesCommand::Import { path }) => {
+                traces_backup_import_cmd(&config, &path)?;
             }
             Some(TracesCommand::Reattach {
                 orphan_account_id,
@@ -7502,43 +7503,282 @@ async fn traces_reattach_cmd(
     }
 }
 
-async fn traces_export_cmd(
-    config: &Config,
-    filter: &TraceFilterArgs,
-    bodies: bool,
-    out: Option<PathBuf>,
+const TRACE_BACKUP_FORMAT: &str = "alex-trace-backup";
+const TRACE_BACKUP_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceBackupManifest {
+    format: String,
+    version: u32,
+}
+
+fn trace_backup_temp_path(parent: &Path, label: &str) -> PathBuf {
+    parent.join(format!(
+        ".alex-trace-{label}-{}-{:08x}",
+        std::process::id(),
+        rand::thread_rng().gen::<u32>()
+    ))
+}
+
+fn write_trace_jsonl(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating temporary JSONL file {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    for row in rows {
+        serde_json::to_writer(&mut writer, row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn collect_trace_body_files(
+    root: &Path,
+    directory: &Path,
+    excluded: &[&Path],
+    files: &mut Vec<(PathBuf, PathBuf)>,
 ) -> Result<()> {
-    let (path, mut params) = match &filter.run_id {
-        Some(id) => {
-            let mut params: Vec<(&str, String)> = Vec::new();
-            if let Some(l) = filter.limit {
-                params.push(("limit", l.to_string()));
-            }
-            (format!("/traces/runs/{id}/export.ndjson"), params)
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if excluded.iter().any(|excluded| path == **excluded) {
+            continue;
         }
-        None => ("/traces/export.ndjson".to_string(), filter.query_params()),
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_trace_body_files(root, &path, excluded, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("body path escaped {}", root.display()))?;
+            files.push((path.clone(), Path::new("bodies").join(relative)));
+        } else {
+            bail!("refusing to archive non-file body path {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) -> Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    if destination.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to replace it",
+            destination.display()
+        );
+    }
+    let parent = destination.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let store = Store::open(config.data_dir.clone())?;
+    let rows = store.export_trace_backup_rows()?;
+    let staging = trace_backup_temp_path(&config.data_dir, "export-rows");
+    let temporary_archive = trace_backup_temp_path(parent, "export.tar.gz.tmp");
+    std::fs::create_dir_all(&staging)?;
+
+    let result = (|| -> Result<(usize, u64)> {
+        let traces_jsonl = staging.join("traces.jsonl");
+        let tool_calls_jsonl = staging.join("tool_calls.jsonl");
+        let heartbeats_jsonl = staging.join("heartbeats.jsonl");
+        write_trace_jsonl(&traces_jsonl, &rows.traces)?;
+        write_trace_jsonl(&tool_calls_jsonl, &rows.tool_calls)?;
+        write_trace_jsonl(&heartbeats_jsonl, &rows.heartbeats)?;
+
+        let mut body_files = Vec::new();
+        collect_trace_body_files(
+            &config.data_dir.join("bodies"),
+            &config.data_dir.join("bodies"),
+            &[destination, &temporary_archive],
+            &mut body_files,
+        )?;
+        body_files.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let file = std::fs::File::create(&temporary_archive).with_context(|| {
+            format!("creating temporary archive {}", temporary_archive.display())
+        })?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let manifest = serde_json::to_vec(&TraceBackupManifest {
+            format: TRACE_BACKUP_FORMAT.into(),
+            version: TRACE_BACKUP_VERSION,
+        })?;
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(manifest.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+        archive.append_path_with_name(&traces_jsonl, "traces.jsonl")?;
+        archive.append_path_with_name(&tool_calls_jsonl, "tool_calls.jsonl")?;
+        archive.append_path_with_name(&heartbeats_jsonl, "heartbeats.jsonl")?;
+        for (source, archive_path) in &body_files {
+            archive.append_path_with_name(source, archive_path)?;
+        }
+        archive.finish()?;
+        let encoder = archive.into_inner()?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+        Ok((body_files.len(), std::fs::metadata(&temporary_archive)?.len()))
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging);
+    let (body_files, archive_bytes) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_archive);
+            return Err(error);
+        }
     };
-    if bodies {
-        params.push(("bodies", "1".into()));
-    }
-    let resp = daemon_get(config, &path, &params).await?;
-    let text = resp.text().await?;
-    let count = text.lines().filter(|l| !l.trim().is_empty()).count();
-    match out {
-        Some(dest) => {
-            if let Some(parent) = dest.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+    std::fs::rename(&temporary_archive, destination).with_context(|| {
+        format!("moving completed archive to {}", destination.display())
+    })?;
+    println!(
+        "exported {} traces, {} tool calls, {} heartbeats, {} body files to {} ({})",
+        rows.traces.len(),
+        rows.tool_calls.len(),
+        rows.heartbeats.len(),
+        body_files,
+        destination.display(),
+        ui::human_bytes(archive_bytes)
+    );
+    Ok(())
+}
+
+fn safe_trace_archive_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn read_trace_jsonl(path: &Path, label: &str) -> Result<Vec<serde_json::Value>> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    reader
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line?;
+            if line.trim().is_empty() {
+                bail!("{label} contains an empty JSONL row at line {}", index + 1);
             }
-            std::fs::write(&dest, &text)?;
-            eprintln!("wrote {count} traces to {}", dest.display());
+            serde_json::from_str(&line)
+                .with_context(|| format!("invalid JSON in {label} at line {}", index + 1))
+        })
+        .collect()
+}
+
+fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::collections::HashSet;
+
+    let store = Store::open(config.data_dir.clone())?;
+    let staging = trace_backup_temp_path(&config.data_dir, "import");
+    std::fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<(alex_store::TraceImportCounts, u64, u64)> {
+        let file = std::fs::File::open(source)
+            .with_context(|| format!("opening trace backup {}", source.display()))?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let mut seen = HashSet::new();
+        for entry in archive.entries().context("reading gzip tar archive")? {
+            let mut entry = entry.context("reading tar entry")?;
+            let path = entry.path().context("reading tar entry path")?.into_owned();
+            if !safe_trace_archive_path(&path) || !seen.insert(path.clone()) {
+                bail!("invalid or duplicate archive path {}", path.display());
+            }
+            let root = path.components().next().and_then(|component| match component {
+                std::path::Component::Normal(value) => value.to_str(),
+                _ => None,
+            });
+            let known_root_file = matches!(
+                path.to_str(),
+                Some("manifest.json" | "traces.jsonl" | "tool_calls.jsonl" | "heartbeats.jsonl")
+            );
+            let is_body = root == Some("bodies") && path.components().count() > 1;
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_dir() {
+                if root != Some("bodies") {
+                    bail!("unexpected directory in trace backup: {}", path.display());
+                }
+                std::fs::create_dir_all(staging.join(&path))?;
+                continue;
+            }
+            if !entry_type.is_file() || (!known_root_file && !is_body) {
+                bail!("unexpected entry in trace backup: {}", path.display());
+            }
+            let destination = staging.join(&path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut output = std::fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
         }
-        None => {
-            print!("{text}");
-            eprintln!("wrote {count} traces to stdout");
+
+        for required in ["manifest.json", "traces.jsonl", "tool_calls.jsonl", "heartbeats.jsonl"] {
+            if !seen.contains(Path::new(required)) {
+                bail!("trace backup is missing {required}");
+            }
         }
-    }
+        let manifest: TraceBackupManifest = serde_json::from_reader(std::fs::File::open(
+            staging.join("manifest.json"),
+        )?)
+        .context("invalid trace backup manifest")?;
+        if manifest.format != TRACE_BACKUP_FORMAT || manifest.version != TRACE_BACKUP_VERSION {
+            bail!(
+                "unsupported trace backup format/version: {}/{}",
+                manifest.format,
+                manifest.version
+            );
+        }
+        let rows = alex_store::TraceBackupRows {
+            traces: read_trace_jsonl(&staging.join("traces.jsonl"), "traces.jsonl")?,
+            tool_calls: read_trace_jsonl(&staging.join("tool_calls.jsonl"), "tool_calls.jsonl")?,
+            heartbeats: read_trace_jsonl(&staging.join("heartbeats.jsonl"), "heartbeats.jsonl")?,
+        };
+        let counts = store.import_trace_backup_rows(&rows)?;
+
+        let mut bodies_imported = 0u64;
+        let mut bodies_skipped = 0u64;
+        let staged_bodies = staging.join("bodies");
+        let mut body_files = Vec::new();
+        collect_trace_body_files(&staged_bodies, &staged_bodies, &[], &mut body_files)?;
+        for (staged, relative) in body_files {
+            let destination = config.data_dir.join(&relative);
+            if destination.exists() {
+                bodies_skipped += 1;
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&staged, &destination).with_context(|| {
+                format!("restoring body file {}", destination.display())
+            })?;
+            bodies_imported += 1;
+        }
+        Ok((counts, bodies_imported, bodies_skipped))
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    let (counts, bodies_imported, bodies_skipped) = result?;
+    println!(
+        "imported {} traces, {} tool calls, {} heartbeats, {} body files; skipped {} traces, {} tool calls, {} heartbeats, {} body files",
+        counts.traces_imported,
+        counts.tool_calls_imported,
+        counts.heartbeats_imported,
+        bodies_imported,
+        counts.traces_skipped,
+        counts.tool_calls_skipped,
+        counts.heartbeats_skipped,
+        bodies_skipped,
+    );
     Ok(())
 }
 
@@ -11002,6 +11242,180 @@ mod tests {
             notification_cooldown_seconds: alex_proxy::notify::default_cooldown_seconds(),
             notification_timeout_seconds: alex_proxy::notify::default_timeout_seconds(),
         }
+    }
+
+    #[test]
+    fn trace_backup_archive_round_trip_restores_rows_and_body_files() {
+        let data_dir = tmpdir("trace-backup-archive-round-trip");
+        let archive = data_dir.parent().unwrap().join(format!(
+            "alex-trace-backup-round-trip-{}.tar.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&archive);
+        let config = test_config(data_dir.clone());
+        let store = Store::open(data_dir.clone()).unwrap();
+        for (id, ts, body) in [
+            ("archive-trace-1", 1_000, b"request one".as_slice()),
+            ("archive-trace-2", 2_000, b"request two".as_slice()),
+        ] {
+            let mut trace = alex_core::TraceRecord {
+                id: id.into(),
+                ts_request_ms: ts,
+                ..Default::default()
+            };
+            trace.req_body_path = Some(store.write_body(id, "request.json", body).unwrap());
+            store.insert_trace(&trace).unwrap();
+        }
+        let tool_body = store
+            .write_body("archive-tool", "tool-result.json", b"tool result")
+            .unwrap();
+        store
+            .upsert_tool_call(&alex_store::ToolCallRecord {
+                id: "archive-tool".into(),
+                harness: "pi".into(),
+                session_id: "archive-session".into(),
+                turn_id: None,
+                tool_call_id: "call-1".into(),
+                trace_id: Some("archive-trace-1".into()),
+                tool_name: "bash".into(),
+                ts_start_ms: 1_100,
+                ts_end_ms: Some(1_200),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: None,
+                result_body_path: Some(tool_body),
+            })
+            .unwrap();
+        store
+            .insert_heartbeat(900, "anthropic", None, true, Some(200), 10, "ok")
+            .unwrap();
+
+        traces_backup_export_cmd(&config, &archive, false).unwrap();
+        assert!(traces_backup_export_cmd(&config, &archive, false).is_err());
+        traces_backup_export_cmd(&config, &archive, true).unwrap();
+        store.clear_traces_and_bodies().unwrap();
+        assert_eq!(store.reset_counts().unwrap().body_files, 0);
+
+        traces_backup_import_cmd(&config, &archive).unwrap();
+        let counts = store.reset_counts().unwrap();
+        assert_eq!((counts.traces, counts.heartbeats, counts.body_files), (2, 1, 3));
+        assert_eq!(store.session_tool_calls("archive-session").unwrap().len(), 1);
+        for id in ["archive-trace-1", "archive-trace-2"] {
+            let path = store.get_trace(id).unwrap().unwrap()["req_body_path"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(Path::new(&path).exists(), "restored body missing: {path}");
+            assert!(Path::new(&path).starts_with(data_dir.join("bodies")));
+        }
+        let tool_path = store.get_tool_call("archive-tool").unwrap().unwrap()["result_body_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(Path::new(&tool_path).exists());
+
+        traces_backup_import_cmd(&config, &archive).unwrap();
+        let repeated = store.reset_counts().unwrap();
+        assert_eq!((repeated.traces, repeated.heartbeats, repeated.body_files), (2, 1, 3));
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn trace_backup_archive_import_keeps_populated_store_rows() {
+        let source_dir = tmpdir("trace-backup-populated-source");
+        let destination_dir = tmpdir("trace-backup-populated-destination");
+        let archive = source_dir.parent().unwrap().join(format!(
+            "alex-trace-backup-populated-{}.tar.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&archive);
+        let source_config = test_config(source_dir.clone());
+        let source = Store::open(source_dir).unwrap();
+        source
+            .insert_trace(&alex_core::TraceRecord {
+                id: "shared".into(),
+                ts_request_ms: 1_000,
+                routed_model: Some("old-model".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        source
+            .insert_trace(&alex_core::TraceRecord {
+                id: "backup-only".into(),
+                ts_request_ms: 2_000,
+                ..Default::default()
+            })
+            .unwrap();
+        traces_backup_export_cmd(&source_config, &archive, false).unwrap();
+
+        let destination_config = test_config(destination_dir.clone());
+        let destination = Store::open(destination_dir).unwrap();
+        destination
+            .insert_trace(&alex_core::TraceRecord {
+                id: "shared".into(),
+                ts_request_ms: 9_000,
+                routed_model: Some("new-model".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        destination
+            .insert_trace(&alex_core::TraceRecord {
+                id: "newer-only".into(),
+                ts_request_ms: 10_000,
+                ..Default::default()
+            })
+            .unwrap();
+
+        traces_backup_import_cmd(&destination_config, &archive).unwrap();
+        assert_eq!(destination.reset_counts().unwrap().traces, 3);
+        assert_eq!(
+            destination.get_trace("shared").unwrap().unwrap()["routed_model"],
+            "new-model"
+        );
+        assert!(destination.get_trace("backup-only").unwrap().is_some());
+        assert!(destination.get_trace("newer-only").unwrap().is_some());
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn trace_backup_cli_surface_and_junk_archive_validation() {
+        let export = Cli::try_parse_from([
+            "alex",
+            "traces",
+            "export",
+            "backup.tar.gz",
+            "--force",
+        ])
+        .unwrap();
+        match export.command {
+            Some(Command::Traces {
+                command: Some(TracesCommand::Export { path, force }),
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("backup.tar.gz"));
+                assert!(force);
+            }
+            _ => panic!("expected traces export"),
+        }
+        let import = Cli::try_parse_from(["alex", "traces", "import", "backup.tar.gz"]).unwrap();
+        assert!(matches!(
+            import.command,
+            Some(Command::Traces {
+                command: Some(TracesCommand::Import { .. }),
+                ..
+            })
+        ));
+
+        let data_dir = tmpdir("trace-backup-junk");
+        let junk = data_dir.join("junk.tar.gz");
+        std::fs::write(&junk, b"this is not a gzip tar archive").unwrap();
+        let error = traces_backup_import_cmd(&test_config(data_dir.clone()), &junk).unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("archive") || error_chain.contains("gzip"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(Store::open(data_dir).unwrap().reset_counts().unwrap().traces, 0);
     }
 
     #[cfg(unix)]
