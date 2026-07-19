@@ -566,7 +566,7 @@ struct MenuRefreshButton: View {
     }
 }
 
-// MARK: - Dario section
+// MARK: - Dario row
 
 extension DarioHealthTint {
     var color: Color {
@@ -593,8 +593,6 @@ struct DarioMenuSectionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            SectionLabel(text: "Dario", style: .menu)
-                .padding(.top, 9)
             HStack(spacing: 7) {
                 Button(action: onOpen) {
                     HStack(spacing: 7) {
@@ -628,9 +626,7 @@ struct DarioMenuSectionView: View {
                     .padding(.leading, 13)
             }
         }
-        .padding(.horizontal, MenuMetrics.inset)
-        .padding(.bottom, 7)
-        .frame(width: MenuMetrics.width, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -639,7 +635,7 @@ struct DarioMenuSectionView: View {
 /// The Providers section of the status menu (mock App.tsx:710-744):
 /// section header with Refresh/Ping, then one row per provider with a brand
 /// icon (health-badged), quota bars, credit balances, the bonded multi-account
-/// layout for Codex.
+/// layout for Codex, and the Dario status nested under Claude.
 struct LimitsCardView: View {
     let limits: [ProviderLimits]
     let accounts: [Account]
@@ -647,8 +643,12 @@ struct LimitsCardView: View {
     var providerPauses: [String: ProviderPause] = [:]
     var heartbeats: [String: Heartbeat] = [:]
     var routing: [String: ProviderRoutingResponse] = [:]
+    var darioEnabled = false
+    var dario: DarioStatus? = nil
     var onRefresh: (@MainActor () async -> Bool)? = nil
     var onPing: (() -> Void)? = nil
+    var onOpenDario: (() -> Void)? = nil
+    var onReauthDario: (() -> Void)? = nil
     var onSetProviderPause: ((String, ProviderPauseMode?) -> Void)? = nil
     @State private var providerAwaitingPause: String?
     @State private var selectedPauseMode: ProviderPauseMode = .down
@@ -667,6 +667,8 @@ struct LimitsCardView: View {
                     bondedSection(provider: name, slots: codexAccounts)
                 } else if let provider = visibleLimits.first(where: { $0.provider == name }) {
                     providerSection(provider)
+                } else if name == "anthropic", darioEnabled {
+                    providerSection(nil)
                 }
             }
         }
@@ -722,9 +724,10 @@ struct LimitsCardView: View {
     /// Keep the provider card's stable order while ensuring Codex accounts are
     /// visible even before a provider-wide response-header snapshot exists.
     private var displayProviders: [String] {
-        var providers = Set(visibleLimits.map(\.provider))
-        if !codexAccounts.isEmpty { providers.insert("openai") }
-        return providers.sorted()
+        ProviderPresentation.menuProviders(
+            limits: limits,
+            accounts: accounts,
+            includeAnthropicDario: darioEnabled)
     }
 
     private var codexAccounts: [Account] {
@@ -741,43 +744,54 @@ struct LimitsCardView: View {
     // MARK: Single provider row
 
     @ViewBuilder
-    private func providerSection(_ provider: ProviderLimits) -> some View {
-        let brand = AlexTheme.ProviderBrand.brand(for: provider.provider).accent
+    private func providerSection(_ provider: ProviderLimits?) -> some View {
+        let name = provider?.provider ?? "anthropic"
+        let brand = AlexTheme.ProviderBrand.brand(for: name).accent
         VStack(alignment: .leading, spacing: 5) {
-            providerHeaderRow(provider.provider) {
-                if let plan = provider.plan {
+            providerHeaderRow(name) {
+                if let plan = provider?.plan {
                     Text(plan)
                         .font(.system(size: 10))
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
                 }
-                providerPauseControl(provider.provider)
+                providerPauseControl(name)
             }
-            if let error = provider.error {
+            if let error = provider?.error {
                 errorText(error)
                     .padding(.leading, 21)
             }
-            VStack(alignment: .leading, spacing: 4) {
-                quotaRow(provider.quota)
-                ForEach(provider.windows ?? [], id: \.window) { window in
-                    if shouldHide(window, for: provider.quota) {
-                        EmptyView()
-                    } else if window.window == "credits" || window.window.hasPrefix("ws:") {
-                        balanceLine(window)
-                    } else {
-                        windowRow(
-                            window,
-                            label: secondaryLabel(window, quota: provider.quota),
-                            brand: brand)
+            if let provider {
+                VStack(alignment: .leading, spacing: 4) {
+                    quotaRow(provider.quota)
+                    ForEach(provider.windows ?? [], id: \.window) { window in
+                        if shouldHide(window, for: provider.quota) {
+                            EmptyView()
+                        } else if window.window == "credits" || window.window.hasPrefix("ws:") {
+                            balanceLine(window)
+                        } else {
+                            windowRow(
+                                window,
+                                label: secondaryLabel(window, quota: provider.quota),
+                                brand: brand)
+                        }
+                    }
+                    if provider.windows?.isEmpty != false, let requests = provider.requests {
+                        countRow("requests", requests)
+                        if let tokens = provider.tokens {
+                            countRow("tokens", tokens)
+                        }
                     }
                 }
-                if provider.windows?.isEmpty != false, let requests = provider.requests {
-                    countRow("requests", requests)
-                    if let tokens = provider.tokens {
-                        countRow("tokens", tokens)
-                    }
-                }
+                .padding(.leading, 21)
             }
-            .padding(.leading, 21)
+            if name == "anthropic", darioEnabled {
+                DarioMenuSectionView(
+                    status: dario,
+                    onOpen: { onOpenDario?() },
+                    onReauth: { onReauthDario?() })
+                    .padding(.leading, 21)
+                    .padding(.vertical, 1)
+            }
         }
         .padding(.horizontal, MenuMetrics.inset)
         .padding(.vertical, 7)

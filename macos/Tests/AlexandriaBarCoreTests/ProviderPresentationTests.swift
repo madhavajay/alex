@@ -35,6 +35,14 @@ import Testing
         #expect(ProviderPresentation.paneState(for: "anthropic", accounts: []) == .connectAccount)
     }
 
+    @Test func enabledDownDarioKeepsAnthropicProviderVisibleWithoutAccounts() {
+        #expect(DarioHealth.evaluate(nil as DarioStatus?).tint == .red)
+        #expect(ProviderPresentation.menuProviders(
+            limits: [], accounts: [], includeAnthropicDario: true) == ["anthropic"])
+        #expect(ProviderPresentation.shouldShowLimitsCard(
+            limits: [], accounts: [], includeAnthropicDario: true))
+    }
+
     @Test func providerWithoutConnectedAccountShowsOnlyConnectState() throws {
         let codexAccount = try account()
 

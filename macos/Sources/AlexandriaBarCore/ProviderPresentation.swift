@@ -24,13 +24,30 @@ public enum ProviderPresentation {
         return limits.filter { providersWithAccounts.contains($0.provider) }
     }
 
+    public static func menuProviders(
+        limits: [ProviderLimits], accounts: [Account], includeAnthropicDario: Bool = false
+    ) -> [String] {
+        var providers = Set(visibleLimits(limits, for: accounts).map(\.provider))
+        if accounts.contains(where: { $0.provider == "openai" && $0.kind == "oauth" }) {
+            providers.insert("openai")
+        }
+        if includeAnthropicDario {
+            providers.insert("anthropic")
+        }
+        return providers.sorted()
+    }
+
     /// Codex supplies limits per account, so a connected Codex OAuth account
     /// still has a useful loading card before a provider-wide snapshot exists.
+    /// Dario similarly keeps its Anthropic parent visible while enabled.
     public static func shouldShowLimitsCard(
-        limits: [ProviderLimits], accounts: [Account]
+        limits: [ProviderLimits], accounts: [Account], includeAnthropicDario: Bool = false
     ) -> Bool {
-        !visibleLimits(limits, for: accounts).isEmpty
-            || accounts.contains { $0.provider == "openai" && $0.kind == "oauth" }
+        !menuProviders(
+            limits: limits,
+            accounts: accounts,
+            includeAnthropicDario: includeAnthropicDario
+        ).isEmpty
     }
 
     public static func paneState(for provider: String, accounts: [Account]) -> ProviderPaneState {
