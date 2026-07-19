@@ -413,6 +413,9 @@ public final class SnapshotStore {
             }
             for window in provider.windows ?? [] {
                 if provider.quota?.isCreditPrimary == true { continue }
+                // An expired window is a stale snapshot awaiting daemon
+                // refresh, not a live 0% — never alert on it.
+                if window.resetHasPassed() { continue }
                 if let pct = window.usedPct, pct >= limitWarnPct {
                     let resets = window.resetsDate.map { " · resets in \(Format.countdown(to: $0))" } ?? ""
                     out.append(StoreAlert(

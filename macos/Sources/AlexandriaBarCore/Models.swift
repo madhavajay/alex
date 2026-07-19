@@ -829,6 +829,17 @@ public extension LimitWindow {
         usedPct.map { max(0, min(100, 100 - $0)) }
     }
 
+    func resetHasPassed(relativeTo now: Date = Date()) -> Bool {
+        resetsDate.map { $0 <= now } ?? false
+    }
+
+    /// An expired snapshot is no longer authoritative. Until the daemon's
+    /// usage-only refresh lands, do not present its old percentage as current.
+    func remainingPct(relativeTo now: Date) -> Double? {
+        guard !resetHasPassed(relativeTo: now) else { return nil }
+        return remainingPct
+    }
+
     /// Interprets the existing warning preference as a used-quota threshold,
     /// while presenting the allowance as quota remaining.
     func remainingSeverity(warnUsedPct: Double) -> RemainingQuotaSeverity? {

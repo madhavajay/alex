@@ -29,6 +29,7 @@ pub const OPENAI_SCOPES: &str = "openid profile email offline_access";
 pub const OPENAI_CALLBACK_PATH: &str = "/auth/callback";
 pub(crate) const OPENAI_CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CODEX_USAGE_REFRESH_MAX_AGE_MS: i64 = 5 * 60 * 1_000;
 pub const OPENAI_DEVICE_USER_CODE_URL: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
 pub const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -805,7 +806,7 @@ async fn codex_account_from_tokens(tokens: TokenResponse) -> Account {
     )
     .await
     {
-        account_meta["codex_limits"] = snapshot;
+        account_meta["routing_limits"] = snapshot;
         account_meta["verified_at_ms"] = json!(now_ms());
     }
     Account {
@@ -890,6 +891,89 @@ async fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Resu
         bail!("Codex usage verification failed ({status})");
     }
     codex_usage_snapshot(&raw).context("Codex usage response did not contain rate-limit windows")
+}
+
+/// Returns whether an account's persisted Codex allowance should be refreshed.
+///
+/// A passed reset boundary is always stale, even when the snapshot was observed
+/// recently. Otherwise, keep the usage-only request rate bounded by the supplied
+/// maximum age. Paused and non-OpenAI accounts never cause background traffic.
+pub fn codex_usage_refresh_due(account: &Account, now_ms: i64, max_age_ms: i64) -> bool {
+    if account.provider != Provider::Openai
+        || account.kind != "oauth"
+        || account.status != "active"
+        || account.paused
+    {
+        return false;
+    }
+    let Some(snapshot) = account
+        .account_meta
+        .get("routing_limits")
+        .or_else(|| account.account_meta.get("codex_limits"))
+    else {
+        return true;
+    };
+    let observed_at_ms = snapshot.get("observed_at_ms").and_then(Value::as_i64);
+    if observed_at_ms
+        .map(|observed| now_ms.saturating_sub(observed) >= max_age_ms)
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    snapshot
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|window| window.get("resets_at_s").and_then(Value::as_i64))
+        .any(|reset_at_s| reset_at_s.saturating_mul(1_000) <= now_ms)
+}
+
+async fn refresh_codex_usage_for_account(vault: &Vault, account: Account) -> Result<()> {
+    let expected_account_id = account
+        .chatgpt_account_id()
+        .context("Codex account has no ChatGPT workspace identity")?;
+    let account = if account.needs_refresh() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            vault.refresh_without_native_reimport(&account.id, false, &expected_account_id),
+        )
+        .await
+        .context("timed out refreshing Codex access token")??
+    } else {
+        account
+    };
+    let access_token = account
+        .access_token
+        .as_deref()
+        .context("Codex account has no access token")?;
+    let snapshot = fetch_codex_usage(access_token, Some(&expected_account_id)).await?;
+    vault
+        .record_routing_limits_for_workspace(&account.id, &expected_account_id, snapshot)
+        .await
+}
+
+/// Refresh every due Codex account with the usage-only endpoint. Each request is
+/// pinned to the credential's exact ChatGPT workspace and never sends a model
+/// prompt. Failures are returned per account so one stale credential cannot
+/// prevent the remaining subscriptions from updating.
+pub async fn refresh_due_codex_usage(
+    vault: &Vault,
+    max_age_ms: i64,
+) -> Vec<(String, Result<()>)> {
+    let now = now_ms();
+    let accounts: Vec<Account> = vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| codex_usage_refresh_due(account, now, max_age_ms))
+        .collect();
+    let mut outcomes = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let id = account.id.clone();
+        outcomes.push((id, refresh_codex_usage_for_account(vault, account).await));
+    }
+    outcomes
 }
 
 async fn save_auto_codex_account(vault: &Vault, mut account: Account) -> Result<String> {
@@ -1764,6 +1848,33 @@ mod tests {
         assert_eq!(snapshot["windows"][0]["window"], "5h");
         assert_eq!(snapshot["windows"][0]["used_pct"], 23.0);
         assert_eq!(snapshot["windows"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn codex_usage_refresh_due_honors_age_reset_and_account_state() {
+        let now = 1_800_000_000_000_i64;
+        let mut account = test_codex_account("refresh-due");
+        account.account_meta["codex_limits"] = json!({
+            "observed_at_ms": now - 1_000,
+            "windows": [{
+                "window": "5h",
+                "used_pct": 100,
+                "resets_at_s": now / 1_000 + 60,
+            }],
+        });
+        assert!(!codex_usage_refresh_due(&account, now, 300_000));
+
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
+            json!(now / 1_000 - 1);
+        assert!(codex_usage_refresh_due(&account, now, 300_000));
+
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
+            json!(now / 1_000 + 60);
+        account.account_meta["codex_limits"]["observed_at_ms"] = json!(now - 300_000);
+        assert!(codex_usage_refresh_due(&account, now, 300_000));
+
+        account.paused = true;
+        assert!(!codex_usage_refresh_due(&account, now, 300_000));
     }
 
     #[test]

@@ -1006,11 +1006,15 @@ struct LimitsCardView: View {
     /// One limit window: small mono label + shared QuotaBarRow (bar, percent,
     /// time-to-reset).
     private func windowRow(_ window: LimitWindow, label: String?, brand: Color) -> some View {
-        QuotaBarRow(
-            fraction: (window.remainingPct ?? 0) / 100,
+        // An expired window is a stale snapshot, not a live 0%: the daemon
+        // refreshes it in the background, so show "refresh pending" instead
+        // of presenting yesterday's percentage as current quota.
+        let expired = window.resetHasPassed()
+        return QuotaBarRow(
+            fraction: expired ? 0 : (window.remainingPct ?? 0) / 100,
             fill: fillColor(window, brand: brand),
-            percentText: window.remainingPct.map { "\(Int($0.rounded()))%" } ?? "—",
-            timeLeftText: window.resetsDate.map { Format.countdown(to: $0) },
+            percentText: expired ? "refresh pending" : window.remainingPct.map { "\(Int($0.rounded()))%" } ?? "—",
+            timeLeftText: expired ? nil : window.resetsDate.map { Format.countdown(to: $0) },
             warnBelow: nil,
             leadingLabel: label ?? window.window)
     }
