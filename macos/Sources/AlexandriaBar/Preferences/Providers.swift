@@ -37,7 +37,6 @@ private enum ProvidersChartRange: String, CaseIterable {
 struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
-    @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
         ProvidersChartRange.twentyFourHours.rawValue
@@ -164,20 +163,6 @@ struct ProvidersPreferencesSection: View {
             else { return }
             chartRangeValue = ProvidersChartRange.twentyFourHours.rawValue
         }
-        .sheet(
-            isPresented: Binding(
-                get: { providerToAdd != nil },
-                set: { if !$0 { providerToAdd = nil } }
-            )
-        ) {
-            if let provider = providerToAdd {
-                if ProviderInfo.usesAPIKeySheet(provider) {
-                    ProviderAPIKeySheet(provider: provider, store: store) {
-                        providerToAdd = nil
-                    }
-                }
-            }
-        }
     }
 
     /// Provider sidebar (§1.26 of the design spec): brand dot rows with a
@@ -286,12 +271,9 @@ struct ProvidersPreferencesSection: View {
 
     private func addAccount(_ provider: String) {
         switch provider {
-        case "exo":
-            // Local cluster: no login. Select its first-class provider detail.
-            selectedProvider = "exo"
-        case _ where ProviderInfo.usesAPIKeySheet(provider):
-            // API-key providers (openrouter) capture a long-lived key.
-            providerToAdd = provider
+        case "exo", "openrouter":
+            // First-class provider details own local endpoint/API-key setup.
+            selectedProvider = provider
         default:
             // OAuth-login providers (anthropic/openai/gemini/xai/kimi) run the
             // device/browser auth flow; amp adopts its CLI credentials via the
@@ -405,6 +387,8 @@ private struct ProviderPreferencesDetail: View {
     var body: some View {
         if provider == "exo" {
             ExoPreferencesSection(store: store)
+        } else if provider == "openrouter" {
+            OpenRouterPreferencesSection(store: store)
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -1802,91 +1786,6 @@ private extension CodexRoutingStrategy {
             "Assign each new session to the first eligible account below that remains above the reserve."
         case .roundRobin:
             "Alternate new sessions across eligible accounts, skipping accounts that have reached the reserve."
-        }
-    }
-}
-
-private struct ProviderAPIKeySheet: View {
-    let provider: String
-    let store: SnapshotStore
-    let onDone: () -> Void
-    @State private var key = ""
-    @State private var httpReferer = ""
-    @State private var xTitle = ""
-    @State private var saving = false
-    @State private var error: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                StatusDot(
-                    tint: AlexTheme.ProviderBrand.brand(for: provider).accent, size: 8)
-                Text("Add \(ProviderInfo.displayName(provider)) API key")
-                    .font(AlexTheme.Fonts.panelTitle)
-                    .foregroundStyle(AlexTheme.Colors.foreground)
-            }
-            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alexandria daemon for encrypted vault storage.")
-                .font(.system(size: 12))
-                .foregroundStyle(AlexTheme.Colors.textTertiary)
-            VStack(spacing: 8) {
-                SecureField("API key", text: $key)
-                    .textFieldStyle(.roundedBorder)
-                TextField("HTTP-Referer (optional)", text: $httpReferer)
-                    .textFieldStyle(.roundedBorder)
-                TextField("X-Title (optional)", text: $xTitle)
-                    .textFieldStyle(.roundedBorder)
-            }
-            .font(AlexTheme.Fonts.mono(11))
-            if let error {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundStyle(AlexTheme.Colors.destructive)
-            }
-            HStack(spacing: 8) {
-                Spacer()
-                if saving { ProgressView().controlSize(.small) }
-                PillButton(
-                    title: "Cancel",
-                    tint: AlexTheme.Colors.textSecondary,
-                    horizontalPadding: 12, verticalPadding: 5, cornerRadius: 7,
-                    showsBorder: true, isEnabled: !saving,
-                    keyboardShortcut: .cancelAction,
-                    action: onDone)
-                PillButton(
-                    title: "Save key",
-                    variant: .solidAccent,
-                    isEnabled: !saving
-                        && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                    keyboardShortcut: .defaultAction
-                ) {
-                    save()
-                }
-            }
-        }
-        .padding(20)
-        .frame(width: 440)
-        .background(AlexTheme.Colors.background)
-    }
-
-    private func save() {
-        guard let config = store.config else { return }
-        saving = true
-        error = nil
-        let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanReferer = httpReferer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanTitle = xTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        Task {
-            do {
-                try await AlexandriaClient(config: config).setOpenRouterKey(
-                    cleanKey,
-                    httpReferer: cleanReferer.isEmpty ? nil : cleanReferer,
-                    xTitle: cleanTitle.isEmpty ? nil : cleanTitle)
-                await store.refresh()
-                onDone()
-            } catch {
-                self.error = error.localizedDescription
-            }
-            saving = false
         }
     }
 }

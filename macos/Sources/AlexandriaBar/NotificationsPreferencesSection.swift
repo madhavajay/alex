@@ -134,25 +134,29 @@ struct NotificationsPreferencesSection: View {
                     Text(verbatim: "•••••••••••••••")
                         .font(AlexTheme.Fonts.metaMono)
                         .foregroundStyle(AlexTheme.Colors.textSecondary)
-                        .settingsField(width: 240)
+                        .settingsField(width: 180)
                     if let bot = connectedBot, !bot.isEmpty {
                         Text(verbatim: "✓ @\(bot)")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(AlexTheme.Colors.success)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                     PillButton(title: "Replace", variant: .bordered, isEnabled: true) {
                         hasSavedToken = false
                         token = ""
                         connectedBot = nil
                     }
+                    .fixedSize()
                 } else {
                     SecureField("123456:ABC…", text: $token)
-                        .settingsField(width: 240)
+                        .settingsField(width: 180)
                     PillButton(
                         title: isValidating ? "Validating…" : "Validate", variant: .bordered,
                         isEnabled: !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isValidating,
                         isBusy: isValidating
                     ) { Task { await validate() } }
+                    .fixedSize()
                 }
             }
         }
@@ -207,7 +211,7 @@ struct NotificationsPreferencesSection: View {
         HStack(spacing: 8) {
             PillButton(
                 title: isTesting ? "Sending…" : "Send test message", variant: .bordered,
-                systemImage: "paperplane", isEnabled: canTest && !isTesting && !isSaving,
+                systemImage: "paperplane", isEnabled: !isTesting && !isSaving,
                 isBusy: isTesting
             ) { Task { await test() } }
             PillButton(
@@ -421,8 +425,6 @@ struct NotificationsPreferencesSection: View {
         NotificationTestTarget.resolve(
             token: token, chatID: chatID, savedChannelID: savedChannelID)
     }
-
-    private var canTest: Bool { testTarget != nil }
 
     private var request: TelegramNotificationChannelRequest {
         TelegramNotificationChannelRequest(

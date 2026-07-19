@@ -14,6 +14,8 @@ struct OpenRouterPreferencesSection: View {
 
     // Key entry (write-only: the daemon never hands a stored key back).
     @State private var keyDraft = ""
+    @State private var httpReferer = ""
+    @State private var xTitle = ""
     @State private var revealKey = false
     @State private var isSavingKey = false
     @State private var keyResult: String?
@@ -124,6 +126,16 @@ struct OpenRouterPreferencesSection: View {
                                 ? AlexTheme.Colors.destructive : AlexTheme.Colors.success)
                 }
                 Spacer()
+            }
+            HStack(spacing: 8) {
+                TextField("HTTP-Referer (optional)", text: $httpReferer)
+                    .textFieldStyle(.roundedBorder)
+                    .font(AlexTheme.Fonts.mono(11))
+                    .frame(maxWidth: 200)
+                TextField("X-Title (optional)", text: $xTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .font(AlexTheme.Fonts.mono(11))
+                    .frame(maxWidth: 140)
             }
         }
     }
@@ -335,8 +347,13 @@ struct OpenRouterPreferencesSection: View {
         isSavingKey = true
         defer { isSavingKey = false }
         let clean = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanReferer = httpReferer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTitle = xTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            try await client.setOpenRouterKey(clean)
+            try await client.setOpenRouterKey(
+                clean,
+                httpReferer: cleanReferer.isEmpty ? nil : cleanReferer,
+                xTitle: cleanTitle.isEmpty ? nil : cleanTitle)
             keyDraft = ""
             revealKey = false
             keyResult = "Key saved"

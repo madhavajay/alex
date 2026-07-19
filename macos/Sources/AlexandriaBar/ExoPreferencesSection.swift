@@ -111,7 +111,7 @@ struct ExoPreferencesSection: View {
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
             ForEach($models) { $model in
-                Toggle(isOn: $model.enabled) {
+                HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(model.name).font(.system(size: 12, weight: .medium))
@@ -124,8 +124,10 @@ struct ExoPreferencesSection: View {
                             .font(AlexTheme.Fonts.metaMono)
                             .foregroundStyle(AlexTheme.Colors.textTertiary)
                     }
+                    Spacer()
+                    Toggle("", isOn: $model.enabled)
+                        .settingsSwitch()
                 }
-                .settingsSwitch()
                 .padding(.vertical, 3)
                 RowDivider()
             }
@@ -201,7 +203,7 @@ struct ExoPreferencesSection: View {
         let current = try await client.exoStatus()
         status = current
         error = current.error
-        if current.running { models = try await client.exoModels() }
+        if current.running { models = try await client.exoModels().sortedForDisplay() }
     }
 
     private func save() async {

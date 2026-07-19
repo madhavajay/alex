@@ -449,7 +449,6 @@ import Testing
         #expect(ProviderInfo.displayName("openrouter") == "OpenRouter")
         #expect(ProviderInfo.loginArg("openrouter") == "openrouter")
         #expect(ProviderInfo.pingArg("openrouter") == "openrouter")
-        #expect(ProviderInfo.usesAPIKeySheet("openrouter"))
     }
 
     @Test func routingReserveResolutionAndDisplay() {

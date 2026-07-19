@@ -1252,6 +1252,24 @@ public struct ExoModel: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+public extension Array where Element == ExoModel {
+    func sortedForDisplay() -> [ExoModel] {
+        enumerated().sorted { lhs, rhs in
+            if (lhs.element.running == true) != (rhs.element.running == true) {
+                return lhs.element.running == true
+            }
+            if lhs.element.enabled != rhs.element.enabled {
+                return lhs.element.enabled
+            }
+            let nameOrder = lhs.element.name.caseInsensitiveCompare(rhs.element.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+}
+
 public enum ProviderInfo {
     public static func displayName(_ provider: String) -> String {
         switch provider {
@@ -1288,10 +1306,6 @@ public enum ProviderInfo {
 
     public static var supportedProviders: [String] {
         ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"]
-    }
-
-    public static func usesAPIKeySheet(_ provider: String) -> Bool {
-        provider == "openrouter"
     }
 }
 
