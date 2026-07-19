@@ -662,7 +662,7 @@ model = "alex/$ALEXANDRIA_E2E_MODEL"
 max_context_size = 200000
 display_name = "alex/$ALEXANDRIA_E2E_MODEL"
 EOF
-kimi -y -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log
+kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
     };
@@ -996,8 +996,10 @@ display_name = "alex/$ALEXANDRIA_E2E_MODEL""#
     #[test]
     fn kimi_script_runs_noninteractively_with_stream_json() {
         let script = docker_script(HarnessKind::Kimi, "claude-fable-5").unwrap();
+        // kimi 0.27.0 rejects -y/--auto combined with -p; prompt mode runs
+        // tools non-interactively on its own.
         assert!(script.contains(
-            r#"kimi -y -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log"#
+            r#"kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log"#
         ));
     }
 
