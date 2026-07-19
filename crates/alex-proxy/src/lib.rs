@@ -14702,10 +14702,10 @@ mod tests {
     async fn provider_routing_endpoint_updates_a_non_codex_provider() {
         let state = test_state("anthropic-routing");
         let mut personal = anthropic_account();
-        personal.id = "anthropic:personal".into();
+        personal.id = "anthropic-personal".into();
         personal.name = "personal".into();
         let mut work = anthropic_account();
-        work.id = "anthropic:work".into();
+        work.id = "anthropic-work".into();
         work.name = "work".into();
         state.vault.upsert(personal).await.unwrap();
         state.vault.upsert(work).await.unwrap();
@@ -14718,8 +14718,8 @@ mod tests {
                     "strategy": "round_robin",
                     "reserve_pct": 7,
                     "accounts": [
-                        {"account_id": "anthropic:work", "eligible": true, "priority": 0, "reserve_pct": 3},
-                        {"account_id": "anthropic:personal", "eligible": true, "priority": 1}
+                        {"account_id": "anthropic-work", "eligible": true, "priority": 0, "reserve_pct": 3},
+                        {"account_id": "anthropic-personal", "eligible": true, "priority": 1}
                     ]
                 })),
             )
