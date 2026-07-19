@@ -96,7 +96,7 @@ struct GeneralPreferencesPane: View {
         SectionLabel(text: "System")
             .settingsSectionSpacing()
         if LaunchAtLogin.available {
-            SettingRow(label: "Launch at login", hint: "Start AlexandriaBar when you log in") {
+            SettingRow(label: "Launch at login", hint: "Start Alex when you log in") {
                 Toggle("", isOn: $launchAtLogin)
                     .settingsSwitch()
                     .onChange(of: launchAtLogin) {
@@ -244,8 +244,8 @@ struct GeneralPreferencesPane: View {
         SectionLabel(text: "Reset")
             .settingsSectionSpacing()
         SettingRow(
-            label: "Reset Alexandria",
-            hint: "Remove selected Alexandria data after reviewing a real-count dry run."
+            label: "Reset Alex",
+            hint: "Remove selected Alex data after reviewing a real-count dry run."
         ) {
             PillButton(
                 title: "Reset…", variant: .danger, horizontalPadding: 12,
@@ -336,7 +336,7 @@ struct GeneralPreferencesPane: View {
                 RowDivider()
                 SettingRow(
                     label: "Interface",
-                    hint: "A LAN address can change under DHCP. If the saved address is unavailable at startup, Alexandria reports it loudly and falls back to loopback."
+                    hint: "A LAN address can change under DHCP. If the saved address is unavailable at startup, Alex reports it loudly and falls back to loopback."
                 ) {
                     Picker("", selection: $selectedInterfaceAddress) {
                         ForEach(networkInterfaces) { interface in
@@ -354,9 +354,9 @@ struct GeneralPreferencesPane: View {
                 Label("Remote admin access enabled", systemImage: "exclamationmark.triangle.fill")
                     .fontWeight(.bold)
                     .foregroundStyle(.red)
-                (Text("This exposes Alexandria's admin API — your credential vault, key minting, and data reset — to that network. Anyone who can reach this port ")
+                (Text("This exposes Alex's admin API — your credential vault, key minting, and data reset — to that network. Anyone who can reach this port ")
                     + Text("and has your local key").bold()
-                    + Text(" can control Alexandria and delete your data. Rotate your local key when enabling this."))
+                    + Text(" can control Alex and delete your data. Rotate your local key when enabling this."))
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.red)
             }
@@ -721,10 +721,10 @@ private struct ResetSettingsSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Reset Alexandria")
+                Text("Reset Alex")
                     .font(AlexTheme.Fonts.panelTitle)
                     .foregroundStyle(AlexTheme.Colors.foreground)
-                Text("Choose the data to remove. Alexandria first runs a dry run with real counts; you can only apply the reset after reviewing it.")
+                Text("Choose the data to remove. Alex first runs a dry run with real counts; you can only apply the reset after reviewing it.")
                     .font(.system(size: 12))
                     .foregroundStyle(AlexTheme.Colors.textTertiary)
             }
@@ -734,7 +734,7 @@ private struct ResetSettingsSheet: View {
                 Toggle("Settings", isOn: $selection.settings)
                 Toggle("Trace history", isOn: $selection.traces)
                 Toggle("Uninstall from all harnesses", isOn: $selection.harnesses)
-                Text("This is the only option that edits files outside Alexandria (in ~/.claude, ~/.codex, and ~/.pi).")
+                Text("This is the only option that edits files outside Alex (in ~/.claude, ~/.codex, and ~/.pi).")
                     .font(.system(size: 10))
                     .foregroundStyle(AlexTheme.Colors.warningOrange)
                     .padding(.leading, 22)

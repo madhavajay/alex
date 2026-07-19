@@ -243,7 +243,7 @@ impl StatusSummary {
             .uptime_s
             .map(|seconds| compact_duration(seconds * 1000))
             .unwrap_or_else(|| "unknown".to_string());
-        format!("pong · Alexandria v{} · uptime {uptime}", self.version)
+        format!("pong · Alex v{} · uptime {uptime}", self.version)
     }
 
     fn telegram_text_at(&self, now: i64) -> String {
@@ -266,7 +266,7 @@ impl StatusSummary {
             "down".to_string()
         };
         let lines = vec![
-            format!("Alexandria v{} · {update}", self.version),
+            format!("Alex v{} · {update}", self.version),
             format!("Daemon: {daemon} · service {}", self.service),
             format!("Dario: {}", if self.dario_ready { "ready" } else { "down" }),
             String::new(),
@@ -596,7 +596,7 @@ mod tests {
         let summary = synthetic_summary(now);
 
         let text = summary.telegram_text_at(now);
-        assert!(text.contains("Alexandria v9.8.7 · update available → v10.0.0"));
+        assert!(text.contains("Alex v9.8.7 · update available → v10.0.0"));
         assert!(text.contains("Daemon: up · uptime 2h · service active"));
         assert!(text.contains("Dario: ready"));
         assert!(text.contains("openai/work — active · healthy · 42% used · 6h left"));
@@ -698,7 +698,7 @@ mod tests {
 
         let text = summary.telegram_text_at(now);
         assert!(telegram_len(&text) <= TELEGRAM_MESSAGE_LIMIT);
-        assert!(text.contains("Alexandria v9.8.7"));
+        assert!(text.contains("Alex v9.8.7"));
         assert!(text.contains("… additional status lines omitted"));
     }
 }

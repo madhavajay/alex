@@ -1524,7 +1524,7 @@ struct TraceBrowserView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(AlexTheme.Colors.textSecondary)
                     .lineLimit(1)
-                    .help("Errored traces grouped by Alexandria error class")
+                    .help("Errored traces grouped by Alex error class")
             }
         }
         .padding(.horizontal, 12)

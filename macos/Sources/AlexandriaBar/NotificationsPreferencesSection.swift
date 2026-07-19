@@ -61,7 +61,7 @@ struct NotificationsPreferencesSection: View {
             Text("Notifications")
                 .font(AlexTheme.Fonts.panelTitle)
                 .foregroundStyle(AlexTheme.Colors.foreground)
-            Text("Telegram alerts from the Alexandria daemon")
+            Text("Telegram alerts from the Alex daemon")
                 .font(.system(size: 12))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
         }
@@ -444,7 +444,7 @@ struct NotificationsPreferencesSection: View {
         loadError = nil
         defer { isLoading = false }
         guard let client = client() else {
-            loadError = "No Alexandria daemon configuration was found."
+            loadError = "No Alex daemon configuration was found."
             return
         }
         do {
@@ -458,7 +458,7 @@ struct NotificationsPreferencesSection: View {
 
     private func validate() async {
         guard let client = client() else {
-            validationResult = "No Alexandria daemon configuration was found."
+            validationResult = "No Alex daemon configuration was found."
             connectedBot = nil
             return
         }
@@ -482,7 +482,7 @@ struct NotificationsPreferencesSection: View {
 
     private func discoverChats() async {
         guard let client = client() else {
-            discoveryResult = "No Alexandria daemon configuration was found."
+            discoveryResult = "No Alex daemon configuration was found."
             return
         }
         isDiscovering = true
@@ -658,7 +658,7 @@ struct NotificationsPreferencesSection: View {
 
     private func refreshMessages() async {
         guard let client = client() else {
-            messagesError = "No Alexandria daemon configuration was found."
+            messagesError = "No Alex daemon configuration was found."
             return
         }
         await loadMessages(using: client)

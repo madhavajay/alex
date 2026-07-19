@@ -318,7 +318,7 @@ import Testing
 
     @Test func harnessRefreshConfigResponse() throws {
         let json = #"""
-        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100","description":"Alexandria adds alex/* models."}
+        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100","description":"Alex adds alex/* models."}
         """#
         let response = try decode(json, as: HarnessConfigWriteResponse.self)
         #expect(response.refreshed == true)
@@ -330,7 +330,7 @@ import Testing
         #expect(response.key == "reused")
         #expect(response.path.hasSuffix("models.json"))
         #expect(response.baseUrl == "http://127.0.0.1:4100")
-        #expect(response.description == "Alexandria adds alex/* models.")
+        #expect(response.description == "Alex adds alex/* models.")
     }
 
     @Test func harnessConnectConfigWriteResponse() throws {

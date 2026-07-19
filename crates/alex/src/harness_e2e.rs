@@ -418,7 +418,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
     };
     if !opts.no_trace_check && !capture.complete {
         bail!(
-            "{} completed but Alexandria capture is incomplete for model '{}': missing {}; stdout={} stderr={}",
+            "{} completed but Alex capture is incomplete for model '{}': missing {}; stdout={} stderr={}",
             canonical_name,
             routed_model,
             capture.missing.join(", "),
@@ -614,7 +614,7 @@ cat > "$CODEX_HOME/config.toml" <<EOF
 model_provider = "alexandria"
 
 [model_providers.alexandria]
-name = "Alexandria Proxy"
+name = "Alex Proxy"
 base_url = "$OPENAI_BASE_URL"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"

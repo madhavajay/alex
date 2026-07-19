@@ -636,7 +636,7 @@ struct AuthFlowView: View {
     private var doneDetail: String {
         switch model.provider {
         case "openai":
-            "The account identity was detected automatically and saved. Alexandria also requested its current Codex usage without sending a model prompt."
+            "The account identity was detected automatically and saved. Alex also requested its current Codex usage without sending a model prompt."
         case "kimi":
             "The Kimi account was saved to the local vault and is ready to route requests."
         default:

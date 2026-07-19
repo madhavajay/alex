@@ -54,7 +54,7 @@ contain prompts, source code, tool results, or user-supplied secrets. Treat
 
 ## Session identity
 
-The proxy discovers a session from explicit Alexandria/Claude session headers,
+The proxy discovers a session from explicit Alex/Claude session headers,
 known request metadata, and format-specific fields such as Codex
 `prompt_cache_key`. A harness tag comes from `x-alexandria-harness` (with a
 user-agent fallback). Run keys can supply a fixed `run_id` and tags; request

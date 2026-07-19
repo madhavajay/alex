@@ -128,7 +128,7 @@ struct CredentialsPreferencesSection: View {
         Group {
             SectionLabel(text: "Use in another app")
                 .settingsSectionSpacing()
-            SettingCaption("The base URL is local to this Mac. A run key can call models, but cannot use Alexandria’s admin API.")
+            SettingCaption("The base URL is local to this Mac. A run key can call models, but cannot use Alex’s admin API.")
             SettingRow(label: "Local base URL") {
                 HStack(spacing: 8) {
                     Text(baseURL)
@@ -144,7 +144,7 @@ struct CredentialsPreferencesSection: View {
             RowDivider()
             SettingRow(
                 label: activeCredentialLabel,
-                hint: mintedKey == nil ? "Your local key can administer Alexandria." : "Model-only scoped key — safe to paste into another app."
+                hint: mintedKey == nil ? "Your local key can administer Alex." : "Model-only scoped key — safe to paste into another app."
             ) {
                 PillButton(title: "Copy key", variant: .bordered, systemImage: "key", isEnabled: activeCredential != nil) {
                     guard let activeCredential else { return }
@@ -167,7 +167,7 @@ struct CredentialsPreferencesSection: View {
         Group {
             SectionLabel(text: "Mint a scoped key")
                 .settingsSectionSpacing()
-            SettingCaption("Creates a model-only run key. It cannot read traces, mint keys, or administer Alexandria.")
+            SettingCaption("Creates a model-only run key. It cannot read traces, mint keys, or administer Alex.")
             SettingRow(label: "Label", hint: "Optional name to recognize this key later") {
                 TextField("e.g. VS Code", text: $label)
                     .settingsField()
@@ -491,7 +491,7 @@ struct CredentialsPreferencesSection: View {
         loadError = nil
         defer { isLoading = false }
         guard let config = await resolvedConfig() else {
-            loadError = "No Alexandria daemon configuration was found."
+            loadError = "No Alex daemon configuration was found."
             return
         }
         self.config = config
@@ -601,7 +601,7 @@ struct CredentialsPreferencesSection: View {
 private enum CredentialsLoadError: LocalizedError {
     case timedOut
     var errorDescription: String? {
-        "The Alexandria daemon did not respond in time. It may be starting up or unreachable."
+        "The Alex daemon did not respond in time. It may be starting up or unreachable."
     }
 }
 

@@ -107,7 +107,7 @@ struct ExoPreferencesSection: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "Models to expose", style: .prominent)
-            Text("Checked models become callable as alex/<model> by any harness pointed at Alexandria. They are also available as exo/<model>.")
+            Text("Checked models become callable as alex/<model> by any harness pointed at Alex. They are also available as exo/<model>.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
             ForEach($models) { $model in
@@ -171,7 +171,7 @@ struct ExoPreferencesSection: View {
     private func load() async {
         isLoading = true
         defer { isLoading = false }
-        guard let client = client() else { error = "No Alexandria daemon configuration was found."; return }
+        guard let client = client() else { error = "No Alex daemon configuration was found."; return }
         do {
             let config = try await client.exoConfig()
             endpoint = config.url
@@ -183,7 +183,7 @@ struct ExoPreferencesSection: View {
     }
 
     private func check() async {
-        guard let client = client() else { error = "No Alexandria daemon configuration was found."; return }
+        guard let client = client() else { error = "No Alex daemon configuration was found."; return }
         isChecking = true
         error = nil
         defer { isChecking = false }

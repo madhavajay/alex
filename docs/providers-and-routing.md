@@ -1,6 +1,6 @@
 # Providers, vault accounts, and routing
 
-Alexandria routes a model name to a provider, selects an eligible account for
+Alex routes a model name to a provider, selects an eligible account for
 that provider, translates the request if needed, and injects credentials from
 the local vault. Provider choice, account choice, and model fallback are three
 separate decisions.

@@ -375,7 +375,7 @@ public final class SnapshotStore {
         if config == nil {
             out.append(StoreAlert(
                 id: "no-config", severity: .critical,
-                title: "Alexandria not configured",
+                title: "Alex not configured",
                 body: "No config found at ~/.alexandria/config.toml"))
             return out
         }
@@ -389,7 +389,7 @@ public final class SnapshotStore {
         if !daemonUp {
             out.append(StoreAlert(
                 id: "daemon-down", severity: .critical,
-                title: "Alexandria daemon is down",
+                title: "Alex daemon is down",
                 body: lastError ?? "Health check failed"))
             return out
         }

@@ -94,7 +94,7 @@ struct OpenRouterPreferencesSection: View {
                     .foregroundStyle(
                         hasKey ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
             }
-            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alexandria daemon for encrypted vault storage; it is never displayed back.")
+            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alex daemon for encrypted vault storage; it is never displayed back.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
             HStack(spacing: 8) {
@@ -325,7 +325,7 @@ struct OpenRouterPreferencesSection: View {
         isLoading = true
         defer { isLoading = false }
         guard let client = client() else {
-            error = "No Alexandria daemon configuration was found."
+            error = "No Alex daemon configuration was found."
             return
         }
         do {

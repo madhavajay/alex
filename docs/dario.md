@@ -1,13 +1,13 @@
 # Dario broker
 
 Dario is a supervised local proxy used to make a Claude subscription usable by
-non-Claude-Code clients. Harnesses still call Alexandria. Alexandria chooses the
+non-Claude-Code clients. Harnesses still call Alex. Alex chooses the
 Anthropic account, optionally sends the Messages request to the active Dario
 generation, and records the real Anthropic account as the billing/trace identity
 rather than the synthetic Dario connection key.
 
 This path is specific to Anthropic. It does not make Amp a `/v1` provider and it
-does not replace Alexandria's general format translation.
+does not replace Alex's general format translation.
 
 ## Routing modes
 
@@ -57,7 +57,7 @@ does not get direct-Claude-Code treatment.
 
 ## The three-block system prompt
 
-Dario depends on Claude Code's model-specific wire shape. Alexandria captures
+Dario depends on Claude Code's model-specific wire shape. Alex captures
 that shape by launching the real `claude` executable against a temporary local
 Messages endpoint with:
 
@@ -67,13 +67,13 @@ claude --model <model> --print -p hi
 
 The captured request is expected to contain at least three `system` blocks:
 
-| Index | Meaning in Alexandria's rewrite |
+| Index | Meaning in Alex's rewrite |
 | --- | --- |
 | `system[0]` | Claude billing/header block. It is left in place. |
 | `system[1]` | Agent identity block. Replaced with the captured model-specific identity when available. |
 | `system[2]` | Main Claude Code system prompt. Replaced with the captured model-specific prompt. |
 
-For `system[2]`, Alexandria preserves the caller's task-specific suffix if the
+For `system[2]`, Alex preserves the caller's task-specific suffix if the
 original text contains the exact operator preface separator:
 
 ```text
@@ -94,31 +94,31 @@ captures for one model share one in-flight capture.
 
 There are two distinct header paths:
 
-- Direct genuine Claude Code traffic receives only Alexandria's explicit
+- Direct genuine Claude Code traffic receives only Alex's explicit
   `CLAUDE_CODE_PASSTHROUGH_HEADERS` allowlist: `accept`, `x-app`, Claude session
   and agent IDs, Stainless runtime metadata, and the dangerous-browser flag.
-  Client auth, host/framing headers, Alexandria metadata, and spoofed Dario
+  Client auth, host/framing headers, Alex metadata, and spoofed Dario
   capture headers are not forwarded. The selected vault credential replaces
   client auth.
 - Ordinary Anthropic OAuth traffic gets the required
-  `oauth-2025-04-20` beta. If the client supplied `anthropic-beta`, Alexandria
+  `oauth-2025-04-20` beta. If the client supplied `anthropic-beta`, Alex
   preserves it and adds the OAuth beta when absent. Anthropic API-key traffic
   passes the client's beta header through. `anthropic-version` is also
   normalized by the upstream header builder.
 
-On the Dario connection, Alexandria authenticates to the local generation with
+On the Dario connection, Alex authenticates to the local generation with
 its generated Dario API key and adds `x-dario-capture-id` plus
 `x-dario-capture-model`. Those fields let the preload associate Dario's actual
-Anthropic fetch with the Alexandria trace and apply the prompt cache. Dario is
+Anthropic fetch with the Alex trace and apply the prompt cache. Dario is
 the component that produces the Claude-subscription upstream wire request;
-Alexandria does not copy arbitrary CLI headers into it.
+Alex does not copy arbitrary CLI headers into it.
 
-Concretely, the local Dario request follows Alexandria's non-OAuth Anthropic
+Concretely, the local Dario request follows Alex's non-OAuth Anthropic
 header branch: `x-api-key` is the Dario key, a client `anthropic-beta` is passed
 when present, and `anthropic-version` is preserved or defaults to `2023-06-01`.
 The checked-in Rust does not define Dario npm's exact final CLI beta list; the
 capture preload records the resulting Dario-to-Anthropic headers with secrets
-redacted. Do not document additional beta flags as an Alexandria guarantee.
+redacted. Do not document additional beta flags as an Alex guarantee.
 
 ## Generational supervisor
 

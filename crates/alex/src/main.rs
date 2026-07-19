@@ -83,7 +83,7 @@ enum Command {
         /// Override the harness config dir
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        /// Alexandria daemon base URL (env: ALEXANDRIA_URL)
+        /// Alex daemon base URL (env: ALEXANDRIA_URL)
         #[arg(long)]
         url: Option<String>,
         /// Pre-minted harness key (env: ALEXANDRIA_HARNESS_KEY)
@@ -182,18 +182,18 @@ enum Command {
         #[command(subcommand)]
         command: WrapCommand,
     },
-    /// Install, connect, configure, and launch a harness through Alexandria
+    /// Install, connect, configure, and launch a harness through Alex
     Up {
         /// Harness to bootstrap (pi is the default)
         #[arg(default_value = "pi")]
         harness: String,
-        /// Remote Alexandria base URL. Supplying this never starts a local daemon.
+        /// Remote Alex base URL. Supplying this never starts a local daemon.
         #[arg(long)]
         url: Option<String>,
-        /// A model-only scoped run key (never an Alexandria local/admin key)
+        /// A model-only scoped run key (never an Alex local/admin key)
         #[arg(long)]
         key: Option<String>,
-        /// Alexandria model to make the harness default
+        /// Alex model to make the harness default
         #[arg(long, default_value = "alex/gpt-5.6-sol")]
         model: String,
         /// npm package version to install when the harness is absent
@@ -252,7 +252,7 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
-    /// Selectively remove local Alexandria data (dry-run unless --yes is supplied)
+    /// Selectively remove local Alex data (dry-run unless --yes is supplied)
     Reset {
         /// Remove vault account JSON and revoke run keys; retain account tombstones
         #[arg(long)]
@@ -509,13 +509,13 @@ enum WrapCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Launch connected Claude with its Alexandria settings: `alex wrap claude -p 'hi'`
+    /// Launch connected Claude with its Alex settings: `alex wrap claude -p 'hi'`
     Claude {
         /// Args passed through verbatim to `claude`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Launch connected Codex with the Alexandria profile: `alex wrap codex exec 'hi'`
+    /// Launch connected Codex with the Alex profile: `alex wrap codex exec 'hi'`
     Codex {
         /// Args passed through verbatim to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -598,7 +598,7 @@ enum WrapCommand {
 
 #[derive(clap::Args, Clone, Default)]
 struct RemoteTraceArgs {
-    /// Central Alexandria base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
+    /// Central Alex base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
     #[arg(long, alias = "alex-url")]
     trace_url: Option<String>,
     /// Correlate this wrap session under a caller-supplied run id instead of a
@@ -694,7 +694,7 @@ enum VaultCommand {
         #[arg(long)]
         passphrase: String,
     },
-    /// Fetch an encrypted bundle from another Alexandria daemon and import it
+    /// Fetch an encrypted bundle from another Alex daemon and import it
     Pull {
         #[arg(long = "from")]
         from: String,
@@ -777,7 +777,7 @@ enum HarnessCommand {
     Run {
         /// Harness name: claude|codex|grok
         harness: String,
-        /// Model to request from the harness; prefixes route through Alexandria
+        /// Model to request from the harness; prefixes route through Alex
         #[arg(long)]
         model: Option<String>,
         /// Prompt sent to the harness
@@ -808,7 +808,7 @@ enum HarnessCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Pack an npm CLI package into Alexandria's frozen harness cache
+    /// Pack an npm CLI package into Alex's frozen harness cache
     Pack {
         /// Harness name or npm package name, for example claude or @anthropic-ai/claude-code
         target: String,
@@ -899,7 +899,7 @@ enum TracesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Push a locally spooled wrap run to a central Alexandria daemon
+    /// Push a locally spooled wrap run to a central Alex daemon
     Push {
         #[arg(long)]
         run_id: String,
@@ -3353,7 +3353,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .context("a pre-minted harness key requires a harness name")?;
             let url = remote_url.as_deref().context(
-                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alexandria config",
+                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alex config",
             )?;
             harness_connect::connect_with_preminted_key(
                 harness,
@@ -3702,7 +3702,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             if let Some(reason) = fallback_reason {
-                eprintln!("\nWARNING: Alexandria could not bind its configured address {host}:{port}: {reason}");
+                eprintln!("\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}");
                 eprintln!("WARNING: Falling back to loopback (127.0.0.1) so the daemon remains available locally.");
                 eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
             }
@@ -4579,7 +4579,7 @@ async fn main() -> Result<()> {
                 let changed = set_daemon_host(&mut config, &address)?;
                 if changed {
                     println!("daemon host saved as {}", config.host);
-                    println!("restart the Alexandria daemon to apply the new listener");
+                    println!("restart the Alex daemon to apply the new listener");
                 } else {
                     println!("daemon host is already {}", config.host);
                 }
@@ -4654,7 +4654,7 @@ async fn main() -> Result<()> {
                     config.dario_mode_migrated = true;
                     save_config(&config)?;
                     println!(
-                        "Dario routing set to {message} ({mode}) in config.toml; restart Alexandria to apply"
+                        "Dario routing set to {message} ({mode}) in config.toml; restart Alex to apply"
                     );
                     return Ok(());
                 }
@@ -5144,7 +5144,7 @@ fn ensure_wrap_launcher_connected(harness: &str, config_dir: &Path) -> Result<()
     };
     if !connected {
         anyhow::bail!(
-            "{harness} is not connected to Alexandria; run `alex connect {harness}` first"
+            "{harness} is not connected to Alex; run `alex connect {harness}` first"
         );
     }
     Ok(())
@@ -5251,7 +5251,7 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
         "remote trace upload requires --trace-key-file, ALEXANDRIA_TRACE_KEY, or ALEXANDRIA_TRACE_KEY_FILE"
     })?;
     if !key.starts_with("alxk-") {
-        anyhow::bail!("remote trace credential is not an Alexandria key (expected alxk-...)");
+        anyhow::bail!("remote trace credential is not an Alex key (expected alxk-...)");
     }
     let url = reqwest::Url::parse(&base_url)
         .with_context(|| format!("invalid trace destination URL '{base_url}'"))?;
@@ -9390,7 +9390,7 @@ async fn up_cmd(
     let spec = harness_connect::spec_by_name(harness)
         .with_context(|| format!("unknown harness '{harness}'"))?;
     if !spec.supports_connect {
-        bail!("harness '{harness}' does not support Alexandria connection yet");
+        bail!("harness '{harness}' does not support Alex connection yet");
     }
     let remote = url.is_some();
     let base_url = if let Some(url) = url {
@@ -9398,7 +9398,7 @@ async fn up_cmd(
         if url.is_empty() {
             bail!("--url must not be empty");
         }
-        println!("target: remote Alexandria at {url} (will not start a local daemon)");
+        println!("target: remote Alex at {url} (will not start a local daemon)");
         url.to_string()
     } else {
         let base = config.base_url();
@@ -9422,7 +9422,7 @@ async fn up_cmd(
     let (key_id, key) = match supplied_key {
         Some(key) => {
             if !key.starts_with("alxk-") {
-                bail!("--key must be a model-only scoped run key (expected alxk-...), never the Alexandria local/admin key");
+                bail!("--key must be a model-only scoped run key (expected alxk-...), never the Alex local/admin key");
             }
             println!("key: using supplied scoped run key");
             ("rk-provided".to_string(), key.to_string())
@@ -12452,7 +12452,7 @@ local_key = "alx-test"
             .ends_with("plugins/alexandria.ts"));
         let plugin_path = config_dir.join("plugins/alexandria.ts");
         let plugin = std::fs::read_to_string(&plugin_path).unwrap();
-        assert!(plugin.contains("Generated by Alexandria for Amp"));
+        assert!(plugin.contains("Generated by Alex for Amp"));
         assert!(plugin.contains("amp.on('tool.call'"));
         assert!(harness_connect::amp_config_connected(&config_dir).unwrap());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);

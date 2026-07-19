@@ -33,9 +33,9 @@ Capture artifacts (default):
   flows.jsonl     # reverse wrap request/response events
 ```
 
-### Send wrapped traces to another Alexandria machine
+### Send wrapped traces to another Alex machine
 
-The reverse wrap and Amp still run on the machine where you launch them and connect directly to `ampcode.com`. Trace upload is a separate channel: normalized records are written to the local Alexandria spool first, then copied to a central Alexandria daemon.
+The reverse wrap and Amp still run on the machine where you launch them and connect directly to `ampcode.com`. Trace upload is a separate channel: normalized records are written to the local Alex spool first, then copied to a central Alex daemon.
 
 Mint an ingest-only credential on the central machine:
 
@@ -96,7 +96,7 @@ Requires:
 | Management REST (`/api/*`) | auth, plugins, thread create, billing | often yes | yes (with CA) | **yes** |
 | Actor WebSocket (`/actors/gateway/...`) | inference / executor stream | **misses WS** | yes if TLS trusted | **yes** |
 
-Native Amp inference is **actor WebSocket (Rivet)**, not OpenAI-style `/v1` through alex-proxy. Amp in Alexandria is wrap + billing only until actor protocol is mapped.
+Native Amp inference is **actor WebSocket (Rivet)**, not OpenAI-style `/v1` through alex-proxy. Amp in Alex is wrap + billing only until actor protocol is mapped.
 
 ### Config-driven catalog
 
@@ -134,7 +134,7 @@ still show `getUserInfo: 200`, actor creation, and a WebSocket `101`
 before Amp's server-side inference authorization rejects the turn. First try
 the same prompt with plain `amp`; if that also fails, refresh/check the Amp
 account's service-side billing or subscription state rather than re-importing
-the Alexandria vault key.
+the Alex vault key.
 
 ## The WebSocket bug (`guard.missing_header`)
 

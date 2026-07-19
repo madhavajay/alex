@@ -1,4 +1,4 @@
-# Alexandria architecture
+# Alex architecture
 
 Alex (`alex` and `alexandria` are two names for the same binary) is a local
 credential vault, HTTP model gateway, account router, and trace recorder. It
@@ -29,7 +29,7 @@ AI harness or API client
   |  model request + local/run/harness key
   |  optional harness/session/run metadata
   v
-Alexandria listener (default 127.0.0.1:4100)
+Alex listener (default 127.0.0.1:4100)
   |  authenticate; parse client dialect; start trace metadata
   |  strip alex/* namespace; infer/accept provider prefix
   v
@@ -52,7 +52,7 @@ SQLite trace row + gzip request/upstream-request/response artifacts
 ```
 
 The client never supplies an upstream provider secret. It supplies an
-Alexandria key. The proxy selects a vault account and builds upstream auth
+Alex key. The proxy selects a vault account and builds upstream auth
 headers from that account. Inbound `authorization`, `x-api-key`, cookies, and
 `chatgpt-account-id` are redacted in stored header JSON.
 
@@ -72,7 +72,7 @@ substitution and protection equivalencies. See
 
 When configured, non-Claude-Code Anthropic traffic can go to a supervised local
 Dario generation instead of directly to `api.anthropic.com`. Dario supplies the
-Claude-subscription wire shape and Alexandria keeps the underlying Anthropic
+Claude-subscription wire shape and Alex keeps the underlying Anthropic
 account as the trace/billing identity. Genuine Claude Code requests are
 detected from their complete request signature and remain direct. See
 [Dario](dario.md).

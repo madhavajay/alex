@@ -95,7 +95,7 @@ The proxy recognizes streaming from request `stream`, response content type,
 and bodies beginning with `event:` or `data:`. It has parsers/reassemblers for
 Anthropic SSE, OpenAI Chat chunks, OpenAI Responses events, and Gemini SSE.
 
-When client and upstream formats differ, Alexandria may buffer/destream the
+When client and upstream formats differ, Alex may buffer/destream the
 upstream final response, translate it, and synthesize the client's SSE event
 sequence. Synthesizers emit the dialect's normal terminal signal: Anthropic
 message events, OpenAI Chat `[DONE]`, OpenAI Responses output/completed events,
@@ -117,7 +117,7 @@ frame. The normalizer recognizes provider variants for:
 - output/completion tokens;
 - reasoning/thought tokens.
 
-If the routed model matches an embedded pricing row, Alexandria computes cost
+If the routed model matches an embedded pricing row, Alex computes cost
 from uncached input, cached input, cache creation, and output rates. For OpenAI
 formats the reported input total is treated as including cached tokens, so the
 cached portion is subtracted before applying the uncached input rate. Cost is
