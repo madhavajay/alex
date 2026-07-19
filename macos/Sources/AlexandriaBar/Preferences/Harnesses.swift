@@ -46,6 +46,9 @@ struct HarnessesPreferencesSection: View {
                 updateAllModel = nil
             }
         }
+        .task(id: store.harnessesCheckedMs) {
+            await store.refreshHarnessesIfStale()
+        }
     }
 
     // MARK: Header (App.tsx:552-567)
@@ -56,9 +59,16 @@ struct HarnessesPreferencesSection: View {
                 Text("Harnesses")
                     .font(AlexTheme.Fonts.panelTitle)
                     .foregroundStyle(AlexTheme.Colors.foreground)
-                Text("\(connectedCount) connected")
-                    .font(.system(size: 12))
-                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                HStack(spacing: 5) {
+                    Text("\(connectedCount) connected")
+                    if store.harnessesChecking {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("checking…")
+                    }
+                }
+                .font(.system(size: 12))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
             }
             Spacer()
             if !refreshTargets.isEmpty {
@@ -211,7 +221,7 @@ private struct HarnessRowView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This disconnects \(HarnessCatalog.displayName(harness.name)) from Alexandria and revokes its harness key.")
+            Text("This disconnects \(HarnessCatalog.displayName(harness.name)) from Alex and revokes its harness key.")
         }
     }
 

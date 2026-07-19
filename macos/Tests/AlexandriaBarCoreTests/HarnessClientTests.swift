@@ -344,9 +344,10 @@ import Testing
     @Test @MainActor func harnessSnapshotRefreshAppliesLatestConnectionState() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses")
+            #expect(request.url?.query == "refresh=1")
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            let payload = #"{"harnesses":[{"name":"kimi","installed":true,"config_dir_exists":true,"connected":false,"supports_connect":true,"daemon_reachable":true}]}"#
+            let payload = #"{"harnesses":[{"name":"kimi","installed":true,"config_dir_exists":true,"connected":false,"supports_connect":true,"daemon_reachable":true}],"checked_ms":1}"#
             return (response, Data(payload.utf8))
         }
         defer { HarnessEndpointURLProtocol.handler = nil }
@@ -363,6 +364,8 @@ import Testing
         #expect(store.harnessesSupported == true)
         #expect(store.harnesses.map(\.name) == ["kimi"])
         #expect(store.harnesses[0].connected == false)
+        #expect(store.harnessesCheckedMs == 1)
+        #expect(store.harnessesAreStale)
     }
 
     @Test func daemonUpdateApplyPostsAndDecodesAccepted() async throws {

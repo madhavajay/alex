@@ -487,12 +487,17 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(ImportOutcomes.self, from: data).outcomes
     }
 
-    public func harnesses() async throws -> [Harness]? {
+    public func harnessSnapshot(refresh: Bool = false) async throws -> HarnessesResponse? {
         do {
-            return try await get("admin/harnesses", as: HarnessesResponse.self).harnesses
+            let query = refresh ? [URLQueryItem(name: "refresh", value: "1")] : []
+            return try await get("admin/harnesses", query: query, as: HarnessesResponse.self)
         } catch ClientError.http(404, _) {
             return nil
         }
+    }
+
+    public func harnesses(refresh: Bool = false) async throws -> [Harness]? {
+        try await harnessSnapshot(refresh: refresh)?.harnesses
     }
 
     public func connectHarness(_ name: String) async throws -> HarnessConfigWriteResponse {

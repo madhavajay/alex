@@ -299,9 +299,11 @@ import Testing
         {"harnesses":[
           {"name":"pi","installed":true,"binary":"/opt/alex/pi","version":"0.80.3","version_warning":null,"config_dir":"/Users/x/.pi/agent","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":null,"config_dir":null},"daemon_reachable":true,"extra":"ignored"},
           {"name":"codex","installed":true,"binary":"/opt/alex/codex","version":"0.144.3","version_warning":null,"config_dir":"/Users/x/.codex","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":"/tmp/codex","config_dir":null},"daemon_reachable":true,"default_route":"alex","backup_path":"/Users/x/.codex/alexandria-original-config.toml"}
-        ],"extra":"ignored"}
+        ],"checked_ms":1783477427269,"extra":"ignored"}
         """#
-        let harnesses = try decode(json, as: HarnessesResponse.self).harnesses
+        let response = try decode(json, as: HarnessesResponse.self)
+        let harnesses = response.harnesses
+        #expect(response.checkedMs == 1783477427269)
         #expect(harnesses.count == 2)
         #expect(harnesses[0].name == "pi")
         #expect(harnesses[0].versionWarning == nil)

@@ -328,7 +328,7 @@ pub(crate) struct VersionCheck {
     pub warning: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct HarnessStatus {
     pub(crate) name: &'static str,
     pub(crate) installed: bool,
@@ -356,7 +356,7 @@ struct HarnessDetection {
     version_warning: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct HarnessOverrideJson {
     pub(crate) binary: Option<String>,
     pub(crate) config_dir: Option<String>,
@@ -386,10 +386,12 @@ struct VersionOutput {
 struct DetectionCacheKey {
     binary: PathBuf,
     modified: Option<SystemTime>,
+    size: Option<u64>,
 }
 
 static VERSION_DETECTION_CACHE: OnceLock<Mutex<HashMap<DetectionCacheKey, VersionOutput>>> =
     OnceLock::new();
+const VERSION_DETECTION_CACHE_MAX_ENTRIES: usize = 64;
 
 #[derive(Debug)]
 struct PiDetection {
@@ -2200,9 +2202,9 @@ pub(crate) fn write_kimi_connection(
     if doc.get("providers").is_none() {
         doc["providers"] = Item::Table(Table::new());
     }
-    let providers = doc["providers"]
-        .as_table_mut()
-        .with_context(|| "Kimi config.toml `providers` must be a table; aborting without changes")?;
+    let providers = doc["providers"].as_table_mut().with_context(|| {
+        "Kimi config.toml `providers` must be a table; aborting without changes"
+    })?;
     // An existing provider block without a state marker is either an orphan
     // from a partial disconnect (its api_key is one of our alxk- run keys —
     // adopt and replace it, since bailing used to strand Kimi on a revoked key
@@ -5073,21 +5075,36 @@ async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> Ver
         .lock()
     {
         cache.retain(|key, _| key.binary != cache_key.binary || key == &cache_key);
+        if cache.len() >= VERSION_DETECTION_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
+            if let Some(oldest_key) = cache.keys().next().cloned() {
+                cache.remove(&oldest_key);
+            }
+        }
         cache.insert(cache_key, output.clone());
     }
     output
 }
 
-fn detection_cache_key(binary: PathBuf, modified: Option<SystemTime>) -> DetectionCacheKey {
-    DetectionCacheKey { binary, modified }
+fn detection_cache_key(
+    binary: PathBuf,
+    modified: Option<SystemTime>,
+    size: Option<u64>,
+) -> DetectionCacheKey {
+    DetectionCacheKey {
+        binary,
+        modified,
+        size,
+    }
 }
 
 fn binary_detection_cache_key(binary: &Path) -> DetectionCacheKey {
     let binary = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-    let modified = std::fs::metadata(&binary)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    detection_cache_key(binary, modified)
+    let metadata = std::fs::metadata(&binary).ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok());
+    let size = metadata.as_ref().map(std::fs::Metadata::len);
+    detection_cache_key(binary, modified, size)
 }
 
 async fn command_version_uncached(
@@ -6175,7 +6192,10 @@ display_name = "K3"
             config["providers"]["managed:kimi-code"]["type"].as_str(),
             Some("kimi")
         );
-        assert_eq!(config["models"]["kimi-code/k3"]["model"].as_str(), Some("k3"));
+        assert_eq!(
+            config["models"]["kimi-code/k3"]["model"].as_str(),
+            Some("k3")
+        );
         // The alexandria OpenAI-compatible provider points at the local proxy.
         let provider = &config["providers"][KIMI_PROVIDER_NAME];
         assert_eq!(provider["type"].as_str(), Some("openai"));
@@ -6254,10 +6274,7 @@ model = "alex/gpt-5.5"
             Some("k3")
         );
         // The stale alex default was replaced with a surviving native model.
-        assert_eq!(
-            restored["default_model"].as_str(),
-            Some("kimi-code/k3")
-        );
+        assert_eq!(restored["default_model"].as_str(), Some("kimi-code/k3"));
     }
 
     #[test]
@@ -6772,21 +6789,30 @@ fi"#,
     }
 
     #[test]
-    fn detection_cache_key_includes_resolved_path_and_mtime() {
+    fn detection_cache_key_includes_resolved_path_mtime_and_size() {
         let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let second_time = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
-        let first = detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time));
+        let first =
+            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time), Some(10));
         assert_eq!(
             first,
-            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time))
+            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time), Some(10))
         );
         assert_ne!(
             first,
-            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(second_time))
+            detection_cache_key(
+                PathBuf::from("/tmp/bin/claude"),
+                Some(second_time),
+                Some(10)
+            )
         );
         assert_ne!(
             first,
-            detection_cache_key(PathBuf::from("/tmp/bin/codex"), Some(first_time))
+            detection_cache_key(PathBuf::from("/tmp/bin/claude"), Some(first_time), Some(11))
+        );
+        assert_ne!(
+            first,
+            detection_cache_key(PathBuf::from("/tmp/bin/codex"), Some(first_time), Some(10))
         );
     }
 

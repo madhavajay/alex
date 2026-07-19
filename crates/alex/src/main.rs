@@ -2276,6 +2276,107 @@ fn dario_admin_router(
         .with_state(glue)
 }
 
+const HARNESS_CACHE_FRESH_MS: i64 = 60_000;
+
+#[derive(Default)]
+struct HarnessListCacheState {
+    scope: Option<PathBuf>,
+    harnesses: Option<Vec<harness_connect::HarnessStatus>>,
+    checked_ms: i64,
+    refreshing: bool,
+    last_refresh_succeeded: bool,
+}
+
+struct HarnessListCache {
+    state: tokio::sync::Mutex<HarnessListCacheState>,
+    refreshed: tokio::sync::watch::Sender<u64>,
+}
+
+static HARNESS_LIST_CACHE: std::sync::OnceLock<Arc<HarnessListCache>> = std::sync::OnceLock::new();
+
+fn harness_list_cache() -> &'static Arc<HarnessListCache> {
+    HARNESS_LIST_CACHE.get_or_init(|| {
+        let (refreshed, _) = tokio::sync::watch::channel(0);
+        Arc::new(HarnessListCache {
+            state: tokio::sync::Mutex::new(HarnessListCacheState::default()),
+            refreshed,
+        })
+    })
+}
+
+fn harness_cache_is_fresh(checked_ms: i64, now_ms: i64) -> bool {
+    checked_ms > 0 && now_ms.saturating_sub(checked_ms) <= HARNESS_CACHE_FRESH_MS
+}
+
+async fn run_claimed_harness_refresh(
+    config: Config,
+) -> Result<(Vec<harness_connect::HarnessStatus>, i64)> {
+    let result = harness_connect::harness_statuses(&config, None, true)
+        .await
+        .map(|harnesses| (harnesses, now_ms()));
+    let cache = harness_list_cache();
+    {
+        let mut guard = cache.state.lock().await;
+        guard.last_refresh_succeeded = result.is_ok();
+        if let Ok((harnesses, checked_ms)) = &result {
+            guard.scope = Some(config.data_dir.clone());
+            guard.harnesses = Some(harnesses.clone());
+            guard.checked_ms = *checked_ms;
+        }
+        guard.refreshing = false;
+    }
+    cache.refreshed.send_modify(|generation| *generation += 1);
+    result
+}
+
+async fn refresh_harness_cache(
+    config: Config,
+) -> Result<(Vec<harness_connect::HarnessStatus>, i64)> {
+    let scope = config.data_dir.clone();
+    loop {
+        let wait_for_refresh = {
+            let cache = harness_list_cache();
+            let mut guard = cache.state.lock().await;
+            if guard.refreshing {
+                Some(cache.refreshed.subscribe())
+            } else {
+                guard.refreshing = true;
+                None
+            }
+        };
+        if let Some(mut wait_for_refresh) = wait_for_refresh {
+            let _ = wait_for_refresh.changed().await;
+            let cache = harness_list_cache();
+            let guard = cache.state.lock().await;
+            if guard.last_refresh_succeeded && guard.scope.as_ref() == Some(&scope) {
+                if let Some(harnesses) = guard.harnesses.clone() {
+                    return Ok((harnesses, guard.checked_ms));
+                }
+            }
+            continue;
+        }
+        return run_claimed_harness_refresh(config).await;
+    }
+}
+
+fn harness_cache_response(
+    result: Result<(Vec<harness_connect::HarnessStatus>, i64)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match result {
+        Ok((harnesses, checked_ms)) => axum::Json(serde_json::json!({
+            "harnesses": harnesses,
+            "checked_ms": checked_ms,
+        }))
+        .into_response(),
+        Err(error_value) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": error_value.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
@@ -2469,16 +2570,52 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         }
     }
 
-    async fn list() -> axum::response::Response {
-        match load_or_create_config() {
-            Ok((config, _)) => match harness_connect::harness_statuses(&config, None, true).await {
-                Ok(harnesses) => {
-                    axum::Json(serde_json::json!({"harnesses": harnesses})).into_response()
-                }
-                Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            },
-            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    async fn list(
+        Query(q): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let (config, _) = match load_or_create_config() {
+            Ok(value) => value,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        if q.get("refresh").is_some_and(|value| value == "1") {
+            return harness_cache_response(refresh_harness_cache(config).await);
         }
+
+        let scope = config.data_dir.clone();
+        let now = now_ms();
+        let (cached, start_refresh) = {
+            let cache = harness_list_cache();
+            let mut guard = cache.state.lock().await;
+            let cached = (guard.scope.as_ref() == Some(&scope))
+                .then(|| {
+                    guard
+                        .harnesses
+                        .clone()
+                        .map(|harnesses| (harnesses, guard.checked_ms))
+                })
+                .flatten();
+            let stale = cached
+                .as_ref()
+                .is_some_and(|(_, checked_ms)| !harness_cache_is_fresh(*checked_ms, now));
+            let start_refresh = stale && !guard.refreshing;
+            if start_refresh {
+                guard.refreshing = true;
+            }
+            (cached, start_refresh)
+        };
+
+        if let Some((harnesses, checked_ms)) = cached {
+            if start_refresh {
+                tokio::spawn(async move {
+                    if let Err(error_value) = run_claimed_harness_refresh(config).await {
+                        tracing::debug!(%error_value, "background harness status refresh failed");
+                    }
+                });
+            }
+            return harness_cache_response(Ok((harnesses, checked_ms)));
+        }
+
+        harness_cache_response(refresh_harness_cache(config).await)
     }
 
     async fn connect(
@@ -3548,6 +3685,9 @@ async fn main() -> Result<()> {
                     describe(body_days),
                     describe(row_days)
                 );
+            }
+            if let Err(error_value) = refresh_harness_cache(config.clone()).await {
+                tracing::warn!(%error_value, "could not warm harness status cache at startup");
             }
             let mut app = alex_proxy::router(state.clone());
             app = app.merge(harness_admin_router(state.clone()));
@@ -9785,14 +9925,9 @@ mod tests {
             } => assert_eq!(channel, "control"),
             _ => panic!("unexpected notify commands parse"),
         }
-        assert!(Cli::try_parse_from([
-            "alex",
-            "notify",
-            "commands",
-            "--enable",
-            "--disable"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["alex", "notify", "commands", "--enable", "--disable"]).is_err()
+        );
         match Cli::try_parse_from([
             "alex",
             "notify",
@@ -11628,7 +11763,10 @@ local_key = "alx-test"
         };
         alex_proxy::OpenrouterExposedPersister::persist(
             &exposed,
-            &["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+            &[
+                "z-ai/glm-5.2".to_string(),
+                "openai/gpt-5.6-terra".to_string(),
+            ],
         )
         .unwrap();
 
@@ -11648,7 +11786,10 @@ local_key = "alx-test"
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(
             reloaded.openrouter_exposed_models,
-            vec!["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+            vec![
+                "z-ai/glm-5.2".to_string(),
+                "openai/gpt-5.6-terra".to_string()
+            ],
             "an unrelated notifications write dropped the OpenRouter exposure list"
         );
         assert_eq!(
@@ -11797,6 +11938,7 @@ local_key = "alx-test"
         let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
+        assert!(body["checked_ms"].as_i64().unwrap() > 0);
         assert_eq!(harnesses.len(), 19);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
@@ -11823,6 +11965,21 @@ local_key = "alx-test"
             .as_str()
             .unwrap()
             .contains("does not support connect"));
+    }
+
+    #[test]
+    fn harness_cache_freshness_expires_after_one_minute() {
+        let checked_ms = 1_000_000;
+        assert!(harness_cache_is_fresh(checked_ms, checked_ms));
+        assert!(harness_cache_is_fresh(
+            checked_ms,
+            checked_ms + HARNESS_CACHE_FRESH_MS
+        ));
+        assert!(!harness_cache_is_fresh(
+            checked_ms,
+            checked_ms + HARNESS_CACHE_FRESH_MS + 1
+        ));
+        assert!(!harness_cache_is_fresh(0, checked_ms));
     }
 
     #[cfg(unix)]
