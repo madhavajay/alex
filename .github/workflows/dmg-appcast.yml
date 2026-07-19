@@ -218,8 +218,8 @@ jobs:
           else
             if ! gh release create "$RELEASE_TAG" "$DMG_PATH" \
               --target "$(git rev-parse HEAD)" \
-              --title "Alexandria ${RELEASE_TAG}" \
-              --notes "Release assets for Alexandria ${RELEASE_VERSION}."; then
+              --title "Alex ${RELEASE_TAG}" \
+              --notes "Release assets for Alex ${RELEASE_VERSION}."; then
               gh release upload "$RELEASE_TAG" "$DMG_PATH" "${upload_args[@]}"
             fi
           fi

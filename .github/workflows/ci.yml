@@ -90,7 +90,7 @@ jobs:
           chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
 
           {
-            echo "Alexandria macOS PR test bundle"
+            echo "Alex macOS PR test bundle"
             echo "pull_request=${PR_NUMBER}"
             echo "commit=${GITHUB_SHA}"
             echo "runner_arch=$(uname -m)"
