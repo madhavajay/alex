@@ -5017,6 +5017,9 @@ fn harness_home_binary(spec: &HarnessSpec) -> Option<PathBuf> {
 pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
+        if !probe_safe_dir(&dir) {
+            continue;
+        }
         for candidate in executable_candidates(&dir, bin) {
             if is_executable_file(&candidate) {
                 return Some(candidate);
@@ -5024,6 +5027,24 @@ pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Never probe network volumes or TCC-protected user folders for harness
+/// binaries: on macOS each stat there makes the OS ask "alex wants to access
+/// files on a network volume / Desktop / …" — for every fresh (unsigned local)
+/// build — and no harness installs itself in those places.
+pub(crate) fn probe_safe_dir(dir: &Path) -> bool {
+    if dir.starts_with("/Volumes") {
+        return false;
+    }
+    if let Some(home) = dirs::home_dir() {
+        for protected in ["Desktop", "Documents", "Downloads"] {
+            if dir.starts_with(home.join(protected)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn executable_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
@@ -5437,6 +5458,22 @@ pub(crate) fn reasoning_enabled(id: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn probe_skips_network_volumes_and_protected_folders() {
+        assert!(!probe_safe_dir(Path::new("/Volumes/NAS/bin")));
+        assert!(!probe_safe_dir(Path::new("/Volumes")));
+        assert!(probe_safe_dir(Path::new("/usr/local/bin")));
+        assert!(probe_safe_dir(Path::new("/opt/homebrew/bin")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(!probe_safe_dir(&home.join("Desktop/tools")));
+            assert!(!probe_safe_dir(&home.join("Documents")));
+            assert!(!probe_safe_dir(&home.join("Downloads/node/bin")));
+            assert!(probe_safe_dir(&home.join(".local/bin")));
+            // Prefix lookalikes stay probeable (path components, not strings).
+            assert!(probe_safe_dir(&home.join("DesktopNot")));
+        }
+    }
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
