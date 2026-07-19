@@ -49,6 +49,7 @@ public struct NotificationChannel: Codable, Sendable {
     public let host: String?
     public let botUsername: String?
     public let chatID: String?
+    public let allowCommands: Bool
     public let supportsReplies: Bool?
     public let minLevel: NotificationLevel
     public let categories: [String]
@@ -61,6 +62,7 @@ public struct NotificationChannel: Codable, Sendable {
         case index, id, kind, format, host, categories
         case botUsername = "bot_username"
         case chatID = "chat_id"
+        case allowCommands = "allow_commands"
         case supportsReplies = "supports_replies"
         case minLevel = "min_level"
         case lastSentMs = "last_sent_ms"
@@ -179,6 +181,103 @@ public struct NotificationSaveResponse: Codable, Sendable {
     public let ok: Bool
     public let channel: NotificationChannel?
     public let error: String?
+}
+
+/// Result of enabling or disabling inbound commands for a saved channel.
+public struct NotificationCommandsResponse: Codable, Sendable {
+    public let ok: Bool
+    public let channel: NotificationChannel?
+    public let error: String?
+
+    private enum CodingKeys: String, CodingKey { case ok, channel, error }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.channel = try container.decodeIfPresent(NotificationChannel.self, forKey: .channel)
+        self.error = try container.decodeIfPresent(String.self, forKey: .error)
+        self.ok = try container.decodeIfPresent(Bool.self, forKey: .ok) ?? (channel != nil)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(ok, forKey: .ok)
+        try container.encodeIfPresent(channel, forKey: .channel)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+}
+
+/// One server-redacted inbound or outbound notification activity entry.
+/// The decoder accepts both the daemon's current `ts`/`kind` field names and
+/// the admin API's documented `ts_ms`/`category` aliases.
+public struct NotificationLogEntry: Codable, Sendable {
+    public let tsMs: Int64
+    public let direction: String
+    public let channelID: String?
+    public let category: String
+    public let ok: Bool
+    public let error: String?
+    public let summary: String
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, kind, direction, ok, error, summary
+        case tsMs = "ts_ms"
+        case channelID = "channel_id"
+        case category
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let tsMs = try container.decodeIfPresent(Int64.self, forKey: .tsMs) {
+            self.tsMs = tsMs
+        } else {
+            self.tsMs = try container.decode(Int64.self, forKey: .ts)
+        }
+        self.direction = try container.decode(String.self, forKey: .direction)
+        self.channelID = try container.decodeIfPresent(String.self, forKey: .channelID)
+        if let category = try container.decodeIfPresent(String.self, forKey: .category) {
+            self.category = category
+        } else {
+            self.category = try container.decode(String.self, forKey: .kind)
+        }
+        self.ok = try container.decode(Bool.self, forKey: .ok)
+        self.error = try container.decodeIfPresent(String.self, forKey: .error)
+        self.summary = try container.decode(String.self, forKey: .summary)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(tsMs, forKey: .tsMs)
+        try container.encode(direction, forKey: .direction)
+        try container.encodeIfPresent(channelID, forKey: .channelID)
+        try container.encode(category, forKey: .category)
+        try container.encode(ok, forKey: .ok)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encode(summary, forKey: .summary)
+    }
+}
+
+public struct NotificationLogResponse: Codable, Sendable {
+    public let messages: [NotificationLogEntry]
+}
+
+/// Selects the credential-bearing test form when it is complete, otherwise a
+/// saved channel whose token remains stored in the daemon.
+public enum NotificationTestTarget: Sendable, Equatable {
+    case inline
+    case savedChannel(String)
+
+    public static func resolve(
+        token: String, chatID: String, savedChannelID: String?
+    ) -> NotificationTestTarget? {
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty, !chatID.isEmpty { return .inline }
+        if let savedChannelID {
+            let id = savedChannelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !id.isEmpty { return .savedChannel(id) }
+        }
+        return nil
+    }
 }
 
 /// Reachability an account's last heartbeat/ping implies, as reported by the

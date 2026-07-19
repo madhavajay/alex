@@ -25,6 +25,37 @@ import Testing
         #expect(!response.fallback)
     }
 
+    @Test func notificationCommandsResponseDecodesUpdatedChannel() throws {
+        let json = #"{"ok":true,"channel":{"index":0,"id":"telegram-main","kind":"telegram","format":"telegram","host":"api.telegram.org","bot_username":"alex_bot","chat_id":"42","allow_commands":true,"supports_replies":true,"min_level":"warn","categories":["reauth"],"last_sent_ms":1783477900000,"last_error":null}}"#
+        let response = try decode(json, as: NotificationCommandsResponse.self)
+        #expect(response.ok)
+        #expect(response.channel?.id == "telegram-main")
+        #expect(response.channel?.allowCommands == true)
+        #expect(response.channel?.lastError == nil)
+    }
+
+    @Test func notificationLogDecodesDaemonAndDocumentedFieldNames() throws {
+        let json = #"{"messages":[{"ts":1783477900000,"direction":"out","channel_id":"telegram-main","kind":"reauth","ok":true,"error":null,"summary":"Re-authentication required"},{"ts_ms":1783477901000,"direction":"in","channel_id":"telegram-main","category":"command","ok":false,"error":"invalid code","summary":"[oauth code redacted]"}]}"#
+        let response = try decode(json, as: NotificationLogResponse.self)
+        #expect(response.messages.count == 2)
+        #expect(response.messages[0].tsMs == 1_783_477_900_000)
+        #expect(response.messages[0].category == "reauth")
+        #expect(response.messages[1].direction == "in")
+        #expect(response.messages[1].category == "command")
+        #expect(response.messages[1].summary == "[oauth code redacted]")
+        #expect(response.messages[1].error == "invalid code")
+    }
+
+    @Test func notificationTestTargetUsesSavedChannelWithoutFormCredentials() {
+        #expect(NotificationTestTarget.resolve(
+            token: "", chatID: "", savedChannelID: "telegram-main")
+            == .savedChannel("telegram-main"))
+        #expect(NotificationTestTarget.resolve(
+            token: "new-token", chatID: "42", savedChannelID: "telegram-main") == .inline)
+        #expect(NotificationTestTarget.resolve(
+            token: "new-token", chatID: "", savedChannelID: nil) == nil)
+    }
+
     @Test func canonicalProviderCatalogIncludesEveryProvider() {
         #expect(Set(ProviderInfo.supportedProviders) == Set([
             "anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"

@@ -60,6 +60,24 @@ private struct FixtureCaptureBody: Encodable {
     }
 }
 
+private struct NotificationCommandsBody: Encodable {
+    let channelId: String
+    let allowCommands: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case channelId = "channel_id"
+        case allowCommands = "allow_commands"
+    }
+}
+
+private struct SavedNotificationTestBody: Encodable {
+    let channelId: String
+
+    enum CodingKeys: String, CodingKey {
+        case channelId = "channel_id"
+    }
+}
+
 private struct MintRunKeyBody: Encodable {
     let kind = "run"
     let label: String?
@@ -594,6 +612,32 @@ public struct AlexandriaClient: Sendable {
         let data = try await request(
             "admin/notifications/test", method: "POST", body: body(channel))
         return try JSONDecoder().decode(NotificationTestResponse.self, from: data)
+    }
+
+    /// Tests a persisted channel using the token retained by the daemon.
+    public func testTelegramNotification(channelId: String) async throws -> NotificationTestResponse {
+        let data = try await request(
+            "admin/notifications/test", method: "POST",
+            body: body(SavedNotificationTestBody(channelId: channelId)))
+        return try JSONDecoder().decode(NotificationTestResponse.self, from: data)
+    }
+
+    @discardableResult
+    public func setChannelCommands(
+        channelId: String, allowCommands: Bool
+    ) async throws -> NotificationCommandsResponse {
+        let data = try await request(
+            "admin/notifications/commands", method: "POST",
+            body: body(NotificationCommandsBody(
+                channelId: channelId, allowCommands: allowCommands)))
+        return try JSONDecoder().decode(NotificationCommandsResponse.self, from: data)
+    }
+
+    public func notificationsLog(limit: Int = 50) async throws -> NotificationLogResponse {
+        try await get(
+            "admin/notifications/log",
+            query: [URLQueryItem(name: "limit", value: "\(limit)")],
+            as: NotificationLogResponse.self)
     }
 
     public func removeNotification(id: String) async throws {
