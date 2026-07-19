@@ -62,6 +62,9 @@ struct MessageBubble: View {
                 SubagentCard(subagent: subagent, onFollow: onFollowSubagent)
                     .padding(isUser ? .trailing : .leading, cardInset)
             }
+            if let event = message.event, !event.isEmpty {
+                eventChip(event)
+            }
             if let error = message.error, !error.isEmpty {
                 errorCard(error)
             }
@@ -258,6 +261,18 @@ struct MessageBubble: View {
             .overlay(
                 RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
                     .strokeBorder(AlexTheme.Colors.destructive.opacity(0.25)))
+            .padding(isUser ? .trailing : .leading, cardInset)
+    }
+
+    private func eventChip(_ event: String) -> some View {
+        Text(event)
+            .font(AlexTheme.Fonts.metaMono)
+            .foregroundStyle(AlexTheme.Colors.textSecondary)
+            .padding(.horizontal, AlexTheme.Spacing.md)
+            .padding(.vertical, AlexTheme.Spacing.xs)
+            .background(Capsule().fill(AlexTheme.Colors.textSecondary.opacity(0.10)))
+            .overlay(
+                Capsule().strokeBorder(AlexTheme.Colors.textSecondary.opacity(0.22)))
             .padding(isUser ? .trailing : .leading, cardInset)
     }
 }

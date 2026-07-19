@@ -26,6 +26,7 @@ final class OnboardingModel {
         "Meet Alex", "Pick a provider", "Pick a harness", "Your models are ready",
         "Make your first request", "See it in the Trace Browser",
         "Credentials for any app", "Never lose a login", "Keep your agents running",
+        "Beyond single provider", "PAM",
     ]
 
     let store: SnapshotStore
@@ -319,7 +320,9 @@ struct OnboardingView: View {
         case 5: traceBrowser
         case 6: credentials
         case 7: notifications
-        default: failover
+        case 8: failover
+        case 9: beyondSingleProvider
+        default: pam
         }
     }
 
@@ -467,6 +470,53 @@ struct OnboardingView: View {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.success)
             intro("Keep your agents running", "Settings → Failover lets you choose models to switch to automatically, preventing capacity errors, logout errors, and guardrail refusals from killing a long-running agent.")
             statusCard(icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary, text: "Work moves to the next eligible model or account and keeps going.")
+        }
+    }
+
+    private var beyondSingleProvider: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(spacing: 18) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Image(systemName: "plus")
+                    .font(.system(size: 22, weight: .light))
+                Image(systemName: "cpu")
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 22, weight: .light))
+                Image(systemName: "sparkles")
+            }
+            .font(.system(size: 46, weight: .medium))
+            .foregroundStyle(AlexTheme.Colors.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+            intro(
+                "Beyond single provider",
+                "The future is fusion models and mixtures of agents. Get the best coding experience by using multiple models at the same time in supported harnesses — or build your own experimental harness tools on Alex.")
+            statusCard(
+                icon: "square.stack.3d.up",
+                tint: AlexTheme.Colors.primary,
+                text: "Combine distinct model strengths instead of asking one model to do everything.")
+        }
+    }
+
+    private var pam: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let image = HarnessIconLoader.image(
+                resource: "pi", extension: "png", subdirectory: "onboarding")
+            {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: 250)
+                    .clipShape(RoundedRectangle(cornerRadius: AlexTheme.Radius.lg))
+            } else {
+                Image(systemName: "person.3.sequence.fill")
+                    .font(.system(size: 72))
+                    .foregroundStyle(AlexTheme.Colors.primary)
+                    .frame(maxWidth: .infinity, minHeight: 180)
+            }
+            intro(
+                "PAM",
+                "PAM is a mixture-of-agents plugin for Pi that runs multiple models at once as Agent and Oracle roles — like the AMP Dial. It ships with Alex (plugins/pam) — point it at your alex/* models and experiment.")
         }
     }
 

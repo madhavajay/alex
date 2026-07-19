@@ -458,6 +458,29 @@ import Testing
         #expect(TraceFingerprint.sessions([a, b]) != TraceFingerprint.sessions([a, bWithUsage]))
     }
 
+    @Test func clientDisconnectsAreEventsNotErrors() {
+        #expect(TraceClassification.isClientDisconnect(errorKind: "client_disconnect"))
+        #expect(!TraceClassification.isError(
+            status: 499, errorKind: "client_disconnect", error: "client went away"))
+        #expect(TraceClassification.isError(
+            status: 500, errorKind: "upstream_error", error: "failed"))
+        #expect(TraceClassification.isError(
+            status: 429, errorKind: nil, error: nil))
+
+        let eventOnly = SessionRow(session: makeSession(
+            id: "event", models: nil, harness: "pi", runId: nil, lastStatus: 499,
+            errors: 1, errorClassCounts: ["client_disconnect": 1]))
+        #expect(eventOnly.errors == 0)
+        #expect(eventOnly.clientDisconnects == 1)
+
+        let mixed = SessionRow(session: makeSession(
+            id: "mixed", models: nil, harness: "pi", runId: nil, lastStatus: 500,
+            errors: 3,
+            errorClassCounts: ["client_disconnect": 2, "upstream_error": 1]))
+        #expect(mixed.errors == 1)
+        #expect(mixed.clientDisconnects == 2)
+    }
+
     @Test func turnsFingerprintSkip() throws {
         let json = #"""
         {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"status":200,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
@@ -487,7 +510,8 @@ import Testing
         tags: [String: String]? = nil, firstTsMs: Int64 = 0, lastTsMs: Int64 = 0,
         efforts: [String]? = nil, accountIds: [String]? = nil, traceCount: Int = 1,
         totalInputTokens: Int64? = nil, totalOutputTokens: Int64? = nil,
-        totalCostUsd: Double? = nil, errors: Int64? = nil
+        totalCostUsd: Double? = nil, errors: Int64? = nil,
+        errorClassCounts: [String: Int64]? = nil
     ) -> TraceSession {
         let json: [String: Any] = [
             "session_id": id,
@@ -505,6 +529,7 @@ import Testing
             "total_output_tokens": totalOutputTokens as Any,
             "total_cost_usd": totalCostUsd as Any,
             "errors": errors as Any,
+            "error_class_counts": errorClassCounts as Any,
         ]
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(TraceSession.self, from: data)
