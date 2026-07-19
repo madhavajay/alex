@@ -8585,13 +8585,33 @@ fn graceful_or_hard_restart(
 }
 
 fn process_running(pid: i64) -> Result<bool> {
-    // Capture stderr: `kill -0` reports ESRCH as "No such process", but that
-    // is the successful end state while waiting for a graceful drain.
-    let output = std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .context("checking daemon process")?;
-    Ok(output.status.success())
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return Ok(false);
+        };
+        if pid <= 0 {
+            return Ok(false);
+        }
+
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Ok(true);
+        }
+
+        // ESRCH (no such process) is the successful end state while waiting
+        // for a graceful drain. EPERM still means the process exists.
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => Ok(true),
+            Some(libc::ESRCH) => Ok(false),
+            _ => Ok(false),
+        };
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
 }
 
 async fn drain_launchd_daemon(pid: i64, timeout: std::time::Duration) -> Result<()> {
