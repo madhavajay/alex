@@ -401,9 +401,12 @@ final class TraceBrowserModel {
         }
     }
 
-    init(store: SnapshotStore, initialHarness: String? = nil) {
+    init(store: SnapshotStore, initialHarness: String? = nil, initialQuery: String? = nil) {
         self.store = store
-        if let initialHarness {
+        if let initialQuery, !initialQuery.isEmpty {
+            queryText = initialQuery
+            parsedQuery = OmniQuery.parse(queryText)
+        } else if let initialHarness {
             queryText = "harness:\(initialHarness)"
             parsedQuery = OmniQuery.parse(queryText)
         }
@@ -411,6 +414,10 @@ final class TraceBrowserModel {
 
     func setHarnessFilter(_ harness: String) {
         queryText = OmniQuery.settingToken(in: queryText, key: "harness", value: harness)
+    }
+
+    func setQueryFilter(_ query: String) {
+        queryText = query
     }
 
     private func recomputeVisible(debounce: Bool = false) {
@@ -622,6 +629,10 @@ final class TraceBrowserModel {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
+        // `stop()` cancels any in-flight search when an existing window is
+        // reopened. Re-apply the current query so initial/preset key filters
+        // always populate their server-backed session id set.
+        queryChanged()
     }
 
     func stop() {
@@ -926,7 +937,7 @@ final class TraceBrowserModel {
         let query = parsedQuery
         recomputeSessionSummary()
         applyTurnFilter()
-        guard !query.freeText.isEmpty else {
+        guard !query.freeText.isEmpty || query.key != nil else {
             searchSessionIds = nil
             searchInFlight = false
             recomputeVisible(debounce: true)
@@ -1513,7 +1524,7 @@ struct TraceBrowserView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(AlexTheme.Colors.textSecondary)
                     .lineLimit(1)
-                    .help("Errored traces grouped by Alexandria error class")
+                    .help("Errored traces grouped by Alex error class")
             }
         }
         .padding(.horizontal, 12)
@@ -2467,9 +2478,12 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
     ///   instead of opening un-targeted. One-line adoption for a caller that
     ///   already holds a `TraceBrowserWindowController`: pass the session id
     ///   here instead of calling `show(harness:)` alone.
-    func show(harness: String? = nil, selectSessionId: String? = nil) {
+    func show(
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+    ) {
         if window == nil {
-            let model = TraceBrowserModel(store: store, initialHarness: harness)
+            let model = TraceBrowserModel(
+                store: store, initialHarness: harness, initialQuery: query)
             self.model = model
             let host = NSHostingController(rootView: TraceBrowserView(model: model))
             let win = NSWindow(contentViewController: host)
@@ -2481,6 +2495,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
             win.center()
             win.setFrameAutosaveName("AlexandriaTraceBrowser")
             window = win
+        } else if let query {
+            model?.setQueryFilter(query)
         } else if let harness {
             model?.setHarnessFilter(harness)
         }

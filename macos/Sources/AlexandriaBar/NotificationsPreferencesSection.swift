@@ -21,13 +21,19 @@ struct NotificationsPreferencesSection: View {
     @State private var discoveryResult: String?
     @State private var actionResult: String?
     @State private var channels: [NotificationChannel] = []
+    @State private var messages: [NotificationLogEntry] = []
     @State private var isLoading = true
+    @State private var isLoadingMessages = false
     @State private var isValidating = false
     @State private var isDiscovering = false
     @State private var isTesting = false
     @State private var isSaving = false
     @State private var removingID: String?
+    @State private var updatingCommandIDs: Set<String> = []
+    @State private var commandResults: [String: String] = [:]
+    @State private var commandErrors: Set<String> = []
     @State private var loadError: String?
+    @State private var messagesError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,7 +61,7 @@ struct NotificationsPreferencesSection: View {
             Text("Notifications")
                 .font(AlexTheme.Fonts.panelTitle)
                 .foregroundStyle(AlexTheme.Colors.foreground)
-            Text("Telegram alerts from the Alexandria daemon")
+            Text("Telegram alerts from the Alex daemon")
                 .font(.system(size: 12))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
         }
@@ -128,25 +134,29 @@ struct NotificationsPreferencesSection: View {
                     Text(verbatim: "•••••••••••••••")
                         .font(AlexTheme.Fonts.metaMono)
                         .foregroundStyle(AlexTheme.Colors.textSecondary)
-                        .settingsField(width: 240)
+                        .settingsField(width: 180)
                     if let bot = connectedBot, !bot.isEmpty {
                         Text(verbatim: "✓ @\(bot)")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(AlexTheme.Colors.success)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                     PillButton(title: "Replace", variant: .bordered, isEnabled: true) {
                         hasSavedToken = false
                         token = ""
                         connectedBot = nil
                     }
+                    .fixedSize()
                 } else {
                     SecureField("123456:ABC…", text: $token)
-                        .settingsField(width: 240)
+                        .settingsField(width: 180)
                     PillButton(
                         title: isValidating ? "Validating…" : "Validate", variant: .bordered,
                         isEnabled: !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isValidating,
                         isBusy: isValidating
                     ) { Task { await validate() } }
+                    .fixedSize()
                 }
             }
         }
@@ -201,11 +211,12 @@ struct NotificationsPreferencesSection: View {
         HStack(spacing: 8) {
             PillButton(
                 title: isTesting ? "Sending…" : "Send test message", variant: .bordered,
-                systemImage: "paperplane", isEnabled: canSubmit && !isTesting, isBusy: isTesting
+                systemImage: "paperplane", isEnabled: !isTesting && !isSaving,
+                isBusy: isTesting
             ) { Task { await test() } }
             PillButton(
                 title: isSaving ? "Saving…" : "Save", variant: .primary,
-                isEnabled: canSubmit && !isSaving, isBusy: isSaving
+                isEnabled: canSubmit && !isSaving && !isTesting, isBusy: isSaving
             ) { Task { await save() } }
             if let actionResult {
                 Text(actionResult)
@@ -227,6 +238,8 @@ struct NotificationsPreferencesSection: View {
                 if channel.stableID != channels.last?.stableID { RowDivider() }
             }
         }
+
+        recentMessagesPanel
     }
 
     private func statusCaption(_ text: String, isError: Bool) -> some View {
@@ -237,44 +250,180 @@ struct NotificationsPreferencesSection: View {
     }
 
     private func configuredChannel(_ channel: NotificationChannel) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(channelSummary(channel))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(AlexTheme.Colors.foreground)
-                if let host = channel.host, !host.isEmpty {
-                    Text(host)
-                        .font(AlexTheme.Fonts.metaMono)
-                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(channelSummary(channel))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    if let host = channel.host, !host.isEmpty {
+                        Text(host)
+                            .font(AlexTheme.Fonts.metaMono)
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    }
+                    Text(channelStatus(channel))
+                        .font(.system(size: 11))
+                        .foregroundStyle(channel.lastError == nil
+                            ? AlexTheme.Colors.textTertiary : AlexTheme.Colors.destructive)
                 }
-                Text(channelStatus(channel))
-                    .font(.system(size: 11))
-                    .foregroundStyle(channel.lastError == nil
-                        ? AlexTheme.Colors.textTertiary : AlexTheme.Colors.destructive)
+                Spacer(minLength: 12)
+                if let id = channel.id {
+                    Button {
+                        Task { await remove(id: id) }
+                    } label: {
+                        if removingID == id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "trash")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .disabled(removingID != nil || !updatingCommandIDs.isEmpty)
+                    .help("Remove notification channel")
+                }
             }
-            Spacer(minLength: 12)
-            if let id = channel.id {
-                Button {
-                    Task { await remove(id: id) }
-                } label: {
-                    if removingID == id {
+
+            if channel.format.lowercased() == "telegram" {
+                HStack(spacing: 8) {
+                    Text("Allow commands")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    Toggle("", isOn: commandBinding(for: channel))
+                        .settingsSwitch()
+                        .disabled(channel.id == nil || updatingCommandIDs.contains(channel.stableID))
+                    if updatingCommandIDs.contains(channel.stableID) {
                         ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "trash")
                     }
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(AlexTheme.Colors.textTertiary)
-                .disabled(removingID != nil)
-                .help("Remove notification channel")
+                Text(channel.id == nil
+                    ? "Commands unavailable because this channel has no saved ID."
+                    : "Enables /status and code#state paste-back from this Telegram chat.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(channel.id == nil
+                        ? AlexTheme.Colors.destructive : AlexTheme.Colors.textTertiary)
+                if let result = commandResults[channel.stableID] {
+                    statusCaption(result, isError: commandErrors.contains(channel.stableID))
+                        .padding(.vertical, -5)
+                }
             }
         }
         .padding(.vertical, 11)
     }
 
+    private var recentMessagesPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionLabel(text: "Recent messages") {
+                PillButton(
+                    title: isLoadingMessages ? "Refreshing…" : "Refresh",
+                    variant: .bordered, systemImage: "arrow.clockwise",
+                    isEnabled: !isLoadingMessages, isBusy: isLoadingMessages
+                ) { Task { await refreshMessages() } }
+            }
+            .settingsSectionSpacing()
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Activity")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    Spacer()
+                    Text("Last \(messages.count)")
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+
+                RowDivider()
+
+                if isLoadingMessages && messages.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading recent notification activity…")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .padding(12)
+                } else if let messagesError {
+                    Text("Could not load activity: \(messagesError)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.destructive)
+                        .textSelection(.enabled)
+                        .padding(12)
+                } else if messages.isEmpty {
+                    Text("No inbound or outbound messages recorded yet.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .padding(12)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(messages.indices, id: \.self) { index in
+                                activityRow(messages[index])
+                                if index != messages.indices.last { RowDivider() }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 240)
+                }
+            }
+            .alexCard(radius: AlexTheme.Radius.lg)
+        }
+    }
+
+    private func activityRow(_ message: NotificationLogEntry) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: message.direction == "in" ? "arrow.down.left" : "arrow.up.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(message.direction == "in"
+                    ? AlexTheme.Colors.primary : AlexTheme.Colors.textSecondary)
+                .frame(width: 13, height: 16)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(message.direction.uppercased())
+                        .font(AlexTheme.Fonts.chipMono)
+                    Text(message.category)
+                        .font(AlexTheme.Fonts.metaMono)
+                    Image(systemName: message.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(message.ok
+                            ? AlexTheme.Colors.success : AlexTheme.Colors.destructive)
+                    Spacer(minLength: 8)
+                    Text(Self.activityTime(message.tsMs))
+                        .font(AlexTheme.Fonts.metaMicro)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                Text(message.summary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                if let error = message.error, !error.isEmpty {
+                    Text(error)
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.destructive)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
     private var canSubmit: Bool {
         !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !chatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var savedChannelID: String? {
+        channels.first(where: { $0.format.lowercased() == "telegram" && $0.id != nil })?.id
+    }
+
+    private var testTarget: NotificationTestTarget? {
+        NotificationTestTarget.resolve(
+            token: token, chatID: chatID, savedChannelID: savedChannelID)
     }
 
     private var request: TelegramNotificationChannelRequest {
@@ -295,18 +444,12 @@ struct NotificationsPreferencesSection: View {
         loadError = nil
         defer { isLoading = false }
         guard let client = client() else {
-            loadError = "No Alexandria daemon configuration was found."
+            loadError = "No Alex daemon configuration was found."
             return
         }
         do {
-            channels = try await client.notificationSettings().channels
-            // Populate the form from an existing channel so it reads as "saved",
-            // not empty. The token stays server-side (redacted) — show it masked.
-            if let saved = channels.first {
-                hasSavedToken = true
-                connectedBot = saved.botUsername
-                if let cid = saved.chatID, !cid.isEmpty { chatID = cid }
-            }
+            applyChannels(try await client.notificationSettings().channels)
+            await loadMessages(using: client)
         } catch is CancellationError {
         } catch {
             loadError = error.localizedDescription
@@ -315,7 +458,7 @@ struct NotificationsPreferencesSection: View {
 
     private func validate() async {
         guard let client = client() else {
-            validationResult = "No Alexandria daemon configuration was found."
+            validationResult = "No Alex daemon configuration was found."
             connectedBot = nil
             return
         }
@@ -339,7 +482,7 @@ struct NotificationsPreferencesSection: View {
 
     private func discoverChats() async {
         guard let client = client() else {
-            discoveryResult = "No Alexandria daemon configuration was found."
+            discoveryResult = "No Alex daemon configuration was found."
             return
         }
         isDiscovering = true
@@ -368,11 +511,21 @@ struct NotificationsPreferencesSection: View {
             actionResult = "Test failed: no daemon configuration"
             return
         }
+        guard let testTarget else {
+            actionResult = "Test failed: enter a bot token and chat ID, or save a channel first"
+            return
+        }
         isTesting = true
         actionResult = nil
         defer { isTesting = false }
         do {
-            let response = try await client.testTelegramNotification(request)
+            let response: NotificationTestResponse
+            switch testTarget {
+            case .inline:
+                response = try await client.testTelegramNotification(request)
+            case let .savedChannel(channelID):
+                response = try await client.testTelegramNotification(channelId: channelID)
+            }
             if let failed = response.channels.first(where: { !$0.ok }) {
                 actionResult = "Test failed: \(failed.error ?? "Telegram delivery failed")"
             } else if response.channels.isEmpty {
@@ -380,6 +533,7 @@ struct NotificationsPreferencesSection: View {
             } else {
                 actionResult = "Sent — check Telegram"
             }
+            await loadMessages(using: client)
         } catch is CancellationError {
         } catch {
             actionResult = "Test failed: \(error.localizedDescription)"
@@ -423,6 +577,8 @@ struct NotificationsPreferencesSection: View {
         do {
             try await client.removeNotification(id: id)
             actionResult = "Notification channel removed"
+            commandResults[id] = nil
+            commandErrors.remove(id)
             await loadChannels(using: client)
         } catch is CancellationError {
         } catch {
@@ -432,10 +588,91 @@ struct NotificationsPreferencesSection: View {
 
     private func loadChannels(using client: AlexandriaClient) async {
         do {
-            channels = try await client.notificationSettings().channels
+            applyChannels(try await client.notificationSettings().channels)
         } catch is CancellationError {
         } catch {
             actionResult = "Saved, but could not reload channels: \(error.localizedDescription)"
+        }
+    }
+
+    private func applyChannels(_ loadedChannels: [NotificationChannel]) {
+        channels = loadedChannels
+        // Populate the form from an existing Telegram channel so it reads as
+        // saved while its token remains redacted and server-side.
+        if let saved = loadedChannels.first(where: { $0.format.lowercased() == "telegram" }) {
+            hasSavedToken = true
+            connectedBot = saved.botUsername
+            if let cid = saved.chatID, !cid.isEmpty { chatID = cid }
+        } else if token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            hasSavedToken = false
+            connectedBot = nil
+        }
+    }
+
+    private func commandBinding(for channel: NotificationChannel) -> Binding<Bool> {
+        Binding(
+            get: {
+                channels.first(where: { $0.stableID == channel.stableID })?.allowCommands
+                    ?? channel.allowCommands
+            },
+            set: { allowCommands in
+                guard let id = channel.id else {
+                    commandResults[channel.stableID] = "Commands unavailable: channel has no saved ID"
+                    commandErrors.insert(channel.stableID)
+                    return
+                }
+                Task { await setCommands(channelID: id, allowCommands: allowCommands) }
+            })
+    }
+
+    private func setCommands(channelID: String, allowCommands: Bool) async {
+        guard let client = client() else {
+            commandResults[channelID] = "Update failed: no daemon configuration"
+            commandErrors.insert(channelID)
+            return
+        }
+        updatingCommandIDs.insert(channelID)
+        commandResults[channelID] = nil
+        commandErrors.remove(channelID)
+        defer { updatingCommandIDs.remove(channelID) }
+        do {
+            let response = try await client.setChannelCommands(
+                channelId: channelID, allowCommands: allowCommands)
+            guard response.ok, let updated = response.channel else {
+                commandResults[channelID] = "Update failed: \(response.error ?? "no channel returned")"
+                commandErrors.insert(channelID)
+                return
+            }
+            if let index = channels.firstIndex(where: { $0.stableID == channelID }) {
+                channels[index] = updated
+            } else {
+                await loadChannels(using: client)
+            }
+            commandResults[channelID] = allowCommands ? "Commands enabled" : "Commands disabled"
+        } catch is CancellationError {
+        } catch {
+            commandResults[channelID] = "Update failed: \(error.localizedDescription)"
+            commandErrors.insert(channelID)
+        }
+    }
+
+    private func refreshMessages() async {
+        guard let client = client() else {
+            messagesError = "No Alex daemon configuration was found."
+            return
+        }
+        await loadMessages(using: client)
+    }
+
+    private func loadMessages(using client: AlexandriaClient) async {
+        isLoadingMessages = true
+        messagesError = nil
+        defer { isLoadingMessages = false }
+        do {
+            messages = Array(try await client.notificationsLog(limit: 50).messages.reversed())
+        } catch is CancellationError {
+        } catch {
+            messagesError = error.localizedDescription
         }
     }
 
@@ -453,6 +690,11 @@ struct NotificationsPreferencesSection: View {
     private static func relativeDate(_ milliseconds: Int64) -> String {
         let date = Date(timeIntervalSince1970: Double(milliseconds) / 1_000)
         return RelativeDateTimeFormatter().localizedString(for: date, relativeTo: Date())
+    }
+
+    private static func activityTime(_ milliseconds: Int64) -> String {
+        Date(timeIntervalSince1970: Double(milliseconds) / 1_000)
+            .formatted(date: .omitted, time: .shortened)
     }
 }
 

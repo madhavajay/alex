@@ -1,8 +1,8 @@
 # Harness integration and session tracing
 
-Alexandria has two separate integration jobs:
+Alex has two separate integration jobs:
 
-1. Route a harness through the Alexandria model proxy and tag every request with the harness name.
+1. Route a harness through the Alex model proxy and tag every request with the harness name.
 2. Recover the harness's native session identity, lifecycle, and parent/child agent relationships.
 
 Those jobs should not be conflated. A provider header is reliable request attribution, but is usually static. A lifecycle hook sees rich session metadata, but often cannot mutate the model request. The strongest integration uses both.
@@ -11,7 +11,7 @@ Those jobs should not be conflated. A provider header is reliable request attrib
 
 ### Provider configuration and static headers
 
-Configure the harness's model provider with Alexandria's base URL and a harness-scoped key. Add static request metadata where the provider format allows it:
+Configure the harness's model provider with Alex's base URL and a harness-scoped key. Add static request metadata where the provider format allows it:
 
 ```text
 x-alexandria-harness: codex
@@ -22,7 +22,7 @@ This is the simplest and most reliable way to identify the client. It does not d
 
 ### Dynamic provider-header hooks
 
-Pi exposes `before_provider_headers`. Alexandria's Pi extension uses it to add Pi's current session ID only when the selected provider is `alexandria`:
+Pi exposes `before_provider_headers`. Alex's Pi extension uses it to add Pi's current session ID only when the selected provider is `alexandria`:
 
 ```ts
 pi.on("before_provider_headers", (event, ctx) => {
@@ -72,7 +72,7 @@ Codex's `shell_environment_policy` controls which variables reach shell commands
 
 ### Request-body session keys
 
-Some harnesses already put a stable conversation identifier in the request body. Codex Responses requests currently include `prompt_cache_key`; Alexandria extracts it after explicit session headers and metadata. This can group model calls without a request-header hook.
+Some harnesses already put a stable conversation identifier in the request body. Codex Responses requests currently include `prompt_cache_key`; Alex extracts it after explicit session headers and metadata. This can group model calls without a request-header hook.
 
 Treat body-derived keys as a discovered capability, not a permanent contract. Validate them against lifecycle-hook session IDs for each supported harness version.
 
@@ -82,7 +82,7 @@ Several hooks expose `transcript_path`, and Pi/OMP can expose the session file. 
 
 ### Local side channel
 
-When hooks cannot change the model request, send lifecycle records to Alexandria over a local authenticated HTTP or Unix-domain-socket endpoint. A record can contain:
+When hooks cannot change the model request, send lifecycle records to Alex over a local authenticated HTTP or Unix-domain-socket endpoint. A record can contain:
 
 ```json
 {
@@ -118,11 +118,11 @@ This table summarizes the integrations in `repos/herdr/src/integration` and the 
 | OpenCode | JavaScript plugin | Session/event API and `parentID` child detection | Explicitly filters child sessions from root state |
 | Kilo | JavaScript plugin | Session/event API | Similar to OpenCode, with less child-specific handling |
 | Hermes | Python plugin | Registered pre/post LLM, tool, approval, and session hooks | Direct in-process lifecycle callbacks |
-| Amp | Terminal-state manifest only in this Herdr checkout | Screen-state detection for working/blocked/idle | Herdr does not install an Amp plugin; Alexandria uses Amp's documented plugin API directly |
+| Amp | Terminal-state manifest only in this Herdr checkout | Screen-state detection for working/blocked/idle | Herdr does not install an Amp plugin; Alex uses Amp's documented plugin API directly |
 
-Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. That describes the checked-in Herdr integrations, not the current capabilities of those products. Grok now documents custom models and trusted command hooks, which Alexandria uses below. For other unimplemented harnesses, Alexandria should start with provider/base-URL configuration, static harness headers if supported, body-derived session discovery, and an optional wrapper run ID. Add a native plugin or hook only when the harness exposes a documented lifecycle API.
+Herdr has no integration assets for Gemini CLI or Grok CLI in this checkout. That describes the checked-in Herdr integrations, not the current capabilities of those products. Grok now documents custom models and trusted command hooks, which Alex uses below. For other unimplemented harnesses, Alex should start with provider/base-URL configuration, static harness headers if supported, body-derived session discovery, and an optional wrapper run ID. Add a native plugin or hook only when the harness exposes a documented lifecycle API.
 
-## Alexandria's current integrations
+## Alex's current integrations
 
 ## Lightweight harness regression suite
 
@@ -141,11 +141,11 @@ input/output tokens and cost, session id, and persisted request/response body
 paths. It then reads both bodies through `/traces/{trace_id}/body/{kind}`.
 
 `I3` takes `ALEX_INTEGRATION_PI_IMAGE` and
-`ALEX_INTEGRATION_PI_COMMAND`; the image must contain Pi with Alexandria's
+`ALEX_INTEGRATION_PI_COMMAND`; the image must contain Pi with Alex's
 session extension and tool capture enabled. `I4` similarly takes
 `ALEX_INTEGRATION_CODEX_SUBAGENT_IMAGE` and
 `ALEX_INTEGRATION_CODEX_SUBAGENT_COMMAND`; its image must contain trusted
-Alexandria lifecycle hooks and the command must force one subagent. Both
+Alex lifecycle hooks and the command must force one subagent. Both
 receive only the scoped key and proxy environment. `I5A` and `I5B` reserve the
 native Amp and Cursor-Agent wrap fixtures, respectively, and skip without
 those logged-in harnesses.
@@ -176,7 +176,7 @@ the parent reports `child_count`. Tool rows are exposed as
 `exit_status`, `args_body_path`, and `result_body_path`; their body endpoints
 are `/tools/{id}/body/args` and `/tools/{id}/body/result`.
 
-Managed harness catalogs are generated from Alexandria's live `/v1/models`
+Managed harness catalogs are generated from Alex's live `/v1/models`
 response. Provider-native IDs remain bare, while OpenRouter discovery IDs use
 `openrouter/<provider>/<model>` and appear in harnesses as
 `alex/openrouter/<provider>/<model>`. Users do not need to enumerate individual
@@ -186,7 +186,7 @@ for the daemon to refresh the catalog.
 ### Pi
 
 `Harnesses → Pi → Connect` adds models named `alex/*` and installs a small
-session hook. The hook sets a local session header that the Alexandria proxy
+session hook. The hook sets a local session header that the Alex proxy
 uses for tracing, then the proxy removes the header before forwarding the
 request upstream. The connection also installs a harness-scoped key and a
 static `x-alexandria-harness: pi` header.
@@ -197,11 +197,11 @@ static `x-alexandria-harness: pi` header.
 
 - A copy of the original `~/.codex/config.toml` at
   `~/.codex/alexandria-original-config.toml`, plus restorable copies of any
-  pre-existing `openai` and `alex` profiles in Alexandria's managed state
+  pre-existing `openai` and `alex` profiles in Alex's managed state
 - `~/.codex/openai.config.toml`, used by `codex --profile openai`, with the
   native Codex model catalog and normal Codex authentication
 - `~/.codex/alex.config.toml`, used by `codex --profile alex`, with the
-  Alexandria model catalog, local proxy, and `alex/*` model names
+  Alex model catalog, local proxy, and `alex/*` model names
 - An `alexandria` Responses API provider in `~/.codex/config.toml`
 - Separate native and merged model catalogs for the fixed profiles
 - A 0600 harness credential read through Codex command-backed authentication
@@ -209,19 +209,19 @@ static `x-alexandria-harness: pi` header.
 - `SessionStart`, `SubagentStart`, and `SubagentStop` hooks in `~/.codex/hooks.json`
 
 Plain `codex` follows the default-route toggle in the menu-bar app. Turning
-“Use Alexandria by Default” off gives plain `codex` the same native route as
+“Use Alex by Default” off gives plain `codex` the same native route as
 `--profile openai`; turning it on gives plain `codex` the proxied route used by
 `--profile alex`. The two explicit profiles remain available regardless of the
 toggle.
 
-Codex hooks cannot mutate HTTP request headers. Alexandria therefore groups current Codex requests using `prompt_cache_key` and records hook events separately in `~/.codex/alexandria-session-events.jsonl` while the parent/child join is being validated. Codex requires the user to review and trust a newly installed command hook.
+Codex hooks cannot mutate HTTP request headers. Alex therefore groups current Codex requests using `prompt_cache_key` and records hook events separately in `~/.codex/alexandria-session-events.jsonl` while the parent/child join is being validated. Codex requires the user to review and trust a newly installed command hook.
 
 For example, Codex selects `alex/gpt-5.6-sol`, the proxy records that requested
-ID, strips the Alexandria namespace, and routes `gpt-5.6-sol` to the inferred
+ID, strips the Alex namespace, and routes `gpt-5.6-sol` to the inferred
 upstream provider. The namespaced default is restored to the user's original
 model when the Codex harness is disconnected.
 
-Disconnect removes only Alexandria-managed provider, catalog, credential, and
+Disconnect removes only Alex-managed provider, catalog, credential, and
 hook entries. It restores the exact pre-connect top-level selection and any
 pre-existing `openai` or `alex` profile files. The readable original-config
 backup and captured event log are preserved for manual recovery and debugging.
@@ -237,16 +237,16 @@ claude --settings ~/.claude/alexandria-settings.json
 ```
 
 Plain `claude` continues to use the user's normal configuration and
-authentication. The profile configures Alexandria as an LLM gateway, enables
+authentication. The profile configures Alex as an LLM gateway, enables
 gateway model discovery, displays its models as `alex/*`, and reads a 0600
 harness credential through Claude's `apiKeyHelper`. A reference copy of the
 original settings is kept at `~/.claude/alexandria-original-settings.json`.
 
 Claude sends native `x-claude-code-session-id`, `x-claude-code-agent-id`, and
-`x-claude-code-parent-agent-id` headers to an LLM gateway. Alexandria uses
+`x-claude-code-parent-agent-id` headers to an LLM gateway. Alex uses
 those request-level identifiers for exact parent/child trace nesting. The
 installed `SessionStart`, `SubagentStart`, and `SubagentStop` hooks supplement
-the request graph with lifecycle timing and agent metadata. Alexandria removes
+the request graph with lifecycle timing and agent metadata. Alex removes
 its own harness metadata before forwarding the model request upstream.
 
 Disconnect removes only the managed profile, credential, catalog, and hook
@@ -256,9 +256,9 @@ files. The normal settings, reference backup, and local event log remain.
 
 `Harnesses → Grok → Connect` preserves Grok's built-in models and current
 default while adding `[model."alex/*"]` entries to `~/.grok/config.toml`.
-Those entries use Alexandria's OpenAI-compatible Chat Completions endpoint and
+Those entries use Alex's OpenAI-compatible Chat Completions endpoint and
 carry static harness/version headers. Built-in models continue to use Grok's
-normal authentication; select an Alexandria model with Grok's model picker or
+normal authentication; select an Alex model with Grok's model picker or
 start one directly, for example:
 
 ```sh
@@ -266,19 +266,19 @@ grok --model alex/gpt-5.5
 ```
 
 Grok does not currently offer a command-backed custom-model credential, so the
-local harness key is stored in its config; Alexandria rewrites that file with
+local harness key is stored in its config; Alex rewrites that file with
 0600 permissions. The exact pre-connect config is also saved at
 `~/.grok/alexandria-original-config.toml` for manual recovery.
 
 A trusted global Grok hook reports `SessionStart`, `SubagentStart`, and
-`SubagentStop` events. Alexandria normalizes Grok's camelCase and snake_case
+`SubagentStop` events. Alex normalizes Grok's camelCase and snake_case
 payload variants before recording lineage. The lifecycle graph is exact when
 Grok supplies parent and child IDs, while joining an individual model request
 to that graph remains best-effort until Grok exposes a dynamic request-header
 callback or a native session header.
 
-Disconnect removes only Alexandria-managed `alex/*` model entries and restores
-any hook registration that previously occupied Alexandria's hook file. Native
+Disconnect removes only Alex-managed `alex/*` model entries and restores
+any hook registration that previously occupied Alex's hook file. Native
 models, the selected default, unrelated config, the backup, and the event log
 are preserved.
 
@@ -287,7 +287,7 @@ are preserved.
 `Harnesses → Amp → Connect` installs a system plugin at
 `~/.config/amp/plugins/alexandria.ts`, a 0600 lifecycle credential, and
 reversible managed state. If a file already occupies that exact plugin path,
-Alexandria stores its contents and restores it on disconnect. The local event
+Alex stores its contents and restores it on disconnect. The local event
 log is preserved for trace repair and debugging.
 
 The plugin observes Amp's documented `session.start`, `agent.start`,
@@ -295,7 +295,7 @@ The plugin observes Amp's documented `session.start`, `agent.start`,
 native `T-*` thread IDs, turn/tool-use IDs, tool names, and outcome status; it
 does not record prompts, tool inputs, or tool outputs. Its `tool.call` hook
 always returns `allow`, so it does not change permissions or execution. A
-command-palette action named `Alexandria: Status` checks the local daemon and
+command-palette action named `Alex: Status` checks the local daemon and
 shows the active thread ID.
 
 Amp's built-in `Task`, `finder`, `librarian`, `oracle`, and `painter` tools are
@@ -314,7 +314,7 @@ alex wrap amp
 The Harnesses fly-out can launch that command after Amp is connected. Amp's
 documented `AMP_URL` changes the whole Amp service/control-plane endpoint, not
 an individual model-provider base URL. Its public plugin agent API accepts only
-Amp's published providers and model catalogue. Alexandria therefore does not
+Amp's published providers and model catalogue. Alex therefore does not
 install a misleading custom model or mode: Amp keeps its normal models and
 authentication, while the wrapper captures traffic and the plugin supplies
 lifecycle identity. Redirecting Amp's underlying model calls would require an
@@ -328,18 +328,18 @@ Run these in order; each experiment answers a different question.
 2. **Run-level environment marker.** Start Codex through a wrapper with `ALEXANDRIA_RUN_ID`. Allow it through `shell_environment_policy`, ask root and child agents to print it, and verify both inherit the same run. This proves shared ancestry, not child identity.
 3. **Custom-agent config marker.** Give each Codex custom agent a distinct static provider header or model/provider layer if Codex preserves it for spawned sessions. This may identify agent type, but not an individual child instance.
 4. **Hook-provided developer context.** Return a child correlation token from `SubagentStart.additionalContext` and instruct the child to include it in supported tool or MCP calls. This is useful for experiments but is not trustworthy request attribution because it depends on model compliance.
-5. **MCP side channel.** Expose an Alexandria MCP tool such as `begin_child_span(parent, child)` and instruct custom agents to call it at startup. This gives rich spans but is also model-mediated unless paired with lifecycle hooks.
+5. **MCP side channel.** Expose an Alex MCP tool such as `begin_child_span(parent, child)` and instruct custom agents to call it at startup. This gives rich spans but is also model-mediated unless paired with lifecycle hooks.
 6. **Process wrapper.** If a future Codex mode launches sub-agents as OS child processes, wrap the executable, inherit `ALEXANDRIA_RUN_ID`, mint `ALEXANDRIA_AGENT_ID` per child, and inject it into provider headers through an environment-backed header. This does not apply to today's logical in-process threads.
 
 The preferred durable design is native lifecycle hooks for the graph, request headers/body fields for model-call attribution, and a wrapper environment only for run/process ancestry.
 
 ## Safety and compatibility rules
 
-- Never place a long-lived Alexandria local key directly in a world-readable config or command line.
-- Scope generated hooks to Alexandria's provider where a request callback permits it.
+- Never place a long-lived Alex local key directly in a world-readable config or command line.
+- Scope generated hooks to Alex's provider where a request callback permits it.
 - Preserve unrelated providers, hooks, comments, and project settings.
 - Store enough managed state to make disconnect reversible.
 - Do not let child events overwrite root-session identity.
 - Treat hook payloads, transcript paths, prompts, and working directories as sensitive local data.
 - Keep hook timeouts short and failures non-fatal.
-- Version generated files so upgrades can replace only Alexandria-owned content.
+- Version generated files so upgrades can replace only Alex-owned content.

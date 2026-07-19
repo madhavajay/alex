@@ -1528,6 +1528,7 @@ public struct OmniQuery: Equatable, Sendable {
     public var effort: String?
     public var duration: String?
     public var account: String?
+    public var key: String?
     public var errorClass: String?
 
     public init() {}
@@ -1541,7 +1542,7 @@ public struct OmniQuery: Equatable, Sendable {
             || status != nil || run != nil || session != nil
             || task != nil || job != nil || tag != nil
             || effort != nil || duration != nil || account != nil
-            || errorClass != nil
+            || key != nil || errorClass != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -1565,6 +1566,7 @@ public struct OmniQuery: Equatable, Sendable {
                     case "effort": query.effort = value; continue
                     case "duration": query.duration = value; continue
                     case "account": query.account = value; continue
+                    case "key": query.key = value; continue
                     case "error_class": query.errorClass = value; continue
                     default: break
                     }
@@ -1659,6 +1661,7 @@ public struct OmniQuery: Equatable, Sendable {
 
     public func isVisible(_ session: TraceSession, serverMatches: Set<String>?) -> Bool {
         guard matches(session) else { return false }
+        if key != nil, serverMatches?.contains(session.sessionId) != true { return false }
         if freeText.isEmpty { return true }
         if freeTextMatchesTags(session) { return true }
         return serverMatches?.contains(session.sessionId) == true

@@ -280,7 +280,11 @@ pub trait DaemonUpdater: Send + Sync {
 }
 
 pub type UpdateChannelSetFuture = Pin<
-    Box<dyn Future<Output = std::result::Result<SetChannelOutcome, UpdateChannelError>> + Send + 'static>,
+    Box<
+        dyn Future<Output = std::result::Result<SetChannelOutcome, UpdateChannelError>>
+            + Send
+            + 'static,
+    >,
 >;
 
 /// Outcome of persisting a new daemon update channel.
@@ -455,11 +459,7 @@ impl ReauthLoginTracker {
         Some(generation)
     }
 
-    fn reserve_replacement(
-        &mut self,
-        key: &ReauthLoginKey,
-        login_id: &str,
-    ) -> Option<u64> {
+    fn reserve_replacement(&mut self, key: &ReauthLoginKey, login_id: &str) -> Option<u64> {
         let replace = matches!(
             self.entries.get(key),
             Some(ReauthLoginSlot::Active { login_id: active, .. }) if active == login_id
@@ -1455,6 +1455,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin_run_keys_list).post(admin_run_keys_create),
         )
         .route(
+            "/admin/run-keys/revoke-all",
+            post(admin_run_keys_revoke_all),
+        )
+        .route(
+            "/admin/run-keys/revoked",
+            axum::routing::delete(admin_run_keys_clear_revoked),
+        )
+        .route(
             "/admin/run-keys/{id}",
             axum::routing::delete(admin_run_keys_revoke),
         )
@@ -1520,10 +1528,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/exo", get(admin_exo).put(admin_exo_update))
         .route("/admin/exo/status", get(admin_exo_status))
         .route("/admin/exo/models", get(admin_exo_models))
-        .route(
-            "/admin/openrouter/catalog",
-            get(admin_openrouter_catalog),
-        )
+        .route("/admin/openrouter/catalog", get(admin_openrouter_catalog))
         .route(
             "/admin/openrouter/exposed",
             get(admin_openrouter_exposed).post(admin_openrouter_exposed_update),
@@ -1568,17 +1573,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/vault/export", post(admin_vault_export))
         .route("/admin/credentials", get(admin_credentials))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
-        .route(
-            "/admin/auth/reauth-notify",
-            post(admin_auth_reauth_notify),
-        )
+        .route("/admin/auth/reauth-notify", post(admin_auth_reauth_notify))
         .route("/admin/auth/reauth/start", post(admin_auth_reauth_start))
         .route("/admin/auth/reauth/submit", post(admin_auth_reauth_submit))
         .route("/admin/auth/reauth/status", get(admin_auth_reauth_status))
-        .route(
-            "/admin/auth/reauth-cancel",
-            post(admin_auth_reauth_cancel),
-        )
+        .route("/admin/auth/reauth-cancel", post(admin_auth_reauth_cancel))
         .route("/admin/auth/reauth/code", post(admin_auth_reauth_code))
         .route(
             "/admin/auth/login/complete",
@@ -2579,10 +2578,7 @@ async fn admin_auth_reauth_notify(
             && account_id.is_none_or(|wanted| account.id == wanted)
     });
     let Some(account) = account else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "no matching managed OAuth account",
-        );
+        return error_response(StatusCode::NOT_FOUND, "no matching managed OAuth account");
     };
     let channel_id = body.0["channel_id"]
         .as_str()
@@ -2636,7 +2632,10 @@ async fn admin_auth_reauth_submit(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
 ) -> Response {
-    let Some(input) = body.0["input"].as_str().filter(|input| !input.trim().is_empty()) else {
+    let Some(input) = body.0["input"]
+        .as_str()
+        .filter(|input| !input.trim().is_empty())
+    else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'input'");
     };
     let provider = match body.0["provider"].as_str() {
@@ -2682,9 +2681,9 @@ async fn admin_auth_reauth_status(
     for (key, login_id) in active {
         if let Some(mut snapshot) = state.logins.status(&login_id).await {
             snapshot["account_id"] = json!(key.account_id);
-            snapshot["age_ms"] = json!(now_ms().saturating_sub(
-                snapshot["created_ms"].as_i64().unwrap_or_else(now_ms)
-            ));
+            snapshot["age_ms"] = json!(
+                now_ms().saturating_sub(snapshot["created_ms"].as_i64().unwrap_or_else(now_ms))
+            );
             sessions.push(snapshot);
         }
     }
@@ -2714,10 +2713,7 @@ async fn admin_auth_reauth_cancel(
                 .into_iter()
                 .find(|account| account.provider == provider && account.kind == "oauth");
             let Some(account) = account else {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    "no matching managed OAuth account",
-                );
+                return error_response(StatusCode::NOT_FOUND, "no matching managed OAuth account");
             };
             account.id
         }
@@ -2734,14 +2730,15 @@ async fn admin_auth_reauth_code(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
 ) -> Response {
-    let (Some(channel_id), Some(input)) = (
-        body.0["channel_id"].as_str(),
-        body.0["input"].as_str(),
-    ) else {
+    let (Some(channel_id), Some(input)) = (body.0["channel_id"].as_str(), body.0["input"].as_str())
+    else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'channel_id' or 'input'");
     };
     if channel_id.trim().is_empty() || input.trim().is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "channel_id and input must not be empty");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "channel_id and input must not be empty",
+        );
     }
     match complete_reauth_code(&state, channel_id, input).await {
         Ok(result) => axum::Json(result).into_response(),
@@ -4182,7 +4179,11 @@ async fn admin_traces(
     // certification: a scoped run key gives every request a unique run id.
     // `list_traces` predates run keys, so delegate only run-id queries to the
     // richer filter API while retaining its established response shape.
-    if q.contains_key("run_id") || q.contains_key("error_class") || q.contains_key("errors") {
+    if q.contains_key("run_id")
+        || q.contains_key("error_class")
+        || q.contains_key("errors")
+        || q.contains_key("key_fingerprint")
+    {
         let mut filter = filter_from_query(&q);
         filter.limit = limit;
         return match state.store.search_traces(&filter) {
@@ -6490,6 +6491,44 @@ async fn record_probe_outcome(state: &Arc<AppState>, result: &PingResult) {
     }
 }
 
+/// Record successful provider evidence through the same path as an explicit
+/// ping. A completed credential exchange or Dario-routed provider response is
+/// just as conclusive as a probe that this account is authenticated and
+/// reachable.
+async fn record_successful_account_probe(state: &Arc<AppState>, account_id: &str, status: u16) {
+    record_probe_outcome(
+        state,
+        &PingResult {
+            provider: "account",
+            account_id: Some(account_id.to_string()),
+            ok: true,
+            status: Some(status),
+            latency_ms: 0,
+            message: "successful provider exchange".into(),
+        },
+    )
+    .await;
+}
+
+/// Attribute a fully completed Dario response to the bonded provider account.
+/// Dario transport/generation failures can arrive after a successful HTTP
+/// response head, so both the final status and terminal stream error must be
+/// clean before this is allowed to turn the provider green.
+async fn record_dario_response_probe(
+    state: &Arc<AppState>,
+    via_dario: bool,
+    account_id: Option<&str>,
+    status: Option<u16>,
+    error: Option<&str>,
+) {
+    let Some((account_id, status)) = account_id.zip(status) else {
+        return;
+    };
+    if via_dario && (200..300).contains(&status) && error.is_none() {
+        record_successful_account_probe(state, account_id, status).await;
+    }
+}
+
 /// The reachability health `/admin/accounts` reports for an account. A confirmed
 /// logout (`needs_reauth`, set by either the probe path or the idle-expiry
 /// watchdog) always wins so the dot is red regardless of the last ping; failing
@@ -8070,15 +8109,10 @@ mod usage_tests {
         let fetched = Arc::new(AtomicBool::new(false));
         let fetched_in_closure = fetched.clone();
 
-        let entry = cached_usage_fetch(
-            &cache,
-            300_000,
-            UsageCacheSource::Entry,
-            || async move {
-                fetched_in_closure.store(true, Ordering::SeqCst);
-                UsageFetchOutcome::Fresh(Some(json!({ "provider": "network" })))
-            },
-        )
+        let entry = cached_usage_fetch(&cache, 300_000, UsageCacheSource::Entry, || async move {
+            fetched_in_closure.store(true, Ordering::SeqCst);
+            UsageFetchOutcome::Fresh(Some(json!({ "provider": "network" })))
+        })
         .await;
 
         assert_eq!(entry.unwrap()["provider"], "cached");
@@ -8090,25 +8124,23 @@ mod usage_tests {
         let cache = Mutex::new(UsageCache::default());
         let before = now_ms();
 
-        let entry = cached_usage_fetch(
-            &cache,
-            300_000,
-            UsageCacheSource::Entry,
-            || async {
-                UsageFetchOutcome::Failed {
-                    retry_after_ms: Some(600_000),
-                    fallback: Some(json!({ "error": "unavailable" })),
-                    log: UsageFailureLog::Silent,
-                }
-            },
-        )
+        let entry = cached_usage_fetch(&cache, 300_000, UsageCacheSource::Entry, || async {
+            UsageFetchOutcome::Failed {
+                retry_after_ms: Some(600_000),
+                fallback: Some(json!({ "error": "unavailable" })),
+                log: UsageFailureLog::Silent,
+            }
+        })
         .await;
 
         assert_eq!(entry.unwrap()["error"], "unavailable");
         let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(cache.failures, 1);
         assert!(cache.cooldown_until_ms >= before + 600_000);
-        assert!(cache.entry.is_none(), "fallbacks are not cached as fresh data");
+        assert!(
+            cache.entry.is_none(),
+            "fallbacks are not cached as fresh data"
+        );
     }
 }
 
@@ -8527,6 +8559,26 @@ async fn admin_run_keys_revoke(
     }
 }
 
+async fn admin_run_keys_revoke_all(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.revoke_all_run_keys() {
+        Ok(revoked) => {
+            state.run_keys.write().unwrap().clear();
+            axum::Json(json!({"revoked": revoked})).into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_run_keys_clear_revoked(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.delete_revoked_run_keys() {
+        Ok(removed) => {
+            state.run_keys.write().unwrap().clear();
+            axum::Json(json!({"removed": removed})).into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 const MAX_INGEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 fn valid_ingest_trace_id(id: &str) -> bool {
@@ -8569,7 +8621,7 @@ fn authenticate_trace_ingest(
     let Some(key) = client_key(headers) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "trace ingest requires an Alexandria wrap key",
+            "trace ingest requires an Alex wrap key",
         ));
     };
     if state
@@ -8603,7 +8655,7 @@ fn authenticate_harness_event(
     let Some(key) = client_key(headers) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "harness events require an Alexandria harness key",
+            "harness events require an Alex harness key",
         ));
     };
     let key_hash = key_hash_hex(&key);
@@ -10224,7 +10276,8 @@ async fn proxy(
         };
         drop(plan.dario_guard.take());
         trace.ts_response_ms = Some(now_ms());
-        fill_usage_and_cost(&state, &mut trace, &buf, is_sse);
+        let buffered_sse_error =
+            observe_buffered_response(&state, &mut trace, &buf, is_sse, plan.upstream_format);
         let text = String::from_utf8_lossy(&buf).to_string();
         if !status.is_success() {
             finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
@@ -10236,6 +10289,11 @@ async fn proxy(
                 .unwrap_or_else(|e| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
                 });
+        }
+        if let Some(error) = buffered_sse_error {
+            let msg = error.trace_message();
+            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            return error_response(StatusCode::BAD_GATEWAY, &msg);
         }
         let trimmed = text.trim_start();
         let looks_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
@@ -10260,7 +10318,10 @@ async fn proxy(
         };
         let Some(mut upstream_final) = upstream_final else {
             let msg = "could not reassemble upstream response for translation";
+            trace.status = Some(StatusCode::BAD_GATEWAY.as_u16() as i64);
             trace.error = Some(msg.to_string());
+            trace.error_kind = Some("invalid_upstream_response".into());
+            trace.error_class = Some(ErrorClass::Server.as_str().into());
             finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
             return error_response(StatusCode::BAD_GATEWAY, msg);
         };
@@ -10338,6 +10399,14 @@ async fn proxy(
                 serde_json::to_vec(&out).unwrap_or_default(),
             )
         };
+        record_dario_response_probe(
+            &state,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(StatusCode::OK)
@@ -10361,14 +10430,25 @@ async fn proxy(
             }
         };
         trace.ts_response_ms = Some(now_ms());
-        fill_usage_and_cost(&state, &mut trace, &buf, is_sse);
+        let buffered_sse_error =
+            observe_buffered_response(&state, &mut trace, &buf, is_sse, plan.upstream_format);
         let text = String::from_utf8_lossy(&buf).to_string();
+        if status.is_success() {
+            if let Some(error) = buffered_sse_error {
+                let msg = error.trace_message();
+                finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+                return error_response(StatusCode::BAD_GATEWAY, &msg);
+            }
+        }
         let (out_status, out_body) = if status.is_success() {
             match extract_final_response(&text) {
                 Some(v) => (StatusCode::OK, serde_json::to_vec(&v).unwrap_or_default()),
                 None => {
                     let msg = "upstream stream ended without a response.completed event";
+                    trace.status = Some(StatusCode::BAD_GATEWAY.as_u16() as i64);
                     trace.error = Some(msg.to_string());
+                    trace.error_kind = Some("invalid_upstream_response".into());
+                    trace.error_class = Some(ErrorClass::Server.as_str().into());
                     (
                         StatusCode::BAD_GATEWAY,
                         serde_json::to_vec(
@@ -10381,6 +10461,14 @@ async fn proxy(
         } else {
             (status, buf.clone())
         };
+        record_dario_response_probe(
+            &state,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(out_status)
@@ -10464,6 +10552,15 @@ async fn proxy(
                 dario.suspect(gen);
             }
         }
+
+        record_dario_response_probe(
+            &state2,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
 
         fill_usage_and_cost(&state2, &mut trace, &buf, is_sse);
         finalize_trace(
@@ -10565,6 +10662,82 @@ fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is
             trace.cost_usd = Some(compute_cost(&trace.usage, &pricing, input_includes_cached));
         }
     }
+}
+
+/// Observe a fully buffered upstream response before it is translated or
+/// destreamed. Codex reports generation failures inside an HTTP 200 SSE body,
+/// so the HTTP status alone cannot distinguish a completed response (which has
+/// usage) from a failed one (which normally has `usage: null`).
+///
+/// Usage is deliberately populated first. Callers can therefore finalize a
+/// successful trace immediately after this returns, while an SSE-level failure
+/// is classified before any failed terminal object can be synthesized as a
+/// successful JSON response.
+fn observe_buffered_response(
+    state: &AppState,
+    trace: &mut TraceRecord,
+    buf: &[u8],
+    is_sse: bool,
+    upstream_format: &'static str,
+) -> Option<UpstreamSseError> {
+    fill_usage_and_cost(state, trace, buf, is_sse);
+
+    let text = String::from_utf8_lossy(buf);
+    let trimmed = text.trim_start();
+    let looks_sse = is_sse || trimmed.starts_with("event:") || trimmed.starts_with("data:");
+    let mut error = if looks_sse {
+        let mut observer = SseErrorObserver::new(upstream_format);
+        observer.observe(buf);
+        observer.finish();
+        observer.upstream_error()
+    } else {
+        None
+    };
+
+    // A completed OpenAI Responses payload without usage cannot satisfy the
+    // trace contract. Keep it out of the successful-200 set instead of
+    // silently storing NULL counts. (Codex normally supplies usage only on the
+    // terminal SSE event.)
+    if error.is_none()
+        && trace.status == Some(StatusCode::OK.as_u16() as i64)
+        && upstream_format == "openai-responses"
+        && trace.usage.is_empty()
+    {
+        let final_response = if looks_sse {
+            extract_final_response(&text)
+        } else {
+            serde_json::from_str::<Value>(&text).ok()
+        };
+        if final_response.as_ref().is_some_and(|response| {
+            matches!(
+                response["status"].as_str(),
+                Some("completed") | Some("incomplete")
+            )
+        }) {
+            error = Some(UpstreamSseError {
+                kind: "missing_usage".into(),
+                message: "completed upstream response did not include usage".into(),
+            });
+        }
+    }
+
+    if trace.status == Some(StatusCode::OK.as_u16() as i64) {
+        if let Some(error) = &error {
+            trace.status = Some(StatusCode::BAD_GATEWAY.as_u16() as i64);
+            trace.error = Some(error.trace_message());
+            trace.error_kind = Some(error.kind.clone());
+            trace.error_class = Some(
+                classify_error(
+                    trace.upstream_provider.as_deref().unwrap_or("unknown"),
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    Some(&error.kind),
+                )
+                .as_str()
+                .into(),
+            );
+        }
+    }
+    error
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11106,7 +11279,8 @@ fn emit_reauth_notification_for_account(state: &Arc<AppState>, account: &Account
     let state = state.clone();
     let account = account.clone();
     tokio::spawn(async move {
-        if let Err(error) = start_reauth_and_notify(&state, account.provider, &account, false).await {
+        if let Err(error) = start_reauth_and_notify(&state, account.provider, &account, false).await
+        {
             tracing::warn!(
                 provider = account.provider.as_str(),
                 account = %account.id,
@@ -11225,8 +11399,11 @@ async fn abandon_reauth_session(
     let (cancelled, login_id, replacement_generation) = {
         let mut tracker = state.reauth_logins.lock().await;
         let (cancelled, login_id) = tracker.abandon_account(key);
-        let replacement_generation = reserve_replacement
-            .then(|| tracker.reserve_new(key.clone()).expect("cleared re-auth slot"));
+        let replacement_generation = reserve_replacement.then(|| {
+            tracker
+                .reserve_new(key.clone())
+                .expect("cleared re-auth slot")
+        });
         (cancelled, login_id, replacement_generation)
     };
     if let Some(login_id) = login_id {
@@ -11346,21 +11523,12 @@ async fn start_reauth_inner(
             .replacement_generation
             .expect("force replacement reserves a generation")
     } else {
-        let existing = state
-            .reauth_logins
-            .lock()
-            .await
-            .entries
-            .get(&key)
-            .cloned();
+        let existing = state.reauth_logins.lock().await.entries.get(&key).cloned();
         match existing {
             Some(ReauthLoginSlot::Starting(_)) => {
                 return Ok(reauth_notify_result(None, false, true, false));
             }
-            Some(ReauthLoginSlot::Active {
-                login_id,
-                ..
-            }) => {
+            Some(ReauthLoginSlot::Active { login_id, .. }) => {
                 let snapshot = state.logins.status(&login_id).await;
                 if reauth_session_is_reusable(snapshot.as_ref()) {
                     if let (Some(channel_id), Some(snapshot)) =
@@ -11375,15 +11543,17 @@ async fn start_reauth_inner(
                     }
                     let notified = if notify && resend_reused {
                         match snapshot.as_ref() {
-                            Some(snapshot) => notify_reauth_snapshot(
-                                state,
-                                provider,
-                                account,
-                                &key,
-                                snapshot,
-                                commands_enabled_note,
-                            )
-                            .await?,
+                            Some(snapshot) => {
+                                notify_reauth_snapshot(
+                                    state,
+                                    provider,
+                                    account,
+                                    &key,
+                                    snapshot,
+                                    commands_enabled_note,
+                                )
+                                .await?
+                            }
                             None => false,
                         }
                     } else {
@@ -11423,11 +11593,7 @@ async fn start_reauth_inner(
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            let abandoned = state
-                .reauth_logins
-                .lock()
-                .await
-                .abandon(&key, generation);
+            let abandoned = state.reauth_logins.lock().await.abandon(&key, generation);
             if abandoned {
                 emit_plain_reauth_notification_for_account(state, account);
             }
@@ -11438,11 +11604,7 @@ async fn start_reauth_inner(
         }
     };
     let Some(login_id) = snapshot["login_id"].as_str().map(str::to_owned) else {
-        let abandoned = state
-            .reauth_logins
-            .lock()
-            .await
-            .abandon(&key, generation);
+        let abandoned = state.reauth_logins.lock().await.abandon(&key, generation);
         if abandoned {
             emit_plain_reauth_notification_for_account(state, account);
         }
@@ -11476,12 +11638,11 @@ async fn start_reauth_inner(
         return Err("login session omitted verification_uri_complete".into());
     };
     if let Some(channel_id) = command_channel_id {
-        state.reauth_logins.lock().await.bind_awaiting_paste(
-            channel_id,
-            &key,
-            &snapshot,
-            now_ms(),
-        );
+        state
+            .reauth_logins
+            .lock()
+            .await
+            .bind_awaiting_paste(channel_id, &key, &snapshot, now_ms());
         return Ok(reauth_notify_result(Some(snapshot), false, false, false));
     }
 
@@ -11571,7 +11732,7 @@ fn reauth_link_body(
         )
     } else {
         format!(
-            "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
+            "Tap this link to re-authenticate {label}:\n{url}\n\nAlex is waiting for authorization and will finish automatically."
         )
     }
 }
@@ -11587,7 +11748,10 @@ fn enable_reauth_commands(state: &Arc<AppState>) -> std::result::Result<bool, St
         let receives_reauth = matches!(channel.format, notify::WebhookFormat::Telegram)
             && notify::NotificationLevel::Warn >= channel.min_level
             && (channel.categories.is_empty()
-                || channel.categories.iter().any(|category| category == "reauth"));
+                || channel
+                    .categories
+                    .iter()
+                    .any(|category| category == "reauth"));
         if receives_reauth && !channel.allow_commands {
             channel.allow_commands = true;
             changed = true;
@@ -11627,9 +11791,7 @@ pub async fn complete_reauth_code(
         .awaiting_paste(channel_id, now_ms());
     let awaiting = match awaiting {
         AwaitingPasteLookup::None => return Ok(json!({"awaiting": false})),
-        AwaitingPasteLookup::Expired => {
-            return Ok(json!({"awaiting": false, "expired": true}))
-        }
+        AwaitingPasteLookup::Expired => return Ok(json!({"awaiting": false, "expired": true})),
         AwaitingPasteLookup::Pending(awaiting) => awaiting,
     };
 
@@ -11649,8 +11811,7 @@ pub async fn complete_reauth_code(
         }
     };
     if snapshot["state"].as_str() == Some("done") {
-        clear_active_reauth(state, &awaiting.account_id).await;
-        mark_account_needs_reauth(state, &awaiting.account_id, false).await;
+        record_successful_account_probe(state, &awaiting.account_id, StatusCode::OK.as_u16()).await;
         return Ok(json!({
             "awaiting": false,
             "ok": true,
@@ -11706,8 +11867,7 @@ async fn complete_pending_reauth(
         .await
         .map_err(|_| "re-authentication session expired or is unavailable".to_string())?;
     if snapshot["state"].as_str() == Some("done") {
-        clear_active_reauth(state, &key.account_id).await;
-        mark_account_needs_reauth(state, &key.account_id, false).await;
+        record_successful_account_probe(state, &key.account_id, StatusCode::OK.as_u16()).await;
         return Ok(json!({"ok": true, "provider": key.provider.as_str()}));
     }
     Ok(json!({
@@ -11859,7 +12019,9 @@ mod tests {
             account_id: "xai-oauth-work".into(),
         };
         let mut tracker = ReauthLoginTracker::default();
-        let first = tracker.reserve_new(key.clone()).expect("first flow reserved");
+        let first = tracker
+            .reserve_new(key.clone())
+            .expect("first flow reserved");
         assert!(tracker.reserve_new(key.clone()).is_none());
         tracker.activate(&key, first, "login-old".into(), 1_000);
         assert!(tracker.reserve_new(key.clone()).is_none());
@@ -11914,9 +12076,8 @@ mod tests {
         let paste = reauth_link_body(Some("paste"), "work", "https://auth.test", false);
         assert!(paste.contains("After approving, paste the code#state here."));
         let device = reauth_link_body(Some("device"), "work", "https://auth.test", false);
-        assert!(device.contains(
-            "Alexandria is waiting for authorization and will finish automatically."
-        ));
+        assert!(device
+            .contains("Alex is waiting for authorization and will finish automatically."));
         assert!(!device.contains("code#state"));
     }
 
@@ -12114,13 +12275,8 @@ mod tests {
             .header("x-api-key", "alx-local")
             .body(Body::from(request_body.to_string()))
             .unwrap();
-        let (status, reused) = response_json(
-            router(state.clone())
-                .oneshot(reused_request)
-                .await
-                .unwrap(),
-        )
-        .await;
+        let (status, reused) =
+            response_json(router(state.clone()).oneshot(reused_request).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(reused["reused"], true);
         assert_eq!(reused["notification_sent"], true);
@@ -12152,13 +12308,8 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let (status, forced) = response_json(
-            router(state.clone())
-                .oneshot(forced_request)
-                .await
-                .unwrap(),
-        )
-        .await;
+        let (status, forced) =
+            response_json(router(state.clone()).oneshot(forced_request).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(forced["reused"], false);
         assert_eq!(forced["notification_sent"], true);
@@ -12260,13 +12411,8 @@ mod tests {
             .header("x-api-key", "alx-local")
             .body(Body::from(body))
             .unwrap();
-        let (status, cancelled) = response_json(
-            router(state.clone())
-                .oneshot(authorized)
-                .await
-                .unwrap(),
-        )
-        .await;
+        let (status, cancelled) =
+            response_json(router(state.clone()).oneshot(authorized).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cancelled, json!({"cancelled": true}));
         assert!(state.logins.status(&old_login_id).await.is_none());
@@ -12280,14 +12426,9 @@ mod tests {
             AwaitingPasteLookup::None
         );
 
-        let restarted = start_reauth_and_notify(
-            &state,
-            Provider::Anthropic,
-            &account,
-            false,
-        )
-        .await
-        .unwrap();
+        let restarted = start_reauth_and_notify(&state, Provider::Anthropic, &account, false)
+            .await
+            .unwrap();
         assert_eq!(restarted["reused"], false);
         assert_ne!(restarted["login_id"], old_login_id);
         sink.abort();
@@ -12325,20 +12466,13 @@ mod tests {
             attempts: AtomicUsize::new(0),
             inputs: std::sync::Mutex::new(Vec::new()),
         });
-        state
-            .logins
-            .set_paste_code_exchanger(exchanger.clone());
+        state.logins.set_paste_code_exchanger(exchanger.clone());
         let account = state.vault.list().await.remove(0);
 
-        let started = start_reauth_for_command(
-            &state,
-            Provider::Anthropic,
-            &account,
-            "control",
-            false,
-        )
-        .await
-        .unwrap();
+        let started =
+            start_reauth_for_command(&state, Provider::Anthropic, &account, "control", false)
+                .await
+                .unwrap();
         assert_eq!(started["mode"], "paste");
         assert!(matches!(
             state
@@ -12368,6 +12502,11 @@ mod tests {
         assert_eq!(completed["ok"], true);
         assert_eq!(completed["provider"], "anthropic");
         assert_eq!(
+            account_health_of(&state, "anthropic-oauth-work").await,
+            "healthy",
+            "a successful pasted re-auth code must stamp healthy probe evidence"
+        );
+        assert_eq!(
             state
                 .reauth_logins
                 .lock()
@@ -12379,6 +12518,45 @@ mod tests {
             *exchanger.inputs.lock().unwrap(),
             ["bad-code#state", "good-code#state"]
         );
+    }
+
+    #[tokio::test]
+    async fn pending_reauth_completion_stamps_healthy_probe_evidence() {
+        let state = test_state("pending-reauth-health");
+        let account_id = "anthropic-oauth-pending-health";
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                account_id,
+                "pending-health",
+                "pending-health@example.test",
+                now_ms() - 1,
+            ))
+            .await
+            .unwrap();
+        mark_account_needs_reauth(&state, account_id, true).await;
+        state
+            .logins
+            .set_paste_code_exchanger(Arc::new(CompletingPasteExchange {
+                account_id: account_id.into(),
+            }));
+        let account = state.vault.list().await.remove(0);
+
+        let started =
+            start_reauth_without_notification(&state, Provider::Anthropic, &account, false)
+                .await
+                .unwrap();
+        assert_eq!(started["state"], "pending");
+
+        let completed =
+            complete_pending_reauth(&state, Some(Provider::Anthropic), "mock-code#mock-state")
+                .await
+                .unwrap();
+
+        assert_eq!(completed["ok"], true);
+        assert!(!needs_reauth_flag(&state, account_id).await);
+        assert_eq!(account_health_of(&state, account_id).await, "healthy");
+        assert_eq!(admin_accounts_health(&state, account_id).await, "healthy");
     }
 
     #[test]
@@ -12432,8 +12610,14 @@ mod tests {
         });
         let snap = parse_kimi_usage_payload(&payload);
         let window = &snap["windows"][0];
-        assert!(window["window"].as_str().is_some(), "window name is a string");
-        assert!(window["used_pct"].as_f64().is_some(), "used_pct drives the bar");
+        assert!(
+            window["window"].as_str().is_some(),
+            "window name is a string"
+        );
+        assert!(
+            window["used_pct"].as_f64().is_some(),
+            "used_pct drives the bar"
+        );
         assert!(
             window["resets_at"].as_str().is_some() || window["resets_at_s"].as_i64().is_some(),
             "a reset timestamp drives the countdown"
@@ -12713,10 +12897,7 @@ mod tests {
         );
         // Curate a subset, plus one id that is not (or no longer) in the
         // catalog — it must silently drop via the exposed ∩ catalog intersect.
-        set_openrouter_exposed_models(
-            &state,
-            vec!["z-ai/glm-5.2".into(), "removed/model".into()],
-        );
+        set_openrouter_exposed_models(&state, vec!["z-ai/glm-5.2".into(), "removed/model".into()]);
 
         let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
         assert!(
@@ -12728,7 +12909,8 @@ mod tests {
             "an un-curated catalog model leaked into /v1/models: {ids:?}"
         );
         assert!(
-            !ids.iter().any(|id| id == "openrouter/meta-llama/llama-4:free"),
+            !ids.iter()
+                .any(|id| id == "openrouter/meta-llama/llama-4:free"),
             "an un-curated catalog model leaked into /v1/models: {ids:?}"
         );
         assert!(
@@ -12744,7 +12926,10 @@ mod tests {
         // z-ai/glm-5.2 and stay a small curated starter set (<= 8).
         let defaults = openrouter_exposed_list(&state);
         assert!(defaults.iter().any(|id| id == "z-ai/glm-5.2"));
-        assert!(defaults.len() <= 8, "default exposure list is not tiny: {defaults:?}");
+        assert!(
+            defaults.len() <= 8,
+            "default exposure list is not tiny: {defaults:?}"
+        );
 
         // With those ids present in the catalog (plus an extra) only the curated
         // examples are published.
@@ -12957,6 +13142,31 @@ mod tests {
         assert_eq!(body["traces"].as_array().unwrap().len(), 1);
         assert_eq!(body["traces"][0]["id"], "trace-in-run");
         assert_eq!(body["traces"][0]["run_id"], "hreg-1");
+    }
+
+    #[tokio::test]
+    async fn admin_traces_filters_by_key_fingerprint() {
+        let state = test_state("admin-traces-key-fingerprint");
+        for (id, fingerprint) in [
+            ("trace-for-key", "5effb978eb304b0b"),
+            ("trace-for-other-key", "1111222233334444"),
+        ] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: now_ms(),
+                    key_fingerprint: Some(fingerprint.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut query = HashMap::new();
+        query.insert("key_fingerprint".into(), "5effb978eb304b0b".into());
+        let (status, body) = response_json(admin_traces(State(state), Query(query)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(body["traces"][0]["id"], "trace-for-key");
     }
 
     #[test]
@@ -13277,7 +13487,9 @@ mod tests {
 
     fn anthropic_account() -> Account {
         Account {
-            id: "anthropic:test".into(),
+            // No ':' — it is an invalid filename character on Windows, and the
+            // vault writes accounts to "<id>.json" (CI failed with os error 87).
+            id: "anthropic-test".into(),
             provider: Provider::Anthropic,
             kind: "oauth".into(),
             name: "test".into(),
@@ -13471,7 +13683,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(direct.url, "https://api.anthropic.com/v1/messages");
-        assert_eq!(direct.account.id, "anthropic:test");
+        assert_eq!(direct.account.id, "anthropic-test");
         assert!(direct.extra_headers.is_empty());
 
         let mut harness_headers = HeaderMap::new();
@@ -13492,7 +13704,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dario.url, "http://127.0.0.1:9191/v1/messages");
-        assert_eq!(dario.account.id, "anthropic:test");
+        assert_eq!(dario.account.id, "anthropic-test");
         assert_eq!(dario.connection_account.as_ref().unwrap().kind, "dario");
         assert!(dario.via_dario);
         assert_eq!(dario.dario_generation.as_deref(), Some("test-generation"));
@@ -13534,7 +13746,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
-        assert_eq!(plan.account.id, "anthropic:test");
+        assert_eq!(plan.account.id, "anthropic-test");
         assert!(plan.dario_guard.is_none());
     }
 
@@ -14127,6 +14339,97 @@ mod tests {
     }
 
     #[test]
+    fn buffered_responses_completion_records_usage_before_trace_finalization() {
+        let state = test_state("buffered-responses-completion-usage");
+        // Codex always streams upstream, even for a non-streaming client. The
+        // response.created frame has no usage; only the terminal frame carries
+        // the counts that must be captured before the buffered trace is stored.
+        let response = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"usage\":null}}\n\n",
+            "event: keepalive\n",
+            "data: {\"type\":\"keepalive\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":15,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
+        );
+        let mut trace = TraceRecord {
+            id: "buffered-responses-completion-usage".into(),
+            ts_request_ms: now_ms(),
+            status: Some(StatusCode::OK.as_u16() as i64),
+            streamed: Some(false),
+            upstream_provider: Some("openai".into()),
+            upstream_format: Some("openai-responses".into()),
+            ..Default::default()
+        };
+
+        let error = observe_buffered_response(
+            &state,
+            &mut trace,
+            response.as_bytes(),
+            false,
+            "openai-responses",
+        );
+        assert!(error.is_none());
+        finalize_trace(&state, trace, b"{}", None, Some(response.as_bytes()));
+
+        let stored = state
+            .store
+            .get_trace("buffered-responses-completion-usage")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["status"], StatusCode::OK.as_u16());
+        assert_eq!(stored["input_tokens"], 15);
+        assert_eq!(stored["cached_input_tokens"], 3);
+        assert_eq!(stored["output_tokens"], 9);
+        assert_eq!(stored["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn buffered_responses_failure_cannot_be_finalized_as_http_200() {
+        let state = test_state("buffered-responses-logical-failure");
+        // This is the live failure shape from the slow wire cells: the HTTP
+        // envelope is 200, but Codex terminates the SSE response with a logical
+        // server error and explicitly supplies no usage.
+        let response = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"usage\":null}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"output\":[],\"usage\":null,\"error\":{\"code\":\"server_error\",\"message\":\"retry this request\"}}}\n\n",
+        );
+        let mut trace = TraceRecord {
+            id: "buffered-responses-logical-failure".into(),
+            ts_request_ms: now_ms(),
+            status: Some(StatusCode::OK.as_u16() as i64),
+            streamed: Some(false),
+            upstream_provider: Some("openai".into()),
+            upstream_format: Some("openai-responses".into()),
+            ..Default::default()
+        };
+
+        let error = observe_buffered_response(
+            &state,
+            &mut trace,
+            response.as_bytes(),
+            false,
+            "openai-responses",
+        )
+        .expect("response.failed must be detected before translation");
+        assert_eq!(error.kind, "server_error");
+        finalize_trace(&state, trace, b"{}", None, Some(response.as_bytes()));
+
+        let stored = state
+            .store
+            .get_trace("buffered-responses-logical-failure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["status"], StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(stored["error_kind"], "server_error");
+        assert_eq!(stored["error_class"], "server");
+        assert!(stored["input_tokens"].is_null());
+        assert!(stored["output_tokens"].is_null());
+    }
+
+    #[test]
     fn upstream_refusal_is_surfaced_nonempty_and_marks_the_trace_on_a_200() {
         let mut trace = TraceRecord::default();
         // Anthropic refusal as reassembled from the upstream: empty content.
@@ -14167,7 +14470,10 @@ mod tests {
         let before = upstream_final.clone();
         let patched = surface_upstream_refusal(&mut trace, &mut upstream_final, "anthropic");
         assert!(!patched);
-        assert_eq!(upstream_final, before, "normal completion must be untouched");
+        assert_eq!(
+            upstream_final, before,
+            "normal completion must be untouched"
+        );
         assert!(trace.error_kind.is_none());
     }
 
@@ -14945,6 +15251,88 @@ mod tests {
         assert_eq!(_status, StatusCode::OK);
         assert_eq!(revoked["revoked"], true);
         assert!(run_key_entry(&state, &hash).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_key_bulk_routes_are_gated_and_static_routes_beat_id_capture() {
+        use tower::ServiceExt;
+
+        let state = test_state("run-key-bulk-routes");
+        for (id, hash) in [
+            ("rk-active-1", "active1111bbbb2222cccc"),
+            ("rk-active-2", "active2222bbbb2222cccc"),
+            ("rk-revoked", "revoked111bbbb2222cccc"),
+        ] {
+            state
+                .store
+                .insert_run_key(id, hash, "run", None, None, None, 1_000, None)
+                .unwrap();
+        }
+        assert!(state.store.revoke_run_key("rk-revoked").unwrap());
+        assert!(run_key_entry(&state, "active1111bbbb2222cccc").is_some());
+
+        for (method, path) in [
+            ("POST", "/admin/run-keys/revoke-all"),
+            ("DELETE", "/admin/run-keys/revoked"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router(state.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let request = axum::http::Request::post("/admin/run-keys/revoke-all")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revoked"], 2);
+        assert!(state.run_keys.read().unwrap().is_empty());
+        assert!(state
+            .store
+            .list_run_keys(true)
+            .unwrap()
+            .iter()
+            .all(|row| row["revoked"] == true));
+
+        state
+            .store
+            .insert_run_key(
+                "rk-survivor",
+                "survive111bbbb2222cccc",
+                "run",
+                None,
+                None,
+                None,
+                2_000,
+                None,
+            )
+            .unwrap();
+        assert!(run_key_entry(&state, "survive111bbbb2222cccc").is_some());
+        let request = axum::http::Request::delete("/admin/run-keys/revoked")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["removed"], 3);
+        assert!(state.run_keys.read().unwrap().is_empty());
+        let rows = state.store.list_run_keys(true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "rk-survivor");
+        assert_eq!(rows[0]["revoked"], false);
     }
 
     #[tokio::test]
@@ -16594,10 +16982,15 @@ mod tests {
             .header("x-api-key", "alx-local")
             .body(Body::from(payload))
             .unwrap();
-        let (status, body) = response_json(router(state.clone()).oneshot(enabled).await.unwrap()).await;
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(enabled).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], true);
-        assert!(state.notifications.read().unwrap().has_command_channel("control"));
+        assert!(state
+            .notifications
+            .read()
+            .unwrap()
+            .has_command_channel("control"));
 
         let disabled = admin_notifications_commands(
             State(state.clone()),
@@ -16610,7 +17003,11 @@ mod tests {
         let (status, body) = response_json(disabled).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], false);
-        assert!(!state.notifications.read().unwrap().has_command_channel("control"));
+        assert!(!state
+            .notifications
+            .read()
+            .unwrap()
+            .has_command_channel("control"));
         let persisted = persister.settings.lock().unwrap();
         assert_eq!(persisted.len(), 2);
         assert!(persisted[0].channels[0].allow_commands);
@@ -16683,14 +17080,9 @@ mod tests {
             },
         );
 
-        let started = start_user_reauth_and_notify(
-            &state,
-            Provider::Anthropic,
-            &account,
-            false,
-        )
-        .await
-        .unwrap();
+        let started = start_user_reauth_and_notify(&state, Provider::Anthropic, &account, false)
+            .await
+            .unwrap();
         assert_eq!(started["notification_sent"], true);
         assert_eq!(started["fallback"], false);
         let event = first_event(&received, "user re-auth link was not delivered").await;
@@ -16699,7 +17091,11 @@ mod tests {
         assert!(text.contains("paste the code#state here"));
         assert!(text.contains("Commands enabled so you can paste the code back"));
         assert!(!text.contains("alex auth login anthropic"));
-        assert!(state.notifications.read().unwrap().has_command_channel("control"));
+        assert!(state
+            .notifications
+            .read()
+            .unwrap()
+            .has_command_channel("control"));
         assert!(persister.settings.lock().unwrap()[0].channels[0].allow_commands);
         assert!(matches!(
             state
@@ -16739,14 +17135,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let started = start_reauth_and_notify(
-            &state,
-            Provider::Anthropic,
-            &account,
-            false,
-        )
-        .await
-        .unwrap();
+        let started = start_reauth_and_notify(&state, Provider::Anthropic, &account, false)
+            .await
+            .unwrap();
         assert_eq!(started["notification_sent"], true);
         assert_eq!(started["fallback"], false);
         let event = first_event(&received, "watchdog did not deliver authorization link").await;
@@ -16754,7 +17145,11 @@ mod tests {
         assert!(text.contains("https://claude.ai/oauth/authorize"));
         assert!(text.contains("paste the code#state here"));
         assert!(!text.contains("alex auth login anthropic"));
-        assert!(!state.notifications.read().unwrap().has_command_channel("alerts"));
+        assert!(!state
+            .notifications
+            .read()
+            .unwrap()
+            .has_command_channel("alerts"));
         sink.abort();
     }
 
@@ -16784,8 +17179,7 @@ mod tests {
             .header("x-api-key", "alx-local")
             .body(Body::empty())
             .unwrap();
-        let (status, body) =
-            response_json(router(state).oneshot(authorized).await.unwrap()).await;
+        let (status, body) = response_json(router(state).oneshot(authorized).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         let encoded = body.to_string();
@@ -16842,12 +17236,11 @@ mod tests {
         assert_eq!(started["mode"], "paste");
         assert!(started["verification_uri_complete"].as_str().is_some());
 
-        let status_request = axum::http::Request::get(
-            "/admin/auth/reauth/status?provider=anthropic",
-        )
-        .header("x-api-key", "alx-local")
-        .body(Body::empty())
-        .unwrap();
+        let status_request =
+            axum::http::Request::get("/admin/auth/reauth/status?provider=anthropic")
+                .header("x-api-key", "alx-local")
+                .body(Body::empty())
+                .unwrap();
         let (_, pending) =
             response_json(router(state.clone()).oneshot(status_request).await.unwrap()).await;
         assert_eq!(pending["sessions"][0]["login_id"], started["login_id"]);
@@ -16861,7 +17254,10 @@ mod tests {
         .await;
         let (_, mismatched) = response_json(mismatched).await;
         assert_eq!(mismatched["ok"], false);
-        assert!(mismatched["error"].as_str().unwrap().contains("state mismatch"));
+        assert!(mismatched["error"]
+            .as_str()
+            .unwrap()
+            .contains("state mismatch"));
         assert!(!mismatched.to_string().contains("SECRET_RESPONSE_BODY"));
 
         let completed = admin_auth_reauth_submit(
@@ -17594,6 +17990,130 @@ mod tests {
             admin_accounts_health(&state, "xai-oauth-grok").await,
             "healthy"
         );
+    }
+
+    #[tokio::test]
+    async fn dario_path_success_stamps_bonded_account_healthy() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                axum::Json(json!({
+                    "id": "msg_dario_health",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-sonnet-4-5",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = test_state_with_dario(
+            "dario-success-health",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "health-success".into(),
+                    base_url: format!("http://{address}"),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: true,
+                routes_requests: true,
+                status: None,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","stream":false,"messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            if account_health_of(&state, "anthropic-test").await == "healthy" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(account_health_of(&state, "anthropic-test").await, "healthy");
+        assert_eq!(
+            admin_accounts_health(&state, "anthropic-test").await,
+            "healthy"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dario_infrastructure_failure_does_not_stamp_bonded_account() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error": "Dario generation unavailable"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = test_state_with_dario(
+            "dario-infra-failure-health",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "health-failure".into(),
+                    base_url: format!("http://{address}"),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: true,
+                routes_requests: true,
+                status: None,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","stream":false,"messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(account_health_of(&state, "anthropic-test").await, "unknown");
+        assert_eq!(
+            admin_accounts_health(&state, "anthropic-test").await,
+            "unknown"
+        );
+        server.abort();
     }
 
     #[tokio::test]

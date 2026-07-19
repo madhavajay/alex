@@ -752,7 +752,7 @@ impl NotificationDispatcher {
         let event = NotificationEvent {
             level: NotificationLevel::Info,
             category: category.into(),
-            title: "Alexandria notification test".into(),
+            title: "Alex notification test".into(),
             body: "This is a synthetic notification test event.".into(),
             account: NotificationAccount {
                 provider: "alexandria".into(),

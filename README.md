@@ -84,17 +84,33 @@ Alex records a trace for every request from any supported harness. **Session gro
 requests into one conversation; **subagent tracing** additionally reconstructs the parent→child tree when a
 harness spawns subagents.
 
-| Harness | Session grouping | Subagent tracing |
-| --- | --- | --- |
-| `claude` (Claude Code) | Per-agent, via `x-claude-code-agent-id` | ✅ **Full** — parent/child lineage from `x-claude-code-parent-agent-id` (recorded as `SubagentStart`/`SubagentStop`) |
-| `codex` | Conversation affinity (`conversation_id`) | ⏳ Planned |
-| `pi` | Session id / request metadata | ⏳ Planned |
-| `gemini`, `grok`, `amp`, `cursor`, `droid`, `goose`, `kimi`, `qwen`, `opencode`, `mini-swe-agent`, `hermes`, `pydantic-ai`, `opensage`, `stirrup`, `jcode`, `omp` | Grouped by any session/`conversation_id` the tool sends, otherwise an `auto-<hash>` session per connection | ⏳ Planned |
+| Harness | Traces | Subagents |
+| --- | :---: | :---: |
+| `claude` (Claude Code) | ✅ | ✅ |
+| `codex` | ✅ | ✅ |
+| `pi` | ✅ | ✅ |
+| `grok` | ✅ | ✅ |
+| `amp` | ✅ | ✅ |
+| `gemini` | ✅ | — |
+| `cursor` | ✅ | — |
+| `droid` | ✅ | — |
+| `goose` | ✅ | — |
+| `kimi` | ✅ | — |
+| `qwen` | ✅ | — |
+| `opencode` | ✅ | — |
+| `mini-swe-agent` | ✅ | — |
+| `hermes` | ✅ | — |
+| `pydantic-ai` | ✅ | — |
+| `opensage` | ✅ | — |
+| `stirrup` | ✅ | — |
+| `jcode` | ✅ | — |
+| `omp` | ✅ | — |
 
-**Today, Claude Code is the only harness with true subagent tracing** — it's the only one that emits the agent
-lineage headers Alex needs. Harnesses that send no session id (e.g. Qwen Code driving a benchmark) get an
-`auto-<hash>` session per connection, so many parallel/retried runs surface as many short sessions rather than one
-grouped job. Broader subagent capture across harnesses is on the roadmap.
+Subagent tracing sources: Claude Code sends native `x-claude-code-agent-id`/`x-claude-code-parent-agent-id`
+headers (recorded as `SubagentStart`/`SubagentStop`); codex, pi, and grok report sessions and sub-agents through
+the lifecycle hook installed by `alex connect`; amp reports lineage via the Alex system plugin. Harnesses that
+send no session id (e.g. Qwen Code driving a benchmark) get an `auto-<hash>` session per connection, so many
+parallel/retried runs surface as many short sessions rather than one grouped job.
 
 ## What makes Alex different?
 
@@ -161,6 +177,28 @@ pi --model alex/gpt-5.6-sol
 `alex status` shows daemon health, accounts, limits, and Dario state. For a guided setup that can install, connect, configure, and launch a supported harness, run `alex up pi`.
 
 ## Compatibility
+
+### Providers & subscriptions
+
+Alex holds the credential, refreshes it, and routes traffic for each provider below. Subscription providers use your existing plan's OAuth login — no API key required.
+
+| Provider | Plan / auth | Status |
+| --- | --- | --- |
+| Anthropic (Claude) | Claude subscription OAuth | ✅ Supported |
+| OpenAI (Codex / ChatGPT) | ChatGPT subscription OAuth | ✅ Supported |
+| Google Gemini | Gemini CLI OAuth import | ✅ Supported |
+| xAI (Grok) | Grok CLI subscription login | ✅ Supported |
+| Moonshot (Kimi) | Kimi subscription | ✅ Supported |
+| OpenRouter | API key | ✅ Supported |
+| Exo | Local / LAN cluster (no auth) | ✅ Supported |
+| Amp | Amp CLI credentials | ✅ Supported |
+| Hugging Face | — | ⏳ Coming soon |
+| Meta (Llama) | — | ⏳ Coming soon |
+| Groq | — | ⏳ Coming soon |
+| LM Studio | — | ⏳ Coming soon |
+| AWS Bedrock | — | ⏳ Coming soon |
+| Ollama | — | ⏳ Coming soon |
+| Cursor | — | ⏳ Coming soon |
 
 ### API formats
 

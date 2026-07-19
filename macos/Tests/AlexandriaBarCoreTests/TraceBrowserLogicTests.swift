@@ -22,6 +22,10 @@ import Testing
         #expect(effort.duration == "5m")
         let account = OmniQuery.parse("account:openai-oauth-acct-2")
         #expect(account.account == "openai-oauth-acct-2")
+        let key = OmniQuery.parse("key:5effb978eb304b0b")
+        #expect(key.key == "5effb978eb304b0b")
+        #expect(key.freeText.isEmpty)
+        #expect(key.hasTokenFilters)
         #expect(q.hasTokenFilters)
         #expect(!q.isEmpty)
     }

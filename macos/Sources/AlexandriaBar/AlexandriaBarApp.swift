@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "w")
         appMenu.addItem(.separator())
         appMenu.addItem(
-            withTitle: "Quit AlexandriaBar", action: #selector(NSApplication.terminate(_:)),
+            withTitle: "Quit Alex", action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)

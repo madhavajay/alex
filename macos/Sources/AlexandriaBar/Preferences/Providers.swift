@@ -37,11 +37,15 @@ private enum ProvidersChartRange: String, CaseIterable {
 struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
-    @State private var providerToAdd: String?
     @State private var selectedProvider: String? = "openai"
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
         ProvidersChartRange.twentyFourHours.rawValue
     @State private var accountAnalyticsLoadID: UUID?
+    /// Full snapshot refreshes can briefly publish an incomplete account list
+    /// while the daemon is settling after re-auth. Keep the pane's last rows
+    /// mounted until that refresh finishes, matching the Harnesses pane's
+    /// retain-while-checking behavior.
+    @State private var accountsBeforeRefresh: [Account]?
     /// Earliest bucket timestamp seen across a one-off 30d fetch, used to
     /// decide which range tabs have enough history to be worth showing.
     /// `nil` until loaded (or if the lookup fails) — `enabledRanges` fails
@@ -71,9 +75,13 @@ struct ProvidersPreferencesSection: View {
             })
     }
 
+    private var displayedAccounts: [Account] {
+        accountsBeforeRefresh ?? store.accounts
+    }
+
     /// Canonical providers plus any provider returned by a newer daemon.
     private var providers: [String] {
-        Array(Set(ProviderInfo.supportedProviders + store.accounts.map(\.provider))).sorted {
+        Array(Set(ProviderInfo.supportedProviders + displayedAccounts.map(\.provider))).sorted {
             ProviderInfo.displayName($0) < ProviderInfo.displayName($1)
         }
     }
@@ -99,13 +107,13 @@ struct ProvidersPreferencesSection: View {
             // openai supports multiple accounts; exo is reconfigurable (no
             // account concept). Everything else hides once it has an account.
             $0 == "openai" || $0 == "exo"
-                || !ProviderPresentation.hasAccount(for: $0, in: store.accounts)
+                || !ProviderPresentation.hasAccount(for: $0, in: displayedAccounts)
         }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            if ProviderPresentation.hasNoAccounts(store.accounts) {
+            if ProviderPresentation.hasNoAccounts(displayedAccounts) {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Connect a Token Provider")
@@ -130,6 +138,7 @@ struct ProvidersPreferencesSection: View {
                     ProviderPreferencesDetail(
                         provider: provider,
                         store: store,
+                        accounts: displayedAccounts.filter { $0.provider == provider },
                         usageByAccount: usageByAccount,
                         chartRangeSelection: chartRangeSelection,
                         chartRangeEnabled: enabledRanges,
@@ -145,6 +154,14 @@ struct ProvidersPreferencesSection: View {
             }
         }
         .background(AlexTheme.Colors.background)
+        .onAppear {
+            if store.refreshing {
+                accountsBeforeRefresh = store.accounts
+            }
+        }
+        .onChange(of: store.refreshing) { _, refreshing in
+            accountsBeforeRefresh = refreshing ? store.accounts : nil
+        }
         .task(id: chartRange) {
             let loadID = UUID()
             accountAnalyticsLoadID = loadID
@@ -163,20 +180,6 @@ struct ProvidersPreferencesSection: View {
                   enabledRanges.indices.contains(index), !enabledRanges[index]
             else { return }
             chartRangeValue = ProvidersChartRange.twentyFourHours.rawValue
-        }
-        .sheet(
-            isPresented: Binding(
-                get: { providerToAdd != nil },
-                set: { if !$0 { providerToAdd = nil } }
-            )
-        ) {
-            if let provider = providerToAdd {
-                if ProviderInfo.usesAPIKeySheet(provider) {
-                    ProviderAPIKeySheet(provider: provider, store: store) {
-                        providerToAdd = nil
-                    }
-                }
-            }
         }
     }
 
@@ -202,7 +205,7 @@ struct ProvidersPreferencesSection: View {
                             provider: provider,
                             count: provider == "exo"
                                 ? store.exoModels.filter(\.enabled).count
-                                : store.accounts.filter { $0.provider == provider }.count,
+                                : displayedAccounts.filter { $0.provider == provider }.count,
                             statusText: provider == "exo"
                                 ? (store.exoStatus?.running == true ? "Online" : "Offline")
                                 : nil,
@@ -245,7 +248,7 @@ struct ProvidersPreferencesSection: View {
             }
             return status.running ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
         }
-        let accounts = store.accounts.filter { $0.provider == provider && !$0.paused }
+        let accounts = displayedAccounts.filter { $0.provider == provider && !$0.paused }
         let displays = accounts.map { account in
             let heartbeat = store.healthAccounts.first { $0.id == account.id }?.lastHeartbeat
             return account.displayState(
@@ -286,12 +289,9 @@ struct ProvidersPreferencesSection: View {
 
     private func addAccount(_ provider: String) {
         switch provider {
-        case "exo":
-            // Local cluster: no login. Select its first-class provider detail.
-            selectedProvider = "exo"
-        case _ where ProviderInfo.usesAPIKeySheet(provider):
-            // API-key providers (openrouter) capture a long-lived key.
-            providerToAdd = provider
+        case "exo", "openrouter":
+            // First-class provider details own local endpoint/API-key setup.
+            selectedProvider = provider
         default:
             // OAuth-login providers (anthropic/openai/gemini/xai/kimi) run the
             // device/browser auth flow; amp adopts its CLI credentials via the
@@ -376,6 +376,7 @@ private struct ProviderSidebarRow: View {
 private struct ProviderPreferencesDetail: View {
     let provider: String
     let store: SnapshotStore
+    let accounts: [Account]
     let usageByAccount: [String: AccountUsage]
     @Binding var chartRangeSelection: Int
     let chartRangeEnabled: [Bool]
@@ -383,7 +384,6 @@ private struct ProviderPreferencesDetail: View {
     let onConnect: (String) -> Void
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
 
-    private var accounts: [Account] { store.accounts.filter { $0.provider == provider } }
     private var routing: ProviderRoutingResponse? { store.routingByProvider[provider] }
     private var routingByAccount: [String: ProviderRoutingAccount] {
         Dictionary(uniqueKeysWithValues: (routing?.accounts ?? []).map { ($0.accountId, $0) })
@@ -405,6 +405,8 @@ private struct ProviderPreferencesDetail: View {
     var body: some View {
         if provider == "exo" {
             ExoPreferencesSection(store: store)
+        } else if provider == "openrouter" {
+            OpenRouterPreferencesSection(store: store)
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -822,7 +824,7 @@ private struct SubscriptionAccountRow: View {
             Button("Remove", role: .destructive) { remove() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Alexandria will stop using and pinging this account.")
+            Text("Alex will stop using and pinging this account.")
         }
         .alert(item: $overwriteAction) { action in
             Alert(
@@ -1487,7 +1489,7 @@ private struct ProviderRoutingPreferencesSection: View {
                     .labelsHidden()
             }
             Text(allowMidThreadFailover
-                ? "If the assigned account hits an auth, rate-limit, or server failure, Alexandria may move that thread to another eligible account. This keeps work moving but can reduce prompt-cache reuse."
+                ? "If the assigned account hits an auth, rate-limit, or server failure, Alex may move that thread to another eligible account. This keeps work moving but can reduce prompt-cache reuse."
                 : "Auth, rate-limit, and server failures stay on the thread’s assigned account instead of retrying another one. Explicitly pausing, disabling, or removing that account can still reassign the thread.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
@@ -1802,91 +1804,6 @@ private extension CodexRoutingStrategy {
             "Assign each new session to the first eligible account below that remains above the reserve."
         case .roundRobin:
             "Alternate new sessions across eligible accounts, skipping accounts that have reached the reserve."
-        }
-    }
-}
-
-private struct ProviderAPIKeySheet: View {
-    let provider: String
-    let store: SnapshotStore
-    let onDone: () -> Void
-    @State private var key = ""
-    @State private var httpReferer = ""
-    @State private var xTitle = ""
-    @State private var saving = false
-    @State private var error: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                StatusDot(
-                    tint: AlexTheme.ProviderBrand.brand(for: provider).accent, size: 8)
-                Text("Add \(ProviderInfo.displayName(provider)) API key")
-                    .font(AlexTheme.Fonts.panelTitle)
-                    .foregroundStyle(AlexTheme.Colors.foreground)
-            }
-            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alexandria daemon for encrypted vault storage.")
-                .font(.system(size: 12))
-                .foregroundStyle(AlexTheme.Colors.textTertiary)
-            VStack(spacing: 8) {
-                SecureField("API key", text: $key)
-                    .textFieldStyle(.roundedBorder)
-                TextField("HTTP-Referer (optional)", text: $httpReferer)
-                    .textFieldStyle(.roundedBorder)
-                TextField("X-Title (optional)", text: $xTitle)
-                    .textFieldStyle(.roundedBorder)
-            }
-            .font(AlexTheme.Fonts.mono(11))
-            if let error {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundStyle(AlexTheme.Colors.destructive)
-            }
-            HStack(spacing: 8) {
-                Spacer()
-                if saving { ProgressView().controlSize(.small) }
-                PillButton(
-                    title: "Cancel",
-                    tint: AlexTheme.Colors.textSecondary,
-                    horizontalPadding: 12, verticalPadding: 5, cornerRadius: 7,
-                    showsBorder: true, isEnabled: !saving,
-                    keyboardShortcut: .cancelAction,
-                    action: onDone)
-                PillButton(
-                    title: "Save key",
-                    variant: .solidAccent,
-                    isEnabled: !saving
-                        && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                    keyboardShortcut: .defaultAction
-                ) {
-                    save()
-                }
-            }
-        }
-        .padding(20)
-        .frame(width: 440)
-        .background(AlexTheme.Colors.background)
-    }
-
-    private func save() {
-        guard let config = store.config else { return }
-        saving = true
-        error = nil
-        let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanReferer = httpReferer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanTitle = xTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        Task {
-            do {
-                try await AlexandriaClient(config: config).setOpenRouterKey(
-                    cleanKey,
-                    httpReferer: cleanReferer.isEmpty ? nil : cleanReferer,
-                    xTitle: cleanTitle.isEmpty ? nil : cleanTitle)
-                await store.refresh()
-                onDone()
-            } catch {
-                self.error = error.localizedDescription
-            }
-            saving = false
         }
     }
 }

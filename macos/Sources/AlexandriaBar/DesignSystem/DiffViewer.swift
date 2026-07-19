@@ -288,7 +288,7 @@ struct DiffViewer<Icon: View>: View {
                 lines: [
                     DiffLineDisplay(.context, "# Project context"),
                     DiffLineDisplay(.added, ""),
-                    DiffLineDisplay(.added, "## AlexandriaBar"),
+                    DiffLineDisplay(.added, "## Alex"),
                 ]),
             DiffFileDisplay(
                 path: "~/.claude/keybindings.json", added: 0, removed: 0,

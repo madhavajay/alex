@@ -50,7 +50,7 @@ for a stable build.
 | --- | --- | --- | --- |
 | `host` | string | `127.0.0.1` | Bind IP. Must parse as IPv4/IPv6. Local harness URLs still use loopback for non-loopback binds. |
 | `port` | integer | `4100` | HTTP listener port. |
-| `data_dir` | path | Alexandria home | Runtime state root. Relative paths are accepted by TOML/path parsing but an absolute path is easier to operate. |
+| `data_dir` | path | Alex home | Runtime state root. Relative paths are accepted by TOML/path parsing but an absolute path is easier to operate. |
 | `local_key` | string | random `alx-...` | Full local/admin and model-ingress credential. |
 | `heartbeat_minutes` | integer | `15` | Provider heartbeat interval; `0` disables. |
 | `reauth_check_minutes` | integer | `5` | Idle OAuth logout watchdog interval; `0` disables. |
@@ -65,7 +65,7 @@ for a stable build.
 | `gemini_project` | string | `""` | Optional Code Assist project override/cache. `GOOGLE_CLOUD_PROJECT` takes precedence when set. |
 | `anthropic_upstream` | string | `auto` | `auto`, `dario`, or `direct`; set through `alex dario auto|enable|disable`. |
 | `dario_mode_migrated` | boolean | `true` | Internal one-time legacy `direct` to `auto` migration marker. Do not use as a routing control. |
-| `dario_api_key` | string | empty, generated/saved at daemon start | Credential used only between Alexandria and its local Dario child. |
+| `dario_api_key` | string | empty, generated/saved at daemon start | Credential used only between Alex and its local Dario child. |
 | `dario_claude_bin` | path or absent | absent | Explicit real Claude Code binary for model prompt capture. An invalid explicit path does not fall through. |
 | `dario_node_path` | path or absent | absent | Explicit Node runtime. `alex dario fix` persists discovered Node/Claude paths. |
 | `dario_update_check_minutes` | integer | `60` | Dario npm update-check interval. |

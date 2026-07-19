@@ -24,6 +24,7 @@ enum HarnessKind {
     Claude,
     Codex,
     Grok,
+    Kimi,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +53,12 @@ const RUNNABLE_HARNESSES: &[RunnableHarness] = &[
         kind: HarnessKind::Grok,
         default_package: None,
         default_model: "gpt-5.5",
+    },
+    RunnableHarness {
+        name: "kimi",
+        kind: HarnessKind::Kimi,
+        default_package: Some("@moonshot-ai/kimi-code"),
+        default_model: "claude-fable-5",
     },
 ];
 
@@ -411,7 +418,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
     };
     if !opts.no_trace_check && !capture.complete {
         bail!(
-            "{} completed but Alexandria capture is incomplete for model '{}': missing {}; stdout={} stderr={}",
+            "{} completed but Alex capture is incomplete for model '{}': missing {}; stdout={} stderr={}",
             canonical_name,
             routed_model,
             capture.missing.join(", "),
@@ -442,14 +449,23 @@ fn catalog() -> Result<HarnessCatalog> {
 
 fn resolve_harness(name: &str) -> Result<(String, CatalogHarness)> {
     let catalog = catalog()?;
-    catalog
+    let (catalog_name, harness) = catalog
         .harnesses
         .into_iter()
         .find(|(key, h)| key == name || h.aliases.iter().any(|alias| alias == name))
-        .ok_or_else(|| anyhow!("unknown harness '{name}'"))
+        .ok_or_else(|| anyhow!("unknown harness '{name}'"))?;
+    let canonical_name = match catalog_name.as_str() {
+        "kimi-code" => "kimi".to_string(),
+        _ => catalog_name,
+    };
+    Ok((canonical_name, harness))
 }
 
 fn runnable_by_name(name: &str) -> Option<&'static RunnableHarness> {
+    let name = match name {
+        "kimi-code" => "kimi",
+        _ => name,
+    };
     RUNNABLE_HARNESSES.iter().find(|h| h.name == name)
 }
 
@@ -561,6 +577,15 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
                 env.push(format!("{key}={value}"));
             }
         }
+        HarnessKind::Kimi => {
+            for (key, value) in [
+                ("OPENAI_BASE_URL", openai_base),
+                ("OPENAI_API_KEY", local_key.to_string()),
+            ] {
+                env.push("-e".to_string());
+                env.push(format!("{key}={value}"));
+            }
+        }
     }
     env
 }
@@ -589,7 +614,7 @@ cat > "$CODEX_HOME/config.toml" <<EOF
 model_provider = "alexandria"
 
 [model_providers.alexandria]
-name = "Alexandria Proxy"
+name = "Alex Proxy"
 base_url = "$OPENAI_BASE_URL"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
@@ -615,6 +640,29 @@ GROK_CLI="$(command -v agent || command -v grok || true)"
 test -n "$GROK_CLI"
 "$GROK_CLI" --version > /out/logs/version.txt 2>&1 || true
 "$GROK_CLI" -p "$ALEXANDRIA_E2E_PROMPT" --model {escaped_model} --output-format streaming-json --permission-mode bypassPermissions > /out/harness.stdout.log 2> /out/harness.stderr.log
+"#
+        ),
+        HarnessKind::Kimi => format!(
+            r#"set -euo pipefail
+mkdir -p /workspace /out/logs "$HOME/.kimi-code"
+npm install -g "$ALEXANDRIA_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
+kimi --version > /out/logs/version.txt 2>&1 || true
+cat > "$HOME/.kimi-code/config.toml" <<EOF
+default_model = "alex/$ALEXANDRIA_E2E_MODEL"
+
+[providers.alexandria]
+type = "openai"
+api_key = "$OPENAI_API_KEY"
+base_url = "$OPENAI_BASE_URL"
+custom_headers = {{ "x-alexandria-harness" = "kimi", "x-session-id" = "$ALEXANDRIA_E2E_SESSION" }}
+
+[models."alex/$ALEXANDRIA_E2E_MODEL"]
+provider = "alexandria"
+model = "alex/$ALEXANDRIA_E2E_MODEL"
+max_context_size = 200000
+display_name = "alex/$ALEXANDRIA_E2E_MODEL"
+EOF
+kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
     };
@@ -747,6 +795,7 @@ fn trace_matches_harness(user_agent: Option<&str>, harness: HarnessKind) -> bool
         HarnessKind::Claude => user_agent.starts_with("claude-cli/"),
         HarnessKind::Codex => user_agent.contains("codex"),
         HarnessKind::Grok => user_agent.contains("grok") || user_agent.contains("xai"),
+        HarnessKind::Kimi => user_agent == "kimi" || user_agent.contains("kimi-code"),
     }
 }
 
@@ -900,6 +949,8 @@ mod tests {
     fn resolves_aliases() {
         assert_eq!(resolve_harness("claude-code").unwrap().0, "claude");
         assert_eq!(resolve_harness("grok").unwrap().0, "grok-build");
+        assert_eq!(resolve_harness("kimi").unwrap().0, "kimi");
+        assert_eq!(resolve_harness("kimi-code").unwrap().0, "kimi");
         assert!(resolve_harness("missing").is_err());
     }
 
@@ -920,6 +971,36 @@ mod tests {
         let script = docker_script(HarnessKind::Codex, "gpt-5.5").unwrap();
         assert!(script.contains("wire_api = \"responses\""));
         assert!(script.contains("codex exec"));
+    }
+
+    #[test]
+    fn kimi_script_contains_openai_provider_config() {
+        let script = docker_script(HarnessKind::Kimi, "claude-fable-5").unwrap();
+        assert!(script.contains(
+            r#"[providers.alexandria]
+type = "openai"
+api_key = "$OPENAI_API_KEY"
+base_url = "$OPENAI_BASE_URL"
+custom_headers = { "x-alexandria-harness" = "kimi", "x-session-id" = "$ALEXANDRIA_E2E_SESSION" }"#
+        ));
+        assert!(script.contains(
+            r#"[models."alex/$ALEXANDRIA_E2E_MODEL"]
+provider = "alexandria"
+model = "alex/$ALEXANDRIA_E2E_MODEL"
+max_context_size = 200000
+display_name = "alex/$ALEXANDRIA_E2E_MODEL""#
+        ));
+        assert!(script.contains(r#"default_model = "alex/$ALEXANDRIA_E2E_MODEL""#));
+    }
+
+    #[test]
+    fn kimi_script_runs_noninteractively_with_stream_json() {
+        let script = docker_script(HarnessKind::Kimi, "claude-fable-5").unwrap();
+        // kimi 0.27.0 rejects -y/--auto combined with -p; prompt mode runs
+        // tools non-interactively on its own.
+        assert!(script.contains(
+            r#"kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log"#
+        ));
     }
 
     #[test]
@@ -959,6 +1040,11 @@ mod tests {
             Some("xai-grok-workspace"),
             HarnessKind::Grok
         ));
+        assert!(trace_matches_harness(Some("kimi"), HarnessKind::Kimi));
+        assert!(!trace_matches_harness(
+            Some("OpenAI/JS 6.34.0"),
+            HarnessKind::Kimi
+        ));
     }
 
     #[test]
@@ -970,6 +1056,10 @@ mod tests {
         );
         assert_eq!(
             expected_dario_route(anthropic, HarnessKind::Codex, true),
+            Some(true)
+        );
+        assert_eq!(
+            expected_dario_route(anthropic, HarnessKind::Kimi, true),
             Some(true)
         );
         assert_eq!(

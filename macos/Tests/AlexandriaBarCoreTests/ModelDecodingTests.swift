@@ -25,6 +25,37 @@ import Testing
         #expect(!response.fallback)
     }
 
+    @Test func notificationCommandsResponseDecodesUpdatedChannel() throws {
+        let json = #"{"ok":true,"channel":{"index":0,"id":"telegram-main","kind":"telegram","format":"telegram","host":"api.telegram.org","bot_username":"alex_bot","chat_id":"42","allow_commands":true,"supports_replies":true,"min_level":"warn","categories":["reauth"],"last_sent_ms":1783477900000,"last_error":null}}"#
+        let response = try decode(json, as: NotificationCommandsResponse.self)
+        #expect(response.ok)
+        #expect(response.channel?.id == "telegram-main")
+        #expect(response.channel?.allowCommands == true)
+        #expect(response.channel?.lastError == nil)
+    }
+
+    @Test func notificationLogDecodesDaemonAndDocumentedFieldNames() throws {
+        let json = #"{"messages":[{"ts":1783477900000,"direction":"out","channel_id":"telegram-main","kind":"reauth","ok":true,"error":null,"summary":"Re-authentication required"},{"ts_ms":1783477901000,"direction":"in","channel_id":"telegram-main","category":"command","ok":false,"error":"invalid code","summary":"[oauth code redacted]"}]}"#
+        let response = try decode(json, as: NotificationLogResponse.self)
+        #expect(response.messages.count == 2)
+        #expect(response.messages[0].tsMs == 1_783_477_900_000)
+        #expect(response.messages[0].category == "reauth")
+        #expect(response.messages[1].direction == "in")
+        #expect(response.messages[1].category == "command")
+        #expect(response.messages[1].summary == "[oauth code redacted]")
+        #expect(response.messages[1].error == "invalid code")
+    }
+
+    @Test func notificationTestTargetUsesSavedChannelWithoutFormCredentials() {
+        #expect(NotificationTestTarget.resolve(
+            token: "", chatID: "", savedChannelID: "telegram-main")
+            == .savedChannel("telegram-main"))
+        #expect(NotificationTestTarget.resolve(
+            token: "new-token", chatID: "42", savedChannelID: "telegram-main") == .inline)
+        #expect(NotificationTestTarget.resolve(
+            token: "new-token", chatID: "", savedChannelID: nil) == nil)
+    }
+
     @Test func canonicalProviderCatalogIncludesEveryProvider() {
         #expect(Set(ProviderInfo.supportedProviders) == Set([
             "anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"
@@ -268,9 +299,11 @@ import Testing
         {"harnesses":[
           {"name":"pi","installed":true,"binary":"/opt/alex/pi","version":"0.80.3","version_warning":null,"config_dir":"/Users/x/.pi/agent","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":null,"config_dir":null},"daemon_reachable":true,"extra":"ignored"},
           {"name":"codex","installed":true,"binary":"/opt/alex/codex","version":"0.144.3","version_warning":null,"config_dir":"/Users/x/.codex","config_dir_exists":true,"connected":true,"supports_connect":true,"override":{"binary":"/tmp/codex","config_dir":null},"daemon_reachable":true,"default_route":"alex","backup_path":"/Users/x/.codex/alexandria-original-config.toml"}
-        ],"extra":"ignored"}
+        ],"checked_ms":1783477427269,"extra":"ignored"}
         """#
-        let harnesses = try decode(json, as: HarnessesResponse.self).harnesses
+        let response = try decode(json, as: HarnessesResponse.self)
+        let harnesses = response.harnesses
+        #expect(response.checkedMs == 1783477427269)
         #expect(harnesses.count == 2)
         #expect(harnesses[0].name == "pi")
         #expect(harnesses[0].versionWarning == nil)
@@ -285,7 +318,7 @@ import Testing
 
     @Test func harnessRefreshConfigResponse() throws {
         let json = #"""
-        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100","description":"Alexandria adds alex/* models."}
+        {"refreshed":true,"path":"/Users/x/.pi/agent/models.json","models_total":28,"added":["alex/claude-fable-5"],"removed":[],"unchanged":27,"key":"reused","base_url":"http://127.0.0.1:4100","description":"Alex adds alex/* models."}
         """#
         let response = try decode(json, as: HarnessConfigWriteResponse.self)
         #expect(response.refreshed == true)
@@ -297,7 +330,7 @@ import Testing
         #expect(response.key == "reused")
         #expect(response.path.hasSuffix("models.json"))
         #expect(response.baseUrl == "http://127.0.0.1:4100")
-        #expect(response.description == "Alexandria adds alex/* models.")
+        #expect(response.description == "Alex adds alex/* models.")
     }
 
     @Test func harnessConnectConfigWriteResponse() throws {
@@ -418,7 +451,6 @@ import Testing
         #expect(ProviderInfo.displayName("openrouter") == "OpenRouter")
         #expect(ProviderInfo.loginArg("openrouter") == "openrouter")
         #expect(ProviderInfo.pingArg("openrouter") == "openrouter")
-        #expect(ProviderInfo.usesAPIKeySheet("openrouter"))
     }
 
     @Test func routingReserveResolutionAndDisplay() {

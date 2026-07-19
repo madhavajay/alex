@@ -283,7 +283,7 @@ fn reauth_flow_reply(flow: &ReauthFlow) -> String {
         )
     } else {
         format!(
-            "Re-authenticate {}:\n{}\n\nAlexandria is waiting for authorization and will finish automatically.",
+            "Re-authenticate {}:\n{}\n\nAlex is waiting for authorization and will finish automatically.",
             flow.provider, flow.url
         )
     }
@@ -345,7 +345,7 @@ impl CommandHandler for PingHandler {
         match context.status().await {
             Ok(summary) => summary.ping_text(),
             Err(_) => format!(
-                "pong · Alexandria v{} · uptime unknown",
+                "pong · Alex v{} · uptime unknown",
                 env!("CARGO_PKG_VERSION")
             ),
         }
@@ -362,7 +362,7 @@ impl CommandHandler for HelpHandler {
         _args: &[String],
         commands: &[CommandHelp],
     ) -> String {
-        let mut lines = vec!["Alexandria commands:".to_string()];
+        let mut lines = vec!["Alex commands:".to_string()];
         lines.extend(
             commands
                 .iter()
@@ -523,7 +523,7 @@ mod tests {
         assert!(router.dispatch(&context, "/help").await.contains("/ping"));
         assert_eq!(
             router.dispatch(&context, "/ping").await,
-            "pong · Alexandria v1.2.3 · uptime 1m"
+            "pong · Alex v1.2.3 · uptime 1m"
         );
         assert_eq!(
             router.dispatch(&context, "/does-not-exist").await,

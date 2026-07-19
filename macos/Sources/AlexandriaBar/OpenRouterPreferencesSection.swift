@@ -14,6 +14,8 @@ struct OpenRouterPreferencesSection: View {
 
     // Key entry (write-only: the daemon never hands a stored key back).
     @State private var keyDraft = ""
+    @State private var httpReferer = ""
+    @State private var xTitle = ""
     @State private var revealKey = false
     @State private var isSavingKey = false
     @State private var keyResult: String?
@@ -92,7 +94,7 @@ struct OpenRouterPreferencesSection: View {
                     .foregroundStyle(
                         hasKey ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
             }
-            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alexandria daemon for encrypted vault storage; it is never displayed back.")
+            Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alex daemon for encrypted vault storage; it is never displayed back.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
             HStack(spacing: 8) {
@@ -124,6 +126,16 @@ struct OpenRouterPreferencesSection: View {
                                 ? AlexTheme.Colors.destructive : AlexTheme.Colors.success)
                 }
                 Spacer()
+            }
+            HStack(spacing: 8) {
+                TextField("HTTP-Referer (optional)", text: $httpReferer)
+                    .textFieldStyle(.roundedBorder)
+                    .font(AlexTheme.Fonts.mono(11))
+                    .frame(maxWidth: 200)
+                TextField("X-Title (optional)", text: $xTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .font(AlexTheme.Fonts.mono(11))
+                    .frame(maxWidth: 140)
             }
         }
     }
@@ -313,7 +325,7 @@ struct OpenRouterPreferencesSection: View {
         isLoading = true
         defer { isLoading = false }
         guard let client = client() else {
-            error = "No Alexandria daemon configuration was found."
+            error = "No Alex daemon configuration was found."
             return
         }
         do {
@@ -335,8 +347,13 @@ struct OpenRouterPreferencesSection: View {
         isSavingKey = true
         defer { isSavingKey = false }
         let clean = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanReferer = httpReferer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTitle = xTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            try await client.setOpenRouterKey(clean)
+            try await client.setOpenRouterKey(
+                clean,
+                httpReferer: cleanReferer.isEmpty ? nil : cleanReferer,
+                xTitle: cleanTitle.isEmpty ? nil : cleanTitle)
             keyDraft = ""
             revealKey = false
             keyResult = "Key saved"

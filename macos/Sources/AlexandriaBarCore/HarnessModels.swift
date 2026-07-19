@@ -2,6 +2,12 @@ import Foundation
 
 public struct HarnessesResponse: Codable, Sendable {
     public let harnesses: [Harness]
+    public let checkedMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case harnesses
+        case checkedMs = "checked_ms"
+    }
 }
 
 public struct Harness: Codable, Sendable, Identifiable, Equatable {

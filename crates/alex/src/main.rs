@@ -83,7 +83,7 @@ enum Command {
         /// Override the harness config dir
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        /// Alexandria daemon base URL (env: ALEXANDRIA_URL)
+        /// Alex daemon base URL (env: ALEXANDRIA_URL)
         #[arg(long)]
         url: Option<String>,
         /// Pre-minted harness key (env: ALEXANDRIA_HARNESS_KEY)
@@ -182,18 +182,18 @@ enum Command {
         #[command(subcommand)]
         command: WrapCommand,
     },
-    /// Install, connect, configure, and launch a harness through Alexandria
+    /// Install, connect, configure, and launch a harness through Alex
     Up {
         /// Harness to bootstrap (pi is the default)
         #[arg(default_value = "pi")]
         harness: String,
-        /// Remote Alexandria base URL. Supplying this never starts a local daemon.
+        /// Remote Alex base URL. Supplying this never starts a local daemon.
         #[arg(long)]
         url: Option<String>,
-        /// A model-only scoped run key (never an Alexandria local/admin key)
+        /// A model-only scoped run key (never an Alex local/admin key)
         #[arg(long)]
         key: Option<String>,
-        /// Alexandria model to make the harness default
+        /// Alex model to make the harness default
         #[arg(long, default_value = "alex/gpt-5.6-sol")]
         model: String,
         /// npm package version to install when the harness is absent
@@ -252,7 +252,7 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
-    /// Selectively remove local Alexandria data (dry-run unless --yes is supplied)
+    /// Selectively remove local Alex data (dry-run unless --yes is supplied)
     Reset {
         /// Remove vault account JSON and revoke run keys; retain account tombstones
         #[arg(long)]
@@ -509,13 +509,13 @@ enum WrapCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Launch connected Claude with its Alexandria settings: `alex wrap claude -p 'hi'`
+    /// Launch connected Claude with its Alex settings: `alex wrap claude -p 'hi'`
     Claude {
         /// Args passed through verbatim to `claude`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Launch connected Codex with the Alexandria profile: `alex wrap codex exec 'hi'`
+    /// Launch connected Codex with the Alex profile: `alex wrap codex exec 'hi'`
     Codex {
         /// Args passed through verbatim to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -598,7 +598,7 @@ enum WrapCommand {
 
 #[derive(clap::Args, Clone, Default)]
 struct RemoteTraceArgs {
-    /// Central Alexandria base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
+    /// Central Alex base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
     #[arg(long, alias = "alex-url")]
     trace_url: Option<String>,
     /// Correlate this wrap session under a caller-supplied run id instead of a
@@ -694,7 +694,7 @@ enum VaultCommand {
         #[arg(long)]
         passphrase: String,
     },
-    /// Fetch an encrypted bundle from another Alexandria daemon and import it
+    /// Fetch an encrypted bundle from another Alex daemon and import it
     Pull {
         #[arg(long = "from")]
         from: String,
@@ -777,7 +777,7 @@ enum HarnessCommand {
     Run {
         /// Harness name: claude|codex|grok
         harness: String,
-        /// Model to request from the harness; prefixes route through Alexandria
+        /// Model to request from the harness; prefixes route through Alex
         #[arg(long)]
         model: Option<String>,
         /// Prompt sent to the harness
@@ -808,7 +808,7 @@ enum HarnessCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Pack an npm CLI package into Alexandria's frozen harness cache
+    /// Pack an npm CLI package into Alex's frozen harness cache
     Pack {
         /// Harness name or npm package name, for example claude or @anthropic-ai/claude-code
         target: String,
@@ -899,7 +899,7 @@ enum TracesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Push a locally spooled wrap run to a central Alexandria daemon
+    /// Push a locally spooled wrap run to a central Alex daemon
     Push {
         #[arg(long)]
         run_id: String,
@@ -2276,6 +2276,107 @@ fn dario_admin_router(
         .with_state(glue)
 }
 
+const HARNESS_CACHE_FRESH_MS: i64 = 60_000;
+
+#[derive(Default)]
+struct HarnessListCacheState {
+    scope: Option<PathBuf>,
+    harnesses: Option<Vec<harness_connect::HarnessStatus>>,
+    checked_ms: i64,
+    refreshing: bool,
+    last_refresh_succeeded: bool,
+}
+
+struct HarnessListCache {
+    state: tokio::sync::Mutex<HarnessListCacheState>,
+    refreshed: tokio::sync::watch::Sender<u64>,
+}
+
+static HARNESS_LIST_CACHE: std::sync::OnceLock<Arc<HarnessListCache>> = std::sync::OnceLock::new();
+
+fn harness_list_cache() -> &'static Arc<HarnessListCache> {
+    HARNESS_LIST_CACHE.get_or_init(|| {
+        let (refreshed, _) = tokio::sync::watch::channel(0);
+        Arc::new(HarnessListCache {
+            state: tokio::sync::Mutex::new(HarnessListCacheState::default()),
+            refreshed,
+        })
+    })
+}
+
+fn harness_cache_is_fresh(checked_ms: i64, now_ms: i64) -> bool {
+    checked_ms > 0 && now_ms.saturating_sub(checked_ms) <= HARNESS_CACHE_FRESH_MS
+}
+
+async fn run_claimed_harness_refresh(
+    config: Config,
+) -> Result<(Vec<harness_connect::HarnessStatus>, i64)> {
+    let result = harness_connect::harness_statuses(&config, None, true)
+        .await
+        .map(|harnesses| (harnesses, now_ms()));
+    let cache = harness_list_cache();
+    {
+        let mut guard = cache.state.lock().await;
+        guard.last_refresh_succeeded = result.is_ok();
+        if let Ok((harnesses, checked_ms)) = &result {
+            guard.scope = Some(config.data_dir.clone());
+            guard.harnesses = Some(harnesses.clone());
+            guard.checked_ms = *checked_ms;
+        }
+        guard.refreshing = false;
+    }
+    cache.refreshed.send_modify(|generation| *generation += 1);
+    result
+}
+
+async fn refresh_harness_cache(
+    config: Config,
+) -> Result<(Vec<harness_connect::HarnessStatus>, i64)> {
+    let scope = config.data_dir.clone();
+    loop {
+        let wait_for_refresh = {
+            let cache = harness_list_cache();
+            let mut guard = cache.state.lock().await;
+            if guard.refreshing {
+                Some(cache.refreshed.subscribe())
+            } else {
+                guard.refreshing = true;
+                None
+            }
+        };
+        if let Some(mut wait_for_refresh) = wait_for_refresh {
+            let _ = wait_for_refresh.changed().await;
+            let cache = harness_list_cache();
+            let guard = cache.state.lock().await;
+            if guard.last_refresh_succeeded && guard.scope.as_ref() == Some(&scope) {
+                if let Some(harnesses) = guard.harnesses.clone() {
+                    return Ok((harnesses, guard.checked_ms));
+                }
+            }
+            continue;
+        }
+        return run_claimed_harness_refresh(config).await;
+    }
+}
+
+fn harness_cache_response(
+    result: Result<(Vec<harness_connect::HarnessStatus>, i64)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match result {
+        Ok((harnesses, checked_ms)) => axum::Json(serde_json::json!({
+            "harnesses": harnesses,
+            "checked_ms": checked_ms,
+        }))
+        .into_response(),
+        Err(error_value) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": error_value.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
     use axum::extract::{Path as AxPath, Query, State};
     use axum::response::IntoResponse;
@@ -2469,16 +2570,52 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         }
     }
 
-    async fn list() -> axum::response::Response {
-        match load_or_create_config() {
-            Ok((config, _)) => match harness_connect::harness_statuses(&config, None, true).await {
-                Ok(harnesses) => {
-                    axum::Json(serde_json::json!({"harnesses": harnesses})).into_response()
-                }
-                Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            },
-            Err(e) => error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    async fn list(
+        Query(q): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let (config, _) = match load_or_create_config() {
+            Ok(value) => value,
+            Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        if q.get("refresh").is_some_and(|value| value == "1") {
+            return harness_cache_response(refresh_harness_cache(config).await);
         }
+
+        let scope = config.data_dir.clone();
+        let now = now_ms();
+        let (cached, start_refresh) = {
+            let cache = harness_list_cache();
+            let mut guard = cache.state.lock().await;
+            let cached = (guard.scope.as_ref() == Some(&scope))
+                .then(|| {
+                    guard
+                        .harnesses
+                        .clone()
+                        .map(|harnesses| (harnesses, guard.checked_ms))
+                })
+                .flatten();
+            let stale = cached
+                .as_ref()
+                .is_some_and(|(_, checked_ms)| !harness_cache_is_fresh(*checked_ms, now));
+            let start_refresh = stale && !guard.refreshing;
+            if start_refresh {
+                guard.refreshing = true;
+            }
+            (cached, start_refresh)
+        };
+
+        if let Some((harnesses, checked_ms)) = cached {
+            if start_refresh {
+                tokio::spawn(async move {
+                    if let Err(error_value) = run_claimed_harness_refresh(config).await {
+                        tracing::debug!(%error_value, "background harness status refresh failed");
+                    }
+                });
+            }
+            return harness_cache_response(Ok((harnesses, checked_ms)));
+        }
+
+        harness_cache_response(refresh_harness_cache(config).await)
     }
 
     async fn connect(
@@ -2705,6 +2842,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 harness_connect::plan_grok_disconnect(&config_dir, &keys)
             } else if name == "amp" {
                 harness_connect::plan_amp_disconnect(&config_dir, &keys)
+            } else if name == "kimi" {
+                harness_connect::plan_kimi_disconnect(&config_dir, &keys)
             } else {
                 harness_connect::plan_disconnect(&config_dir, &keys)
             };
@@ -2714,6 +2853,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => config_dir.join("alexandria-settings.json"),
             "codex" => config_dir.join("config.toml"),
             "grok" => config_dir.join("config.toml"),
+            "kimi" => config_dir.join("config.toml"),
             "amp" => config_dir.join("plugins").join("alexandria.ts"),
             _ => config_dir.join("models.json"),
         };
@@ -2721,6 +2861,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::read_claude_model_ids(&config_dir),
             "codex" => harness_connect::read_codex_model_ids(&config_dir),
             "grok" => harness_connect::read_grok_model_ids(&config_dir),
+            "kimi" => harness_connect::read_kimi_model_ids(&config_dir),
             "amp" => Vec::new(),
             _ => harness_connect::read_pi_model_ids(&config_dir),
         };
@@ -2728,6 +2869,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::disconnect_claude_config(&config_dir),
             "codex" => harness_connect::disconnect_codex_config(&config_dir),
             "grok" => harness_connect::disconnect_grok_config(&config_dir),
+            "kimi" => harness_connect::disconnect_kimi_config(&config_dir),
             "amp" => harness_connect::disconnect_amp_config(&config_dir),
             _ => harness_connect::disconnect_pi_config(&config_dir),
         };
@@ -3211,7 +3353,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .context("a pre-minted harness key requires a harness name")?;
             let url = remote_url.as_deref().context(
-                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alexandria config",
+                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alex config",
             )?;
             harness_connect::connect_with_preminted_key(
                 harness,
@@ -3544,6 +3686,9 @@ async fn main() -> Result<()> {
                     describe(row_days)
                 );
             }
+            if let Err(error_value) = refresh_harness_cache(config.clone()).await {
+                tracing::warn!(%error_value, "could not warm harness status cache at startup");
+            }
             let mut app = alex_proxy::router(state.clone());
             app = app.merge(harness_admin_router(state.clone()));
             app = app.merge(dario_admin_router(glue, state.local_key.clone()));
@@ -3557,7 +3702,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             if let Some(reason) = fallback_reason {
-                eprintln!("\nWARNING: Alexandria could not bind its configured address {host}:{port}: {reason}");
+                eprintln!("\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}");
                 eprintln!("WARNING: Falling back to loopback (127.0.0.1) so the daemon remains available locally.");
                 eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
             }
@@ -4434,7 +4579,7 @@ async fn main() -> Result<()> {
                 let changed = set_daemon_host(&mut config, &address)?;
                 if changed {
                     println!("daemon host saved as {}", config.host);
-                    println!("restart the Alexandria daemon to apply the new listener");
+                    println!("restart the Alex daemon to apply the new listener");
                 } else {
                     println!("daemon host is already {}", config.host);
                 }
@@ -4509,7 +4654,7 @@ async fn main() -> Result<()> {
                     config.dario_mode_migrated = true;
                     save_config(&config)?;
                     println!(
-                        "Dario routing set to {message} ({mode}) in config.toml; restart Alexandria to apply"
+                        "Dario routing set to {message} ({mode}) in config.toml; restart Alex to apply"
                     );
                     return Ok(());
                 }
@@ -4999,7 +5144,7 @@ fn ensure_wrap_launcher_connected(harness: &str, config_dir: &Path) -> Result<()
     };
     if !connected {
         anyhow::bail!(
-            "{harness} is not connected to Alexandria; run `alex connect {harness}` first"
+            "{harness} is not connected to Alex; run `alex connect {harness}` first"
         );
     }
     Ok(())
@@ -5106,7 +5251,7 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
         "remote trace upload requires --trace-key-file, ALEXANDRIA_TRACE_KEY, or ALEXANDRIA_TRACE_KEY_FILE"
     })?;
     if !key.starts_with("alxk-") {
-        anyhow::bail!("remote trace credential is not an Alexandria key (expected alxk-...)");
+        anyhow::bail!("remote trace credential is not an Alex key (expected alxk-...)");
     }
     let url = reqwest::Url::parse(&base_url)
         .with_context(|| format!("invalid trace destination URL '{base_url}'"))?;
@@ -9245,7 +9390,7 @@ async fn up_cmd(
     let spec = harness_connect::spec_by_name(harness)
         .with_context(|| format!("unknown harness '{harness}'"))?;
     if !spec.supports_connect {
-        bail!("harness '{harness}' does not support Alexandria connection yet");
+        bail!("harness '{harness}' does not support Alex connection yet");
     }
     let remote = url.is_some();
     let base_url = if let Some(url) = url {
@@ -9253,7 +9398,7 @@ async fn up_cmd(
         if url.is_empty() {
             bail!("--url must not be empty");
         }
-        println!("target: remote Alexandria at {url} (will not start a local daemon)");
+        println!("target: remote Alex at {url} (will not start a local daemon)");
         url.to_string()
     } else {
         let base = config.base_url();
@@ -9277,7 +9422,7 @@ async fn up_cmd(
     let (key_id, key) = match supplied_key {
         Some(key) => {
             if !key.starts_with("alxk-") {
-                bail!("--key must be a model-only scoped run key (expected alxk-...), never the Alexandria local/admin key");
+                bail!("--key must be a model-only scoped run key (expected alxk-...), never the Alex local/admin key");
             }
             println!("key: using supplied scoped run key");
             ("rk-provided".to_string(), key.to_string())
@@ -9780,14 +9925,9 @@ mod tests {
             } => assert_eq!(channel, "control"),
             _ => panic!("unexpected notify commands parse"),
         }
-        assert!(Cli::try_parse_from([
-            "alex",
-            "notify",
-            "commands",
-            "--enable",
-            "--disable"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["alex", "notify", "commands", "--enable", "--disable"]).is_err()
+        );
         match Cli::try_parse_from([
             "alex",
             "notify",
@@ -11623,7 +11763,10 @@ local_key = "alx-test"
         };
         alex_proxy::OpenrouterExposedPersister::persist(
             &exposed,
-            &["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+            &[
+                "z-ai/glm-5.2".to_string(),
+                "openai/gpt-5.6-terra".to_string(),
+            ],
         )
         .unwrap();
 
@@ -11643,7 +11786,10 @@ local_key = "alx-test"
         std::env::remove_var("ALEXANDRIA_HOME");
         assert_eq!(
             reloaded.openrouter_exposed_models,
-            vec!["z-ai/glm-5.2".to_string(), "openai/gpt-5.6-terra".to_string()],
+            vec![
+                "z-ai/glm-5.2".to_string(),
+                "openai/gpt-5.6-terra".to_string()
+            ],
             "an unrelated notifications write dropped the OpenRouter exposure list"
         );
         assert_eq!(
@@ -11792,6 +11938,7 @@ local_key = "alx-test"
         let (status, body) = router_json(app.clone(), Method::GET, "/admin/harnesses", None).await;
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
+        assert!(body["checked_ms"].as_i64().unwrap() > 0);
         assert_eq!(harnesses.len(), 19);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
@@ -11818,6 +11965,21 @@ local_key = "alx-test"
             .as_str()
             .unwrap()
             .contains("does not support connect"));
+    }
+
+    #[test]
+    fn harness_cache_freshness_expires_after_one_minute() {
+        let checked_ms = 1_000_000;
+        assert!(harness_cache_is_fresh(checked_ms, checked_ms));
+        assert!(harness_cache_is_fresh(
+            checked_ms,
+            checked_ms + HARNESS_CACHE_FRESH_MS
+        ));
+        assert!(!harness_cache_is_fresh(
+            checked_ms,
+            checked_ms + HARNESS_CACHE_FRESH_MS + 1
+        ));
+        assert!(!harness_cache_is_fresh(0, checked_ms));
     }
 
     #[cfg(unix)]
@@ -12290,7 +12452,7 @@ local_key = "alx-test"
             .ends_with("plugins/alexandria.ts"));
         let plugin_path = config_dir.join("plugins/alexandria.ts");
         let plugin = std::fs::read_to_string(&plugin_path).unwrap();
-        assert!(plugin.contains("Generated by Alexandria for Amp"));
+        assert!(plugin.contains("Generated by Alex for Amp"));
         assert!(plugin.contains("amp.on('tool.call'"));
         assert!(harness_connect::amp_config_connected(&config_dir).unwrap());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);

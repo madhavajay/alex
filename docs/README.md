@@ -1,4 +1,4 @@
-# Alex / Alexandria docs
+# Alex docs
 
 Implementation reference derived from the current Rust code. For planned work
 use the root [`TODO.md`](../TODO.md); for released changes use

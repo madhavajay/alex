@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Declarative harness/model defaults and routing notes used to keep Alexandria harness smoke runs consistent.",
+  "description": "Declarative harness/model defaults and routing notes used to keep Alex harness smoke runs consistent.",
   "models": {
     "gpt-5.5": {
       "provider": "openai-subscription",
@@ -17,7 +17,7 @@
       "provider": "alexandria-proxy",
       "proxy_route": "codex",
       "endpoint": "openai-chat-completions",
-      "notes": "Alexandria proxy model alias for OpenAI-compatible harnesses."
+      "notes": "Alex proxy model alias for OpenAI-compatible harnesses."
     },
     "claude-opus-4-8": {
       "provider": "claude-subscription",
@@ -34,7 +34,7 @@
       "provider": "alexandria-proxy",
       "proxy_route": "dario",
       "endpoint": "openai-chat-completions-to-anthropic",
-      "notes": "Alexandria proxy model alias for OpenAI-compatible harnesses."
+      "notes": "Alex proxy model alias for OpenAI-compatible harnesses."
     },
     "claude-sonnet-5": {
       "provider": "claude-subscription",

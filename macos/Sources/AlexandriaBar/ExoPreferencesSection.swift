@@ -107,11 +107,11 @@ struct ExoPreferencesSection: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "Models to expose", style: .prominent)
-            Text("Checked models become callable as alex/<model> by any harness pointed at Alexandria. They are also available as exo/<model>.")
+            Text("Checked models become callable as alex/<model> by any harness pointed at Alex. They are also available as exo/<model>.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
             ForEach($models) { $model in
-                Toggle(isOn: $model.enabled) {
+                HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(model.name).font(.system(size: 12, weight: .medium))
@@ -124,8 +124,10 @@ struct ExoPreferencesSection: View {
                             .font(AlexTheme.Fonts.metaMono)
                             .foregroundStyle(AlexTheme.Colors.textTertiary)
                     }
+                    Spacer()
+                    Toggle("", isOn: $model.enabled)
+                        .settingsSwitch()
                 }
-                .settingsSwitch()
                 .padding(.vertical, 3)
                 RowDivider()
             }
@@ -169,7 +171,7 @@ struct ExoPreferencesSection: View {
     private func load() async {
         isLoading = true
         defer { isLoading = false }
-        guard let client = client() else { error = "No Alexandria daemon configuration was found."; return }
+        guard let client = client() else { error = "No Alex daemon configuration was found."; return }
         do {
             let config = try await client.exoConfig()
             endpoint = config.url
@@ -181,7 +183,7 @@ struct ExoPreferencesSection: View {
     }
 
     private func check() async {
-        guard let client = client() else { error = "No Alexandria daemon configuration was found."; return }
+        guard let client = client() else { error = "No Alex daemon configuration was found."; return }
         isChecking = true
         error = nil
         defer { isChecking = false }
@@ -201,7 +203,7 @@ struct ExoPreferencesSection: View {
         let current = try await client.exoStatus()
         status = current
         error = current.error
-        if current.running { models = try await client.exoModels() }
+        if current.running { models = try await client.exoModels().sortedForDisplay() }
     }
 
     private func save() async {

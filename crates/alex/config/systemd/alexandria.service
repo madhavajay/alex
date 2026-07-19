@@ -1,5 +1,5 @@
 [Unit]
-Description=Alexandria LLM proxy daemon
+Description=Alex LLM proxy daemon
 After=network-online.target
 Wants=network-online.target
 

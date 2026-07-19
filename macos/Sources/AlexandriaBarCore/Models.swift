@@ -49,6 +49,7 @@ public struct NotificationChannel: Codable, Sendable {
     public let host: String?
     public let botUsername: String?
     public let chatID: String?
+    public let allowCommands: Bool
     public let supportsReplies: Bool?
     public let minLevel: NotificationLevel
     public let categories: [String]
@@ -61,6 +62,7 @@ public struct NotificationChannel: Codable, Sendable {
         case index, id, kind, format, host, categories
         case botUsername = "bot_username"
         case chatID = "chat_id"
+        case allowCommands = "allow_commands"
         case supportsReplies = "supports_replies"
         case minLevel = "min_level"
         case lastSentMs = "last_sent_ms"
@@ -179,6 +181,103 @@ public struct NotificationSaveResponse: Codable, Sendable {
     public let ok: Bool
     public let channel: NotificationChannel?
     public let error: String?
+}
+
+/// Result of enabling or disabling inbound commands for a saved channel.
+public struct NotificationCommandsResponse: Codable, Sendable {
+    public let ok: Bool
+    public let channel: NotificationChannel?
+    public let error: String?
+
+    private enum CodingKeys: String, CodingKey { case ok, channel, error }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.channel = try container.decodeIfPresent(NotificationChannel.self, forKey: .channel)
+        self.error = try container.decodeIfPresent(String.self, forKey: .error)
+        self.ok = try container.decodeIfPresent(Bool.self, forKey: .ok) ?? (channel != nil)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(ok, forKey: .ok)
+        try container.encodeIfPresent(channel, forKey: .channel)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+}
+
+/// One server-redacted inbound or outbound notification activity entry.
+/// The decoder accepts both the daemon's current `ts`/`kind` field names and
+/// the admin API's documented `ts_ms`/`category` aliases.
+public struct NotificationLogEntry: Codable, Sendable {
+    public let tsMs: Int64
+    public let direction: String
+    public let channelID: String?
+    public let category: String
+    public let ok: Bool
+    public let error: String?
+    public let summary: String
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, kind, direction, ok, error, summary
+        case tsMs = "ts_ms"
+        case channelID = "channel_id"
+        case category
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let tsMs = try container.decodeIfPresent(Int64.self, forKey: .tsMs) {
+            self.tsMs = tsMs
+        } else {
+            self.tsMs = try container.decode(Int64.self, forKey: .ts)
+        }
+        self.direction = try container.decode(String.self, forKey: .direction)
+        self.channelID = try container.decodeIfPresent(String.self, forKey: .channelID)
+        if let category = try container.decodeIfPresent(String.self, forKey: .category) {
+            self.category = category
+        } else {
+            self.category = try container.decode(String.self, forKey: .kind)
+        }
+        self.ok = try container.decode(Bool.self, forKey: .ok)
+        self.error = try container.decodeIfPresent(String.self, forKey: .error)
+        self.summary = try container.decode(String.self, forKey: .summary)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(tsMs, forKey: .tsMs)
+        try container.encode(direction, forKey: .direction)
+        try container.encodeIfPresent(channelID, forKey: .channelID)
+        try container.encode(category, forKey: .category)
+        try container.encode(ok, forKey: .ok)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encode(summary, forKey: .summary)
+    }
+}
+
+public struct NotificationLogResponse: Codable, Sendable {
+    public let messages: [NotificationLogEntry]
+}
+
+/// Selects the credential-bearing test form when it is complete, otherwise a
+/// saved channel whose token remains stored in the daemon.
+public enum NotificationTestTarget: Sendable, Equatable {
+    case inline
+    case savedChannel(String)
+
+    public static func resolve(
+        token: String, chatID: String, savedChannelID: String?
+    ) -> NotificationTestTarget? {
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty, !chatID.isEmpty { return .inline }
+        if let savedChannelID {
+            let id = savedChannelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !id.isEmpty { return .savedChannel(id) }
+        }
+        return nil
+    }
 }
 
 /// Reachability an account's last heartbeat/ping implies, as reported by the
@@ -1057,6 +1156,76 @@ public struct CredentialRunKey: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+public enum CredentialRunKeySortField: Sendable, CaseIterable {
+    case label
+    case created
+    case expires
+    case lastUsed
+    case uses
+}
+
+public enum CredentialRunKeySortDirection: Sendable {
+    case ascending
+    case descending
+}
+
+public extension Array where Element == CredentialRunKey {
+    /// Returns a deterministic presentation ordering for the credentials key table.
+    /// Missing optional dates stay at the end in either direction.
+    func sorted(
+        by field: CredentialRunKeySortField,
+        direction: CredentialRunKeySortDirection
+    ) -> [CredentialRunKey] {
+        sorted { lhs, rhs in
+            let ordered: Bool?
+            switch field {
+            case .label:
+                let left = lhs.label?.isEmpty == false ? lhs.label! : lhs.kind
+                let right = rhs.label?.isEmpty == false ? rhs.label! : rhs.kind
+                let comparison = left.localizedCaseInsensitiveCompare(right)
+                ordered = comparison == .orderedSame
+                    ? nil
+                    : (direction == .ascending
+                        ? comparison == .orderedAscending
+                        : comparison == .orderedDescending)
+            case .created:
+                ordered = Self.runKeyOrder(lhs.createdMs, rhs.createdMs, direction: direction)
+            case .expires:
+                ordered = Self.runKeyOptionalOrder(
+                    lhs.expiresMs, rhs.expiresMs, direction: direction)
+            case .lastUsed:
+                ordered = Self.runKeyOptionalOrder(
+                    lhs.lastUsedMs, rhs.lastUsedMs, direction: direction)
+            case .uses:
+                ordered = Self.runKeyOrder(lhs.useCount, rhs.useCount, direction: direction)
+            }
+            return ordered ?? (lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending)
+        }
+    }
+
+    private static func runKeyOrder<T: Comparable>(
+        _ lhs: T, _ rhs: T, direction: CredentialRunKeySortDirection
+    ) -> Bool? {
+        guard lhs != rhs else { return nil }
+        return direction == .ascending ? lhs < rhs : lhs > rhs
+    }
+
+    private static func runKeyOptionalOrder<T: Comparable>(
+        _ lhs: T?, _ rhs: T?, direction: CredentialRunKeySortDirection
+    ) -> Bool? {
+        switch (lhs, rhs) {
+        case let (left?, right?):
+            return runKeyOrder(left, right, direction: direction)
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        case (nil, nil):
+            return nil
+        }
+    }
+}
+
 /// Daemon tags allow arbitrary JSON values. Keeping them typed rather than
 /// assuming strings means an unusual tag cannot make the whole inventory fail
 /// to decode.
@@ -1153,6 +1322,24 @@ public struct ExoModel: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+public extension Array where Element == ExoModel {
+    func sortedForDisplay() -> [ExoModel] {
+        enumerated().sorted { lhs, rhs in
+            if (lhs.element.running == true) != (rhs.element.running == true) {
+                return lhs.element.running == true
+            }
+            if lhs.element.enabled != rhs.element.enabled {
+                return lhs.element.enabled
+            }
+            let nameOrder = lhs.element.name.caseInsensitiveCompare(rhs.element.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+}
+
 public enum ProviderInfo {
     public static func displayName(_ provider: String) -> String {
         switch provider {
@@ -1189,10 +1376,6 @@ public enum ProviderInfo {
 
     public static var supportedProviders: [String] {
         ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"]
-    }
-
-    public static func usesAPIKeySheet(_ provider: String) -> Bool {
-        provider == "openrouter"
     }
 }
 

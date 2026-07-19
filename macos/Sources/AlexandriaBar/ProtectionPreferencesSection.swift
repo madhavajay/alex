@@ -235,7 +235,7 @@ struct ProtectionPreferencesSection: View {
         actionResult = nil
         defer { isLoading = false }
         guard let config = store.config ?? DaemonDiscovery.load() else {
-            loadError = "No Alexandria daemon configuration was found."
+            loadError = "No Alex daemon configuration was found."
             return
         }
         do {

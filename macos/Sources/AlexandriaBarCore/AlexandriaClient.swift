@@ -60,6 +60,24 @@ private struct FixtureCaptureBody: Encodable {
     }
 }
 
+private struct NotificationCommandsBody: Encodable {
+    let channelId: String
+    let allowCommands: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case channelId = "channel_id"
+        case allowCommands = "allow_commands"
+    }
+}
+
+private struct SavedNotificationTestBody: Encodable {
+    let channelId: String
+
+    enum CodingKeys: String, CodingKey {
+        case channelId = "channel_id"
+    }
+}
+
 private struct MintRunKeyBody: Encodable {
     let kind = "run"
     let label: String?
@@ -70,6 +88,14 @@ private struct MintRunKeyBody: Encodable {
         case kind, label, tags
         case ttlSeconds = "ttl_seconds"
     }
+}
+
+private struct RunKeysRevokedResponse: Decodable {
+    let revoked: Int
+}
+
+private struct RunKeysRemovedResponse: Decodable {
+    let removed: Int
 }
 
 public enum TraceBodyKind: String, Sendable, CaseIterable {
@@ -234,6 +260,18 @@ public struct AlexandriaClient: Sendable {
     public func revokeRunKey(id: String) async throws {
         _ = try await request(
             "admin/run-keys/\(encodedPathComponent(id))", method: "DELETE")
+    }
+
+    @discardableResult
+    public func revokeAllRunKeys() async throws -> Int {
+        let data = try await request("admin/run-keys/revoke-all", method: "POST")
+        return try JSONDecoder().decode(RunKeysRevokedResponse.self, from: data).revoked
+    }
+
+    @discardableResult
+    public func clearRevokedRunKeys() async throws -> Int {
+        let data = try await request("admin/run-keys/revoked", method: "DELETE")
+        return try JSONDecoder().decode(RunKeysRemovedResponse.self, from: data).removed
     }
 
     public func accounts() async throws -> [Account] {
@@ -449,12 +487,17 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(ImportOutcomes.self, from: data).outcomes
     }
 
-    public func harnesses() async throws -> [Harness]? {
+    public func harnessSnapshot(refresh: Bool = false) async throws -> HarnessesResponse? {
         do {
-            return try await get("admin/harnesses", as: HarnessesResponse.self).harnesses
+            let query = refresh ? [URLQueryItem(name: "refresh", value: "1")] : []
+            return try await get("admin/harnesses", query: query, as: HarnessesResponse.self)
         } catch ClientError.http(404, _) {
             return nil
         }
+    }
+
+    public func harnesses(refresh: Bool = false) async throws -> [Harness]? {
+        try await harnessSnapshot(refresh: refresh)?.harnesses
     }
 
     public func connectHarness(_ name: String) async throws -> HarnessConfigWriteResponse {
@@ -596,6 +639,32 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(NotificationTestResponse.self, from: data)
     }
 
+    /// Tests a persisted channel using the token retained by the daemon.
+    public func testTelegramNotification(channelId: String) async throws -> NotificationTestResponse {
+        let data = try await request(
+            "admin/notifications/test", method: "POST",
+            body: body(SavedNotificationTestBody(channelId: channelId)))
+        return try JSONDecoder().decode(NotificationTestResponse.self, from: data)
+    }
+
+    @discardableResult
+    public func setChannelCommands(
+        channelId: String, allowCommands: Bool
+    ) async throws -> NotificationCommandsResponse {
+        let data = try await request(
+            "admin/notifications/commands", method: "POST",
+            body: body(NotificationCommandsBody(
+                channelId: channelId, allowCommands: allowCommands)))
+        return try JSONDecoder().decode(NotificationCommandsResponse.self, from: data)
+    }
+
+    public func notificationsLog(limit: Int = 50) async throws -> NotificationLogResponse {
+        try await get(
+            "admin/notifications/log",
+            query: [URLQueryItem(name: "limit", value: "\(limit)")],
+            as: NotificationLogResponse.self)
+    }
+
     public func removeNotification(id: String) async throws {
         _ = try await request(
             "admin/notifications/\(encodedPathComponent(id))", method: "DELETE")
@@ -671,6 +740,7 @@ public struct AlexandriaClient: Sendable {
                 URLQueryItem(name: "status", value: filters.status),
                 URLQueryItem(name: "session", value: filters.session),
                 URLQueryItem(name: "run_id", value: filters.run),
+                URLQueryItem(name: "key_fingerprint", value: filters.key),
                 URLQueryItem(name: "effort", value: filters.effort),
                 URLQueryItem(name: "error_class", value: filters.errorClass),
             ],

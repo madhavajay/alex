@@ -669,6 +669,12 @@ impl Store {
         Ok(conn.execute("UPDATE run_keys SET revoked = 1 WHERE revoked = 0", [])? as u64)
     }
 
+    /// Permanently removes revoked run-key audit rows, leaving active keys intact.
+    pub fn delete_revoked_run_keys(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM run_keys WHERE revoked = 1", [])? as u64)
+    }
+
     /// Deletes trace rows and heartbeats and removes every captured body file.
     /// `known_accounts` is intentionally not touched.
     pub fn clear_traces_and_bodies(&self) -> Result<()> {
@@ -2609,6 +2615,28 @@ mod tests {
                 None
             )
             .is_err());
+    }
+
+    #[test]
+    fn delete_revoked_run_keys_keeps_active_rows() {
+        let store = Store::open(tmpdir("delete-revoked-run-keys")).unwrap();
+        for (id, hash) in [
+            ("rk-active", "active1111bbbb2222cccc"),
+            ("rk-revoked-1", "revoked111bbbb2222cccc"),
+            ("rk-revoked-2", "revoked222bbbb2222cccc"),
+        ] {
+            store
+                .insert_run_key(id, hash, "run", None, None, None, 1_000, None)
+                .unwrap();
+        }
+        assert!(store.revoke_run_key("rk-revoked-1").unwrap());
+        assert!(store.revoke_run_key("rk-revoked-2").unwrap());
+
+        assert_eq!(store.delete_revoked_run_keys().unwrap(), 2);
+        let remaining = store.list_run_keys(true).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["id"], "rk-active");
+        assert_eq!(store.delete_revoked_run_keys().unwrap(), 0);
     }
 
     #[test]

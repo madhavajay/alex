@@ -94,7 +94,7 @@ connection export with JSON/host options.
 
 ## `connect`
 
-Detect or configure one installed harness to use Alexandria.
+Detect or configure one installed harness to use Alex.
 
 | Argument | Meaning |
 | --- | --- |
@@ -125,7 +125,7 @@ alex tool-capture pi on --json
 
 ## `disconnect`
 
-Remove Alexandria-managed harness configuration and revoke its keys. Optional
+Remove Alex-managed harness configuration and revoke its keys. Optional
 `--config-dir` targets a non-default native directory.
 
 ```bash
@@ -270,7 +270,7 @@ Launch connected Claude/Codex profiles or reverse-wrap catalog harnesses.
 | `status` | List embedded/user wrap harnesses; `--json`. | `alex wrap status --json` |
 | `env [HARNESS]` | Harness defaults to `amp`; optional `--mode`, `--wrap-url` (default `http://127.0.0.1:4101`), `--ca-cert`, `--json`. Writes settings and prints exports/plan. | `alex wrap env amp --mode base_url` |
 | `claude [ARGS...]` | Passes all remaining args to connected `claude`. | `alex wrap claude -p 'Reply PONG'` |
-| `codex [ARGS...]` | Passes all remaining args to `codex` with the Alexandria profile. | `alex wrap codex exec 'Reply PONG'` |
+| `codex [ARGS...]` | Passes all remaining args to `codex` with the Alex profile. | `alex wrap codex exec 'Reply PONG'` |
 | `amp [ARGS...]` | Reverse wrap plus Amp; optional remote trace flags, `--mode`, `--bind` (default ephemeral), `--upstream`, `--serve-only`, `-q/--quiet`. Use `--` before Amp flags. | `alex wrap amp -- -x 'Reply PONG'` |
 | `agent [ARGS...]` | Same controls for Cursor Agent; use `--` before agent flags. | `alex wrap agent -- --print --trust 'Reply PONG'` |
 | `run <HARNESS> [ARGS...]` | Generic catalog equivalent of Amp/Agent with the same wrap and remote-trace controls. | `alex wrap run amp --bind 127.0.0.1:4101 -- -x PONG` |
@@ -300,7 +300,7 @@ alex up codex --url https://alex.example.invalid --key '<redacted>' --no-launch
 
 ## `update`
 
-Check or install Alexandria releases.
+Check or install Alex releases.
 
 | Flag | Meaning |
 | --- | --- |

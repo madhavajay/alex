@@ -44,6 +44,8 @@ public final class SnapshotStore {
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
     public private(set) var harnessesSupported: Bool?
+    public private(set) var harnessesCheckedMs: Int64?
+    public private(set) var harnessesChecking = false
     /// The daemon does not currently list active login sessions. Retain IDs
     /// returned to this app so provider detail can resume/status/complete them.
     public private(set) var pendingLoginSessions: [String: LoginSession] = [:]
@@ -177,7 +179,7 @@ public final class SnapshotStore {
             bucketMinutes: accountAnalyticsBucketMinutes)
         async let darioR = Self.fetchDario(using: client)
         async let daemonUpdateR = try? client.daemonUpdateStatus()
-        async let harnessesR = client.harnesses()
+        async let harnessesR = client.harnessSnapshot()
         async let recentSessionsR = try? client.traceSessions(since: "24h", limit: 12)
         async let exoConfigR = try? client.exoConfig()
         async let exoStatusR = try? client.exoStatus()
@@ -231,15 +233,18 @@ public final class SnapshotStore {
                 .prefix(4))
         do {
             if let fetched = try await harnessesR {
-                harnesses = fetched
+                harnesses = fetched.harnesses
+                harnessesCheckedMs = fetched.checkedMs
                 harnessesSupported = true
             } else {
                 harnesses = []
+                harnessesCheckedMs = nil
                 harnessesSupported = false
             }
         } catch {
-            harnesses = []
-            harnessesSupported = nil
+            if harnesses.isEmpty {
+                harnessesSupported = nil
+            }
         }
         detectWindowResets(old: oldLimits, new: limits)
         scheduleBoundaryRefresh()
@@ -252,19 +257,49 @@ public final class SnapshotStore {
             guard !Task.isCancelled else { return }
             try? await Task.sleep(for: .milliseconds(10))
         }
+        harnessesChecking = true
+        defer { harnessesChecking = false }
         do {
-            if let fetched = try await client.harnesses() {
-                harnesses = fetched
+            if let fetched = try await client.harnessSnapshot(refresh: true) {
+                harnesses = fetched.harnesses
+                harnessesCheckedMs = fetched.checkedMs
                 harnessesSupported = true
             } else {
                 harnesses = []
+                harnessesCheckedMs = nil
                 harnessesSupported = false
             }
         } catch {
-            harnesses = []
-            harnessesSupported = nil
+            if harnesses.isEmpty {
+                harnessesSupported = nil
+            }
         }
         onRefresh?()
+    }
+
+    public var harnessesAreStale: Bool {
+        guard let harnessesCheckedMs else { return false }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        return nowMs - harnessesCheckedMs > 60_000
+    }
+
+    /// Re-probe stale harness metadata while retaining the last rows on screen.
+    public func refreshHarnessesIfStale() async {
+        guard harnessesAreStale, !harnessesChecking, let config else { return }
+        harnessesChecking = true
+        defer {
+            harnessesChecking = false
+            onRefresh?()
+        }
+        do {
+            if let fetched = try await AlexandriaClient(config: config).harnessSnapshot(refresh: true) {
+                harnesses = fetched.harnesses
+                harnessesCheckedMs = fetched.checkedMs
+                harnessesSupported = true
+            }
+        } catch {
+            // The cached rows are still useful; the next pane open or poll can retry.
+        }
     }
 
     /// Refreshes only the per-account chart data and leaves the rest of the
@@ -340,7 +375,7 @@ public final class SnapshotStore {
         if config == nil {
             out.append(StoreAlert(
                 id: "no-config", severity: .critical,
-                title: "Alexandria not configured",
+                title: "Alex not configured",
                 body: "No config found at ~/.alexandria/config.toml"))
             return out
         }
@@ -354,7 +389,7 @@ public final class SnapshotStore {
         if !daemonUp {
             out.append(StoreAlert(
                 id: "daemon-down", severity: .critical,
-                title: "Alexandria daemon is down",
+                title: "Alex daemon is down",
                 body: lastError ?? "Health check failed"))
             return out
         }

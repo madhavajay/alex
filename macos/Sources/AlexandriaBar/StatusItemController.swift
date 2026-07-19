@@ -195,7 +195,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         } else if store.lastRefresh == nil {
             addInfo("Alex UI — connecting…")
         } else {
-            addInfo("Alexandria daemon is not running")
+            addInfo("Alex daemon is not running")
             if let err = store.lastError {
                 addInfo(String(err.prefix(70)), indent: 1)
             }
@@ -675,7 +675,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             if harness.name == "codex" {
                 let useAlex = harness.defaultRoute == "alex"
                 let toggle = NSMenuItem(
-                    title: "Use Alexandria by Default",
+                    title: "Use Alex by Default",
                     action: #selector(runHandler(_:)), keyEquivalent: "")
                 toggle.target = self
                 toggle.state = useAlex ? .on : .off
@@ -711,7 +711,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self?.notify(
                     title: "Codex default updated",
                     body: route == "alex"
-                        ? "New Codex sessions use Alexandria."
+                        ? "New Codex sessions use Alex."
                         : "New Codex sessions use normal OpenAI authentication.")
             } catch {
                 self?.notify(title: "Could not update Codex default", body: error.localizedDescription)
@@ -749,7 +749,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let result = await DaemonController.startDaemon()
             await self?.store.refresh()
             self?.notify(
-                title: result.ok ? "Alexandria daemon started" : "Failed to start daemon",
+                title: result.ok ? "Alex daemon started" : "Failed to start daemon",
                 body: String(result.combined.suffix(200)))
         }
     }
@@ -795,7 +795,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let name = ProviderInfo.displayName(account.provider)
         let alert = NSAlert()
         alert.messageText = "Remove \(name) account (\(account.id))?"
-        alert.informativeText = "Alexandria will stop using and pinging it."
+        alert.informativeText = "Alex will stop using and pinging it."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
@@ -883,7 +883,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             daemonUpdateApplying = false
             daemonUpdateTarget = nil
             daemonUpdateMessage = "Daemon updated to \(target)"
-            notify(title: "Daemon updated", body: "Alexandria \(target)")
+            notify(title: "Daemon updated", body: "Alex \(target)")
         }
     }
 
@@ -896,11 +896,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
     }
 
-    private func openTraceBrowser(harness: String? = nil, selectSessionId: String? = nil) {
+    private func openTraceBrowser(
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+    ) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show(harness: harness, selectSessionId: selectSessionId)
+        traceBrowser?.show(harness: harness, query: query, selectSessionId: selectSessionId)
     }
 
     private func openDario() {
@@ -917,9 +919,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func openPreferences(section: PreferencesSection = .general) {
         if prefsController == nil {
-            prefsController = PreferencesWindowController(store: store, onOpenDario: { [weak self] in
-                self?.openDario()
-            })
+            prefsController = PreferencesWindowController(
+                store: store,
+                onOpenDario: { [weak self] in self?.openDario() },
+                onOpenTraceBrowser: { [weak self] query in
+                    self?.openTraceBrowser(query: query)
+                })
         }
         prefsController?.show(section: section)
     }
