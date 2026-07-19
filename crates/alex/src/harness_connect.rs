@@ -6880,9 +6880,8 @@ fi"#,
     }
 
     #[test]
-    fn preferred_claude_default_skips_retired_alphabetical_first_model() {
+    fn preferred_claude_default_selects_sonnet_over_live_haiku() {
         let models = vec![
-            "claude-alex/claude-3-5-haiku".to_string(),
             "claude-alex/claude-haiku-4-5".to_string(),
             "claude-alex/claude-opus-4-8".to_string(),
             "claude-alex/claude-sonnet-5".to_string(),

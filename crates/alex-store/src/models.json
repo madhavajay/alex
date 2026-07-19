@@ -140,13 +140,6 @@
     "output_per_m": 5.0
   },
   {
-    "model": "claude-3-5-haiku",
-    "input_per_m": 0.8,
-    "cached_input_per_m": 0.08,
-    "cache_creation_per_m": 1.0,
-    "output_per_m": 4.0
-  },
-  {
     "model": "gpt-5.1-codex",
     "input_per_m": 1.25,
     "cached_input_per_m": 0.125,
