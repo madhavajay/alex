@@ -1830,6 +1830,13 @@ private struct SessionListView: View {
         .width(min: 240)
         .customizationID("session")
         .disabledCustomizationBehavior(.visibility)
+        TableColumn("Model(s)", value: \.models) { (row: SessionRow) in
+            Text(row.models)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .customizationID("models")
         TableColumn("Last activity", value: \.lastTs) { (row: SessionRow) in
             Text(TraceFormat.relative(row.lastTsMs))
                 .font(.system(size: 10))
@@ -1876,13 +1883,6 @@ private struct SessionListView: View {
         .width(min: 40, ideal: 48)
         .customizationID("errors")
         .defaultVisibility(.hidden)
-        TableColumn("Model(s)", value: \.models) { (row: SessionRow) in
-            Text(row.models)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .customizationID("models")
         TableColumn("Harness", value: \.harness) { (row: SessionRow) in
             Text(row.harness)
                 .font(.system(size: 10))

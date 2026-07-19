@@ -388,6 +388,7 @@ struct AuthStep<Content: View>: View {
 struct AuthFlowView: View {
     @Bindable var model: AuthFlowModel
     let close: () -> Void
+    var embedded = false
     @State private var copiedLink = false
     @State private var copiedCode = false
     @State private var linkRevert: Task<Void, Never>?
@@ -413,20 +414,27 @@ struct AuthFlowView: View {
             .padding(.horizontal, 24)
             .padding(.top, 24)
             .padding(.bottom, 20)
-            Spacer(minLength: 0)
-            HStack {
-                Spacer()
-                Button(model.stage.isTerminal ? "Close" : "Cancel") {
-                    model.cancel()
-                    close()
+            if !embedded {
+                Spacer(minLength: 0)
+                HStack {
+                    Spacer()
+                    Button(model.stage.isTerminal ? "Close" : "Cancel") {
+                        model.cancel()
+                        close()
+                    }
+                    .buttonStyle(AuthFooterButtonStyle())
+                    .keyboardShortcut(.cancelAction)
                 }
-                .buttonStyle(AuthFooterButtonStyle())
-                .keyboardShortcut(.cancelAction)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
             }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 16)
         }
-        .frame(width: 480, height: 430, alignment: .top)
+        .frame(
+            minWidth: embedded ? 0 : 480,
+            maxWidth: embedded ? .infinity : 480,
+            minHeight: embedded ? 0 : 430,
+            maxHeight: embedded ? .infinity : 430,
+            alignment: .top)
         .background(AlexTheme.Colors.background)
     }
 
