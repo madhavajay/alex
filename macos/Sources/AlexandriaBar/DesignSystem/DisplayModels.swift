@@ -91,4 +91,5 @@ struct MessageDisplay: Identifiable, Equatable, Sendable {
     var toolCalls: [ToolCallDisplay] = []
     var subagent: SubagentDisplay?
     var error: String?
+    var event: String?
 }

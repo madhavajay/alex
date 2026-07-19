@@ -233,8 +233,9 @@ enum TranscriptChatMessages {
 
         let toolCalls = toolDisplays(for: turn)
         let content = assistantText(turn)
-        let hasError = turn.error?.isEmpty == false
-        if !content.isEmpty || !toolCalls.isEmpty || hasError {
+        let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
+        let hasError = !clientClosed && turn.error?.isEmpty == false
+        if !content.isEmpty || !toolCalls.isEmpty || hasError || clientClosed {
             let effort = TurnHeader.effort(
                 reasoningEffort: turn.reasoningEffort, thinkingBudget: turn.thinkingBudget)
             out.append(MessageDisplay(
@@ -248,7 +249,8 @@ enum TranscriptChatMessages {
                 timestamp: TraceFormat.time(turn.tsResponseMs ?? turn.tsRequestMs),
                 tokenText: ChatDisplayFormat.tokenLabel(turn.outputTokens),
                 toolCalls: toolCalls,
-                error: turn.error))
+                error: hasError ? turn.error : nil,
+                event: clientClosed ? "client closed" : nil))
         }
         return out
     }

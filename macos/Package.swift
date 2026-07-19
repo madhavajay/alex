@@ -23,7 +23,7 @@ packageTargets.append(
             "AlexandriaBarCore",
             .product(name: "Sparkle", package: "Sparkle"),
         ],
-        resources: [.copy("Resources/logos")],
+        resources: [.copy("Resources/logos"), .copy("Resources/onboarding")],
         linkerSettings: [
             .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         ]

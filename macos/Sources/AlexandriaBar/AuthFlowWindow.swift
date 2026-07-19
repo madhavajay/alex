@@ -24,6 +24,7 @@ final class AuthFlowModel {
     /// True while a "Use existing Kimi login" import is in flight.
     private(set) var importing = false
     var onAuthenticated: (@MainActor (_ provider: String) -> Void)?
+    var onFailed: (@MainActor (_ message: String) -> Void)?
     private var pollTask: Task<Void, Never>?
 
     /// Kimi backs a one-click "use the CLI's existing login" import path, since
@@ -52,7 +53,9 @@ final class AuthFlowModel {
         pasteInput = ""
         pollTask?.cancel()
         guard let config = store.config else {
-            stage = .failed("Daemon config not found — is alexandria installed?")
+            let message = "Daemon config not found — is Alex installed?"
+            stage = .failed(message)
+            onFailed?(message)
             return
         }
         let client = AlexandriaClient(config: config)
@@ -72,6 +75,7 @@ final class AuthFlowModel {
                     self?.stage = .pendingConflict
                 } else {
                     self?.stage = .failed(message)
+                    self?.onFailed?(message)
                 }
             }
         }
@@ -90,7 +94,9 @@ final class AuthFlowModel {
             Task { await store.refresh() }
             onAuthenticated?(provider)
         case "failed":
-            stage = .failed(session.error ?? "login failed")
+            let message = session.error ?? "login failed"
+            stage = .failed(message)
+            onFailed?(message)
             pollTask?.cancel()
         default:
             stage = .awaiting
@@ -125,7 +131,9 @@ final class AuthFlowModel {
                 let updated = try await client.authLoginComplete(id: session.loginId, input: input)
                 self?.sessionUpdated(updated)
             } catch {
-                self?.stage = .failed(error.localizedDescription)
+                let message = error.localizedDescription
+                self?.stage = .failed(message)
+                self?.onFailed?(message)
             }
         }
     }
@@ -154,9 +162,12 @@ final class AuthFlowModel {
                     let note = outcomes.first?.note
                         ?? "No existing Kimi login found. Run `kimi` and sign in, or use the device code above."
                     self?.stage = .failed(note)
+                    self?.onFailed?(note)
                 }
             } catch {
-                self?.stage = .failed(error.localizedDescription)
+                let message = error.localizedDescription
+                self?.stage = .failed(message)
+                self?.onFailed?(message)
             }
         }
     }
@@ -732,13 +743,19 @@ final class AuthWindowController {
     func show(
         provider: String, accountName: String? = "default", autoIdentity: Bool = false,
         force: Bool = false, store: SnapshotStore,
-        onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil
+        onAuthenticated: (@MainActor (_ provider: String) -> Void)? = nil,
+        onFailed: (@MainActor (_ message: String) -> Void)? = nil
     ) {
         let isAddingAccount = accountName == nil || autoIdentity
         let key = isAddingAccount
             ? "\(provider):add"
             : "\(provider):reauth:\(accountName ?? "default")"
         if let window = windows[key] {
+            // A caller may relaunch onboarding while this provider window is
+            // still open. Hand completion back to the current caller so the
+            // wizard cannot wait on a stale callback from its prior window.
+            models[key]?.onAuthenticated = onAuthenticated
+            models[key]?.onFailed = onFailed
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
@@ -746,6 +763,7 @@ final class AuthWindowController {
         let model = AuthFlowModel(
             provider: provider, accountName: accountName, autoIdentity: autoIdentity, store: store)
         model.onAuthenticated = onAuthenticated
+        model.onFailed = onFailed
         models[key] = model
         let view = AuthFlowView(model: model) { [weak self] in
             self?.closeWindow(key: key)

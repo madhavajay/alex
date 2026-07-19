@@ -87,7 +87,7 @@ jobs:
               --prerelease \
               --latest=false \
               --verify-tag \
-              --title "Alexandria $tag (beta)" \
+              --title "Alex $tag (beta)" \
               --notes "Beta build ${{ needs.meta.outputs.version }}. Pre-release test version — install via the beta update channel."
           fi
 

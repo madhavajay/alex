@@ -5092,6 +5092,13 @@ async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> Ver
         return cached;
     }
     let output = command_version_uncached(binary, args, timeout).await;
+    // Cache only successful probes. A timeout under machine load is transient,
+    // and memoizing it pinned "version check timed out" (the orange triangle)
+    // to a harness row until the binary itself changed — surviving refreshes
+    // and Update All.
+    if output.version.is_none() {
+        return output;
+    }
     if let Ok(mut cache) = VERSION_DETECTION_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -5458,6 +5465,24 @@ pub(crate) fn reasoning_enabled(id: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_timeout_is_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("version-timeout-uncached");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("slowver");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 0.3\necho 9.9.9\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let timed_out = command_version(&bin, &[], Duration::from_millis(30)).await;
+        assert_eq!(timed_out.warning.as_deref(), Some("version check timed out"));
+        // The failure must not be memoized: a retry with a workable timeout
+        // succeeds instead of replaying the cached timeout.
+        let retried = command_version(&bin, &[], Duration::from_secs(10)).await;
+        assert_eq!(retried.version.as_deref(), Some("9.9.9"));
+    }
 
     #[test]
     fn probe_skips_network_volumes_and_protected_folders() {

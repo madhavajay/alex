@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -270,6 +270,138 @@ const TRACE_COLS: &str =
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
      account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
      method, path, subscription_identity, via_dario, dario_generation";
+
+const BACKUP_TRACE_COLS: &[&str] = &[
+    "id", "ts_request_ms", "ts_response_ms", "session_id", "harness", "client_format",
+    "upstream_provider", "upstream_format", "requested_model", "routed_model", "method", "path",
+    "status", "streamed", "input_tokens", "cached_input_tokens", "cache_creation_tokens",
+    "output_tokens", "reasoning_tokens", "cost_usd", "billing_bucket", "req_body_path",
+    "upstream_req_body_path", "resp_body_path", "req_headers_json", "resp_headers_json", "error",
+    "error_kind", "error_code", "error_class", "substituted", "original_model", "served_model",
+    "substitution_reason", "attempts", "injected", "fixture_name", "original_account_id",
+    "served_account_id", "account_id", "run_id", "tags_json", "client_ip", "key_fingerprint",
+    "reasoning_effort", "thinking_budget", "subscription_identity", "via_dario", "dario_generation",
+];
+const BACKUP_TOOL_CALL_COLS: &[&str] = &[
+    "id", "harness", "session_id", "turn_id", "tool_call_id", "trace_id", "tool_name",
+    "ts_start_ms", "ts_end_ms", "is_error", "exit_status", "args_body_path", "result_body_path",
+];
+const BACKUP_HEARTBEAT_COLS: &[&str] = &[
+    "ts_ms", "provider", "account_id", "ok", "status", "latency_ms", "message",
+];
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceBackupRows {
+    pub traces: Vec<Value>,
+    pub tool_calls: Vec<Value>,
+    pub heartbeats: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TraceImportCounts {
+    pub traces_imported: u64,
+    pub traces_skipped: u64,
+    pub tool_calls_imported: u64,
+    pub tool_calls_skipped: u64,
+    pub heartbeats_imported: u64,
+    pub heartbeats_skipped: u64,
+}
+
+fn sqlite_row_json(row: &rusqlite::Row<'_>, columns: &[&str]) -> rusqlite::Result<Value> {
+    use rusqlite::types::ValueRef;
+
+    let mut object = serde_json::Map::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let value = match row.get_ref(index)? {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(value) => json!(value),
+            ValueRef::Real(value) => json!(value),
+            ValueRef::Text(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
+            ValueRef::Blob(_) => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    index,
+                    (*column).to_string(),
+                    rusqlite::types::Type::Blob,
+                ))
+            }
+        };
+        object.insert((*column).to_string(), value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn export_table_rows(conn: &Connection, table: &str, columns: &[&str], order: &str) -> Result<Vec<Value>> {
+    let sql = format!("SELECT {} FROM {table} ORDER BY {order}", columns.join(", "));
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| sqlite_row_json(row, columns))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn archive_body_path(data_dir: &Path, value: &mut Value) {
+    let Some(path) = value.as_str() else { return };
+    let body_root = data_dir.join("bodies");
+    if let Ok(relative) = Path::new(path).strip_prefix(&body_root) {
+        // Archive paths are always forward-slash so an export is portable
+        // across platforms (Windows would otherwise emit `bodies\…`).
+        let mut portable = String::from("bodies");
+        for component in relative.components() {
+            portable.push('/');
+            portable.push_str(&component.as_os_str().to_string_lossy());
+        }
+        *value = Value::String(portable);
+    }
+}
+
+fn restored_body_path(data_dir: &Path, value: &mut Value) {
+    let Some(path) = value.as_str() else { return };
+    let path = Path::new(path);
+    let mut components = path.components();
+    if components.next() != Some(Component::Normal("bodies".as_ref()))
+        || !components.all(|component| matches!(component, Component::Normal(_)))
+    {
+        return;
+    }
+    *value = Value::String(data_dir.join(path).to_string_lossy().into_owned());
+}
+
+fn checked_sql_values(row: &Value, table: &str, columns: &[&str]) -> Result<Vec<rusqlite::types::Value>> {
+    use rusqlite::types::Value as SqlValue;
+
+    let object = row
+        .as_object()
+        .with_context(|| format!("{table} backup row must be a JSON object"))?;
+    if object.len() != columns.len() || columns.iter().any(|column| !object.contains_key(*column)) {
+        anyhow::bail!("{table} backup row has an unexpected set of columns");
+    }
+    columns
+        .iter()
+        .map(|column| {
+            let value = &object[*column];
+            match value {
+                Value::Null => Ok(SqlValue::Null),
+                Value::Bool(value) => Ok(SqlValue::Integer(*value as i64)),
+                Value::Number(value) => {
+                    if let Some(value) = value.as_i64() {
+                        Ok(SqlValue::Integer(value))
+                    } else if let Some(value) = value.as_u64() {
+                        i64::try_from(value)
+                            .map(SqlValue::Integer)
+                            .with_context(|| format!("{table}.{column} is outside SQLite's integer range"))
+                    } else {
+                        value
+                            .as_f64()
+                            .map(SqlValue::Real)
+                            .with_context(|| format!("{table}.{column} is not a finite JSON number"))
+                    }
+                }
+                Value::String(value) => Ok(SqlValue::Text(value.clone())),
+                Value::Array(_) | Value::Object(_) => {
+                    anyhow::bail!("{table}.{column} must be a JSON scalar")
+                }
+            }
+        })
+        .collect()
+}
 
 fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let ts_request_ms = r.get::<_, i64>(1)?;
@@ -686,6 +818,148 @@ impl Store {
         }
         conn.execute_batch("DELETE FROM tool_calls; DELETE FROM traces; DELETE FROM heartbeats;")?;
         Ok(())
+    }
+
+    /// Export the three trace-history tables as lossless JSON values. Body
+    /// paths owned by this store are made portable relative to `data_dir`.
+    pub fn export_trace_backup_rows(&self) -> Result<TraceBackupRows> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let mut rows = TraceBackupRows {
+            traces: export_table_rows(
+                &transaction,
+                "traces",
+                BACKUP_TRACE_COLS,
+                "ts_request_ms, id",
+            )?,
+            tool_calls: export_table_rows(
+                &transaction,
+                "tool_calls",
+                BACKUP_TOOL_CALL_COLS,
+                "ts_start_ms, id",
+            )?,
+            heartbeats: export_table_rows(
+                &transaction,
+                "heartbeats",
+                BACKUP_HEARTBEAT_COLS,
+                "ts_ms, provider",
+            )?,
+        };
+        transaction.commit()?;
+        for row in &mut rows.traces {
+            for column in ["req_body_path", "upstream_req_body_path", "resp_body_path"] {
+                archive_body_path(&self.data_dir, &mut row[column]);
+            }
+        }
+        for row in &mut rows.tool_calls {
+            for column in ["args_body_path", "result_body_path"] {
+                archive_body_path(&self.data_dir, &mut row[column]);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Restore trace-history rows without modifying rows already present.
+    /// Trace and tool-call uniqueness is enforced by SQLite; heartbeats use
+    /// equality across their complete row because that table has no key.
+    pub fn import_trace_backup_rows(&self, rows: &TraceBackupRows) -> Result<TraceImportCounts> {
+        let mut rows = rows.clone();
+        for row in &mut rows.traces {
+            for column in ["req_body_path", "upstream_req_body_path", "resp_body_path"] {
+                restored_body_path(&self.data_dir, &mut row[column]);
+            }
+        }
+        for row in &mut rows.tool_calls {
+            for column in ["args_body_path", "result_body_path"] {
+                restored_body_path(&self.data_dir, &mut row[column]);
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let mut counts = TraceImportCounts::default();
+
+        let insert_rows = |table: &str,
+                           columns: &[&str],
+                           source: &[Value],
+                           imported: &mut u64,
+                           skipped: &mut u64|
+         -> Result<()> {
+            let placeholders = (1..=columns.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                columns.join(", ")
+            );
+            let mut statement = transaction.prepare(&sql)?;
+            for row in source {
+                let values = checked_sql_values(row, table, columns)?;
+                let changed = statement.execute(rusqlite::params_from_iter(values.iter()))?;
+                if changed == 0 {
+                    *skipped += 1;
+                } else {
+                    *imported += 1;
+                }
+            }
+            Ok(())
+        };
+
+        insert_rows(
+            "traces",
+            BACKUP_TRACE_COLS,
+            &rows.traces,
+            &mut counts.traces_imported,
+            &mut counts.traces_skipped,
+        )?;
+        insert_rows(
+            "tool_calls",
+            BACKUP_TOOL_CALL_COLS,
+            &rows.tool_calls,
+            &mut counts.tool_calls_imported,
+            &mut counts.tool_calls_skipped,
+        )?;
+
+        let heartbeat_match = format!(
+            "SELECT 1 FROM heartbeats WHERE {} LIMIT 1",
+            BACKUP_HEARTBEAT_COLS
+                .iter()
+                .enumerate()
+                .map(|(index, column)| format!("{column} IS ?{}", index + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        );
+        let heartbeat_insert = format!(
+            "INSERT INTO heartbeats ({}) VALUES ({})",
+            BACKUP_HEARTBEAT_COLS.join(", "),
+            (1..=BACKUP_HEARTBEAT_COLS.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for row in &rows.heartbeats {
+            let values = checked_sql_values(row, "heartbeats", BACKUP_HEARTBEAT_COLS)?;
+            let exists = transaction
+                .query_row(
+                    &heartbeat_match,
+                    rusqlite::params_from_iter(values.iter()),
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                counts.heartbeats_skipped += 1;
+            } else {
+                transaction.execute(
+                    &heartbeat_insert,
+                    rusqlite::params_from_iter(values.iter()),
+                )?;
+                counts.heartbeats_imported += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(counts)
     }
 
     /// Clears learned price data and immediately re-seeds the bundled catalog.
@@ -2334,6 +2608,134 @@ mod tests {
         store.clear_traces_and_bodies().unwrap();
         assert!(store.session_tool_calls("session").unwrap().is_empty());
         assert_eq!(store.reset_counts().unwrap().body_files, 0);
+    }
+
+    #[test]
+    fn trace_backup_rows_round_trip_and_are_idempotent() {
+        let dir = tmpdir("trace-backup-round-trip");
+        let store = Store::open(dir.clone()).unwrap();
+        let request_path = store
+            .write_body("backup-trace", "request.json", br#"{"model":"test"}"#)
+            .unwrap();
+        let tool_path = store
+            .write_body("backup-tool", "tool-result.json", b"tool output")
+            .unwrap();
+        let mut row = trace("backup-trace", 1_000, Some("backup-run"));
+        row.req_body_path = Some(request_path);
+        store.insert_trace(&row).unwrap();
+        store
+            .upsert_tool_call(&ToolCallRecord {
+                id: "backup-tool".into(),
+                harness: "pi".into(),
+                session_id: "backup-session".into(),
+                turn_id: Some("turn-1".into()),
+                tool_call_id: "call-1".into(),
+                trace_id: Some("backup-trace".into()),
+                tool_name: "bash".into(),
+                ts_start_ms: 1_100,
+                ts_end_ms: Some(1_200),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: None,
+                result_body_path: Some(tool_path),
+            })
+            .unwrap();
+        store
+            .insert_heartbeat(900, "anthropic", Some("account"), true, Some(200), 12, "ok")
+            .unwrap();
+
+        let backup = store.export_trace_backup_rows().unwrap();
+        assert_eq!(backup.traces.len(), 1);
+        assert_eq!(backup.tool_calls.len(), 1);
+        assert_eq!(backup.heartbeats.len(), 1);
+        assert!(backup.traces[0]["req_body_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("bodies/"));
+        assert!(backup.tool_calls[0]["result_body_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("bodies/"));
+
+        store.clear_traces_and_bodies().unwrap();
+        let imported = store.import_trace_backup_rows(&backup).unwrap();
+        assert_eq!(imported.traces_imported, 1);
+        assert_eq!(imported.tool_calls_imported, 1);
+        assert_eq!(imported.heartbeats_imported, 1);
+        assert_eq!(store.reset_counts().unwrap().traces, 1);
+        assert_eq!(store.reset_counts().unwrap().heartbeats, 1);
+        assert!(store.get_trace("backup-trace").unwrap().unwrap()["req_body_path"]
+            .as_str()
+            .unwrap()
+            .starts_with(dir.to_string_lossy().as_ref()));
+
+        let repeated = store.import_trace_backup_rows(&backup).unwrap();
+        assert_eq!(repeated.traces_skipped, 1);
+        assert_eq!(repeated.tool_calls_skipped, 1);
+        assert_eq!(repeated.heartbeats_skipped, 1);
+    }
+
+    #[test]
+    fn trace_backup_import_skips_existing_rows_and_keeps_newer_history() {
+        let source = Store::open(tmpdir("trace-backup-source")).unwrap();
+        source.insert_trace(&trace("existing", 1_000, None)).unwrap();
+        source.insert_trace(&trace("from-backup", 2_000, None)).unwrap();
+        source
+            .upsert_tool_call(&ToolCallRecord {
+                id: "existing-tool".into(),
+                harness: "pi".into(),
+                session_id: "session".into(),
+                turn_id: None,
+                tool_call_id: "call".into(),
+                trace_id: Some("existing".into()),
+                tool_name: "old-name".into(),
+                ts_start_ms: 1_100,
+                ts_end_ms: None,
+                is_error: None,
+                exit_status: None,
+                args_body_path: None,
+                result_body_path: None,
+            })
+            .unwrap();
+        let backup = source.export_trace_backup_rows().unwrap();
+
+        let destination = Store::open(tmpdir("trace-backup-destination")).unwrap();
+        let mut existing = trace("existing", 9_000, None);
+        existing.routed_model = Some("newer-model".into());
+        destination.insert_trace(&existing).unwrap();
+        destination.insert_trace(&trace("newer", 10_000, None)).unwrap();
+        destination
+            .upsert_tool_call(&ToolCallRecord {
+                id: "existing-tool".into(),
+                harness: "pi".into(),
+                session_id: "session".into(),
+                turn_id: None,
+                tool_call_id: "call".into(),
+                trace_id: Some("existing".into()),
+                tool_name: "new-name".into(),
+                ts_start_ms: 9_100,
+                ts_end_ms: None,
+                is_error: None,
+                exit_status: None,
+                args_body_path: None,
+                result_body_path: None,
+            })
+            .unwrap();
+
+        let imported = destination.import_trace_backup_rows(&backup).unwrap();
+        assert_eq!(imported.traces_imported, 1);
+        assert_eq!(imported.traces_skipped, 1);
+        assert_eq!(imported.tool_calls_imported, 0);
+        assert_eq!(imported.tool_calls_skipped, 1);
+        assert_eq!(destination.reset_counts().unwrap().traces, 3);
+        assert_eq!(
+            destination.get_trace("existing").unwrap().unwrap()["routed_model"],
+            "newer-model"
+        );
+        assert_eq!(
+            destination.session_tool_calls("session").unwrap()[0]["tool_name"],
+            "new-name"
+        );
     }
 
     #[test]

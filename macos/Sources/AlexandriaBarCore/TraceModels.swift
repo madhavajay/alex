@@ -392,6 +392,39 @@ public enum TraceErrorDisplay {
     }
 }
 
+/// Shared trace outcome classification. A harness closing its request is a
+/// lifecycle event, even when the transport status is in the 4xx range and
+/// the daemon includes explanatory text in the error fields.
+public enum TraceClassification {
+    public static let clientDisconnectKind = "client_disconnect"
+
+    public static func isClientDisconnect(errorKind: String?) -> Bool {
+        errorKind?.trimmingCharacters(in: .whitespacesAndNewlines)
+            == clientDisconnectKind
+    }
+
+    public static func isError(
+        status: Int?, errorKind: String?, error: String?
+    ) -> Bool {
+        guard !isClientDisconnect(errorKind: errorKind) else { return false }
+        return (status ?? 0) >= 400
+            || errorKind?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    public static func clientDisconnectCount(
+        errorClassCounts: [String: Int64]?
+    ) -> Int64 {
+        max(0, errorClassCounts?[clientDisconnectKind] ?? 0)
+    }
+
+    public static func realErrorCount(
+        total: Int64?, errorClassCounts: [String: Int64]?
+    ) -> Int64 {
+        max(0, (total ?? 0) - clientDisconnectCount(errorClassCounts: errorClassCounts))
+    }
+}
+
 public struct DarioCaptureExtras: Codable, Sendable {
     public let requestPath: String?
     public let responsePath: String?
@@ -1155,6 +1188,7 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public let tokensOut: Int64
     public let cost: Double
     public let errors: Int
+    public let clientDisconnects: Int
     public let runId: String
     public let durationMs: Int64
     public let duration: String
@@ -1193,7 +1227,10 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         tokensIn = session.totalInputTokens ?? 0
         tokensOut = session.totalOutputTokens ?? 0
         cost = session.totalCostUsd ?? 0
-        errors = Int(session.errors ?? 0)
+        errors = Int(TraceClassification.realErrorCount(
+            total: session.errors, errorClassCounts: session.errorClassCounts))
+        clientDisconnects = Int(TraceClassification.clientDisconnectCount(
+            errorClassCounts: session.errorClassCounts))
         runId = session.runId ?? ""
         durationMs = session.durationMs ?? max(0, session.lastTsMs - session.firstTsMs)
         duration = SessionDuration.format(ms: durationMs)
@@ -2439,6 +2476,12 @@ public enum TranscriptRender {
             .paragraphStyle: rightCardPara,
             .transcriptBubbleKind: TranscriptBubbleKind.error.rawValue,
         ]
+        let event: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.12),
+            .paragraphStyle: rightCardPara,
+        ]
         var toolResultKey = toolResult
         toolResultKey[.foregroundColor] = NSColor.secondaryLabelColor
         var toolKey = tool
@@ -2521,7 +2564,8 @@ public enum TranscriptRender {
                 costUsd: turn.costUsd,
                 costUnavailable: turn.provider?.caseInsensitiveCompare("cursor") == .orderedSame
                     && turn.costUsd == nil)
-            let isError = (turn.status ?? 0) >= 400
+            let isError = TraceClassification.isError(
+                status: turn.status, errorKind: turn.errorKind, error: turn.error)
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) ·\n", attributes: sepAttrs))
             if let text = turn.user, !text.isEmpty {
@@ -2600,7 +2644,9 @@ public enum TranscriptRender {
                 }
             }
             for lifecycle in toolLifecycles.dropFirst(nextTool) { appendTool(lifecycle) }
-            if let text = turn.error, !text.isEmpty {
+            if TraceClassification.isClientDisconnect(errorKind: turn.errorKind) {
+                out.append(NSAttributedString(string: " client closed \n", attributes: event))
+            } else if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }
             out.append(NSAttributedString(string: "\n", attributes: separator))

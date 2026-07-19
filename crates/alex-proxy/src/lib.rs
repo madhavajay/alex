@@ -1750,8 +1750,11 @@ struct NotificationChannelRequest {
     token: Option<String>,
     #[serde(default)]
     chat_id: Option<String>,
+    /// None (field absent) means "preserve the existing channel's setting, or
+    /// enable for a brand-new channel" — a form that never sends this field
+    /// must not silently switch commands off on every save.
     #[serde(default)]
-    allow_commands: bool,
+    allow_commands: Option<bool>,
     #[serde(default)]
     min_level: notify::NotificationLevel,
     #[serde(default)]
@@ -1814,7 +1817,7 @@ fn notification_channel_from_request(
             .chat_id
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().to_owned()),
-        allow_commands: request.allow_commands,
+        allow_commands: request.allow_commands.unwrap_or(true),
         min_level: request.min_level,
         categories: request.categories,
     })
@@ -1908,6 +1911,7 @@ async fn admin_notifications_save(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<NotificationChannelRequest>,
 ) -> Response {
+    let requested_commands = request.allow_commands;
     let mut channel = match notification_channel_from_request(request, true) {
         Ok(channel) => channel,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
@@ -1955,6 +1959,12 @@ async fn admin_notifications_save(
         .iter()
         .position(|existing| existing.id.as_deref() == Some(id.as_str()))
     {
+        // A save that does not mention allow_commands keeps the channel's
+        // current setting — the settings form never sends the field, and it
+        // used to switch commands off on every save.
+        if requested_commands.is_none() {
+            channel.allow_commands = settings.channels[index].allow_commands;
+        }
         settings.channels[index] = channel;
     } else {
         settings.channels.push(channel);
@@ -14702,10 +14712,10 @@ mod tests {
     async fn provider_routing_endpoint_updates_a_non_codex_provider() {
         let state = test_state("anthropic-routing");
         let mut personal = anthropic_account();
-        personal.id = "anthropic:personal".into();
+        personal.id = "anthropic-personal".into();
         personal.name = "personal".into();
         let mut work = anthropic_account();
-        work.id = "anthropic:work".into();
+        work.id = "anthropic-work".into();
         work.name = "work".into();
         state.vault.upsert(personal).await.unwrap();
         state.vault.upsert(work).await.unwrap();
@@ -14718,8 +14728,8 @@ mod tests {
                     "strategy": "round_robin",
                     "reserve_pct": 7,
                     "accounts": [
-                        {"account_id": "anthropic:work", "eligible": true, "priority": 0, "reserve_pct": 3},
-                        {"account_id": "anthropic:personal", "eligible": true, "priority": 1}
+                        {"account_id": "anthropic-work", "eligible": true, "priority": 0, "reserve_pct": 3},
+                        {"account_id": "anthropic-personal", "eligible": true, "priority": 1}
                     ]
                 })),
             )
@@ -16868,7 +16878,7 @@ mod tests {
                     url: Some(format!("{url}?token=very-secret-webhook-token")),
                     token: None,
                     chat_id: None,
-                    allow_commands: false,
+                    allow_commands: Some(false),
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),
@@ -16940,6 +16950,63 @@ mod tests {
             .channels
             .is_empty());
         sink.abort();
+    }
+
+    #[tokio::test]
+    async fn save_without_allow_commands_preserves_existing_and_defaults_new_channels_on() {
+        let state = test_state("notification-save-preserves-commands");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("keep".into()),
+                    url: "http://127.0.0.1:1/send".into(),
+                    allow_commands: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        // Re-saving the channel without mentioning allow_commands (the settings
+        // form never sends it) must not switch commands off.
+        let request: NotificationChannelRequest = serde_json::from_value(json!({
+            "id": "keep",
+            "url": "http://127.0.0.1:1/send",
+        }))
+        .unwrap();
+        let (status, body) =
+            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"]["allow_commands"], true);
+
+        // A brand-new channel starts with commands enabled.
+        let request: NotificationChannelRequest = serde_json::from_value(json!({
+            "id": "fresh",
+            "url": "http://127.0.0.1:1/send",
+        }))
+        .unwrap();
+        let (status, body) =
+            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"]["allow_commands"], true);
+
+        // An explicit false still lands.
+        let request: NotificationChannelRequest = serde_json::from_value(json!({
+            "id": "keep",
+            "url": "http://127.0.0.1:1/send",
+            "allow_commands": false,
+        }))
+        .unwrap();
+        let (status, body) =
+            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"]["allow_commands"], false);
     }
 
     #[tokio::test]
@@ -17387,7 +17454,7 @@ mod tests {
                     url: None,
                     token: Some("123:secret".into()),
                     chat_id: Some("42".into()),
-                    allow_commands: false,
+                    allow_commands: Some(false),
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),
@@ -17445,7 +17512,7 @@ mod tests {
                     url: None,
                     token: Some("bad-token".into()),
                     chat_id: Some("42".into()),
-                    allow_commands: false,
+                    allow_commands: Some(false),
                     min_level: notify::NotificationLevel::Warn,
                     categories: vec!["reauth".into()],
                 }),

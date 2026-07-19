@@ -585,15 +585,18 @@ final class TraceBrowserModel {
                     totals[errorClass, default: 0] += count
                 }
             }
-        guard !counts.isEmpty else {
+        let realCounts = counts.filter {
+            $0.key != TraceClassification.clientDisconnectKind
+        }
+        guard !realCounts.isEmpty else {
             errorClassSummaryLine = nil
             return
         }
-        let real = counts.filter { $0.key != "client_disconnect" }.values.reduce(0, +)
-        let detail = counts.sorted { $0.key < $1.key }
+        let real = realCounts.values.reduce(0, +)
+        let detail = realCounts.sorted { $0.key < $1.key }
             .map { "\($0.key) \($0.value)" }
             .joined(separator: " · ")
-        errorClassSummaryLine = "\(real) errored (excluding client disconnect) · \(detail)"
+        errorClassSummaryLine = "\(real) errored · \(detail)"
     }
 
     var selectedSession: TraceSession? {
@@ -1063,7 +1066,9 @@ final class TraceBrowserModel {
     }
 
     func promptSaveFixture(from session: TraceSession) {
-        guard (session.errors ?? 0) > 0 else { return }
+        guard TraceClassification.realErrorCount(
+            total: session.errors, errorClassCounts: session.errorClassCounts) > 0
+        else { return }
         let field = NSTextField(string: "")
         field.placeholderString = "fixture name"
         field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
@@ -1089,7 +1094,8 @@ final class TraceBrowserModel {
             do {
                 let transcript = try await client.traceTranscript(sessionId: session.sessionId)
                 guard let errorTrace = transcript.turns.reversed().first(where: {
-                    $0.error != nil || $0.errorKind != nil || ($0.status ?? 0) >= 400
+                    TraceClassification.isError(
+                        status: $0.status, errorKind: $0.errorKind, error: $0.error)
                 }) else {
                     self.showSimulationNotice("Save failed: no error trace found")
                     return
@@ -1165,7 +1171,9 @@ final class TraceBrowserModel {
             if let assistant = turn.assistant, !assistant.isEmpty {
                 out += "\n**Assistant:**\n\n\(assistant)\n"
             }
-            if let error = turn.error, !error.isEmpty {
+            if TraceClassification.isClientDisconnect(errorKind: turn.errorKind) {
+                out += "\n**Event:** client closed\n"
+            } else if let error = turn.error, !error.isEmpty {
                 out += "\n**Error:** \(error)\n"
             }
         }
@@ -1981,7 +1989,9 @@ private struct SessionListView: View {
         Button("Clear pending injections") { model.clearFixtureInjections(for: session) }
             .disabled(!hasSessionId)
             .help(hasSessionId ? "Remove queued error fixtures" : "no session id")
-        if (session.errors ?? 0) > 0 {
+        if TraceClassification.realErrorCount(
+            total: session.errors, errorClassCounts: session.errorClassCounts) > 0
+        {
             Button("Save as fixture…") { model.promptSaveFixture(from: session) }
         }
         Divider()
@@ -2119,6 +2129,15 @@ private struct SessionCellView: View {
                     .padding(.vertical, 1)
                     .background(Capsule().fill(.red))
                     .help("\(row.errors) failed request\(row.errors == 1 ? "" : "s")")
+            }
+            if row.clientDisconnects > 0 {
+                Text("client closed")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.quaternary.opacity(0.6)))
+                    .help("Harness closed \(row.clientDisconnects) request\(row.clientDisconnects == 1 ? "" : "s")")
             }
             if pinned {
                 Image(systemName: "pin.fill")

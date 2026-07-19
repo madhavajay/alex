@@ -73,11 +73,14 @@ public enum TranscriptFilter {
             }
             if !userText.isEmpty { total += 1 }
             let toolsPresent = hasTools(turn)
+            let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
             let errorPresent = turn.error?.isEmpty == false
             let assistant = assistantText(turn)
-            guard !assistant.isEmpty || toolsPresent || errorPresent else { continue }
+            guard !assistant.isEmpty || toolsPresent || errorPresent || clientClosed else { continue }
             total += 1
-            let searchText = trimmed.isEmpty ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "")
+            let eventText = clientClosed ? "\nclient closed" : ""
+            let searchText = trimmed.isEmpty
+                ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "") + eventText
             if matches(
                 role: .assistant, searchText: searchText, hasTools: toolsPresent,
                 filterTab: filterTab, query: trimmed)

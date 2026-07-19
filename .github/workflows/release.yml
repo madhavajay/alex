@@ -125,14 +125,14 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           tag="v${version}"
           asset_dir="dist/release-assets"
-          notes="Release assets for Alexandria ${version}."
+          notes="Release assets for Alex ${version}."
 
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$asset_dir"/* --clobber
           else
             if ! gh release create "$tag" "$asset_dir"/* \
               --target "$(git rev-parse HEAD)" \
-              --title "Alexandria ${tag}" \
+              --title "Alex ${tag}" \
               --notes "$notes"; then
               gh release upload "$tag" "$asset_dir"/* --clobber
             fi

@@ -355,7 +355,7 @@ struct TraceInspectorView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(AlexTheme.Colors.foreground)
                     if let status = detail?.trace.status {
-                        httpStatusChip(status)
+                        httpStatusChip(status, errorKind: detail?.trace.errorKind)
                     }
                     if isLoading, detail != nil {
                         ProgressView()
@@ -416,10 +416,13 @@ struct TraceInspectorView: View {
 
     /// HTTP status chip: mono 9.5, 2×6 padding, radius 4, green/red tint pair
     /// (mock TB App.tsx:773-780).
-    private func httpStatusChip(_ status: Int) -> some View {
+    private func httpStatusChip(_ status: Int, errorKind: String?) -> some View {
+        let clientClosed = TraceClassification.isClientDisconnect(errorKind: errorKind)
         let ok = (200..<300).contains(status)
-        let tint = ok ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
-        return Text("\(status)")
+        let tint = clientClosed
+            ? AlexTheme.Colors.textSecondary
+            : (ok ? AlexTheme.Colors.success : AlexTheme.Colors.destructive)
+        return Text(clientClosed ? "client closed" : "\(status)")
             .font(AlexTheme.Fonts.mono(9.5))
             .foregroundStyle(tint)
             .padding(.horizontal, 6)
@@ -567,6 +570,7 @@ struct TraceInspectorView: View {
 
     @ViewBuilder
     private func overview(_ trace: TraceDetail) -> some View {
+        let clientClosed = TraceClassification.isClientDisconnect(errorKind: trace.errorKind)
         section(
             "Overview",
             copyText: TurnExport.overviewLines(trace).joined(separator: "\n")
@@ -574,7 +578,9 @@ struct TraceInspectorView: View {
             if let status = trace.status {
                 InfoRow(
                     label: "status", value: "\(status)",
-                    color: status >= 400 ? .red : .green)
+                    color: clientClosed
+                        ? AlexTheme.Colors.textSecondary
+                        : (status >= 400 ? .red : .green))
             }
             if let requestMs = trace.tsRequestMs {
                 InfoRow(label: "time", value: TraceFormat.time(requestMs))
@@ -601,7 +607,11 @@ struct TraceInspectorView: View {
             if let cost = trace.costUsd, cost > 0 {
                 InfoRow(label: "cost", value: TraceNumberFormat.cost(cost))
             }
-            if let error = TraceErrorDisplay.line(
+            if clientClosed {
+                InfoRow(
+                    label: "event", value: "client closed",
+                    color: AlexTheme.Colors.textSecondary)
+            } else if let error = TraceErrorDisplay.line(
                 kind: trace.errorKind, code: trace.errorCode, message: trace.error)
             {
                 let label = trace.errorClass.map { "error [\($0)]" } ?? "error"

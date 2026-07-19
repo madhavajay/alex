@@ -42,6 +42,7 @@ struct PreferencesView: View {
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
     let onOpenDario: () -> Void
     let onOpenTraceBrowser: (String) -> Void
+    let onRunOnboarding: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -112,7 +113,7 @@ struct PreferencesView: View {
             Group {
                 switch state.section {
                 case .general:
-                    GeneralPreferencesPane(store: store)
+                    GeneralPreferencesPane(store: store, onRunOnboarding: onRunOnboarding)
                 case .providers:
                     ProvidersPreferencesSection(
                         store: store,
@@ -205,15 +206,18 @@ final class PreferencesWindowController {
     private let authWindows = AuthWindowController()
     private let onOpenDario: () -> Void
     private let onOpenTraceBrowser: (String) -> Void
+    private let onRunOnboarding: () -> Void
 
     init(
         store: SnapshotStore,
         onOpenDario: @escaping () -> Void = {},
-        onOpenTraceBrowser: @escaping (String) -> Void = { _ in }
+        onOpenTraceBrowser: @escaping (String) -> Void = { _ in },
+        onRunOnboarding: @escaping () -> Void = {}
     ) {
         self.store = store
         self.onOpenDario = onOpenDario
         self.onOpenTraceBrowser = onOpenTraceBrowser
+        self.onRunOnboarding = onRunOnboarding
     }
 
     func show(section: PreferencesSection = .general) {
@@ -230,7 +234,8 @@ final class PreferencesWindowController {
                         store: self.store)
                 },
                 onOpenDario: onOpenDario,
-                onOpenTraceBrowser: onOpenTraceBrowser))
+                onOpenTraceBrowser: onOpenTraceBrowser,
+                onRunOnboarding: onRunOnboarding))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock
