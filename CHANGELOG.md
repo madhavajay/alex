@@ -7,6 +7,77 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-07-19
+
+First stable release of the 0.1.28 line — everything from the 0.1.28 betas plus
+the fixes below.
+
+### Fixed
+- **Kimi uninstall/reinstall no longer bricks the harness.** The app's
+  disconnect API had no kimi case and fell through to the Pi handler: it revoked
+  the run keys but edited the wrong file, leaving Kimi wired to a dead key with
+  no way to reconnect ("401 run key expired or revoked"). Disconnect now edits
+  `~/.kimi-code/config.toml` properly, reconnect adopts an orphaned Alex
+  provider (identified by its `alxk-` key) instead of refusing, and cleanup
+  works even when the managed-state marker file is lost. A user-authored
+  provider that shares the name is still left alone.
+- **Harness binaries are found even when they're not on the daemon's PATH.**
+  Detection now also probes `<config dir>/bin/<binary>` (kimi installs itself at
+  `~/.kimi-code/bin/kimi`, visible only to interactive shells), so
+  connect no longer fails after a disconnect already revoked the old key.
+- **Non-streaming failures are no longer masked as successes.** Buffered/
+  destreamed responses (OpenAI Responses non-stream, chat bridge, Gemini
+  generateContent) that carried an upstream `response.failed` error were
+  synthesized into HTTP 200 responses with no usage recorded — hiding provider
+  errors and undercounting cost. They now surface as classified 502s, and
+  successful buffered responses record usage before the trace is finalized.
+- **Provider health goes green after a successful re-auth.** Completing a
+  Telegram re-auth now stamps the account's probe health (and Dario-routed
+  traffic attributes health to the bonded account), so the provider no longer
+  sits on a purple "unknown" dot after reporting success. The Providers pane
+  also keeps its content visible while refreshing instead of blanking.
+- **Exo model list is usable.** Model toggle rows showed bare switches with no
+  label text; names/details render again, and running/enabled models sort to
+  the top of the catalog.
+- **Notifications pane polish.** "Send test message" is always pressable (with
+  a clear error when there's nothing to send with); the Bot token row no longer
+  wraps the Replace button or squeezes the connected-bot caption.
+- **No more repeated "Alex wants to access network volumes" prompts.** Both the
+  app's node runtime probe and the daemon's harness binary detection skip
+  network volumes and TCC-protected folders (Desktop/Documents/Downloads)
+  instead of stat-ing every PATH entry.
+
+### Added
+- **Detailed Telegram `/status`.** Subscriptions & limit windows (plan,
+  utilization %, reset time) and per-provider ping health (✓/✗, age, error)
+  alongside the existing daemon/account sections, truncation-safe for
+  Telegram's message limit.
+- **Run-key management.** Sortable columns in the Credentials key table,
+  **Revoke all** and **Clear revoked** (new admin endpoints), and a per-key
+  **Traces** button that opens the Trace Browser pre-filtered by that key's
+  fingerprint (new `key:` omni-query token, server-side `key_fingerprint`
+  filter).
+- **Telegram channel controls.** Allow-commands toggle per channel, a recent
+  messages in/out activity panel, and Test works for saved channels using the
+  daemon-stored token.
+- **Kimi harness smoke runner + H7 test cell.** `./test.sh harness` can now run
+  the kimi CLI in Docker against an Anthropic-subscription Claude model via
+  Dario, driving a real tool call.
+- **Instant Harnesses page.** `/admin/harnesses` serves a warm cache with
+  background refresh (version probes memoized by binary mtime), so the pane
+  renders immediately instead of blocking ~5s on version subprocesses.
+
+### Changed
+- **OpenRouter settings moved into Providers → OpenRouter** (API key +
+  curated model exposure in one place); the standalone sidebar entry is gone.
+- **README**: per-harness tracing table (traces/subagents), providers &
+  subscriptions table with coming-soon list, provider docs say "Alex".
+- **CI**: the pre-release Windows job no longer fails the workflow (tracked
+  separately until Windows ships).
+- **User-facing product name is Alex everywhere** (217 strings across app,
+  CLI, daemon messages, and docs); functional identifiers, paths, and config
+  keys are unchanged.
+
 ## [0.1.28-beta.10] - 2026-07-19
 
 ### Fixed
