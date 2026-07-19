@@ -121,7 +121,6 @@ const PREFIXES: &[(&str, Provider)] = &[
 const PASSTHROUGH: &[&str] = &["claude-alex/", "cove/", "alexandria/", "alex/"];
 
 const ALIASES: &[(&str, &str)] = &[
-    ("k3", "kimi/k3"),
     ("opus-4.8", "claude-opus-4-8"),
     ("opus-4.5", "claude-opus-4-5"),
     ("sonnet-5", "claude-sonnet-5"),
@@ -252,17 +251,10 @@ pub fn route_model(model: &str) -> (Option<Provider>, String) {
         Some(Provider::Gemini)
     } else if lower.starts_with("grok") {
         Some(Provider::Xai)
-    } else if lower.starts_with("kimi") {
+    } else if lower.starts_with("kimi") || lower == "k3" {
         Some(Provider::Kimi)
     } else {
         None
-    };
-    let model = match model.as_str() {
-        // Kimi advertises these with its provider namespace. Preserve unknown
-        // bare `kimi*` ids, but normalize known catalog names to the same ids
-        // written by `alex connect` (for example `alex/kimi/kimi-for-coding`).
-        "kimi-for-coding" | "kimi-for-coding-highspeed" => format!("kimi/{model}"),
-        _ => model,
     };
     (inferred, model)
 }
@@ -598,7 +590,7 @@ mod tests {
             route_model("kimi-for-coding"),
             (
                 Some(Provider::Kimi),
-                "kimi/kimi-for-coding".to_string()
+                "kimi-for-coding".to_string()
             )
         );
         assert_eq!(route_model("mystery-model").0, None);
@@ -634,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             route_model("kimi/k3"),
-            (Some(Provider::Kimi), "kimi/k3".to_string())
+            (Some(Provider::Kimi), "k3".to_string())
         );
         assert_eq!(
             route_model("kimi:kimi-for-coding"),
@@ -642,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             route_model("alex/kimi/k3"),
-            (Some(Provider::Kimi), "kimi/k3".to_string())
+            (Some(Provider::Kimi), "k3".to_string())
         );
         assert_eq!(Provider::from_str_loose("kimi"), Some(Provider::Kimi));
         assert_eq!(Provider::Kimi.as_str(), "kimi");
@@ -726,7 +718,7 @@ mod tests {
     fn routes_aliases() {
         assert_eq!(
             route_model("k3"),
-            (Some(Provider::Kimi), "kimi/k3".to_string())
+            (Some(Provider::Kimi), "k3".to_string())
         );
         assert_eq!(
             route_model("opus-4.8"),
@@ -756,7 +748,7 @@ mod tests {
             route_model("alexandria/sonnet-5"),
             (Some(Provider::Anthropic), "claude-sonnet-5".to_string())
         );
-        assert_eq!(model_aliases().len(), 6);
+        assert_eq!(model_aliases().len(), 5);
     }
 
     #[test]
