@@ -7,6 +7,7 @@ import AlexandriaBarCore
 /// one-time value returned when a run key is minted.
 struct CredentialsPreferencesSection: View {
     let store: SnapshotStore
+    let onOpenTraceBrowser: (String) -> Void
 
     @State private var credentials: CredentialsResponse?
     @State private var config: DaemonConfig?
@@ -17,6 +18,12 @@ struct CredentialsPreferencesSection: View {
     @State private var ttlSeconds = 86_400
     @State private var isMinting = false
     @State private var isRevoking: Set<String> = []
+    @State private var isRevokingAll = false
+    @State private var isClearingRevoked = false
+    @State private var confirmingRevokeAll = false
+    @State private var confirmingClearRevoked = false
+    @State private var sortField = CredentialRunKeySortField.created
+    @State private var sortDirection = CredentialRunKeySortDirection.descending
     @State private var actionStatus: String?
     @State private var mintedKey: MintedRunKey?
 
@@ -57,7 +64,7 @@ struct CredentialsPreferencesSection: View {
                 Spacer()
                 PillButton(
                     title: "Refresh", variant: .bordered, systemImage: "arrow.clockwise",
-                    isEnabled: !isLoading && !isMinting && isRevoking.isEmpty
+                    isEnabled: !isLoading && !isMinting && isRevoking.isEmpty && !isBulkBusy
                 ) {
                     Task { await refresh() }
                 }
@@ -244,6 +251,7 @@ struct CredentialsPreferencesSection: View {
             }
 
             if let keys = credentials?.inbound.runKeys, !keys.isEmpty {
+                runKeyBulkActions(keys)
                 runKeyTable(keys)
             } else {
                 SettingCaption("No run keys have been minted.")
@@ -257,17 +265,23 @@ struct CredentialsPreferencesSection: View {
     // inside the section's ScrollView — only lays out visible rows, so the pane
     // stays responsive no matter how many keys exist.
     private static let keyCols: [CGFloat] = [96, 92, 110, 90, 90, 90, 38]
+    private static let keyActionWidth: CGFloat = 132
 
     private func keyHeaderRow() -> some View {
         HStack(spacing: 10) {
-            tableHeader("Label").frame(width: Self.keyCols[0], alignment: .leading)
+            sortableHeader("Label", field: .label)
+                .frame(width: Self.keyCols[0], alignment: .leading)
             tableHeader("Fingerprint").frame(width: Self.keyCols[1], alignment: .leading)
             tableHeader("Tags").frame(width: Self.keyCols[2], alignment: .leading)
-            tableHeader("Created").frame(width: Self.keyCols[3], alignment: .leading)
-            tableHeader("Expires").frame(width: Self.keyCols[4], alignment: .leading)
-            tableHeader("Last used").frame(width: Self.keyCols[5], alignment: .leading)
-            tableHeader("Uses").frame(width: Self.keyCols[6], alignment: .leading)
-            Text("").frame(width: 66)
+            sortableHeader("Created", field: .created)
+                .frame(width: Self.keyCols[3], alignment: .leading)
+            sortableHeader("Expires", field: .expires)
+                .frame(width: Self.keyCols[4], alignment: .leading)
+            sortableHeader("Last used", field: .lastUsed)
+                .frame(width: Self.keyCols[5], alignment: .leading)
+            sortableHeader("Uses", field: .uses)
+                .frame(width: Self.keyCols[6], alignment: .leading)
+            Text("").frame(width: Self.keyActionWidth)
         }
     }
 
@@ -285,14 +299,22 @@ struct CredentialsPreferencesSection: View {
             Text(optionalDateText(key.lastUsedMs, never: "Never"))
                 .frame(width: Self.keyCols[5], alignment: .leading)
             Text("\(key.useCount)").frame(width: Self.keyCols[6], alignment: .leading)
-            PillButton(
-                title: key.revoked ? "Revoked" : "Revoke", variant: .danger,
-                horizontalPadding: 9, verticalPadding: 4, cornerRadius: 6,
-                isEnabled: !key.revoked && !isRevoking.contains(key.id)
-            ) {
-                Task { await revoke(key) }
+            HStack(spacing: 6) {
+                PillButton(
+                    title: "Traces", variant: .bordered, systemImage: "magnifyingglass",
+                    fontSize: 9, horizontalPadding: 7, verticalPadding: 4, cornerRadius: 6
+                ) {
+                    onOpenTraceBrowser("key:\(key.keyFingerprint)")
+                }
+                PillButton(
+                    title: key.revoked ? "Revoked" : "Revoke", variant: .danger,
+                    horizontalPadding: 9, verticalPadding: 4, cornerRadius: 6,
+                    isEnabled: !key.revoked && !isRevoking.contains(key.id) && !isBulkBusy
+                ) {
+                    Task { await revoke(key) }
+                }
             }
-            .frame(width: 66, alignment: .leading)
+            .frame(width: Self.keyActionWidth, alignment: .leading)
         }
         .font(.system(size: 10))
         .foregroundStyle(AlexTheme.Colors.textSecondary)
@@ -301,7 +323,7 @@ struct CredentialsPreferencesSection: View {
     private func runKeyTable(_ keys: [CredentialRunKey]) -> some View {
         LazyVStack(alignment: .leading, spacing: 8) {
             keyHeaderRow()
-            ForEach(keys) { key in
+            ForEach(keys.sorted(by: sortField, direction: sortDirection)) { key in
                 keyRow(key)
             }
         }
@@ -330,6 +352,7 @@ struct CredentialsPreferencesSection: View {
     private var openAIBaseURL: String { baseURL == "Not configured" ? baseURL : "\(baseURL)/v1" }
     private var activeCredential: String? { mintedKey?.key ?? config?.localKey }
     private var activeCredentialLabel: String { mintedKey == nil ? "Local key" : "New model-only run key" }
+    private var isBulkBusy: Bool { isRevokingAll || isClearingRevoked }
 
     private func statusBadge(_ active: Bool, label: String? = nil) -> some View {
         HStack(spacing: 5) {
@@ -346,6 +369,72 @@ struct CredentialsPreferencesSection: View {
         Text(value)
             .font(.system(size: 9, weight: .semibold))
             .foregroundStyle(AlexTheme.Colors.textFaint)
+    }
+
+    private func sortableHeader(
+        _ value: String, field: CredentialRunKeySortField
+    ) -> some View {
+        Button {
+            if sortField == field {
+                sortDirection = sortDirection == .ascending ? .descending : .ascending
+            } else {
+                sortField = field
+                sortDirection = .ascending
+            }
+        } label: {
+            HStack(spacing: 2) {
+                tableHeader(value)
+                if sortField == field {
+                    Text(sortDirection == .ascending ? "▲" : "▼")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func runKeyBulkActions(_ keys: [CredentialRunKey]) -> some View {
+        HStack(spacing: 8) {
+            Spacer()
+            PillButton(
+                title: isRevokingAll ? "Revoking…" : "Revoke all",
+                variant: .danger, systemImage: "xmark.circle",
+                isEnabled: keys.contains(where: { !$0.revoked }) && !isBulkBusy,
+                isBusy: isRevokingAll
+            ) {
+                confirmingRevokeAll = true
+            }
+            .confirmationDialog(
+                "Revoke all active run keys?",
+                isPresented: $confirmingRevokeAll,
+                titleVisibility: .visible
+            ) {
+                Button("Revoke all", role: .destructive) { Task { await revokeAll() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Every active run key will stop working immediately. Audit rows will be retained.")
+            }
+            PillButton(
+                title: isClearingRevoked ? "Clearing…" : "Clear revoked",
+                variant: .bordered, systemImage: "trash",
+                isEnabled: keys.contains(where: \.revoked) && !isBulkBusy,
+                isBusy: isClearingRevoked
+            ) {
+                confirmingClearRevoked = true
+            }
+            .confirmationDialog(
+                "Clear all revoked run keys?",
+                isPresented: $confirmingClearRevoked,
+                titleVisibility: .visible
+            ) {
+                Button("Clear revoked", role: .destructive) { Task { await clearRevoked() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Revoked key audit rows will be permanently deleted. Active keys are not affected.")
+            }
+        }
+        .padding(.top, 8)
     }
 
     private func presenceText(_ present: Bool?) -> String {
@@ -473,6 +562,38 @@ struct CredentialsPreferencesSection: View {
             return
         } catch {
             actionStatus = "Could not revoke the key: \(error.localizedDescription)"
+        }
+    }
+
+    private func revokeAll() async {
+        guard let config else { return }
+        isRevokingAll = true
+        actionStatus = nil
+        defer { isRevokingAll = false }
+        do {
+            let count = try await AlexandriaClient(config: config).revokeAllRunKeys()
+            actionStatus = "Revoked \(count) active run key\(count == 1 ? "" : "s")."
+            await refresh()
+        } catch is CancellationError {
+            return
+        } catch {
+            actionStatus = "Could not revoke all keys: \(error.localizedDescription)"
+        }
+    }
+
+    private func clearRevoked() async {
+        guard let config else { return }
+        isClearingRevoked = true
+        actionStatus = nil
+        defer { isClearingRevoked = false }
+        do {
+            let count = try await AlexandriaClient(config: config).clearRevokedRunKeys()
+            actionStatus = "Removed \(count) revoked run key row\(count == 1 ? "" : "s")."
+            await refresh()
+        } catch is CancellationError {
+            return
+        } catch {
+            actionStatus = "Could not clear revoked keys: \(error.localizedDescription)"
         }
     }
 }

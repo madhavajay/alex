@@ -90,6 +90,14 @@ private struct MintRunKeyBody: Encodable {
     }
 }
 
+private struct RunKeysRevokedResponse: Decodable {
+    let revoked: Int
+}
+
+private struct RunKeysRemovedResponse: Decodable {
+    let removed: Int
+}
+
 public enum TraceBodyKind: String, Sendable, CaseIterable {
     case request
     case upstreamRequest = "upstream-request"
@@ -252,6 +260,18 @@ public struct AlexandriaClient: Sendable {
     public func revokeRunKey(id: String) async throws {
         _ = try await request(
             "admin/run-keys/\(encodedPathComponent(id))", method: "DELETE")
+    }
+
+    @discardableResult
+    public func revokeAllRunKeys() async throws -> Int {
+        let data = try await request("admin/run-keys/revoke-all", method: "POST")
+        return try JSONDecoder().decode(RunKeysRevokedResponse.self, from: data).revoked
+    }
+
+    @discardableResult
+    public func clearRevokedRunKeys() async throws -> Int {
+        let data = try await request("admin/run-keys/revoked", method: "DELETE")
+        return try JSONDecoder().decode(RunKeysRemovedResponse.self, from: data).removed
     }
 
     public func accounts() async throws -> [Account] {
@@ -715,6 +735,7 @@ public struct AlexandriaClient: Sendable {
                 URLQueryItem(name: "status", value: filters.status),
                 URLQueryItem(name: "session", value: filters.session),
                 URLQueryItem(name: "run_id", value: filters.run),
+                URLQueryItem(name: "key_fingerprint", value: filters.key),
                 URLQueryItem(name: "effort", value: filters.effort),
                 URLQueryItem(name: "error_class", value: filters.errorClass),
             ],

@@ -646,6 +646,59 @@ import Testing
         #expect(result.applied)
         #expect(requests == 2)
     }
+
+    @Test func runKeyBulkMethodsUseStaticRoutesAndDecodeCounts() async throws {
+        var requests = 0
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            defer { requests += 1 }
+            if requests == 0 {
+                #expect(request.url?.path == "/admin/run-keys/revoke-all")
+                #expect(request.httpMethod == "POST")
+                return (response, Data(#"{"revoked":3}"#.utf8))
+            }
+            #expect(request.url?.path == "/admin/run-keys/revoked")
+            #expect(request.httpMethod == "DELETE")
+            return (response, Data(#"{"removed":4}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        #expect(try await client.revokeAllRunKeys() == 3)
+        #expect(try await client.clearRevokedRunKeys() == 4)
+        #expect(requests == 2)
+    }
+
+    @Test func traceSearchSendsKeyFingerprintFilter() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/traces/search")
+            let components = try #require(URLComponents(url: request.url!, resolvingAgainstBaseURL: false))
+            let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap {
+                item in item.value.map { (item.name, $0) }
+            })
+            #expect(query["key_fingerprint"] == "5effb978eb304b0b")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"traces":[]}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        _ = try await client.searchTraces(
+            text: "", filters: OmniQuery.parse("key:5effb978eb304b0b"))
+    }
 }
 
 private func requestBody(_ request: URLRequest) throws -> Data {

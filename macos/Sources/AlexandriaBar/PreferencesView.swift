@@ -41,6 +41,7 @@ struct PreferencesView: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
     let onOpenDario: () -> Void
+    let onOpenTraceBrowser: (String) -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -119,7 +120,8 @@ struct PreferencesView: View {
                 case .harnesses:
                     HarnessesPreferencesSection(store: store)
                 case .credentials:
-                    CredentialsPreferencesSection(store: store)
+                    CredentialsPreferencesSection(
+                        store: store, onOpenTraceBrowser: onOpenTraceBrowser)
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .protection:
@@ -202,10 +204,16 @@ final class PreferencesWindowController {
     private let store: SnapshotStore
     private let authWindows = AuthWindowController()
     private let onOpenDario: () -> Void
+    private let onOpenTraceBrowser: (String) -> Void
 
-    init(store: SnapshotStore, onOpenDario: @escaping () -> Void = {}) {
+    init(
+        store: SnapshotStore,
+        onOpenDario: @escaping () -> Void = {},
+        onOpenTraceBrowser: @escaping (String) -> Void = { _ in }
+    ) {
         self.store = store
         self.onOpenDario = onOpenDario
+        self.onOpenTraceBrowser = onOpenTraceBrowser
     }
 
     func show(section: PreferencesSection = .general) {
@@ -221,7 +229,8 @@ final class PreferencesWindowController {
                         force: force,
                         store: self.store)
                 },
-                onOpenDario: onOpenDario))
+                onOpenDario: onOpenDario,
+                onOpenTraceBrowser: onOpenTraceBrowser))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock

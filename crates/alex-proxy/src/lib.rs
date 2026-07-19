@@ -1455,6 +1455,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin_run_keys_list).post(admin_run_keys_create),
         )
         .route(
+            "/admin/run-keys/revoke-all",
+            post(admin_run_keys_revoke_all),
+        )
+        .route(
+            "/admin/run-keys/revoked",
+            axum::routing::delete(admin_run_keys_clear_revoked),
+        )
+        .route(
             "/admin/run-keys/{id}",
             axum::routing::delete(admin_run_keys_revoke),
         )
@@ -4182,7 +4190,11 @@ async fn admin_traces(
     // certification: a scoped run key gives every request a unique run id.
     // `list_traces` predates run keys, so delegate only run-id queries to the
     // richer filter API while retaining its established response shape.
-    if q.contains_key("run_id") || q.contains_key("error_class") || q.contains_key("errors") {
+    if q.contains_key("run_id")
+        || q.contains_key("error_class")
+        || q.contains_key("errors")
+        || q.contains_key("key_fingerprint")
+    {
         let mut filter = filter_from_query(&q);
         filter.limit = limit;
         return match state.store.search_traces(&filter) {
@@ -8523,6 +8535,26 @@ async fn admin_run_keys_revoke(
             axum::Json(json!({"revoked": true})).into_response()
         }
         Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown run key '{id}'")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_run_keys_revoke_all(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.revoke_all_run_keys() {
+        Ok(revoked) => {
+            state.run_keys.write().unwrap().clear();
+            axum::Json(json!({"revoked": revoked})).into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn admin_run_keys_clear_revoked(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.delete_revoked_run_keys() {
+        Ok(removed) => {
+            state.run_keys.write().unwrap().clear();
+            axum::Json(json!({"removed": removed})).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -12959,6 +12991,31 @@ mod tests {
         assert_eq!(body["traces"][0]["run_id"], "hreg-1");
     }
 
+    #[tokio::test]
+    async fn admin_traces_filters_by_key_fingerprint() {
+        let state = test_state("admin-traces-key-fingerprint");
+        for (id, fingerprint) in [
+            ("trace-for-key", "5effb978eb304b0b"),
+            ("trace-for-other-key", "1111222233334444"),
+        ] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: now_ms(),
+                    key_fingerprint: Some(fingerprint.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut query = HashMap::new();
+        query.insert("key_fingerprint".into(), "5effb978eb304b0b".into());
+        let (status, body) = response_json(admin_traces(State(state), Query(query)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(body["traces"][0]["id"], "trace-for-key");
+    }
+
     #[test]
     fn dario_health_state_follows_credentials_generation_and_probe() {
         assert_eq!(
@@ -14945,6 +15002,88 @@ mod tests {
         assert_eq!(_status, StatusCode::OK);
         assert_eq!(revoked["revoked"], true);
         assert!(run_key_entry(&state, &hash).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_key_bulk_routes_are_gated_and_static_routes_beat_id_capture() {
+        use tower::ServiceExt;
+
+        let state = test_state("run-key-bulk-routes");
+        for (id, hash) in [
+            ("rk-active-1", "active1111bbbb2222cccc"),
+            ("rk-active-2", "active2222bbbb2222cccc"),
+            ("rk-revoked", "revoked111bbbb2222cccc"),
+        ] {
+            state
+                .store
+                .insert_run_key(id, hash, "run", None, None, None, 1_000, None)
+                .unwrap();
+        }
+        assert!(state.store.revoke_run_key("rk-revoked").unwrap());
+        assert!(run_key_entry(&state, "active1111bbbb2222cccc").is_some());
+
+        for (method, path) in [
+            ("POST", "/admin/run-keys/revoke-all"),
+            ("DELETE", "/admin/run-keys/revoked"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router(state.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let request = axum::http::Request::post("/admin/run-keys/revoke-all")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revoked"], 2);
+        assert!(state.run_keys.read().unwrap().is_empty());
+        assert!(state
+            .store
+            .list_run_keys(true)
+            .unwrap()
+            .iter()
+            .all(|row| row["revoked"] == true));
+
+        state
+            .store
+            .insert_run_key(
+                "rk-survivor",
+                "survive111bbbb2222cccc",
+                "run",
+                None,
+                None,
+                None,
+                2_000,
+                None,
+            )
+            .unwrap();
+        assert!(run_key_entry(&state, "survive111bbbb2222cccc").is_some());
+        let request = axum::http::Request::delete("/admin/run-keys/revoked")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["removed"], 3);
+        assert!(state.run_keys.read().unwrap().is_empty());
+        let rows = state.store.list_run_keys(true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "rk-survivor");
+        assert_eq!(rows[0]["revoked"], false);
     }
 
     #[tokio::test]

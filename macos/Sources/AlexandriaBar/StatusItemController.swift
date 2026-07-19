@@ -896,11 +896,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         (NSApp.delegate as? AppDelegate)?.postNotification(title: title, body: body)
     }
 
-    private func openTraceBrowser(harness: String? = nil, selectSessionId: String? = nil) {
+    private func openTraceBrowser(
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+    ) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show(harness: harness, selectSessionId: selectSessionId)
+        traceBrowser?.show(harness: harness, query: query, selectSessionId: selectSessionId)
     }
 
     private func openDario() {
@@ -917,9 +919,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func openPreferences(section: PreferencesSection = .general) {
         if prefsController == nil {
-            prefsController = PreferencesWindowController(store: store, onOpenDario: { [weak self] in
-                self?.openDario()
-            })
+            prefsController = PreferencesWindowController(
+                store: store,
+                onOpenDario: { [weak self] in self?.openDario() },
+                onOpenTraceBrowser: { [weak self] query in
+                    self?.openTraceBrowser(query: query)
+                })
         }
         prefsController?.show(section: section)
     }

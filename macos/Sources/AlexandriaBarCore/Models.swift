@@ -1156,6 +1156,76 @@ public struct CredentialRunKey: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+public enum CredentialRunKeySortField: Sendable, CaseIterable {
+    case label
+    case created
+    case expires
+    case lastUsed
+    case uses
+}
+
+public enum CredentialRunKeySortDirection: Sendable {
+    case ascending
+    case descending
+}
+
+public extension Array where Element == CredentialRunKey {
+    /// Returns a deterministic presentation ordering for the credentials key table.
+    /// Missing optional dates stay at the end in either direction.
+    func sorted(
+        by field: CredentialRunKeySortField,
+        direction: CredentialRunKeySortDirection
+    ) -> [CredentialRunKey] {
+        sorted { lhs, rhs in
+            let ordered: Bool?
+            switch field {
+            case .label:
+                let left = lhs.label?.isEmpty == false ? lhs.label! : lhs.kind
+                let right = rhs.label?.isEmpty == false ? rhs.label! : rhs.kind
+                let comparison = left.localizedCaseInsensitiveCompare(right)
+                ordered = comparison == .orderedSame
+                    ? nil
+                    : (direction == .ascending
+                        ? comparison == .orderedAscending
+                        : comparison == .orderedDescending)
+            case .created:
+                ordered = Self.runKeyOrder(lhs.createdMs, rhs.createdMs, direction: direction)
+            case .expires:
+                ordered = Self.runKeyOptionalOrder(
+                    lhs.expiresMs, rhs.expiresMs, direction: direction)
+            case .lastUsed:
+                ordered = Self.runKeyOptionalOrder(
+                    lhs.lastUsedMs, rhs.lastUsedMs, direction: direction)
+            case .uses:
+                ordered = Self.runKeyOrder(lhs.useCount, rhs.useCount, direction: direction)
+            }
+            return ordered ?? (lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending)
+        }
+    }
+
+    private static func runKeyOrder<T: Comparable>(
+        _ lhs: T, _ rhs: T, direction: CredentialRunKeySortDirection
+    ) -> Bool? {
+        guard lhs != rhs else { return nil }
+        return direction == .ascending ? lhs < rhs : lhs > rhs
+    }
+
+    private static func runKeyOptionalOrder<T: Comparable>(
+        _ lhs: T?, _ rhs: T?, direction: CredentialRunKeySortDirection
+    ) -> Bool? {
+        switch (lhs, rhs) {
+        case let (left?, right?):
+            return runKeyOrder(left, right, direction: direction)
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        case (nil, nil):
+            return nil
+        }
+    }
+}
+
 /// Daemon tags allow arbitrary JSON values. Keeping them typed rather than
 /// assuming strings means an unusual tag cannot make the whole inventory fail
 /// to decode.
