@@ -1,8 +1,64 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 /// Pure presentation builders shared by the onboarding UI and its tests.
 public enum OnboardingSupport {
     public static let defaultExampleModel = "alex/claude-haiku-4-5"
+    public static let credentialsDemoPrompt = "Say hello from Alex onboarding."
+
+    public static func credentialsDemoHeaders(key: String) -> [(name: String, value: String)] {
+        [
+            ("Authorization", "Bearer \(key)"),
+            ("Content-Type", "application/json"),
+            ("x-session-id", "my-first-session"),
+            ("x-alexandria-task", "quickstart"),
+            ("x-alexandria-kind", "experiment"),
+        ]
+    }
+
+    public static func credentialsDemoBody(model: String) -> String {
+        let quotedModel = jsonQuoted(model)
+        let quotedPrompt = jsonQuoted(credentialsDemoPrompt)
+        return "{\"model\":\(quotedModel),\"messages\":[{\"role\":\"user\",\"content\":\(quotedPrompt)}]}"
+    }
+
+    public static func credentialsDemoURL(baseURL: URL?) -> URL {
+        let base = baseURL?.absoluteString
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            ?? "http://127.0.0.1:4100"
+        return URL(string: "\(base)/v1/chat/completions")!
+    }
+
+    /// A paste-ready request that is byte-for-byte equivalent to the request
+    /// sent by the onboarding Run button (same URL, headers, and JSON body).
+    public static func credentialsCurlExample(baseURL: URL?, key: String, model: String) -> String {
+        let headerLines = credentialsDemoHeaders(key: key)
+            .map { "  -H \"\($0.name): \($0.value)\" \\" }
+            .joined(separator: "\n")
+        return """
+        curl "\(credentialsDemoURL(baseURL: baseURL).absoluteString)" \\
+        \(headerLines)
+          -d '\(credentialsDemoBody(model: model))'
+        """
+    }
+
+    public static func runKeyFingerprint(_ key: String) -> String {
+#if canImport(CryptoKit)
+        SHA256.hash(data: Data(key.utf8)).prefix(8)
+            .map { String(format: "%02x", $0) }.joined()
+#else
+        String(key.prefix(16))
+#endif
+    }
+
+    private static func jsonQuoted(_ value: String) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let data = try? encoder.encode(value)
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+    }
 
     /// Picks the deliberately verified onboarding model for a provider. Dynamic
     /// providers preserve daemon order: the first exposed OpenRouter model and

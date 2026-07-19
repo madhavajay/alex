@@ -1294,6 +1294,7 @@ public struct OutboundCredential: Codable, Sendable, Equatable, Identifiable {
 public struct MintedRunKey: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let key: String
+    public let keyFingerprint: String?
     public let kind: String
     public let runId: String?
     public let label: String?
@@ -1302,6 +1303,7 @@ public struct MintedRunKey: Codable, Sendable, Equatable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, key, kind, label, tags
+        case keyFingerprint = "key_fingerprint"
         case runId = "run_id"
         case expiresMs = "expires_ms"
     }

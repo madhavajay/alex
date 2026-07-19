@@ -3,6 +3,20 @@ import Testing
 @testable import AlexandriaBarCore
 
 struct OnboardingSupportTests {
+    @Test func credentialsCurlBuilderIncludesRunnableRequestAndOptionalTags() {
+        let curl = OnboardingSupport.credentialsCurlExample(
+            baseURL: URL(string: "http://127.0.0.1:9876/"),
+            key: "rk-secret", model: "alex/gpt-5.6-sol")
+
+        #expect(curl.contains(#"curl "http://127.0.0.1:9876/v1/chat/completions""#))
+        #expect(curl.contains(#"-H "Authorization: Bearer rk-secret""#))
+        #expect(curl.contains(#"-H "x-session-id: my-first-session""#))
+        #expect(curl.contains(#"-H "x-alexandria-task: quickstart""#))
+        #expect(curl.contains(#"-H "x-alexandria-kind: experiment""#))
+        #expect(curl.contains(
+            #"-d '{"model":"alex/gpt-5.6-sol","messages":[{"role":"user","content":"Say hello from Alex onboarding."}]}'"#))
+    }
+
     @Test func verifiedExampleModelsAreExplicit() {
         #expect(OnboardingSupport.exampleModel(for: "anthropic") == "alex/claude-haiku-4-5")
         #expect(OnboardingSupport.exampleModel(for: "openai") == "alex/gpt-5.6-sol")

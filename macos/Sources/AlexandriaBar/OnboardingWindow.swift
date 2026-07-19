@@ -25,7 +25,7 @@ final class OnboardingModel {
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
         "Credentials for any app", "Never lose a login", "Keep your agents running",
-        "Beyond single provider", "PAM",
+        "Beyond single provider", "PAM — Experimental",
     ]
 
     let store: SnapshotStore
@@ -46,6 +46,11 @@ final class OnboardingModel {
     var exampleModelLoading = false
     var traceState: OperationState = .idle
     var discoveredTrace: TraceSession?
+    var mintedOnboardingKey: MintedRunKey?
+    var onboardingKeyFingerprint: String?
+    var credentialMintState: OperationState = .idle
+    var credentialRunState: OperationState = .idle
+    var credentialResponseText: String?
     var troubleshootExpanded = false
     var checks: [Check] = []
     var checksRunning = false
@@ -69,6 +74,12 @@ final class OnboardingModel {
         HarnessCatalog.rows(store.harnesses).filter { $0.installed && $0.supportsConnect }
     }
 
+    var credentialsCurl: String? {
+        guard let key = mintedOnboardingKey else { return nil }
+        return OnboardingSupport.credentialsCurlExample(
+            baseURL: store.config?.baseURL, key: key.key, model: exampleModel)
+    }
+
     var canAdvance: Bool {
         switch step {
         case 1:
@@ -83,6 +94,7 @@ final class OnboardingModel {
     func chooseProvider(_ provider: String) {
         authModel?.cancel()
         selectedProvider = provider
+        exampleModel = OnboardingSupport.exampleModel(for: provider)
         if provider == "openrouter" || provider == "exo" {
             authModel = nil
             let name = ProviderInfo.displayName(provider)
@@ -211,6 +223,77 @@ final class OnboardingModel {
             for: selectedProvider,
             openRouterExposed: openRouterExposed,
             exoModels: exoModels)
+    }
+
+    func mintCredentialsDemoKey() {
+        guard !credentialMintState.isWorking else { return }
+        guard let config = store.config else {
+            credentialMintState = .failure("The Alex daemon configuration is not available.")
+            return
+        }
+        credentialMintState = .working("Minting a one-hour model-only key…")
+        credentialRunState = .idle
+        credentialResponseText = nil
+        Task {
+            do {
+                let client = AlexandriaClient(config: config)
+                await loadExampleModel(using: client)
+                let minted = try await client.mintRunKey(
+                    label: "onboarding", model: exampleModel, ttlSeconds: 3_600)
+                var fingerprint = minted.keyFingerprint
+                if fingerprint == nil {
+                    let inventory = try? await client.credentials()
+                    fingerprint = inventory?.inbound.runKeys
+                        .first(where: { $0.id == minted.id })?.keyFingerprint
+                }
+                mintedOnboardingKey = minted
+                onboardingKeyFingerprint = fingerprint
+                    ?? OnboardingSupport.runKeyFingerprint(minted.key)
+                credentialMintState = .success("One-hour onboarding key ready.")
+            } catch {
+                credentialMintState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
+    func runCredentialsDemo() {
+        guard !credentialRunState.isWorking else { return }
+        guard let config = store.config, let key = mintedOnboardingKey else {
+            credentialRunState = .failure("Mint the onboarding key first.")
+            return
+        }
+        credentialRunState = .working("Sending the request through Alex…")
+        credentialResponseText = nil
+        Task {
+            do {
+                var request = URLRequest(
+                    url: OnboardingSupport.credentialsDemoURL(baseURL: config.baseURL))
+                request.httpMethod = "POST"
+                request.timeoutInterval = 60
+                for header in OnboardingSupport.credentialsDemoHeaders(key: key.key) {
+                    request.setValue(header.value, forHTTPHeaderField: header.name)
+                }
+                request.httpBody = Data(
+                    OnboardingSupport.credentialsDemoBody(model: exampleModel).utf8)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let text = String(data: data, encoding: .utf8) ?? "<non-UTF-8 response>"
+                credentialResponseText = text
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(status) {
+                    credentialRunState = .success("Request completed · HTTP \(status)")
+                } else {
+                    credentialRunState = .failure("Request failed · HTTP \(status)")
+                }
+            } catch {
+                credentialResponseText = error.localizedDescription
+                credentialRunState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
+    func openCredentialsTrace() {
+        guard let onboardingKeyFingerprint else { return }
+        openTraceBrowser("key:\(onboardingKeyFingerprint)")
     }
 
     func beginTracePolling() {
@@ -569,16 +652,94 @@ struct OnboardingView: View {
                 Text("Your app speaks one of these formats — Alex routes it to any provider's models.")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(AlexTheme.Colors.foreground)
             }.padding(14).cardStyle()
-            ForEach(OnboardingSupport.environmentSnippets(baseURL: model.store.config?.baseURL), id: \.self) { CopyableCode(value: $0) }
-            Text("Scoped keys are revocable and auditable in the Credentials table.")
-                .font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary)
+            credentialsDemo
+        }
+    }
+
+    @ViewBuilder private var credentialsDemo: some View {
+        if let curl = model.credentialsCurl, let key = model.mintedOnboardingKey {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("ONE-HOUR MODEL-ONLY KEY")
+                            .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.success)
+                        Text("Scoped to \(model.exampleModel) · label onboarding")
+                            .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    Spacer()
+                    Text(key.expiresMs == nil ? "1 hour" : "expires in 1 hour")
+                        .font(AlexTheme.Fonts.metaLabel).foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                ScrollView(.horizontal) {
+                    Text(curl)
+                        .font(AlexTheme.Fonts.mono(10.5))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                    .fill(AlexTheme.Colors.consoleBackground))
+                optionalHeader("x-session-id: my-first-session", "groups requests into one session")
+                optionalHeader("x-alexandria-task: quickstart", "tags the trace with a task name")
+                optionalHeader("x-alexandria-kind: experiment", "labels the kind of work")
+                Text("All three tagging headers are optional and Alex strips them before forwarding the request upstream.")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                HStack(spacing: 8) {
+                    PillButton(title: "Copy", variant: .bordered, systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(curl, forType: .string)
+                    }
+                    PillButton(
+                        title: "Run", variant: .solidAccent, systemImage: "play.fill",
+                        isEnabled: !model.credentialRunState.isWorking,
+                        isBusy: model.credentialRunState.isWorking
+                    ) { model.runCredentialsDemo() }
+                    if model.credentialRunState.isTerminal,
+                       model.onboardingKeyFingerprint != nil
+                    {
+                        PillButton(
+                            title: "Show in Trace Browser", variant: .bordered,
+                            systemImage: "magnifyingglass"
+                        ) { model.openCredentialsTrace() }
+                    }
+                }
+                operation(model.credentialRunState)
+                if let response = model.credentialResponseText {
+                    Text(response)
+                        .font(AlexTheme.Fonts.mono(10.5))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .textSelection(.enabled)
+                        .lineLimit(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                            .fill(AlexTheme.Colors.consoleBackground))
+                }
+            }
+            .padding(14).cardStyle()
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Mint a real one-hour key to try Alex from any OpenAI-compatible app.")
+                    .font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                PillButton(
+                    title: "Mint onboarding key", variant: .solidAccent, systemImage: "key",
+                    isEnabled: !model.credentialMintState.isWorking,
+                    isBusy: model.credentialMintState.isWorking
+                ) { model.mintCredentialsDemoKey() }
+                operation(model.credentialMintState)
+                Text("Scoped keys are revocable and auditable in Settings → Credentials.")
+                    .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+            .padding(14).cardStyle()
         }
     }
 
     private var notifications: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "paperplane.circle.fill").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.primary)
-            intro("Never lose a login", "Connect Telegram in Settings → Notifications. Alex alerts you when a credential needs re-authenticating, and you can reply from your phone to re-auth.")
+            intro("Never lose a login", "Alex detects when your credentials need re-authenticating and can message you to refresh them — or simply switch models for you.")
             statusCard(icon: "text.bubble", tint: AlexTheme.Colors.success, text: "/status shows subscriptions, usage, and ping health wherever you are.")
         }
     }
@@ -586,8 +747,15 @@ struct OnboardingView: View {
     private var failover: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.success)
-            intro("Keep your agents running", "Settings → Failover lets you choose models to switch to automatically, preventing capacity errors, logout errors, and guardrail refusals from killing a long-running agent.")
-            statusCard(icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary, text: "Work moves to the next eligible model or account and keeps going.")
+            intro("Keep your agents running", "Settings → Failover lets you pair models that can take over for each other.")
+            VStack(alignment: .leading, spacing: 9) {
+                failoverPair("alex/claude-fable-5", "alex/gpt-5.6-sol")
+                failoverPair("alex/gpt-5.6-sol", "alex/claude-fable-5")
+            }
+            .padding(14).cardStyle()
+            statusCard(
+                icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary,
+                text: "capacity errors, logouts, or guardrail refusals move work to the other model automatically.")
         }
     }
 
@@ -633,14 +801,14 @@ struct OnboardingView: View {
                     .frame(maxWidth: .infinity, minHeight: 180)
             }
             intro(
-                "PAM",
+                "PAM — Experimental",
                 "PAM is a mixture-of-agents plugin for Pi that runs multiple models at once as Agent and Oracle roles — like the AMP Dial. It ships with Alex (plugins/pam) — point it at your alex/* models and experiment.")
         }
     }
 
     private var footer: some View {
         HStack(spacing: 12) {
-            PillButton(title: "Skip tutorial", variant: .standard, tint: AlexTheme.Colors.textTertiary) { model.skipTutorial() }
+            PillButton(title: "Skip tutorial", variant: .bordered) { model.skipTutorial() }
             PillButton(title: "Skip for now", variant: .bordered) { model.skipStep() }
             Spacer()
             HStack(spacing: 5) {
@@ -755,6 +923,23 @@ struct OnboardingView: View {
         HStack { Text(name).font(.system(size: 12, weight: .medium)); Spacer(); Text(endpoint).font(AlexTheme.Fonts.mono(11)).foregroundStyle(AlexTheme.Colors.primary) }
     }
 
+    private func optionalHeader(_ header: String, _ explanation: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(header).font(AlexTheme.Fonts.mono(10.5)).foregroundStyle(AlexTheme.Colors.primary)
+            Text("— \(explanation)").font(.system(size: 10.5)).foregroundStyle(AlexTheme.Colors.textTertiary)
+        }
+    }
+
+    private func failoverPair(_ primary: String, _ fallback: String) -> some View {
+        HStack(spacing: 10) {
+            Text(primary).font(AlexTheme.Fonts.mono(11.5))
+            Image(systemName: "arrow.right").foregroundStyle(AlexTheme.Colors.primary)
+            Text(fallback).font(AlexTheme.Fonts.mono(11.5))
+            Spacer()
+        }
+        .foregroundStyle(AlexTheme.Colors.foreground)
+    }
+
     private func statusCard(icon: String, tint: Color, text: String) -> some View {
         HStack(spacing: 10) { Image(systemName: icon).foregroundStyle(tint); Text(text).font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary) }.padding(14).cardStyle()
     }
@@ -764,6 +949,7 @@ private extension OnboardingModel.OperationState {
     var isFailure: Bool { if case .failure = self { true } else { false } }
     var isSuccess: Bool { if case .success = self { true } else { false } }
     var isWorking: Bool { if case .working = self { true } else { false } }
+    var isTerminal: Bool { if case .success = self { true } else if case .failure = self { true } else { false } }
     var message: String? {
         switch self {
         case .working(let message), .success(let message), .failure(let message): message
