@@ -341,7 +341,14 @@ fn archive_body_path(data_dir: &Path, value: &mut Value) {
     let Some(path) = value.as_str() else { return };
     let body_root = data_dir.join("bodies");
     if let Ok(relative) = Path::new(path).strip_prefix(&body_root) {
-        *value = Value::String(Path::new("bodies").join(relative).to_string_lossy().into_owned());
+        // Archive paths are always forward-slash so an export is portable
+        // across platforms (Windows would otherwise emit `bodies\…`).
+        let mut portable = String::from("bodies");
+        for component in relative.components() {
+            portable.push('/');
+            portable.push_str(&component.as_os_str().to_string_lossy());
+        }
+        *value = Value::String(portable);
     }
 }
 
