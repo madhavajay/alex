@@ -27,14 +27,14 @@ Usage: ./test.sh [TIER ...] [flags]
 Tiers (default: unit wire):
   unit      cargo test --workspace
   wire      curl-level matrix through the proxy (W1..W12), all cells parallel
-  harness   Docker harness matrix (H1..H6), parallel
+  harness   Docker harness matrix (H1..H7), parallel
   dario     dario supervisor cells (SKIP cleanly when /admin/dario is absent)
   all       unit + wire + harness + dario
 
 Flags:
   --only W1,H2,...        run only these cell ids (UNIT, W*, H*, DARIO; W11 matches W11a+W11b)
   --provider P            anthropic|openai|xai - only cells needing provider P
-  --harness H             claude|codex|grok-build - only these harness cells
+  --harness H             claude|codex|grok-build|kimi - only these harness cells
   --jobs N                max parallel cells (default: CPU count; harness capped at 4)
   --json                  machine-readable report on stdout
   --timeout N             per-cell seconds (default: 120 wire / 600 harness)
@@ -108,8 +108,8 @@ if [ -n "$PROVIDER_FILTER" ]; then
 fi
 if [ -n "$HARNESS_FILTER" ]; then
   case "$HARNESS_FILTER" in
-    claude|codex|grok-build) ;;
-    *) echo "--harness must be claude|codex|grok-build" >&2; exit 2 ;;
+    claude|codex|grok-build|kimi) ;;
+    *) echo "--harness must be claude|codex|grok-build|kimi" >&2; exit 2 ;;
   esac
 fi
 for n in "$JOBS" "$TIMEOUT" "$PORT_OVERRIDE"; do
@@ -329,6 +329,7 @@ H3|codex|gpt-5.6-luna|openai
 H4|codex|claude-haiku-4-5|anthropic
 H5|grok-build|gpt-5.6-luna|openai
 H6|grok-build|grok-code-fast-1|xai
+H7|kimi|claude-fable-5|anthropic
 EOF
 }
 
@@ -560,13 +561,82 @@ run_wire_cells() {
   wait_cells
 }
 
+run_h7_dario_assertion() {
+  local summary=$1 status traces mode session msg code
+  status="$TMP/cell.H7.dario.json"
+  traces="$TMP/cell.H7.dario.traces.json"
+  code=$(curl -sS --max-time 5 -H "x-api-key: $KEY" -o "$status" -w '%{http_code}' \
+    "$BASE/admin/dario" 2>/dev/null || echo 000)
+  mode=$(python3 - "$status" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("routing_mode") or "")
+except Exception:
+    print("")
+PY
+  )
+  if [ "$code" != "200" ] || [ "$mode" != "dario" ]; then
+    mode=${mode:-unavailable}
+    write_result H7-DARIO SKIP 0 "anthropic_upstream=$mode (Dario generation assertion requires dario mode)"
+    return 0
+  fi
+  session=$(python3 - "$summary" <<'PY'
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = None
+if d is None:
+    for line in reversed(open(sys.argv[1]).read().strip().splitlines()):
+        try:
+            d = json.loads(line)
+            break
+        except Exception:
+            pass
+print(os.path.basename((d or {}).get("session_dir") or ""))
+PY
+  )
+  if [ -z "$session" ]; then
+    write_result H7-DARIO FAIL 0 "H7 JSON summary did not contain a session directory"
+    return 0
+  fi
+  curl -sS --max-time 10 -H "x-api-key: $KEY" -o "$traces" \
+    "$BASE/admin/traces?session=$session&limit=20" 2>/dev/null || true
+  if msg=$(python3 - "$traces" "$session" <<'PY' 2>&1
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1])).get("traces", [])
+except Exception as e:
+    print(f"cannot read H7 traces: {e}")
+    sys.exit(1)
+rows = [r for r in rows if r.get("session_id") == sys.argv[2] and r.get("upstream_provider") == "anthropic"]
+if not rows:
+    print("no anthropic-bound trace found for the H7 session")
+    sys.exit(1)
+missing = [r.get("id") or "<unknown>" for r in rows if not r.get("dario_generation")]
+if missing:
+    print("anthropic trace(s) missing dario_generation: " + ", ".join(missing))
+    sys.exit(1)
+generations = sorted({r["dario_generation"] for r in rows})
+print(f"anthropic traces={len(rows)} dario_generation={','.join(generations)}")
+PY
+  ); then
+    write_result H7-DARIO PASS 0 "$msg"
+  else
+    write_result H7-DARIO FAIL 0 "$msg"
+  fi
+}
+
 run_harness_cell() {
   local id=$1 h=$2 model=$3 t0 t1 rc out msg
   t0=$(now_ms)
   out="$TMP/cell.$id.harness.out"
   rc=0
-  "$ROOT/alex" harness run "$h" --model "$model" --json --timeout-secs "$HARNESS_TIMEOUT" \
-    >"$out" 2>"$TMP/cell.$id.harness.err" || rc=$?
+  set -- "$ROOT/alex" harness run "$h" --model "$model" --json --timeout-secs "$HARNESS_TIMEOUT"
+  if [ "$id" = "H7" ]; then
+    set -- "$@" --prompt "List the files in the current directory using your file tools, then reply with just the file count."
+  fi
+  "$@" >"$out" 2>"$TMP/cell.$id.harness.err" || rc=$?
   t1=$(now_ms)
   if [ "$rc" -ne 0 ]; then
     msg="exit $rc: $(tail -c 200 "$TMP/cell.$id.harness.err" 2>/dev/null)"
@@ -600,6 +670,9 @@ sys.exit(1)
 PY
   ); then
     write_result "$id" PASS "$((t1 - t0))" "$msg"
+    if [ "$id" = "H7" ]; then
+      run_h7_dario_assertion "$out"
+    fi
   else
     write_result "$id" FAIL "$((t1 - t0))" "$msg"
   fi

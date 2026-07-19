@@ -2705,6 +2705,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
                 harness_connect::plan_grok_disconnect(&config_dir, &keys)
             } else if name == "amp" {
                 harness_connect::plan_amp_disconnect(&config_dir, &keys)
+            } else if name == "kimi" {
+                harness_connect::plan_kimi_disconnect(&config_dir, &keys)
             } else {
                 harness_connect::plan_disconnect(&config_dir, &keys)
             };
@@ -2714,6 +2716,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => config_dir.join("alexandria-settings.json"),
             "codex" => config_dir.join("config.toml"),
             "grok" => config_dir.join("config.toml"),
+            "kimi" => config_dir.join("config.toml"),
             "amp" => config_dir.join("plugins").join("alexandria.ts"),
             _ => config_dir.join("models.json"),
         };
@@ -2721,6 +2724,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::read_claude_model_ids(&config_dir),
             "codex" => harness_connect::read_codex_model_ids(&config_dir),
             "grok" => harness_connect::read_grok_model_ids(&config_dir),
+            "kimi" => harness_connect::read_kimi_model_ids(&config_dir),
             "amp" => Vec::new(),
             _ => harness_connect::read_pi_model_ids(&config_dir),
         };
@@ -2728,6 +2732,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             "claude" => harness_connect::disconnect_claude_config(&config_dir),
             "codex" => harness_connect::disconnect_codex_config(&config_dir),
             "grok" => harness_connect::disconnect_grok_config(&config_dir),
+            "kimi" => harness_connect::disconnect_kimi_config(&config_dir),
             "amp" => harness_connect::disconnect_amp_config(&config_dir),
             _ => harness_connect::disconnect_pi_config(&config_dir),
         };

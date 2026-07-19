@@ -2195,6 +2195,7 @@ pub(crate) fn write_kimi_connection(
     if !managed_before || !backup_path.exists() {
         atomic_write_text(&backup_path, &original_config)?;
     }
+    let orphan_adoptable = kimi_provider_is_ours(&doc);
 
     if doc.get("providers").is_none() {
         doc["providers"] = Item::Table(Table::new());
@@ -2202,9 +2203,13 @@ pub(crate) fn write_kimi_connection(
     let providers = doc["providers"]
         .as_table_mut()
         .with_context(|| "Kimi config.toml `providers` must be a table; aborting without changes")?;
-    if providers.contains_key(KIMI_PROVIDER_NAME) && !state.added_provider {
+    // An existing provider block without a state marker is either an orphan
+    // from a partial disconnect (its api_key is one of our alxk- run keys —
+    // adopt and replace it, since bailing used to strand Kimi on a revoked key
+    // with no way to reconnect) or genuinely user-authored (leave it alone).
+    if providers.contains_key(KIMI_PROVIDER_NAME) && !state.added_provider && !orphan_adoptable {
         bail!(
-            "{} already defines providers.{}; Alexandria will not replace an unmanaged provider",
+            "{} already defines providers.{}; Alex will not replace an unmanaged provider",
             config_path.display(),
             KIMI_PROVIDER_NAME
         );
@@ -2224,15 +2229,41 @@ pub(crate) fn write_kimi_connection(
         .with_context(|| "Kimi config.toml `models` must be a table; aborting without changes")?;
     for model in &display_models {
         if model_configs.contains_key(model) && !previous_managed.contains(model) {
-            bail!(
-                "{} already defines models.{}; Alexandria will not replace an unmanaged model",
-                config_path.display(),
-                model
-            );
+            let ours = is_alex_kimi_model(model)
+                || model_configs
+                    .get(model)
+                    .and_then(Item::as_table_like)
+                    .and_then(|entry| entry.get("provider"))
+                    .and_then(Item::as_str)
+                    == Some(KIMI_PROVIDER_NAME);
+            if !ours {
+                bail!(
+                    "{} already defines models.{}; Alexandria will not replace an unmanaged model",
+                    config_path.display(),
+                    model
+                );
+            }
         }
     }
     for previous in &state.managed_models {
         model_configs.remove(previous);
+    }
+    // Sweep orphaned alex/* entries a lost state file no longer tracks, so a
+    // reconnect never leaves stale models pointing at a dead key.
+    let orphaned: Vec<String> = model_configs
+        .iter()
+        .filter(|(model, entry)| {
+            is_alex_kimi_model(model)
+                || entry
+                    .as_table_like()
+                    .and_then(|entry| entry.get("provider"))
+                    .and_then(Item::as_str)
+                    == Some(KIMI_PROVIDER_NAME)
+        })
+        .map(|(model, _)| model.to_string())
+        .collect();
+    for model in orphaned {
+        model_configs.remove(&model);
     }
     for model in &display_models {
         let mut entry = Table::new();
@@ -2324,8 +2355,12 @@ pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
         if !config_path.exists() {
             return Ok(false);
         }
+        // No managed-state marker, but Alexandria's entries are self-identifying
+        // — remove them anyway so a lost state file can't leave Kimi wired to a
+        // revoked key.
         let mut doc = read_grok_config(&config_path)?;
-        let changed = clear_stale_kimi_default_selection(config_dir, &mut doc)?;
+        let mut changed = remove_self_identifying_kimi_entries(&mut doc);
+        changed |= clear_stale_kimi_default_selection(config_dir, &mut doc)?;
         if changed {
             atomic_write_text(&config_path, &doc.to_string())?;
         }
@@ -2406,6 +2441,65 @@ fn clear_stale_kimi_default_selection(config_dir: &Path, doc: &mut DocumentMut) 
 
 fn is_alex_kimi_model(model: &str) -> bool {
     model.starts_with("alex/") || model.starts_with("alexandria/")
+}
+
+/// True when the `alexandria` provider block in a Kimi config carries an Alex
+/// run key (`alxk-` prefix) — the marker that it was written by `alex connect`
+/// rather than authored by the user.
+fn kimi_provider_is_ours(doc: &DocumentMut) -> bool {
+    doc.get("providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(KIMI_PROVIDER_NAME))
+        .and_then(Item::as_table_like)
+        .and_then(|entry| entry.get("api_key"))
+        .and_then(Item::as_str)
+        .is_some_and(|key| key.starts_with("alxk-"))
+}
+
+/// Removes every Kimi config entry that is Alex's by construction — the
+/// `alexandria` provider block (when its key proves it ours) and any model
+/// named `alex/*` or routed through that provider. These entries are
+/// self-identifying, so they can be cleaned up even when the managed-state
+/// marker file has been lost (a partial disconnect or a crash between writes
+/// previously stranded them, leaving Kimi pointed at a revoked key and
+/// blocking reconnects). A user-authored provider that happens to share the
+/// name is left alone.
+fn remove_self_identifying_kimi_entries(doc: &mut DocumentMut) -> bool {
+    let provider_is_ours = kimi_provider_is_ours(doc);
+    let mut changed = false;
+    if let Some(models) = doc.get_mut("models").and_then(Item::as_table_mut) {
+        let orphaned: Vec<String> = models
+            .iter()
+            .filter(|(model, entry)| {
+                is_alex_kimi_model(model)
+                    || (provider_is_ours
+                        && entry
+                            .as_table_like()
+                            .and_then(|entry| entry.get("provider"))
+                            .and_then(Item::as_str)
+                            == Some(KIMI_PROVIDER_NAME))
+            })
+            .map(|(model, _)| model.to_string())
+            .collect();
+        for model in orphaned {
+            models.remove(&model);
+            changed = true;
+        }
+        if models.is_empty() {
+            doc.as_table_mut().remove("models");
+        }
+    }
+    if provider_is_ours {
+        if let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_mut) {
+            if providers.remove(KIMI_PROVIDER_NAME).is_some() {
+                changed = true;
+            }
+            if providers.is_empty() {
+                doc.as_table_mut().remove("providers");
+            }
+        }
+    }
+    changed
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4046,6 +4140,32 @@ pub(crate) fn plan_grok_connect(
         "action": "create",
         "detail": "mint harness key",
     }));
+    json!({"plan": plan})
+}
+
+pub(crate) fn plan_kimi_disconnect(config_dir: &Path, keys: &[(String, String)]) -> Value {
+    let mut plan = Vec::new();
+    if kimi_config_connected(config_dir).unwrap_or(false)
+        || config_dir.join(KIMI_STATE_FILE).exists()
+    {
+        plan.push(json!({
+            "path": config_dir.join(KIMI_CONFIG_FILE).display().to_string(),
+            "action": "modify",
+            "detail": "remove only the Alex provider and alex/* models; Kimi's own providers and models are preserved",
+        }));
+        plan.push(json!({
+            "path": config_dir.join(KIMI_BACKUP_FILE).display().to_string(),
+            "action": "preserve",
+            "detail": "keep the original Kimi configuration backup",
+        }));
+    }
+    for (id, fp) in keys {
+        plan.push(json!({
+            "path": id,
+            "action": "delete",
+            "detail": format!("revoke harness key {fp}"),
+        }));
+    }
     json!({"plan": plan})
 }
 
@@ -6093,6 +6213,92 @@ display_name = "K3"
         // Second disconnect is a no-op (state file already gone).
         assert!(!disconnect_kimi_config(&dir).unwrap());
         assert!(dir.join(KIMI_BACKUP_FILE).exists());
+    }
+
+    #[test]
+    fn kimi_disconnect_without_state_removes_orphaned_alex_entries() {
+        let dir = tmpdir("kimi-disconnect-orphaned");
+        // Config left behind by a partial disconnect: Alex entries present but
+        // the managed-state marker file is gone.
+        std::fs::write(
+            dir.join(KIMI_CONFIG_FILE),
+            r#"default_model = "alex/gpt-5.5"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+api_key = ""
+base_url = "https://api.kimi.com/coding/v1"
+
+[providers.alexandria]
+type = "openai"
+api_key = "alxk-revoked"
+base_url = "http://127.0.0.1:4100/v1"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."alex/gpt-5.5"]
+provider = "alexandria"
+model = "alex/gpt-5.5"
+"#,
+        )
+        .unwrap();
+
+        assert!(disconnect_kimi_config(&dir).unwrap());
+        let restored = read_grok_config(&dir.join(KIMI_CONFIG_FILE)).unwrap();
+        assert!(restored["providers"].get(KIMI_PROVIDER_NAME).is_none());
+        assert!(restored["models"].get("alex/gpt-5.5").is_none());
+        assert_eq!(
+            restored["models"]["kimi-code/k3"]["model"].as_str(),
+            Some("k3")
+        );
+        // The stale alex default was replaced with a surviving native model.
+        assert_eq!(
+            restored["default_model"].as_str(),
+            Some("kimi-code/k3")
+        );
+    }
+
+    #[test]
+    fn kimi_reconnect_adopts_orphaned_provider_without_state() {
+        let dir = tmpdir("kimi-reconnect-orphaned");
+        // A reconnect after the state file was lost must adopt and replace the
+        // self-identifying Alex entries instead of bailing (which stranded the
+        // revoked key in place).
+        std::fs::write(
+            dir.join(KIMI_CONFIG_FILE),
+            r#"[providers.alexandria]
+type = "openai"
+api_key = "alxk-revoked"
+base_url = "http://127.0.0.1:4100/v1"
+
+[models."alex/legacy-model"]
+provider = "alexandria"
+model = "alex/legacy-model"
+"#,
+        )
+        .unwrap();
+
+        let summary = write_kimi_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-kimi-2".into(),
+            "alxk-fresh".into(),
+            model_ids(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(summary.models, vec!["alex/claude-opus-4-8", "alex/gpt-5.5"]);
+        let config = read_grok_config(&dir.join(KIMI_CONFIG_FILE)).unwrap();
+        assert_eq!(
+            config["providers"][KIMI_PROVIDER_NAME]["api_key"].as_str(),
+            Some("alxk-fresh")
+        );
+        // The orphaned model entry a lost state file no longer tracked is gone.
+        assert!(config["models"].get("alex/legacy-model").is_none());
+        assert!(kimi_config_connected(&dir).unwrap());
     }
 
     #[test]
