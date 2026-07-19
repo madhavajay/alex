@@ -60,6 +60,7 @@ impl LoginSession {
             "user_code": self.user_code,
             "verification_uri": self.verification_uri,
             "verification_uri_complete": self.verification_uri_complete,
+            "created_ms": self.created_ms,
             "expires_at_ms": self.expires_at_ms,
         })
     }

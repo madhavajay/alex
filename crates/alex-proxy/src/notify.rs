@@ -2,7 +2,8 @@
 //! the `alex` binary, while the proxy owns dispatch because it knows when an
 //! authenticated request has failed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,6 +11,122 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const MESSAGE_LOG_CAPACITY: usize = 200;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationMessage {
+    pub ts: i64,
+    pub direction: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    pub kind: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub summary: String,
+}
+
+/// A small redacted audit ring shared by every hot-reloaded dispatcher. The
+/// optional JSON file makes debugging history survive daemon restarts without
+/// putting message contents or credentials in config.toml.
+#[derive(Clone, Default)]
+pub struct NotificationMessageLog {
+    entries: Arc<Mutex<VecDeque<NotificationMessage>>>,
+    path: Arc<Option<PathBuf>>,
+}
+
+impl NotificationMessageLog {
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let mut entries = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<VecDeque<NotificationMessage>>(&bytes).ok())
+            .unwrap_or_default();
+        while entries.len() > MESSAGE_LOG_CAPACITY {
+            entries.pop_front();
+        }
+        Self {
+            entries: Arc::new(Mutex::new(entries)),
+            path: Arc::new(path),
+        }
+    }
+
+    pub fn record(
+        &self,
+        ts: i64,
+        direction: &str,
+        channel_id: Option<&str>,
+        kind: &str,
+        ok: bool,
+        error: Option<&str>,
+        summary: &str,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.push_back(NotificationMessage {
+            ts,
+            direction: direction.to_string(),
+            channel_id: channel_id.map(str::to_owned),
+            kind: redact_text(kind),
+            ok,
+            error: error.map(redact_text),
+            summary: redact_text(summary),
+        });
+        while entries.len() > MESSAGE_LOG_CAPACITY {
+            entries.pop_front();
+        }
+        if let Some(path) = self.path.as_ref() {
+            if let Ok(bytes) = serde_json::to_vec(&*entries) {
+                let temporary = path.with_extension("json.tmp");
+                if std::fs::write(&temporary, bytes).is_ok() {
+                    let _ = std::fs::rename(temporary, path);
+                }
+            }
+        }
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<NotificationMessage> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .iter()
+            .rev()
+            .take(limit.min(MESSAGE_LOG_CAPACITY))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
+fn redact_text(value: &str) -> String {
+    if value.contains('#') {
+        return "[oauth code redacted]".into();
+    }
+    static TELEGRAM_TOKEN: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?i)(?:bot)?[0-9]+:[a-z0-9_-]+").expect("telegram token regex")
+    });
+    let value = TELEGRAM_TOKEN.replace_all(value, "[telegram token redacted]");
+    value.chars().take(240).collect()
+}
+
+fn inbound_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "/code" || lower.starts_with("/code ") {
+        return "/code [oauth code redacted]".into();
+    }
+    if !trimmed.starts_with('/') && trimmed.contains('#') {
+        return "[oauth code redacted]".into();
+    }
+    redact_text(trimmed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -320,6 +437,7 @@ pub struct NotificationDispatcher {
     timeout: Duration,
     sent: Arc<Mutex<HashMap<String, i64>>>,
     status: Arc<Mutex<Vec<ChannelStatus>>>,
+    message_log: NotificationMessageLog,
 }
 
 impl Default for NotificationDispatcher {
@@ -330,6 +448,13 @@ impl Default for NotificationDispatcher {
 
 impl NotificationDispatcher {
     pub fn from_settings(settings: NotificationSettings) -> Self {
+        Self::from_settings_with_log(settings, NotificationMessageLog::default())
+    }
+
+    pub fn from_settings_with_log(
+        settings: NotificationSettings,
+        message_log: NotificationMessageLog,
+    ) -> Self {
         let mut entries = Vec::new();
         for (index, config) in settings.channels.iter().enumerate() {
             if config.kind != "webhook" {
@@ -353,10 +478,16 @@ impl NotificationDispatcher {
             entries,
             Duration::from_secs(settings.cooldown_seconds),
             Duration::from_secs(settings.timeout_seconds.max(1)),
+            message_log,
         )
     }
 
-    fn from_entries(entries: Vec<ChannelEntry>, cooldown: Duration, timeout: Duration) -> Self {
+    fn from_entries(
+        entries: Vec<ChannelEntry>,
+        cooldown: Duration,
+        timeout: Duration,
+        message_log: NotificationMessageLog,
+    ) -> Self {
         let count = entries.len();
         Self {
             channels: Arc::new(entries),
@@ -364,6 +495,104 @@ impl NotificationDispatcher {
             timeout,
             sent: Arc::new(Mutex::new(HashMap::new())),
             status: Arc::new(Mutex::new(vec![ChannelStatus::default(); count])),
+            message_log,
+        }
+    }
+
+    pub fn message_log(&self) -> NotificationMessageLog {
+        self.message_log.clone()
+    }
+
+    pub fn recent_messages(&self, limit: usize) -> Vec<NotificationMessage> {
+        self.message_log.recent(limit)
+    }
+
+    pub fn record_inbound(&self, channel_id: &str, text: &str, ok: bool, error: Option<&str>) {
+        self.message_log.record(
+            crate::now_ms(),
+            "in",
+            Some(channel_id),
+            "command",
+            ok,
+            error,
+            &inbound_summary(text),
+        );
+        if !ok {
+            self.set_channel_error(channel_id, error.unwrap_or("telegram command failed"));
+        } else {
+            self.clear_channel_error(channel_id);
+        }
+    }
+
+    pub fn record_poll_success(&self, channel_id: &str) {
+        self.clear_channel_error(channel_id);
+    }
+
+    pub fn record_poll_error(&self, channel_id: &str, error: &str) {
+        self.set_channel_error(channel_id, error);
+        self.message_log.record(
+            crate::now_ms(),
+            "in",
+            Some(channel_id),
+            "poll",
+            false,
+            Some(error),
+            "Telegram getUpdates failed",
+        );
+    }
+
+    pub fn record_reauth_error(&self, error: &str) {
+        for entry in self.channels.iter().filter(|entry| {
+            matches!(entry.config.format, WebhookFormat::Telegram)
+                && NotificationLevel::Warn >= entry.config.min_level
+                && (entry.config.categories.is_empty()
+                    || entry.config.categories.iter().any(|category| category == "reauth"))
+        }) {
+            let channel_id = entry.config.id.as_deref();
+            if let Some(channel_id) = channel_id {
+                self.set_channel_error(channel_id, error);
+            }
+            self.message_log.record(
+                crate::now_ms(),
+                "out",
+                channel_id,
+                "reauth",
+                false,
+                Some(error),
+                "Re-authentication notification could not be prepared",
+            );
+        }
+    }
+
+    fn set_channel_error(&self, channel_id: &str, error: &str) {
+        let Some(index) = self.channels.iter().position(|entry| {
+            entry.config.id.as_deref() == Some(channel_id)
+        }) else {
+            return;
+        };
+        let mut statuses = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(status) = statuses.get_mut(index) {
+            status.last_error = Some(redact_text(error));
+        }
+    }
+
+    fn clear_channel_error(&self, channel_id: &str) {
+        let Some(index) = self
+            .channels
+            .iter()
+            .position(|entry| entry.config.id.as_deref() == Some(channel_id))
+        else {
+            return;
+        };
+        let mut statuses = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(status) = statuses.get_mut(index) {
+            status.last_error = None;
         }
     }
 
@@ -413,9 +642,8 @@ impl NotificationDispatcher {
         let mut delivery = CustomDelivery::default();
         for (index, entry) in self.channels.iter().enumerate() {
             if !matches!(entry.config.format, WebhookFormat::Telegram)
-                || only_channel_id.is_some_and(|wanted| {
-                    entry.config.id.as_deref() != Some(wanted) || !entry.config.allow_commands
-                })
+                || only_channel_id
+                    .is_some_and(|wanted| entry.config.id.as_deref() != Some(wanted))
                 || !accepts(&entry.config, &event)
             {
                 continue;
@@ -476,12 +704,28 @@ impl NotificationDispatcher {
         }) else {
             return Err(anyhow!("telegram command channel is unavailable"));
         };
-        match tokio::time::timeout(self.timeout, entry.channel.send_text(text)).await {
+        let result = match tokio::time::timeout(self.timeout, entry.channel.send_text(text)).await {
             Ok(Ok(())) => Ok(()),
             // The underlying HTTP error may contain the token-bearing URL.
             Ok(Err(_)) => Err(anyhow!("telegram reply delivery failed")),
             Err(_) => Err(anyhow!("telegram reply timed out")),
+        };
+        let error = result.as_ref().err().map(ToString::to_string);
+        self.message_log.record(
+            crate::now_ms(),
+            "out",
+            Some(channel_id),
+            "reply",
+            result.is_ok(),
+            error.as_deref(),
+            text,
+        );
+        if let Some(error) = error.as_deref() {
+            self.set_channel_error(channel_id, error);
+        } else {
+            self.clear_channel_error(channel_id);
         }
+        result
     }
 
     pub fn emit_test(&self, channel: Option<usize>, now_ms: i64) {
@@ -496,9 +740,18 @@ impl NotificationDispatcher {
     /// can report an honest per-channel result. Tests intentionally bypass
     /// min_level/category filters.
     pub async fn test(&self, only: Option<usize>, now_ms: i64) -> Vec<Value> {
+        self.test_category(only, "test", now_ms).await
+    }
+
+    pub async fn test_category(
+        &self,
+        only: Option<usize>,
+        category: &str,
+        now_ms: i64,
+    ) -> Vec<Value> {
         let event = NotificationEvent {
             level: NotificationLevel::Info,
-            category: "test".into(),
+            category: category.into(),
             title: "Alexandria notification test".into(),
             body: "This is a synthetic notification test event.".into(),
             account: NotificationAccount {
@@ -531,6 +784,15 @@ impl NotificationDispatcher {
                     }
                 }
             }
+            self.message_log.record(
+                event.ts,
+                "out",
+                entry.config.id.as_deref(),
+                &event.category,
+                ok,
+                error,
+                &event.title,
+            );
             results.push(json!({
                 "index": index,
                 "id": entry.config.id,
@@ -572,6 +834,8 @@ impl NotificationDispatcher {
             let status = self.status.clone();
             let timeout = self.timeout;
             let event = event.clone();
+            let message_log = self.message_log.clone();
+            let channel_id = entry.config.id.clone();
             tokio::spawn(async move {
                 let result = tokio::time::timeout(timeout, channel.send(&event)).await;
                 let mut statuses = status
@@ -588,8 +852,28 @@ impl NotificationDispatcher {
                     Ok(Err(_)) => state.last_error = Some("delivery failed".into()),
                     Err(_) => state.last_error = Some("delivery timed out".into()),
                 }
+                let (ok, error) = match result {
+                    Ok(Ok(())) => (true, None),
+                    Ok(Err(_)) => (false, Some("delivery failed")),
+                    Err(_) => (false, Some("delivery timed out")),
+                };
+                message_log.record(
+                    event.ts,
+                    "out",
+                    channel_id.as_deref(),
+                    &event.category,
+                    ok,
+                    error,
+                    &event.title,
+                );
             });
         }
+    }
+
+    pub fn channel_index(&self, id: &str) -> Option<usize> {
+        self.channels
+            .iter()
+            .position(|entry| entry.config.id.as_deref() == Some(id))
     }
 
     pub fn admin_view(&self) -> Value {
@@ -734,6 +1018,59 @@ mod tests {
         }
     }
 
+    struct FailingChannel;
+
+    #[async_trait]
+    impl NotificationChannel for FailingChannel {
+        fn kind(&self) -> &str {
+            "test"
+        }
+
+        async fn send(&self, _: &NotificationEvent) -> Result<()> {
+            Err(anyhow!("secret transport detail"))
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_delivery_failure_surfaces_in_channel_status_and_message_log() {
+        let dispatcher = NotificationDispatcher::from_entries(
+            vec![ChannelEntry {
+                config: NotificationChannelConfig {
+                    id: Some("failing".into()),
+                    format: WebhookFormat::Telegram,
+                    chat_id: Some("42".into()),
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                },
+                channel: Arc::new(FailingChannel),
+            }],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            NotificationMessageLog::default(),
+        );
+        assert!(dispatcher.send_custom(
+            "Re-authentication needed",
+            "Tap the link",
+            NotificationAccount {
+                provider: "anthropic".into(),
+                label: None,
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dispatcher.admin_view()["channels"][0]["last_error"],
+            "delivery failed"
+        );
+        let log = dispatcher.recent_messages(10);
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].ok);
+        assert_eq!(log[0].error.as_deref(), Some("delivery failed"));
+        assert!(!serde_json::to_string(&log)
+            .unwrap()
+            .contains("secret transport detail"));
+    }
+
     #[tokio::test]
     async fn coalesces_identical_auth_events() {
         let channel = Arc::new(CountingChannel(AtomicUsize::new(0)));
@@ -744,6 +1081,7 @@ mod tests {
             }],
             Duration::from_secs(30 * 60),
             Duration::from_secs(1),
+            NotificationMessageLog::default(),
         );
         dispatcher.emit(event());
         dispatcher.emit(event());
@@ -780,6 +1118,7 @@ mod tests {
             }],
             Duration::from_secs(30 * 60),
             Duration::from_secs(1),
+            NotificationMessageLog::default(),
         );
         let account = NotificationAccount {
             provider: "xai".into(),
@@ -863,6 +1202,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             Duration::from_secs(1),
+            NotificationMessageLog::default(),
         );
 
         dispatcher
@@ -871,5 +1211,88 @@ mod tests {
             .unwrap();
         assert_eq!(*channel.0.lock().unwrap(), ["pong"]);
         assert!(dispatcher.send_telegram_reply("foreign", "nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn message_log_records_inbound_and_outbound_with_code_and_token_redaction() {
+        let channel = Arc::new(TextChannel(Mutex::new(Vec::new())));
+        let dispatcher = NotificationDispatcher::from_entries(
+            vec![ChannelEntry {
+                config: NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: WebhookFormat::Telegram,
+                    chat_id: Some("123".into()),
+                    allow_commands: true,
+                    ..Default::default()
+                },
+                channel,
+            }],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            NotificationMessageLog::default(),
+        );
+
+        dispatcher.record_inbound("control", "/code secret-code#secret-state", true, None);
+        dispatcher.record_inbound(
+            "control",
+            "/status 123456:VERY_SECRET_TELEGRAM_TOKEN",
+            false,
+            Some("poll failed for bot123456:VERY_SECRET_TELEGRAM_TOKEN"),
+        );
+        dispatcher
+            .send_telegram_reply("control", "status reply")
+            .await
+            .unwrap();
+
+        let messages = dispatcher.recent_messages(10);
+        assert_eq!(messages.len(), 3);
+        let encoded = serde_json::to_string(&messages).unwrap();
+        assert!(!encoded.contains("secret-code"));
+        assert!(!encoded.contains("secret-state"));
+        assert!(!encoded.contains("VERY_SECRET_TELEGRAM_TOKEN"));
+        assert!(encoded.contains("oauth code redacted"));
+        assert_eq!(messages[0].direction, "in");
+        assert_eq!(messages[2].direction, "out");
+        assert_eq!(messages[2].kind, "reply");
+        assert_eq!(dispatcher.admin_view()["channels"][0]["last_error"], Value::Null);
+    }
+
+    #[test]
+    fn message_log_is_bounded_and_persists_only_redacted_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "alex-notification-log-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let log = NotificationMessageLog::load(Some(path.clone()));
+        for index in 0..250 {
+            log.record(
+                index,
+                "in",
+                Some("control"),
+                "command",
+                true,
+                None,
+                "plain-code#secret-state",
+            );
+        }
+        log.record(
+            251,
+            "in",
+            Some("control"),
+            "command",
+            true,
+            None,
+            "bot123456:VERY_SECRET_TELEGRAM_TOKEN",
+        );
+        let reloaded = NotificationMessageLog::load(Some(path.clone()));
+        let entries = reloaded.recent(250);
+        assert_eq!(entries.len(), MESSAGE_LOG_CAPACITY);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("VERY_SECRET_TELEGRAM_TOKEN"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("plain-code"));
+        let _ = std::fs::remove_file(path);
     }
 }

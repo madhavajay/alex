@@ -906,7 +906,7 @@ pub fn build_state_with_substitution(
     Arc::new(AppState {
         local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
-        store,
+        store: store.clone(),
         http,
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
@@ -933,7 +933,12 @@ pub fn build_state_with_substitution(
         reset_handler: std::sync::RwLock::new(None),
         plugins: Arc::new(PluginManager::empty()),
         notifications: Arc::new(std::sync::RwLock::new(
-            notify::NotificationDispatcher::default(),
+            notify::NotificationDispatcher::from_settings_with_log(
+                notify::NotificationSettings::default(),
+                notify::NotificationMessageLog::load(Some(
+                    store.data_dir.join("notification-messages.json"),
+                )),
+            ),
         )),
         notification_settings: std::sync::RwLock::new(notify::NotificationSettings::default()),
         notification_persister: std::sync::RwLock::new(None),
@@ -1342,7 +1347,13 @@ pub fn set_notifications(state: &Arc<AppState>, mut settings: notify::Notificati
             channel.id = Some(format!("channel-{index}"));
         }
     }
-    let dispatcher = notify::NotificationDispatcher::from_settings(settings.clone());
+    let message_log = state
+        .notifications
+        .read()
+        .map(|dispatcher| dispatcher.message_log())
+        .unwrap_or_default();
+    let dispatcher =
+        notify::NotificationDispatcher::from_settings_with_log(settings.clone(), message_log);
     if let Ok(mut notifications) = state.notifications.write() {
         *notifications = dispatcher;
     }
@@ -1534,6 +1545,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_notifications_discover_chat),
         )
         .route("/admin/notifications/test", post(admin_notifications_test))
+        .route(
+            "/admin/notifications/commands",
+            post(admin_notifications_commands),
+        )
+        .route("/admin/notifications/log", get(admin_notifications_log))
         .route("/admin/analytics", get(admin_analytics))
         .route("/admin/limits", get(admin_limits))
         .route("/admin/update", get(admin_update).post(admin_update_apply))
@@ -1556,6 +1572,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/auth/reauth-notify",
             post(admin_auth_reauth_notify),
         )
+        .route("/admin/auth/reauth/start", post(admin_auth_reauth_start))
+        .route("/admin/auth/reauth/submit", post(admin_auth_reauth_submit))
+        .route("/admin/auth/reauth/status", get(admin_auth_reauth_status))
         .route(
             "/admin/auth/reauth-cancel",
             post(admin_auth_reauth_cancel),
@@ -1643,6 +1662,79 @@ async fn admin_notifications(State(state): State<Arc<AppState>>) -> Response {
         .map(|notifications| notifications.admin_view())
         .unwrap_or_else(|_| json!({"channels": [], "error": "notification status unavailable"}));
     axum::Json(view).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationCommandsRequest {
+    channel_id: String,
+    allow_commands: bool,
+}
+
+async fn admin_notifications_commands(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<NotificationCommandsRequest>,
+) -> Response {
+    let channel_id = request.channel_id.trim();
+    if channel_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "channel_id must not be empty");
+    }
+    let mut settings = match state.notification_settings.read() {
+        Ok(settings) => settings.clone(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notification settings unavailable",
+            )
+        }
+    };
+    let Some(channel) = settings
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id.as_deref() == Some(channel_id))
+    else {
+        return error_response(StatusCode::NOT_FOUND, "notification channel not found");
+    };
+    if !matches!(channel.format, notify::WebhookFormat::Telegram) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "commands are supported only for Telegram channels",
+        );
+    }
+    channel.allow_commands = request.allow_commands;
+    if let Err(response) = persist_and_apply_notifications(&state, settings) {
+        return response;
+    }
+    let updated = state
+        .notifications
+        .read()
+        .ok()
+        .map(|dispatcher| dispatcher.admin_view())
+        .and_then(|view| view["channels"].as_array().cloned())
+        .and_then(|channels| {
+            channels
+                .into_iter()
+                .find(|channel| channel["id"] == channel_id)
+        });
+    axum::Json(json!({"ok": true, "channel": updated})).into_response()
+}
+
+async fn admin_notifications_log(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match query.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(200),
+            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be positive"),
+        },
+        None => 50,
+    };
+    let messages = state
+        .notifications
+        .read()
+        .map(|dispatcher| dispatcher.recent_messages(limit))
+        .unwrap_or_default();
+    axum::Json(json!({"messages": messages})).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2005,6 +2097,7 @@ async fn admin_notifications_test(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
 ) -> Response {
+    let channel_id = body.0.get("channel_id").and_then(Value::as_str);
     let channel = match body.0.get("channel") {
         None | Some(Value::Null) => None,
         Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
@@ -2051,7 +2144,22 @@ async fn admin_notifications_test(
             )
         }
     };
-    axum::Json(json!({"channels": dispatcher.test(channel, now_ms()).await})).into_response()
+    let channel = match (channel, channel_id) {
+        (Some(index), _) => Some(index),
+        (None, Some(id)) => match dispatcher.channel_index(id) {
+            Some(index) => Some(index),
+            None => return error_response(StatusCode::NOT_FOUND, "notification channel not found"),
+        },
+        (None, None) => None,
+    };
+    let category = body.0["category"]
+        .as_str()
+        .filter(|category| !category.trim().is_empty())
+        .unwrap_or("test");
+    axum::Json(json!({
+        "channels": dispatcher.test_category(channel, category, now_ms()).await
+    }))
+    .into_response()
 }
 
 async fn admin_reset(
@@ -2484,12 +2592,103 @@ async fn admin_auth_reauth_notify(
         Some(channel_id) => {
             start_reauth_for_command(&state, provider, &account, channel_id, force).await
         }
-        None => start_reauth_and_notify(&state, provider, &account, force).await,
+        None => start_user_reauth_and_notify(&state, provider, &account, force).await,
     };
     match result {
         Ok(result) => axum::Json(result).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+async fn admin_auth_reauth_start(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(provider_name) = body.0["provider"].as_str() else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'provider'");
+    };
+    let Some(provider) = Provider::from_str_loose(provider_name) else {
+        return error_response(StatusCode::BAD_REQUEST, "unknown provider");
+    };
+    let account_id = body.0["account_id"].as_str();
+    let account = state.vault.list().await.into_iter().find(|account| {
+        account.provider == provider
+            && account.kind == "oauth"
+            && account_id.is_none_or(|wanted| account.id == wanted)
+    });
+    let Some(account) = account else {
+        return error_response(StatusCode::NOT_FOUND, "no matching managed OAuth account");
+    };
+    let force = body.0["force"].as_bool().unwrap_or(false);
+    let notify = body.0["notify"].as_bool().unwrap_or(false);
+    let result = if notify {
+        start_user_reauth_and_notify(&state, provider, &account, force).await
+    } else {
+        start_reauth_without_notification(&state, provider, &account, force).await
+    };
+    match result {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_auth_reauth_submit(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let Some(input) = body.0["input"].as_str().filter(|input| !input.trim().is_empty()) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'input'");
+    };
+    let provider = match body.0["provider"].as_str() {
+        Some(name) => match Provider::from_str_loose(name) {
+            Some(provider) => Some(provider),
+            None => return error_response(StatusCode::BAD_REQUEST, "unknown provider"),
+        },
+        None => None,
+    };
+    match complete_pending_reauth(&state, provider, input).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_auth_reauth_status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let provider = match query.get("provider") {
+        Some(name) => match Provider::from_str_loose(name) {
+            Some(provider) => Some(provider),
+            None => return error_response(StatusCode::BAD_REQUEST, "unknown provider"),
+        },
+        None => None,
+    };
+    let active: Vec<(ReauthLoginKey, String)> = state
+        .reauth_logins
+        .lock()
+        .await
+        .entries
+        .iter()
+        .filter_map(|(key, slot)| match slot {
+            ReauthLoginSlot::Active { login_id, .. }
+                if provider.is_none_or(|wanted| wanted == key.provider) =>
+            {
+                Some((key.clone(), login_id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut sessions = Vec::new();
+    for (key, login_id) in active {
+        if let Some(mut snapshot) = state.logins.status(&login_id).await {
+            snapshot["account_id"] = json!(key.account_id);
+            snapshot["age_ms"] = json!(now_ms().saturating_sub(
+                snapshot["created_ms"].as_i64().unwrap_or_else(now_ms)
+            ));
+            sessions.push(snapshot);
+        }
+    }
+    axum::Json(json!({"sessions": sessions})).into_response()
 }
 
 async fn admin_auth_reauth_cancel(
@@ -11049,7 +11248,36 @@ pub async fn start_reauth_and_notify(
     account: &Account,
     force: bool,
 ) -> std::result::Result<Value, String> {
-    start_reauth_inner(state, provider, account, None, force).await
+    start_reauth_inner(state, provider, account, None, true, false, false, force).await
+}
+
+pub async fn start_user_reauth_and_notify(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+    force: bool,
+) -> std::result::Result<Value, String> {
+    let commands_enabled = enable_reauth_commands(state)?;
+    start_reauth_inner(
+        state,
+        provider,
+        account,
+        None,
+        true,
+        commands_enabled,
+        true,
+        force,
+    )
+    .await
+}
+
+pub async fn start_reauth_without_notification(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+    force: bool,
+) -> std::result::Result<Value, String> {
+    start_reauth_inner(state, provider, account, None, false, false, false, force).await
 }
 
 /// Start or reuse a re-auth session for one command-enabled Telegram channel.
@@ -11070,7 +11298,17 @@ pub async fn start_reauth_for_command(
     if !allowed {
         return Err("telegram command channel is not enabled".into());
     }
-    start_reauth_inner(state, provider, account, Some(channel_id), force).await
+    start_reauth_inner(
+        state,
+        provider,
+        account,
+        Some(channel_id),
+        false,
+        false,
+        false,
+        force,
+    )
+    .await
 }
 
 async fn start_reauth_inner(
@@ -11078,22 +11316,19 @@ async fn start_reauth_inner(
     provider: Provider,
     account: &Account,
     command_channel_id: Option<&str>,
+    notify: bool,
+    commands_enabled_note: bool,
+    resend_reused: bool,
     force: bool,
 ) -> std::result::Result<Value, String> {
     if account.provider != provider || account.kind != "oauth" {
         return Err("re-authentication requires the matching managed OAuth account".into());
     }
-    if command_channel_id.is_none() {
+    if notify {
         let telegram_enabled = state
             .notifications
             .read()
-            .map(|notifications| {
-                if provider == Provider::Anthropic {
-                    notifications.has_enabled_command_telegram()
-                } else {
-                    notifications.has_enabled_telegram()
-                }
-            })
+            .map(|notifications| notifications.has_enabled_telegram())
             .unwrap_or(false);
         if !telegram_enabled {
             emit_plain_reauth_notification_for_account(state, account);
@@ -11138,7 +11373,28 @@ async fn start_reauth_inner(
                             now_ms(),
                         );
                     }
-                    return Ok(reauth_notify_result(snapshot, false, true, false));
+                    let notified = if notify && resend_reused {
+                        match snapshot.as_ref() {
+                            Some(snapshot) => notify_reauth_snapshot(
+                                state,
+                                provider,
+                                account,
+                                &key,
+                                snapshot,
+                                commands_enabled_note,
+                            )
+                            .await?,
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    return Ok(reauth_notify_result(
+                        snapshot,
+                        notified,
+                        true,
+                        notify && resend_reused && !notified,
+                    ));
                 }
                 let generation = {
                     let mut tracker = state.reauth_logins.lock().await;
@@ -11175,6 +11431,9 @@ async fn start_reauth_inner(
             if abandoned {
                 emit_plain_reauth_notification_for_account(state, account);
             }
+            if let Ok(notifications) = state.notifications.read() {
+                notifications.record_reauth_error("re-authentication start failed");
+            }
             return Err(error.to_string());
         }
     };
@@ -11186,6 +11445,9 @@ async fn start_reauth_inner(
             .abandon(&key, generation);
         if abandoned {
             emit_plain_reauth_notification_for_account(state, account);
+        }
+        if let Ok(notifications) = state.notifications.read() {
+            notifications.record_reauth_error("login session omitted login_id");
         }
         return Err("login session omitted login_id".into());
     };
@@ -11203,11 +11465,14 @@ async fn start_reauth_inner(
         return Err("re-authentication start was cancelled or superseded".into());
     }
 
-    let Some(url) = snapshot["verification_uri_complete"]
+    let Some(_url) = snapshot["verification_uri_complete"]
         .as_str()
         .filter(|url| !url.trim().is_empty())
     else {
         emit_plain_reauth_notification_for_account(state, account);
+        if let Ok(notifications) = state.notifications.read() {
+            notifications.record_reauth_error("login session omitted authorization link");
+        }
         return Err("login session omitted verification_uri_complete".into());
     };
     if let Some(channel_id) = command_channel_id {
@@ -11220,9 +11485,52 @@ async fn start_reauth_inner(
         return Ok(reauth_notify_result(Some(snapshot), false, false, false));
     }
 
+    if !notify {
+        return Ok(reauth_notify_result(Some(snapshot), false, false, false));
+    }
+
+    let notified = notify_reauth_snapshot(
+        state,
+        provider,
+        account,
+        &key,
+        &snapshot,
+        commands_enabled_note,
+    )
+    .await?;
+    Ok(reauth_notify_result(
+        Some(snapshot),
+        notified,
+        false,
+        !notified,
+    ))
+}
+
+async fn notify_reauth_snapshot(
+    state: &Arc<AppState>,
+    provider: Provider,
+    account: &Account,
+    key: &ReauthLoginKey,
+    snapshot: &Value,
+    commands_enabled_note: bool,
+) -> std::result::Result<bool, String> {
+    let Some(url) = snapshot["verification_uri_complete"]
+        .as_str()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        if let Ok(notifications) = state.notifications.read() {
+            notifications.record_reauth_error("login session omitted authorization link");
+        }
+        return Err("login session omitted verification_uri_complete".into());
+    };
     let label = reauth_account_label(account);
     let title = format!("{} needs re-authentication", provider.as_str());
-    let body = reauth_link_body(snapshot["mode"].as_str(), &label, url);
+    let body = reauth_link_body(
+        snapshot["mode"].as_str(),
+        &label,
+        url,
+        commands_enabled_note,
+    );
     let notification_account = notify::NotificationAccount {
         provider: provider.as_str().into(),
         label: Some(label),
@@ -11237,30 +11545,62 @@ async fn start_reauth_inner(
     if snapshot["mode"].as_str() == Some("paste") {
         let mut tracker = state.reauth_logins.lock().await;
         for channel_id in &delivery.command_channel_ids {
-            tracker.bind_awaiting_paste(channel_id, &key, &snapshot, now_ms());
+            tracker.bind_awaiting_paste(channel_id, key, snapshot, now_ms());
         }
     }
     if !delivery.scheduled {
         emit_plain_reauth_notification_for_account(state, account);
     }
-    Ok(reauth_notify_result(
-        Some(snapshot),
-        delivery.scheduled,
-        false,
-        !delivery.scheduled,
-    ))
+    Ok(delivery.scheduled)
 }
 
-fn reauth_link_body(mode: Option<&str>, label: &str, url: &str) -> String {
+fn reauth_link_body(
+    mode: Option<&str>,
+    label: &str,
+    url: &str,
+    commands_enabled_note: bool,
+) -> String {
     if mode == Some("paste") {
+        let note = if commands_enabled_note {
+            " Commands enabled so you can paste the code back."
+        } else {
+            ""
+        };
         format!(
-            "Tap this link to re-authenticate {label}:\n{url}\n\nAfter approving, paste the code#state here."
+            "Tap this link to re-authenticate {label}:\n{url}\n\nAfter approving, paste the code#state here.{note}"
         )
     } else {
         format!(
             "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
         )
     }
+}
+
+fn enable_reauth_commands(state: &Arc<AppState>) -> std::result::Result<bool, String> {
+    let mut settings = state
+        .notification_settings
+        .read()
+        .map_err(|_| "notification settings unavailable".to_string())?
+        .clone();
+    let mut changed = false;
+    for channel in &mut settings.channels {
+        let receives_reauth = matches!(channel.format, notify::WebhookFormat::Telegram)
+            && notify::NotificationLevel::Warn >= channel.min_level
+            && (channel.categories.is_empty()
+                || channel.categories.iter().any(|category| category == "reauth"));
+        if receives_reauth && !channel.allow_commands {
+            channel.allow_commands = true;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let persister = notification_persister(state)
+        .ok_or_else(|| "notification persistence is not configured".to_string())?;
+    persister.persist(&settings)?;
+    set_notifications(state, settings);
+    Ok(true)
 }
 
 /// Complete the paste-mode session bound to a command channel. The submitted
@@ -11324,6 +11664,57 @@ pub async fn complete_reauth_code(
         "ok": false,
         "provider": awaiting.provider.as_str(),
         "error": error,
+    }))
+}
+
+async fn complete_pending_reauth(
+    state: &Arc<AppState>,
+    provider: Option<Provider>,
+    input: &str,
+) -> std::result::Result<Value, String> {
+    let active: Vec<(ReauthLoginKey, String, i64)> = state
+        .reauth_logins
+        .lock()
+        .await
+        .entries
+        .iter()
+        .filter_map(|(key, slot)| match slot {
+            ReauthLoginSlot::Active {
+                login_id,
+                expires_at_ms,
+                ..
+            } if provider.is_none_or(|wanted| wanted == key.provider) => {
+                Some((key.clone(), login_id.clone(), *expires_at_ms))
+            }
+            _ => None,
+        })
+        .collect();
+    if active.is_empty() {
+        return Err("no pending re-authentication session".into());
+    }
+    if active.len() > 1 {
+        return Err("multiple sessions are pending; specify provider".into());
+    }
+    let (key, login_id, expires_at_ms) = active.into_iter().next().unwrap();
+    if expires_at_ms <= now_ms() {
+        abandon_reauth_session(state, &key, false).await;
+        return Ok(json!({"ok": false, "expired": true, "provider": key.provider.as_str()}));
+    }
+    let snapshot = state
+        .logins
+        .complete(state.vault.clone(), &login_id, input)
+        .await
+        .map_err(|_| "re-authentication session expired or is unavailable".to_string())?;
+    if snapshot["state"].as_str() == Some("done") {
+        clear_active_reauth(state, &key.account_id).await;
+        mark_account_needs_reauth(state, &key.account_id, false).await;
+        return Ok(json!({"ok": true, "provider": key.provider.as_str()}));
+    }
+    Ok(json!({
+        "ok": false,
+        "expired": false,
+        "provider": key.provider.as_str(),
+        "error": redacted_paste_error(snapshot["error"].as_str()),
     }))
 }
 
@@ -11520,9 +11911,9 @@ mod tests {
 
     #[test]
     fn reauth_link_instructions_branch_without_changing_device_wording() {
-        let paste = reauth_link_body(Some("paste"), "work", "https://auth.test");
+        let paste = reauth_link_body(Some("paste"), "work", "https://auth.test", false);
         assert!(paste.contains("After approving, paste the code#state here."));
-        let device = reauth_link_body(Some("device"), "work", "https://auth.test");
+        let device = reauth_link_body(Some("device"), "work", "https://auth.test", false);
         assert!(device.contains(
             "Alexandria is waiting for authorization and will finish automatically."
         ));
@@ -11546,7 +11937,7 @@ mod tests {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if attempt == 0 {
-                    anyhow::bail!("token exchange failed: SECRET_RESPONSE_BODY")
+                    anyhow::bail!("OAuth state mismatch: SECRET_RESPONSE_BODY")
                 }
                 Ok("anthropic-oauth-work".to_string())
             })
@@ -11732,13 +12123,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(reused["reused"], true);
-        assert_eq!(reused["notification_sent"], false);
+        assert_eq!(reused["notification_sent"], true);
         let first_login_id = reused["login_id"].as_str().unwrap().to_string();
         let first_url = reused["verification_uri_complete"]
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(received.lock().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if received.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("user-requested re-auth did not resend the reusable link");
 
         let forced_request = axum::http::Request::post("/admin/auth/reauth-notify")
             .header("content-type", "application/json")
@@ -11770,7 +12170,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if received.lock().unwrap().len() >= 2 {
+                if received.lock().unwrap().len() >= 3 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -11779,8 +12179,8 @@ mod tests {
         .await
         .expect("forced re-auth link was not sent");
         let events = received.lock().unwrap();
-        let forced_message = events[1]["text"].as_str().unwrap();
-        assert_ne!(events[1], first_message);
+        let forced_message = events[2]["text"].as_str().unwrap();
+        assert_ne!(events[2], first_message);
         assert!(forced_message.contains(forced_url));
         drop(events);
         sink.abort();
@@ -16152,6 +16552,343 @@ mod tests {
             .channels
             .is_empty());
         sink.abort();
+    }
+
+    #[tokio::test]
+    async fn notification_commands_endpoint_is_key_gated_persisted_and_reversible() {
+        use tower::ServiceExt;
+
+        let state = test_state("notification-command-toggle");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url: "http://127.0.0.1:1/send".into(),
+                    chat_id: Some("42".into()),
+                    allow_commands: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let payload = json!({"channel_id": "control", "allow_commands": true}).to_string();
+        let unauthorized = axum::http::Request::post("/admin/notifications/commands")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.clone()))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let enabled = axum::http::Request::post("/admin/notifications/commands")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(payload))
+            .unwrap();
+        let (status, body) = response_json(router(state.clone()).oneshot(enabled).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"]["allow_commands"], true);
+        assert!(state.notifications.read().unwrap().has_command_channel("control"));
+
+        let disabled = admin_notifications_commands(
+            State(state.clone()),
+            axum::Json(NotificationCommandsRequest {
+                channel_id: "control".into(),
+                allow_commands: false,
+            }),
+        )
+        .await;
+        let (status, body) = response_json(disabled).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"]["allow_commands"], false);
+        assert!(!state.notifications.read().unwrap().has_command_channel("control"));
+        let persisted = persister.settings.lock().unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted[0].channels[0].allow_commands);
+        assert!(!persisted[1].channels[0].allow_commands);
+    }
+
+    #[tokio::test]
+    async fn saved_channel_test_uses_persisted_delivery_target_and_records_category() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("saved-channel-test");
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("saved".into()),
+                    url,
+                    token: Some("stored-not-reentered".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let (status, body) = response_json(
+            admin_notifications_test(
+                State(state.clone()),
+                axum::Json(json!({"channel_id": "saved", "category": "reauth"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channels"][0]["id"], "saved");
+        assert_eq!(body["channels"][0]["ok"], true);
+        assert_eq!(received.lock().unwrap()[0]["category"], "reauth");
+        let log = state.notifications.read().unwrap().recent_messages(10);
+        assert_eq!(log.last().unwrap().kind, "reauth");
+        assert!(!serde_json::to_string(&log)
+            .unwrap()
+            .contains("stored-not-reentered"));
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn user_reauth_auto_enables_commands_and_sends_link_without_plain_fallback() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("reauth-auto-enable-commands");
+        let persister = Arc::new(RecordingNotificationPersister::default());
+        set_notification_config_persister(&state, persister.clone());
+        let account = anthropic_account_full(
+            "anthropic-oauth-work",
+            "work",
+            "work@example.test",
+            now_ms() - 1,
+        );
+        state.vault.upsert(account.clone()).await.unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("control".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url,
+                    chat_id: Some("42".into()),
+                    allow_commands: false,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let started = start_user_reauth_and_notify(
+            &state,
+            Provider::Anthropic,
+            &account,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["notification_sent"], true);
+        assert_eq!(started["fallback"], false);
+        let event = first_event(&received, "user re-auth link was not delivered").await;
+        let text = event["text"].as_str().unwrap();
+        assert!(text.contains("https://claude.ai/oauth/authorize"));
+        assert!(text.contains("paste the code#state here"));
+        assert!(text.contains("Commands enabled so you can paste the code back"));
+        assert!(!text.contains("alex auth login anthropic"));
+        assert!(state.notifications.read().unwrap().has_command_channel("control"));
+        assert!(persister.settings.lock().unwrap()[0].channels[0].allow_commands);
+        assert!(matches!(
+            state
+                .reauth_logins
+                .lock()
+                .await
+                .awaiting_paste("control", now_ms()),
+            AwaitingPasteLookup::Pending(_)
+        ));
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn watchdog_reauth_with_commands_off_still_sends_clickable_link() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("watchdog-link-commands-off");
+        let account = anthropic_account_full(
+            "anthropic-oauth-watch-link",
+            "watch",
+            "watch@example.test",
+            now_ms() - 1,
+        );
+        state.vault.upsert(account.clone()).await.unwrap();
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("alerts".into()),
+                    format: notify::WebhookFormat::Telegram,
+                    url,
+                    chat_id: Some("42".into()),
+                    allow_commands: false,
+                    min_level: notify::NotificationLevel::Warn,
+                    categories: vec!["reauth".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let started = start_reauth_and_notify(
+            &state,
+            Provider::Anthropic,
+            &account,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["notification_sent"], true);
+        assert_eq!(started["fallback"], false);
+        let event = first_event(&received, "watchdog did not deliver authorization link").await;
+        let text = event["text"].as_str().unwrap();
+        assert!(text.contains("https://claude.ai/oauth/authorize"));
+        assert!(text.contains("paste the code#state here"));
+        assert!(!text.contains("alex auth login anthropic"));
+        assert!(!state.notifications.read().unwrap().has_command_channel("alerts"));
+        sink.abort();
+    }
+
+    #[tokio::test]
+    async fn notification_log_endpoint_is_key_gated_and_returns_redacted_messages() {
+        use tower::ServiceExt;
+
+        let state = test_state("notification-log-route");
+        state.notifications.read().unwrap().record_inbound(
+            "control",
+            "/code secret-code#secret-state",
+            false,
+            Some("bad bot123456:TOP_SECRET_TOKEN"),
+        );
+        let unauthorized = axum::http::Request::get("/admin/notifications/log?limit=5")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let authorized = axum::http::Request::get("/admin/notifications/log?limit=5")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state).oneshot(authorized).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        let encoded = body.to_string();
+        assert!(!encoded.contains("secret-code"));
+        assert!(!encoded.contains("secret-state"));
+        assert!(!encoded.contains("TOP_SECRET_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn reauth_admin_start_status_submit_handles_mismatch_success_and_expiry() {
+        use tower::ServiceExt;
+
+        let state = test_state("reauth-admin-cli-flow");
+        let account_id = "anthropic-oauth-cli";
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                account_id,
+                "cli",
+                "cli@example.test",
+                now_ms() - 1,
+            ))
+            .await
+            .unwrap();
+        state
+            .logins
+            .set_paste_code_exchanger(Arc::new(RetryPasteExchange {
+                attempts: AtomicUsize::new(0),
+                inputs: std::sync::Mutex::new(Vec::new()),
+            }));
+
+        let unauthorized = axum::http::Request::post("/admin/auth/reauth/start")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"provider": "anthropic"}).to_string()))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let started = axum::http::Request::post("/admin/auth/reauth/start")
+            .header("content-type", "application/json")
+            .header("x-api-key", "alx-local")
+            .body(Body::from(
+                json!({"provider": "anthropic", "notify": false}).to_string(),
+            ))
+            .unwrap();
+        let (status, started) =
+            response_json(router(state.clone()).oneshot(started).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(started["mode"], "paste");
+        assert!(started["verification_uri_complete"].as_str().is_some());
+
+        let status_request = axum::http::Request::get(
+            "/admin/auth/reauth/status?provider=anthropic",
+        )
+        .header("x-api-key", "alx-local")
+        .body(Body::empty())
+        .unwrap();
+        let (_, pending) =
+            response_json(router(state.clone()).oneshot(status_request).await.unwrap()).await;
+        assert_eq!(pending["sessions"][0]["login_id"], started["login_id"]);
+        assert_eq!(pending["sessions"][0]["mode"], "paste");
+        assert!(pending["sessions"][0]["age_ms"].as_i64().unwrap() >= 0);
+
+        let mismatched = admin_auth_reauth_submit(
+            State(state.clone()),
+            axum::Json(json!({"input": "wrong-code#wrong-state"})),
+        )
+        .await;
+        let (_, mismatched) = response_json(mismatched).await;
+        assert_eq!(mismatched["ok"], false);
+        assert!(mismatched["error"].as_str().unwrap().contains("state mismatch"));
+        assert!(!mismatched.to_string().contains("SECRET_RESPONSE_BODY"));
+
+        let completed = admin_auth_reauth_submit(
+            State(state.clone()),
+            axum::Json(json!({"input": "good-code#good-state"})),
+        )
+        .await;
+        let (_, completed) = response_json(completed).await;
+        assert_eq!(completed["ok"], true);
+
+        let account = state.vault.list().await.into_iter().next().unwrap();
+        start_reauth_without_notification(&state, Provider::Anthropic, &account, true)
+            .await
+            .unwrap();
+        for slot in state.reauth_logins.lock().await.entries.values_mut() {
+            if let ReauthLoginSlot::Active { expires_at_ms, .. } = slot {
+                *expires_at_ms = now_ms() - 1;
+            }
+        }
+        let expired = admin_auth_reauth_submit(
+            State(state.clone()),
+            axum::Json(json!({"input": "late-code#late-state"})),
+        )
+        .await;
+        let (_, expired) = response_json(expired).await;
+        assert_eq!(expired["ok"], false);
+        assert_eq!(expired["expired"], true);
     }
 
     #[tokio::test]
