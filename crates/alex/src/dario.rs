@@ -728,6 +728,10 @@ fn node_path_version(path: &Path) -> Vec<u64> {
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
+        // Same guard as harness detection: stat-ing network volumes or
+        // TCC-protected folders makes macOS prompt on every dario update
+        // check — the recurring "access files on a network volume" dialog.
+        .filter(|dir| crate::harness_connect::probe_safe_dir(dir))
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }

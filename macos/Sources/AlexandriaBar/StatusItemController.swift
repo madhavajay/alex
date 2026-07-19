@@ -941,30 +941,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if onboardingWindow == nil {
             onboardingWindow = OnboardingWindowController(
                 store: store,
-                authenticate: { [weak self] provider, completion in
-                    guard let self else { return }
-                    if provider == "openrouter" || provider == "exo" {
-                        self.openPreferences(section: .providers)
-                        let name = ProviderInfo.displayName(provider)
-                        completion(.failure(NSError(
-                            domain: "Alex.Onboarding.ProviderSetup", code: 1,
-                            userInfo: [NSLocalizedDescriptionKey:
-                                "\(name) uses its Settings setup instead of browser authentication. Complete it there, then skip this step to continue."])))
-                        return
-                    }
-                    self.authWindows.show(
-                        provider: provider,
-                        accountName: nil,
-                        autoIdentity: provider == "openai",
-                        store: self.store,
-                        onAuthenticated: { authenticatedProvider in
-                            completion(.success(authenticatedProvider))
-                        },
-                        onFailed: { message in
-                            completion(.failure(NSError(
-                                domain: "Alex.Onboarding.Authentication", code: 1,
-                                userInfo: [NSLocalizedDescriptionKey: message])))
-                        })
+                openProviderSettings: { [weak self] in
+                    self?.openPreferences(section: .providers)
                 },
                 openTraceBrowser: { [weak self] query in
                     self?.openTraceBrowser(query: query)

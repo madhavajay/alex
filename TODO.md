@@ -617,6 +617,15 @@ is still unimplemented against current `main` before picking it up.
 
 ### CLI
 - [ ] `alex doctor` — environment/health self-check command. *(confirmed missing)*
+- [ ] `alex resume <trace-id> <harness>` — cross-harness session resume: fetch the
+      chat log from a captured trace (request/response bodies are already stored),
+      reconstruct it as the target harness's native session/conversation format,
+      and launch that harness resumed into the conversation under a NEW trace id.
+      Link lineage with a header (e.g. `x-alexandria-resumed-from: <old-trace-id>`)
+      recorded on the new session's traces so the Trace Browser can show the
+      resume chain across harnesses. Open questions: per-harness session-file
+      formats (claude/codex/pi/kimi all differ), tool-call history fidelity, and
+      whether to also support `--model` to resume on a different provider.
 
 ### Credentials vault — remaining from the credentials plan (now `docs/credentials-plan.md`)
 - [ ] Token/dollar **budgets** per credential (per-day/week/month/lifetime) with auto-pause +

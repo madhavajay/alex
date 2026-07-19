@@ -23,50 +23,61 @@ final class OnboardingModel {
     static let completedDefaultsKey = "onboardingCompletedVersion"
     static let currentVersion = "1"
     static let stepTitles = [
-        "Meet Alex", "Pick a provider", "Pick a harness", "Your models are ready",
-        "Make your first request", "See it in the Trace Browser",
+        "Meet Alex", "Pick a provider", "Connect and test",
         "Credentials for any app", "Never lose a login", "Keep your agents running",
-        "Beyond single provider", "PAM",
+        "Beyond single provider", "PAM — Experimental",
     ]
 
     let store: SnapshotStore
-    let authenticate: @MainActor (String, @escaping @MainActor (Result<String, Error>) -> Void) -> Void
+    let openProviderSettings: @MainActor () -> Void
     let openTraceBrowser: @MainActor (String?) -> Void
     let finish: @MainActor () -> Void
 
     var step = 0
     var selectedProvider: String?
     var selectedHarness: String?
+    var authModel: AuthFlowModel?
     var providerState: OperationState = .idle
+    var harnessPlanState: OperationState = .idle
+    var harnessPlan: [HarnessPlanStep] = []
     var harnessState: OperationState = .idle
-    var models: [String] = []
-    var modelsLoading = false
+    var connectedModelsCount = 0
+    var exampleModel = OnboardingSupport.defaultExampleModel
+    var exampleModelLoading = false
     var traceState: OperationState = .idle
     var discoveredTrace: TraceSession?
+    var mintedOnboardingKey: MintedRunKey?
+    var onboardingKeyFingerprint: String?
+    var credentialMintState: OperationState = .idle
+    var credentialRunState: OperationState = .idle
+    var credentialResponseText: String?
     var troubleshootExpanded = false
     var checks: [Check] = []
     var checksRunning = false
     private var traceEnteredMs: Int64?
     private var pollTask: Task<Void, Never>?
+    private var lastRejectedSessionId: String?
 
     init(
         store: SnapshotStore,
-        authenticate: @escaping @MainActor (String, @escaping @MainActor (Result<String, Error>) -> Void) -> Void,
+        openProviderSettings: @escaping @MainActor () -> Void,
         openTraceBrowser: @escaping @MainActor (String?) -> Void,
         finish: @escaping @MainActor () -> Void
     ) {
         self.store = store
-        self.authenticate = authenticate
+        self.openProviderSettings = openProviderSettings
         self.openTraceBrowser = openTraceBrowser
         self.finish = finish
     }
 
-    var exampleModel: String {
-        models.first ?? OnboardingSupport.fallbackModels(for: selectedProvider).first!
-    }
-
     var connectableHarnesses: [Harness] {
         HarnessCatalog.rows(store.harnesses).filter { $0.installed && $0.supportsConnect }
+    }
+
+    var credentialsCurl: String? {
+        guard let key = mintedOnboardingKey else { return nil }
+        return OnboardingSupport.credentialsCurlExample(
+            baseURL: store.config?.baseURL, key: key.key, model: exampleModel)
     }
 
     var canAdvance: Bool {
@@ -75,50 +86,85 @@ final class OnboardingModel {
             if case .success = providerState { return true }
             return false
         case 2:
-            if case .success = harnessState { return true }
-            return false
-        case 4:
-            if case .success = traceState { return true }
             return false
         default: return true
         }
     }
 
     func chooseProvider(_ provider: String) {
+        authModel?.cancel()
         selectedProvider = provider
-        providerState = .working("Waiting for browser authorization…")
-        authenticate(provider) { [weak self] result in
-            guard let self, self.selectedProvider == provider else { return }
-            switch result {
-            case .success:
-                Task {
-                    await self.store.refresh()
-                    let account = self.store.accounts.last { $0.provider == provider }
-                    let identity = account?.email ?? account?.label ?? account?.name
-                        ?? ProviderInfo.displayName(provider)
-                    self.providerState = .success(identity)
-                    try? await Task.sleep(for: .milliseconds(650))
-                    if self.step == 1 { self.go(to: 2) }
-                }
-            case .failure(let error):
-                self.providerState = .failure(error.localizedDescription)
+        exampleModel = OnboardingSupport.exampleModel(for: provider)
+        if provider == "openrouter" || provider == "exo" {
+            authModel = nil
+            let name = ProviderInfo.displayName(provider)
+            providerState = .failure(
+                "\(name) is configured in Settings → Providers. Finish setup there, then skip this step to continue.")
+            openProviderSettings()
+            return
+        }
+        providerState = .working("Starting secure authorization…")
+        let auth = AuthFlowModel(
+            provider: provider, accountName: nil, autoIdentity: provider == "openai", store: store)
+        auth.onAuthenticated = { [weak self] authenticatedProvider in
+            guard let self, self.selectedProvider == authenticatedProvider else { return }
+            Task {
+                await self.store.refresh()
+                let account = self.store.accounts.last { $0.provider == authenticatedProvider }
+                let identity = account?.email ?? account?.label ?? account?.name
+                    ?? ProviderInfo.displayName(authenticatedProvider)
+                self.providerState = .success(identity)
             }
         }
+        auth.onFailed = { [weak self] message in self?.providerState = .failure(message) }
+        authModel = auth
+        auth.begin()
     }
 
-    func chooseHarness(_ harness: Harness) {
+    func selectHarness(_ harness: Harness) {
+        pollTask?.cancel()
         selectedHarness = harness.name
-        harnessState = .working("Connecting \(HarnessCatalog.displayName(harness.name))…")
+        harnessPlan = []
+        harnessState = .idle
+        connectedModelsCount = 0
+        traceState = .idle
+        discoveredTrace = nil
+        harnessPlanState = .working("Previewing changes…")
         guard let config = store.config else {
-            harnessState = .failure("The Alex daemon configuration is not available.")
+            harnessPlanState = .failure("The Alex daemon configuration is not available.")
             return
         }
         Task {
             do {
-                let response = try await AlexandriaClient(config: config).connectHarness(harness.name)
-                harnessState = .success("Connected · \(response.modelsTotal) models ready")
-                await store.refreshHarnesses(using: AlexandriaClient(config: config))
+                let response = try await AlexandriaClient(config: config).connectHarnessPlan(harness.name)
+                guard selectedHarness == harness.name else { return }
+                harnessPlan = response.plan
+                harnessPlanState = .success(OnboardingSupport.harnessInstallDescription(harness.name))
             } catch {
+                guard selectedHarness == harness.name else { return }
+                harnessPlanState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
+    func connectSelectedHarness() {
+        guard let harness = selectedHarness, let config = store.config else {
+            harnessState = .failure("Choose a harness and load its connection plan first.")
+            return
+        }
+        harnessState = .working("Connecting \(HarnessCatalog.displayName(harness))…")
+        Task {
+            do {
+                let client = AlexandriaClient(config: config)
+                let response = try await client.connectHarness(harness)
+                guard selectedHarness == harness else { return }
+                connectedModelsCount = response.modelsTotal
+                harnessState = .success("\(response.modelsTotal) models ready ✓")
+                await store.refreshHarnesses(using: client)
+                await loadExampleModel(using: client)
+                beginTracePolling()
+            } catch {
+                guard selectedHarness == harness else { return }
                 harnessState = .failure(error.localizedDescription)
             }
         }
@@ -139,10 +185,14 @@ final class OnboardingModel {
 
     func skipStep() {
         if step == 1 {
+            authModel?.cancel()
+            authModel = nil
             selectedProvider = nil
             providerState = .idle
         } else if step == 2 {
             selectedHarness = nil
+            harnessPlanState = .idle
+            harnessPlan = []
             harnessState = .idle
         }
         if step < Self.stepTitles.count - 1 { go(to: step + 1) }
@@ -160,28 +210,95 @@ final class OnboardingModel {
     func go(to next: Int) {
         pollTask?.cancel()
         step = min(max(next, 0), Self.stepTitles.count - 1)
-        if step == 3 { loadModels() }
-        if step == 4 { beginTracePolling() }
     }
 
-    func loadModels() {
-        modelsLoading = true
-        let fallback = OnboardingSupport.fallbackModels(for: selectedProvider)
+    private func loadExampleModel(using client: AlexandriaClient) async {
+        exampleModelLoading = true
+        defer { exampleModelLoading = false }
+        let openRouterExposed = selectedProvider == "openrouter"
+            ? (try? await client.openRouterExposed().exposed) ?? [] : []
+        let exoModels = selectedProvider == "exo"
+            ? (try? await client.exoModels()) ?? [] : []
+        exampleModel = OnboardingSupport.exampleModel(
+            for: selectedProvider,
+            openRouterExposed: openRouterExposed,
+            exoModels: exoModels)
+    }
+
+    func mintCredentialsDemoKey() {
+        guard !credentialMintState.isWorking else { return }
         guard let config = store.config else {
-            models = fallback
-            modelsLoading = false
+            credentialMintState = .failure("The Alex daemon configuration is not available.")
             return
         }
+        credentialMintState = .working("Minting a one-hour model-only key…")
+        credentialRunState = .idle
+        credentialResponseText = nil
         Task {
-            let fetched = try? await AlexandriaClient(config: config).modelCatalog()
-            let filtered = OnboardingSupport.models(fetched ?? [], for: selectedProvider)
-            models = filtered.isEmpty ? fallback : filtered
-            modelsLoading = false
+            do {
+                let client = AlexandriaClient(config: config)
+                await loadExampleModel(using: client)
+                let minted = try await client.mintRunKey(
+                    label: "onboarding", model: exampleModel, ttlSeconds: 3_600)
+                var fingerprint = minted.keyFingerprint
+                if fingerprint == nil {
+                    let inventory = try? await client.credentials()
+                    fingerprint = inventory?.inbound.runKeys
+                        .first(where: { $0.id == minted.id })?.keyFingerprint
+                }
+                mintedOnboardingKey = minted
+                onboardingKeyFingerprint = fingerprint
+                    ?? OnboardingSupport.runKeyFingerprint(minted.key)
+                credentialMintState = .success("One-hour onboarding key ready.")
+            } catch {
+                credentialMintState = .failure(error.localizedDescription)
+            }
         }
+    }
+
+    func runCredentialsDemo() {
+        guard !credentialRunState.isWorking else { return }
+        guard let config = store.config, let key = mintedOnboardingKey else {
+            credentialRunState = .failure("Mint the onboarding key first.")
+            return
+        }
+        credentialRunState = .working("Sending the request through Alex…")
+        credentialResponseText = nil
+        Task {
+            do {
+                var request = URLRequest(
+                    url: OnboardingSupport.credentialsDemoURL(baseURL: config.baseURL))
+                request.httpMethod = "POST"
+                request.timeoutInterval = 60
+                for header in OnboardingSupport.credentialsDemoHeaders(key: key.key) {
+                    request.setValue(header.value, forHTTPHeaderField: header.name)
+                }
+                request.httpBody = Data(
+                    OnboardingSupport.credentialsDemoBody(model: exampleModel).utf8)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let text = String(data: data, encoding: .utf8) ?? "<non-UTF-8 response>"
+                credentialResponseText = text
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(status) {
+                    credentialRunState = .success("Request completed · HTTP \(status)")
+                } else {
+                    credentialRunState = .failure("Request failed · HTTP \(status)")
+                }
+            } catch {
+                credentialResponseText = error.localizedDescription
+                credentialRunState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
+    func openCredentialsTrace() {
+        guard let onboardingKeyFingerprint else { return }
+        openTraceBrowser("key:\(onboardingKeyFingerprint)")
     }
 
     func beginTracePolling() {
         discoveredTrace = nil
+        lastRejectedSessionId = nil
         traceState = .working("Waiting for a new traced request…")
         traceEnteredMs = Int64(Date().timeIntervalSince1970 * 1_000)
         pollTask?.cancel()
@@ -204,10 +321,32 @@ final class OnboardingModel {
             .filter({ harness == nil || $0.harness?.lowercased() == harness })
             .max(by: { $0.lastTsMs < $1.lastTsMs })
         {
-            discoveredTrace = match
-            let model = match.models?.first ?? "alex model"
-            let tokens = (match.totalInputTokens ?? 0) + (match.totalOutputTokens ?? 0)
-            traceState = .success("\(model) · \(tokens) tokens")
+            let initial = OnboardingSupport.traceOutcome(
+                status: match.lastStatus, errorCount: match.errors, error: nil)
+            switch initial {
+            case .clean:
+                discoveredTrace = match
+                let model = match.models?.first ?? "alex model"
+                let tokens = (match.totalInputTokens ?? 0) + (match.totalOutputTokens ?? 0)
+                traceState = .success("\(model) · \(tokens) tokens")
+            case .rejected:
+                guard lastRejectedSessionId != match.sessionId else { return }
+                lastRejectedSessionId = match.sessionId
+                let transcript = try? await AlexandriaClient(config: config)
+                    .traceTranscript(sessionId: match.sessionId)
+                let rejectedTurn = transcript?.turns.reversed().first {
+                    ($0.status ?? 0) >= 400 || $0.error?.isEmpty == false
+                }
+                let detail = rejectedTurn?.error
+                    ?? rejectedTurn?.errorCode
+                    ?? match.statusLabel
+                if case .rejected(let message) = OnboardingSupport.traceOutcome(
+                    status: match.lastStatus, errorCount: match.errors, error: detail)
+                {
+                    traceState = .failure(
+                        "Your request reached Alex but the provider rejected it: \(message)")
+                }
+            }
         }
     }
 
@@ -262,9 +401,13 @@ final class OnboardingModel {
 
     func openBrowser() {
         openTraceBrowser(selectedHarness.map { "harness:\($0)" })
+        if step == 2 { go(to: 3) }
     }
 
-    func cancel() { pollTask?.cancel() }
+    func cancel() {
+        pollTask?.cancel()
+        authModel?.cancel()
+    }
 }
 
 struct OnboardingView: View {
@@ -314,14 +457,11 @@ struct OnboardingView: View {
         switch model.step {
         case 0: meetAlex
         case 1: providerPicker
-        case 2: harnessPicker
-        case 3: modelsReady
-        case 4: firstRequest
-        case 5: traceBrowser
-        case 6: credentials
-        case 7: notifications
-        case 8: failover
-        case 9: beyondSingleProvider
+        case 2: stagedConnect
+        case 3: credentials
+        case 4: notifications
+        case 5: failover
+        case 6: beyondSingleProvider
         default: pam
         }
     }
@@ -347,7 +487,7 @@ struct OnboardingView: View {
 
     private var providerPicker: some View {
         VStack(alignment: .leading, spacing: 16) {
-            intro("Connect a real provider", "Choose a provider. Alex opens its normal secure authentication flow and waits for the account to arrive.")
+            intro("Connect a real provider", "Choose a provider and complete its secure authentication here. You can skip for now at any point.")
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                 ForEach(ProviderInfo.supportedProviders, id: \.self) { provider in
                     choiceButton(
@@ -357,61 +497,103 @@ struct OnboardingView: View {
                     ) { model.chooseProvider(provider) }
                 }
             }
-            operation(model.providerState)
+            if let authModel = model.authModel {
+                AuthFlowView(model: authModel, close: {}, embedded: true)
+                    .padding(.top, 4)
+                    .cardStyle()
+            } else {
+                operation(model.providerState)
+            }
         }
     }
 
-    private var harnessPicker: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            intro("Connect a harness", "Alex writes the same managed configuration used by Settings → Harnesses.")
+    private var stagedConnect: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            intro("Connect, test, and inspect", "Complete each stage to unlock the next. Finished stages collapse so your current action stays in view.")
+            stageOne
+            stageTwo
+            stageThree
+        }
+    }
+
+    private var stageOne: some View {
+        stageCard(number: 1, title: "Pick your harness", completed: model.harnessState.isSuccess,
+                  summary: model.harnessState.message) {
             if model.connectableHarnesses.isEmpty {
                 statusCard(icon: "terminal", tint: AlexTheme.Colors.warningOrange,
-                           text: "No installed, connectable harnesses were detected. You can skip this step and continue with generic examples.")
+                           text: "No installed, connectable harnesses were detected. You can skip this page and continue.")
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 8)], spacing: 8) {
                     ForEach(model.connectableHarnesses) { harness in
                         choiceButton(
                             title: HarnessCatalog.displayName(harness.name),
-                            subtitle: harness.connected ? "Reconnect" : "Connect",
+                            subtitle: harness.name == model.selectedHarness ? "Plan loaded" : "Preview plan",
                             icon: harness.name, selected: harness.name == model.selectedHarness
-                        ) { model.chooseHarness(harness) }
+                        ) { model.selectHarness(harness) }
                     }
                 }
             }
-            operation(model.harnessState)
+            operation(model.harnessPlanState)
+            if model.harnessPlanState.isSuccess {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("FILES CHANGED")
+                        .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
+                    if model.harnessPlan.isEmpty {
+                        Text("No file changes are needed; Connect will refresh the harness model list.")
+                            .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    ForEach(model.harnessPlan) { item in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 7) {
+                                Text(item.action.uppercased())
+                                    .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.primary)
+                                Text(item.path).font(AlexTheme.Fonts.mono(11)).textSelection(.enabled)
+                            }
+                            Text(item.detail).font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                        }
+                    }
+                    PillButton(
+                        title: "Connect", variant: .solidAccent, systemImage: "link",
+                        isEnabled: model.harnessPlanState.isSuccess && !model.harnessState.isWorking,
+                        isBusy: model.harnessState.isWorking
+                    ) { model.connectSelectedHarness() }
+                    operation(model.harnessState)
+                }
+                .padding(12).cardStyle()
+            }
         }
     }
 
-    private var modelsReady: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            intro("Your models are ready", "Connected models appear inside your harness with the alex/ prefix.")
-            if model.modelsLoading { ProgressView("Loading Alex's live model catalog…") }
-            else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.models.isEmpty ? OnboardingSupport.fallbackModels(for: model.selectedProvider) : model.models, id: \.self) { name in
-                        HStack { Image(systemName: "checkmark.circle.fill").foregroundStyle(AlexTheme.Colors.success); Text(name).font(AlexTheme.Fonts.mono(13)) }
-                    }
-                }
-                .padding(16).cardStyle()
+    private var stageTwo: some View {
+        stageCard(number: 2, title: "Send a test request", completed: model.traceState.isSuccess,
+                  summary: model.traceState.message, locked: !model.harnessState.isSuccess) {
+            if model.exampleModelLoading {
+                ProgressView("Choosing the verified example model…")
+            } else {
                 Text(OnboardingSupport.modelHint(harness: model.selectedHarness, model: model.exampleModel))
                     .font(.system(size: 13)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                CopyableCode(value: OnboardingSupport.testCommand(
+                    harness: model.selectedHarness, model: model.exampleModel))
             }
-        }
-        .onAppear { if model.models.isEmpty { model.loadModels() } }
-    }
-
-    private var firstRequest: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            intro("Make your first request", "Open your harness, choose an alex/* model, and send any prompt. This page will notice the new trace automatically.")
-            HStack(spacing: 12) {
-                if case .success = model.traceState { Image(systemName: "checkmark.circle.fill").foregroundStyle(AlexTheme.Colors.success).font(.system(size: 28)) }
-                else { ProgressView().controlSize(.regular) }
+            HStack(spacing: 10) {
+                if model.traceState.isSuccess {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(AlexTheme.Colors.success)
+                } else if model.traceState.isFailure {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(AlexTheme.Colors.destructive)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
                 operationText(model.traceState)
-            }.padding(16).cardStyle()
-            PillButton(title: "Troubleshoot", variant: .bordered, systemImage: "wrench.and.screwdriver", isBusy: model.checksRunning) { model.runTroubleshooting() }
+            }
+            .padding(12).cardStyle()
+            if model.traceState.isFailure {
+                PillButton(title: "Troubleshoot", variant: .bordered,
+                           systemImage: "wrench.and.screwdriver", isBusy: model.checksRunning) {
+                    model.runTroubleshooting()
+                }
+            }
             if model.troubleshootExpanded { troubleshootPanel }
         }
-        .onAppear { if case .idle = model.traceState { model.beginTracePolling() } }
     }
 
     private var troubleshootPanel: some View {
@@ -430,37 +612,134 @@ struct OnboardingView: View {
         }.padding(14).cardStyle()
     }
 
-    private var traceBrowser: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            intro("See it in the Trace Browser", "Inspect requests, responses, model routing, tokens, costs, and errors in the real Trace Browser.")
-            PillButton(title: "Open Trace Browser", variant: .solidAccent, systemImage: "list.bullet.rectangle") { model.openBrowser() }
-            if let harness = model.selectedHarness {
-                Text("The browser opens pre-filtered with `harness:\(harness)`.").font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textTertiary)
-            } else {
-                Text("Because the harness step was skipped, the browser opens without a harness filter.").font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textTertiary)
+    private var stageThree: some View {
+        stageCard(number: 3, title: "See your trace", completed: false, summary: nil,
+                  locked: !model.traceState.isSuccess) {
+            if let trace = model.discoveredTrace {
+                traceSummary(trace)
+                PillButton(title: "Open Trace Browser", variant: .solidAccent,
+                           systemImage: "list.bullet.rectangle") { model.openBrowser() }
+                Text(model.selectedHarness.map { "Opens filtered with `harness:\($0)`." }
+                     ?? "Opens without a harness filter.")
+                    .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textTertiary)
             }
         }
     }
 
     private var credentials: some View {
         VStack(alignment: .leading, spacing: 14) {
-            intro("Credentials for any app", "Settings → Credentials can mint scoped, model-only keys for any application that speaks one of Alex's client APIs.")
+            intro("Credentials for any app", "Settings → Credentials can mint scoped, model-only keys for any application.")
             VStack(alignment: .leading, spacing: 7) {
+                Text("APIs your app can speak")
+                    .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
                 api("Anthropic Messages", "POST /v1/messages")
-                api("OpenAI Chat Completions", "POST /v1/chat/completions")
+                api("OpenAI Chat", "POST /v1/chat/completions")
                 api("OpenAI Responses", "POST /v1/responses")
                 api("Gemini generateContent", "POST /v1beta/models/{model}:generateContent")
             }.padding(14).cardStyle()
-            ForEach(OnboardingSupport.environmentSnippets(baseURL: model.store.config?.baseURL), id: \.self) { CopyableCode(value: $0) }
-            Text("Scoped keys are revocable and auditable in the Credentials table.")
-                .font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary)
+            VStack(alignment: .leading, spacing: 9) {
+                Text("Models you reach through them")
+                    .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 76), spacing: 7)], spacing: 7) {
+                    ForEach(["Claude", "GPT/Codex", "Gemini", "Grok", "Kimi", "OpenRouter", "Exo", "Amp"], id: \.self) { name in
+                        Text(name)
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 9).padding(.vertical, 5)
+                            .background(Capsule().fill(AlexTheme.Colors.primary.opacity(0.10)))
+                            .overlay(Capsule().strokeBorder(AlexTheme.Colors.primary.opacity(0.25)))
+                    }
+                }
+                Text("Your app speaks one of these formats — Alex routes it to any provider's models.")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(AlexTheme.Colors.foreground)
+            }.padding(14).cardStyle()
+            credentialsDemo
+        }
+    }
+
+    @ViewBuilder private var credentialsDemo: some View {
+        if let curl = model.credentialsCurl, let key = model.mintedOnboardingKey {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("ONE-HOUR MODEL-ONLY KEY")
+                            .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.success)
+                        Text("Scoped to \(model.exampleModel) · label onboarding")
+                            .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    Spacer()
+                    Text(key.expiresMs == nil ? "1 hour" : "expires in 1 hour")
+                        .font(AlexTheme.Fonts.metaLabel).foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                ScrollView(.horizontal) {
+                    Text(curl)
+                        .font(AlexTheme.Fonts.mono(10.5))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                    .fill(AlexTheme.Colors.consoleBackground))
+                optionalHeader("x-session-id: my-first-session", "groups requests into one session")
+                optionalHeader("x-alexandria-task: quickstart", "tags the trace with a task name")
+                optionalHeader("x-alexandria-kind: experiment", "labels the kind of work")
+                Text("All three tagging headers are optional and Alex strips them before forwarding the request upstream.")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                HStack(spacing: 8) {
+                    PillButton(title: "Copy", variant: .bordered, systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(curl, forType: .string)
+                    }
+                    PillButton(
+                        title: "Run", variant: .solidAccent, systemImage: "play.fill",
+                        isEnabled: !model.credentialRunState.isWorking,
+                        isBusy: model.credentialRunState.isWorking
+                    ) { model.runCredentialsDemo() }
+                    if model.credentialRunState.isTerminal,
+                       model.onboardingKeyFingerprint != nil
+                    {
+                        PillButton(
+                            title: "Show in Trace Browser", variant: .bordered,
+                            systemImage: "magnifyingglass"
+                        ) { model.openCredentialsTrace() }
+                    }
+                }
+                operation(model.credentialRunState)
+                if let response = model.credentialResponseText {
+                    Text(response)
+                        .font(AlexTheme.Fonts.mono(10.5))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                        .textSelection(.enabled)
+                        .lineLimit(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                            .fill(AlexTheme.Colors.consoleBackground))
+                }
+            }
+            .padding(14).cardStyle()
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Mint a real one-hour key to try Alex from any OpenAI-compatible app.")
+                    .font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary)
+                PillButton(
+                    title: "Mint onboarding key", variant: .solidAccent, systemImage: "key",
+                    isEnabled: !model.credentialMintState.isWorking,
+                    isBusy: model.credentialMintState.isWorking
+                ) { model.mintCredentialsDemoKey() }
+                operation(model.credentialMintState)
+                Text("Scoped keys are revocable and auditable in Settings → Credentials.")
+                    .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+            .padding(14).cardStyle()
         }
     }
 
     private var notifications: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "paperplane.circle.fill").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.primary)
-            intro("Never lose a login", "Connect Telegram in Settings → Notifications. Alex alerts you when a credential needs re-authenticating, and you can reply from your phone to re-auth.")
+            intro("Never lose a login", "Alex detects when your credentials need re-authenticating and can message you to refresh them — or simply switch models for you.")
             statusCard(icon: "text.bubble", tint: AlexTheme.Colors.success, text: "/status shows subscriptions, usage, and ping health wherever you are.")
         }
     }
@@ -468,8 +747,15 @@ struct OnboardingView: View {
     private var failover: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.success)
-            intro("Keep your agents running", "Settings → Failover lets you choose models to switch to automatically, preventing capacity errors, logout errors, and guardrail refusals from killing a long-running agent.")
-            statusCard(icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary, text: "Work moves to the next eligible model or account and keeps going.")
+            intro("Keep your agents running", "Settings → Failover lets you pair models that can take over for each other.")
+            VStack(alignment: .leading, spacing: 9) {
+                failoverPair("alex/claude-fable-5", "alex/gpt-5.6-sol")
+                failoverPair("alex/gpt-5.6-sol", "alex/claude-fable-5")
+            }
+            .padding(14).cardStyle()
+            statusCard(
+                icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary,
+                text: "capacity errors, logouts, or guardrail refusals move work to the other model automatically.")
         }
     }
 
@@ -515,14 +801,14 @@ struct OnboardingView: View {
                     .frame(maxWidth: .infinity, minHeight: 180)
             }
             intro(
-                "PAM",
+                "PAM — Experimental",
                 "PAM is a mixture-of-agents plugin for Pi that runs multiple models at once as Agent and Oracle roles — like the AMP Dial. It ships with Alex (plugins/pam) — point it at your alex/* models and experiment.")
         }
     }
 
     private var footer: some View {
         HStack(spacing: 12) {
-            PillButton(title: "Skip tutorial", variant: .standard, tint: AlexTheme.Colors.textTertiary) { model.skipTutorial() }
+            PillButton(title: "Skip tutorial", variant: .bordered) { model.skipTutorial() }
             PillButton(title: "Skip for now", variant: .bordered) { model.skipStep() }
             Spacer()
             HStack(spacing: 5) {
@@ -539,6 +825,50 @@ struct OnboardingView: View {
                 keyboardShortcut: .defaultAction
             ) { model.next() }
         }.padding(.horizontal, 20).frame(height: 64)
+    }
+
+    private func stageCard<Content: View>(
+        number: Int, title: String, completed: Bool, summary: String?, locked: Bool = false,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
+                Image(systemName: completed ? "checkmark.circle.fill" : (locked ? "lock.fill" : "\(number).circle.fill"))
+                    .foregroundStyle(completed ? AlexTheme.Colors.success : (locked ? AlexTheme.Colors.textFaintest : AlexTheme.Colors.primary))
+                Text(title).font(.system(size: 14, weight: .semibold))
+                if completed, let summary {
+                    Spacer()
+                    Text(summary).font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.success)
+                }
+            }
+            if !completed && !locked { content() }
+            if locked {
+                Text("Complete the previous stage to unlock this one.")
+                    .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+        }
+        .padding(14).cardStyle()
+    }
+
+    private func traceSummary(_ trace: TraceSession) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            summaryRow("Model", trace.models?.first ?? "Unknown")
+            summaryRow("Tokens", "\(trace.totalInputTokens ?? 0) in · \(trace.totalOutputTokens ?? 0) out")
+            if let cost = trace.totalCostUsd { summaryRow("Cost", TraceNumberFormat.cost(cost)) }
+            summaryRow("Status", trace.statusLabel ?? trace.lastStatus.map(String.init) ?? "Complete")
+            let seconds = max(0, Int64(Date().timeIntervalSince1970) - trace.lastTsMs / 1_000)
+            summaryRow("Time", seconds < 10 ? "now" : "\(Format.duration(seconds)) ago")
+        }
+        .padding(12).cardStyle()
+    }
+
+    private func summaryRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).font(AlexTheme.Fonts.metaLabel).foregroundStyle(AlexTheme.Colors.textTertiary)
+            Spacer()
+            Text(value).font(.system(size: 11, weight: .medium)).foregroundStyle(AlexTheme.Colors.foreground)
+        }
     }
 
     private func intro(_ title: String, _ detail: String) -> some View {
@@ -593,6 +923,23 @@ struct OnboardingView: View {
         HStack { Text(name).font(.system(size: 12, weight: .medium)); Spacer(); Text(endpoint).font(AlexTheme.Fonts.mono(11)).foregroundStyle(AlexTheme.Colors.primary) }
     }
 
+    private func optionalHeader(_ header: String, _ explanation: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(header).font(AlexTheme.Fonts.mono(10.5)).foregroundStyle(AlexTheme.Colors.primary)
+            Text("— \(explanation)").font(.system(size: 10.5)).foregroundStyle(AlexTheme.Colors.textTertiary)
+        }
+    }
+
+    private func failoverPair(_ primary: String, _ fallback: String) -> some View {
+        HStack(spacing: 10) {
+            Text(primary).font(AlexTheme.Fonts.mono(11.5))
+            Image(systemName: "arrow.right").foregroundStyle(AlexTheme.Colors.primary)
+            Text(fallback).font(AlexTheme.Fonts.mono(11.5))
+            Spacer()
+        }
+        .foregroundStyle(AlexTheme.Colors.foreground)
+    }
+
     private func statusCard(icon: String, tint: Color, text: String) -> some View {
         HStack(spacing: 10) { Image(systemName: icon).foregroundStyle(tint); Text(text).font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary) }.padding(14).cardStyle()
     }
@@ -600,6 +947,15 @@ struct OnboardingView: View {
 
 private extension OnboardingModel.OperationState {
     var isFailure: Bool { if case .failure = self { true } else { false } }
+    var isSuccess: Bool { if case .success = self { true } else { false } }
+    var isWorking: Bool { if case .working = self { true } else { false } }
+    var isTerminal: Bool { if case .success = self { true } else if case .failure = self { true } else { false } }
+    var message: String? {
+        switch self {
+        case .working(let message), .success(let message), .failure(let message): message
+        case .idle: nil
+        }
+    }
 }
 
 private struct CopyableCode: View {
@@ -628,23 +984,24 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var model: OnboardingModel?
     private let store: SnapshotStore
-    private let authenticate: @MainActor (String, @escaping @MainActor (Result<String, Error>) -> Void) -> Void
+    private let openProviderSettings: @MainActor () -> Void
     private let openTraceBrowser: @MainActor (String?) -> Void
 
     init(
         store: SnapshotStore,
-        authenticate: @escaping @MainActor (String, @escaping @MainActor (Result<String, Error>) -> Void) -> Void,
+        openProviderSettings: @escaping @MainActor () -> Void,
         openTraceBrowser: @escaping @MainActor (String?) -> Void
     ) {
         self.store = store
-        self.authenticate = authenticate
+        self.openProviderSettings = openProviderSettings
         self.openTraceBrowser = openTraceBrowser
     }
 
     func show() {
         if window == nil {
             let model = OnboardingModel(
-                store: store, authenticate: authenticate, openTraceBrowser: openTraceBrowser,
+                store: store, openProviderSettings: openProviderSettings,
+                openTraceBrowser: openTraceBrowser,
                 finish: { [weak self] in self?.window?.close() })
             self.model = model
             let win = NSWindow(contentViewController: NSHostingController(rootView: OnboardingView(model: model)))

@@ -611,6 +611,9 @@ pub struct AppState {
     exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
     pub logins: alex_auth::sessions::LoginManager,
     reauth_logins: tokio::sync::Mutex<ReauthLoginTracker>,
+    /// Consecutive transient OAuth refresh failures by account. Two watchdog
+    /// passes are required before a transient outage becomes a re-auth alert.
+    reauth_refresh_failures: std::sync::Mutex<HashMap<String, u8>>,
     pub run_keys: std::sync::RwLock<HashMap<String, CachedRunKey>>,
     trace_ingest_lock: tokio::sync::Mutex<()>,
     pub update_status: Arc<tokio::sync::RwLock<Option<Value>>>,
@@ -925,6 +928,7 @@ pub fn build_state_with_substitution(
         exo_persister: std::sync::RwLock::new(None),
         logins: alex_auth::sessions::LoginManager::default(),
         reauth_logins: tokio::sync::Mutex::new(ReauthLoginTracker::default()),
+        reauth_refresh_failures: std::sync::Mutex::new(HashMap::new()),
         run_keys: std::sync::RwLock::new(HashMap::new()),
         trace_ingest_lock: tokio::sync::Mutex::new(()),
         update_status: Arc::new(tokio::sync::RwLock::new(None)),
@@ -10039,16 +10043,13 @@ async fn proxy(
                 forced_oauth_refresh = true;
                 match state.vault.refresh(&account.id, true).await {
                     Ok(fresh) => {
+                        clear_transient_reauth_failures(&state, &account.id);
                         account = fresh;
                         continue;
                     }
                     Err(e) => {
                         tracing::warn!("forced refresh failed: {e}");
-                        // The refresh path has the managed account in scope.
-                        // Send now; final trace classification will attempt
-                        // the same event for the retained 401, and the
-                        // dispatcher coalesces that duplicate.
-                        emit_reauth_notification_for_account(&state, &account);
+                        handle_reauth_refresh_failure(&state, &account, &e).await;
                     }
                 }
             }
@@ -11235,6 +11236,13 @@ fn emit_reauth_notification(state: &Arc<AppState>, trace: &TraceRecord) {
     let Some(account) = reauth_account_for_trace(state, trace) else {
         return;
     };
+    // A retained 401 can coincide with a transient token-endpoint outage. The
+    // refresh handler marks `needs_reauth` immediately for permanent errors or
+    // after two consecutive transient failures; until then trace finalization
+    // must not bypass that confirmation threshold.
+    if !account.needs_reauth() {
+        return;
+    }
     emit_reauth_notification_for_account(state, &account);
 }
 
@@ -11902,6 +11910,54 @@ fn redacted_paste_error(error: Option<&str>) -> &'static str {
 
 async fn clear_active_reauth(state: &AppState, account_id: &str) {
     state.reauth_logins.lock().await.clear_account(account_id);
+    clear_transient_reauth_failures(state, account_id);
+}
+
+const REAUTH_TRANSIENT_FAILURE_THRESHOLD: u8 = 2;
+
+fn clear_transient_reauth_failures(state: &AppState, account_id: &str) {
+    if let Ok(mut failures) = state.reauth_refresh_failures.lock() {
+        failures.remove(account_id);
+    }
+}
+
+fn record_transient_reauth_failure(state: &AppState, account_id: &str) -> u8 {
+    let Ok(mut failures) = state.reauth_refresh_failures.lock() else {
+        // Poisoning should not turn an unconfirmed outage into a phone alert.
+        return 0;
+    };
+    let count = failures.entry(account_id.to_string()).or_default();
+    *count = count.saturating_add(1);
+    *count
+}
+
+/// Notify immediately for a permanently rejected refresh token. Transient
+/// token-endpoint failures must repeat on two consecutive refresh attempts;
+/// with the default five-minute watchdog interval, the confirming attempt is
+/// the second scheduled pass (roughly ten minutes after an already-expired
+/// account first becomes eligible for checking).
+async fn handle_reauth_refresh_failure(
+    state: &Arc<AppState>,
+    account: &Account,
+    error: &anyhow::Error,
+) {
+    let permanent = alex_auth::refresh_error_needs_reauth(error);
+    let failures = if permanent {
+        clear_transient_reauth_failures(state, &account.id);
+        REAUTH_TRANSIENT_FAILURE_THRESHOLD
+    } else {
+        record_transient_reauth_failure(state, &account.id)
+    };
+    if permanent || failures >= REAUTH_TRANSIENT_FAILURE_THRESHOLD {
+        mark_account_needs_reauth(state, &account.id, true).await;
+        emit_reauth_notification_for_account(state, account);
+    } else {
+        tracing::warn!(
+            account = %account.id,
+            attempt = failures,
+            "OAuth refresh failed transiently; waiting for confirmation before re-auth alert: {error}"
+        );
+    }
 }
 
 /// Grace period after `expires_at_ms` before the watchdog treats an idle token
@@ -11916,9 +11972,9 @@ const REAUTH_EXPIRY_GRACE_MS: i64 = 60_000;
 ///
 /// For each active managed OAuth account whose access token has expired past a
 /// small grace window it distinguishes a *silently refreshable* token (which it
-/// refreshes in place, no alert) from a genuinely *dead* one — no refresh token
-/// at all, or a refresh the provider rejects with invalid_grant — and only for
-/// the latter does it emit `emit_reauth_notification_for_account`. That reuses
+/// refreshes in place, no alert) from a genuinely *dead* one — no refresh token,
+/// a refresh the provider rejects permanently, or two consecutive transient
+/// refresh failures. Only confirmed failures emit a re-auth notification. That reuses
 /// the exact same dispatcher (and its cooldown) as the live 401 path, so a
 /// persistently-dead account alerts about once per cooldown window rather than
 /// every tick, and the live/proactive events coalesce. The per-account
@@ -11965,6 +12021,7 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
             .unwrap_or(false);
         if !has_refresh_token {
             // Expired with nothing to refresh from: a confirmed logout.
+            clear_transient_reauth_failures(state, &account.id);
             mark_account_needs_reauth(state, &account.id, true).await;
             if let Err(error) =
                 start_reauth_and_notify(state, account.provider, &account, false).await
@@ -11975,8 +12032,8 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
         }
         // Has a refresh token: the only reliable way to tell a live login from a
         // revoked one is to try. Success silently recovers the account (no
-        // alert); an invalid_grant is a confirmed logout; a transient failure is
-        // ignored so a network blip never cries wolf.
+        // alert); an invalid_grant is a confirmed logout; a transient failure
+        // must repeat on the next attempt so a single network blip stays quiet.
         match state.vault.refresh(&account.id, true).await {
             Ok(_) => {
                 // Silently recovered. Vault::refresh clears a prior logout
@@ -11986,19 +12043,8 @@ pub async fn reauth_watch_once(state: &Arc<AppState>) {
                 }
                 clear_active_reauth(state, &account.id).await;
             }
-            Err(error) if alex_auth::refresh_error_needs_reauth(&error) => {
-                mark_account_needs_reauth(state, &account.id, true).await;
-                if let Err(error) =
-                    start_reauth_and_notify(state, account.provider, &account, false).await
-                {
-                    tracing::warn!(account = %account.id, %error, "could not start watchdog re-auth flow");
-                }
-            }
             Err(error) => {
-                tracing::warn!(
-                    account = %account.id,
-                    "proactive reauth refresh failed transiently; not alerting: {error}"
-                );
+                handle_reauth_refresh_failure(state, &account, &error).await;
             }
         }
     }
@@ -17556,7 +17602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_retained_401_emits_reauth_notification() {
+    async fn finalized_confirmed_401_emits_reauth_notification() {
         let (url, received, sink) = webhook_sink().await;
         let state = test_state("finalized-401-reauth-notification");
         state
@@ -17564,6 +17610,7 @@ mod tests {
             .upsert(test_openai_account("retained-401"))
             .await
             .unwrap();
+        mark_account_needs_reauth(&state, "openai-oauth-retained-401", true).await;
         set_notifications(&state, reauth_channel(url));
         let trace = TraceRecord {
             id: "retained-401".into(),
@@ -17720,6 +17767,46 @@ mod tests {
         (format!("http://{address}/"), server)
     }
 
+    /// Local token endpoint that returns a transient 503 for the requested
+    /// number of attempts, then a valid refreshed token.
+    async fn transient_token_server(
+        failures_before_success: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < failures_before_success {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({"error": "temporarily_unavailable"})),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "access_token": "fresh-access-token",
+                                "refresh_token": "fresh-refresh-token",
+                                "expires_in": 3600
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), server)
+    }
+
     #[tokio::test]
     async fn proactive_idle_expiry_without_refresh_token_emits_one_reauth_notification() {
         let (url, received, sink) = webhook_sink().await;
@@ -17787,6 +17874,74 @@ mod tests {
         assert_eq!(event["account"]["provider"], "openai");
         assert!(!event.to_string().contains("dead-refresh-token"));
         assert!(needs_reauth_flag(&state, "openai-oauth-expired-invalid").await);
+    }
+
+    #[tokio::test]
+    async fn proactive_single_transient_refresh_then_success_does_not_notify() {
+        let (url, received, sink) = webhook_sink().await;
+        let (token_url, token_server) = transient_token_server(1).await;
+        let state = test_state("proactive-transient-recovery");
+        state.vault.set_refresh_endpoint_override(Some(token_url));
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "transient-recovery",
+                Some("refresh-token"),
+                now_ms() - 5 * 60_000,
+            ))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(received.lock().unwrap().len(), 0);
+
+        reauth_watch_once(&state).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let count = received.lock().unwrap().len();
+        sink.abort();
+        token_server.abort();
+        assert_eq!(count, 0, "a recovered one-off refresh failure must stay silent");
+        assert!(
+            !needs_reauth_flag(&state, "openai-oauth-transient-recovery").await,
+            "a successful retry must clear the transient failure state"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_repeated_transient_refresh_notifies_on_second_attempt() {
+        let (url, received, sink) = webhook_sink().await;
+        let (token_url, token_server) = transient_token_server(usize::MAX).await;
+        let state = test_state("proactive-transient-repeated");
+        state.vault.set_refresh_endpoint_override(Some(token_url));
+        state
+            .vault
+            .upsert(expired_oauth_account(
+                Provider::Openai,
+                "transient-repeated",
+                Some("refresh-token"),
+                now_ms() - 5 * 60_000,
+            ))
+            .await
+            .unwrap();
+        set_notifications(&state, reauth_channel(url));
+
+        reauth_watch_once(&state).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(received.lock().unwrap().len(), 0);
+
+        reauth_watch_once(&state).await;
+        let event = first_event(
+            &received,
+            "two consecutive transient refresh failures did not alert",
+        )
+        .await;
+        sink.abort();
+        token_server.abort();
+        assert_eq!(event["category"], "reauth");
+        assert!(needs_reauth_flag(&state, "openai-oauth-transient-repeated").await);
     }
 
     #[tokio::test]
