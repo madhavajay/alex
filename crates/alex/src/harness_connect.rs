@@ -4876,8 +4876,19 @@ pub(crate) fn resolve_harness_binary(config: &Config, spec: &HarnessSpec) -> Opt
     {
         Some(path) if is_executable_file(&path) => Some(path),
         Some(_) => None,
-        None => find_on_path(spec.binary),
+        None => find_on_path(spec.binary).or_else(|| harness_home_binary(spec)),
     }
+}
+
+/// Some harnesses (kimi) install their binary inside their own config dir
+/// (`~/.kimi-code/bin/kimi`). Interactive shells add that dir to PATH via rc
+/// files, but non-interactive `alex connect` runs never see it, so detection
+/// failed and connect bailed before minting a key — leaving the harness config
+/// pointing at a key the preceding disconnect had already revoked.
+fn harness_home_binary(spec: &HarnessSpec) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let candidate = (spec.config_dir)(&home).join("bin").join(spec.binary);
+    is_executable_file(&candidate).then_some(candidate)
 }
 
 pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
