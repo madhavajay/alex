@@ -88,7 +88,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // Section order follows the system-menu mock (ui/Design macOS system
     // menu App.tsx:665-795): header · update banner · stats · providers ·
-    // accounts · harnesses · Dario · traces · footer actions.
+    // accounts · harnesses · traces · footer actions.
     private func rebuildMenu() {
         menu.removeAllItems()
         buildHeader()
@@ -100,11 +100,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if store.daemonUp {
             buildStats()
             buildProviderEmptyState()
-            buildLimits()
+        }
+        // Dario lives under Anthropic and remains visible there even when the
+        // daemon is down, so the providers card cannot share the daemon gate.
+        buildLimits()
+        if store.daemonUp {
             buildAccounts()
             buildHarnesses()
         }
-        buildDario()
         buildTraces()
         buildActions()
     }
@@ -285,19 +288,26 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func buildLimits() {
+        let darioEnabled = store.config?.darioEnabled == true || store.dario != nil
+        let limits = store.daemonUp ? store.limits : []
+        let accounts = store.daemonUp ? store.accounts : []
         guard ProviderPresentation.shouldShowLimitsCard(
-            limits: store.limits, accounts: store.accounts
+            limits: limits,
+            accounts: accounts,
+            includeAnthropicDario: darioEnabled
         ) else {
             return
         }
         let card = LimitsCardView(
-            limits: store.limits,
-            accounts: store.accounts,
+            limits: limits,
+            accounts: accounts,
             warnPct: store.limitWarnPct,
             providerPauses: Dictionary(
                 uniqueKeysWithValues: store.providerPauses.map { ($0.provider, $0) }),
             heartbeats: heartbeatsById,
             routing: store.routingByProvider,
+            darioEnabled: darioEnabled,
+            dario: store.daemonUp ? store.dario : nil,
             onRefresh: { [weak self] in
                 guard let self else { return false }
                 await self.store.refresh()
@@ -313,6 +323,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             onPing: { [weak self] in
                 self?.menu.cancelTrackingWithoutAnimation()
                 self?.runPing(target: "all", name: "All providers")
+            },
+            onOpenDario: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.openDario()
+            },
+            onReauthDario: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.reauthDario()
             },
             onSetProviderPause: { [weak self] provider, mode in
                 guard let self, let config = self.store.config else { return }
@@ -331,23 +351,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 }
             })
         addHostedView(card)
-        menu.addItem(.separator())
-    }
-
-    private func buildDario() {
-        guard store.config?.darioEnabled == true || store.dario != nil else { return }
-        addHostedView(DarioMenuSectionView(
-            status: store.daemonUp ? store.dario : nil,
-            onOpen: { [weak self] in
-                guard let self else { return }
-                self.menu.cancelTrackingWithoutAnimation()
-                self.openDario()
-            },
-            onReauth: { [weak self] in
-                guard let self else { return }
-                self.menu.cancelTrackingWithoutAnimation()
-                self.reauthDario()
-            }))
         menu.addItem(.separator())
     }
 
