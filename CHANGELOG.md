@@ -7,9 +7,13 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
-## [0.1.28-beta.9] - 2026-07-19
+## [0.1.28-beta.10] - 2026-07-19
 
 ### Fixed
+- **Daemon liveness check no longer needs the `kill` binary.** `process_running`
+  now uses a direct `libc::kill(pid, 0)` syscall instead of spawning `kill`,
+  which is absent on some minimal hosts. (beta.9's release build failed on this;
+  beta.10 supersedes it — no beta.9 was published.)
 - **Anthropic re-auth actually works now.** A permanent token-refresh failure
   (`invalid_grant` / `reauth_required` / no refresh token) now persists a
   `needs_reauth` marker, so the account stops reporting **Active** when it is in
