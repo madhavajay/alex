@@ -132,6 +132,11 @@ enum Command {
         #[command(subcommand)]
         command: NotifyCommand,
     },
+    /// Start, inspect, and complete daemon-managed provider re-authentication
+    Reauth {
+        #[command(subcommand)]
+        command: ReauthCommand,
+    },
     /// Manage captured upstream error fixtures
     Fixtures {
         #[command(subcommand)]
@@ -371,11 +376,59 @@ enum DarioCommand {
 #[derive(Subcommand)]
 enum NotifyCommand {
     /// List configured channels (webhook URLs and tokens are redacted)
-    List,
-    /// Send a synthetic event through every channel or one channel index
-    Test {
+    #[command(alias = "list")]
+    Channels,
+    /// Enable or disable inbound commands for a saved Telegram channel
+    Commands {
+        /// Enable inbound commands and OAuth paste-back
+        #[arg(long, conflicts_with = "disable", required_unless_present = "disable")]
+        enable: bool,
+        /// Disable inbound commands and OAuth paste-back
+        #[arg(long, conflicts_with = "enable", required_unless_present = "enable")]
+        disable: bool,
+        /// Saved channel id; omit when exactly one channel exists
         #[arg(long)]
-        channel: Option<usize>,
+        channel: Option<String>,
+    },
+    /// Send a synthetic event through saved channels using their stored token
+    Test {
+        /// Saved channel id; omit to test all saved channels
+        #[arg(long)]
+        channel: Option<String>,
+        /// Event category to exercise, such as reauth
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Show recent redacted inbound commands and outbound notification messages
+    Log {
+        /// Maximum recent messages to return (up to the persisted 200-entry ring)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReauthCommand {
+    /// Start or replace a pending re-authentication session
+    Start {
+        /// Provider name or alias, such as anthropic or claude
+        provider: String,
+        /// Also deliver the clickable authorization link to Telegram
+        #[arg(long)]
+        notify: bool,
+        /// Replace a stuck pending session
+        #[arg(long)]
+        force: bool,
+    },
+    /// Submit the code#state for the pending paste-mode session
+    Submit {
+        /// Complete pasted OAuth value in code#state form
+        input: String,
+    },
+    /// Show pending re-authentication sessions
+    Status {
+        /// Optional provider filter
+        provider: Option<String>,
     },
 }
 
@@ -3527,17 +3580,16 @@ async fn main() -> Result<()> {
                     "local clients and harnesses remain available at http://127.0.0.1:{port}"
                 );
             }
-            let command_dispatcher = state
-                .notifications
-                .read()
-                .map(|dispatcher| dispatcher.clone())
-                .unwrap_or_default();
-            let telegram_command_tasks =
-                telegram::spawn_command_pollers(&config, command_dispatcher);
-            if !telegram_command_tasks.is_empty() {
+            let (telegram_command_supervisor, telegram_command_count) =
+                telegram::spawn_command_poller_supervisor(
+                    daemon_config.clone(),
+                    state.notifications.clone(),
+                );
+            let telegram_command_tasks = vec![telegram_command_supervisor];
+            if telegram_command_count > 0 {
                 eprintln!(
                     "telegram commands: enabled for {} allowlisted channel(s)",
-                    telegram_command_tasks.len()
+                    telegram_command_count
                 );
             }
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -4521,28 +4573,114 @@ async fn main() -> Result<()> {
             }
         }
         Command::Notify { command } => match command {
-            NotifyCommand::List => {
+            NotifyCommand::Channels => {
                 let response = daemon_get(&config, "/admin/notifications", &[]).await?;
                 let body: serde_json::Value = response.json().await?;
                 println!("{}", serde_json::to_string_pretty(&body)?);
             }
-            NotifyCommand::Test { channel } => {
-                let body = Some(
-                    channel
-                        .map(|channel| json!({"channel": channel}))
-                        .unwrap_or_else(|| json!({})),
-                );
+            NotifyCommand::Commands {
+                enable,
+                disable: _,
+                channel,
+            } => {
+                let channel_id = resolve_notification_channel(&config, channel.as_deref()).await?;
+                let (status, response) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/notifications/commands",
+                    Some(json!({"channel_id": channel_id, "allow_commands": enable})),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if !status.is_success() {
+                    anyhow::bail!("notification commands update failed: {status}");
+                }
+            }
+            NotifyCommand::Test { channel, category } => {
+                let mut body = json!({});
+                if let Some(channel) = channel {
+                    body["channel_id"] = json!(channel);
+                }
+                if let Some(category) = category {
+                    body["category"] = json!(category);
+                }
                 let (status, response) = daemon_send(
                     &config,
                     reqwest::Method::POST,
                     "/admin/notifications/test",
-                    body,
+                    Some(body),
                 )
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 if !status.is_success() {
                     anyhow::bail!("notification test request failed: {status}");
                 }
+            }
+            NotifyCommand::Log { limit } => {
+                if limit == 0 {
+                    anyhow::bail!("--limit must be positive");
+                }
+                let response = daemon_get(
+                    &config,
+                    "/admin/notifications/log",
+                    &[("limit", limit.to_string())],
+                )
+                .await?;
+                let body: serde_json::Value = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+        },
+        Command::Reauth { command } => match command {
+            ReauthCommand::Start {
+                provider,
+                notify,
+                force,
+            } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/auth/reauth/start",
+                    Some(json!({"provider": provider, "notify": notify, "force": force})),
+                )
+                .await?;
+                if !status.is_success() {
+                    anyhow::bail!("could not start re-authentication: {body}");
+                }
+                let url = body["verification_uri_complete"]
+                    .as_str()
+                    .context("daemon response omitted authorization URL")?;
+                println!("{url}");
+                if notify {
+                    println!(
+                        "notification: {}",
+                        if body["notification_sent"].as_bool() == Some(true) {
+                            "sent"
+                        } else {
+                            "not sent"
+                        }
+                    );
+                }
+            }
+            ReauthCommand::Submit { input } => {
+                let (status, body) = daemon_send(
+                    &config,
+                    reqwest::Method::POST,
+                    "/admin/auth/reauth/submit",
+                    Some(json!({"input": input})),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                if !status.is_success() || body["ok"].as_bool() != Some(true) {
+                    anyhow::bail!("re-authentication was not completed");
+                }
+            }
+            ReauthCommand::Status { provider } => {
+                let params = provider
+                    .map(|provider| vec![("provider", provider)])
+                    .unwrap_or_default();
+                let response = daemon_get(&config, "/admin/auth/reauth/status", &params).await?;
+                let body: serde_json::Value = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
             }
         },
         Command::Fixtures { command } => match command {
@@ -7093,6 +7231,23 @@ async fn daemon_get(
     Ok(resp)
 }
 
+async fn resolve_notification_channel(config: &Config, requested: Option<&str>) -> Result<String> {
+    if let Some(requested) = requested.filter(|value| !value.trim().is_empty()) {
+        return Ok(requested.trim().to_string());
+    }
+    let response = daemon_get(config, "/admin/notifications", &[]).await?;
+    let body: serde_json::Value = response.json().await?;
+    let channels = body["channels"].as_array().cloned().unwrap_or_default();
+    match channels.as_slice() {
+        [channel] => channel["id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("saved notification channel has no id"),
+        [] => anyhow::bail!("no saved notification channels"),
+        _ => anyhow::bail!("multiple notification channels are saved; use --channel <id>"),
+    }
+}
+
 async fn traces_search_cmd(config: &Config, filter: &TraceFilterArgs, json: bool) -> Result<()> {
     let resp = daemon_get(config, "/traces/search", &filter.query_params()).await?;
     let body: serde_json::Value = resp.json().await?;
@@ -9590,6 +9745,127 @@ mod tests {
                 json: true,
             } => assert_eq!(harness, "codex"),
             _ => panic!("unexpected tool-capture command"),
+        }
+    }
+
+    #[test]
+    fn notification_debug_cli_subcommands_parse_all_supported_steps() {
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "notify", "channels"])
+                .unwrap()
+                .command,
+            Some(Command::Notify {
+                command: NotifyCommand::Channels
+            })
+        ));
+        match Cli::try_parse_from([
+            "alex",
+            "notify",
+            "commands",
+            "--enable",
+            "--channel",
+            "control",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Notify {
+                command:
+                    NotifyCommand::Commands {
+                        enable: true,
+                        disable: false,
+                        channel: Some(channel),
+                    },
+            } => assert_eq!(channel, "control"),
+            _ => panic!("unexpected notify commands parse"),
+        }
+        assert!(Cli::try_parse_from([
+            "alex",
+            "notify",
+            "commands",
+            "--enable",
+            "--disable"
+        ])
+        .is_err());
+        match Cli::try_parse_from([
+            "alex",
+            "notify",
+            "test",
+            "--channel",
+            "saved",
+            "--category",
+            "reauth",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Notify {
+                command:
+                    NotifyCommand::Test {
+                        channel: Some(channel),
+                        category: Some(category),
+                    },
+            } => {
+                assert_eq!(channel, "saved");
+                assert_eq!(category, "reauth");
+            }
+            _ => panic!("unexpected notify test parse"),
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "notify", "log", "--limit", "17"])
+                .unwrap()
+                .command,
+            Some(Command::Notify {
+                command: NotifyCommand::Log { limit: 17 }
+            })
+        ));
+    }
+
+    #[test]
+    fn reauth_cli_subcommands_parse_start_submit_and_status() {
+        match Cli::try_parse_from([
+            "alex",
+            "reauth",
+            "start",
+            "anthropic",
+            "--notify",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Reauth {
+                command:
+                    ReauthCommand::Start {
+                        provider,
+                        notify: true,
+                        force: true,
+                    },
+            } => assert_eq!(provider, "anthropic"),
+            _ => panic!("unexpected reauth start parse"),
+        }
+        match Cli::try_parse_from(["alex", "reauth", "submit", "code#state"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Reauth {
+                command: ReauthCommand::Submit { input },
+            } => assert_eq!(input, "code#state"),
+            _ => panic!("unexpected reauth submit parse"),
+        }
+        match Cli::try_parse_from(["alex", "reauth", "status", "anthropic"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Reauth {
+                command: ReauthCommand::Status { provider },
+            } => assert_eq!(provider.as_deref(), Some("anthropic")),
+            _ => panic!("unexpected reauth status parse"),
         }
     }
 
