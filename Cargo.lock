@@ -83,6 +83,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures-util",
+ "libc",
  "rand 0.8.6",
  "ratatui",
  "reqwest",
