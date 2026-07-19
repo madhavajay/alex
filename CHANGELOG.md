@@ -7,6 +7,44 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.28-beta.9] - 2026-07-19
+
+### Fixed
+- **Anthropic re-auth actually works now.** A permanent token-refresh failure
+  (`invalid_grant` / `reauth_required` / no refresh token) now persists a
+  `needs_reauth` marker, so the account stops reporting **Active** when it is in
+  fact broken, and the watchdog sends the paste-mode Telegram re-auth link end to
+  end. This is the fix if Anthropic re-auth "still wasn't working" on beta.8.
+- **Dario status line is back under the Anthropic provider.** Dario is only used
+  for Anthropic subscription traffic, so its menu-bar line is nested under the
+  Anthropic provider card again instead of a standalone section — while still
+  always showing when Dario is enabled (red when down), even if the Anthropic
+  account itself is unreachable.
+- **Trace Browser shows OpenRouter / Kimi / xAI replies.** Streamed `openai-chat`
+  passthrough responses previously rendered a blank assistant turn; the transcript
+  now reassembles the streamed SSE body (text + tool calls).
+- **Daemon update from the UI** no longer prints `kill: No such process` when the
+  old daemon has already exited — a graceful drain treats that as success.
+- **crates.io images render** — the README now uses absolute image URLs.
+
+### Added
+- **Provider detail health + re-auth controls (macOS).** A live status pill that
+  never shows Active when the account is broken, a **Ping** button that runs a
+  real round-trip and refreshes the pill, and a pending re-auth panel: view the
+  authorize URL / user code, paste `code#state` by hand, **Reset/cancel**, or
+  **Overwrite** a stuck pending session.
+- **Force-overwrite + cancel a pending re-auth** — `reauth-notify` accepts
+  `force:true` and a new local-key-gated `POST /admin/auth/reauth-cancel` backs
+  the app's Overwrite/Reset.
+- **Update the daemon from the menu banner / Preferences.**
+
+### Internal
+- Harness test suite now proves tool calls and both-sides trace capture/display
+  across every API dialect (anthropic, `openai-chat` incl. streamed SSE,
+  `openai-responses`, gemini), with gated live cells for real harness runs.
+- New structured reference docs under `docs/` (overview, CLI, providers/routing,
+  API/formats, Dario, traces, configuration), linked from the README.
+
 ## [0.1.28-beta.8] - 2026-07-18
 
 ### Added
