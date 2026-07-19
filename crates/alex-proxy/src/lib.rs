@@ -6491,6 +6491,44 @@ async fn record_probe_outcome(state: &Arc<AppState>, result: &PingResult) {
     }
 }
 
+/// Record successful provider evidence through the same path as an explicit
+/// ping. A completed credential exchange or Dario-routed provider response is
+/// just as conclusive as a probe that this account is authenticated and
+/// reachable.
+async fn record_successful_account_probe(state: &Arc<AppState>, account_id: &str, status: u16) {
+    record_probe_outcome(
+        state,
+        &PingResult {
+            provider: "account",
+            account_id: Some(account_id.to_string()),
+            ok: true,
+            status: Some(status),
+            latency_ms: 0,
+            message: "successful provider exchange".into(),
+        },
+    )
+    .await;
+}
+
+/// Attribute a fully completed Dario response to the bonded provider account.
+/// Dario transport/generation failures can arrive after a successful HTTP
+/// response head, so both the final status and terminal stream error must be
+/// clean before this is allowed to turn the provider green.
+async fn record_dario_response_probe(
+    state: &Arc<AppState>,
+    via_dario: bool,
+    account_id: Option<&str>,
+    status: Option<u16>,
+    error: Option<&str>,
+) {
+    let Some((account_id, status)) = account_id.zip(status) else {
+        return;
+    };
+    if via_dario && (200..300).contains(&status) && error.is_none() {
+        record_successful_account_probe(state, account_id, status).await;
+    }
+}
+
 /// The reachability health `/admin/accounts` reports for an account. A confirmed
 /// logout (`needs_reauth`, set by either the probe path or the idle-expiry
 /// watchdog) always wins so the dot is red regardless of the last ping; failing
@@ -8583,7 +8621,7 @@ fn authenticate_trace_ingest(
     let Some(key) = client_key(headers) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "trace ingest requires an Alexandria wrap key",
+            "trace ingest requires an Alex wrap key",
         ));
     };
     if state
@@ -8617,7 +8655,7 @@ fn authenticate_harness_event(
     let Some(key) = client_key(headers) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "harness events require an Alexandria harness key",
+            "harness events require an Alex harness key",
         ));
     };
     let key_hash = key_hash_hex(&key);
@@ -10361,6 +10399,14 @@ async fn proxy(
                 serde_json::to_vec(&out).unwrap_or_default(),
             )
         };
+        record_dario_response_probe(
+            &state,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(StatusCode::OK)
@@ -10415,6 +10461,14 @@ async fn proxy(
         } else {
             (status, buf.clone())
         };
+        record_dario_response_probe(
+            &state,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(out_status)
@@ -10498,6 +10552,15 @@ async fn proxy(
                 dario.suspect(gen);
             }
         }
+
+        record_dario_response_probe(
+            &state2,
+            trace.via_dario,
+            trace.account_id.as_deref(),
+            trace.status.and_then(|value| u16::try_from(value).ok()),
+            trace.error.as_deref(),
+        )
+        .await;
 
         fill_usage_and_cost(&state2, &mut trace, &buf, is_sse);
         finalize_trace(
@@ -11669,7 +11732,7 @@ fn reauth_link_body(
         )
     } else {
         format!(
-            "Tap this link to re-authenticate {label}:\n{url}\n\nAlexandria is waiting for authorization and will finish automatically."
+            "Tap this link to re-authenticate {label}:\n{url}\n\nAlex is waiting for authorization and will finish automatically."
         )
     }
 }
@@ -11748,8 +11811,7 @@ pub async fn complete_reauth_code(
         }
     };
     if snapshot["state"].as_str() == Some("done") {
-        clear_active_reauth(state, &awaiting.account_id).await;
-        mark_account_needs_reauth(state, &awaiting.account_id, false).await;
+        record_successful_account_probe(state, &awaiting.account_id, StatusCode::OK.as_u16()).await;
         return Ok(json!({
             "awaiting": false,
             "ok": true,
@@ -11805,8 +11867,7 @@ async fn complete_pending_reauth(
         .await
         .map_err(|_| "re-authentication session expired or is unavailable".to_string())?;
     if snapshot["state"].as_str() == Some("done") {
-        clear_active_reauth(state, &key.account_id).await;
-        mark_account_needs_reauth(state, &key.account_id, false).await;
+        record_successful_account_probe(state, &key.account_id, StatusCode::OK.as_u16()).await;
         return Ok(json!({"ok": true, "provider": key.provider.as_str()}));
     }
     Ok(json!({
@@ -12016,7 +12077,7 @@ mod tests {
         assert!(paste.contains("After approving, paste the code#state here."));
         let device = reauth_link_body(Some("device"), "work", "https://auth.test", false);
         assert!(device
-            .contains("Alexandria is waiting for authorization and will finish automatically."));
+            .contains("Alex is waiting for authorization and will finish automatically."));
         assert!(!device.contains("code#state"));
     }
 
@@ -12441,6 +12502,11 @@ mod tests {
         assert_eq!(completed["ok"], true);
         assert_eq!(completed["provider"], "anthropic");
         assert_eq!(
+            account_health_of(&state, "anthropic-oauth-work").await,
+            "healthy",
+            "a successful pasted re-auth code must stamp healthy probe evidence"
+        );
+        assert_eq!(
             state
                 .reauth_logins
                 .lock()
@@ -12452,6 +12518,45 @@ mod tests {
             *exchanger.inputs.lock().unwrap(),
             ["bad-code#state", "good-code#state"]
         );
+    }
+
+    #[tokio::test]
+    async fn pending_reauth_completion_stamps_healthy_probe_evidence() {
+        let state = test_state("pending-reauth-health");
+        let account_id = "anthropic-oauth-pending-health";
+        state
+            .vault
+            .upsert(anthropic_account_full(
+                account_id,
+                "pending-health",
+                "pending-health@example.test",
+                now_ms() - 1,
+            ))
+            .await
+            .unwrap();
+        mark_account_needs_reauth(&state, account_id, true).await;
+        state
+            .logins
+            .set_paste_code_exchanger(Arc::new(CompletingPasteExchange {
+                account_id: account_id.into(),
+            }));
+        let account = state.vault.list().await.remove(0);
+
+        let started =
+            start_reauth_without_notification(&state, Provider::Anthropic, &account, false)
+                .await
+                .unwrap();
+        assert_eq!(started["state"], "pending");
+
+        let completed =
+            complete_pending_reauth(&state, Some(Provider::Anthropic), "mock-code#mock-state")
+                .await
+                .unwrap();
+
+        assert_eq!(completed["ok"], true);
+        assert!(!needs_reauth_flag(&state, account_id).await);
+        assert_eq!(account_health_of(&state, account_id).await, "healthy");
+        assert_eq!(admin_accounts_health(&state, account_id).await, "healthy");
     }
 
     #[test]
@@ -13382,7 +13487,9 @@ mod tests {
 
     fn anthropic_account() -> Account {
         Account {
-            id: "anthropic:test".into(),
+            // No ':' — it is an invalid filename character on Windows, and the
+            // vault writes accounts to "<id>.json" (CI failed with os error 87).
+            id: "anthropic-test".into(),
             provider: Provider::Anthropic,
             kind: "oauth".into(),
             name: "test".into(),
@@ -13576,7 +13683,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(direct.url, "https://api.anthropic.com/v1/messages");
-        assert_eq!(direct.account.id, "anthropic:test");
+        assert_eq!(direct.account.id, "anthropic-test");
         assert!(direct.extra_headers.is_empty());
 
         let mut harness_headers = HeaderMap::new();
@@ -13597,7 +13704,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dario.url, "http://127.0.0.1:9191/v1/messages");
-        assert_eq!(dario.account.id, "anthropic:test");
+        assert_eq!(dario.account.id, "anthropic-test");
         assert_eq!(dario.connection_account.as_ref().unwrap().kind, "dario");
         assert!(dario.via_dario);
         assert_eq!(dario.dario_generation.as_deref(), Some("test-generation"));
@@ -13639,7 +13746,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
-        assert_eq!(plan.account.id, "anthropic:test");
+        assert_eq!(plan.account.id, "anthropic-test");
         assert!(plan.dario_guard.is_none());
     }
 
@@ -17883,6 +17990,130 @@ mod tests {
             admin_accounts_health(&state, "xai-oauth-grok").await,
             "healthy"
         );
+    }
+
+    #[tokio::test]
+    async fn dario_path_success_stamps_bonded_account_healthy() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                axum::Json(json!({
+                    "id": "msg_dario_health",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-sonnet-4-5",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = test_state_with_dario(
+            "dario-success-health",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "health-success".into(),
+                    base_url: format!("http://{address}"),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: true,
+                routes_requests: true,
+                status: None,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","stream":false,"messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            if account_health_of(&state, "anthropic-test").await == "healthy" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(account_health_of(&state, "anthropic-test").await, "healthy");
+        assert_eq!(
+            admin_accounts_health(&state, "anthropic-test").await,
+            "healthy"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dario_infrastructure_failure_does_not_stamp_bonded_account() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error": "Dario generation unavailable"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = test_state_with_dario(
+            "dario-infra-failure-health",
+            Some(Arc::new(FakeDario {
+                active: Some(DarioActive {
+                    generation_id: "health-failure".into(),
+                    base_url: format!("http://{address}"),
+                    api_key: "dario-key".into(),
+                }),
+                begin_succeeds: true,
+                routes_requests: true,
+                status: None,
+            })),
+        );
+        state.vault.upsert(anthropic_account()).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","stream":false,"messages":[]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(account_health_of(&state, "anthropic-test").await, "unknown");
+        assert_eq!(
+            admin_accounts_health(&state, "anthropic-test").await,
+            "unknown"
+        );
+        server.abort();
     }
 
     #[tokio::test]

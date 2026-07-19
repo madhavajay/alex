@@ -41,6 +41,11 @@ struct ProvidersPreferencesSection: View {
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
         ProvidersChartRange.twentyFourHours.rawValue
     @State private var accountAnalyticsLoadID: UUID?
+    /// Full snapshot refreshes can briefly publish an incomplete account list
+    /// while the daemon is settling after re-auth. Keep the pane's last rows
+    /// mounted until that refresh finishes, matching the Harnesses pane's
+    /// retain-while-checking behavior.
+    @State private var accountsBeforeRefresh: [Account]?
     /// Earliest bucket timestamp seen across a one-off 30d fetch, used to
     /// decide which range tabs have enough history to be worth showing.
     /// `nil` until loaded (or if the lookup fails) — `enabledRanges` fails
@@ -70,9 +75,13 @@ struct ProvidersPreferencesSection: View {
             })
     }
 
+    private var displayedAccounts: [Account] {
+        accountsBeforeRefresh ?? store.accounts
+    }
+
     /// Canonical providers plus any provider returned by a newer daemon.
     private var providers: [String] {
-        Array(Set(ProviderInfo.supportedProviders + store.accounts.map(\.provider))).sorted {
+        Array(Set(ProviderInfo.supportedProviders + displayedAccounts.map(\.provider))).sorted {
             ProviderInfo.displayName($0) < ProviderInfo.displayName($1)
         }
     }
@@ -98,13 +107,13 @@ struct ProvidersPreferencesSection: View {
             // openai supports multiple accounts; exo is reconfigurable (no
             // account concept). Everything else hides once it has an account.
             $0 == "openai" || $0 == "exo"
-                || !ProviderPresentation.hasAccount(for: $0, in: store.accounts)
+                || !ProviderPresentation.hasAccount(for: $0, in: displayedAccounts)
         }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            if ProviderPresentation.hasNoAccounts(store.accounts) {
+            if ProviderPresentation.hasNoAccounts(displayedAccounts) {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Connect a Token Provider")
@@ -129,6 +138,7 @@ struct ProvidersPreferencesSection: View {
                     ProviderPreferencesDetail(
                         provider: provider,
                         store: store,
+                        accounts: displayedAccounts.filter { $0.provider == provider },
                         usageByAccount: usageByAccount,
                         chartRangeSelection: chartRangeSelection,
                         chartRangeEnabled: enabledRanges,
@@ -144,6 +154,14 @@ struct ProvidersPreferencesSection: View {
             }
         }
         .background(AlexTheme.Colors.background)
+        .onAppear {
+            if store.refreshing {
+                accountsBeforeRefresh = store.accounts
+            }
+        }
+        .onChange(of: store.refreshing) { _, refreshing in
+            accountsBeforeRefresh = refreshing ? store.accounts : nil
+        }
         .task(id: chartRange) {
             let loadID = UUID()
             accountAnalyticsLoadID = loadID
@@ -187,7 +205,7 @@ struct ProvidersPreferencesSection: View {
                             provider: provider,
                             count: provider == "exo"
                                 ? store.exoModels.filter(\.enabled).count
-                                : store.accounts.filter { $0.provider == provider }.count,
+                                : displayedAccounts.filter { $0.provider == provider }.count,
                             statusText: provider == "exo"
                                 ? (store.exoStatus?.running == true ? "Online" : "Offline")
                                 : nil,
@@ -230,7 +248,7 @@ struct ProvidersPreferencesSection: View {
             }
             return status.running ? AlexTheme.Colors.success : AlexTheme.Colors.destructive
         }
-        let accounts = store.accounts.filter { $0.provider == provider && !$0.paused }
+        let accounts = displayedAccounts.filter { $0.provider == provider && !$0.paused }
         let displays = accounts.map { account in
             let heartbeat = store.healthAccounts.first { $0.id == account.id }?.lastHeartbeat
             return account.displayState(
@@ -358,6 +376,7 @@ private struct ProviderSidebarRow: View {
 private struct ProviderPreferencesDetail: View {
     let provider: String
     let store: SnapshotStore
+    let accounts: [Account]
     let usageByAccount: [String: AccountUsage]
     @Binding var chartRangeSelection: Int
     let chartRangeEnabled: [Bool]
@@ -365,7 +384,6 @@ private struct ProviderPreferencesDetail: View {
     let onConnect: (String) -> Void
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
 
-    private var accounts: [Account] { store.accounts.filter { $0.provider == provider } }
     private var routing: ProviderRoutingResponse? { store.routingByProvider[provider] }
     private var routingByAccount: [String: ProviderRoutingAccount] {
         Dictionary(uniqueKeysWithValues: (routing?.accounts ?? []).map { ($0.accountId, $0) })
@@ -806,7 +824,7 @@ private struct SubscriptionAccountRow: View {
             Button("Remove", role: .destructive) { remove() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Alexandria will stop using and pinging this account.")
+            Text("Alex will stop using and pinging this account.")
         }
         .alert(item: $overwriteAction) { action in
             Alert(
@@ -1471,7 +1489,7 @@ private struct ProviderRoutingPreferencesSection: View {
                     .labelsHidden()
             }
             Text(allowMidThreadFailover
-                ? "If the assigned account hits an auth, rate-limit, or server failure, Alexandria may move that thread to another eligible account. This keeps work moving but can reduce prompt-cache reuse."
+                ? "If the assigned account hits an auth, rate-limit, or server failure, Alex may move that thread to another eligible account. This keeps work moving but can reduce prompt-cache reuse."
                 : "Auth, rate-limit, and server failures stay on the thread’s assigned account instead of retrying another one. Explicitly pausing, disabling, or removing that account can still reassign the thread.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
