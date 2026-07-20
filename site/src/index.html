@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Alex routes AI subscriptions into any harness, survives overloads with programmable middleware, and records what happened.">
+  <meta name="theme-color" content="#080c14">
+  <title>Alex — your subscriptions, one resilient model team</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script>document.documentElement.classList.add('js-ready')</script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#demo">Skip to walkthrough</a>
+  <header class="shell">
+    <a class="brand" href="./" aria-label="Alex home"><span>A</span>lex</a>
+    <nav class="top-links" aria-label="Main navigation">
+      <a data-campaign-link href="https://github.com/madhavajay/alex#readme">Docs</a>
+      <a data-campaign-link href="https://github.com/madhavajay/alex">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero shell" aria-labelledby="hero-title">
+      <div class="eyebrow">Local AI control plane</div>
+      <h1 id="hero-title">Your subscriptions.<br>One resilient model team.</h1>
+      <p>Route the models you already pay for into the harness you prefer. When one model is overloaded, Alex can move the session and leave a trace that explains exactly why.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="#demo">Watch Fable move to Sol</a>
+        <a class="button" data-campaign-link href="https://github.com/madhavajay/alex#quick-start">Install Alex</a>
+      </div>
+    </section>
+
+    <section id="demo" class="demo-wrap shell" aria-labelledby="demo-title">
+      <article class="demo-card" data-demo="fable-to-sol-overload">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Deterministic fixture · no live prompts</div>
+            <h2 id="demo-title">Fable 5 is full. The session keeps moving.</h2>
+            <p>Play the whole route, pause it, or inspect one decision at a time.</p>
+          </div>
+          <div class="demo-controls" aria-label="Walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="6" aria-label="Walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            <!-- BUILD:SCENARIO_STEPS -->
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting trace summary">
+            <h3>Trace proof</h3>
+            <div class="trace-row"><span>Harness</span><strong>Claude</strong></div>
+            <div class="trace-row"><span>Requested</span><strong>claude-fable-5</strong></div>
+            <div class="trace-row"><span>Attempt 1</span><strong class="status-fail">Anthropic · 529</strong></div>
+            <div class="trace-row"><span>Decision</span><strong>middleware reroute</strong></div>
+            <div class="trace-row"><span>Attempt 2</span><strong class="status-good">OpenAI · 200</strong></div>
+            <div class="trace-row"><span>Session pin</span><strong>24 hours</strong></div>
+            <p class="privacy-note"><strong>This is synthetic.</strong> The animation is built from a repository test fixture, not visitor activity.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <details class="rule" data-rule="example.fable-overload-to-sol">
+          <summary>Reveal the actual middleware rule</summary>
+          <p>This readable rule is checked against the same Rust built-in and deterministic fixture used by Alex.</p>
+          <pre><code><!-- BUILD:RULE_SOURCE --></code></pre>
+        </details>
+        <noscript>
+          <p class="privacy-note" style="padding: 0 2rem 1rem"><strong>JavaScript is off.</strong> Every routing step and the complete rule remain available above; only automatic playback and anonymous engagement measurement are disabled.</p>
+        </noscript>
+      </article>
+    </section>
+
+    <section class="interest shell" aria-label="Try Alex">
+      <article class="provider-card">
+        <div class="eyebrow">Your path</div>
+        <h2>Which setup sounds like yours?</h2>
+        <p>Selecting an option records only its name—never account details or credentials.</p>
+        <div class="provider-options">
+          <button type="button" data-provider="anthropic" aria-pressed="false">Claude subscription</button>
+          <button type="button" data-provider="openai" aria-pressed="false">Codex subscription</button>
+          <button type="button" data-provider="cliproxyapi" aria-pressed="false">CLIProxyAPI</button>
+        </div>
+        <p><a data-cliproxyapi-docs data-campaign-link href="https://github.com/router-for-me/CLIProxyAPI#readme">Open the CLIProxyAPI docs</a></p>
+      </article>
+
+      <article class="cta-card">
+        <div class="eyebrow">Keep your next session moving</div>
+        <h2>Install Alex locally.</h2>
+        <div class="install-command">
+          <code data-install-command>curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh</code>
+          <button type="button" data-install-copy="curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh">Copy install</button>
+        </div>
+        <div class="cta-links">
+          <a class="button primary" data-download="releases" data-campaign-link href="https://github.com/madhavajay/alex/releases/latest">Open downloads</a>
+          <a class="button" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/configuration.md">Read configuration docs</a>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">Alex runs locally. Site analytics accept only named UI events and campaign attribution—never prompts, traces, credentials, or product activity.</div>
+  </footer>
+</body>
+</html>
