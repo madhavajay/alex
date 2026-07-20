@@ -97,6 +97,110 @@ fn physical_snapshot(root: &std::path::Path) -> (i64, i64, i64) {
 }
 
 #[test]
+fn bodies_only_retention_drops_old_turn_ownership_but_keeps_shared_newer_entries() {
+    let root = tmpdir("retention-shared-entry");
+    let store = Store::open_with_lar_body_store(root.clone(), config()).unwrap();
+    let session = "retention-session";
+    insert_trace(&store, "old-turn", session, 100);
+    insert_trace(&store, "new-turn", session, 1_000);
+
+    let shared_body = b"shared conversation prefix";
+    let shared_manifest = store
+        .write_body_artifact(
+            &LarBodyArtifact::trace("old-turn", "client_request"),
+            "request.json",
+            shared_body,
+        )
+        .unwrap()
+        .manifest_id
+        .unwrap();
+    let old_response_body = b"old response only";
+    let old_response_manifest = store
+        .write_body_artifact(
+            &LarBodyArtifact::trace("old-turn", "client_response"),
+            "response.json",
+            old_response_body,
+        )
+        .unwrap()
+        .manifest_id
+        .unwrap();
+    let shared_entry = store
+        .register_lar_conversation_entry(&known(
+            "openai-chat",
+            LarConversationRole::User,
+            LarConversationEntryKind::Message,
+            range(&shared_manifest, shared_body, shared_body),
+        ))
+        .unwrap();
+    let old_response_entry = store
+        .register_lar_conversation_entry(&known(
+            "openai-chat",
+            LarConversationRole::Assistant,
+            LarConversationEntryKind::Message,
+            range(&old_response_manifest, old_response_body, old_response_body),
+        ))
+        .unwrap();
+
+    let old = store
+        .record_lar_conversation_turn(&LarConversationTurnCapture {
+            trace_id: "old-turn".into(),
+            session_id: session.into(),
+            event: LarConversationGenerationEvent::Initial,
+            generation_entry_ids: vec![shared_entry.clone()],
+            upto_index: 0,
+            response_entry_ids: vec![old_response_entry.clone()],
+        })
+        .unwrap();
+    let new = store
+        .record_lar_conversation_turn(&LarConversationTurnCapture {
+            trace_id: "new-turn".into(),
+            session_id: session.into(),
+            event: LarConversationGenerationEvent::Initial,
+            generation_entry_ids: vec![shared_entry.clone()],
+            upto_index: 0,
+            response_entry_ids: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(old.generation_id, new.generation_id);
+
+    store.prune(500, true, false).unwrap();
+
+    let page = store
+        .lar_conversation_events_page(session, None, 10)
+        .unwrap();
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.events[0].trace_id, "new-turn");
+    assert_eq!(page.events[0].entries[0].entry_id, shared_entry);
+    assert_eq!(
+        store.read_lar_manifest_body(&shared_manifest).unwrap(),
+        shared_body
+    );
+
+    let gc = store.plan_lar_gc().unwrap();
+    assert_eq!(gc.reachable_manifests, 1);
+    assert_eq!(gc.unreachable_manifests, 1);
+    let conn = Connection::open(root.join("alexandria.sqlite3")).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM lar_conversation_entries WHERE entry_id=?1",
+            [&old_response_entry],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM lar_conversation_entry_ranges WHERE manifest_id=?1",
+            [&old_response_manifest],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn explicit_generation_events_are_paged_and_share_exact_body_ranges() {
     let root = tmpdir("events");
     let store = Store::open_with_lar_body_store(root.clone(), config()).unwrap();

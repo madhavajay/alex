@@ -484,6 +484,37 @@ index, or rebuilds them during its bounded recovery scan.
 Session, run, parent, and clock identifiers are optional byte strings rather
 than assumed UUIDs so existing Alex identifiers survive migration exactly.
 
+### Alex tool-supplement application profile
+
+Late harness events do not mutate an already-published Exchange. Alex appends
+one immutable child Exchange per published phase, containing exactly one
+`tool call` or `tool result` Stage and reusing a previously published
+body-manifest ID. The semantic phases are `start` and `end`. If an initially
+body-less callback is enriched later, immutable `arguments` and `result`
+phases add the newly available manifest instead of rewriting the earlier
+records. The Stage `routing_reason` is UTF-8 JSON with schema
+`alex.tool-supplement.v1`; it carries the phase, original tool row/call ID,
+harness, name, source trace, and start/end/error/exit metadata required to
+rebuild the SQLite projection. The child has the same non-empty session ID as
+its canonical parent and a deterministic internal trace ID derived from
+harness, session, tool-call ID, and phase.
+
+`parent_trace_id` alone is general trace/subagent lineage and never proves that
+a child is a supplement. Consumers must validate the versioned provenance,
+deterministic ID, session, one-stage cardinality, and phase/stage-kind match.
+The canonical view keeps the exact base Exchange first, then orders validated
+supplements by stage wall time, capture sequence, the phase order `start`,
+`arguments`, `end`, `result`, and internal trace ID. A result callback always
+proves a preceding tool-call occurrence even when no argument body was
+captured. The entire `lar-tool-` trace-ID prefix is reserved and malformed or
+unknown-phase records fail closed. Unknown ordinary child exchanges remain
+separate lineage and must not be folded into replay/export.
+
+This profile adds no v1 record type: old readers retain the child Exchange and
+Stage as ordinary canonical records. Alex's supplement/tool tables are derived
+indexes and can be rebuilt from the archive. Explicit retention tombstones
+prevent deleted immutable children from being resurrected by a later rescan.
+
 ## Type 15: exchange metadata companion, record schema 1
 
 This optional extension carries transport, accounting, and Alex trace metadata

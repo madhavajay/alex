@@ -48,6 +48,9 @@ WITH reachable_manifests(manifest_id) AS (
   SELECT response_body_manifest_ref
     FROM lar_stage_records
    WHERE response_body_manifest_ref IS NOT NULL
+  UNION
+  SELECT manifest_id
+    FROM lar_conversation_entry_ranges
 ),
 reachable_chunks(hash_algorithm, chunk_hash) AS (
   SELECT DISTINCT mc.hash_algorithm, mc.chunk_hash
@@ -421,6 +424,40 @@ impl Store {
 /// deleted here; globally shared content remains reachable through other roots.
 pub(crate) fn delete_trace_references(conn: &Connection, trace_id: &str) -> Result<()> {
     crate::lar_fts::delete_trace_references(conn, trace_id)?;
+    // Explicit deletion is a durable disposition, not a transient projection
+    // loss. Prevent startup recovery from recreating this parent's children.
+    conn.execute(
+        "UPDATE tool_calls SET canonical_timeline=0 WHERE id IN
+           (SELECT tool_id FROM lar_timeline_supplements
+             WHERE parent_trace_id=?1 OR display_trace_id=?1)",
+        [trace_id],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO lar_timeline_supplement_tombstones
+           (tool_id, phase, supplement_trace_id, parent_trace_id, deleted_at_ms)
+         SELECT tool_id, phase, supplement_trace_id, parent_trace_id,
+                CAST(strftime('%s','now') AS INTEGER) * 1000
+           FROM lar_timeline_supplements
+          WHERE parent_trace_id=?1 OR display_trace_id=?1",
+        [trace_id],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_stage_records WHERE stage_id IN
+           (SELECT stage_id FROM lar_timeline_supplements
+             WHERE parent_trace_id=?1 OR display_trace_id=?1)",
+        [trace_id],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_exchange_records WHERE trace_id IN
+           (SELECT supplement_trace_id FROM lar_timeline_supplements
+             WHERE parent_trace_id=?1 OR display_trace_id=?1)",
+        [trace_id],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_timeline_supplements
+          WHERE parent_trace_id=?1 OR display_trace_id=?1",
+        [trace_id],
+    )?;
     conn.execute(
         "DELETE FROM lar_trace_artifacts WHERE owner_kind='trace' AND owner_id=?1",
         [trace_id],
@@ -433,14 +470,27 @@ pub(crate) fn delete_trace_references(conn: &Connection, trace_id: &str) -> Resu
         "DELETE FROM lar_exchange_records WHERE trace_id=?1",
         [trace_id],
     )?;
+    delete_trace_conversation_references(conn, trace_id)?;
+    delete_orphan_transport_metadata(conn)?;
     Ok(())
 }
 
 pub(crate) fn clear_all_trace_references(conn: &Connection) -> Result<()> {
     crate::lar_fts::clear_all_references(conn)?;
     conn.execute("DELETE FROM lar_trace_artifacts", [])?;
+    conn.execute("DELETE FROM lar_timeline_supplements", [])?;
+    conn.execute("DELETE FROM lar_timeline_supplement_tombstones", [])?;
     conn.execute("DELETE FROM lar_stage_records", [])?;
     conn.execute("DELETE FROM lar_exchange_records", [])?;
+    conn.execute("DELETE FROM lar_conversation_turn_responses", [])?;
+    conn.execute("DELETE FROM lar_conversation_turn_views", [])?;
+    conn.execute("DELETE FROM lar_conversation_session_generations", [])?;
+    conn.execute("DELETE FROM lar_conversation_generation_entries", [])?;
+    conn.execute("DELETE FROM lar_conversation_generations", [])?;
+    conn.execute("DELETE FROM lar_conversation_entry_ranges", [])?;
+    conn.execute("DELETE FROM lar_conversation_entry_formats", [])?;
+    conn.execute("DELETE FROM lar_conversation_entry_fingerprints", [])?;
+    conn.execute("DELETE FROM lar_conversation_entries", [])?;
     Ok(())
 }
 
@@ -454,36 +504,82 @@ pub(crate) fn prune_references(
     crate::lar_fts::prune_references(conn, older_than_ms)?;
     if bodies_only {
         conn.execute(
-            "DELETE FROM lar_trace_artifacts
-              WHERE manifest_id IS NOT NULL AND header_block_id IS NULL AND
-                    ((owner_kind='trace' AND owner_id IN
+            "DELETE FROM lar_trace_artifacts WHERE
+                    (owner_kind='trace' AND owner_id IN
                        (SELECT id FROM traces WHERE ts_request_ms < ?1)) OR
                      (owner_kind='tool_call' AND owner_id IN
-                       (SELECT id FROM tool_calls WHERE ts_start_ms < ?1)))",
-            [older_than_ms],
-        )?;
-        conn.execute(
-            "UPDATE lar_trace_artifacts SET manifest_id=NULL
-              WHERE manifest_id IS NOT NULL AND header_block_id IS NOT NULL AND
-                    ((owner_kind='trace' AND owner_id IN
-                       (SELECT id FROM traces WHERE ts_request_ms < ?1)) OR
-                     (owner_kind='tool_call' AND owner_id IN
-                       (SELECT id FROM tool_calls WHERE ts_start_ms < ?1)))",
+                       (SELECT id FROM tool_calls WHERE ts_start_ms < ?1))",
             [older_than_ms],
         )?;
         conn.execute(
             "UPDATE lar_stage_records
-                SET request_body_manifest_ref=NULL, response_body_manifest_ref=NULL
-              WHERE trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
+                SET request_headers_ref=NULL, request_body_manifest_ref=NULL,
+                    response_headers_ref=NULL, response_body_manifest_ref=NULL,
+                    trailers_ref=NULL, stream_index_ref=NULL
+              WHERE trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)
+                 OR stage_id IN (
+                    SELECT s.stage_id FROM lar_timeline_supplements s
+                    LEFT JOIN tool_calls t ON t.id=s.tool_id
+                    LEFT JOIN traces p ON p.id=s.display_trace_id
+                    WHERE t.ts_start_ms < ?1 OR p.ts_request_ms < ?1)",
             [older_than_ms],
         )?;
+        conn.execute(
+            "UPDATE lar_timeline_supplements SET manifest_id=NULL
+              WHERE tool_id IN (SELECT id FROM tool_calls WHERE ts_start_ms < ?1)
+                 OR display_trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
+            [older_than_ms],
+        )?;
+        prune_conversation_references(conn, older_than_ms)?;
+        delete_orphan_transport_metadata(conn)?;
     } else {
+        conn.execute(
+            "UPDATE tool_calls SET canonical_timeline=0
+              WHERE id IN (
+                SELECT s.tool_id FROM lar_timeline_supplements s
+                LEFT JOIN tool_calls t ON t.id=s.tool_id
+                LEFT JOIN traces p ON p.id=s.display_trace_id
+                WHERE t.ts_start_ms < ?1 OR p.ts_request_ms < ?1)",
+            [older_than_ms],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO lar_timeline_supplement_tombstones
+               (tool_id, phase, supplement_trace_id, parent_trace_id, deleted_at_ms)
+             SELECT s.tool_id, s.phase, s.supplement_trace_id, s.parent_trace_id, ?1
+               FROM lar_timeline_supplements s
+               LEFT JOIN tool_calls t ON t.id=s.tool_id
+               LEFT JOIN traces p ON p.id=s.display_trace_id
+              WHERE t.ts_start_ms < ?1 OR p.ts_request_ms < ?1",
+            [older_than_ms],
+        )?;
         conn.execute(
             "DELETE FROM lar_trace_artifacts WHERE
                  (owner_kind='trace' AND owner_id IN
                     (SELECT id FROM traces WHERE ts_request_ms < ?1)) OR
                  (owner_kind='tool_call' AND owner_id IN
                     (SELECT id FROM tool_calls WHERE ts_start_ms < ?1))",
+            [older_than_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM lar_stage_records WHERE stage_id IN
+               (SELECT s.stage_id FROM lar_timeline_supplements s
+                LEFT JOIN tool_calls t ON t.id=s.tool_id
+                LEFT JOIN traces p ON p.id=s.display_trace_id
+                WHERE t.ts_start_ms < ?1 OR p.ts_request_ms < ?1)",
+            [older_than_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM lar_exchange_records WHERE trace_id IN
+               (SELECT s.supplement_trace_id FROM lar_timeline_supplements s
+                LEFT JOIN tool_calls t ON t.id=s.tool_id
+                LEFT JOIN traces p ON p.id=s.display_trace_id
+                WHERE t.ts_start_ms < ?1 OR p.ts_request_ms < ?1)",
+            [older_than_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM lar_timeline_supplements
+              WHERE tool_id IN (SELECT id FROM tool_calls WHERE ts_start_ms < ?1)
+                 OR display_trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
             [older_than_ms],
         )?;
         conn.execute(
@@ -496,7 +592,123 @@ pub(crate) fn prune_references(
               WHERE trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
             [older_than_ms],
         )?;
+        prune_conversation_references(conn, older_than_ms)?;
+        delete_orphan_transport_metadata(conn)?;
     }
+    Ok(())
+}
+
+fn delete_trace_conversation_references(conn: &Connection, trace_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM lar_conversation_session_generations
+          WHERE generation_id IN
+            (SELECT generation_id FROM lar_conversation_turn_views WHERE trace_id=?1)
+            AND NOT EXISTS (
+              SELECT 1 FROM lar_conversation_turn_views other
+               WHERE other.generation_id=lar_conversation_session_generations.generation_id
+                 AND other.trace_id!=?1)",
+        [trace_id],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_conversation_turn_responses WHERE turn_view_id IN
+           (SELECT turn_view_id FROM lar_conversation_turn_views WHERE trace_id=?1)",
+        [trace_id],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_conversation_turn_views WHERE trace_id=?1",
+        [trace_id],
+    )?;
+    delete_orphan_conversation_graph(conn)
+}
+
+fn prune_conversation_references(conn: &Connection, older_than_ms: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM lar_conversation_session_generations
+          WHERE generation_id IN (
+            SELECT tv.generation_id FROM lar_conversation_turn_views tv
+            JOIN traces t ON t.id=tv.trace_id
+            WHERE t.ts_request_ms < ?1)
+            AND NOT EXISTS (
+            SELECT 1 FROM lar_conversation_turn_views tv
+            JOIN traces t ON t.id=tv.trace_id
+            WHERE tv.generation_id=lar_conversation_session_generations.generation_id
+              AND t.ts_request_ms >= ?1)",
+        [older_than_ms],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_conversation_turn_responses WHERE turn_view_id IN
+           (SELECT tv.turn_view_id FROM lar_conversation_turn_views tv
+            JOIN traces t ON t.id=tv.trace_id WHERE t.ts_request_ms < ?1)",
+        [older_than_ms],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_conversation_turn_views WHERE trace_id IN
+           (SELECT id FROM traces WHERE ts_request_ms < ?1)",
+        [older_than_ms],
+    )?;
+    delete_orphan_conversation_graph(conn)
+}
+
+fn delete_orphan_conversation_graph(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "WITH RECURSIVE retained(generation_id) AS (
+           SELECT generation_id FROM lar_conversation_turn_views
+           UNION SELECT generation_id FROM lar_conversation_session_generations
+           UNION
+           SELECT g.parent_generation_id FROM lar_conversation_generations g
+           JOIN retained r ON r.generation_id=g.generation_id
+           WHERE g.parent_generation_id IS NOT NULL
+         )
+         DELETE FROM lar_conversation_generation_entries
+          WHERE generation_id NOT IN (SELECT generation_id FROM retained);
+         WITH RECURSIVE retained(generation_id) AS (
+           SELECT generation_id FROM lar_conversation_turn_views
+           UNION SELECT generation_id FROM lar_conversation_session_generations
+           UNION
+           SELECT g.parent_generation_id FROM lar_conversation_generations g
+           JOIN retained r ON r.generation_id=g.generation_id
+           WHERE g.parent_generation_id IS NOT NULL
+         )
+         DELETE FROM lar_conversation_generations
+          WHERE generation_id NOT IN (SELECT generation_id FROM retained);
+         DELETE FROM lar_conversation_entry_ranges WHERE entry_id NOT IN (
+           SELECT entry_id FROM lar_conversation_generation_entries
+           UNION SELECT entry_id FROM lar_conversation_turn_responses);
+         DELETE FROM lar_conversation_entry_formats WHERE entry_id NOT IN (
+           SELECT entry_id FROM lar_conversation_generation_entries
+           UNION SELECT entry_id FROM lar_conversation_turn_responses);
+         DELETE FROM lar_conversation_entry_fingerprints WHERE entry_id NOT IN (
+           SELECT entry_id FROM lar_conversation_generation_entries
+           UNION SELECT entry_id FROM lar_conversation_turn_responses);
+         DELETE FROM lar_conversation_entries WHERE entry_id NOT IN (
+           SELECT entry_id FROM lar_conversation_generation_entries
+           UNION SELECT entry_id FROM lar_conversation_turn_responses);",
+    )?;
+    Ok(())
+}
+
+fn delete_orphan_transport_metadata(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM lar_header_block_atoms WHERE block_id NOT IN (
+           SELECT request_headers_ref FROM lar_stage_records WHERE request_headers_ref IS NOT NULL
+           UNION SELECT response_headers_ref FROM lar_stage_records WHERE response_headers_ref IS NOT NULL
+           UNION SELECT trailers_ref FROM lar_stage_records WHERE trailers_ref IS NOT NULL
+           UNION SELECT header_block_id FROM lar_trace_artifacts WHERE header_block_id IS NOT NULL)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_header_blocks WHERE block_id NOT IN (
+           SELECT request_headers_ref FROM lar_stage_records WHERE request_headers_ref IS NOT NULL
+           UNION SELECT response_headers_ref FROM lar_stage_records WHERE response_headers_ref IS NOT NULL
+           UNION SELECT trailers_ref FROM lar_stage_records WHERE trailers_ref IS NOT NULL
+           UNION SELECT header_block_id FROM lar_trace_artifacts WHERE header_block_id IS NOT NULL)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM lar_header_atoms WHERE atom_id NOT IN
+           (SELECT atom_id FROM lar_header_block_atoms)",
+        [],
+    )?;
     Ok(())
 }
 

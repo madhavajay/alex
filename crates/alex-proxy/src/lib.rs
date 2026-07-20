@@ -10830,7 +10830,7 @@ async fn tool_event(
         if let Some(bytes) = result_body {
             record.result_body_path = Some(store.write_body(&id, "tool-result.json", &bytes)?);
         }
-        store.upsert_tool_call(&record)
+        store.upsert_live_tool_call_with_timeline(&record)
     })
     .await
     {
@@ -16572,6 +16572,105 @@ mod tests {
         assert_eq!(rows[0]["turn_id"], "1");
         let response = tool_event(State(state), HeaderMap::new(), axum::Json(json!({}))).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn live_tool_ingest_publishes_call_then_result_into_the_trace_timeline() {
+        let root = tmpdir("tool-ingest-lar-store");
+        let store = Store::open_with_lar_body_store(
+            root,
+            alex_store::LarBodyStoreConfig {
+                mode: alex_store::LarBodyStoreMode::LarWithFallback,
+                ..alex_store::LarBodyStoreConfig::default()
+            },
+        )
+        .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "trace-tool-live".into(),
+                session_id: Some("session".into()),
+                harness: Some("pi".into()),
+                ts_request_ms: 50,
+                ..TraceRecord::default()
+            })
+            .unwrap();
+        store
+            .write_lar_exchange_capture(
+                &alex_store::LarExchangeCapture {
+                    trace_id: "trace-tool-live".into(),
+                    session_id: Some("session".into()),
+                    run_id: None,
+                    wall_time_ns: 50_000_000,
+                    client_request_headers: None,
+                    client_request_trailers: None,
+                    client_response_headers: None,
+                    client_response_trailers: None,
+                    upstream_attempts: Vec::new(),
+                    upstream_stream_reads: None,
+                    provider: None,
+                    requested_model: None,
+                    routed_model: None,
+                    account_id: None,
+                    routing_reason: None,
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+                &alex_store::LarExchangeBodyRefs::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let state = test_state_with_store("tool-ingest-lar", store);
+        let key = "tool-lar-harness-key";
+        state
+            .store
+            .insert_run_key(
+                "rk-tool-lar",
+                &key_hash_hex(key),
+                "harness",
+                None,
+                None,
+                Some("pi"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static(key));
+        let event = json!({
+            "phase":"end",
+            "session_id":"session",
+            "tool_call_id":"call",
+            "tool_name":"bash",
+            "trace_id":"trace-tool-live",
+            "result":{"content":"hi"},
+            "timestamp_ms":100
+        });
+        assert_eq!(
+            tool_event(State(state.clone()), headers, axum::Json(event))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let stages = state
+            .store
+            .lar_stages_for_traces(&["trace-tool-live".to_string()])
+            .unwrap()
+            .remove("trace-tool-live")
+            .unwrap();
+        let tool_kinds = stages
+            .iter()
+            .filter_map(|stage| {
+                matches!(stage["kind"].as_str(), Some("tool_call" | "tool_result"))
+                    .then(|| stage["kind"].as_str().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_kinds, vec!["tool_call", "tool_result"]);
+        assert!(stages
+            .iter()
+            .find(|stage| stage["kind"] == "tool_call")
+            .unwrap()["request_body_manifest_ref"]
+            .is_null());
     }
 
     #[tokio::test]

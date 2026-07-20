@@ -3975,6 +3975,41 @@ impl Store {
         }
     }
 
+    /// Stream one mixed-mode artifact without materializing its decoded bytes.
+    /// Returns `false` only when no artifact is cataloged or referenced.
+    pub fn write_lar_or_legacy_artifact<W: Write>(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        stage_id: Option<&str>,
+        output: &mut W,
+    ) -> Result<bool> {
+        match self.lar_artifact_location(owner_kind, owner_id, artifact_kind, stage_id)? {
+            Some(LarArtifactLocation::Lar { manifest_id, .. }) => {
+                self.write_lar_manifest_body(&manifest_id, output)?;
+                Ok(true)
+            }
+            Some(LarArtifactLocation::Legacy { path, .. }) => {
+                let path = resolve_source_path(&self.data_dir, &path);
+                let file = File::open(&path)
+                    .with_context(|| format!("opening legacy body at {}", path.display()))?;
+                let mut decoder = GzDecoder::new(file);
+                std::io::copy(&mut decoder, output)
+                    .with_context(|| format!("decompressing legacy body at {}", path.display()))?;
+                Ok(true)
+            }
+            Some(LarArtifactLocation::Unavailable { error, .. }) => {
+                bail!(
+                    "legacy artifact is unavailable ({}): {}",
+                    error.kind,
+                    error.detail
+                )
+            }
+            None => Ok(false),
+        }
+    }
+
     fn backfill_import_archive_catalog(
         &self,
         ids: &ImportIds,

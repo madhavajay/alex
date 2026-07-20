@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::Store;
 
-const LAR_CATALOG_SCHEMA_VERSION: i64 = 4;
+const LAR_CATALOG_SCHEMA_VERSION: i64 = 5;
 
 const LAR_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS lar_schema_versions (
@@ -190,6 +190,45 @@ CREATE TABLE IF NOT EXISTS lar_exchange_records (
 );
 CREATE INDEX IF NOT EXISTS lar_exchange_records_file
   ON lar_exchange_records(file_uuid, capture_sequence);
+
+-- Late harness events are immutable child exchanges rather than mutations of
+-- the original exchange. This table is the durable owner/order projection for
+-- those canonical supplements; the Exchange/Stage records remain authoritative.
+CREATE TABLE IF NOT EXISTS lar_timeline_supplements (
+  tool_id              TEXT NOT NULL,
+  phase                TEXT NOT NULL CHECK (phase IN ('start','arguments','end','result')),
+  supplement_trace_id  TEXT NOT NULL UNIQUE,
+  parent_trace_id      TEXT,
+  display_trace_id     TEXT NOT NULL,
+  session_id           TEXT NOT NULL,
+  capture_sequence     INTEGER NOT NULL CHECK (capture_sequence >= 0),
+  exchange_id          TEXT NOT NULL,
+  stage_id             TEXT NOT NULL,
+  stage_record_id      TEXT NOT NULL,
+  manifest_id          TEXT,
+  file_uuid            TEXT NOT NULL,
+  wall_time_ns         INTEGER NOT NULL CHECK (wall_time_ns >= 0),
+  created_at_ms        INTEGER NOT NULL,
+  PRIMARY KEY (tool_id, phase),
+  FOREIGN KEY (file_uuid) REFERENCES lar_files(file_uuid),
+  FOREIGN KEY (manifest_id) REFERENCES lar_manifests(manifest_id)
+);
+CREATE INDEX IF NOT EXISTS lar_timeline_supplements_parent
+  ON lar_timeline_supplements(parent_trace_id, wall_time_ns, phase);
+CREATE INDEX IF NOT EXISTS lar_timeline_supplements_display
+  ON lar_timeline_supplements(display_trace_id, capture_sequence);
+
+-- Explicit trace deletion must win over later archive rescans. The immutable
+-- child bytes may remain until repack, so a durable tombstone distinguishes a
+-- deleted owner from an accidentally lost derived projection.
+CREATE TABLE IF NOT EXISTS lar_timeline_supplement_tombstones (
+  tool_id              TEXT NOT NULL,
+  phase                TEXT NOT NULL CHECK (phase IN ('start','arguments','end','result')),
+  supplement_trace_id  TEXT NOT NULL UNIQUE,
+  parent_trace_id      TEXT,
+  deleted_at_ms        INTEGER NOT NULL,
+  PRIMARY KEY (tool_id, phase)
+);
 
 CREATE TABLE IF NOT EXISTS lar_trace_artifacts (
   owner_kind          TEXT NOT NULL CHECK (owner_kind IN ('trace', 'tool_call')),
@@ -1521,14 +1560,28 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT trace_id, stage_id, capture_sequence, kind, attempt_number,
-                    wall_time_ns, monotonic_delta_ns, request_headers_ref,
-                    request_body_manifest_ref, response_headers_ref,
-                    response_body_manifest_ref, trailers_ref, stream_index_ref,
-                    fidelity
-               FROM lar_stage_records
-              WHERE trace_id IN ({placeholders})
-              ORDER BY trace_id, capture_sequence"
+            "SELECT r.trace_id, r.stage_id, r.capture_sequence, r.kind, r.attempt_number,
+                    r.wall_time_ns, r.monotonic_delta_ns, r.request_headers_ref,
+                    r.request_body_manifest_ref, r.response_headers_ref,
+                    r.response_body_manifest_ref, r.trailers_ref, r.stream_index_ref,
+                    r.fidelity
+               FROM lar_stage_records AS r
+               LEFT JOIN lar_timeline_supplements AS s
+                 ON s.display_trace_id=r.trace_id AND s.stage_id=r.stage_id
+              WHERE r.trace_id IN ({placeholders})
+              ORDER BY r.trace_id,
+                       CASE WHEN s.stage_id IS NULL THEN 0 ELSE 1 END,
+                       CASE WHEN s.stage_id IS NULL THEN r.capture_sequence END,
+                       CASE WHEN s.stage_id IS NOT NULL THEN r.wall_time_ns END,
+                       CASE WHEN s.stage_id IS NOT NULL THEN r.capture_sequence END,
+                       CASE s.phase
+                         WHEN 'start' THEN 0
+                         WHEN 'arguments' THEN 1
+                         WHEN 'end' THEN 2
+                         WHEN 'result' THEN 3
+                         ELSE 4
+                       END,
+                       r.stage_id"
         );
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(&sql)?;
@@ -1624,7 +1677,7 @@ mod tests {
             .unwrap();
 
         let store = Store::open(data_dir.clone()).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 5);
         {
             let conn = store.conn.lock().unwrap();
             let lar_tables: i64 = conn
@@ -1634,12 +1687,14 @@ mod tests {
                        ('lar_archive_sets','lar_files','lar_checkpoints','lar_chunks',
                         'lar_manifests','lar_manifest_chunks','lar_header_atoms',
                         'lar_header_blocks','lar_trace_artifacts','lar_stage_records',
-                        'lar_migration_jobs','lar_migration_items','lar_gc_runs')",
+                        'lar_timeline_supplements','lar_timeline_supplement_tombstones',
+                        'lar_migration_jobs',
+                        'lar_migration_items','lar_gc_runs')",
                     [],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(lar_tables, 13);
+            assert_eq!(lar_tables, 15);
             let legacy_path_columns: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('traces')
@@ -1656,7 +1711,7 @@ mod tests {
         drop(store);
 
         let reopened = Store::open(data_dir).unwrap();
-        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 4);
+        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 5);
         let conn = reopened.conn.lock().unwrap();
         let version_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM lar_schema_versions", [], |row| {
@@ -1702,7 +1757,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(data_dir).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 5);
         let conn = store.conn.lock().unwrap();
         let preserved: String = conn
             .query_row(
@@ -1769,7 +1824,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(data_dir).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 5);
         let conn = store.conn.lock().unwrap();
         let stage_schema: String = conn
             .query_row(

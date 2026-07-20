@@ -106,7 +106,9 @@ source files.
 | `grep LITERAL [ARCHIVE...]` | Search exact raw body bytes in the live catalog plus any supplied sealed archives. This body-only, deduplicated scan remains the default. `--scope whole-record` additionally searches safe ordered header/trailer atoms and canonical model/provider/error/control metadata. Sensitive header values and privacy-sensitive metadata fields are excluded and listed in the JSON `record_coverage` report; the command never searches arbitrary SQLite columns or unreferenced file bytes. Shared chunks are decompressed once per source, matches may span manifest ranges, and results include manifest/stage/trace/session/time anchors where available. The default 512 MiB charged chunk-cache limit is a RAM budget: verified evictions spill to an auto-cleaned temporary file and remain reusable without decompression. Scan-limit, temporary-disk, corruption, and `--limit N` failures abort rather than return an incomplete result set. |
 | `extract --trace-id ID --artifact KIND` | Write exact mixed legacy/LAR bytes to stdout or `--output`; kinds are `request`, `upstream-request`, `response`, and `raw-stream`. `--force` is required to replace an output. |
 | `replay ARCHIVE --trace-id ID` | Replay a captured stream from a standalone or sealed archive. Raw mode preserves observed HTTP-client read boundaries; `--parsed` independently emits recorded SSE/NDJSON ranges. `--speed instant\|0.25x\|0.5x\|1x\|2x\|4x` controls timing and defaults to instant so a long capture cannot accidentally block for hours. Use `--stage-id` when a trace has multiple streams and `--output` for a file. |
-| `export OUTPUT --format lar\|har\|warc\|jsonl\|otel\|openinference` | Export one `--trace-id`, one `--session`, or the complete live trace catalog. For cataloged LAR traces, standalone LAR copies the exact ordered stage/header/logical-body/stream closure plus existing ExchangeMetadata and transitive conversation ancestors/response entries; an older exchange without a companion derives supported fields from its current trace row. Manifest media/encoding is retained and dependent IDs are recomputed if destination chunking changes topology. Unavailable cataloged sources fail instead of degrading, while legacy-only traces use a declared synthesized-fidelity path. LAR output is written to a sibling temp file, sealed, body-verified, and atomically no-clobber published; forced replacement semantics are platform-dependent. Body-copy memory is currently bounded by the largest artifact, while writer/index and selection metadata scale with the archive. Interchange outputs embed an explicit fidelity-loss report. `otel` uses current `gen_ai.*` names and `openinference` is a distinct OpenInference-on-OpenTelemetry attribute vocabulary. `--force` is required to replace output. |
+| `transaction --trace-id ID --output FILE [--archive SEALED.lar]` | Export one complete transaction as a verified RFC 7464 JSON sequence. Live canonical data is streamed directly from catalog packs; a sealed archive can be selected explicitly. The source-neutral timeline preserves each stage's actual Exchange identity while ordering strict late tool supplements and excluding ordinary child/subagent lineage. Header/trailer atoms, body bytes/content IDs, transport/routing/usage/error metadata, and stream timing remain addressable; shared bodies are emitted once in decoded pieces of at most 48 KiB. Legacy-only traces use a direct bounded `synthesized_legacy` path. Output is synced and atomically published; `--force` is required to replace it. See [complete-transaction format](lar-transaction-json-seq.md). |
+| `transaction-replay FILE` | Validate a complete transaction sequence, then replay one captured stream's exact observed reads or `--parsed` frame ranges. Use `--stage-id` when several streams exist and `--speed instant\|0.25x\|0.5x\|1x\|2x\|4x`. File output is atomically published and never partially replaces an existing destination on corruption or truncation. No HTTP/provider framing is invented. |
+| `export OUTPUT --format lar\|har\|warc\|jsonl\|otel\|openinference` | Export one `--trace-id`, one `--session`, or the complete live trace catalog. For cataloged LAR traces, all formats derive from the exact canonical exchange/stage timeline, including retries, ordered duplicate-preserving headers/trailers, stream indexes, late linked tool supplements, and one descriptor per distinct logical body. Unavailable canonical sources fail instead of degrading; genuinely legacy-only traces use a separate declared-loss path. Bodies are copied/encoded in fixed-size windows, interchange trace selection is cursor-paged from a stable high-water mark, and a deletion/filter mutation that changes the emitted count aborts publication. Output is written to a synced sibling temp file before atomic publication. Native LAR also copies the conversation closure and verifies every reconstructed body. JSONL v1 remains the legacy/import-compatible shape; canonical or mixed output is JSONL v2 with bounded body-part records and is currently export-only. HAR/WARC/semantic adapters preserve the canonical graph in Alex extensions while reporting losses in their standard projections. `otel` uses current `gen_ai.*` names and `openinference` uses its distinct vocabulary. `--force` is required to replace output. |
 | `cleanup --dry-run` | Run a full verification pass and report the legacy files/bytes eligible for cleanup. No file is moved. |
 | `cleanup --apply` | Only after every migration job is complete with no pending/failed items and full verification passes, move legacy body files into a recoverable, audited quarantine below `lar/quarantine/`. LAR data is never removed. |
 
@@ -134,16 +136,23 @@ alex lar replay session.lar --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
   --speed 2x
 alex lar replay session.lar --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
   --parsed --speed instant --output parsed-events.sse
+alex lar transaction --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
+  --output trace.transaction.jsonseq --json
+alex lar transaction-replay trace.transaction.jsonseq \
+  --stage-id STAGE_CONTENT_ID --speed instant --output raw-stream.sse
 ```
 
-JSONL import defaults cap a physical line at 768 MiB, each decoded body at
+JSONL v1 import defaults cap a physical line at 768 MiB, each decoded body at
 256 MiB, metadata at 2 MiB, headers at 65,536 fields/8 MiB, the stream at one
 million trace records, and total input at 4 TiB. These are rejection limits,
 not buffering targets: only one line and its at-most-three decoded bodies are
 resident. The source manifest's fidelity-loss list and per-record header
 fidelity are returned in the import report. Header arrays must agree with the
 raw header JSON retained in trace metadata, which makes export/import/export
-stable for current Alex JSONL files.
+stable for current Alex JSONL v1 files. JSONL v2 preserves the canonical graph
+and emits body bytes in 48 KiB records, but the v1 importer rejects it with an
+explicit explanation rather than discarding retries, trailers, streams, or
+tool links. Use standalone LAR for a currently re-importable lossless export.
 
 ## `env`
 

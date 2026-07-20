@@ -26,6 +26,8 @@ mod lar_jsonl_import;
 mod lar_repack;
 mod lar_stage_content;
 mod lar_stream_replay;
+mod lar_tool_timeline;
+mod lar_transaction;
 mod lar_verify;
 mod legacy_import;
 mod live_body_store;
@@ -67,6 +69,10 @@ pub use lar_stream_replay::{
     LarStreamReplayPageOptions, LarStreamReplaySource, DEFAULT_STREAM_REPLAY_PAGE_BYTES,
     DEFAULT_STREAM_REPLAY_PAGE_LIMIT, MAX_STREAM_REPLAY_PAGE_BYTES, MAX_STREAM_REPLAY_PAGE_LIMIT,
 };
+pub use lar_transaction::{
+    write_archive_transaction, write_synthesized_legacy_transaction, LarTransactionExportReport,
+    LAR_TRANSACTION_ARTIFACT_PIECE_BYTES, LAR_TRANSACTION_FORMAT, LAR_TRANSACTION_VERSION,
+};
 pub use lar_verify::{LarMigrationVerificationIssue, LarMigrationVerificationReport};
 pub use legacy_import::{
     LarArtifactBatchRead, LarArtifactReadRequest, LarLegacyArtifact, LarLegacyImportBoundary,
@@ -77,6 +83,10 @@ pub use live_body_store::{
     LarBodyArtifact, LarBodyOwnerKind, LarBodyStoreConfig, LarBodyStoreMode, LarBodyWriteResult,
     LarDurabilityMode, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
     LarStreamReadCapture, LarUpstreamAttemptCapture, LAR_HEADER_FLAG_REDACTED,
+};
+pub use standalone_export::{
+    LarExportTraceCursor, LarInterchangeBody, LarInterchangeHeaderBlock, LarInterchangeStage,
+    LarInterchangeStream, LarInterchangeTrace,
 };
 pub use standalone_import::{
     LarBackupArtifactRef, LarStandaloneImportOptions, LarStandaloneImportReport,
@@ -297,6 +307,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   exit_status        INTEGER,
   args_body_path     TEXT,
   result_body_path   TEXT,
+  canonical_timeline INTEGER NOT NULL DEFAULT 0,
   UNIQUE(harness, session_id, tool_call_id)
 );
 CREATE INDEX IF NOT EXISTS tool_calls_session_ts ON tool_calls(session_id, ts_start_ms);
@@ -722,6 +733,18 @@ fn migrate_run_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_tool_calls(conn: &Connection) -> Result<()> {
+    if let Err(error) = conn.execute_batch(
+        "ALTER TABLE tool_calls
+         ADD COLUMN canonical_timeline INTEGER NOT NULL DEFAULT 0",
+    ) {
+        if !error.to_string().contains("duplicate column name") {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct TraceFilter {
     pub since_ms: Option<i64>,
@@ -876,6 +899,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrate_traces(&conn)?;
         migrate_run_keys(&conn)?;
+        migrate_tool_calls(&conn)?;
         lar_catalog::migrate(&mut conn)?;
         lar_archive_ops::migrate(&conn)?;
         lar_conversation::migrate(&conn)?;
@@ -894,6 +918,16 @@ impl Store {
             if let Err(error) = store.recover_lar_body_store_orphans() {
                 tracing::warn!(
                     "live LAR startup recovery failed; legacy fallbacks remain available: {error:#}"
+                );
+            }
+            if let Err(error) = store.rebuild_active_lar_tool_timeline_catalog() {
+                tracing::warn!(
+                    "LAR tool timeline rescan failed; archive records remain authoritative: {error:#}"
+                );
+            }
+            if let Err(error) = store.recover_lar_tool_timeline_supplements() {
+                tracing::warn!(
+                    "LAR tool timeline recovery failed; harness rows remain retryable: {error:#}"
                 );
             }
         }
@@ -1935,10 +1969,74 @@ impl Store {
     }
 
     pub fn upsert_tool_call(&self, tool: &ToolCallRecord) -> Result<()> {
+        self.upsert_tool_call_projection(tool, false)
+    }
+
+    /// Persist a harness event and append its immutable canonical timeline
+    /// phases. Importers and metadata restores must use [`Self::upsert_tool_call`]
+    /// so an already-materialized archive exchange is not duplicated.
+    pub fn upsert_live_tool_call_with_timeline(&self, tool: &ToolCallRecord) -> Result<()> {
+        self.upsert_tool_call_projection(tool, true)?;
+        let tool = self
+            .load_tool_call_projection(&tool.harness, &tool.session_id, &tool.tool_call_id)?
+            .context("live tool projection disappeared before timeline capture")?;
+        // A result callback may be the first event Alex sees and may contain
+        // both the original input and the result. Publish every phase proved
+        // by the row; each immutable supplement has its own idempotence key.
+        self.append_lar_tool_timeline_phase(&tool, "start")?;
+        if tool.ts_end_ms.is_some() {
+            self.append_lar_tool_timeline_phase(&tool, "end")?;
+        }
+        if tool.args_body_path.is_some() {
+            self.append_lar_tool_timeline_phase(&tool, "arguments")?;
+        }
+        if tool.result_body_path.is_some() {
+            self.append_lar_tool_timeline_phase(&tool, "result")?;
+        }
+        Ok(())
+    }
+
+    fn load_tool_call_projection(
+        &self,
+        harness: &str,
+        session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<ToolCallRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, harness, session_id, turn_id, tool_call_id, trace_id,
+                    tool_name, ts_start_ms, ts_end_ms, is_error, exit_status,
+                    args_body_path, result_body_path
+               FROM tool_calls
+              WHERE harness=?1 AND session_id=?2 AND tool_call_id=?3",
+            params![harness, session_id, tool_call_id],
+            |row| {
+                Ok(ToolCallRecord {
+                    id: row.get(0)?,
+                    harness: row.get(1)?,
+                    session_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    tool_call_id: row.get(4)?,
+                    trace_id: row.get(5)?,
+                    tool_name: row.get(6)?,
+                    ts_start_ms: row.get(7)?,
+                    ts_end_ms: row.get(8)?,
+                    is_error: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+                    exit_status: row.get(10)?,
+                    args_body_path: row.get(11)?,
+                    result_body_path: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(anyhow::Error::new)
+    }
+
+    fn upsert_tool_call_projection(&self, tool: &ToolCallRecord, canonical: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tool_calls (id, harness, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms, ts_end_ms, is_error, exit_status, args_body_path, result_body_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "INSERT INTO tool_calls (id, harness, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms, ts_end_ms, is_error, exit_status, args_body_path, result_body_path, canonical_timeline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(harness, session_id, tool_call_id) DO UPDATE SET
                turn_id=COALESCE(excluded.turn_id, tool_calls.turn_id),
                trace_id=COALESCE(excluded.trace_id, tool_calls.trace_id),
@@ -1948,12 +2046,13 @@ impl Store {
                is_error=COALESCE(excluded.is_error, tool_calls.is_error),
                exit_status=COALESCE(excluded.exit_status, tool_calls.exit_status),
                args_body_path=COALESCE(excluded.args_body_path, tool_calls.args_body_path),
-               result_body_path=COALESCE(excluded.result_body_path, tool_calls.result_body_path)",
-            params![tool.id, tool.harness, tool.session_id, tool.turn_id, tool.tool_call_id,
-                tool.trace_id, tool.tool_name, tool.ts_start_ms, tool.ts_end_ms,
-                tool.is_error.map(|v| v as i64), tool.exit_status, tool.args_body_path,
-                tool.result_body_path],
-        )?;
+               result_body_path=COALESCE(excluded.result_body_path, tool_calls.result_body_path),
+               canonical_timeline=MAX(tool_calls.canonical_timeline, excluded.canonical_timeline)",
+                params![tool.id, tool.harness, tool.session_id, tool.turn_id, tool.tool_call_id,
+                    tool.trace_id, tool.tool_name, tool.ts_start_ms, tool.ts_end_ms,
+                    tool.is_error.map(|v| v as i64), tool.exit_status, tool.args_body_path,
+                    tool.result_body_path, i64::from(canonical)],
+            )?;
         lar_fts::refresh_tool_anchor(&conn, &tool.id)?;
         Ok(())
     }

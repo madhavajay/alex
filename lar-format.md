@@ -807,10 +807,10 @@ Standalone export:
   no-clobber publication even if another process races to create the output.
   Forced replacement is atomic on Unix; platforms that cannot replace by
   rename may remove the old destination immediately before publication. It
-  does not build the complete archive bytes in a `Vec`; body copying currently
-  reconstructs one logical body at a time and can therefore use memory
-  proportional to the largest single artifact. Writer indexes/record metadata
-  and multi-trace selection metadata still scale with the selected archive,
+  does not build the complete archive bytes or a complete logical body in a
+  `Vec`; body copying uses fixed-size memory windows and a temporary on-disk
+  spool while retaining transport metadata. Writer indexes/record metadata and
+  native multi-trace selection metadata still scale with the selected archive,
   subject to format limits. Trace backup construction is a separate path and
   still materializes its embedded LAR before packaging.
 
@@ -895,15 +895,33 @@ Reset requirements:
 
 ### 14.3 Exports
 
-- HAR: transport-oriented request/response/timing representation.
-- WARC: durable request/response/metadata records and payload digests.
-- JSONL: versioned manifest plus normalized trace metadata, header fidelity,
-  explicit loss report, and length/hash-checked inline bodies. Import is
-  line-streamed with hard limits, rejects duplicate/conflicting trace IDs, and
-  publishes each trace only after its bodies validate through the normal store.
+- Modern interchange exports derive from the exact canonical exchange/stage
+  timeline. Base stages retain capture order; late linked tool supplements are
+  added in deterministic wall-time/capture-sequence/phase order even when their
+  records live in another pack. Occurrence IDs remain distinct from immutable
+  content IDs. Header/trailer atoms, retries, stream reads/frames, exchange
+  metadata, and one descriptor per distinct logical body are retained.
+- HAR: transport-oriented request/response/timing representation. Standard
+  client fields are populated and the complete canonical graph plus non-client
+  stage bodies remain in Alex extensions.
+- WARC: durable linked request/response/metadata/resource records with
+  interoperable SHA-256 block digests. HTTP framing is a declared synthesis;
+  projected HTTP records do not mislabel a hash of their complete block as an
+  entity payload digest.
+- JSONL: legacy-only selections retain the import-compatible v1 shape.
+  Canonical/mixed selections use v2 graph records plus bounded 48 KiB body-part
+  records, so a physical line is independent of logical body size. The current
+  v1 importer rejects v2 precisely instead of silently dropping canonical
+  details; standalone LAR is the lossless re-import path for now.
 - OpenTelemetry and OpenInference: distinct derived JSONL span adapters. OTel
   uses current `gen_ai.*` attributes; OpenInference uses
-  `openinference.span.kind`, `llm.*`, and `input/output.*` attributes.
+  `openinference.span.kind`, `llm.*`, and `input/output.*` attributes. Both keep
+  the exact canonical graph in an Alex extension.
+- Bulk interchange export freezes a SQLite high-water mark, pages trace rows by
+  a stable cursor, streams bodies in fixed-size windows, and atomically publishes
+  a sibling temporary file. A concurrent backdated insert is not pulled into an
+  in-progress export; a deletion or selection mutation that changes the emitted
+  count aborts publication rather than producing a contradictory summary.
 - OTAP/Arrow: optional columnar analytics output.
 - Raw: exact reconstructed artifact bytes plus metadata manifest.
 
@@ -1080,9 +1098,15 @@ work, even when a narrower prototype exists.
 - [x] Add unified artifact references and legacy fallback reads.
 - [x] Route new request, upstream-request, response, tool, Dario, and fixture
       artifacts through manifests.
-- [ ] Append live harness tool-call/tool-result events to the immutable ordered
-      exchange stage timeline as well as the separate tool table, matching the
-      canonical stage graph synthesized by legacy import.
+- [x] Append live harness tool-call/tool-result events as immutable,
+      self-describing child exchanges as well as the separate tool table.
+      Call/result stages reuse the one body manifest; strict provenance keeps
+      ordinary child-agent lineage out of the parent timeline. Live-only intent,
+      startup recovery, reattach/rescan, standalone export/import, retention
+      tombstones, and repack preserve occurrence identity without duplicating
+      legacy-imported base stages. Body-less phases can be enriched later by
+      immutable arguments/result records, and the exact base stage order always
+      precedes even backdated supplements.
 - [x] Persist ordered trailer blocks when a capture source supplies them; the
       current HTTP proxy stacks expose data frames but not HTTP trailer frames,
       so absent trailers remain explicitly absent rather than fabricated.
@@ -1094,7 +1118,14 @@ work, even when a narrower prototype exists.
 - [x] Reuse one manifest for identical stages.
 - [x] Move hashing/compression/parsing to bounded blocking workers.
 - [x] Add pack rotation and periodic checkpoints.
-- [x] Add live health and storage metrics.
+- [ ] Add the complete live health and storage metric set from section 17.
+      The health surface currently reports bounded-worker queue wait/work and
+      failure counters. Storage status reports logical/unique bytes, dedup
+      ratios, checkpoint/file state, corruption/unreachable counts, migration
+      progress, and offline archives. Runtime histograms for
+      chunker/hash/compression, append/flush/SQLite commit, read TTFT and
+      reconstruction, GC/repack reclamation, and search-index lag remain to be
+      instrumented before this item is complete.
 - [x] Add feature flags for read, write, dual-write, and fallback modes.
 
 ### Phase 3 — legacy importer and startup migration
@@ -1183,9 +1214,9 @@ work, even when a narrower prototype exists.
       traces, including ordered stages and headers, all manifest/stream refs,
       ExchangeMetadata, and the transitive conversation generation/entry/turn
       closure. Export uses a sibling temp file and atomic publication; body
-      copy/validation is bounded by the largest single artifact, not yet by a
-      smaller streaming window within that artifact. Legacy-only traces retain
-      their explicitly declared synthesized-fidelity path.
+      copy/validation uses fixed-size memory windows and a temporary disk spool.
+      Legacy-only traces retain their explicitly declared synthesized-fidelity
+      path.
 - [x] Integrate reset, backup, and restore flows.
 - [x] Add interrupted GC recovery tests.
 - [x] Add interrupted repack recovery tests.
@@ -1201,14 +1232,19 @@ work, even when a narrower prototype exists.
 - [x] Implement explicitly lossy, legacy-compatible JSONL export/import.
 - [x] Implement distinct legacy-compatible OpenTelemetry GenAI and
       OpenInference export adapters with explicit loss reports.
-- [ ] Derive HAR, WARC, JSONL, OpenTelemetry, and OpenInference export from the
+- [x] Derive HAR, WARC, JSONL, OpenTelemetry, and OpenInference export from the
       canonical LAR exchange/stage graph when it exists, including every
       upstream attempt, ordered header/trailer block, stream index, and linked
       tool event instead of reducing modern captures to three legacy bodies.
-- [ ] Add a raw transaction replay/export that reconstructs method/path,
+- [x] Add a raw transaction replay/export that reconstructs method/path,
       ordered stage sequence, headers/trailers, raw artifact bytes, and stream
-      timing from one canonical exchange.
-- [ ] Stream bulk non-LAR conversion with memory bounded independently of the
+      timing from one canonical exchange plus strictly validated late tool
+      supplements. The RFC 7464 envelope streams canonical live/sealed sources
+      into one source-neutral timeline, retains each stage's actual Exchange
+      content ID, emits shared bodies once in bounded pieces, explicitly labels
+      direct legacy synthesis, validates corruption/truncation and stream
+      ranges before replay, and atomically publishes file outputs.
+- [x] Stream bulk non-LAR conversion with memory bounded independently of the
       total selected logical body size.
 - [x] Evaluate OTAP/Arrow analytics export after the semantic schema stabilizes.
 - [x] Publish format specification, MIME proposal, examples, and CLI guide.
@@ -1261,6 +1297,9 @@ work, even when a narrower prototype exists.
 - [x] Disk-full behavior before and during append.
 - [x] Sessions crossing event-log and body-pack rotations.
 - [x] Retention with chunks shared by old and retained traces.
+- [x] Bodies-only retention clears manifest, header/trailer, and stream-index
+      projections from replay/export while preserving conversation entry bytes
+      still referenced by a newer retained turn.
 - [x] Offline archive detach and reattach.
 - [x] Standalone and JSONL export/import into an empty store.
 - [x] Legacy fallback after an intentionally failed migration item.
@@ -1316,9 +1355,11 @@ Phase 0 resolved the v1 choices with reproducible benchmarks and ADRs:
   pages remain optional until a real multi-file corpus justifies their privacy
   and roughly 3% storage cost.
 
-The only remaining container-design gate is whether standalone exports should
-include a portable search index by default. The compatibility window is also
-resolved operationally in `docs/lar-operations.md`: at least two subsequent
+Portable search indexes are explicitly not included by default in standalone
+v1 exports. Reconsider them only in a post-v1 optional feature after the real
+multi-file corpus demonstrates enough avoided I/O to justify their privacy and
+storage cost; this is not a v1 container-design gate. The compatibility window
+is resolved operationally in `docs/lar-operations.md`: at least two subsequent
 minor releases and 90 days after default LAR writes, whichever is longer;
 pre-LAR downgrade requires retained gzip files or restoration from
 quarantine/backup.

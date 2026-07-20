@@ -1,17 +1,19 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alex_core::TraceRecord;
 use alex_lar::{
-    ArchiveWriter, ChunkerConfig, Exchange, ExchangeData, FileHeader, Limits, ParsedFrame, Stage,
-    StageData, StageKind, StreamFrameKind, StreamIndex, StreamParser, StreamRead,
+    ArchiveReader, ArchiveWriter, ChunkerConfig, Exchange, ExchangeData, FileHeader, Limits,
+    ParsedFrame, Stage, StageData, StageKind, StreamFrameKind, StreamIndex, StreamParser,
+    StreamRead,
 };
 use alex_store::{
     LarArchiveAvailability, LarArchiveUnavailableError, LarBodyArtifact, LarBodyStoreConfig,
-    LarBodyStoreMode, LarExchangeBodyRefs, LarExchangeCapture, LarStandaloneImportOptions,
-    LarStreamReadCapture, LarStreamReplayError, LarStreamReplayPageOptions, LarStreamReplaySource,
-    LarUpstreamAttemptCapture, Store, MAX_STREAM_REPLAY_PAGE_BYTES, MAX_STREAM_REPLAY_PAGE_LIMIT,
+    LarBodyStoreMode, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
+    LarStandaloneImportOptions, LarStreamReadCapture, LarStreamReplayError,
+    LarStreamReplayPageOptions, LarStreamReplaySource, LarUpstreamAttemptCapture, Store,
+    MAX_STREAM_REPLAY_PAGE_BYTES, MAX_STREAM_REPLAY_PAGE_LIMIT,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -80,16 +82,29 @@ fn live_stream_fixture(root: &Path, trace_id: &str) -> (Store, String, Vec<u8>) 
                 session_id: Some("stream-session".into()),
                 run_id: None,
                 wall_time_ns: 1_000_000,
-                client_request_headers: None,
+                client_request_headers: Some(LarHeaderCapture::observed([
+                    ("Content-Type", "application/json"),
+                    ("X-Repeated", "one"),
+                    ("X-Repeated", "two"),
+                ])),
                 client_request_trailers: None,
-                client_response_headers: None,
+                client_response_headers: Some(LarHeaderCapture::observed([(
+                    "Content-Type",
+                    "text/event-stream",
+                )])),
                 client_response_trailers: None,
                 upstream_attempts: vec![LarUpstreamAttemptCapture {
                     attempt_number: 1,
                     wall_time_ns: 1_100_000,
-                    request_headers: None,
+                    request_headers: Some(LarHeaderCapture::observed([(
+                        "Content-Type",
+                        "application/json",
+                    )])),
                     request_trailers: None,
-                    response_headers: None,
+                    response_headers: Some(LarHeaderCapture::observed([(
+                        "Content-Type",
+                        "text/event-stream",
+                    )])),
                     response_trailers: None,
                     status_code: Some(200),
                     error_class: None,
@@ -283,6 +298,53 @@ fn active_and_sealed_raw_pages_concatenate_exactly_and_enforce_bounds() {
         LarArchiveAvailability::ArchivedOffline
     );
     assert_eq!(offline.file_uuid, file_uuid);
+}
+
+#[test]
+fn bodies_only_retention_removes_header_and_stream_graph_from_export() {
+    let root = tmpdir("retention-export");
+    let (store, _stage_id, _body) = live_stream_fixture(&root, "trace-retained-metadata");
+
+    store.prune(2_000, true, false).unwrap();
+    let interchange = store
+        .lar_interchange_trace("trace-retained-metadata")
+        .unwrap()
+        .unwrap();
+    assert!(interchange.bodies.is_empty());
+    assert!(interchange.stages.iter().all(|stage| {
+        stage.data.request_headers_ref.is_none()
+            && stage.data.request_body_manifest_ref.is_none()
+            && stage.data.response_headers_ref.is_none()
+            && stage.data.response_body_manifest_ref.is_none()
+            && stage.data.trailers_ref.is_none()
+            && stage.data.stream_index_ref.is_none()
+    }));
+
+    let export_path = root.join("retained-metadata.lar");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&export_path)
+        .unwrap();
+    let mut writer = ArchiveWriter::create(
+        file,
+        FileHeader::standalone([0x94; 16], 2_000_000_000, b"retention-export".to_vec()),
+        ChunkerConfig::default(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(store
+        .append_exact_trace_to_standalone(&mut writer, "trace-retained-metadata")
+        .unwrap());
+    writer.seal().unwrap();
+    drop(writer);
+
+    let exported =
+        ArchiveReader::open(File::open(export_path).unwrap(), Limits::default()).unwrap();
+    assert_eq!(exported.manifest_count(), 0);
+    assert_eq!(exported.header_block_count(), 0);
+    assert_eq!(exported.stream_index_count(), 0);
 }
 
 fn write_parsed_archive(path: &Path) -> (String, Vec<u8>, Vec<u8>) {

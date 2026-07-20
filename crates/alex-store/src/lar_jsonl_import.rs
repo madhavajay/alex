@@ -87,6 +87,14 @@ struct ManifestLine {
     version: u64,
     format: String,
     loss_report: Vec<String>,
+    #[serde(default)]
+    record_schema: Option<String>,
+    #[serde(default)]
+    canonical_traces: Option<u64>,
+    #[serde(default)]
+    legacy_traces: Option<u64>,
+    #[serde(default)]
+    body_part_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +369,18 @@ impl Store {
 }
 
 fn validate_manifest(manifest: &ManifestLine, options: &LarJsonlImportOptions) -> Result<()> {
+    if manifest.record_type == "alex.lar.export.manifest"
+        && manifest.version == 2
+        && manifest.format == "jsonl"
+    {
+        let schema = manifest.record_schema.as_deref().unwrap_or("unspecified");
+        let canonical = manifest.canonical_traces.unwrap_or_default();
+        let legacy = manifest.legacy_traces.unwrap_or_default();
+        let part_bytes = manifest.body_part_bytes.unwrap_or_default();
+        bail!(
+            "Alex JSONL v2 schema {schema} is a canonical graph interchange ({canonical} canonical, {legacy} legacy traces; {part_bytes}-byte body parts); this version only imports legacy-compatible JSONL v1 without discarding retries, trailers, streams, or tool links (use a standalone .lar archive for lossless import)"
+        );
+    }
     if manifest.record_type != "alex.lar.export.manifest"
         || manifest.version != 1
         || manifest.format != "jsonl"

@@ -16,6 +16,7 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | [Dario](dario.md) | Dario routing modes, three-block prompt rewrite, header handling, generations, health, and fallback behavior. |
 | [Traces](traces.md) | Trace rows and gzip bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
 | [LAR v1 wire format](lar-format-v1.md) | Container framing, content IDs, limits, recovery, versioning, and conformance fixtures for the deduplicated archive. |
+| [LAR complete-transaction JSON sequence](lar-transaction-json-seq.md) | Byte-authoritative one-trace interchange records, source Exchange identity, bounded body pieces, replay behavior, and fidelity limits. |
 | [LAR v1 conformance](lar-conformance.md) | Public vectors, verifier commands, MIME proposal, compatibility workflow, and security notes. |
 
 ## Harnesses and capture

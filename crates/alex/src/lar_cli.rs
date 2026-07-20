@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use alex_lar::{
@@ -12,9 +12,11 @@ use alex_lar::{
 };
 use alex_store::{
     grep_lar_archive_records, LarArchiveReattachOptions, LarArtifactLocation, LarBackupArtifactRef,
-    LarBodyStoreConfig, LarBodyStoreMode, LarCatalogGrepMatch, LarJsonlImportOptions,
+    LarBodyStoreConfig, LarBodyStoreMode, LarCatalogGrepMatch, LarExportTraceCursor,
+    LarInterchangeBody, LarInterchangeStage, LarInterchangeTrace, LarJsonlImportOptions,
     LarLegacyImportOptions, LarMigrationJob, LarRecordGrepCoverage, LarRecordGrepMatch,
-    LarRepackConfig, LarStandaloneImportOptions, Store, TraceBackupRows,
+    LarRepackConfig, LarStandaloneImportOptions, LarTransactionExportReport, Store,
+    TraceBackupRows, LAR_TRANSACTION_FORMAT, LAR_TRANSACTION_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -65,6 +67,10 @@ pub(crate) enum LarCommand {
     Extract(ExtractArgs),
     /// Replay a captured raw stream with instant, original, or scaled timing
     Replay(ReplayArgs),
+    /// Export one complete raw transaction as a bounded JSON sequence
+    Transaction(TransactionArgs),
+    /// Replay a captured stream from a transaction JSON sequence
+    TransactionReplay(TransactionReplayArgs),
     /// Export selected records to a standalone archive or interchange format
     Export(ExportArgs),
 }
@@ -387,6 +393,46 @@ pub(crate) struct ReplayArgs {
     pub(crate) force: bool,
 }
 
+#[derive(Debug, Args)]
+pub(crate) struct TransactionArgs {
+    /// Trace whose complete ordered transaction should be exported
+    #[arg(long)]
+    pub(crate) trace_id: String,
+    /// Read from this sealed standalone archive instead of the live catalog
+    #[arg(long)]
+    pub(crate) archive: Option<PathBuf>,
+    /// Required destination; transaction bytes never print to a terminal
+    #[arg(long)]
+    pub(crate) output: PathBuf,
+    /// Replace an existing destination
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Emit a machine-readable export report
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TransactionReplayArgs {
+    /// Transaction JSON-sequence file
+    pub(crate) input: PathBuf,
+    /// Select one stage when the transaction contains multiple captured streams
+    #[arg(long)]
+    pub(crate) stage_id: Option<String>,
+    /// Replay parsed SSE/NDJSON frame ranges instead of observed reads
+    #[arg(long)]
+    pub(crate) parsed: bool,
+    /// Playback speed; instant is the safe default for long captures
+    #[arg(long, value_enum, default_value_t = LarReplaySpeed::Instant)]
+    pub(crate) speed: LarReplaySpeed,
+    /// Write replay bytes here instead of stdout
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
+    /// Replace an existing output file
+    #[arg(long, requires = "output")]
+    pub(crate) force: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum LarExportFormat {
     Lar,
@@ -492,6 +538,10 @@ impl LarCommandBackend for LocalLarBackend {
             LarCommand::Grep(args) => grep_records(data_dir, args),
             LarCommand::Extract(args) => extract_artifact(data_dir, args),
             LarCommand::Replay(_) => bail!("internal error: replay bypassed streaming runner"),
+            LarCommand::Transaction(args) => export_transaction(data_dir, args),
+            LarCommand::TransactionReplay(_) => {
+                bail!("internal error: transaction replay bypassed command backend")
+            }
             LarCommand::Export(args) => export_records(data_dir, args),
         }
     }
@@ -500,6 +550,9 @@ impl LarCommandBackend for LocalLarBackend {
 pub(crate) fn run(data_dir: &Path, command: LarCommand) -> Result<()> {
     if let LarCommand::Replay(args) = &command {
         return replay_stream(args);
+    }
+    if let LarCommand::TransactionReplay(args) = &command {
+        return replay_transaction(args);
     }
     let json = command.json();
     LocalLarBackend.execute(data_dir, &command)?.print(json)
@@ -535,9 +588,644 @@ impl LarCommand {
             Self::Grep(args) => args.json,
             Self::Extract(args) => args.json,
             Self::Replay(_) => false,
+            Self::Transaction(args) => args.json,
+            Self::TransactionReplay(_) => false,
             Self::Export(args) => args.json,
         }
     }
+}
+
+fn export_transaction(data_dir: &Path, args: &TransactionArgs) -> Result<LarCommandOutput> {
+    if args.output.exists() && !args.force {
+        bail!(
+            "transaction output already exists: {} (use --force to replace it)",
+            args.output.display()
+        );
+    }
+    if let Some(source) = &args.archive {
+        preflight_archive(source)?;
+        if source == &args.output {
+            bail!("transaction output must differ from its source archive");
+        }
+    }
+    let parent = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = args
+        .output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("transaction");
+    let temporary = parent.join(format!(
+        ".{name}.{}.lar-transaction.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<LarTransactionExportReport> {
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        let report = if let Some(archive) = &args.archive {
+            let file = fs::File::open(archive)
+                .with_context(|| format!("opening {}", archive.display()))?;
+            let mut reader = ArchiveReader::open(BufReader::new(file), Limits::default())
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("reading {}", archive.display()))?;
+            if !reader.is_sealed() {
+                bail!("transaction source archive must be sealed");
+            }
+            let mut buffered = BufWriter::new(&mut output);
+            let report =
+                alex_store::write_archive_transaction(&mut reader, &args.trace_id, &mut buffered)?;
+            buffered.flush()?;
+            report
+        } else {
+            let store =
+                Store::open(data_dir.to_path_buf()).context("opening the Alex storage catalog")?;
+            let direct = {
+                let mut buffered = BufWriter::new(&mut output);
+                let report = store.write_lar_transaction(&args.trace_id, &mut buffered)?;
+                buffered.flush()?;
+                report
+            };
+            if let Some(report) = direct {
+                report
+            } else {
+                let mut buffered = BufWriter::new(&mut output);
+                let report = store
+                    .write_legacy_transaction(&args.trace_id, &mut buffered)?
+                    .with_context(|| format!("trace {} was not found", args.trace_id))?;
+                buffered.flush()?;
+                report
+            }
+        };
+        output.sync_all()?;
+        drop(output);
+        validate_transaction_sequence(&temporary, Some(&args.trace_id))?;
+        publish_export_temp(&temporary, &args.output, args.force)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    let report = result?;
+    Ok(LarCommandOutput {
+        human: format!(
+            "exported {} exchange(s)/{} ordered stage(s) for trace {} to {} as {} v{} ({} artifact byte(s), fidelity {}, verified)",
+            report.exchanges,
+            report.stages,
+            report.trace_id,
+            args.output.display(),
+            report.format,
+            report.version,
+            report.artifact_bytes,
+            report.fidelity,
+        ),
+        json: serde_json::json!({
+            "output": args.output,
+            "report": report,
+            "verified": true,
+        }),
+        raw_body: None,
+    })
+}
+
+const MAX_TRANSACTION_JSON_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+fn visit_transaction_records(
+    path: &Path,
+    mut visitor: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    let file =
+        fs::File::open(path).with_context(|| format!("opening transaction {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut record = Vec::new();
+    let mut inside_record = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let consumed = available.len();
+        for &byte in available {
+            if byte == 0x1e {
+                if inside_record {
+                    visitor(parse_transaction_json_record(&record)?)?;
+                    record.clear();
+                }
+                inside_record = true;
+                continue;
+            }
+            if !inside_record {
+                if !byte.is_ascii_whitespace() {
+                    bail!("transaction bytes precede the first RFC 7464 record separator");
+                }
+                continue;
+            }
+            if record.len() >= MAX_TRANSACTION_JSON_RECORD_BYTES {
+                bail!(
+                    "transaction JSON record exceeds {} byte limit",
+                    MAX_TRANSACTION_JSON_RECORD_BYTES
+                );
+            }
+            record.push(byte);
+        }
+        reader.consume(consumed);
+    }
+    if inside_record {
+        visitor(parse_transaction_json_record(&record)?)?;
+    }
+    Ok(())
+}
+
+fn parse_transaction_json_record(record: &[u8]) -> Result<Value> {
+    let start = record
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .context("transaction contains an empty RFC 7464 record")?;
+    let end = record
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .expect("a non-whitespace record byte was found");
+    serde_json::from_slice(&record[start..=end]).context("parsing transaction JSON record")
+}
+
+fn validate_transaction_sequence(path: &Path, expected_trace_id: Option<&str>) -> Result<()> {
+    let mut active_artifact: Option<(String, u64, blake3::Hasher, u64, String)> = None;
+    let mut artifact_ids = BTreeSet::<String>::new();
+    let mut record_count = 0u64;
+    let mut complete = false;
+    visit_transaction_records(path, |record| {
+        if record_count == 0 {
+            if record["type"] != "format"
+                || record["format"] != LAR_TRANSACTION_FORMAT
+                || record["version"] != LAR_TRANSACTION_VERSION
+            {
+                bail!("unsupported transaction format or version");
+            }
+            if expected_trace_id.is_some_and(|expected| record["trace_id"] != expected) {
+                bail!("transaction trace ID does not match the requested trace");
+            }
+        }
+        if complete {
+            bail!("transaction contains records after its complete marker");
+        }
+        match record["type"].as_str() {
+            Some("format") if record_count != 0 => {
+                bail!("transaction contains a repeated format record");
+            }
+            Some("artifact_start") => {
+                if active_artifact.is_some() {
+                    bail!("transaction artifacts overlap");
+                }
+                let content_id = record["content_id"]
+                    .as_str()
+                    .context("artifact has no content ID")?
+                    .to_owned();
+                if !artifact_ids.insert(content_id.clone()) {
+                    bail!("transaction emits artifact {content_id} more than once");
+                }
+                active_artifact = Some((
+                    content_id,
+                    0,
+                    blake3::Hasher::new(),
+                    record["total_length"]
+                        .as_u64()
+                        .context("artifact has no total length")?,
+                    record["whole_body_hash"]
+                        .as_str()
+                        .context("artifact has no whole-body hash")?
+                        .into(),
+                ));
+            }
+            Some("artifact_bytes") => {
+                let (id, length, hasher, _, _) = active_artifact
+                    .as_mut()
+                    .context("artifact bytes appear outside an artifact")?;
+                if record["content_id"].as_str() != Some(id) {
+                    bail!("artifact byte content ID changed mid-artifact");
+                }
+                if record["logical_offset"].as_u64() != Some(*length) {
+                    bail!("artifact bytes are not contiguous");
+                }
+                let bytes = base64::engine::general_purpose::STANDARD.decode(
+                    record["data_base64"]
+                        .as_str()
+                        .context("artifact byte record has no base64 data")?,
+                )?;
+                if bytes.len() > alex_store::LAR_TRANSACTION_ARTIFACT_PIECE_BYTES {
+                    bail!("transaction artifact byte record exceeds the bounded piece size");
+                }
+                *length = length.saturating_add(bytes.len() as u64);
+                hasher.update(&bytes);
+            }
+            Some("artifact_end") => {
+                let (id, length, hasher, expected_length, expected_hash) =
+                    active_artifact
+                        .take()
+                        .context("artifact end appears without a start")?;
+                if record["content_id"].as_str() != Some(&id)
+                    || record["total_length"].as_u64() != Some(length)
+                    || length != expected_length
+                    || hasher.finalize().to_hex().as_str() != expected_hash
+                    || record["verified"] != true
+                {
+                    bail!("artifact end record does not match reconstructed bytes");
+                }
+            }
+            Some("end") => {
+                if record["complete"] != true {
+                    bail!("transaction end record is not complete");
+                }
+                complete = true;
+            }
+            _ => {}
+        }
+        record_count = record_count.saturating_add(1);
+        Ok(())
+    })?;
+    if record_count == 0 {
+        bail!("transaction is empty");
+    }
+    if !complete {
+        bail!("transaction has no complete end record");
+    }
+    if active_artifact.is_some() {
+        bail!("transaction ended inside an artifact");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct TransactionReplayEvent {
+    byte_offset: u64,
+    byte_length: u64,
+    delta_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TransactionReplayStream {
+    stage_id: String,
+    body_content_id: String,
+    events: Vec<TransactionReplayEvent>,
+}
+
+fn replay_transaction(args: &TransactionReplayArgs) -> Result<()> {
+    validate_transaction_sequence(&args.input, None)?;
+    let Some(path) = &args.output else {
+        return replay_transaction_to(args, &mut std::io::stdout().lock());
+    };
+    if path == &args.input {
+        bail!("transaction replay output must differ from its input");
+    }
+    if path.exists() && !args.force {
+        bail!(
+            "transaction replay output already exists: {} (use --force to replace it)",
+            path.display()
+        );
+    }
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("transaction-replay");
+    let temporary = parent.join(format!(
+        ".{name}.{}.lar-transaction-replay.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        {
+            let mut output = BufWriter::new(&mut file);
+            replay_transaction_to(args, &mut output)?;
+            output.flush()?;
+        }
+        file.sync_all()?;
+        drop(file);
+        publish_export_temp(&temporary, path, args.force)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn replay_transaction_to(args: &TransactionReplayArgs, output: &mut dyn Write) -> Result<()> {
+    let mut candidates = Vec::<TransactionReplayStream>::new();
+    let mut selected: Option<TransactionReplayStream> = None;
+    let mut selected_artifact = false;
+    let mut replayed = false;
+    let mut event_index = 0usize;
+    let mut event_written = 0u64;
+    let mut previous_delta = 0u64;
+    let mut saw_format = false;
+
+    visit_transaction_records(&args.input, |record| {
+        match record["type"].as_str() {
+            Some("format") => {
+                if saw_format
+                    || record["format"] != LAR_TRANSACTION_FORMAT
+                    || record["version"] != LAR_TRANSACTION_VERSION
+                {
+                    bail!("unsupported or repeated transaction format record");
+                }
+                saw_format = true;
+            }
+            Some("stream_index") => {
+                if selected.is_some() {
+                    bail!("stream index appeared after transaction artifacts began");
+                }
+                let event_field = if args.parsed {
+                    "parsed_frames"
+                } else {
+                    "observed_reads"
+                };
+                let events = record[event_field]
+                    .as_array()
+                    .context("stream index event list is missing")?
+                    .iter()
+                    .map(|event| {
+                        Ok(TransactionReplayEvent {
+                            byte_offset: event["byte_offset"]
+                                .as_u64()
+                                .context("stream event has no byte offset")?,
+                            byte_length: event["byte_length"]
+                                .as_u64()
+                                .context("stream event has no byte length")?,
+                            delta_ns: event["delta_from_first_byte_ns"]
+                                .as_u64()
+                                .context("stream event has no timing delta")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                validate_transaction_replay_events(&events, args.parsed)?;
+                candidates.push(TransactionReplayStream {
+                    stage_id: record["stage_id"]
+                        .as_str()
+                        .context("stream index has no stage ID")?
+                        .into(),
+                    body_content_id: record["raw_body_content_id"]
+                        .as_str()
+                        .context("stream index has no raw body content ID")?
+                        .into(),
+                    events,
+                });
+            }
+            Some("artifact_start") if selected.is_none() => {
+                selected = Some(select_transaction_stream(&candidates, args)?);
+                let stream = selected.as_ref().expect("selected above");
+                if stream.events.is_empty() {
+                    bail!(
+                        "stream stage {} has no {} timing ranges",
+                        stream.stage_id,
+                        if args.parsed { "parsed" } else { "observed" }
+                    );
+                }
+                selected_artifact =
+                    record["content_id"].as_str() == Some(stream.body_content_id.as_str());
+                if selected_artifact {
+                    validate_transaction_replay_length(
+                        stream,
+                        record["total_length"]
+                            .as_u64()
+                            .context("stream artifact has no total length")?,
+                        args.parsed,
+                    )?;
+                }
+            }
+            Some("artifact_start") => {
+                let stream = selected.as_ref().expect("selection is initialized");
+                selected_artifact =
+                    record["content_id"].as_str() == Some(stream.body_content_id.as_str());
+                if selected_artifact {
+                    validate_transaction_replay_length(
+                        stream,
+                        record["total_length"]
+                            .as_u64()
+                            .context("stream artifact has no total length")?,
+                        args.parsed,
+                    )?;
+                }
+            }
+            Some("artifact_bytes") if selected_artifact => {
+                let stream = selected.as_ref().expect("selected artifact has a stream");
+                let chunk_offset = record["logical_offset"]
+                    .as_u64()
+                    .context("artifact bytes have no logical offset")?;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(
+                    record["data_base64"]
+                        .as_str()
+                        .context("artifact bytes have no base64 data")?,
+                )?;
+                replay_transaction_piece(
+                    output,
+                    &stream.events,
+                    &mut event_index,
+                    &mut event_written,
+                    &mut previous_delta,
+                    args.speed,
+                    chunk_offset,
+                    &bytes,
+                )?;
+            }
+            Some("artifact_end") if selected_artifact => {
+                let stream = selected.as_ref().expect("selected artifact has a stream");
+                if event_index != stream.events.len() || event_written != 0 {
+                    bail!("selected stream ranges were not fully reconstructed");
+                }
+                selected_artifact = false;
+                replayed = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    if !saw_format {
+        bail!("transaction has no format record");
+    }
+    if selected.is_none() {
+        let _ = select_transaction_stream(&candidates, args)?;
+        bail!("transaction has no artifact bytes for the selected stream");
+    }
+    if !replayed {
+        bail!("selected stream body was not present in the transaction");
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn validate_transaction_replay_events(
+    events: &[TransactionReplayEvent],
+    parsed: bool,
+) -> Result<()> {
+    let mut previous_end = 0_u64;
+    let mut previous_delta = 0_u64;
+    for event in events {
+        if event.byte_length == 0 {
+            bail!("transaction stream event has zero length");
+        }
+        if (parsed && event.byte_offset < previous_end)
+            || (!parsed && event.byte_offset != previous_end)
+        {
+            bail!(
+                "transaction stream events are {}",
+                if parsed {
+                    "overlapping or out of order"
+                } else {
+                    "overlapping or non-contiguous"
+                }
+            );
+        }
+        if event.delta_ns < previous_delta {
+            bail!("transaction stream event timing is not monotonic");
+        }
+        previous_end = event
+            .byte_offset
+            .checked_add(event.byte_length)
+            .context("transaction stream event offset overflow")?;
+        previous_delta = event.delta_ns;
+    }
+    Ok(())
+}
+
+fn validate_transaction_replay_length(
+    stream: &TransactionReplayStream,
+    artifact_length: u64,
+    parsed: bool,
+) -> Result<()> {
+    let covered = stream
+        .events
+        .last()
+        .map(|event| event.byte_offset.saturating_add(event.byte_length))
+        .unwrap_or_default();
+    if (parsed && covered > artifact_length) || (!parsed && covered != artifact_length) {
+        bail!(
+            "stream stage {} timing ranges {} the {artifact_length}-byte artifact (range end {covered})",
+            stream.stage_id,
+            if parsed { "exceed" } else { "do not cover" },
+        );
+    }
+    Ok(())
+}
+
+fn select_transaction_stream(
+    candidates: &[TransactionReplayStream],
+    args: &TransactionReplayArgs,
+) -> Result<TransactionReplayStream> {
+    let matching = candidates
+        .iter()
+        .filter(|stream| {
+            args.stage_id
+                .as_deref()
+                .is_none_or(|selected| stream.stage_id == selected)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] if args.stage_id.is_some() => bail!(
+            "stage {} is not a captured stream stage in this transaction",
+            args.stage_id.as_deref().unwrap_or_default()
+        ),
+        [] => bail!("transaction has no captured stream"),
+        [only] => Ok(only.clone()),
+        many => bail!(
+            "transaction has multiple captured streams; use --stage-id with one of: {}",
+            many.iter()
+                .map(|stream| stream.stage_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_transaction_piece(
+    output: &mut dyn Write,
+    events: &[TransactionReplayEvent],
+    event_index: &mut usize,
+    event_written: &mut u64,
+    previous_delta: &mut u64,
+    speed: LarReplaySpeed,
+    chunk_offset: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let chunk_end = chunk_offset
+        .checked_add(bytes.len() as u64)
+        .context("transaction artifact chunk offset overflow")?;
+    while *event_index < events.len() {
+        let event = &events[*event_index];
+        let event_end = event
+            .byte_offset
+            .checked_add(event.byte_length)
+            .context("transaction stream event offset overflow")?;
+        if event_end <= chunk_offset {
+            if *event_written != event.byte_length {
+                bail!("transaction stream event has a gap in artifact bytes");
+            }
+            *event_index += 1;
+            *event_written = 0;
+            continue;
+        }
+        if event.byte_offset >= chunk_end {
+            break;
+        }
+        let overlap_start = event.byte_offset.max(chunk_offset);
+        let overlap_end = event_end.min(chunk_end);
+        if overlap_start < overlap_end {
+            if *event_written == 0 {
+                let delay = event.delta_ns.saturating_sub(*previous_delta);
+                if let Some(duration) = transaction_replay_delay(speed, delay) {
+                    std::thread::sleep(duration);
+                }
+                *previous_delta = event.delta_ns;
+            }
+            let start = usize::try_from(overlap_start - chunk_offset)
+                .context("transaction replay slice start exceeds address space")?;
+            let end = usize::try_from(overlap_end - chunk_offset)
+                .context("transaction replay slice end exceeds address space")?;
+            output.write_all(&bytes[start..end])?;
+            *event_written = event_written.saturating_add(overlap_end - overlap_start);
+        }
+        if overlap_end == event_end {
+            if *event_written != event.byte_length {
+                bail!("transaction stream event reconstruction length mismatch");
+            }
+            *event_index += 1;
+            *event_written = 0;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn transaction_replay_delay(speed: LarReplaySpeed, delta_ns: u64) -> Option<std::time::Duration> {
+    let scaled = match speed {
+        LarReplaySpeed::Instant => return None,
+        LarReplaySpeed::Realtime => delta_ns,
+        LarReplaySpeed::Quarter => delta_ns.saturating_mul(4),
+        LarReplaySpeed::Half => delta_ns.saturating_mul(2),
+        LarReplaySpeed::Double => delta_ns / 2,
+        LarReplaySpeed::Quadruple => delta_ns / 4,
+    };
+    Some(std::time::Duration::from_nanos(scaled))
 }
 
 fn replay_stream(args: &ReplayArgs) -> Result<()> {
@@ -2755,6 +3443,21 @@ struct ExportTrace {
     response: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+struct InterchangeExportTrace {
+    row: Value,
+    request_headers: Vec<ExportHeader>,
+    response_headers: Vec<ExportHeader>,
+    canonical: Option<LarInterchangeTrace>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InterchangeSelectionSummary {
+    traces: usize,
+    canonical: usize,
+    legacy: usize,
+}
+
 struct BackupExtraBody {
     owner_id: String,
     artifact_kind: &'static str,
@@ -2769,31 +3472,31 @@ struct ExportReport {
     bytes: u64,
     verified: bool,
     loss_report: Vec<&'static str>,
+    canonical_traces: usize,
+    legacy_traces: usize,
 }
 
 fn export_records(data_dir: &Path, args: &ExportArgs) -> Result<LarCommandOutput> {
     let store = Store::open(data_dir.to_path_buf()).context("opening the Alex storage catalog")?;
-    let traces = load_export_traces(&store, args, !matches!(args.format, LarExportFormat::Lar))?;
-    if traces.is_empty() {
-        bail!("no traces matched the requested export selection");
-    }
-    let losses = export_loss_report();
+    let upper = store
+        .lar_export_trace_upper_bound(args.trace_id.as_deref(), args.session.as_deref())?
+        .with_context(|| match (&args.trace_id, &args.session) {
+            (Some(trace_id), _) => format!("trace {trace_id} was not found"),
+            (_, Some(session)) => format!("session {session} has no traces"),
+            _ => "no traces matched the requested export selection".into(),
+        })?;
+    let summary = summarize_export_selection(&store, args, &upper)?;
+    let losses = interchange_loss_report(args.format, summary);
     let (byte_count, verified) = match args.format {
         LarExportFormat::Lar => {
+            let traces = load_export_traces(&store, args, false)?;
             let bytes = write_standalone_lar_export(&store, &traces, &args.output, args.force)?;
             (bytes, true)
         }
         format => {
-            let bytes = match format {
-                LarExportFormat::Har => build_har(&traces, &losses)?,
-                LarExportFormat::Warc => build_warc(&traces, &losses)?,
-                LarExportFormat::Jsonl => build_jsonl(&traces, &losses)?,
-                LarExportFormat::OpenTelemetry => build_otel_jsonl(&traces, &losses)?,
-                LarExportFormat::OpenInference => build_openinference_jsonl(&traces, &losses)?,
-                LarExportFormat::Lar => unreachable!("LAR handled by streaming branch"),
-            };
-            write_export_file(&args.output, &bytes, args.force)?;
-            (bytes.len() as u64, true)
+            let bytes =
+                write_streaming_interchange_export(&store, args, format, summary, &upper, &losses)?;
+            (bytes, true)
         }
     };
     if !verified {
@@ -2805,10 +3508,12 @@ fn export_records(data_dir: &Path, args: &ExportArgs) -> Result<LarCommandOutput
     let report = ExportReport {
         output: args.output.clone(),
         format: export_format_name(args.format),
-        traces: traces.len(),
+        traces: summary.traces,
         bytes: byte_count,
         verified,
         loss_report: losses,
+        canonical_traces: summary.canonical,
+        legacy_traces: summary.legacy,
     };
     Ok(LarCommandOutput {
         human: format!(
@@ -2843,6 +3548,1707 @@ fn export_loss_report() -> Vec<&'static str> {
         "stream read timing is unavailable for legacy bodies",
         "tool-call rows are not included in this trace-only exporter",
     ]
+}
+
+fn interchange_loss_report(
+    format: LarExportFormat,
+    summary: InterchangeSelectionSummary,
+) -> Vec<&'static str> {
+    let mut losses = Vec::new();
+    if summary.canonical > 0 {
+        match format {
+            LarExportFormat::Lar | LarExportFormat::Jsonl => {}
+            LarExportFormat::Har => losses.extend([
+                "HAR standard fields synthesize HTTP framing and expose non-client stages through _alex.canonicalGraph",
+                "HAR viewers may ignore trailers, retries, tool stages, and stream timing retained in Alex extensions",
+            ]),
+            LarExportFormat::Warc => losses.extend([
+                "WARC HTTP projections synthesize framing; canonical stage metadata and bodies are retained as linked records",
+            ]),
+            LarExportFormat::OpenTelemetry => losses.extend([
+                "OpenTelemetry semantic spans do not standardize exact transport replay; Alex canonical graph extensions retain captured transport details",
+            ]),
+            LarExportFormat::OpenInference => losses.extend([
+                "OpenInference semantic spans do not standardize exact transport replay; Alex canonical graph extensions retain captured transport details",
+            ]),
+        }
+    }
+    if summary.legacy > 0 {
+        losses.extend(export_loss_report());
+    }
+    losses
+}
+
+const INTERCHANGE_TRACE_PAGE_SIZE: usize = 32;
+
+fn for_each_selected_export_row<F>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    mut visit: F,
+) -> Result<usize>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    let mut cursor: Option<LarExportTraceCursor> = None;
+    let mut count = 0usize;
+    loop {
+        let rows = store
+            .lar_export_trace_rows_page(
+                args.trace_id.as_deref(),
+                args.session.as_deref(),
+                cursor.as_ref(),
+                upper,
+                INTERCHANGE_TRACE_PAGE_SIZE,
+            )
+            .context("reading a bounded trace export page")?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let trace_id = row["id"]
+                .as_str()
+                .context("trace export row has no string id")?
+                .to_string();
+            let ts_request_ms = row["ts_request_ms"]
+                .as_i64()
+                .context("trace export row has no request timestamp")?;
+            visit(row)?;
+            count = count.saturating_add(1);
+            cursor = Some(LarExportTraceCursor {
+                ts_request_ms,
+                trace_id,
+                max_rowid: upper.max_rowid,
+            });
+        }
+    }
+    if count == 0 {
+        if let Some(trace_id) = &args.trace_id {
+            bail!("trace {trace_id} was not found");
+        }
+        if let Some(session) = &args.session {
+            bail!("session {session} has no traces");
+        }
+        bail!("no traces matched the requested export selection");
+    }
+    Ok(count)
+}
+
+fn summarize_export_selection(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+) -> Result<InterchangeSelectionSummary> {
+    let mut summary = InterchangeSelectionSummary::default();
+    for_each_selected_export_row(store, args, upper, |row| {
+        let trace_id = row["id"]
+            .as_str()
+            .context("trace export row has no string id")?;
+        if store.lar_trace_has_canonical_exchange(trace_id)? {
+            summary.canonical += 1;
+        } else {
+            summary.legacy += 1;
+        }
+        Ok(())
+    })?;
+    summary.traces = summary.canonical.saturating_add(summary.legacy);
+    Ok(summary)
+}
+
+fn for_each_interchange_trace<F>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    mut visit: F,
+) -> Result<usize>
+where
+    F: FnMut(InterchangeExportTrace) -> Result<()>,
+{
+    for_each_selected_export_row(store, args, upper, |row| {
+        let trace_id = row["id"]
+            .as_str()
+            .context("trace export row has no string id")?;
+        let canonical = store
+            .lar_interchange_trace(trace_id)
+            .with_context(|| format!("loading canonical exchange graph for trace {trace_id}"))?;
+        visit(InterchangeExportTrace {
+            request_headers: parse_legacy_headers(row.get("req_headers_json")),
+            response_headers: parse_legacy_headers(row.get("resp_headers_json")),
+            row,
+            canonical,
+        })
+    })
+}
+
+fn write_streaming_interchange_export(
+    store: &Store,
+    args: &ExportArgs,
+    format: LarExportFormat,
+    summary: InterchangeSelectionSummary,
+    upper: &LarExportTraceCursor,
+    losses: &[&str],
+) -> Result<u64> {
+    if args.output.exists() && !args.force {
+        bail!(
+            "export output already exists: {} (use --force to replace it)",
+            args.output.display()
+        );
+    }
+    let parent = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = args
+        .output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+    let temporary = parent.join(format!(".{name}.{}.interchange.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<u64> {
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut output = BufWriter::with_capacity(64 * 1024, file);
+        let emitted = match format {
+            LarExportFormat::Har => stream_har(store, args, upper, summary, losses, &mut output)?,
+            LarExportFormat::Warc => stream_warc(store, args, upper, losses, &mut output)?,
+            LarExportFormat::Jsonl => {
+                stream_jsonl(store, args, upper, summary, losses, &mut output)?
+            }
+            LarExportFormat::OpenTelemetry => {
+                stream_otel_jsonl(store, args, upper, losses, &mut output)?
+            }
+            LarExportFormat::OpenInference => {
+                stream_openinference_jsonl(store, args, upper, losses, &mut output)?
+            }
+            LarExportFormat::Lar => unreachable!("LAR uses its native archive writer"),
+        };
+        if emitted != summary.traces {
+            bail!(
+                "trace selection changed during export: preflight selected {} trace(s), but {} remained at the frozen high-water mark",
+                summary.traces,
+                emitted
+            );
+        }
+        output.flush()?;
+        let file = output
+            .into_inner()
+            .map_err(|error| anyhow::anyhow!(error.into_error()))?;
+        file.sync_all()?;
+        let bytes = file.metadata()?.len();
+        drop(file);
+        publish_export_temp(&temporary, &args.output, args.force)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn transport_bytes(value: Option<&[u8]>) -> Value {
+    match value {
+        None => Value::Null,
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => serde_json::json!({"encoding": "utf8", "data": text}),
+            Err(_) => serde_json::json!({
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        },
+    }
+}
+
+fn optional_content_id<T: std::fmt::Display>(value: Option<T>) -> Value {
+    value
+        .map(|id| Value::String(id.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn canonical_stage_json(trace: &LarInterchangeTrace, stage: &LarInterchangeStage) -> Value {
+    let data = &stage.data;
+    serde_json::json!({
+        "stage_id": stage.stage_id,
+        "record_id": stage.record_id,
+        "ordinal": stage.ordinal,
+        "capture_sequence": stage.capture_sequence,
+        "kind": stage.kind,
+        "attempt_number": data.attempt_number,
+        "wall_time_ns": data.wall_time_ns,
+        "monotonic_delta_ns": data.monotonic_delta_ns,
+        "first_byte_delta_ns": data.first_byte_delta_ns,
+        "last_byte_delta_ns": data.last_byte_delta_ns,
+        "request_headers_ref": optional_content_id(data.request_headers_ref),
+        "request_body_manifest_ref": optional_content_id(data.request_body_manifest_ref),
+        "response_headers_ref": optional_content_id(data.response_headers_ref),
+        "response_body_manifest_ref": optional_content_id(data.response_body_manifest_ref),
+        "trailers_ref": optional_content_id(data.trailers_ref),
+        "stream_index_ref": optional_content_id(data.stream_index_ref),
+        "provider": transport_bytes(data.provider.as_deref()),
+        "requested_model": transport_bytes(data.requested_model.as_deref()),
+        "routed_model": transport_bytes(data.routed_model.as_deref()),
+        "account_id": transport_bytes(data.account_id.as_deref()),
+        "routing_reason": transport_bytes(data.routing_reason.as_deref()),
+        "status_code": data.status_code,
+        "usage": data.usage.as_ref().map(|usage| serde_json::json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_tokens": usage.cached_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+        })),
+        "cost_nanos": data.cost_nanos,
+        "cost_currency": transport_bytes(data.cost_currency.as_deref()),
+        "error_class": transport_bytes(data.error_class.as_deref()),
+        "error_message": transport_bytes(data.error_message.as_deref()),
+        "tool_link": stage.tool_id.as_ref().map(|tool_id| serde_json::json!({
+            "tool_id": tool_id,
+            "phase": stage.tool_phase,
+            "supplement_trace_id": stage.supplement_trace_id,
+            "supplement_exchange_content_id": stage.supplement_exchange_id,
+        })),
+        "origin": {
+            "trace_id": stage.supplement_trace_id.as_ref().map(|value| transport_bytes(Some(value.as_bytes()))).unwrap_or_else(|| transport_bytes(Some(&trace.trace_id))),
+            "exchange_content_id": stage.supplement_exchange_id.as_deref().unwrap_or(&trace.exchange_id),
+            "stage_occurrence_id": stage.stage_id,
+            "stage_record_content_id": stage.record_id,
+        },
+    })
+}
+
+fn canonical_metadata_json(metadata: Option<&ExchangeMetadataData>) -> Value {
+    let Some(metadata) = metadata else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "ts_request_ms": metadata.ts_request_ms,
+        "ts_response_ms": metadata.ts_response_ms,
+        "harness": transport_bytes(metadata.harness.as_deref()),
+        "client_format": transport_bytes(metadata.client_format.as_deref()),
+        "upstream_format": transport_bytes(metadata.upstream_format.as_deref()),
+        "method": transport_bytes(metadata.method.as_deref()),
+        "path": transport_bytes(metadata.path.as_deref()),
+        "streamed": metadata.streamed,
+        "status": metadata.status,
+        "cost_usd_bits": metadata.cost_usd_bits,
+        "billing_bucket": transport_bytes(metadata.billing_bucket.as_deref()),
+        "error_kind": transport_bytes(metadata.error_kind.as_deref()),
+        "error_code": transport_bytes(metadata.error_code.as_deref()),
+        "substituted": metadata.substituted,
+        "original_model": transport_bytes(metadata.original_model.as_deref()),
+        "served_model": transport_bytes(metadata.served_model.as_deref()),
+        "substitution_reason": transport_bytes(metadata.substitution_reason.as_deref()),
+        "injected": metadata.injected,
+        "fixture_name": transport_bytes(metadata.fixture_name.as_deref()),
+        "attempts_json": transport_bytes(metadata.attempts_json.as_deref()),
+        "original_account_id": transport_bytes(metadata.original_account_id.as_deref()),
+        "served_account_id": transport_bytes(metadata.served_account_id.as_deref()),
+        "subscription_identity": transport_bytes(metadata.subscription_identity.as_deref()),
+        "via_dario": metadata.via_dario,
+        "dario_generation": transport_bytes(metadata.dario_generation.as_deref()),
+        "tags_json": transport_bytes(metadata.tags_json.as_deref()),
+        "client_ip": transport_bytes(metadata.client_ip.as_deref()),
+        "key_fingerprint": transport_bytes(metadata.key_fingerprint.as_deref()),
+        "reasoning_effort": transport_bytes(metadata.reasoning_effort.as_deref()),
+        "thinking_budget": metadata.thinking_budget,
+        "input_tokens": metadata.input_tokens,
+        "cached_input_tokens": metadata.cached_input_tokens,
+        "cache_creation_tokens": metadata.cache_creation_tokens,
+        "output_tokens": metadata.output_tokens,
+        "reasoning_tokens": metadata.reasoning_tokens,
+        "unknown_attributes": metadata.unknown_attributes.iter().map(|attribute| serde_json::json!({
+            "key": transport_bytes(Some(&attribute.key)),
+            "value": transport_bytes(Some(&attribute.value)),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn stream_parser_name(value: alex_lar::StreamParser) -> String {
+    match value {
+        alex_lar::StreamParser::Opaque => "opaque".into(),
+        alex_lar::StreamParser::Sse => "sse".into(),
+        alex_lar::StreamParser::Ndjson => "ndjson".into(),
+        alex_lar::StreamParser::Unknown(code) => format!("unknown_{code}"),
+    }
+}
+
+fn stream_frame_kind_name(value: alex_lar::StreamFrameKind) -> String {
+    match value {
+        alex_lar::StreamFrameKind::Opaque => "opaque".into(),
+        alex_lar::StreamFrameKind::SseEvent => "sse_event".into(),
+        alex_lar::StreamFrameKind::NdjsonRecord => "ndjson_record".into(),
+        alex_lar::StreamFrameKind::Unknown(code) => format!("unknown_{code}"),
+    }
+}
+
+fn canonical_graph_metadata(trace: &LarInterchangeTrace) -> Value {
+    serde_json::json!({
+        "schema": "alex.lar.canonical-timeline-projection.v2",
+        "exchange": {
+            "base_exchange_content_id": trace.exchange_id,
+            "trace_id": transport_bytes(Some(&trace.trace_id)),
+            "session_id": transport_bytes(trace.session_id.as_deref()),
+            "run_id": transport_bytes(trace.run_id.as_deref()),
+            "parent_trace_id": transport_bytes(trace.parent_trace_id.as_deref()),
+            "capture_sequence": trace.capture_sequence,
+            "wall_time_ns": trace.wall_time_ns,
+            "monotonic_delta_ns": trace.monotonic_delta_ns,
+            "clock_id": transport_bytes(trace.clock_id.as_deref()),
+        },
+        "exchange_metadata": canonical_metadata_json(trace.metadata.as_ref()),
+        "stages": trace.stages.iter().map(|stage| canonical_stage_json(trace, stage)).collect::<Vec<_>>(),
+        "header_blocks": trace.header_blocks.iter().map(|block| serde_json::json!({
+            "block_id": block.block_id,
+            "fidelity": block.fidelity,
+            "atoms": block.atoms.iter().enumerate().map(|(ordinal, atom)| serde_json::json!({
+                "ordinal": ordinal,
+                "original_name": transport_bytes(Some(&atom.original_name)),
+                "value": transport_bytes(Some(&atom.value)),
+                "flags": atom.flags,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "streams": trace.streams.iter().map(|stream| serde_json::json!({
+            "stream_index_id": stream.stream_index_id,
+            "raw_body_manifest_id": stream.raw_body_manifest_id,
+            "reads": stream.reads.iter().map(|read| serde_json::json!({
+                "byte_offset": read.byte_offset,
+                "byte_length": read.byte_length,
+                "delta_from_first_byte_ns": read.delta_from_first_byte_ns,
+            })).collect::<Vec<_>>(),
+            "frames": stream.frames.iter().map(|frame| serde_json::json!({
+                "byte_offset": frame.byte_offset,
+                "byte_length": frame.byte_length,
+                "delta_from_first_byte_ns": frame.delta_from_first_byte_ns,
+                "parser": stream_parser_name(frame.parser),
+                "frame_kind": stream_frame_kind_name(frame.frame_kind),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn body_descriptor(body: &LarInterchangeBody) -> Value {
+    serde_json::json!({
+        "manifest_id": body.manifest_id,
+        "encoding": "base64",
+        "length": body.total_length,
+        "blake3": body.whole_body_blake3,
+        "media_type": transport_bytes(body.media_type.as_deref()),
+        "content_encoding": transport_bytes(body.content_encoding.as_deref()),
+    })
+}
+
+fn write_canonical_graph<W: Write>(
+    store: &Store,
+    trace: &LarInterchangeTrace,
+    include_body_data: bool,
+    output: &mut W,
+) -> Result<()> {
+    output.write_all(b"{\"capture\":")?;
+    serde_json::to_writer(&mut *output, &canonical_graph_metadata(trace))?;
+    output.write_all(b",\"bodies\":[")?;
+    for (index, body) in trace.bodies.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        if include_body_data {
+            write_canonical_body(store, body, output)?;
+        } else {
+            serde_json::to_writer(&mut *output, &body_descriptor(body))?;
+        }
+    }
+    output.write_all(b"]}")?;
+    Ok(())
+}
+
+fn write_canonical_body<W: Write>(
+    store: &Store,
+    body: &LarInterchangeBody,
+    output: &mut W,
+) -> Result<()> {
+    write!(
+        output,
+        "{{\"manifest_id\":{},\"encoding\":\"base64\",\"length\":{},\"blake3\":{},\"media_type\":{},\"content_encoding\":{},\"data\":\"",
+        serde_json::to_string(&body.manifest_id)?,
+        body.total_length,
+        serde_json::to_string(&body.whole_body_blake3)?,
+        serde_json::to_string(&transport_bytes(body.media_type.as_deref()))?,
+        serde_json::to_string(&transport_bytes(body.content_encoding.as_deref()))?,
+    )?;
+    let written = {
+        let mut encoder = base64::write::EncoderWriter::new(
+            &mut *output,
+            &base64::engine::general_purpose::STANDARD,
+        );
+        let written = store
+            .write_lar_manifest_body(&body.manifest_id, &mut encoder)
+            .with_context(|| format!("streaming canonical manifest {}", body.manifest_id))?;
+        encoder.finish()?;
+        written
+    };
+    if written != body.total_length {
+        bail!(
+            "canonical manifest {} streamed {written} bytes, expected {}",
+            body.manifest_id,
+            body.total_length
+        );
+    }
+    output.write_all(b"\"}")?;
+    Ok(())
+}
+
+struct HashCountWriter<W> {
+    inner: W,
+    hash: blake3::Hasher,
+    bytes: u64,
+}
+
+struct Sha256CountWriter<W> {
+    inner: W,
+    hash: Sha256,
+    bytes: u64,
+}
+
+impl<W> Sha256CountWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hash: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (W, u64, String) {
+        (self.inner, self.bytes, hex_bytes(&self.hash.finalize()))
+    }
+}
+
+impl<W: Write> Write for Sha256CountWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W> HashCountWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hash: blake3::Hasher::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (W, u64, String) {
+        (
+            self.inner,
+            self.bytes,
+            self.hash.finalize().to_hex().to_string(),
+        )
+    }
+}
+
+impl<W: Write> Write for HashCountWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_legacy_artifact<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    artifact_kind: &str,
+    output: &mut W,
+) -> Result<()> {
+    if store
+        .lar_artifact_location("trace", trace_id, artifact_kind, None)?
+        .is_none()
+    {
+        output.write_all(b"null")?;
+        return Ok(());
+    }
+    output.write_all(b"{\"encoding\":\"base64\",\"data\":\"")?;
+    let (length, digest) = {
+        let encoder = base64::write::EncoderWriter::new(
+            &mut *output,
+            &base64::engine::general_purpose::STANDARD,
+        );
+        let mut tracked = HashCountWriter::new(encoder);
+        if !store.write_lar_or_legacy_artifact(
+            "trace",
+            trace_id,
+            artifact_kind,
+            None,
+            &mut tracked,
+        )? {
+            bail!("artifact {artifact_kind} for trace {trace_id} disappeared during export");
+        }
+        let (mut encoder, length, digest) = tracked.finish();
+        encoder.finish()?;
+        (length, digest)
+    };
+    write!(
+        output,
+        "\",\"length\":{length},\"blake3\":{}}}",
+        serde_json::to_string(&digest)?
+    )?;
+    Ok(())
+}
+
+fn write_legacy_trace_payload<W: Write>(
+    store: &Store,
+    trace: &InterchangeExportTrace,
+    output: &mut W,
+) -> Result<()> {
+    let trace_id = trace.row["id"]
+        .as_str()
+        .context("trace export row has no string id")?;
+    output.write_all(b"{\"type\":\"alex.trace\",\"metadata\":")?;
+    serde_json::to_writer(&mut *output, &sanitized_trace_metadata(&trace.row))?;
+    output.write_all(b",\"headers\":")?;
+    serde_json::to_writer(
+        &mut *output,
+        &serde_json::json!({
+            "request": trace.request_headers,
+            "response": trace.response_headers,
+            "fidelity": "legacy_order_and_casing_unknown",
+        }),
+    )?;
+    output.write_all(b",\"artifacts\":{\"client_request\":")?;
+    write_legacy_artifact(store, trace_id, "client_request", output)?;
+    output.write_all(b",\"upstream_request\":")?;
+    write_legacy_artifact(store, trace_id, "upstream_request", output)?;
+    output.write_all(b",\"client_response\":")?;
+    write_legacy_artifact(store, trace_id, "client_response", output)?;
+    output.write_all(b"}}")?;
+    Ok(())
+}
+
+fn stream_jsonl<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    summary: InterchangeSelectionSummary,
+    losses: &[&str],
+    output: &mut W,
+) -> Result<usize> {
+    let version = if summary.canonical == 0 { 1 } else { 2 };
+    if version == 1 {
+        serde_json::to_writer(
+            &mut *output,
+            &serde_json::json!({
+                "type": "alex.lar.export.manifest",
+                "version": 1,
+                "format": "jsonl",
+                "loss_report": losses,
+            }),
+        )?;
+    } else {
+        serde_json::to_writer(
+            &mut *output,
+            &serde_json::json!({
+                "type": "alex.lar.export.manifest",
+                "version": 2,
+                "format": "jsonl",
+                "record_schema": "alex.trace.canonical.v2",
+                "canonical_traces": summary.canonical,
+                "legacy_traces": summary.legacy,
+                "body_part_bytes": JSONL_BODY_PART_BYTES,
+                "loss_report": losses,
+            }),
+        )?;
+    }
+    output.write_all(b"\n")?;
+    let emitted = for_each_interchange_trace(store, args, upper, |trace| {
+        if let Some(canonical) = &trace.canonical {
+            output.write_all(b"{\"type\":\"alex.trace.canonical\",\"version\":2,\"metadata\":")?;
+            serde_json::to_writer(&mut *output, &sanitized_trace_metadata(&trace.row))?;
+            output.write_all(b",\"fidelity\":\"canonical\",\"graph\":")?;
+            write_canonical_graph(store, canonical, false, output)?;
+            output.write_all(b"}\n")?;
+            let trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+            for body in &canonical.bodies {
+                stream_jsonl_body_parts(store, trace_id, body, output)?;
+            }
+        } else if version == 1 {
+            write_legacy_trace_payload(store, &trace, output)?;
+            output.write_all(b"\n")?;
+        } else {
+            output.write_all(b"{\"type\":\"alex.trace.legacy\",\"version\":1,\"loss_report\":")?;
+            serde_json::to_writer(&mut *output, &export_loss_report())?;
+            output.write_all(b",\"record\":")?;
+            write_legacy_trace_payload(store, &trace, output)?;
+            output.write_all(b"}\n")?;
+        }
+        Ok(())
+    })?;
+    Ok(emitted)
+}
+
+const JSONL_BODY_PART_BYTES: usize = 48 * 1024;
+
+struct JsonlBodyPartWriter<'a, W> {
+    output: &'a mut W,
+    trace_id: &'a str,
+    manifest_id: &'a str,
+    buffer: Vec<u8>,
+    offset: u64,
+    hash: blake3::Hasher,
+}
+
+impl<W: Write> JsonlBodyPartWriter<'_, W> {
+    fn emit(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        serde_json::to_writer(
+            &mut *self.output,
+            &serde_json::json!({
+                "type": "alex.body.part",
+                "version": 2,
+                "trace_id": self.trace_id,
+                "manifest_id": self.manifest_id,
+                "byte_offset": self.offset,
+                "byte_length": self.buffer.len(),
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&self.buffer),
+            }),
+        )?;
+        self.output.write_all(b"\n")?;
+        self.hash.update(&self.buffer);
+        self.offset = self.offset.saturating_add(self.buffer.len() as u64);
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for JsonlBodyPartWriter<'_, W> {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let original = bytes.len();
+        while !bytes.is_empty() {
+            let available = JSONL_BODY_PART_BYTES.saturating_sub(self.buffer.len());
+            let take = available.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == JSONL_BODY_PART_BYTES {
+                self.emit().map_err(std::io::Error::other)?;
+            }
+        }
+        Ok(original)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit().map_err(std::io::Error::other)?;
+        self.output.flush()
+    }
+}
+
+fn stream_jsonl_body_parts<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    body: &LarInterchangeBody,
+    output: &mut W,
+) -> Result<()> {
+    let mut writer = JsonlBodyPartWriter {
+        output,
+        trace_id,
+        manifest_id: &body.manifest_id,
+        buffer: Vec::with_capacity(JSONL_BODY_PART_BYTES),
+        offset: 0,
+        hash: blake3::Hasher::new(),
+    };
+    let written = store.write_lar_manifest_body(&body.manifest_id, &mut writer)?;
+    writer.emit()?;
+    let actual_hash = writer.hash.finalize().to_hex().to_string();
+    if written != body.total_length
+        || writer.offset != body.total_length
+        || actual_hash != body.whole_body_blake3
+    {
+        bail!("JSONL body {} changed while streaming", body.manifest_id);
+    }
+    serde_json::to_writer(
+        &mut *writer.output,
+        &serde_json::json!({
+            "type": "alex.body.end",
+            "version": 2,
+            "trace_id": trace_id,
+            "manifest_id": body.manifest_id,
+            "length": body.total_length,
+            "blake3": body.whole_body_blake3,
+        }),
+    )?;
+    writer.output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn standard_headers(
+    trace: &LarInterchangeTrace,
+    reference: Option<alex_lar::HeaderBlockId>,
+) -> Vec<ExportHeader> {
+    let Some(reference) = reference else {
+        return Vec::new();
+    };
+    trace
+        .header_blocks
+        .iter()
+        .find(|block| block.block_id == reference.to_string())
+        .map(|block| {
+            block
+                .atoms
+                .iter()
+                .map(|atom| ExportHeader {
+                    name: String::from_utf8_lossy(&atom.original_name).into_owned(),
+                    value: String::from_utf8_lossy(&atom.value).into_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn metadata_text(value: Option<&[u8]>, fallback: &str) -> String {
+    value
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_else(|| fallback.into())
+}
+
+fn canonical_har_projection(trace: &LarInterchangeTrace, row: &Value, losses: &[&str]) -> Value {
+    let request_stage = trace
+        .stages
+        .iter()
+        .find(|stage| stage.kind == "client_request");
+    let response_stage = trace
+        .stages
+        .iter()
+        .rev()
+        .find(|stage| matches!(stage.kind.as_str(), "client_response" | "injected_response"));
+    let metadata = trace.metadata.as_ref();
+    let request_time = metadata
+        .and_then(|value| value.ts_request_ms)
+        .unwrap_or_else(|| row["ts_request_ms"].as_i64().unwrap_or_default());
+    let response_time = metadata
+        .and_then(|value| value.ts_response_ms)
+        .unwrap_or(request_time);
+    let duration = response_time.saturating_sub(request_time).max(0);
+    let request_headers = standard_headers(
+        trace,
+        request_stage.and_then(|stage| stage.data.request_headers_ref),
+    );
+    let response_headers = standard_headers(
+        trace,
+        response_stage.and_then(|stage| stage.data.response_headers_ref),
+    );
+    serde_json::json!({
+        "startedDateTime": rfc3339_millis(request_time),
+        "time": duration,
+        "request": {
+            "method": metadata_text(metadata.and_then(|value| value.method.as_deref()), "POST"),
+            "url": metadata_text(metadata.and_then(|value| value.path.as_deref()), "/"),
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": request_headers,
+            "queryString": [],
+            "headersSize": -1,
+            "bodySize": request_stage.and_then(|stage| stage.data.request_body_manifest_ref)
+                .and_then(|id| trace.bodies.iter().find(|body| body.manifest_id == id.to_string()))
+                .map(|body| body.total_length).unwrap_or_default(),
+            "postData": request_stage.and_then(|stage| stage.data.request_body_manifest_ref)
+                .map(|id| serde_json::json!({"mimeType":"application/octet-stream", "_alexManifestRef": id.to_string()})),
+        },
+        "response": {
+            "status": response_stage.and_then(|stage| stage.data.status_code).unwrap_or_default(),
+            "statusText": "",
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": response_headers,
+            "content": {
+                "size": response_stage.and_then(|stage| stage.data.response_body_manifest_ref)
+                    .and_then(|id| trace.bodies.iter().find(|body| body.manifest_id == id.to_string()))
+                    .map(|body| body.total_length).unwrap_or_default(),
+                "mimeType": "application/octet-stream",
+                "_alexManifestRef": response_stage.and_then(|stage| stage.data.response_body_manifest_ref).map(|id| id.to_string()),
+            },
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": response_stage.and_then(|stage| stage.data.response_body_manifest_ref)
+                .and_then(|id| trace.bodies.iter().find(|body| body.manifest_id == id.to_string()))
+                .map(|body| body.total_length).unwrap_or_default(),
+        },
+        "cache": {},
+        "timings": {"send": 0, "wait": duration, "receive": 0},
+        "_alex": {"fidelity": "canonical", "lossReport": losses},
+    })
+}
+
+fn write_json_object_except<W: Write>(
+    output: &mut W,
+    object: &serde_json::Map<String, Value>,
+    skipped: &[&str],
+    first: &mut bool,
+) -> Result<()> {
+    for (key, value) in object {
+        if skipped.contains(&key.as_str()) {
+            continue;
+        }
+        if !*first {
+            output.write_all(b",")?;
+        }
+        *first = false;
+        serde_json::to_writer(&mut *output, key)?;
+        output.write_all(b":")?;
+        serde_json::to_writer(&mut *output, value)?;
+    }
+    Ok(())
+}
+
+fn write_har_canonical_content<W: Write>(
+    store: &Store,
+    body: Option<&LarInterchangeBody>,
+    output: &mut W,
+) -> Result<()> {
+    let Some(body) = body else {
+        output.write_all(b"null")?;
+        return Ok(());
+    };
+    write!(
+        output,
+        "{{\"mimeType\":{},\"text\":\"",
+        serde_json::to_string(
+            &body
+                .media_type
+                .as_deref()
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .unwrap_or_else(|| "application/octet-stream".into())
+        )?
+    )?;
+    let written = {
+        let mut encoder = base64::write::EncoderWriter::new(
+            &mut *output,
+            &base64::engine::general_purpose::STANDARD,
+        );
+        let written = store.write_lar_manifest_body(&body.manifest_id, &mut encoder)?;
+        encoder.finish()?;
+        written
+    };
+    if written != body.total_length {
+        bail!("HAR manifest {} changed during export", body.manifest_id);
+    }
+    write!(
+        output,
+        "\",\"encoding\":\"base64\",\"size\":{},\"_alexManifestRef\":{}}}",
+        body.total_length,
+        serde_json::to_string(&body.manifest_id)?
+    )?;
+    Ok(())
+}
+
+fn write_har_legacy_content<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    artifact_kind: &str,
+    output: &mut W,
+) -> Result<()> {
+    output.write_all(
+        b"{\"mimeType\":\"application/octet-stream\",\"encoding\":\"base64\",\"text\":\"",
+    )?;
+    if store
+        .lar_artifact_location("trace", trace_id, artifact_kind, None)?
+        .is_some()
+    {
+        let mut encoder = base64::write::EncoderWriter::new(
+            &mut *output,
+            &base64::engine::general_purpose::STANDARD,
+        );
+        store.write_lar_or_legacy_artifact("trace", trace_id, artifact_kind, None, &mut encoder)?;
+        encoder.finish()?;
+    }
+    output.write_all(b"\"}")?;
+    Ok(())
+}
+
+fn stream_har<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    summary: InterchangeSelectionSummary,
+    losses: &[&str],
+    output: &mut W,
+) -> Result<usize> {
+    write!(
+        output,
+        "{{\"log\":{{\"version\":\"1.2\",\"creator\":{{\"name\":\"Alex\",\"version\":{}}},\"_alexSummary\":{},\"entries\":[",
+        serde_json::to_string(env!("CARGO_PKG_VERSION"))?,
+        serde_json::to_string(&serde_json::json!({
+            "canonical_traces": summary.canonical,
+            "legacy_traces": summary.legacy,
+            "loss_report": losses,
+        }))?
+    )?;
+    let mut first = true;
+    let emitted = for_each_interchange_trace(store, args, upper, |trace| {
+        if !first {
+            output.write_all(b",")?;
+        }
+        first = false;
+        if let Some(canonical) = &trace.canonical {
+            let projection = canonical_har_projection(canonical, &trace.row, losses);
+            let object = projection
+                .as_object()
+                .cloned()
+                .context("canonical HAR projection is not an object")?;
+            output.write_all(b"{")?;
+            let mut wrote = true;
+            write_json_object_except(
+                output,
+                &object,
+                &["request", "response", "_alex"],
+                &mut wrote,
+            )?;
+            let request_stage = canonical
+                .stages
+                .iter()
+                .find(|stage| stage.kind == "client_request");
+            let response_stage = canonical.stages.iter().rev().find(|stage| {
+                matches!(stage.kind.as_str(), "client_response" | "injected_response")
+            });
+            let request_body_id = request_stage
+                .and_then(|stage| stage.data.request_body_manifest_ref)
+                .map(|id| id.to_string());
+            let response_body_id = response_stage
+                .and_then(|stage| stage.data.response_body_manifest_ref)
+                .map(|id| id.to_string());
+            let request_body = request_body_id
+                .as_deref()
+                .and_then(|id| canonical.bodies.iter().find(|body| body.manifest_id == id));
+            let response_body = response_body_id
+                .as_deref()
+                .and_then(|id| canonical.bodies.iter().find(|body| body.manifest_id == id));
+            output.write_all(b",\"request\":{")?;
+            let request = object["request"]
+                .as_object()
+                .context("HAR request is not an object")?;
+            let mut request_first = true;
+            write_json_object_except(output, request, &["postData"], &mut request_first)?;
+            if !request_first {
+                output.write_all(b",")?;
+            }
+            output.write_all(b"\"postData\":")?;
+            write_har_canonical_content(store, request_body, output)?;
+            output.write_all(b"},\"response\":{")?;
+            let response = object["response"]
+                .as_object()
+                .context("HAR response is not an object")?;
+            let mut response_first = true;
+            write_json_object_except(output, response, &["content"], &mut response_first)?;
+            if !response_first {
+                output.write_all(b",")?;
+            }
+            output.write_all(b"\"content\":")?;
+            write_har_canonical_content(store, response_body, output)?;
+            output.write_all(b"},\"_alex\":{\"fidelity\":\"canonical\",\"lossReport\":")?;
+            serde_json::to_writer(&mut *output, losses)?;
+            output.write_all(b",\"canonicalGraph\":")?;
+            write_canonical_graph(store, canonical, false, output)?;
+            output.write_all(b",\"stageBodyData\":[")?;
+            let mut first_body = true;
+            for body in &canonical.bodies {
+                if request_body_id.as_deref() == Some(body.manifest_id.as_str())
+                    || response_body_id.as_deref() == Some(body.manifest_id.as_str())
+                {
+                    continue;
+                }
+                if !first_body {
+                    output.write_all(b",")?;
+                }
+                first_body = false;
+                write_canonical_body(store, body, output)?;
+            }
+            output.write_all(b"]")?;
+            output.write_all(b"}}")?;
+        } else {
+            // Legacy HAR remains an explicit projection; its bodies are still
+            // streamed as one trace rather than accumulated across selection.
+            let request_time = trace.row["ts_request_ms"].as_i64().unwrap_or_default();
+            let response_time = trace.row["ts_response_ms"].as_i64().unwrap_or(request_time);
+            let legacy = serde_json::json!({
+                "startedDateTime": rfc3339_millis(request_time),
+                "time": response_time.saturating_sub(request_time).max(0),
+                "request": {"method": trace.row["method"], "url": trace.row["path"], "httpVersion":"HTTP/1.1", "cookies":[], "headers":trace.request_headers, "queryString":[], "headersSize":-1, "bodySize":-1},
+                "response": {"status":trace.row["status"], "statusText":"", "httpVersion":"HTTP/1.1", "cookies":[], "headers":trace.response_headers, "content":{"size":-1,"mimeType":"application/octet-stream"}, "redirectURL":"", "headersSize":-1, "bodySize":-1},
+                "cache":{}, "timings":{"send":0,"wait":response_time.saturating_sub(request_time).max(0),"receive":0},
+            });
+            let legacy_object = legacy
+                .as_object()
+                .context("legacy HAR entry is not an object")?;
+            output.write_all(b"{")?;
+            let mut legacy_first = true;
+            write_json_object_except(
+                output,
+                legacy_object,
+                &["request", "response", "_alex"],
+                &mut legacy_first,
+            )?;
+            let trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+            output.write_all(b",\"request\":{")?;
+            let request = legacy_object["request"]
+                .as_object()
+                .context("legacy HAR request is not an object")?;
+            let mut request_first = true;
+            write_json_object_except(output, request, &[], &mut request_first)?;
+            output.write_all(b",\"postData\":")?;
+            write_har_legacy_content(store, trace_id, "client_request", output)?;
+            output.write_all(b"},\"response\":{")?;
+            let response = legacy_object["response"]
+                .as_object()
+                .context("legacy HAR response is not an object")?;
+            let mut response_first = true;
+            write_json_object_except(output, response, &["content"], &mut response_first)?;
+            output.write_all(b",\"content\":")?;
+            write_har_legacy_content(store, trace_id, "client_response", output)?;
+            output.write_all(b"},\"_alex\":{\"trace\":")?;
+            serde_json::to_writer(&mut *output, &sanitized_trace_metadata(&trace.row))?;
+            output.write_all(b",\"fidelity\":\"legacy\",\"lossReport\":")?;
+            serde_json::to_writer(&mut *output, &export_loss_report())?;
+            output.write_all(b",\"upstreamRequest\":")?;
+            write_legacy_artifact(store, trace_id, "upstream_request", output)?;
+            output.write_all(b"}}")?;
+        }
+        Ok(())
+    })?;
+    output.write_all(b"]}}")?;
+    Ok(emitted)
+}
+
+fn semantic_base_record(trace: &InterchangeExportTrace, openinference: bool) -> Value {
+    let alex_trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+    let trace_id = semantic_trace_id(alex_trace_id);
+    let span_id = semantic_span_id(
+        alex_trace_id,
+        if openinference {
+            b"openinference"
+        } else {
+            b"otel"
+        },
+    );
+    let prompt_tokens = trace.row["input_tokens"].as_i64();
+    let completion_tokens = trace.row["output_tokens"].as_i64();
+    let attributes = if openinference {
+        serde_json::json!({
+            "openinference.span.kind": "LLM",
+            "llm.system": openinference_system(&trace.row["upstream_provider"]),
+            "llm.provider": openinference_provider(&trace.row["upstream_provider"]),
+            "llm.model_name": trace.row["routed_model"],
+            "llm.token_count.prompt": prompt_tokens,
+            "llm.token_count.prompt_details.cache_read": trace.row["cached_input_tokens"],
+            "llm.token_count.prompt_details.cache_write": trace.row["cache_creation_tokens"],
+            "llm.token_count.completion": completion_tokens,
+            "llm.token_count.completion_details.reasoning": trace.row["reasoning_tokens"],
+            "llm.token_count.total": prompt_tokens.zip(completion_tokens).map(|(left, right)| left.saturating_add(right)),
+            "llm.cost.total": trace.row["cost_usd"],
+            "input.mime_type": "application/json",
+            "output.mime_type": "application/json",
+            "alex.trace.id": alex_trace_id,
+        })
+    } else {
+        serde_json::json!({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": otel_provider_name(&trace.row["upstream_provider"]),
+            "gen_ai.request.model": trace.row["requested_model"],
+            "gen_ai.response.model": trace.row["routed_model"],
+            "gen_ai.usage.input_tokens": trace.row["input_tokens"],
+            "gen_ai.usage.cache_read.input_tokens": trace.row["cached_input_tokens"],
+            "gen_ai.usage.cache_creation.input_tokens": trace.row["cache_creation_tokens"],
+            "gen_ai.usage.output_tokens": trace.row["output_tokens"],
+            "gen_ai.usage.reasoning.output_tokens": trace.row["reasoning_tokens"],
+            "http.request.method": trace.row["method"],
+            "http.response.status_code": trace.row["status"],
+            "alex.trace.id": alex_trace_id,
+        })
+    };
+    serde_json::json!({
+        "resource": {"service.name":"alex"},
+        "scope": {
+            "name": if openinference {"alex.lar.openinference.export"} else {"alex.lar.export"},
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "span": {
+            "name": if openinference {"LLM"} else {"gen_ai.request"},
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "start_time_unix_nano": trace.row["ts_request_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
+            "end_time_unix_nano": trace.row["ts_response_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
+            "attributes": attributes,
+            "status": if trace.row["error"].is_null() {"OK"} else {"ERROR"},
+        },
+    })
+}
+
+fn stream_semantic_jsonl<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    losses: &[&str],
+    openinference: bool,
+    output: &mut W,
+) -> Result<usize> {
+    for_each_interchange_trace(store, args, upper, |trace| {
+        let base = semantic_base_record(&trace, openinference);
+        let object = base
+            .as_object()
+            .context("semantic export record is not an object")?;
+        output.write_all(b"{")?;
+        for (index, (key, value)) in object.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut *output, key)?;
+            output.write_all(b":")?;
+            serde_json::to_writer(&mut *output, value)?;
+        }
+        output.write_all(b",\"alex_loss_report\":")?;
+        serde_json::to_writer(&mut *output, losses)?;
+        if let Some(canonical) = &trace.canonical {
+            output
+                .write_all(b",\"alex_capture_fidelity\":\"canonical\",\"alex_canonical_graph\":")?;
+            write_canonical_graph(store, canonical, true, output)?;
+        } else {
+            let trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+            output.write_all(b",\"alex_capture_fidelity\":\"legacy\",\"alex_legacy_artifacts\":{\"client_request\":")?;
+            write_legacy_artifact(store, trace_id, "client_request", output)?;
+            output.write_all(b",\"upstream_request\":")?;
+            write_legacy_artifact(store, trace_id, "upstream_request", output)?;
+            output.write_all(b",\"client_response\":")?;
+            write_legacy_artifact(store, trace_id, "client_response", output)?;
+            output.write_all(b"}")?;
+        }
+        output.write_all(b"}\n")?;
+        Ok(())
+    })
+}
+
+fn stream_otel_jsonl<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    losses: &[&str],
+    output: &mut W,
+) -> Result<usize> {
+    stream_semantic_jsonl(store, args, upper, losses, false, output)
+}
+
+fn stream_openinference_jsonl<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    losses: &[&str],
+    output: &mut W,
+) -> Result<usize> {
+    stream_semantic_jsonl(store, args, upper, losses, true, output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_warc_stream_record<W: Write, R: Read>(
+    output: &mut W,
+    record_type: &str,
+    record_id: &str,
+    concurrent_to: Option<&str>,
+    date: &str,
+    content_type: &str,
+    content_length: u64,
+    block_digest_algorithm: &str,
+    block_digest: &str,
+    input: &mut R,
+    losses: &[&str],
+) -> Result<()> {
+    write!(output, "WARC/1.1\r\n")?;
+    write!(output, "WARC-Type: {record_type}\r\n")?;
+    write!(output, "WARC-Record-ID: {record_id}\r\n")?;
+    write!(output, "WARC-Date: {date}\r\n")?;
+    if let Some(id) = concurrent_to {
+        write!(output, "WARC-Concurrent-To: {id}\r\n")?;
+    }
+    write!(
+        output,
+        "WARC-Block-Digest: {block_digest_algorithm}:{block_digest}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\n"
+    )?;
+    write!(
+        output,
+        "Alex-Fidelity-Loss: {}\r\n\r\n",
+        losses.join(" | ").replace(['\r', '\n'], " ")
+    )?;
+    let copied = std::io::copy(input, output)?;
+    if copied != content_length {
+        bail!("WARC payload changed while streaming: copied {copied}, expected {content_length}");
+    }
+    output.write_all(b"\r\n\r\n")?;
+    Ok(())
+}
+
+fn stream_canonical_warc_body<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    body: &LarInterchangeBody,
+    date: &str,
+    metadata_record_id: &str,
+    losses: &[&str],
+    spool_parent: &Path,
+    output: &mut W,
+) -> Result<()> {
+    let record_id = warc_record_id(trace_id, &format!("manifest:{}", body.manifest_id));
+    let spool = spool_parent.join(format!(
+        ".warc-manifest-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&spool)?;
+        let mut tracked = Sha256CountWriter::new(&mut file);
+        let written = store.write_lar_manifest_body(&body.manifest_id, &mut tracked)?;
+        let (_, length, sha256) = tracked.finish();
+        if written != body.total_length || length != body.total_length {
+            bail!(
+                "canonical WARC body {} changed length during export",
+                body.manifest_id
+            );
+        }
+        file.seek(std::io::SeekFrom::Start(0))?;
+        append_warc_stream_record(
+            output,
+            "resource",
+            &record_id,
+            Some(metadata_record_id),
+            date,
+            "application/octet-stream",
+            length,
+            "sha256",
+            &sha256,
+            &mut file,
+            losses,
+        )
+    })();
+    let _ = fs::remove_file(&spool);
+    result
+}
+
+fn stream_legacy_warc_artifact<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    artifact_kind: &str,
+    date: &str,
+    metadata_record_id: &str,
+    losses: &[&str],
+    spool_parent: &Path,
+    output: &mut W,
+) -> Result<()> {
+    if store
+        .lar_artifact_location("trace", trace_id, artifact_kind, None)?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let spool = spool_parent.join(format!(
+        ".warc-body-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&spool)?;
+        let mut tracked = Sha256CountWriter::new(&mut file);
+        if !store.write_lar_or_legacy_artifact(
+            "trace",
+            trace_id,
+            artifact_kind,
+            None,
+            &mut tracked,
+        )? {
+            bail!("artifact {artifact_kind} for trace {trace_id} disappeared during export");
+        }
+        let (_, length, digest) = tracked.finish();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        append_warc_stream_record(
+            output,
+            "resource",
+            &warc_record_id(trace_id, artifact_kind),
+            Some(metadata_record_id),
+            date,
+            "application/octet-stream",
+            length,
+            "sha256",
+            &digest,
+            &mut file,
+            losses,
+        )
+    })();
+    let _ = fs::remove_file(&spool);
+    result
+}
+
+fn append_projected_headers(output: &mut Vec<u8>, headers: &[ExportHeader]) {
+    for header in headers {
+        output.extend_from_slice(header.name.replace(['\r', '\n'], " ").as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(header.value.replace(['\r', '\n'], " ").as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_canonical_http_projection<W: Write>(
+    store: &Store,
+    _trace_id: &str,
+    canonical: &LarInterchangeTrace,
+    stage: &LarInterchangeStage,
+    record_type: &str,
+    record_id: &str,
+    concurrent_to: &str,
+    date: &str,
+    losses: &[&str],
+    spool_parent: &Path,
+    output: &mut W,
+) -> Result<()> {
+    let (headers_ref, body_ref) = if record_type == "request" {
+        (
+            stage.data.request_headers_ref,
+            stage.data.request_body_manifest_ref,
+        )
+    } else {
+        (
+            stage.data.response_headers_ref,
+            stage.data.response_body_manifest_ref,
+        )
+    };
+    let headers = standard_headers(canonical, headers_ref);
+    let metadata = canonical.metadata.as_ref();
+    let mut prefix = if record_type == "request" {
+        let method = metadata_text(metadata.and_then(|value| value.method.as_deref()), "POST")
+            .replace(['\r', '\n'], " ");
+        let path = metadata_text(metadata.and_then(|value| value.path.as_deref()), "/")
+            .replace(['\r', '\n'], " ");
+        format!("{} {} HTTP/1.1\r\n", method, path).into_bytes()
+    } else {
+        format!(
+            "HTTP/1.1 {} \r\n",
+            stage
+                .data
+                .status_code
+                .or_else(|| metadata
+                    .and_then(|value| value.status)
+                    .and_then(|value| u16::try_from(value).ok()))
+                .unwrap_or_default()
+        )
+        .into_bytes()
+    };
+    append_projected_headers(&mut prefix, &headers);
+    prefix.extend_from_slice(b"\r\n");
+    let body = body_ref
+        .map(|id| id.to_string())
+        .and_then(|id| canonical.bodies.iter().find(|body| body.manifest_id == id));
+    let spool = spool_parent.join(format!(
+        ".warc-http-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&spool)?;
+        let mut tracked = Sha256CountWriter::new(&mut file);
+        tracked.write_all(&prefix)?;
+        if let Some(body) = body {
+            store.write_lar_manifest_body(&body.manifest_id, &mut tracked)?;
+        }
+        let (_, length, digest) = tracked.finish();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        append_warc_stream_record(
+            output,
+            record_type,
+            record_id,
+            Some(concurrent_to),
+            date,
+            &format!("application/http; msgtype={record_type}"),
+            length,
+            "sha256",
+            &digest,
+            &mut file,
+            losses,
+        )
+    })();
+    let _ = fs::remove_file(&spool);
+    result
+}
+
+fn stream_canonical_http_timeline<W: Write>(
+    store: &Store,
+    trace_id: &str,
+    canonical: &LarInterchangeTrace,
+    date: &str,
+    metadata_record_id: &str,
+    losses: &[&str],
+    spool_parent: &Path,
+    output: &mut W,
+) -> Result<()> {
+    let mut attempt_requests = HashMap::<u32, String>::new();
+    let mut client_request = None::<String>;
+    for stage in &canonical.stages {
+        let is_request = matches!(
+            stage.kind.as_str(),
+            "client_request" | "upstream_request" | "dario_request"
+        );
+        let is_response = matches!(
+            stage.kind.as_str(),
+            "upstream_response"
+                | "upstream_failure"
+                | "client_response"
+                | "dario_response"
+                | "injected_response"
+        );
+        if !is_request && !is_response {
+            continue;
+        }
+        let record_type = if is_request { "request" } else { "response" };
+        let record_id =
+            warc_record_id(trace_id, &format!("stage:{}:{record_type}", stage.stage_id));
+        let concurrent_to = if is_response {
+            stage
+                .data
+                .attempt_number
+                .and_then(|attempt| attempt_requests.get(&attempt))
+                .or(client_request.as_ref())
+                .map(String::as_str)
+                .unwrap_or(metadata_record_id)
+        } else {
+            metadata_record_id
+        };
+        stream_canonical_http_projection(
+            store,
+            trace_id,
+            canonical,
+            stage,
+            record_type,
+            &record_id,
+            concurrent_to,
+            date,
+            losses,
+            spool_parent,
+            output,
+        )?;
+        if is_request {
+            if let Some(attempt) = stage.data.attempt_number {
+                attempt_requests.insert(attempt, record_id.clone());
+            }
+            if stage.kind == "client_request" {
+                client_request = Some(record_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_legacy_http_projection<W: Write>(
+    store: &Store,
+    trace: &InterchangeExportTrace,
+    record_type: &str,
+    artifact_kind: &str,
+    record_id: &str,
+    concurrent_to: &str,
+    date: &str,
+    losses: &[&str],
+    spool_parent: &Path,
+    output: &mut W,
+) -> Result<()> {
+    let trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+    let mut prefix = if record_type == "request" {
+        let method = trace.row["method"]
+            .as_str()
+            .unwrap_or("POST")
+            .replace(['\r', '\n'], " ");
+        let path = trace.row["path"]
+            .as_str()
+            .unwrap_or("/")
+            .replace(['\r', '\n'], " ");
+        format!("{} {} HTTP/1.1\r\n", method, path).into_bytes()
+    } else {
+        format!(
+            "HTTP/1.1 {} \r\n",
+            trace.row["status"].as_i64().unwrap_or_default()
+        )
+        .into_bytes()
+    };
+    append_projected_headers(
+        &mut prefix,
+        if record_type == "request" {
+            &trace.request_headers
+        } else {
+            &trace.response_headers
+        },
+    );
+    prefix.extend_from_slice(b"\r\n");
+    let spool = spool_parent.join(format!(
+        ".warc-legacy-http-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&spool)?;
+        let mut tracked = Sha256CountWriter::new(&mut file);
+        tracked.write_all(&prefix)?;
+        store.write_lar_or_legacy_artifact("trace", trace_id, artifact_kind, None, &mut tracked)?;
+        let (_, length, digest) = tracked.finish();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        append_warc_stream_record(
+            output,
+            record_type,
+            record_id,
+            Some(concurrent_to),
+            date,
+            &format!("application/http; msgtype={record_type}"),
+            length,
+            "sha256",
+            &digest,
+            &mut file,
+            losses,
+        )
+    })();
+    let _ = fs::remove_file(&spool);
+    result
+}
+
+fn stream_warc<W: Write>(
+    store: &Store,
+    args: &ExportArgs,
+    upper: &LarExportTraceCursor,
+    losses: &[&str],
+    output: &mut W,
+) -> Result<usize> {
+    let spool_parent = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for_each_interchange_trace(store, args, upper, |trace| {
+        let trace_id = trace.row["id"].as_str().unwrap_or("unknown");
+        let date = rfc3339_millis(trace.row["ts_request_ms"].as_i64().unwrap_or_default());
+        let metadata_record_id = warc_record_id(trace_id, "canonical-metadata");
+        if let Some(canonical) = &trace.canonical {
+            let mut metadata = Vec::new();
+            write_canonical_graph(store, canonical, false, &mut metadata)?;
+            append_warc_record(
+                output,
+                "metadata",
+                &metadata_record_id,
+                None,
+                &date,
+                "application/vnd.alex.lar-canonical+json",
+                &metadata,
+                losses,
+            )?;
+            stream_canonical_http_timeline(
+                store,
+                trace_id,
+                canonical,
+                &date,
+                &metadata_record_id,
+                losses,
+                spool_parent,
+                output,
+            )?;
+            for body in &canonical.bodies {
+                stream_canonical_warc_body(
+                    store,
+                    trace_id,
+                    body,
+                    &date,
+                    &metadata_record_id,
+                    losses,
+                    spool_parent,
+                    output,
+                )?;
+            }
+        } else {
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "schema":"alex.legacy-trace.v1",
+                "trace":sanitized_trace_metadata(&trace.row),
+                "headers":{"request":trace.request_headers,"response":trace.response_headers},
+                "loss_report":export_loss_report(),
+            }))?;
+            append_warc_record(
+                output,
+                "metadata",
+                &metadata_record_id,
+                None,
+                &date,
+                "application/vnd.alex.legacy-trace+json",
+                &metadata,
+                losses,
+            )?;
+            let request_record_id = warc_record_id(trace_id, "request");
+            stream_legacy_http_projection(
+                store,
+                &trace,
+                "request",
+                "client_request",
+                &request_record_id,
+                &metadata_record_id,
+                &date,
+                losses,
+                spool_parent,
+                output,
+            )?;
+            stream_legacy_http_projection(
+                store,
+                &trace,
+                "response",
+                "client_response",
+                &warc_record_id(trace_id, "response"),
+                &request_record_id,
+                &date,
+                losses,
+                spool_parent,
+                output,
+            )?;
+            stream_legacy_warc_artifact(
+                store,
+                trace_id,
+                "upstream_request",
+                &date,
+                &metadata_record_id,
+                losses,
+                spool_parent,
+                output,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 fn load_export_traces(
@@ -2981,54 +5387,6 @@ fn header_value_string(value: &Value) -> Option<String> {
     }
 }
 
-fn encoded_artifact(bytes: Option<&[u8]>) -> Value {
-    match bytes {
-        None => Value::Null,
-        Some(bytes) => serde_json::json!({
-            "encoding": "base64",
-            "length": bytes.len(),
-            "blake3": hex_bytes(&alex_lar::ChunkHash::blake3(bytes).digest),
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }),
-    }
-}
-
-fn build_jsonl(traces: &[ExportTrace], losses: &[&str]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    serde_json::to_writer(
-        &mut output,
-        &serde_json::json!({
-            "type": "alex.lar.export.manifest",
-            "version": 1,
-            "format": "jsonl",
-            "loss_report": losses,
-        }),
-    )?;
-    output.push(b'\n');
-    for trace in traces {
-        let metadata = sanitized_trace_metadata(&trace.row);
-        serde_json::to_writer(
-            &mut output,
-            &serde_json::json!({
-                "type": "alex.trace",
-                "metadata": metadata,
-                "headers": {
-                    "request": trace.request_headers,
-                    "response": trace.response_headers,
-                    "fidelity": "legacy_order_and_casing_unknown",
-                },
-                "artifacts": {
-                    "client_request": encoded_artifact(trace.request.as_deref()),
-                    "upstream_request": encoded_artifact(trace.upstream_request.as_deref()),
-                    "client_response": encoded_artifact(trace.response.as_deref()),
-                },
-            }),
-        )?;
-        output.push(b'\n');
-    }
-    Ok(output)
-}
-
 fn sanitized_trace_metadata(row: &Value) -> Value {
     let mut metadata = row.clone();
     if let Some(object) = metadata.as_object_mut() {
@@ -3039,119 +5397,10 @@ fn sanitized_trace_metadata(row: &Value) -> Value {
     metadata
 }
 
-fn build_har(traces: &[ExportTrace], losses: &[&str]) -> Result<Vec<u8>> {
-    let entries = traces
-        .iter()
-        .map(|trace| {
-            let request_time = trace.row["ts_request_ms"].as_i64().unwrap_or_default();
-            let response_time = trace.row["ts_response_ms"].as_i64().unwrap_or(request_time);
-            let duration = response_time.saturating_sub(request_time).max(0);
-            let request = trace.request.as_deref().unwrap_or_default();
-            let response = trace.response.as_deref().unwrap_or_default();
-            let request_type = header_value(&trace.request_headers, "content-type")
-                .unwrap_or("application/octet-stream");
-            let response_type = header_value(&trace.response_headers, "content-type")
-                .unwrap_or("application/octet-stream");
-            serde_json::json!({
-                "startedDateTime": rfc3339_millis(request_time),
-                "time": duration,
-                "request": {
-                    "method": trace.row["method"].as_str().unwrap_or("POST"),
-                    "url": trace.row["path"].as_str().unwrap_or("/"),
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": trace.request_headers,
-                    "queryString": [],
-                    "postData": {
-                        "mimeType": request_type,
-                        "text": base64::engine::general_purpose::STANDARD.encode(request),
-                        "_encoding": "base64",
-                    },
-                    "headersSize": -1,
-                    "bodySize": request.len(),
-                },
-                "response": {
-                    "status": trace.row["status"].as_i64().unwrap_or_default(),
-                    "statusText": "",
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": trace.response_headers,
-                    "content": {
-                        "size": response.len(),
-                        "mimeType": response_type,
-                        "text": base64::engine::general_purpose::STANDARD.encode(response),
-                        "encoding": "base64",
-                    },
-                    "redirectURL": "",
-                    "headersSize": -1,
-                    "bodySize": response.len(),
-                },
-                "cache": {},
-                "timings": {"send": 0, "wait": duration, "receive": 0},
-                "_alex": {
-                    "trace": sanitized_trace_metadata(&trace.row),
-                    "upstreamRequest": encoded_artifact(trace.upstream_request.as_deref()),
-                    "headerFidelity": "legacy_order_and_casing_unknown",
-                    "lossReport": losses,
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(serde_json::to_vec_pretty(&serde_json::json!({
-        "log": {
-            "version": "1.2",
-            "creator": {"name": "Alex", "version": env!("CARGO_PKG_VERSION")},
-            "entries": entries,
-        }
-    }))?)
-}
-
-fn header_value<'a>(headers: &'a [ExportHeader], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case(name))
-        .map(|header| header.value.as_str())
-}
-
 fn rfc3339_millis(timestamp_ms: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
         .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned())
-}
-
-fn build_warc(traces: &[ExportTrace], losses: &[&str]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    for trace in traces {
-        let id = trace.row["id"].as_str().unwrap_or("unknown");
-        let request_id = warc_record_id(id, "request");
-        let request_payload = http_request_payload(trace);
-        append_warc_record(
-            &mut output,
-            "request",
-            &request_id,
-            None,
-            &rfc3339_millis(trace.row["ts_request_ms"].as_i64().unwrap_or_default()),
-            "application/http; msgtype=request",
-            &request_payload,
-            losses,
-        )?;
-        let response_payload = http_response_payload(trace);
-        append_warc_record(
-            &mut output,
-            "response",
-            &warc_record_id(id, "response"),
-            Some(&request_id),
-            &rfc3339_millis(
-                trace.row["ts_response_ms"]
-                    .as_i64()
-                    .unwrap_or_else(|| trace.row["ts_request_ms"].as_i64().unwrap_or_default()),
-            ),
-            "application/http; msgtype=response",
-            &response_payload,
-            losses,
-        )?;
-    }
-    Ok(output)
 }
 
 fn warc_record_id(trace_id: &str, kind: &str) -> String {
@@ -3159,43 +5408,9 @@ fn warc_record_id(trace_id: &str, kind: &str) -> String {
     format!("<urn:alex:sha256:{}>", hex_bytes(&digest))
 }
 
-fn http_request_payload(trace: &ExportTrace) -> Vec<u8> {
-    let mut output = format!(
-        "{} {} HTTP/1.1\r\n",
-        trace.row["method"].as_str().unwrap_or("POST"),
-        trace.row["path"].as_str().unwrap_or("/")
-    )
-    .into_bytes();
-    append_http_headers(&mut output, &trace.request_headers);
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(trace.request.as_deref().unwrap_or_default());
-    output
-}
-
-fn http_response_payload(trace: &ExportTrace) -> Vec<u8> {
-    let mut output = format!(
-        "HTTP/1.1 {}\r\n",
-        trace.row["status"].as_i64().unwrap_or_default()
-    )
-    .into_bytes();
-    append_http_headers(&mut output, &trace.response_headers);
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(trace.response.as_deref().unwrap_or_default());
-    output
-}
-
-fn append_http_headers(output: &mut Vec<u8>, headers: &[ExportHeader]) {
-    for header in headers {
-        output.extend_from_slice(header.name.as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(header.value.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn append_warc_record(
-    output: &mut Vec<u8>,
+fn append_warc_record<W: Write>(
+    output: &mut W,
     record_type: &str,
     record_id: &str,
     concurrent_to: Option<&str>,
@@ -3204,7 +5419,7 @@ fn append_warc_record(
     payload: &[u8],
     losses: &[&str],
 ) -> Result<()> {
-    let payload_digest = hex_bytes(&Sha256::digest(payload));
+    let block_digest = hex_bytes(&Sha256::digest(payload));
     write!(output, "WARC/1.1\r\n")?;
     write!(output, "WARC-Type: {record_type}\r\n")?;
     write!(output, "WARC-Record-ID: {record_id}\r\n")?;
@@ -3212,7 +5427,7 @@ fn append_warc_record(
     if let Some(id) = concurrent_to {
         write!(output, "WARC-Concurrent-To: {id}\r\n")?;
     }
-    write!(output, "WARC-Payload-Digest: sha256:{payload_digest}\r\n")?;
+    write!(output, "WARC-Block-Digest: sha256:{block_digest}\r\n")?;
     write!(output, "Content-Type: {content_type}\r\n")?;
     write!(output, "Content-Length: {}\r\n", payload.len())?;
     write!(
@@ -3220,145 +5435,9 @@ fn append_warc_record(
         "Alex-Fidelity-Loss: {}\r\n\r\n",
         losses.join(" | ").replace(['\r', '\n'], " ")
     )?;
-    output.extend_from_slice(payload);
-    output.extend_from_slice(b"\r\n\r\n");
+    output.write_all(payload)?;
+    output.write_all(b"\r\n\r\n")?;
     Ok(())
-}
-
-fn build_otel_jsonl(traces: &[ExportTrace], losses: &[&str]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    for trace in traces {
-        let alex_trace_id = trace.row["id"].as_str().unwrap_or("unknown");
-        let trace_id = semantic_trace_id(alex_trace_id);
-        let span_id = semantic_span_id(alex_trace_id, b"otel");
-        let attributes = serde_json::json!({
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": otel_provider_name(&trace.row["upstream_provider"]),
-            "gen_ai.request.model": trace.row["requested_model"],
-            "gen_ai.response.model": trace.row["routed_model"],
-            "gen_ai.usage.input_tokens": trace.row["input_tokens"],
-            "gen_ai.usage.cache_read.input_tokens": trace.row["cached_input_tokens"],
-            "gen_ai.usage.cache_creation.input_tokens": trace.row["cache_creation_tokens"],
-            "gen_ai.usage.output_tokens": trace.row["output_tokens"],
-            "gen_ai.usage.reasoning.output_tokens": trace.row["reasoning_tokens"],
-            "http.request.method": trace.row["method"],
-            "http.response.status_code": trace.row["status"],
-            "alex.trace.id": alex_trace_id,
-            "alex.capture.request_body": encoded_artifact(trace.request.as_deref()),
-            "alex.capture.upstream_request_body": encoded_artifact(trace.upstream_request.as_deref()),
-            "alex.capture.response_body": encoded_artifact(trace.response.as_deref()),
-            "alex.capture.request_headers": trace.request_headers,
-            "alex.capture.response_headers": trace.response_headers,
-            "alex.capture.fidelity": "legacy_order_and_casing_unknown",
-        });
-        serde_json::to_writer(
-            &mut output,
-            &serde_json::json!({
-                "resource": {"service.name": "alex"},
-                "scope": {"name": "alex.lar.export", "version": env!("CARGO_PKG_VERSION")},
-                "span": {
-                    "name": "gen_ai.request",
-                    "trace_id": trace_id,
-                    "span_id": span_id,
-                    "start_time_unix_nano": trace.row["ts_request_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
-                    "end_time_unix_nano": trace.row["ts_response_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
-                    "attributes": attributes,
-                    "status": if trace.row["error"].is_null() { "OK" } else { "ERROR" },
-                },
-                "alex_loss_report": losses,
-            }),
-        )?;
-        output.push(b'\n');
-    }
-    Ok(output)
-}
-
-/// OpenInference is an OpenTelemetry semantic-convention layer, not an alias
-/// for the evolving OTel GenAI conventions. Keep it as a distinct export so
-/// consumers can select the attribute vocabulary they actually implement.
-fn build_openinference_jsonl(traces: &[ExportTrace], losses: &[&str]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    for trace in traces {
-        let alex_trace_id = trace.row["id"].as_str().unwrap_or("unknown");
-        let trace_id = semantic_trace_id(alex_trace_id);
-        let span_id = semantic_span_id(alex_trace_id, b"openinference");
-        let prompt_tokens = trace.row["input_tokens"].as_i64();
-        let completion_tokens = trace.row["output_tokens"].as_i64();
-        let total_tokens = prompt_tokens
-            .zip(completion_tokens)
-            .map(|(input, output)| input.saturating_add(output));
-        let (input_mime, input_value) = openinference_value(trace.request.as_deref())?;
-        let (output_mime, output_value) = openinference_value(trace.response.as_deref())?;
-        let attributes = serde_json::json!({
-            "openinference.span.kind": "LLM",
-            "llm.system": openinference_system(&trace.row["upstream_provider"]),
-            "llm.provider": openinference_provider(&trace.row["upstream_provider"]),
-            "llm.model_name": trace.row["routed_model"],
-            "llm.token_count.prompt": prompt_tokens,
-            "llm.token_count.prompt_details.cache_read": trace.row["cached_input_tokens"],
-            "llm.token_count.prompt_details.cache_write": trace.row["cache_creation_tokens"],
-            "llm.token_count.completion": completion_tokens,
-            "llm.token_count.completion_details.reasoning": trace.row["reasoning_tokens"],
-            "llm.token_count.total": total_tokens,
-            "llm.cost.total": trace.row["cost_usd"],
-            "input.mime_type": input_mime,
-            "input.value": input_value,
-            "output.mime_type": output_mime,
-            "output.value": output_value,
-            "metadata": serde_json::to_string(&sanitized_trace_metadata(&trace.row))?,
-            "alex.trace.id": alex_trace_id,
-            "alex.capture.request_body": encoded_artifact(trace.request.as_deref()),
-            "alex.capture.upstream_request_body": encoded_artifact(trace.upstream_request.as_deref()),
-            "alex.capture.response_body": encoded_artifact(trace.response.as_deref()),
-            "alex.capture.request_headers": trace.request_headers,
-            "alex.capture.response_headers": trace.response_headers,
-            "alex.capture.fidelity": "legacy_order_and_casing_unknown",
-        });
-        serde_json::to_writer(
-            &mut output,
-            &serde_json::json!({
-                "resource": {"service.name": "alex"},
-                "scope": {
-                    "name": "alex.lar.openinference.export",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "span": {
-                    "name": "LLM",
-                    "trace_id": trace_id,
-                    "span_id": span_id,
-                    "start_time_unix_nano": trace.row["ts_request_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
-                    "end_time_unix_nano": trace.row["ts_response_ms"].as_i64().unwrap_or_default().saturating_mul(1_000_000),
-                    "attributes": attributes,
-                    "status": if trace.row["error"].is_null() { "OK" } else { "ERROR" },
-                },
-                "alex_loss_report": losses,
-            }),
-        )?;
-        output.push(b'\n');
-    }
-    Ok(output)
-}
-
-fn openinference_value(body: Option<&[u8]>) -> Result<(Value, Value)> {
-    let Some(body) = body else {
-        return Ok((Value::Null, Value::Null));
-    };
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        return Ok((
-            Value::String("application/json".into()),
-            Value::String(serde_json::to_string(&value)?),
-        ));
-    }
-    if let Ok(text) = std::str::from_utf8(body) {
-        return Ok((
-            Value::String("text/plain; charset=utf-8".into()),
-            Value::String(text.into()),
-        ));
-    }
-    Ok((
-        Value::String("application/octet-stream".into()),
-        Value::String(base64::engine::general_purpose::STANDARD.encode(body)),
-    ))
 }
 
 fn semantic_trace_id(value: &str) -> String {
@@ -3844,45 +5923,6 @@ fn verify_standalone_lar_export(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_export_file(output: &Path, bytes: &[u8], force: bool) -> Result<()> {
-    if output.exists() && !force {
-        bail!(
-            "export output already exists: {} (use --force to replace it)",
-            output.display()
-        );
-    }
-    let parent = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("export");
-    let temporary = parent.join(format!(".{name}.{}.lar-export.tmp", std::process::id()));
-    if temporary.exists() {
-        bail!(
-            "temporary export output already exists: {}",
-            temporary.display()
-        );
-    }
-    let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        publish_export_temp(&temporary, output, force)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 fn publish_export_temp(temporary: &Path, output: &Path, force: bool) -> Result<()> {
     if !force {
         // A sibling hard-link is an atomic no-clobber publish. If another
@@ -4119,6 +6159,43 @@ mod tests {
         path
     }
 
+    #[derive(Debug)]
+    struct ParsedWarcRecord {
+        headers: HashMap<String, String>,
+        payload: Vec<u8>,
+    }
+
+    fn parse_warc_records(bytes: &[u8]) -> Vec<ParsedWarcRecord> {
+        let mut records = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            assert!(bytes[cursor..].starts_with(b"WARC/1.1\r\n"));
+            let relative_header_end = bytes[cursor..]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("WARC record has a header terminator");
+            let header_end = cursor + relative_header_end;
+            let header_text = std::str::from_utf8(&bytes[cursor..header_end]).unwrap();
+            let headers = header_text
+                .split("\r\n")
+                .skip(1)
+                .map(|line| line.split_once(": ").expect("valid WARC header"))
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect::<HashMap<_, _>>();
+            let content_length = headers["Content-Length"].parse::<usize>().unwrap();
+            let payload_start = header_end + 4;
+            let payload_end = payload_start + content_length;
+            assert!(payload_end + 4 <= bytes.len());
+            assert_eq!(&bytes[payload_end..payload_end + 4], b"\r\n\r\n");
+            records.push(ParsedWarcRecord {
+                headers,
+                payload: bytes[payload_start..payload_end].to_vec(),
+            });
+            cursor = payload_end + 4;
+        }
+        records
+    }
+
     fn create_migration_job(store: &Store, job_id: &str, source_key: &str, now_ms: i64) {
         store
             .ensure_lar_migration_job(
@@ -4341,7 +6418,7 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn write_replay_archive(path: &Path) -> (String, String) {
+    fn write_replay_archive(path: &Path) -> (String, String, String) {
         use alex_lar::{ParsedFrame, StreamFrameKind, StreamIndex, StreamParser, StreamRead};
 
         let file = fs::OpenOptions::new()
@@ -4377,14 +6454,14 @@ mod tests {
                 vec![
                     ParsedFrame {
                         byte_offset: 0,
-                        byte_length: 11,
+                        byte_length: 9,
                         delta_from_first_byte_ns: 0,
                         parser: StreamParser::Sse,
                         frame_kind: StreamFrameKind::SseEvent,
                     },
                     ParsedFrame {
                         byte_offset: 11,
-                        byte_length: 11,
+                        byte_length: 9,
                         delta_from_first_byte_ns: 1_000,
                         parser: StreamParser::Sse,
                         frame_kind: StreamFrameKind::SseEvent,
@@ -4410,6 +6487,7 @@ mod tests {
         (
             stage.to_string(),
             String::from_utf8_lossy(body).into_owned(),
+            "data: onedata: two".into(),
         )
     }
 
@@ -4556,6 +6634,8 @@ mod tests {
             "grep",
             "extract",
             "replay",
+            "transaction",
+            "transaction-replay",
             "export",
         ] {
             assert!(help.contains(command), "help omitted {command}: {help}");
@@ -4687,6 +6767,28 @@ mod tests {
         ));
         assert!(matches!(
             parse(&[
+                "transaction",
+                "--trace-id",
+                "trace-1",
+                "--output",
+                "trace.jsonseq"
+            ]),
+            LarCommand::Transaction(TransactionArgs { json: false, .. })
+        ));
+        assert!(matches!(
+            parse(&[
+                "transaction-replay",
+                "trace.jsonseq",
+                "--parsed",
+                "--stage-id",
+                "stage-1",
+                "--output",
+                "events.sse"
+            ]),
+            LarCommand::TransactionReplay(TransactionReplayArgs { parsed: true, .. })
+        ));
+        assert!(matches!(
+            parse(&[
                 "export",
                 "out.warc",
                 "--format",
@@ -4715,7 +6817,7 @@ mod tests {
     fn replay_command_emits_exact_raw_reads_and_parsed_frames() {
         let dir = tmpdir("replay");
         let archive = dir.join("stream.lar");
-        let (stage_id, expected) = write_replay_archive(&archive);
+        let (stage_id, raw_expected, parsed_expected) = write_replay_archive(&archive);
         for parsed in [false, true] {
             let output = dir.join(if parsed { "parsed.sse" } else { "raw.sse" });
             replay_stream(&ReplayArgs {
@@ -4728,8 +6830,222 @@ mod tests {
                 force: false,
             })
             .unwrap();
-            assert_eq!(fs::read_to_string(output).unwrap(), expected);
+            assert_eq!(
+                fs::read_to_string(output).unwrap(),
+                if parsed {
+                    parsed_expected.as_str()
+                } else {
+                    raw_expected.as_str()
+                }
+            );
         }
+    }
+
+    #[test]
+    fn transaction_export_and_replay_are_verified_bounded_and_atomic() {
+        let dir = tmpdir("transaction-replay");
+        let archive = dir.join("stream.lar");
+        let (stage_id, raw_expected, parsed_expected) = write_replay_archive(&archive);
+        let transaction = dir.join("trace.transaction.jsonseq");
+        let report = export_transaction(
+            &dir,
+            &TransactionArgs {
+                trace_id: "replay-trace".into(),
+                archive: Some(archive),
+                output: transaction.clone(),
+                force: false,
+                json: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.json["verified"], true);
+        validate_transaction_sequence(&transaction, Some("replay-trace")).unwrap();
+
+        let pretty_transaction = dir.join("pretty.transaction.jsonseq");
+        let mut pretty_bytes = Vec::new();
+        for line in fs::read(&transaction)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let record: Value = serde_json::from_slice(&line[1..]).unwrap();
+            pretty_bytes.push(0x1e);
+            if record["type"] == "transaction_timeline" {
+                serde_json::to_writer_pretty(&mut pretty_bytes, &record).unwrap();
+            } else {
+                serde_json::to_writer(&mut pretty_bytes, &record).unwrap();
+            }
+            pretty_bytes.extend_from_slice(b"\n \t\n");
+        }
+        fs::write(&pretty_transaction, pretty_bytes).unwrap();
+        validate_transaction_sequence(&pretty_transaction, Some("replay-trace")).unwrap();
+
+        let oversized = dir.join("oversized.transaction.jsonseq");
+        let mut oversized_file = fs::File::create(&oversized).unwrap();
+        oversized_file.write_all(&[0x1e]).unwrap();
+        oversized_file
+            .write_all(&vec![b' '; MAX_TRANSACTION_JSON_RECORD_BYTES])
+            .unwrap();
+        oversized_file.write_all(b"x").unwrap();
+        drop(oversized_file);
+        let oversized_error = validate_transaction_sequence(&oversized, None).unwrap_err();
+        assert!(oversized_error.to_string().contains("exceeds"));
+
+        for parsed in [false, true] {
+            let output = dir.join(if parsed {
+                "transaction-parsed.sse"
+            } else {
+                "transaction-raw.sse"
+            });
+            replay_transaction(&TransactionReplayArgs {
+                input: transaction.clone(),
+                stage_id: Some(stage_id.clone()),
+                parsed,
+                speed: LarReplaySpeed::Instant,
+                output: Some(output.clone()),
+                force: false,
+            })
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(output).unwrap(),
+                if parsed {
+                    parsed_expected.as_str()
+                } else {
+                    raw_expected.as_str()
+                }
+            );
+        }
+
+        let existing_export = dir.join("existing.transaction.jsonseq");
+        fs::write(&existing_export, b"sentinel export").unwrap();
+        let export_error = export_transaction(
+            &dir,
+            &TransactionArgs {
+                trace_id: "replay-trace".into(),
+                archive: Some(dir.join("stream.lar")),
+                output: existing_export.clone(),
+                force: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(export_error.to_string().contains("--force"));
+        assert_eq!(fs::read(&existing_export).unwrap(), b"sentinel export");
+
+        let truncated = dir.join("truncated.transaction.jsonseq");
+        let mut truncated_bytes = fs::read(&transaction).unwrap();
+        let final_record = truncated_bytes
+            .iter()
+            .rposition(|byte| *byte == 0x1e)
+            .unwrap();
+        truncated_bytes.truncate(final_record);
+        fs::write(&truncated, truncated_bytes).unwrap();
+        assert!(validate_transaction_sequence(&truncated, None).is_err());
+
+        let corrupt = dir.join("corrupt.transaction.jsonseq");
+        let mut corrupt_bytes = fs::read(&transaction).unwrap();
+        let marker = b"\"data_base64\":\"";
+        let marker_at = corrupt_bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap();
+        let corrupt_at = marker_at + marker.len();
+        corrupt_bytes[corrupt_at] = if corrupt_bytes[corrupt_at] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        fs::write(&corrupt, corrupt_bytes).unwrap();
+        assert!(validate_transaction_sequence(&corrupt, None).is_err());
+
+        let protected = dir.join("protected.sse");
+        fs::write(&protected, b"existing replay").unwrap();
+        let corrupt_error = replay_transaction(&TransactionReplayArgs {
+            input: corrupt,
+            stage_id: Some(stage_id.clone()),
+            parsed: false,
+            speed: LarReplaySpeed::Instant,
+            output: Some(protected.clone()),
+            force: true,
+        })
+        .unwrap_err();
+        assert!(corrupt_error.to_string().contains("artifact end"));
+        assert_eq!(fs::read(&protected).unwrap(), b"existing replay");
+
+        let overlapping = dir.join("overlapping.transaction.jsonseq");
+        let mut rewritten = Vec::new();
+        for line in fs::read(&transaction)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let mut record: Value = serde_json::from_slice(&line[1..]).unwrap();
+            if record["type"] == "stream_index" {
+                record["observed_reads"][1]["byte_offset"] = 10.into();
+            }
+            rewritten.push(0x1e);
+            serde_json::to_writer(&mut rewritten, &record).unwrap();
+            rewritten.push(b'\n');
+        }
+        fs::write(&overlapping, rewritten).unwrap();
+        let overlap_error = replay_transaction(&TransactionReplayArgs {
+            input: overlapping,
+            stage_id: Some(stage_id),
+            parsed: false,
+            speed: LarReplaySpeed::Instant,
+            output: Some(dir.join("overlap.sse")),
+            force: false,
+        })
+        .unwrap_err();
+        assert!(overlap_error
+            .to_string()
+            .contains("overlapping or non-contiguous"));
+    }
+
+    #[test]
+    fn transaction_cli_labels_and_streams_legacy_synthesis() {
+        let dir = tmpdir("transaction-legacy");
+        let store = Store::open(dir.clone()).unwrap();
+        let mut body = vec![0x5a; alex_store::LAR_TRANSACTION_ARTIFACT_PIECE_BYTES * 3 + 9];
+        body[0] = 0;
+        body[1] = 0xff;
+        let path = store
+            .write_body("legacy-transaction-cli", "request.json", &body)
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "legacy-transaction-cli".into(),
+                method: Some("POST".into()),
+                path: Some("/v1/legacy".into()),
+                req_body_path: Some(path),
+                ..Default::default()
+            })
+            .unwrap();
+        drop(store);
+
+        let output = dir.join("legacy.transaction.jsonseq");
+        let report = export_transaction(
+            &dir,
+            &TransactionArgs {
+                trace_id: "legacy-transaction-cli".into(),
+                archive: None,
+                output: output.clone(),
+                force: false,
+                json: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.json["report"]["fidelity"], "synthesized_legacy");
+        validate_transaction_sequence(&output, Some("legacy-transaction-cli")).unwrap();
+        let bytes = fs::read(output).unwrap();
+        let first_line = bytes.split(|byte| *byte == b'\n').next().unwrap();
+        let format: Value = serde_json::from_slice(&first_line[1..]).unwrap();
+        assert_eq!(format["fidelity"], "synthesized_legacy");
+        assert!(format["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("synthesized")));
     }
 
     #[test]
@@ -5924,8 +8240,8 @@ mod tests {
             upstream_format: Some("openai-chat".into()),
             requested_model: Some("alex/grok-code-fast-1".into()),
             routed_model: Some("grok-code-fast-1".into()),
-            method: Some("POST".into()),
-            path: Some("/v1/chat/completions".into()),
+            method: Some("POST\r\nX-Forged-Method: no".into()),
+            path: Some("/v1/chat/completions\r\nX-Forged-Path: no".into()),
             status: Some(200),
             streamed: Some(true),
             usage: alex_core::Usage {
@@ -6113,7 +8429,8 @@ mod tests {
         let imported = Store::open(imported_dir).unwrap();
         let row = imported.get_trace(trace_id).unwrap().unwrap();
         assert_eq!(row["harness"], "pi");
-        assert_eq!(row["method"], "POST");
+        assert_eq!(row["method"], trace.method.as_deref().unwrap());
+        assert_eq!(row["path"], trace.path.as_deref().unwrap());
         assert_eq!(row["input_tokens"], 41);
         assert_eq!(row["cache_creation_tokens"], 3);
         assert_eq!(
@@ -6141,6 +8458,734 @@ mod tests {
                 .unwrap(),
             client_response
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn canonical_interchange_streams_complete_retry_tool_and_transport_timeline() {
+        use alex_store::{
+            LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, LarExchangeBodyRefs,
+            LarExchangeCapture, LarHeaderCapture, LarStreamReadCapture, LarUpstreamAttemptCapture,
+            ToolCallRecord,
+        };
+
+        let dir = tmpdir("canonical-interchange");
+        let store = Store::open_with_lar_body_store(
+            dir.clone(),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                max_pack_bytes: 1_024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trace_id = "trace-canonical-interchange";
+        let session_id = "session-canonical-interchange";
+        let large_request = (0..(JSONL_BODY_PART_BYTES * 3 + 17))
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect::<Vec<_>>();
+        let upstream_request = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let streamed_response = b"data: one\n\ndata: two\n\n";
+        let append = |kind: &str, legacy: &str, bytes: &[u8]| {
+            store
+                .write_body_artifact(&LarBodyArtifact::trace(trace_id, kind), legacy, bytes)
+                .unwrap()
+                .manifest_id
+                .unwrap()
+        };
+        let client_manifest = append("client_request", "request.json", &large_request);
+        let upstream_manifest = append(
+            "upstream_request",
+            "upstream-request.json",
+            upstream_request,
+        );
+        let response_manifest = append(
+            "upstream_response",
+            "upstream-response.body",
+            streamed_response,
+        );
+        let body_refs = LarExchangeBodyRefs {
+            client_request_manifest_id: Some(client_manifest),
+            upstream_request_manifest_id: Some(upstream_manifest),
+            upstream_response_manifest_id: Some(response_manifest.clone()),
+            // Deliberately share the same logical body across two stage roles.
+            client_response_manifest_id: Some(response_manifest),
+        };
+        let trace = alex_core::TraceRecord {
+            id: trace_id.into(),
+            session_id: Some(session_id.into()),
+            ts_request_ms: 1_701_000_000_000,
+            ts_response_ms: Some(1_701_000_000_250),
+            method: Some("POST".into()),
+            path: Some("/v1/chat/completions".into()),
+            upstream_provider: Some("xai".into()),
+            requested_model: Some("alex/grok".into()),
+            routed_model: Some("grok".into()),
+            status: Some(200),
+            streamed: Some(true),
+            ..Default::default()
+        };
+        store.insert_trace(&trace).unwrap();
+        let capture = LarExchangeCapture {
+            trace_id: trace_id.into(),
+            session_id: Some(session_id.into()),
+            run_id: Some("run-canonical".into()),
+            wall_time_ns: trace.ts_request_ms as u64 * 1_000_000,
+            client_request_headers: Some(LarHeaderCapture::observed([
+                ("X-Duplicate", "one"),
+                ("X-Duplicate", "two"),
+            ])),
+            client_request_trailers: Some(LarHeaderCapture::observed([(
+                "x-client-request-trailer",
+                "request-end",
+            )])),
+            client_response_headers: Some(LarHeaderCapture::observed([(
+                "content-type",
+                "text/event-stream",
+            )])),
+            client_response_trailers: Some(LarHeaderCapture::observed([(
+                "x-client-response-trailer",
+                "response-end",
+            )])),
+            upstream_attempts: vec![
+                LarUpstreamAttemptCapture {
+                    attempt_number: 1,
+                    wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 10,
+                    request_headers: Some(LarHeaderCapture::observed([("x-attempt", "one")])),
+                    request_trailers: Some(LarHeaderCapture::observed([(
+                        "x-request-trailer",
+                        "one-end",
+                    )])),
+                    response_headers: Some(LarHeaderCapture::observed([("retry-after", "1")])),
+                    response_trailers: Some(LarHeaderCapture::observed([(
+                        "x-response-trailer",
+                        "one-end",
+                    )])),
+                    status_code: Some(429),
+                    error_class: Some("rate_limit".into()),
+                    error_message: Some("retry".into()),
+                },
+                LarUpstreamAttemptCapture {
+                    attempt_number: 2,
+                    wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 20,
+                    request_headers: Some(LarHeaderCapture::observed([("x-attempt", "two")])),
+                    request_trailers: None,
+                    response_headers: Some(LarHeaderCapture::observed([(
+                        "content-type",
+                        "text/event-stream",
+                    )])),
+                    response_trailers: Some(LarHeaderCapture::observed([(
+                        "x-response-trailer",
+                        "two-end",
+                    )])),
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+            ],
+            upstream_stream_reads: Some(vec![
+                LarStreamReadCapture {
+                    byte_offset: 0,
+                    byte_length: 11,
+                    delta_from_first_byte_ns: 0,
+                },
+                LarStreamReadCapture {
+                    byte_offset: 11,
+                    byte_length: (streamed_response.len() - 11) as u64,
+                    delta_from_first_byte_ns: 5_000,
+                },
+            ]),
+            provider: Some("xai".into()),
+            requested_model: Some("alex/grok".into()),
+            routed_model: Some("grok".into()),
+            account_id: Some("xai-1".into()),
+            routing_reason: Some("retry".into()),
+            status_code: Some(200),
+            error_class: None,
+            error_message: None,
+        };
+        store
+            .write_lar_exchange_capture_with_metadata(
+                &capture,
+                &body_refs,
+                &export_exchange_metadata(&store.get_trace(trace_id).unwrap().unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let live = store.lar_interchange_trace(trace_id).unwrap().unwrap();
+        assert_eq!(
+            live.stages
+                .iter()
+                .filter(|stage| stage.kind == "upstream_request")
+                .count(),
+            2
+        );
+        assert!(live
+            .stages
+            .iter()
+            .any(|stage| stage.data.trailers_ref.is_some()));
+        assert_eq!(live.streams.len(), 1);
+        assert_eq!(live.streams[0].reads.len(), 2);
+        assert_eq!(
+            live.bodies
+                .iter()
+                .filter(|body| body.manifest_id
+                    == body_refs.client_response_manifest_id.clone().unwrap())
+                .count(),
+            1
+        );
+
+        // A subsequent write rotates the tiny active pack. The same exact
+        // projection must resolve from the now-sealed archive.
+        store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("rotation-filler", "client_request"),
+                "request.json",
+                &vec![0x5a; 4_096],
+            )
+            .unwrap();
+        let sealed = store.lar_interchange_trace(trace_id).unwrap().unwrap();
+        assert_eq!(sealed.stages, live.stages);
+        assert_eq!(sealed.header_blocks, live.header_blocks);
+        assert_eq!(sealed.streams, live.streams);
+
+        let tool_args = store
+            .write_body_artifact(
+                &LarBodyArtifact::tool_call("tool-canonical", "tool_arguments"),
+                "tool-args.json",
+                br#"{"path":"/tmp"}"#,
+            )
+            .unwrap();
+        let tool_result = store
+            .write_body_artifact(
+                &LarBodyArtifact::tool_call("tool-canonical", "tool_result"),
+                "tool-result.json",
+                b"file-a\nfile-b\n",
+            )
+            .unwrap();
+        store
+            .upsert_live_tool_call_with_timeline(&ToolCallRecord {
+                id: "tool-canonical".into(),
+                harness: "pi".into(),
+                session_id: session_id.into(),
+                turn_id: Some("turn-1".into()),
+                tool_call_id: "call-1".into(),
+                trace_id: Some(trace_id.into()),
+                tool_name: "ls".into(),
+                ts_start_ms: trace.ts_request_ms + 100,
+                ts_end_ms: Some(trace.ts_request_ms + 150),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: Some(tool_args.legacy_path),
+                result_body_path: Some(tool_result.legacy_path),
+            })
+            .unwrap();
+        let graph = store.lar_interchange_trace(trace_id).unwrap().unwrap();
+        assert_eq!(
+            graph
+                .stages
+                .iter()
+                .filter(|stage| stage.kind == "tool_call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .stages
+                .iter()
+                .filter(|stage| stage.kind == "tool_result")
+                .count(),
+            1
+        );
+        for tool_stage in graph.stages.iter().filter(|stage| stage.tool_id.is_some()) {
+            assert_eq!(tool_stage.tool_id.as_deref(), Some("tool-canonical"));
+            assert!(!tool_stage.stage_id.is_empty());
+            assert!(!tool_stage.record_id.is_empty());
+            assert!(tool_stage.supplement_trace_id.is_some());
+            assert!(tool_stage.supplement_exchange_id.is_some());
+        }
+
+        // Exercise more than one selection page without retaining all rows.
+        for index in 0..(INTERCHANGE_TRACE_PAGE_SIZE + 3) {
+            store
+                .insert_trace(&alex_core::TraceRecord {
+                    id: format!("legacy-page-{index:03}"),
+                    session_id: Some(session_id.into()),
+                    ts_request_ms: trace.ts_request_ms + 1_000 + index as i64,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let jsonl = dir.join("canonical.jsonl");
+        let report = LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "export",
+                    jsonl.to_str().unwrap(),
+                    "--format",
+                    "jsonl",
+                    "--session",
+                    session_id,
+                    "--json",
+                ]),
+            )
+            .unwrap();
+        assert_eq!(report.json["canonical_traces"], 1);
+        assert_eq!(
+            report.json["traces"],
+            (INTERCHANGE_TRACE_PAGE_SIZE + 4) as u64
+        );
+        let file = fs::File::open(&jsonl).unwrap();
+        let mut canonical_record = None;
+        let mut body_parts = HashMap::<String, usize>::new();
+        let mut maximum_line = 0usize;
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.unwrap();
+            maximum_line = maximum_line.max(line.len());
+            let value: Value = serde_json::from_str(&line).unwrap();
+            match value["type"].as_str() {
+                Some("alex.trace.canonical") => canonical_record = Some(value),
+                Some("alex.body.part") => {
+                    assert!(value["byte_length"].as_u64().unwrap() <= JSONL_BODY_PART_BYTES as u64);
+                    *body_parts
+                        .entry(value["manifest_id"].as_str().unwrap().into())
+                        .or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(maximum_line < 512 * 1024);
+        assert!(body_parts.values().any(|count| *count >= 4));
+        let canonical_record = canonical_record.unwrap();
+        let capture = &canonical_record["graph"]["capture"];
+        assert_eq!(
+            capture["schema"],
+            "alex.lar.canonical-timeline-projection.v2"
+        );
+        assert!(capture["exchange"].get("exchange_id").is_none());
+        assert_eq!(
+            capture["exchange"]["base_exchange_content_id"],
+            graph.exchange_id
+        );
+        assert_eq!(
+            capture["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|stage| stage["kind"] == "tool_call" || stage["kind"] == "tool_result")
+                .count(),
+            2
+        );
+        assert_eq!(capture["streams"][0]["reads"].as_array().unwrap().len(), 2);
+
+        let import_error = LocalLarBackend
+            .execute(
+                &dir.join("v2-import"),
+                &parse(&["import", jsonl.to_str().unwrap(), "--format", "jsonl"]),
+            )
+            .unwrap_err();
+        assert!(format!("{import_error:#}")
+            .contains("without discarding retries, trailers, streams, or tool links"));
+
+        for format in ["har", "warc", "otel", "openinference"] {
+            let output = dir.join(format!("canonical.{format}"));
+            let exported = LocalLarBackend
+                .execute(
+                    &dir,
+                    &parse(&[
+                        "export",
+                        output.to_str().unwrap(),
+                        "--format",
+                        format,
+                        "--trace-id",
+                        trace_id,
+                        "--json",
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(exported.json["canonical_traces"], 1);
+            assert!(!exported.json["loss_report"].as_array().unwrap().is_empty());
+            let bytes = fs::read(&output).unwrap();
+            match format {
+                "har" => {
+                    let har: Value = serde_json::from_slice(&bytes).unwrap();
+                    let entry = &har["log"]["entries"][0];
+                    assert!(!entry["request"]["postData"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty());
+                    assert!(!entry["response"]["content"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(
+                        entry["_alex"]["canonicalGraph"]["capture"]["stages"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        graph.stages.len()
+                    );
+                }
+                "warc" => {
+                    let records = parse_warc_records(&bytes);
+                    let mut record_ids = std::collections::HashSet::new();
+                    for record in &records {
+                        assert!(record_ids.insert(record.headers["WARC-Record-ID"].clone()));
+                        assert_eq!(
+                            record.headers["WARC-Block-Digest"],
+                            format!("sha256:{}", hex_bytes(&Sha256::digest(&record.payload)))
+                        );
+                        if record.headers["Content-Type"].starts_with("application/http") {
+                            for forbidden in [
+                                b"\r\nX-Forged-Method".as_slice(),
+                                b"\r\nX-Forged-Path:".as_slice(),
+                            ] {
+                                assert!(!record
+                                    .payload
+                                    .windows(forbidden.len())
+                                    .any(|window| window == forbidden));
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        records
+                            .iter()
+                            .filter(|record| record.headers["WARC-Type"] == "resource")
+                            .count(),
+                        graph.bodies.len()
+                    );
+                    assert!(
+                        records
+                            .iter()
+                            .filter(|record| {
+                                record.headers["Content-Type"]
+                                    == "application/http; msgtype=request"
+                            })
+                            .count()
+                            >= 3
+                    );
+                    assert!(records.iter().any(|record| {
+                        record.headers["Content-Type"] == "application/http; msgtype=response"
+                            && record.payload.starts_with(b"HTTP/1.1 200 \r\n")
+                    }));
+                    assert!(
+                        records
+                            .iter()
+                            .filter(|record| {
+                                record.headers["Content-Type"]
+                                    == "application/http; msgtype=response"
+                            })
+                            .count()
+                            >= 3
+                    );
+                    for response in graph.stages.iter().filter(|stage| {
+                        matches!(
+                            stage.kind.as_str(),
+                            "upstream_response" | "upstream_failure"
+                        )
+                    }) {
+                        let attempt = response.data.attempt_number.unwrap();
+                        let request = graph
+                            .stages
+                            .iter()
+                            .find(|stage| {
+                                stage.kind == "upstream_request"
+                                    && stage.data.attempt_number == Some(attempt)
+                            })
+                            .unwrap();
+                        let response_id = warc_record_id(
+                            trace_id,
+                            &format!("stage:{}:response", response.stage_id),
+                        );
+                        let request_id = warc_record_id(
+                            trace_id,
+                            &format!("stage:{}:request", request.stage_id),
+                        );
+                        let response_record = records
+                            .iter()
+                            .find(|record| record.headers["WARC-Record-ID"] == response_id)
+                            .unwrap();
+                        assert_eq!(response_record.headers["WARC-Concurrent-To"], request_id);
+                    }
+                }
+                "otel" | "openinference" => {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        value["alex_canonical_graph"]["capture"]["stages"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        graph.stages.len()
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_trace_snapshot_excludes_concurrent_backdated_inserts() {
+        let dir = tmpdir("export-snapshot");
+        let store = Store::open(dir.clone()).unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "snapshot-original".into(),
+                ts_request_ms: 200,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "snapshot-second".into(),
+                ts_request_ms: 300,
+                ..Default::default()
+            })
+            .unwrap();
+        let upper = store
+            .lar_export_trace_upper_bound(None, None)
+            .unwrap()
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "snapshot-concurrent-backdated".into(),
+                ts_request_ms: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        let rows = store
+            .lar_export_trace_rows_page(None, None, None, &upper, 32)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "snapshot-original");
+        assert_eq!(rows[1]["id"], "snapshot-second");
+
+        let output = dir.join("diverged.jsonl");
+        let args = ExportArgs {
+            output: output.clone(),
+            format: LarExportFormat::Jsonl,
+            trace_id: None,
+            session: None,
+            force: false,
+            json: false,
+        };
+        let summary = summarize_export_selection(&store, &args, &upper).unwrap();
+        assert_eq!(summary.traces, 2);
+        store.delete_trace("snapshot-original").unwrap();
+        let error = write_streaming_interchange_export(
+            &store,
+            &args,
+            LarExportFormat::Jsonl,
+            summary,
+            &upper,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "preflight selected 2 trace(s), but 1 remained at the frozen high-water mark"
+        ));
+        assert!(!output.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bodies_only_prune_is_authoritative_for_canonical_exports() {
+        use alex_store::{
+            LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, LarExchangeBodyRefs,
+            LarExchangeCapture, ToolCallRecord,
+        };
+
+        let dir = tmpdir("export-after-bodies-prune");
+        let store = Store::open_with_lar_body_store(
+            dir.clone(),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trace_id = "trace-bodies-pruned";
+        let session_id = "session-bodies-pruned";
+        let request_manifest = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace(trace_id, "client_request"),
+                "request.json",
+                br#"{"secret":"request"}"#,
+            )
+            .unwrap()
+            .manifest_id
+            .unwrap();
+        let response_manifest = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace(trace_id, "client_response"),
+                "response.json",
+                br#"{"secret":"response"}"#,
+            )
+            .unwrap()
+            .manifest_id
+            .unwrap();
+        let trace = alex_core::TraceRecord {
+            id: trace_id.into(),
+            session_id: Some(session_id.into()),
+            ts_request_ms: 100,
+            ts_response_ms: Some(150),
+            method: Some("POST".into()),
+            path: Some("/v1/messages".into()),
+            status: Some(200),
+            ..Default::default()
+        };
+        store.insert_trace(&trace).unwrap();
+        store
+            .write_lar_exchange_capture_with_metadata(
+                &LarExchangeCapture {
+                    trace_id: trace_id.into(),
+                    session_id: Some(session_id.into()),
+                    run_id: None,
+                    wall_time_ns: 100_000_000,
+                    client_request_headers: None,
+                    client_request_trailers: None,
+                    client_response_headers: None,
+                    client_response_trailers: None,
+                    upstream_attempts: Vec::new(),
+                    upstream_stream_reads: None,
+                    provider: None,
+                    requested_model: None,
+                    routed_model: None,
+                    account_id: None,
+                    routing_reason: None,
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+                &LarExchangeBodyRefs {
+                    client_request_manifest_id: Some(request_manifest),
+                    client_response_manifest_id: Some(response_manifest),
+                    ..Default::default()
+                },
+                &export_exchange_metadata(&store.get_trace(trace_id).unwrap().unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+        let tool_args = store
+            .write_body_artifact(
+                &LarBodyArtifact::tool_call("tool-bodies-pruned", "tool_arguments"),
+                "tool-args.json",
+                br#"{"secret":"tool arguments"}"#,
+            )
+            .unwrap();
+        let tool_result = store
+            .write_body_artifact(
+                &LarBodyArtifact::tool_call("tool-bodies-pruned", "tool_result"),
+                "tool-result.json",
+                br#"{"secret":"tool result"}"#,
+            )
+            .unwrap();
+        store
+            .upsert_live_tool_call_with_timeline(&ToolCallRecord {
+                id: "tool-bodies-pruned".into(),
+                harness: "pi".into(),
+                session_id: session_id.into(),
+                turn_id: Some("turn-pruned".into()),
+                tool_call_id: "call-pruned".into(),
+                trace_id: Some(trace_id.into()),
+                tool_name: "read".into(),
+                ts_start_ms: 120,
+                ts_end_ms: Some(140),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: Some(tool_args.legacy_path),
+                result_body_path: Some(tool_result.legacy_path),
+            })
+            .unwrap();
+        let before_prune = store.lar_interchange_trace(trace_id).unwrap().unwrap();
+        assert_eq!(
+            before_prune.bodies.len(),
+            4,
+            "base and late tool bodies must all be visible before pruning"
+        );
+        let supplement_trace_ids = before_prune
+            .stages
+            .iter()
+            .filter_map(|stage| stage.supplement_trace_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(supplement_trace_ids.len(), 2);
+        store.prune(200, true, false).unwrap();
+        let pruned = store.lar_interchange_trace(trace_id).unwrap().unwrap();
+        assert!(pruned.bodies.is_empty());
+        assert!(pruned.stages.iter().all(|stage| {
+            stage.data.request_body_manifest_ref.is_none()
+                && stage.data.response_body_manifest_ref.is_none()
+        }));
+        drop(store);
+
+        let jsonl = dir.join("pruned.jsonl");
+        LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "export",
+                    jsonl.to_str().unwrap(),
+                    "--format",
+                    "jsonl",
+                    "--trace-id",
+                    trace_id,
+                ]),
+            )
+            .unwrap();
+        let canonical = fs::read_to_string(&jsonl)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["type"] == "alex.trace.canonical")
+            .unwrap();
+        assert!(canonical["graph"]["bodies"].as_array().unwrap().is_empty());
+        assert!(canonical["graph"]["capture"]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage["request_body_manifest_ref"].is_null()
+                && stage["response_body_manifest_ref"].is_null()));
+
+        let lar = dir.join("pruned.lar");
+        LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "export",
+                    lar.to_str().unwrap(),
+                    "--format",
+                    "lar",
+                    "--trace-id",
+                    trace_id,
+                ]),
+            )
+            .unwrap();
+        let reader = ArchiveReader::open(fs::File::open(&lar).unwrap(), Limits::default()).unwrap();
+        let exchange = reader
+            .exchange_by_trace(trace_id.as_bytes())
+            .unwrap()
+            .clone();
+        assert!(exchange.data.stages.iter().all(|stage_id| {
+            let stage = reader.stage(stage_id).unwrap();
+            stage.data.request_body_manifest_ref.is_none()
+                && stage.data.response_body_manifest_ref.is_none()
+        }));
+        for supplement_trace_id in supplement_trace_ids {
+            let supplement = reader
+                .exchange_by_trace(supplement_trace_id.as_bytes())
+                .unwrap();
+            assert!(supplement.data.stages.iter().all(|stage_id| {
+                let stage = reader.stage(stage_id).unwrap();
+                stage.data.request_body_manifest_ref.is_none()
+                    && stage.data.response_body_manifest_ref.is_none()
+            }));
+        }
+        assert_eq!(reader.manifest_ids().count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

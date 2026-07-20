@@ -170,7 +170,17 @@ Transcript assembly associates an executed tool by explicit `trace_id` when
 provided. Otherwise it uses the session-local interval between the requesting
 trace and the next model request. Tool activity is intentionally a separate
 table because a turn can have zero or many executions and hook delivery is
-asynchronous.
+asynchronous. In LAR mode, live ingest also appends immutable, self-describing
+child Exchanges for the call and result. Those stages reuse the tool body
+manifests rather than copying bytes. If arguments or a result arrive after a
+body-less phase was published, separate `arguments`/`result` enrichment
+children preserve the bytes without mutating history. The Trace Browser merges
+only strictly validated tool supplements into the parent stage timeline;
+ordinary subagent/model children that also use `parent_trace_id` remain
+separate. The exact base-stage sequence is always shown first, followed by
+supplements ordered by event time, capture sequence, and stable phase order, so
+backdated or end-before-start hook delivery cannot reorder the original
+exchange.
 
 ## Trace Browser and CLI
 

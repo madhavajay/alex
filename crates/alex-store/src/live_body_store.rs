@@ -23,7 +23,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     lar_archive_ops::{compute_lar_file_identity, record_lar_file_identity, resolved_catalog_path},
-    LarArchiveUnavailableError, Store,
+    lar_tool_timeline::{supplement_trace_id, ToolSupplementProvenance},
+    LarArchiveUnavailableError, Store, ToolCallRecord,
 };
 
 static LIVE_PACK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1486,6 +1487,271 @@ impl Store {
         result
     }
 
+    /// Append one late harness tool phase as an immutable child Exchange of
+    /// the original trace. The base exchange is never rewritten: its timeline
+    /// is the base stages plus child exchanges ordered by wall time and stable
+    /// supplement trace ID. Body fields reuse the already cataloged tool
+    /// manifest, so this adds metadata only.
+    pub fn append_lar_tool_timeline_phase(&self, tool: &ToolCallRecord, phase: &str) -> Result<()> {
+        if self.lar_body_store_mode() == LarBodyStoreMode::Legacy {
+            return Ok(());
+        }
+        let (kind, artifact_kind, wall_time_ms) = match phase {
+            "start" | "arguments" => (StageKind::ToolCall, "tool_arguments", tool.ts_start_ms),
+            "end" | "result" => (
+                StageKind::ToolResult,
+                "tool_result",
+                tool.ts_end_ms.unwrap_or(tool.ts_start_ms),
+            ),
+            _ => bail!("unsupported LAR tool timeline phase {phase}"),
+        };
+        let supplement_trace_id =
+            supplement_trace_id(&tool.harness, &tool.session_id, &tool.tool_call_id, phase);
+        let (manifest_id, display_trace_id) = {
+            let conn = self.conn.lock().unwrap();
+            let existing: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lar_timeline_supplements
+                  WHERE tool_id=?1 AND phase=?2)
+                    OR EXISTS(SELECT 1 FROM lar_timeline_supplement_tombstones
+                  WHERE tool_id=?1 AND phase=?2)",
+                params![tool.id, phase],
+                |row| row.get(0),
+            )?;
+            if existing {
+                return Ok(());
+            }
+            let manifest_id = conn
+                .query_row(
+                    "SELECT manifest_id FROM lar_trace_artifacts
+                      WHERE owner_kind='tool_call' AND owner_id=?1
+                        AND artifact_kind=?2 AND stage_id=''",
+                    params![tool.id, artifact_kind],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(|value| value.parse::<ManifestId>().map_err(anyhow::Error::new))
+                .transpose()?;
+            if matches!(phase, "arguments" | "result") {
+                let Some(manifest_id) = manifest_id else {
+                    return Ok(());
+                };
+                let base_phase = if phase == "arguments" { "start" } else { "end" };
+                let base_manifest: Option<String> = conn
+                    .query_row(
+                        "SELECT manifest_id FROM lar_timeline_supplements
+                          WHERE tool_id=?1 AND phase=?2",
+                        params![tool.id, base_phase],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let manifest_id_text = manifest_id.to_string();
+                if base_manifest.as_deref() == Some(manifest_id_text.as_str()) {
+                    return Ok(());
+                }
+            }
+            let explicit = tool.trace_id.as_deref().filter(|trace_id| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM traces WHERE id=?1)",
+                    [trace_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            });
+            let display_trace_id = match explicit {
+                Some(trace_id) => trace_id.to_string(),
+                None => conn
+                    .query_row(
+                        "SELECT id FROM traces WHERE session_id=?1 AND ts_request_ms<=?2
+                          ORDER BY ts_request_ms DESC, id DESC LIMIT 1",
+                        params![tool.session_id, wall_time_ms],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| supplement_trace_id.clone()),
+            };
+            (manifest_id, display_trace_id)
+        };
+
+        let mut state = self.lock_live_lar_writer("tool timeline", &tool.id)?;
+        let mut conn = self.conn.lock().unwrap();
+        ensure_active_pack(self, &mut state, &mut conn, 0)?;
+        if state.active.as_ref().is_some_and(|active| {
+            active.writer.header().required_feature_bits & REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS
+                == 0
+        }) {
+            let durability = state.config.durability;
+            let active = state.active.as_mut().expect("active pack exists");
+            active.writer.seal().map_err(anyhow::Error::new)?;
+            active.writer.flush().map_err(anyhow::Error::new)?;
+            persist_lar_boundary(active.writer.get_ref(), durability)?;
+            let size = active.writer.get_mut().seek(std::io::SeekFrom::End(0))?;
+            conn.execute(
+                "UPDATE lar_files SET state='sealed', sealed_at_ms=?2, size_bytes=?3
+                 WHERE file_uuid=?1 AND state='active'",
+                params![active.file_uuid, now_ms(), size],
+            )?;
+            catalog_sealed_file_identity(self, &conn, &active.file_uuid, "tool_rotation")?;
+            state.active = None;
+            ensure_active_pack(self, &mut state, &mut conn, 0)?;
+        }
+        let existing: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lar_timeline_supplements
+              WHERE tool_id=?1 AND phase=?2)
+                OR EXISTS(SELECT 1 FROM lar_timeline_supplement_tombstones
+              WHERE tool_id=?1 AND phase=?2)",
+            params![tool.id, phase],
+            |row| row.get(0),
+        )?;
+        if existing {
+            return Ok(());
+        }
+        if let Some(manifest_id) = manifest_id {
+            let ready: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lar_manifests
+                  WHERE manifest_id=?1 AND state='ready')",
+                [manifest_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !ready {
+                bail!("tool timeline references unavailable manifest {manifest_id}");
+            }
+        }
+        let capture_sequence = conn.query_row(
+            "SELECT COALESCE(MAX(capture_sequence), -1) + 1
+               FROM lar_stage_records WHERE trace_id=?1",
+            [&display_trace_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let wall_time_ns = u64::try_from(wall_time_ms.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1_000_000);
+        let provenance = serde_json::to_vec(&ToolSupplementProvenance {
+            schema: crate::lar_tool_timeline::TOOL_SUPPLEMENT_SCHEMA.to_string(),
+            phase: phase.to_string(),
+            tool_id: tool.id.clone(),
+            harness: tool.harness.clone(),
+            turn_id: tool.turn_id.clone(),
+            tool_call_id: tool.tool_call_id.clone(),
+            tool_name: tool.tool_name.clone(),
+            source_trace_id: tool.trace_id.clone(),
+            ts_start_ms: tool.ts_start_ms,
+            ts_end_ms: matches!(phase, "end" | "result").then_some(wall_time_ms),
+            is_error: tool.is_error,
+            exit_status: tool.exit_status,
+        })?;
+        let mut stage_data = StageData::new(kind, wall_time_ns);
+        stage_data.routing_reason = Some(provenance);
+        match kind {
+            StageKind::ToolCall => stage_data.request_body_manifest_ref = manifest_id,
+            StageKind::ToolResult => {
+                stage_data.response_body_manifest_ref = manifest_id;
+                if tool.is_error == Some(true) {
+                    stage_data.error_class = Some(b"tool_error".to_vec());
+                }
+                stage_data.error_message = tool
+                    .exit_status
+                    .map(|status| format!("tool process exited with status {status}").into_bytes());
+            }
+            _ => unreachable!(),
+        }
+        let stage = Stage::new(stage_data);
+        let external_manifests = manifest_id.into_iter().collect::<Vec<_>>();
+        let checkpoint_config = state.config.clone();
+        let active = state.active.as_mut().expect("active pack was established");
+        let stage_id = active
+            .writer
+            .append_stage_with_external_manifests(stage, &external_manifests)?;
+        let mut exchange_data = ExchangeData::new(
+            supplement_trace_id.as_bytes(),
+            capture_sequence,
+            wall_time_ns,
+            vec![stage_id],
+        );
+        exchange_data.session_id = Some(tool.session_id.as_bytes().to_vec());
+        let canonical_parent_trace_id =
+            (display_trace_id != supplement_trace_id).then(|| display_trace_id.clone());
+        exchange_data.parent_trace_id = canonical_parent_trace_id
+            .as_deref()
+            .map(str::as_bytes)
+            .map(Vec::from);
+        exchange_data.clock_id = Some(b"unix-epoch-ms".to_vec());
+        let exchange = Exchange::new(exchange_data);
+        let metadata = ExchangeMetadataData {
+            ts_request_ms: Some(wall_time_ms),
+            ts_response_ms: Some(wall_time_ms),
+            harness: Some(tool.harness.as_bytes().to_vec()),
+            ..ExchangeMetadataData::default()
+        };
+        let exchange_id = active
+            .writer
+            .append_exchange_with_metadata(exchange, metadata)?;
+        let file_uuid = active.file_uuid.clone();
+        let flush = flush_active_pack(active, &checkpoint_config)?;
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        catalog_capture_exchange(
+            &tx,
+            &file_uuid,
+            &supplement_trace_id,
+            &exchange_id.to_string(),
+            capture_sequence,
+            1,
+            "captured_tool_supplement",
+        )?;
+        let stage_occurrence_id = catalog_tool_supplement_stage(
+            &tx,
+            &file_uuid,
+            &display_trace_id,
+            capture_sequence,
+            stage_id,
+            &active.writer,
+            now_ms(),
+        )?;
+        tx.execute(
+            "INSERT INTO lar_timeline_supplements
+               (tool_id, phase, supplement_trace_id, parent_trace_id,
+                display_trace_id, session_id, capture_sequence, exchange_id,
+                stage_id, stage_record_id, manifest_id, file_uuid,
+                wall_time_ns, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                tool.id,
+                phase,
+                supplement_trace_id,
+                canonical_parent_trace_id,
+                display_trace_id,
+                tool.session_id,
+                capture_sequence,
+                exchange_id.to_string(),
+                stage_occurrence_id,
+                stage_id.to_string(),
+                manifest_id.map(|id| id.to_string()),
+                file_uuid,
+                wall_time_ns,
+                now_ms(),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE lar_files SET size_bytes=?2 WHERE file_uuid=?1",
+            params![file_uuid, flush.size],
+        )?;
+        if let Some(checkpoint) = flush.checkpoint {
+            publish_checkpoint(&tx, &file_uuid, checkpoint)?;
+        }
+        tx.execute(
+            "INSERT INTO lar_session_revisions (session_id, revision, updated_at_ms)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET
+               revision=lar_session_revisions.revision+1,
+               updated_at_ms=excluded.updated_at_ms",
+            params![tool.session_id, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn write_body_through_configured_store(
         &self,
         owner_id: &str,
@@ -1819,6 +2085,98 @@ impl Store {
         Ok((after - before).max(0) as u64)
     }
 
+    /// Repair tool supplement projections after a crash between the durable
+    /// archive sync and SQLite publication. Only rows explicitly marked by
+    /// live ingestion are retried; imported metadata may already have tool
+    /// stages in its immutable base exchange and is never inferred here.
+    pub fn recover_lar_tool_timeline_supplements(&self) -> Result<u64> {
+        if self.lar_body_store_mode() == LarBodyStoreMode::Legacy {
+            return Ok(0);
+        }
+        let pending = {
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare(
+                "SELECT t.id, t.harness, t.session_id, t.turn_id, t.tool_call_id,
+                        t.trace_id, t.tool_name, t.ts_start_ms, t.ts_end_ms,
+                        t.is_error, t.exit_status, t.args_body_path, t.result_body_path,
+                        EXISTS(SELECT 1 FROM lar_timeline_supplements s
+                                WHERE s.tool_id=t.id AND s.phase='start'),
+                        EXISTS(SELECT 1 FROM lar_timeline_supplements s
+                                WHERE s.tool_id=t.id AND s.phase='end')
+                   FROM tool_calls t
+                  WHERE t.canonical_timeline=1 AND (
+                        t.ts_end_ms IS NOT NULL AND NOT EXISTS(
+                            SELECT 1 FROM lar_timeline_supplements s
+                                    WHERE s.tool_id=t.id AND s.phase='end')
+                     OR NOT EXISTS(SELECT 1 FROM lar_timeline_supplements s
+                                    WHERE s.tool_id=t.id AND s.phase='start')
+                     OR (t.args_body_path IS NOT NULL
+                         AND NOT EXISTS(SELECT 1 FROM lar_timeline_supplements s
+                                        WHERE s.tool_id=t.id AND s.phase='arguments')
+                         AND NOT EXISTS(
+                           SELECT 1 FROM lar_timeline_supplements s
+                           JOIN lar_trace_artifacts a
+                             ON a.owner_kind='tool_call' AND a.owner_id=t.id
+                            AND a.artifact_kind='tool_arguments' AND a.stage_id=''
+                            AND a.manifest_id=s.manifest_id
+                           WHERE s.tool_id=t.id AND s.phase='start'))
+                     OR (t.result_body_path IS NOT NULL
+                         AND NOT EXISTS(SELECT 1 FROM lar_timeline_supplements s
+                                        WHERE s.tool_id=t.id AND s.phase='result')
+                         AND NOT EXISTS(
+                           SELECT 1 FROM lar_timeline_supplements s
+                           JOIN lar_trace_artifacts a
+                             ON a.owner_kind='tool_call' AND a.owner_id=t.id
+                            AND a.artifact_kind='tool_result' AND a.stage_id=''
+                            AND a.manifest_id=s.manifest_id
+                           WHERE s.tool_id=t.id AND s.phase='end')))
+                  ORDER BY t.ts_start_ms, t.id",
+            )?;
+            let values = statement
+                .query_map([], |row| {
+                    Ok((
+                        ToolCallRecord {
+                            id: row.get(0)?,
+                            harness: row.get(1)?,
+                            session_id: row.get(2)?,
+                            turn_id: row.get(3)?,
+                            tool_call_id: row.get(4)?,
+                            trace_id: row.get(5)?,
+                            tool_name: row.get(6)?,
+                            ts_start_ms: row.get(7)?,
+                            ts_end_ms: row.get(8)?,
+                            is_error: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+                            exit_status: row.get(10)?,
+                            args_body_path: row.get(11)?,
+                            result_body_path: row.get(12)?,
+                        },
+                        row.get::<_, bool>(13)?,
+                        row.get::<_, bool>(14)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            values
+        };
+        let mut repaired = 0u64;
+        for (tool, has_start, has_end) in pending {
+            if !has_start {
+                self.append_lar_tool_timeline_phase(&tool, "start")?;
+                repaired = repaired.saturating_add(1);
+            }
+            if !has_end && tool.ts_end_ms.is_some() {
+                self.append_lar_tool_timeline_phase(&tool, "end")?;
+                repaired = repaired.saturating_add(1);
+            }
+            if tool.args_body_path.is_some() {
+                self.append_lar_tool_timeline_phase(&tool, "arguments")?;
+            }
+            if tool.result_body_path.is_some() {
+                self.append_lar_tool_timeline_phase(&tool, "result")?;
+            }
+        }
+        Ok(repaired)
+    }
+
     /// Move completed Node-preload Dario captures through the same typed body
     /// store as ordinary proxy traffic. Partially written/corrupt spool files
     /// are retained for a later retry.
@@ -2137,6 +2495,72 @@ fn stage_occurrence_id(file_uuid: &str, trace_id: &str, sequence: u64, content_i
     }
     hash.update(&sequence.to_le_bytes());
     hash.finalize().to_hex().to_string()
+}
+
+fn catalog_tool_supplement_stage(
+    conn: &Connection,
+    file_uuid: &str,
+    trace_id: &str,
+    capture_sequence: u64,
+    stage_id: alex_lar::StageId,
+    writer: &ArchiveWriter<File>,
+    created_at_ms: i64,
+) -> Result<String> {
+    let stage = writer
+        .stage(&stage_id)
+        .with_context(|| format!("live LAR writer lost tool stage {stage_id}"))?;
+    let data = &stage.data;
+    let content_id = stage_id.to_string();
+    let content_id_in_use: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lar_stage_records WHERE stage_id=?1)",
+        [&content_id],
+        |row| row.get(0),
+    )?;
+    let occurrence_id = if content_id_in_use {
+        stage_occurrence_id(file_uuid, trace_id, capture_sequence, &content_id)
+    } else {
+        content_id.clone()
+    };
+    conn.execute(
+        "INSERT INTO lar_stage_records
+           (stage_id, trace_id, capture_sequence, kind, attempt_number,
+            wall_time_ns, monotonic_delta_ns, request_headers_ref,
+            request_body_manifest_ref, response_headers_ref,
+            response_body_manifest_ref, trailers_ref, stream_index_ref,
+            file_uuid, record_id, fidelity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, 'captured_tool_supplement')",
+        params![
+            occurrence_id,
+            trace_id,
+            capture_sequence,
+            stage_kind_name(data.kind),
+            data.attempt_number,
+            data.wall_time_ns,
+            data.monotonic_delta_ns,
+            data.request_headers_ref.map(|id| id.to_string()),
+            data.request_body_manifest_ref.map(|id| id.to_string()),
+            data.response_headers_ref.map(|id| id.to_string()),
+            data.response_body_manifest_ref.map(|id| id.to_string()),
+            data.trailers_ref.map(|id| id.to_string()),
+            data.stream_index_ref.map(|id| id.to_string()),
+            file_uuid,
+            content_id,
+        ],
+    )?;
+    if let Some(manifest_id) = data
+        .request_body_manifest_ref
+        .or(data.response_body_manifest_ref)
+    {
+        crate::lar_fts::attach_stage_manifest_refs(
+            conn,
+            trace_id,
+            &occurrence_id,
+            &manifest_id.to_string(),
+            created_at_ms,
+        )?;
+    }
+    Ok(occurrence_id)
 }
 
 pub(crate) fn catalog_capture_stages(

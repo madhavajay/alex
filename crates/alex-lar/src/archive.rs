@@ -1121,6 +1121,22 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
         self.append_reader_with_config(&mut input, chunker_config)
     }
 
+    /// Append a body from a bounded reader while retaining its transport
+    /// metadata. The reader is consumed in fixed-size windows.
+    pub fn append_reader_with_metadata<R: Read>(
+        &mut self,
+        input: R,
+        media_type: Option<Vec<u8>>,
+        content_encoding: Option<Vec<u8>>,
+    ) -> Result<ManifestId> {
+        self.append_reader_with_config_and_metadata(
+            input,
+            self.chunker_config,
+            media_type,
+            content_encoding,
+        )
+    }
+
     fn append_reader_with_config<R: Read>(
         &mut self,
         input: R,
@@ -4222,10 +4238,74 @@ impl<R: Read + Seek> ArchiveReader<R> {
     pub fn turn_view(&self, id: &TurnViewId) -> Option<&TurnView> {
         self.turn_views.get(id)
     }
+    /// Return only the immutable exchange indexed directly by this trace ID.
+    /// General child lineage is intentionally not folded into this lookup.
     pub fn exchange_by_trace(&self, trace_id: &[u8]) -> Option<&Exchange> {
         self.traces
             .get(trace_id)
             .and_then(|id| self.exchanges.get(id))
+    }
+    /// Return a base exchange and every direct child in general trace lineage.
+    /// Callers must apply their own typed profile filter before treating a
+    /// child as an append-only supplement rather than a subagent/model trace.
+    pub fn exchange_lineage_by_trace(&self, trace_id: &[u8]) -> Vec<&Exchange> {
+        let mut values = self
+            .exchanges
+            .values()
+            .filter(|exchange| {
+                exchange.data.trace_id == trace_id
+                    || exchange.data.parent_trace_id.as_deref() == Some(trace_id)
+            })
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            let left_base = left.data.trace_id == trace_id;
+            let right_base = right.data.trace_id == trace_id;
+            right_base
+                .cmp(&left_base)
+                .then_with(|| left.data.wall_time_ns.cmp(&right.data.wall_time_ns))
+                .then_with(|| left.data.capture_sequence.cmp(&right.data.capture_sequence))
+                .then_with(|| left.data.trace_id.cmp(&right.data.trace_id))
+        });
+        values
+    }
+
+    /// Materialize all direct lineage stages. This is not a canonical
+    /// supplement view because `parent_trace_id` also represents subagents.
+    pub fn stage_lineage_by_trace(&self, trace_id: &[u8]) -> Vec<&Stage> {
+        let mut values = self
+            .exchange_lineage_by_trace(trace_id)
+            .into_iter()
+            .flat_map(|exchange| {
+                exchange
+                    .data
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(ordinal, id)| {
+                        self.stages.get(id).map(|stage| {
+                            (
+                                stage.data.wall_time_ns,
+                                exchange.data.capture_sequence,
+                                ordinal,
+                                *id,
+                                stage,
+                            )
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        values.sort_by_key(|value| (value.0, value.1, value.2, value.3));
+        values.into_iter().map(|value| value.4).collect()
+    }
+
+    /// Compatibility alias for [`Self::exchange_lineage_by_trace`].
+    pub fn exchange_timeline_by_trace(&self, trace_id: &[u8]) -> Vec<&Exchange> {
+        self.exchange_lineage_by_trace(trace_id)
+    }
+
+    /// Compatibility alias for [`Self::stage_lineage_by_trace`].
+    pub fn stage_timeline_by_trace(&self, trace_id: &[u8]) -> Vec<&Stage> {
+        self.stage_lineage_by_trace(trace_id)
     }
     pub fn exchange_metadata_by_trace(&self, trace_id: &[u8]) -> Option<&ExchangeMetadata> {
         self.traces

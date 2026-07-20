@@ -458,6 +458,8 @@ impl Store {
             }
             tx.commit()?;
         }
+        self.rebuild_lar_tool_timeline_catalog_file(file_uuid)
+            .context("rebuilding tool timeline projections after archive reattach")?;
         let file = self
             .lar_archive_file_status(file_uuid)?
             .context("reattached LAR archive disappeared from the catalog")?;

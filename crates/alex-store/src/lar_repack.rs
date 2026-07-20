@@ -1806,6 +1806,12 @@ impl Store {
             }
         }
         tx.execute(
+            "UPDATE lar_timeline_supplements SET file_uuid=?2
+              WHERE file_uuid=?1 AND supplement_trace_id IN
+                (SELECT trace_id FROM lar_exchange_records WHERE file_uuid=?2)",
+            params![run.source_file_uuid, run.destination_file_uuid],
+        )?;
+        tx.execute(
             "UPDATE lar_migration_items SET destination_file_uuid=NULL
               WHERE destination_file_uuid=?1",
             [&run.source_file_uuid],
@@ -1840,6 +1846,7 @@ impl Store {
                  UNION ALL SELECT 1 FROM lar_header_blocks WHERE file_uuid=?1
                  UNION ALL SELECT 1 FROM lar_stage_records WHERE file_uuid=?1
                  UNION ALL SELECT 1 FROM lar_exchange_records WHERE file_uuid=?1
+                 UNION ALL SELECT 1 FROM lar_timeline_supplements WHERE file_uuid=?1
                  UNION ALL SELECT 1 FROM lar_migration_items WHERE destination_file_uuid=?1
              )",
             [&run.source_file_uuid],

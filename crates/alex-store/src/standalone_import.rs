@@ -22,7 +22,8 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    lar_archive_ops::{record_lar_file_identity, LarFileIdentity},
+    lar_archive_ops::{record_lar_file_identity, resolved_catalog_path, LarFileIdentity},
+    lar_tool_timeline::{parse_tool_supplement, ParsedToolSupplement},
     Store,
 };
 
@@ -98,6 +99,7 @@ struct ValidatedExchange {
     request_headers_json: Option<String>,
     response_headers_json: Option<String>,
     stages: Vec<Stage>,
+    tool_supplement: Option<ParsedToolSupplement>,
 }
 
 struct ValidatedTurnView {
@@ -123,6 +125,189 @@ struct ValidatedArchive {
 }
 
 impl Store {
+    /// Rebuild the derived tool supplement and tool-call projections from all
+    /// currently online self-describing archives. This is safe to run after a
+    /// catalog projection loss and is idempotent.
+    pub fn rebuild_lar_tool_timeline_catalog(&self) -> Result<u64> {
+        let files = self.lar_tool_timeline_catalog_files(
+            "SELECT file_uuid, path FROM lar_files
+              WHERE state IN ('active','sealed') ORDER BY file_uuid",
+            [],
+        )?;
+        self.rebuild_lar_tool_timeline_catalog_files(files)
+    }
+
+    /// Startup recovery is intentionally bounded to the current append pack.
+    /// Sealed historical files are immutable and cannot contain a new
+    /// append-before-catalog crash from this process lifetime.
+    pub(crate) fn rebuild_active_lar_tool_timeline_catalog(&self) -> Result<u64> {
+        let files = self.lar_tool_timeline_catalog_files(
+            "SELECT file_uuid, path FROM lar_files
+              WHERE state='active' ORDER BY file_uuid",
+            [],
+        )?;
+        self.rebuild_lar_tool_timeline_catalog_files(files)
+    }
+
+    pub(crate) fn rebuild_lar_tool_timeline_catalog_file(&self, file_uuid: &str) -> Result<u64> {
+        let files = self.lar_tool_timeline_catalog_files(
+            "SELECT file_uuid, path FROM lar_files WHERE file_uuid=?1",
+            [file_uuid],
+        )?;
+        self.rebuild_lar_tool_timeline_catalog_files(files)
+    }
+
+    fn lar_tool_timeline_catalog_files<P>(
+        &self,
+        sql: &str,
+        parameters: P,
+    ) -> Result<Vec<(String, String)>>
+    where
+        P: rusqlite::Params,
+    {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(sql)?;
+        let values = statement
+            .query_map(parameters, |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(values)
+    }
+
+    fn rebuild_lar_tool_timeline_catalog_files(&self, files: Vec<(String, String)>) -> Result<u64> {
+        let mut rebuilt = 0u64;
+        for (file_uuid, catalog_path) in files {
+            let path = resolved_catalog_path(&self.data_dir, &catalog_path);
+            let file = File::open(&path).with_context(|| {
+                format!("opening LAR archive {} for tool rescan", path.display())
+            })?;
+            let reader = ArchiveReader::open(file, Limits::default())
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("reading LAR archive {file_uuid} for tool rescan"))?;
+            let mut supplements = Vec::new();
+            for exchange_id in reader.exchange_ids() {
+                let exchange = reader
+                    .exchange(exchange_id)
+                    .context("tool rescan lost an indexed exchange")?;
+                let stages = exchange
+                    .data
+                    .stages
+                    .iter()
+                    .map(|id| {
+                        reader
+                            .stage(id)
+                            .cloned()
+                            .with_context(|| format!("tool rescan is missing stage {id}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(supplement) = parse_tool_supplement(exchange, &stages)? {
+                    supplements.push((exchange.clone(), supplement));
+                }
+            }
+            if supplements.is_empty() {
+                continue;
+            }
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (exchange, supplement) in supplements {
+                let tombstoned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lar_timeline_supplement_tombstones
+                      WHERE tool_id=?1 AND phase=?2 AND supplement_trace_id=?3)",
+                    params![
+                        supplement.provenance.tool_id,
+                        supplement.provenance.phase,
+                        supplement.supplement_trace_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if tombstoned {
+                    continue;
+                }
+                let display_trace_id = supplement
+                    .parent_trace_id
+                    .as_deref()
+                    .unwrap_or(&supplement.supplement_trace_id);
+                if let Some(parent_trace_id) = supplement.parent_trace_id.as_deref() {
+                    let parent_session: Option<Option<String>> = tx
+                        .query_row(
+                            "SELECT session_id FROM traces WHERE id=?1",
+                            [parent_trace_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if parent_session.flatten().as_deref() != Some(supplement.session_id.as_str()) {
+                        bail!(
+                            "tool supplement {} has a missing or conflicting parent session",
+                            supplement.supplement_trace_id
+                        );
+                    }
+                }
+                let stage_record_id = supplement.stage.id.to_string();
+                let stage_occurrence: (String, Option<String>) = tx
+                    .query_row(
+                        "SELECT stage_id,
+                                COALESCE(request_body_manifest_ref,
+                                         response_body_manifest_ref)
+                           FROM lar_stage_records
+                          WHERE trace_id=?1 AND record_id=?2",
+                        params![display_trace_id, stage_record_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "tool supplement {} has no cataloged stage occurrence",
+                            supplement.supplement_trace_id
+                        )
+                    })?;
+                let exchange_matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lar_exchange_records
+                      WHERE trace_id=?1 AND exchange_id=?2 AND file_uuid=?3)",
+                    params![
+                        supplement.supplement_trace_id,
+                        exchange.id.to_string(),
+                        file_uuid,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !exchange_matches {
+                    bail!(
+                        "tool supplement {} has no matching exchange ownership",
+                        supplement.supplement_trace_id
+                    );
+                }
+                let inserted = attach_tool_supplement_projection(
+                    &tx,
+                    &file_uuid,
+                    &exchange,
+                    &supplement,
+                    &stage_occurrence.0,
+                    stage_occurrence.1.as_deref(),
+                    chrono::Utc::now().timestamp_millis(),
+                )?;
+                if let Some(manifest_id) = stage_occurrence.1.as_deref() {
+                    let artifact_kind = match supplement.provenance.phase.as_str() {
+                        "start" | "arguments" => "tool_arguments",
+                        "end" | "result" => "tool_result",
+                        _ => unreachable!("profile parser validated phase"),
+                    };
+                    attach_tool_artifact(
+                        &tx,
+                        &supplement,
+                        artifact_kind,
+                        manifest_id,
+                        "archive_tool_rescan",
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                }
+                upsert_tool_projection(&tx, &supplement)?;
+                rebuilt = rebuilt.saturating_add(u64::from(inserted));
+            }
+            tx.commit()?;
+        }
+        Ok(rebuilt)
+    }
+
     /// Validate and attach one immutable standalone archive. Passing a new path
     /// for an already known file UUID performs a validated relocation/reattach.
     pub fn import_sealed_lar_archive(
@@ -186,27 +371,37 @@ impl Store {
         }
         if existing_file.is_some() {
             for value in &archive.exchanges {
-                let stored: Option<(String, String, i64)> = tx
+                let stored: Option<(String, String)> = tx
                     .query_row(
-                        "SELECT exchange_id, file_uuid,
-                                (SELECT COUNT(*) FROM lar_stage_records s
-                                  WHERE s.trace_id=e.trace_id)
-                           FROM lar_exchange_records e WHERE trace_id=?1",
+                        "SELECT exchange_id, file_uuid
+                           FROM lar_exchange_records WHERE trace_id=?1",
                         [&value.trace_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                let expected_stage_count =
-                    to_i64(value.stages.len() as u64, "exchange stage count")?;
-                if stored.as_ref()
-                    != Some(&(
-                        value.exchange.id.to_string(),
-                        file_uuid.clone(),
-                        expected_stage_count,
-                    ))
-                {
+                if stored.as_ref() != Some(&(value.exchange.id.to_string(), file_uuid.clone())) {
                     bail!(
                         "trace {} has an incompatible existing standalone exchange catalog",
+                        value.trace_id
+                    );
+                }
+            }
+            for value in &archive.stages {
+                let stored: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM lar_stage_records
+                          WHERE file_uuid=?1 AND trace_id=?2 AND capture_sequence=?3
+                     )",
+                    params![
+                        file_uuid,
+                        value.trace_id,
+                        to_i64(value.sequence, "stage capture sequence")?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !stored {
+                    bail!(
+                        "trace {} has an incompatible existing standalone stage catalog",
                         value.trace_id
                     );
                 }
@@ -610,21 +805,38 @@ fn validate_archive(data_dir: &Path, path: &Path, limits: &Limits) -> Result<Val
         optional_identifier(exchange.data.parent_trace_id.as_deref(), "parent trace ID")?;
         optional_identifier(exchange.data.clock_id.as_deref(), "clock ID")?;
         let mut exchange_stages = Vec::with_capacity(exchange.data.stages.len());
-        for (sequence, stage_id) in exchange.data.stages.iter().enumerate() {
+        for stage_id in &exchange.data.stages {
             let stage = reader
                 .stage(stage_id)
                 .cloned()
                 .with_context(|| format!("exchange {trace_id} is missing stage {stage_id}"))?;
             validate_stage_text(&stage)?;
-            // Stage records are content-addressed and may legitimately be
-            // shared by exchanges or repeated within one exchange. Catalog
-            // every occurrence; the SQLite stage key is occurrence-scoped.
-            stages.push(ValidatedStage {
-                trace_id: trace_id.clone(),
-                sequence: sequence as u64,
-                stage: stage.clone(),
-            });
             exchange_stages.push(stage);
+        }
+        let tool_supplement = parse_tool_supplement(&exchange, &exchange_stages)?;
+        for (ordinal, stage) in exchange_stages.iter().cloned().enumerate() {
+            // Tool supplements are projected into their canonical parent
+            // timeline at the occurrence sequence carried by the child
+            // exchange. Ordinary exchanges retain local stage ordinals.
+            stages.push(ValidatedStage {
+                trace_id: if let Some(supplement) = &tool_supplement {
+                    supplement
+                        .parent_trace_id
+                        .clone()
+                        .unwrap_or_else(|| trace_id.clone())
+                } else {
+                    trace_id.clone()
+                },
+                sequence: if tool_supplement.is_some() {
+                    exchange
+                        .data
+                        .capture_sequence
+                        .saturating_add(ordinal as u64)
+                } else {
+                    ordinal as u64
+                },
+                stage,
+            });
         }
         let request_headers_json = exchange_stages
             .iter()
@@ -653,7 +865,34 @@ fn validate_archive(data_dir: &Path, path: &Path, limits: &Limits) -> Result<Val
             request_headers_json,
             response_headers_json,
             stages: exchange_stages,
+            tool_supplement,
         });
+    }
+    let exchange_sessions = validated_exchanges
+        .iter()
+        .map(|value| (value.trace_id.as_str(), value.session_id.as_deref()))
+        .collect::<HashMap<_, _>>();
+    for value in &validated_exchanges {
+        let Some(supplement) = &value.tool_supplement else {
+            continue;
+        };
+        if value.session_id.as_deref() != Some(supplement.session_id.as_str()) {
+            bail!("tool supplement session identity changed during validation");
+        }
+        if let Some(parent) = supplement.parent_trace_id.as_deref() {
+            if let Some(parent_session) = exchange_sessions.get(parent) {
+                if *parent_session != Some(supplement.session_id.as_str()) {
+                    bail!("tool supplement parent belongs to a different session");
+                }
+            }
+        }
+        if let Some(source) = supplement.provenance.source_trace_id.as_deref() {
+            if exchange_sessions.contains_key(source)
+                && supplement.parent_trace_id.as_deref() != Some(source)
+            {
+                bail!("tool supplement source trace does not match its canonical parent");
+            }
+        }
     }
     let stream_indexes = reader.stream_index_count();
     let mut conversation_entries = reader
@@ -1923,6 +2162,13 @@ fn attach_exchange(
     validated_at_ms: i64,
     insert_trace_rows: bool,
 ) -> Result<bool> {
+    let tool_supplement = value.tool_supplement.as_ref();
+    let supplement_display_trace_id = tool_supplement.map(|supplement| {
+        supplement
+            .parent_trace_id
+            .as_deref()
+            .unwrap_or(&supplement.supplement_trace_id)
+    });
     crate::live_body_store::catalog_capture_exchange(
         tx,
         file_uuid,
@@ -1956,7 +2202,7 @@ fn attach_exchange(
         }
     }
     let materialized = materialized_trace(value)?;
-    let inserted = if insert_trace_rows {
+    let inserted = if insert_trace_rows && tool_supplement.is_none() {
         tx.execute(
             "INSERT INTO traces (
                id, ts_request_ms, ts_response_ms, session_id, harness, client_format,
@@ -2056,17 +2302,38 @@ fn attach_exchange(
         .iter()
         .rposition(|stage| stage.data.kind == StageKind::UpstreamResponse);
     for (sequence, stage) in value.stages.iter().enumerate() {
+        let occurrence_trace_id = supplement_display_trace_id.unwrap_or(&value.trace_id);
+        let occurrence_sequence = if tool_supplement.is_some() {
+            value
+                .exchange
+                .data
+                .capture_sequence
+                .saturating_add(sequence as u64)
+        } else {
+            sequence as u64
+        };
         let stage_id = stage_occurrences
-            .get(&(value.trace_id.clone(), sequence as u64))
+            .get(&(occurrence_trace_id.to_string(), occurrence_sequence))
             .with_context(|| {
                 format!(
-                    "trace {} is missing catalog stage occurrence {sequence}",
-                    value.trace_id
+                    "trace {} is missing catalog stage occurrence {occurrence_sequence}",
+                    occurrence_trace_id
                 )
             })?
             .clone();
         let data = &stage.data;
         if let Some(manifest_id) = mapped_manifest(data.request_body_manifest_ref, manifests)? {
+            if let Some(supplement) = tool_supplement {
+                attach_tool_artifact(
+                    tx,
+                    supplement,
+                    "tool_arguments",
+                    &manifest_id,
+                    source_fingerprint,
+                    validated_at_ms,
+                )?;
+                continue;
+            }
             attach_artifact(
                 tx,
                 &value.trace_id,
@@ -2101,6 +2368,17 @@ fn attach_exchange(
             }
         }
         if let Some(manifest_id) = mapped_manifest(data.response_body_manifest_ref, manifests)? {
+            if let Some(supplement) = tool_supplement {
+                attach_tool_artifact(
+                    tx,
+                    supplement,
+                    "tool_result",
+                    &manifest_id,
+                    source_fingerprint,
+                    validated_at_ms,
+                )?;
+                continue;
+            }
             attach_artifact(
                 tx,
                 &value.trace_id,
@@ -2154,7 +2432,254 @@ fn attach_exchange(
             }
         }
     }
+    if let Some(supplement) = tool_supplement {
+        let stage = &supplement.stage;
+        let display_trace_id = supplement
+            .parent_trace_id
+            .as_deref()
+            .unwrap_or(&supplement.supplement_trace_id);
+        let stage_id = stage_occurrences
+            .get(&(
+                display_trace_id.to_string(),
+                value.exchange.data.capture_sequence,
+            ))
+            .context("tool supplement stage occurrence was not attached")?;
+        let manifest_id = mapped_manifest(
+            stage
+                .data
+                .request_body_manifest_ref
+                .or(stage.data.response_body_manifest_ref),
+            manifests,
+        )?;
+        attach_tool_supplement_projection(
+            tx,
+            file_uuid,
+            &value.exchange,
+            supplement,
+            stage_id,
+            manifest_id.as_deref(),
+            validated_at_ms,
+        )?;
+        upsert_tool_projection(tx, supplement)?;
+    }
     Ok(existing.is_none() && inserted == 1)
+}
+
+fn attach_tool_supplement_projection(
+    tx: &Transaction<'_>,
+    file_uuid: &str,
+    exchange: &Exchange,
+    supplement: &ParsedToolSupplement,
+    stage_id: &str,
+    manifest_id: Option<&str>,
+    validated_at_ms: i64,
+) -> Result<bool> {
+    let display_trace_id = supplement
+        .parent_trace_id
+        .as_deref()
+        .unwrap_or(&supplement.supplement_trace_id);
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO lar_timeline_supplements
+           (tool_id, phase, supplement_trace_id, parent_trace_id,
+            display_trace_id, session_id, capture_sequence, exchange_id,
+            stage_id, stage_record_id, manifest_id, file_uuid,
+            wall_time_ns, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            supplement.provenance.tool_id,
+            supplement.provenance.phase,
+            supplement.supplement_trace_id,
+            supplement.parent_trace_id,
+            display_trace_id,
+            supplement.session_id,
+            exchange.data.capture_sequence,
+            exchange.id.to_string(),
+            stage_id,
+            supplement.stage.id.to_string(),
+            manifest_id,
+            file_uuid,
+            supplement.stage.data.wall_time_ns,
+            validated_at_ms,
+        ],
+    )?;
+    let stored: (
+        (String, String, String, Option<String>, String, String, u64),
+        (String, String, String, Option<String>, String, u64),
+    ) = tx.query_row(
+        "SELECT tool_id, phase, supplement_trace_id, parent_trace_id,
+                display_trace_id, session_id, capture_sequence, exchange_id,
+                stage_id, stage_record_id, manifest_id, file_uuid, wall_time_ns
+           FROM lar_timeline_supplements
+          WHERE tool_id=?1 AND phase=?2",
+        params![supplement.provenance.tool_id, supplement.provenance.phase],
+        |row| {
+            Ok((
+                (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ),
+                (
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ),
+            ))
+        },
+    )?;
+    let expected = (
+        (
+            supplement.provenance.tool_id.clone(),
+            supplement.provenance.phase.clone(),
+            supplement.supplement_trace_id.clone(),
+            supplement.parent_trace_id.clone(),
+            display_trace_id.to_string(),
+            supplement.session_id.clone(),
+            exchange.data.capture_sequence,
+        ),
+        (
+            exchange.id.to_string(),
+            stage_id.to_string(),
+            supplement.stage.id.to_string(),
+            manifest_id.map(str::to_string),
+            file_uuid.to_string(),
+            supplement.stage.data.wall_time_ns,
+        ),
+    );
+    if stored != expected {
+        bail!("tool supplement conflicts with its existing catalog projection");
+    }
+    Ok(inserted == 1)
+}
+
+fn attach_tool_artifact(
+    tx: &Transaction<'_>,
+    supplement: &ParsedToolSupplement,
+    artifact_kind: &str,
+    manifest_id: &str,
+    source_fingerprint: &str,
+    validated_at_ms: i64,
+) -> Result<()> {
+    let existing: Option<Option<String>> = tx
+        .query_row(
+            "SELECT manifest_id FROM lar_trace_artifacts
+              WHERE owner_kind='tool_call' AND owner_id=?1
+                AND artifact_kind=?2 AND stage_id=''",
+            params![supplement.provenance.tool_id, artifact_kind],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing.as_deref() != Some(manifest_id) {
+            bail!(
+                "tool {} artifact {artifact_kind} conflicts with attached content",
+                supplement.provenance.tool_id
+            );
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO lar_trace_artifacts
+           (owner_kind, owner_id, artifact_kind, stage_id, manifest_id,
+            source_fingerprint, fidelity, validation_state, validated_at_ms)
+         VALUES ('tool_call', ?1, ?2, '', ?3, ?4,
+                 'standalone_tool_supplement', 'validated', ?5)",
+        params![
+            supplement.provenance.tool_id,
+            artifact_kind,
+            manifest_id,
+            source_fingerprint,
+            validated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_tool_projection(tx: &Transaction<'_>, supplement: &ParsedToolSupplement) -> Result<()> {
+    let provenance = &supplement.provenance;
+    let existing: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    )> = tx
+        .query_row(
+            "SELECT id, harness, session_id, tool_call_id, turn_id, trace_id,
+                    tool_name, ts_start_ms
+               FROM tool_calls
+              WHERE id=?1 OR (harness=?2 AND session_id=?3 AND tool_call_id=?4)
+              LIMIT 1",
+            params![
+                provenance.tool_id,
+                provenance.harness,
+                supplement.session_id,
+                provenance.tool_call_id,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let expected = (
+            provenance.tool_id.clone(),
+            provenance.harness.clone(),
+            supplement.session_id.clone(),
+            provenance.tool_call_id.clone(),
+            provenance.turn_id.clone(),
+            provenance.source_trace_id.clone(),
+            provenance.tool_name.clone(),
+            provenance.ts_start_ms,
+        );
+        if existing != expected {
+            bail!("tool supplement conflicts with an existing tool identity");
+        }
+    }
+    tx.execute(
+        "INSERT INTO tool_calls
+           (id, harness, session_id, turn_id, tool_call_id, trace_id, tool_name,
+            ts_start_ms, ts_end_ms, is_error, exit_status, canonical_timeline)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+         ON CONFLICT(harness, session_id, tool_call_id) DO UPDATE SET
+           ts_end_ms=COALESCE(excluded.ts_end_ms, tool_calls.ts_end_ms),
+           is_error=COALESCE(excluded.is_error, tool_calls.is_error),
+           exit_status=COALESCE(excluded.exit_status, tool_calls.exit_status),
+           canonical_timeline=1",
+        params![
+            provenance.tool_id,
+            provenance.harness,
+            supplement.session_id,
+            provenance.turn_id,
+            provenance.tool_call_id,
+            provenance.source_trace_id,
+            provenance.tool_name,
+            provenance.ts_start_ms,
+            provenance.ts_end_ms,
+            provenance.is_error.map(i64::from),
+            provenance.exit_status,
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

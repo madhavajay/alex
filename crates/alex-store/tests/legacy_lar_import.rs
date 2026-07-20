@@ -1115,6 +1115,20 @@ fn metadata_import_preserves_proven_headers_routes_tool_order_and_shared_bodies(
         .iter()
         .position(|kind| *kind == StageKind::ToolResult)
         .unwrap();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == StageKind::ToolCall)
+            .count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == StageKind::ToolResult)
+            .count(),
+        1
+    );
     let client_response = kinds
         .iter()
         .position(|kind| *kind == StageKind::ClientResponse)
@@ -1252,6 +1266,36 @@ fn metadata_import_preserves_proven_headers_routes_tool_order_and_shared_bodies(
         )
         .unwrap();
     assert_eq!(after_counts, before_counts);
+    assert_eq!(
+        catalog
+            .query_row("SELECT COUNT(*) FROM lar_timeline_supplements", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "legacy metadata stages must not also create live supplements"
+    );
+    drop(catalog);
+    drop(store);
+    let reopened = Store::open_with_lar_body_store(
+        data_dir.clone(),
+        LarBodyStoreConfig {
+            mode: LarBodyStoreMode::LarWithFallback,
+            ..LarBodyStoreConfig::default()
+        },
+    )
+    .unwrap();
+    drop(reopened);
+    assert_eq!(
+        rusqlite::Connection::open(data_dir.join("alexandria.sqlite3"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM lar_timeline_supplements", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "startup recovery must ignore projection-only imported tool rows"
+    );
 }
 
 #[test]

@@ -255,13 +255,34 @@ and reopens it to verify the clean footer and every body. Without `--force`, it
 publishes through an atomic no-clobber sibling hard-link, so a racing creator is
 not overwritten. Forced replacement uses atomic rename on Unix; platforms that
 cannot replace by rename may remove the old destination first. It syncs the
-parent directory on Unix and never holds the complete
-output archive in memory. Current body copying reconstructs
-one artifact before immediately chunking it into the destination, so peak body
-memory is bounded by the largest single artifact rather than by the complete
-session. Writer indexes/record metadata and selected-trace metadata still scale
-with the selected archive, subject to format limits. The separate trace backup
+parent directory on Unix and never holds the complete output archive or a
+complete logical body in memory. Body copying uses fixed-size windows and a
+temporary on-disk spool while retaining media type and content encoding.
+Writer indexes/record metadata and selected-trace metadata still scale with the
+selected native archive, subject to format limits. The separate trace backup
 builder still materializes its embedded LAR before packaging.
+
+HAR, WARC, JSONL, OpenTelemetry, and OpenInference exports take a stable
+high-water snapshot and page selected rows by `(request timestamp, trace ID)`.
+If a concurrent deletion or selection-field mutation changes the number of
+rows still visible at that mark, export fails and removes the temporary output
+instead of publishing a file whose summary disagrees with its contents.
+Each modern trace is loaded as one exact canonical timeline projection: base
+exchange stages in captured order, followed by deterministically ordered late
+tool start/end supplements even when they live in another pack. The projection
+keeps occurrence and content IDs distinct, ordered raw header/trailer atoms,
+all stream reads/frames and timings, exchange metadata, and one descriptor per
+distinct logical body. Bodies are streamed in fixed-size windows. HAR and WARC
+also emit conventional HTTP projections; semantic formats keep their standard
+span fields. Each carries the full canonical graph in an Alex extension and an
+explicit loss report for details the conventional projection cannot express.
+
+Legacy-only JSONL is the import-compatible Alex v1 shape. If any selected trace
+is canonical, JSONL v2 is emitted: its graph record contains body descriptors
+and the bytes follow in independently bounded 48 KiB `alex.body.part` records,
+terminated by a checked body record. The current v1 importer deliberately
+rejects v2 with a precise loss warning. Until a v2 importer lands, use standalone
+LAR when the export must be re-imported without losing the canonical timeline.
 
 Import accepts only a regular, clean, sealed standalone file with no required
 external body references. Before its single catalog transaction it verifies
@@ -271,6 +292,45 @@ not change during validation. Publication preserves generation ancestry and
 turn/session evidence, rejects conflicting IDs or cycles, and is idempotent.
 Import body validation streams verified chunks to a sink. Parsed canonical
 record/index state still scales with the archive within the configured limits.
+
+## Complete transaction export and replay
+
+Use the transaction envelope when a consumer needs the exact retained body
+bytes and ordered transport/agent evidence without copying them into another
+`.lar` first:
+
+```bash
+alex lar transaction --trace-id TRACE_ID --output trace.transaction.jsonseq --json
+alex lar transaction --archive sealed.lar --trace-id TRACE_ID \
+  --output trace.transaction.jsonseq
+alex lar transaction-replay trace.transaction.jsonseq --stage-id STAGE_ID \
+  --speed instant --output observed-stream.bin
+alex lar transaction-replay trace.transaction.jsonseq --stage-id STAGE_ID \
+  --parsed --speed 1x --output parsed-frames.bin
+```
+
+Canonical live export resolves the shared graph and streams manifests/chunks
+straight from their catalog packs. The logical `transaction_timeline` names
+the immutable base Exchange separately from its flattened stage ordering;
+strict late tool supplements retain their own source Exchange content IDs.
+Ordinary children and subagent lineage are not merged merely because they have
+the same `parent_trace_id`. A sealed source produces the identical logical
+record sequence.
+
+Bodies and header blocks are content-addressed and emitted once. Body pieces
+decode to at most 48 KiB, so peak body memory does not scale with a long
+artifact. A truly legacy-only trace is labeled `synthesized_legacy`; Alex reads
+each source once to establish its identity and once to stream/re-verify it,
+without constructing a temporary standalone archive.
+
+Replay validates the complete marker, body contiguity, decoded piece limit,
+length, BLAKE3, and stream ranges before emitting. File destinations use a
+synced sibling temporary file and atomic publication, including with `--force`;
+corrupt or truncated input leaves an existing destination unchanged. Replay is
+application-level only: it emits captured byte ranges with instant/original/
+scaled timing and never fabricates HTTP, SSE, or provider framing. Full format,
+bounds, and fidelity limits are in
+[LAR complete-transaction JSON sequence](lar-transaction-json-seq.md).
 
 For a damaged standalone/active file, inspect first:
 

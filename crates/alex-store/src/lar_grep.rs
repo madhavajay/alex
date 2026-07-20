@@ -707,7 +707,7 @@ fn catalog_manifest_ids(conn: &Connection, max_manifests: u64) -> Result<Vec<Str
     Ok(ids)
 }
 
-fn load_catalog_manifest(conn: &Connection, manifest_id: &str) -> Result<BodyManifest> {
+pub(crate) fn load_catalog_manifest(conn: &Connection, manifest_id: &str) -> Result<BodyManifest> {
     let (length, whole_hash, media_type, content_encoding): (
         i64,
         Vec<u8>,

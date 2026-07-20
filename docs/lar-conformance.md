@@ -48,10 +48,13 @@ an additional outer encoding and is discouraged because it defeats range
 access. Suggested content disposition is `attachment; filename="capture.lar"`.
 
 The JSONL interchange representation is distinct and may be labeled
-`application/vnd.alexandria.lar+jsonl`; it is not byte-fidelity-equivalent to a
-standalone LAR archive. Neither proposal is an IANA registration. Readers must
-still validate magic, required features, lengths, checksums, hashes, and
-reference closure rather than trusting a filename or media type.
+`application/vnd.alexandria.lar+jsonl`. Legacy-only v1 is import-compatible but
+lossy. Canonical v2 preserves the exact timeline graph and splits body data into
+bounded records, but the current importer intentionally rejects v2; it is not a
+substitute for a self-contained, currently re-importable standalone LAR archive.
+Neither proposal is an IANA registration. Readers must still validate magic,
+required features, lengths, checksums, hashes, and reference closure rather
+than trusting a filename or media type.
 
 LAR files can contain sensitive prompts, responses, tool data, ordered headers,
 and equality-revealing content hashes. Operators should serve them only with
