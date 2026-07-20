@@ -2,6 +2,7 @@ pub mod amp_usage;
 pub mod grok_billing;
 pub mod openrouter_catalog;
 pub mod quota;
+pub mod resume_context;
 pub mod translate;
 
 pub use amp_usage::{
@@ -14,6 +15,9 @@ pub use grok_billing::{
 };
 pub use openrouter_catalog::parse_models_response as parse_openrouter_models_response;
 pub use quota::quota_state;
+pub use resume_context::{
+    build_resume_context, build_resume_context_from_captures, ResumeCapture, ResumeContext,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

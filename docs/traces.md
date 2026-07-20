@@ -138,6 +138,10 @@ caps the candidate set at 300 rows.
 The TUI has Sessions, Limits, Accounts, and Dario tabs. Session rows include
 stable display fields (short ID, duration, provider summary, tag summary, and
 running/done/error status), and transcript tab counts are computed server-side.
+In the native macOS Trace Browser, right-click a session and choose **Fork
+session with…** to copy its `alex resume <session-id>` command. Sessions created
+this way retain fork provenance separately from harness-managed subagent
+lineage.
 
 ## Agent-facing trace API
 
