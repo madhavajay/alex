@@ -332,7 +332,11 @@ fn account_block(summary: &StatusSummary, account: &StatusAccount, now: i64) -> 
     }
 
     let mut lines = vec![first];
-    if let Some(entry) = limit_entry {
+    // Credit-metered providers (amp, openrouter): a dollar balance says more
+    // than a percent bar with an unknowable reset. Show it and skip the bar.
+    if let Some(balance) = limit_entry.and_then(credit_balance_line) {
+        lines.push(balance);
+    } else if let Some(entry) = limit_entry {
         let windows = limit_windows(entry, now);
         if let Some((tightest_index, tightest)) = windows
             .iter()
@@ -436,6 +440,25 @@ fn remaining_bar(remaining_pct: f64) -> String {
     }
     blocks.resize(10, "⬜");
     blocks.join("")
+}
+
+
+/// A dollar-balance line for credit-metered providers (`💰 $30.16 credits`).
+/// Reads `individual_credits_usd`, `credits.balance`, or `quota.balance` from
+/// the provider's `/admin/limits` entry; None for window-metered providers.
+fn credit_balance_line(entry: &Value) -> Option<String> {
+    if let Some(usd) = entry["individual_credits_usd"].as_f64() {
+        return Some(format!("💰 ${usd:.2} credits"));
+    }
+    let balance = entry["credits"]["balance"]
+        .as_str()
+        .or_else(|| entry["quota"]["balance"].as_str())?
+        .trim()
+        .to_string();
+    if balance.is_empty() {
+        return None;
+    }
+    Some(format!("💰 {balance} credits"))
 }
 
 fn compact_whitespace(value: &str) -> String {
@@ -590,6 +613,24 @@ mod tests {
                 }]
             }]
         }));
+    }
+
+    #[test]
+    fn credit_metered_providers_show_dollar_balance_not_bars() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        summary.accounts[0].provider = "amp".into();
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "amp",
+                "plan": "amp",
+                "individual_credits_usd": 30.16,
+                "windows": [{"window": "credits", "used_pct": 0.0}]
+            }]
+        }));
+        let text = summary.telegram_text_at(now);
+        assert!(text.contains("💰 $30.16 credits"), "{text}");
+        assert!(!text.contains("credits resets"), "{text}");
     }
 
     #[test]
