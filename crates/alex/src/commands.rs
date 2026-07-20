@@ -428,6 +428,7 @@ mod tests {
                     name: "default".into(),
                     kind: "oauth".into(),
                     label: None,
+                    email: None,
                     status: "active".into(),
                     health: "healthy".into(),
                     needs_reauth: false,
@@ -519,7 +520,7 @@ mod tests {
         assert!(router
             .dispatch(&context, "/status")
             .await
-            .contains("Accounts:"));
+            .contains("✅ openai"));
         assert!(router.dispatch(&context, "/help").await.contains("/ping"));
         assert_eq!(
             router.dispatch(&context, "/ping").await,

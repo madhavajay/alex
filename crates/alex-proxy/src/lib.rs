@@ -5669,12 +5669,14 @@ async fn admin_provider_resume(
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let heartbeats = state.store.last_heartbeats().unwrap_or_default();
     let accounts: Vec<Value> = state
         .vault
         .list()
         .await
         .into_iter()
         .map(|a| {
+            let last_heartbeat = heartbeat_for_account(&heartbeats, &a);
             let email = a.email();
             let policy = state.vault.policy(a.provider);
             let reserve_pct = routing_reserve_pct(&a, &policy);
@@ -5709,7 +5711,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 // Reachability derived from the last heartbeat/ping, distinct
                 // from `status` (credential presence). The UI dot must follow
                 // this, not `status`, so a failing-ping provider reads red.
-                "health": account_health(&a),
+                "health": account_health(&a, last_heartbeat),
                 "last_probe": a.account_meta.get("last_probe").cloned().unwrap_or(Value::Null),
                 "needs_reauth": a.needs_reauth(),
                 "expires_at_ms": a.expires_at_ms,
@@ -6048,10 +6050,7 @@ async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
         .await
         .into_iter()
         .map(|a| {
-            let last = heartbeats
-                .iter()
-                .find(|h| h["provider"].as_str() == Some(a.provider.as_str()))
-                .cloned();
+            let last = heartbeat_for_account(&heartbeats, &a).cloned();
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -6599,17 +6598,36 @@ async fn record_dario_response_probe(
 /// watchdog) always wins so the dot is red regardless of the last ping; failing
 /// that it echoes the last probe's health, defaulting to `unknown` when the
 /// account has never been probed (never claim green without evidence).
-fn account_health(account: &Account) -> String {
+fn heartbeat_for_account<'a>(heartbeats: &'a [Value], account: &Account) -> Option<&'a Value> {
+    heartbeats
+        .iter()
+        .find(|heartbeat| heartbeat["account_id"].as_str() == Some(account.id.as_str()))
+        .or_else(|| {
+            heartbeats.iter().find(|heartbeat| {
+                heartbeat["account_id"].is_null()
+                    && heartbeat["provider"].as_str() == Some(account.provider.as_str())
+            })
+        })
+}
+
+fn account_health(account: &Account, last_heartbeat: Option<&Value>) -> String {
     if account.needs_reauth() {
         return "auth_failed".to_string();
     }
-    account
+    if let Some(health) = account
         .account_meta
         .get("last_probe")
         .and_then(|probe| probe.get("health"))
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string()
+    {
+        return health.to_string();
+    }
+    match last_heartbeat.and_then(|heartbeat| heartbeat["ok"].as_bool()) {
+        Some(true) => "healthy",
+        Some(false) => "unreachable",
+        None => "unknown",
+    }
+    .to_string()
 }
 
 async fn anthropic_messages(
@@ -18399,7 +18417,8 @@ mod tests {
             .into_iter()
             .find(|a| a.id == id)
             .expect("account present");
-        account_health(&account)
+        let heartbeats = state.store.last_heartbeats().unwrap_or_default();
+        account_health(&account, heartbeat_for_account(&heartbeats, &account))
     }
 
     async fn admin_accounts_health(state: &Arc<AppState>, id: &str) -> String {
@@ -18672,6 +18691,69 @@ mod tests {
             "unknown"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_only_account_reports_healthy_or_unreachable() {
+        for (ok, expected) in [(true, "healthy"), (false, "unreachable")] {
+            let state = test_state(if ok {
+                "heartbeat-only-healthy"
+            } else {
+                "heartbeat-only-unreachable"
+            });
+            state
+                .vault
+                .upsert(active_oauth_account(Provider::Xai, "grok"))
+                .await
+                .unwrap();
+            state
+                .store
+                .insert_heartbeat(
+                    now_ms(),
+                    "xai",
+                    Some("xai-oauth-grok"),
+                    ok,
+                    ok.then_some(200),
+                    12,
+                    "heartbeat evidence",
+                )
+                .unwrap();
+
+            assert_eq!(account_health_of(&state, "xai-oauth-grok").await, expected);
+            assert_eq!(
+                admin_accounts_health(&state, "xai-oauth-grok").await,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_evidence_wins_over_newer_heartbeat() {
+        let state = test_state("probe-wins-over-heartbeat");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", true, Some(200))).await;
+        state
+            .store
+            .insert_heartbeat(
+                now_ms(),
+                "xai",
+                Some("xai-oauth-grok"),
+                false,
+                Some(503),
+                12,
+                "later heartbeat failed",
+            )
+            .unwrap();
+
+        assert_eq!(account_health_of(&state, "xai-oauth-grok").await, "healthy");
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "healthy"
+        );
     }
 
     #[tokio::test]
