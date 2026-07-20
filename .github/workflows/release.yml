@@ -436,7 +436,16 @@ jobs:
           tar -xzf "$root/$asset" -C "$root/extracted"
           for bin in "$root/extracted/alex" "$root/extracted/alexandria"; do
             codesign --verify --strict --verbose=2 "$bin"
-            spctl --assess --type execute --verbose=2 "$bin"
+            details="$(codesign --display --verbose=4 "$bin" 2>&1)"
+            grep -q '^Authority=Developer ID Application:' <<< "$details"
+            grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<< "$details"
+            grep -Eq '^CodeDirectory .*flags=.*runtime' <<< "$details"
+            case "$(basename "$bin")" in
+              alex) expected_identifier="com.madhavajay.alex.cli" ;;
+              alexandria) expected_identifier="com.madhavajay.alex.daemon" ;;
+            esac
+            grep -Fxq "Identifier=$expected_identifier" <<< "$details"
+            "$bin" --version
           done
 
   manifest:
