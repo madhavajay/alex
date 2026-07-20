@@ -1772,9 +1772,44 @@ enum SessionShortId {
     }
 }
 
+@MainActor
+final class TraceBrowserBenchmarkViewProbe {
+    private(set) var activeMarkers: Set<String> = []
+    private(set) var markerActivationCounts: [String: Int] = [:]
+    private(set) var commitCount = 0
+
+    func commit(_ markers: Set<String>) {
+        for marker in markers.subtracting(activeMarkers) {
+            markerActivationCounts[marker, default: 0] += 1
+        }
+        activeMarkers = markers
+        commitCount += 1
+    }
+}
+
+private struct TraceBrowserBenchmarkMarkerKey: PreferenceKey {
+    static let defaultValue: Set<String> = []
+
+    static func reduce(value: inout Set<String>, nextValue: () -> Set<String>) {
+        value.formUnion(nextValue())
+    }
+}
+
+private extension View {
+    func traceBrowserBenchmarkMarker(_ marker: String) -> some View {
+        preference(key: TraceBrowserBenchmarkMarkerKey.self, value: [marker])
+    }
+}
+
 struct TraceBrowserView: View {
     @Bindable var model: TraceBrowserModel
+    let benchmarkProbe: TraceBrowserBenchmarkViewProbe?
     @AppStorage("TraceBrowserDetailsOn") private var persistedDetailsOn = false
+
+    init(model: TraceBrowserModel, benchmarkProbe: TraceBrowserBenchmarkViewProbe? = nil) {
+        self.model = model
+        self.benchmarkProbe = benchmarkProbe
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1798,8 +1833,10 @@ struct TraceBrowserView: View {
                                 SplitStore.saveLeftWidth(width)
                             }
                         })
+                    .traceBrowserBenchmarkMarker("session-pane")
                 TranscriptView(model: model)
                     .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+                    .traceBrowserBenchmarkMarker("transcript-pane")
                 if model.detailsVisible {
                     if let route = model.inspectorToolBody {
                         ToolBodyInspectorView(route: route, model: model)
@@ -1844,6 +1881,10 @@ struct TraceBrowserView: View {
                 persistedDetailsOn = value
             }
         }
+        .onPreferenceChange(TraceBrowserBenchmarkMarkerKey.self) { markers in
+            benchmarkProbe?.commit(markers)
+        }
+        .accessibilityIdentifier("trace-browser-root")
     }
 
     private var detailsBinding: Binding<Bool> {
@@ -1922,6 +1963,8 @@ struct TraceBrowserView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.orange.opacity(0.12))
+        .traceBrowserBenchmarkMarker("daemon-down")
+        .accessibilityIdentifier("trace-browser-daemon-down")
     }
 }
 
@@ -2154,6 +2197,7 @@ private struct SessionListView: View {
                         ProgressView().controlSize(.small)
                         Text(model.sessionsUnreachable ? "Connecting to daemon…" : "Loading sessions…")
                     }
+                    .traceBrowserBenchmarkMarker("sessions-loading")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 } else if model.sessionsUnreachable {
@@ -2623,7 +2667,10 @@ private struct TranscriptView: View {
                             .buttonStyle(.link)
                     }
                     if model.transcriptPageLoading {
-                        ProgressView().controlSize(.small)
+                        ProgressView()
+                            .controlSize(.small)
+                            .traceBrowserBenchmarkMarker("page-loading")
+                            .accessibilityIdentifier("trace-browser-page-loading")
                     }
                     Spacer()
                     if model.transcriptHasMoreAfter {
@@ -2655,6 +2702,8 @@ private struct TranscriptView: View {
                             ProgressView().controlSize(.small)
                             Text(model.transcriptUnreachable ? "Connecting to daemon…" : "Loading transcript…")
                         }
+                        .traceBrowserBenchmarkMarker("transcript-loading")
+                        .accessibilityIdentifier("trace-browser-transcript-loading")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if model.transcriptUnreachable {
@@ -2772,6 +2821,7 @@ private struct TranscriptView: View {
             text: "\(model.transcriptEntries.count) of \(model.transcriptTotalCount) messages",
             showsDot: true,
             trailingText: "\(model.transcriptLoadedTurnCount)/\(model.transcriptAvailableTurnCount) turns loaded · \(TraceFormat.tokens(model.transcriptTokensTotal)) tokens shown")
+            .accessibilityIdentifier("trace-browser-transcript-footer")
     }
 
     private var header: some View {
@@ -2920,7 +2970,9 @@ private struct ConversationGenerationTimeline: View {
                 if model.conversationLoading,
                     model.conversationEvents.isEmpty || model.conversationHasMore
                 {
-                    ProgressView().controlSize(.small)
+                    ProgressView()
+                        .controlSize(.small)
+                        .traceBrowserBenchmarkMarker("conversation-loading")
                 }
                 Button(expanded ? "Hide" : "Timeline") { expanded.toggle() }
                     .buttonStyle(.link)
@@ -3073,12 +3125,14 @@ enum TraceFormat {
 
 @MainActor
 final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
-    private var window: NSWindow?
-    private var model: TraceBrowserModel?
+    private(set) var window: NSWindow?
+    private(set) var model: TraceBrowserModel?
     private let store: SnapshotStore
+    private let benchmarkProbe: TraceBrowserBenchmarkViewProbe?
 
-    init(store: SnapshotStore) {
+    init(store: SnapshotStore, benchmarkProbe: TraceBrowserBenchmarkViewProbe? = nil) {
         self.store = store
+        self.benchmarkProbe = benchmarkProbe
         super.init()
     }
 
@@ -3094,7 +3148,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
             let model = TraceBrowserModel(
                 store: store, initialHarness: harness, initialQuery: query)
             self.model = model
-            let host = NSHostingController(rootView: TraceBrowserView(model: model))
+            let host = NSHostingController(
+                rootView: TraceBrowserView(model: model, benchmarkProbe: benchmarkProbe))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI — Trace Browser"
             win.styleMask = [.titled, .closable, .miniaturizable, .resizable]

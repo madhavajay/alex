@@ -444,6 +444,7 @@ In-depth reference docs live in [`docs/`](docs/) (see the [docs index](docs/READ
 | [LAR format plan](lar-format.md) | Requirements, wire/storage design, migration, performance targets, and implementation checklist for the seekable LLM archive |
 | [LAR v1 wire format](docs/lar-format-v1.md) | Versioned container framing, IDs, limits, recovery, conformance fixtures, and compatibility rules |
 | [LAR v1 conformance](docs/lar-conformance.md) | Public vectors, verifier, MIME proposal, compatibility workflow, and security notes |
+| [Trace Browser packaged benchmark](docs/trace-browser-packaged-benchmark.md) | Aggregate-only packaged macOS window benchmark against a real isolated LAR-backed daemon |
 | [Harness integration](docs/harnesses.md) | Provider headers, lifecycle hooks, and session/sub-agent identity |
 | [Amp wrap](docs/amp-wrap.md) | `alex wrap amp` reverse HTTP/WebSocket capture for closed harnesses |
 | [Signed macOS build](docs/build-signed.md) | `build-signed.sh`, Developer ID signing, and notarization |

@@ -239,7 +239,7 @@ def build(args: argparse.Namespace) -> None:
         f"{hashlib.sha256(f'{args.seed}:{line}'.encode()).hexdigest()}\n"
         for line in range(args.tool_lines)
     )
-    base_ms = 1_768_435_200_000
+    base_ms = args.base_ms
     compact_at = max(4, args.turns * 3 // 5)
     turn_spacing_ms = max(
         1,
@@ -402,6 +402,84 @@ def build(args: argparse.Namespace) -> None:
         )
         messages.append({"role": "assistant", "content": f"answer-{turn}-synthetic"})
 
+    # A deliberately small second session lets the packaged Trace Browser
+    # benchmark leave a delayed page request in flight, navigate elsewhere,
+    # and prove that the stale long-session response is discarded. Keep this
+    # opt-in so existing corpus/storage benchmarks retain their exact shape.
+    short_messages: list[dict[str, object]] = [
+        {"role": "system", "content": "Synthetic short-session fixture."}
+    ]
+    short_base_ms = base_ms + args.duration_ms + 1_000
+    for turn in range(args.short_session_turns):
+        trace_id = f"short-synthetic-{turn:06d}"
+        short_messages.append(
+            {"role": "user", "content": f"short turn {turn}: deterministic navigation fixture"}
+        )
+        request = json_bytes(
+            {
+                "model": "gpt-synthetic-code",
+                "messages": short_messages,
+                "stream": True,
+            }
+        )
+        response = response_sse(args.turns + turn)
+        req_path = corpus.body(trace_id, "request.json", request)
+        upstream_path = corpus.body(trace_id, "upstream-request.json", request)
+        resp_path = corpus.body(trace_id, "response.body", response)
+        ts_request_ms = short_base_ms + turn * 1_000
+        db.execute(
+            "INSERT INTO traces VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                trace_id,
+                ts_request_ms,
+                ts_request_ms + 250,
+                args.short_session_id,
+                "synthetic-codex",
+                "openai-responses",
+                "synthetic",
+                "openai-responses",
+                "gpt-synthetic-code",
+                "gpt-synthetic-code",
+                "POST",
+                "/v1/responses",
+                200,
+                1,
+                req_path,
+                upstream_path,
+                resp_path,
+                json.dumps(
+                    {
+                        "authorization": "[redacted]",
+                        "content-type": "application/json",
+                        "user-agent": "synthetic-agent/1",
+                        "x-session-id": args.short_session_id,
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {"content-type": "text/event-stream", "cache-control": "no-cache"},
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    [
+                        {
+                            "attempt": 1,
+                            "provider": "synthetic",
+                            "model": "gpt-synthetic-code",
+                            "status": 200,
+                        }
+                    ],
+                    separators=(",", ":"),
+                ),
+                None,
+                "synthetic-short-run",
+                json.dumps({"corpus": "lar", "fixture": "short"}),
+            ),
+        )
+        short_messages.append(
+            {"role": "assistant", "content": f"short-answer-{turn}-synthetic"}
+        )
+
     db.commit()
     db.close()
     summary = {
@@ -410,6 +488,9 @@ def build(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "session_id": args.session_id,
         "turns": args.turns,
+        "base_ms": base_ms,
+        "short_session_id": args.short_session_id,
+        "short_session_turns": args.short_session_turns,
         "tool_lines": args.tool_lines,
         "response_target_bytes": args.response_bytes,
         "duration_ms": args.duration_ms,
@@ -460,7 +541,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1784466165325)
     parser.add_argument(
+        "--base-ms",
+        type=int,
+        default=1_768_435_200_000,
+        help="request timestamp for the first long-session turn",
+    )
+    parser.add_argument(
         "--session-id", default="019f6872-a3ee-7431-b4bb-2bafbabb7235-synthetic"
+    )
+    parser.add_argument(
+        "--short-session-id", default="synthetic-short-session-navigation"
+    )
+    parser.add_argument(
+        "--short-session-turns",
+        type=int,
+        default=0,
+        help="also generate a distinct short session for navigation/cancellation tests",
     )
     parser.add_argument("--include-failures", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -473,6 +569,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--duration-ms must not be negative")
     if args.response_bytes is not None and args.response_bytes < 1:
         parser.error("--response-bytes must be at least 1")
+    if args.base_ms < 0:
+        parser.error("--base-ms must not be negative")
+    if args.short_session_turns < 0:
+        parser.error("--short-session-turns must not be negative")
+    if args.short_session_turns and args.short_session_id == args.session_id:
+        parser.error("--short-session-id must differ from --session-id")
     return args
 
 

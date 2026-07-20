@@ -66,7 +66,11 @@ public final class SnapshotStore {
     private var accountAnalyticsBucketMinutes = 60
     private var accountAnalyticsRequestGeneration = 0
 
-    public init() {}
+    /// A supplied configuration is primarily useful to deterministic app
+    /// launch modes. Normal startup still discovers config.toml while polling.
+    public init(config: DaemonConfig? = nil) {
+        self.config = config
+    }
 
     public func pendingLoginSession(accountId: String, provider: String) -> LoginSession? {
         pendingLoginSessions[accountId] ?? pendingLoginSessions["provider:\(provider)"]

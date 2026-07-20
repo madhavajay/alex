@@ -174,6 +174,12 @@ public struct AlexandriaClient: Sendable {
         do {
             (data, resp) = try await session.data(for: req)
         } catch {
+            // URLSession reports task cancellation as URLError.cancelled on
+            // some paths. Normalize it so browser generation changes do not
+            // briefly turn an intentional navigation into a daemon outage.
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
             BarLog.error(.net, "\(method) /\(path) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
             throw error
         }

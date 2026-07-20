@@ -1,0 +1,36 @@
+name: Trace Browser packaged benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-macos-benchmark:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run packaged Trace Browser benchmark
+        run: |
+          macos/Scripts/run_trace_browser_benchmark.sh \
+            --result "$RUNNER_TEMP/trace-browser-benchmark.json" \
+            --artifacts-dir "$RUNNER_TEMP/trace-browser-benchmark-artifacts"
+
+      - name: Upload benchmark result and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-browser-packaged-benchmark
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/trace-browser-benchmark.json
+            ${{ runner.temp }}/trace-browser-benchmark-artifacts

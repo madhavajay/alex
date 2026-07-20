@@ -114,6 +114,21 @@ import Testing
         #expect(try await client.larMigrationVerify() == false)
     }
 
+    @Test func urlSessionCancellationIsNormalized() async {
+        LARMigrationURLProtocol.handler = { _ in throw URLError(.cancelled) }
+        defer { LARMigrationURLProtocol.handler = nil }
+
+        do {
+            _ = try await makeClient().health()
+            Issue.record("expected cancellation")
+        } catch is CancellationError {
+            // Intentional navigation cancellation must not be reported as a
+            // daemon/network failure by higher-level browser state.
+        } catch {
+            Issue.record("expected CancellationError, got \(error)")
+        }
+    }
+
     private func makeClient() -> AlexandriaClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [LARMigrationURLProtocol.self]

@@ -35,10 +35,24 @@ public struct DaemonConfig: Sendable, Equatable {
 
 public enum DaemonDiscovery {
     private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedPath: URL?
     nonisolated(unsafe) private static var cachedModificationDate: Date?
     nonisolated(unsafe) private static var cachedConfig: DaemonConfig?
     public static var configPath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        configPath(
+            environment: ProcessInfo.processInfo.environment,
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    static func configPath(environment: [String: String], homeDirectory: URL) -> URL {
+        if let override = environment["ALEXANDRIA_CONFIG"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        if let override = environment["ALEXANDRIA_HOME"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+                .appendingPathComponent("config.toml")
+        }
+        return homeDirectory
             .appendingPathComponent(".alexandria/config.toml")
     }
 
@@ -47,7 +61,7 @@ public enum DaemonDiscovery {
         let modificationDate = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?
             .contentModificationDate
         cacheLock.lock()
-        if cachedModificationDate == modificationDate {
+        if cachedPath == path, cachedModificationDate == modificationDate {
             let cached = cachedConfig
             cacheLock.unlock()
             return cached
@@ -60,6 +74,7 @@ public enum DaemonDiscovery {
         let parsed = (try? String(contentsOf: path, encoding: .utf8))
             .flatMap { Self.parse(toml: $0) }
         cacheLock.lock()
+        cachedPath = path
         cachedModificationDate = modificationDate
         cachedConfig = parsed
         cacheLock.unlock()
@@ -68,6 +83,7 @@ public enum DaemonDiscovery {
 
     public static func invalidateCache() {
         cacheLock.lock()
+        cachedPath = nil
         cachedModificationDate = nil
         cachedConfig = nil
         cacheLock.unlock()

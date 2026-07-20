@@ -446,6 +446,26 @@ import Testing
         #expect(ipv6.baseURL.absoluteString == "http://[::1]:4100")
     }
 
+    @Test func daemonConfigPathHonorsIsolatedOverrides() {
+        let home = URL(fileURLWithPath: "/tmp/alex-home", isDirectory: true)
+        #expect(
+            DaemonDiscovery.configPath(
+                environment: ["ALEXANDRIA_HOME": "/tmp/isolated-alex"],
+                homeDirectory: home).path
+                == "/tmp/isolated-alex/config.toml")
+        #expect(
+            DaemonDiscovery.configPath(
+                environment: [
+                    "ALEXANDRIA_HOME": "/tmp/ignored",
+                    "ALEXANDRIA_CONFIG": "/tmp/explicit-alex.toml",
+                ],
+                homeDirectory: home).path
+                == "/tmp/explicit-alex.toml")
+        #expect(
+            DaemonDiscovery.configPath(environment: [:], homeDirectory: home).path
+                == "/tmp/alex-home/.alexandria/config.toml")
+    }
+
     @Test func daemonBoundToTailscaleStillConnectsLocallyOverLoopback() {
         let config = DaemonConfig(host: "100.101.102.103", port: 4100, localKey: "alx-abc123")
         #expect(config.connectHost == "127.0.0.1")
