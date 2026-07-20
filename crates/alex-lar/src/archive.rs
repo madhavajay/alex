@@ -3,6 +3,7 @@ use crate::conversation::{
     ConversationEntry, ConversationEntryId, Generation, GenerationId, TurnView, TurnViewId,
 };
 use crate::event::{Exchange, ExchangeId, Stage, StageId, StreamIndex, StreamIndexId};
+use crate::exchange_metadata::{ExchangeMetadata, ExchangeMetadataData};
 use crate::format::{file_length, FrameRead};
 use crate::index::{
     payload_hash, Checkpoint, CheckpointPointer, ChunkIndexEntry, IndexBlock, IndexBlockRef,
@@ -204,6 +205,16 @@ where
                 frame.write(&mut output)?;
                 canonical_records_copied += 1;
             }
+            RecordType::ExchangeMetadata => {
+                if frame.flags & RecordFrame::REQUIRED != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "exchange metadata record at {before} is unexpectedly required"
+                    )));
+                }
+                saw_non_dictionary_record = true;
+                frame.write(&mut output)?;
+                canonical_records_copied += 1;
+            }
             RecordType::IndexBlock | RecordType::Checkpoint | RecordType::CheckpointLocator => {
                 if frame.schema_version != INDEX_SCHEMA_V1 || frame.flags != 0 {
                     return Err(Error::Unsupported(format!(
@@ -216,10 +227,14 @@ where
                 saw_non_dictionary_record = true;
                 derived_records_replaced += 1;
             }
-            RecordType::Unknown(code) => {
-                return Err(Error::Unsupported(format!(
-                    "unknown optional record type {code} at {before} cannot be preserved safely"
-                )))
+            RecordType::Unknown(_) => {
+                // Optional outer records are opaque, independently framed,
+                // checksummed, and bounded. Preserve them byte-for-byte in
+                // stream order so future extensions survive a v1 upgrade.
+                debug_assert_eq!(frame.flags & RecordFrame::REQUIRED, 0);
+                saw_non_dictionary_record = true;
+                frame.write(&mut output)?;
+                canonical_records_copied += 1;
             }
         }
     }
@@ -412,10 +427,13 @@ fn next_canonical_upgrade_frame<R: Read + Seek>(
                     )));
                 }
             }
-            RecordType::Unknown(code) => {
-                return Err(Error::Unsupported(format!(
-                    "unknown optional record type {code} at {before}"
-                )))
+            RecordType::ExchangeMetadata | RecordType::Unknown(_) => {
+                if frame.flags & RecordFrame::REQUIRED != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "unsupported required extension record at {before}"
+                    )));
+                }
+                return Ok(Some(frame));
             }
         }
     }
@@ -611,6 +629,8 @@ impl StoredChunk {
 
 /// Append-only archive writer. Duplicate content is verified byte-for-byte
 /// against its existing frame before the existing logical ID is reused.
+type BodyIdentity = (ChunkHash, u64, Option<Vec<u8>>, Option<Vec<u8>>);
+
 pub struct ArchiveWriter<W> {
     io: W,
     header: FileHeader,
@@ -623,7 +643,7 @@ pub struct ArchiveWriter<W> {
     pending_metadata_bytes: usize,
     metadata_page_batching: bool,
     metadata_dictionary: Option<StoredDictionary>,
-    body_identities: HashMap<(ChunkHash, u64), ManifestId>,
+    body_identities: HashMap<BodyIdentity, ManifestId>,
     header_blocks: HashMap<HeaderBlockId, HeaderBlock>,
     header_block_offsets: HashMap<HeaderBlockId, u64>,
     stream_indexes: HashMap<StreamIndexId, StreamIndex>,
@@ -632,6 +652,7 @@ pub struct ArchiveWriter<W> {
     stage_offsets: HashMap<StageId, u64>,
     exchanges: HashMap<ExchangeId, Exchange>,
     exchange_offsets: HashMap<ExchangeId, u64>,
+    exchange_metadata: HashMap<ExchangeId, ExchangeMetadata>,
     traces: HashMap<Vec<u8>, ExchangeId>,
     sessions: HashMap<Vec<u8>, Vec<ExchangeId>>,
     conversation_entries: HashMap<ConversationEntryId, ConversationEntry>,
@@ -692,6 +713,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             stage_offsets: HashMap::new(),
             exchanges: HashMap::new(),
             exchange_offsets: HashMap::new(),
+            exchange_metadata: HashMap::new(),
             traces: HashMap::new(),
             sessions: HashMap::new(),
             conversation_entries: HashMap::new(),
@@ -802,6 +824,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
         let stage_offsets = scanned.stage_offsets.clone();
         let exchanges = scanned.exchanges.clone();
         let exchange_offsets = scanned.exchange_offsets.clone();
+        let exchange_metadata = scanned.exchange_metadata.clone();
         let traces = scanned.traces.clone();
         let sessions = scanned.sessions.clone();
         let conversation_entries = scanned.conversation_entries.clone();
@@ -835,6 +858,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             stage_offsets,
             exchanges,
             exchange_offsets,
+            exchange_metadata,
             traces,
             sessions,
             conversation_entries,
@@ -857,11 +881,41 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
                 limit: self.limits.max_body_length,
             });
         }
-        if let Some(id) = self.existing_body_id(bytes)? {
+        if let Some(id) = self.existing_body_id(bytes, None, None)? {
             return Ok(id);
         }
         let chunker_config = self.chunker_config.for_body_length(bytes.len() as u64);
         self.append_reader_with_config(Cursor::new(bytes), chunker_config)
+    }
+
+    /// Append body bytes while retaining the manifest-level media metadata.
+    /// Chunks remain content-addressed, so two semantic manifests over the
+    /// same bytes do not duplicate the actual body storage.
+    pub fn append_body_with_metadata(
+        &mut self,
+        bytes: &[u8],
+        media_type: Option<Vec<u8>>,
+        content_encoding: Option<Vec<u8>>,
+    ) -> Result<ManifestId> {
+        if bytes.len() as u64 > self.limits.max_body_length {
+            return Err(Error::Limit {
+                what: "body length",
+                actual: bytes.len() as u64,
+                limit: self.limits.max_body_length,
+            });
+        }
+        if let Some(id) =
+            self.existing_body_id(bytes, media_type.as_deref(), content_encoding.as_deref())?
+        {
+            return Ok(id);
+        }
+        let chunker_config = self.chunker_config.for_body_length(bytes.len() as u64);
+        self.append_reader_with_config_and_metadata(
+            Cursor::new(bytes),
+            chunker_config,
+            media_type,
+            content_encoding,
+        )
     }
 
     /// Appends `bytes` while reusing byte ranges from one semantically related
@@ -890,7 +944,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
                 limit: self.limits.max_body_length,
             });
         }
-        if let Some(id) = self.existing_body_id(bytes)? {
+        if let Some(id) = self.existing_body_id(bytes, None, None)? {
             return Ok(id);
         }
         let Some(base_manifest) = self.manifests.get(&predecessor).cloned() else {
@@ -953,8 +1007,18 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
 
     fn append_reader_with_config<R: Read>(
         &mut self,
+        input: R,
+        chunker_config: ChunkerConfig,
+    ) -> Result<ManifestId> {
+        self.append_reader_with_config_and_metadata(input, chunker_config, None, None)
+    }
+
+    fn append_reader_with_config_and_metadata<R: Read>(
+        &mut self,
         mut input: R,
         chunker_config: ChunkerConfig,
+        media_type: Option<Vec<u8>>,
+        content_encoding: Option<Vec<u8>>,
     ) -> Result<ManifestId> {
         let mut whole_hash = blake3::Hasher::new();
         let mut chunker = StreamingChunker::new(chunker_config)?;
@@ -1007,8 +1071,8 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
                 algorithm: crate::HashAlgorithm::Blake3,
                 digest: *whole_hash.finalize().as_bytes(),
             },
-            None,
-            None,
+            media_type,
+            content_encoding,
             refs,
         );
         self.append_manifest(manifest)
@@ -1179,6 +1243,43 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
                 .push(id);
         }
         self.exchanges.insert(id, exchange);
+        Ok(id)
+    }
+
+    /// Append an exchange and its optional transport-metadata companion as
+    /// adjacent standalone frames. Adjacency is the compatibility-safe index:
+    /// old readers skip the optional frame, while new checkpoint/footer readers
+    /// find it from the existing Exchange offset without a new index kind.
+    pub fn append_exchange_with_metadata(
+        &mut self,
+        exchange: Exchange,
+        data: ExchangeMetadataData,
+    ) -> Result<ExchangeId> {
+        let metadata = ExchangeMetadata::new(exchange.id, data);
+        let payload = metadata.encode(&self.limits)?;
+        if let Some(existing) = self.exchanges.get(&exchange.id) {
+            if existing != &exchange {
+                return Err(Error::Invalid("exchange hash collision"));
+            }
+            return match self.exchange_metadata.get(&exchange.id) {
+                Some(existing_metadata) if existing_metadata == &metadata => Ok(exchange.id),
+                Some(_) => Err(Error::Invalid("conflicting exchange metadata")),
+                None => Err(Error::Invalid(
+                    "exchange metadata must be appended atomically with its exchange",
+                )),
+            };
+        }
+
+        // Never put this extension inside MetadataPage: shipped v1 readers
+        // reject unknown inner record types even when their flags are optional.
+        self.flush_metadata_page()?;
+        let batching = self.metadata_page_batching;
+        self.metadata_page_batching = false;
+        let exchange_result = self.append_exchange(exchange);
+        self.metadata_page_batching = batching;
+        let id = exchange_result?;
+        self.append_optional_frame(RecordType::ExchangeMetadata, payload)?;
+        self.exchange_metadata.insert(id, metadata);
         Ok(id)
     }
 
@@ -1375,6 +1476,9 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
     }
     pub fn exchange_count(&self) -> usize {
         self.exchanges.len()
+    }
+    pub fn exchange_metadata(&self, id: &ExchangeId) -> Option<&ExchangeMetadata> {
+        self.exchange_metadata.get(id)
     }
     pub fn conversation_entry_count(&self) -> usize {
         self.conversation_entries.len()
@@ -1688,8 +1792,18 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
         Ok((offset, length))
     }
 
-    fn existing_body_id(&mut self, bytes: &[u8]) -> Result<Option<ManifestId>> {
-        let identity = (ChunkHash::blake3(bytes), bytes.len() as u64);
+    fn existing_body_id(
+        &mut self,
+        bytes: &[u8],
+        media_type: Option<&[u8]>,
+        content_encoding: Option<&[u8]>,
+    ) -> Result<Option<ManifestId>> {
+        let identity = (
+            ChunkHash::blake3(bytes),
+            bytes.len() as u64,
+            media_type.map(Vec::from),
+            content_encoding.map(Vec::from),
+        );
         let Some(id) = self.body_identities.get(&identity).copied() else {
             return Ok(None);
         };
@@ -1861,7 +1975,12 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             });
         }
         validate_manifest_references(&manifest, &self.chunks)?;
-        let identity = (manifest.whole_body_hash, manifest.total_length);
+        let identity = (
+            manifest.whole_body_hash,
+            manifest.total_length,
+            manifest.media_type.clone(),
+            manifest.content_encoding.clone(),
+        );
         if let Some(existing_id) = self.body_identities.get(&identity).copied() {
             let existing = self
                 .manifests
@@ -1999,6 +2118,19 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
     }
 
     fn append_frame(&mut self, kind: RecordType, payload: Vec<u8>) -> Result<u64> {
+        self.append_frame_with_flags(kind, RecordFrame::REQUIRED, payload)
+    }
+
+    fn append_optional_frame(&mut self, kind: RecordType, payload: Vec<u8>) -> Result<u64> {
+        self.append_frame_with_flags(kind, 0, payload)
+    }
+
+    fn append_frame_with_flags(
+        &mut self,
+        kind: RecordType,
+        flags: u32,
+        payload: Vec<u8>,
+    ) -> Result<u64> {
         if self.sealed {
             return Err(Error::Invalid("sealed archive cannot be appended"));
         }
@@ -2013,7 +2145,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
         RecordFrame {
             record_type: kind,
             schema_version: RECORD_SCHEMA_V1,
-            flags: RecordFrame::REQUIRED,
+            flags,
             payload,
             offset,
         }
@@ -2296,6 +2428,57 @@ fn read_indexed_metadata_payload<R: Read + Seek>(
     Ok(payload)
 }
 
+fn read_adjacent_exchange_metadata<R: Read + Seek>(
+    io: &mut R,
+    limits: &Limits,
+    exchange_offset: u64,
+    indexed_end: u64,
+    expected_id: ExchangeId,
+) -> Result<Option<ExchangeMetadata>> {
+    let (exchange_frame, exchange_length) = read_frame_at(io, limits, exchange_offset)?;
+    if exchange_frame.record_type == RecordType::MetadataPage {
+        // The composite writer always forces its Exchange out of a page. A
+        // paged exchange therefore has no companion and must not be probed
+        // past the page boundary.
+        return Ok(None);
+    }
+    if exchange_frame.record_type != RecordType::Exchange
+        || exchange_frame.schema_version != RECORD_SCHEMA_V1
+        || exchange_frame.flags != RecordFrame::REQUIRED
+    {
+        return Err(Error::Invalid(
+            "exchange index does not point to a canonical exchange frame",
+        ));
+    }
+    let adjacent_offset = exchange_offset
+        .checked_add(exchange_length)
+        .ok_or(Error::Invalid("exchange companion offset overflow"))?;
+    if adjacent_offset >= indexed_end {
+        return Ok(None);
+    }
+    let (frame, _) = read_frame_at(io, limits, adjacent_offset)?;
+    if frame.record_type != RecordType::ExchangeMetadata {
+        return Ok(None);
+    }
+    if frame.flags & RecordFrame::REQUIRED != 0 {
+        return Err(Error::Unsupported(
+            "required exchange metadata companion is unsupported".into(),
+        ));
+    }
+    if frame.schema_version != RECORD_SCHEMA_V1 || frame.flags != 0 {
+        // Optional future schema/flag combinations retain archive
+        // readability. Upgrade copies the opaque frame byte-for-byte.
+        return Ok(None);
+    }
+    let metadata = ExchangeMetadata::decode(&frame.payload, limits)?;
+    if metadata.exchange_id != expected_id {
+        return Err(Error::Invalid(
+            "exchange metadata companion identity mismatch",
+        ));
+    }
+    Ok(Some(metadata))
+}
+
 fn indexed_metadata_inner_order(
     cache: &HashMap<u64, IndexedMetadataRecords>,
     offset: u64,
@@ -2386,7 +2569,7 @@ struct LoadedIndex {
     chunks: HashMap<ChunkHash, ChunkLocation>,
     manifests: HashMap<ManifestId, BodyManifest>,
     manifest_offsets: HashMap<ManifestId, u64>,
-    body_identities: HashMap<(ChunkHash, u64), ManifestId>,
+    body_identities: HashMap<BodyIdentity, ManifestId>,
     header_blocks: HashMap<HeaderBlockId, HeaderBlock>,
     header_block_offsets: HashMap<HeaderBlockId, u64>,
     stream_indexes: HashMap<StreamIndexId, StreamIndex>,
@@ -2395,6 +2578,7 @@ struct LoadedIndex {
     stage_offsets: HashMap<StageId, u64>,
     exchanges: HashMap<ExchangeId, Exchange>,
     exchange_offsets: HashMap<ExchangeId, u64>,
+    exchange_metadata: HashMap<ExchangeId, ExchangeMetadata>,
     traces: HashMap<Vec<u8>, ExchangeId>,
     sessions: HashMap<Vec<u8>, Vec<ExchangeId>>,
     conversation_entries: HashMap<ConversationEntryId, ConversationEntry>,
@@ -2420,7 +2604,7 @@ pub struct ArchiveReader<R> {
     chunks: HashMap<ChunkHash, ChunkLocation>,
     manifests: HashMap<ManifestId, BodyManifest>,
     manifest_offsets: HashMap<ManifestId, u64>,
-    body_identities: HashMap<(ChunkHash, u64), ManifestId>,
+    body_identities: HashMap<BodyIdentity, ManifestId>,
     header_blocks: HashMap<HeaderBlockId, HeaderBlock>,
     header_block_offsets: HashMap<HeaderBlockId, u64>,
     stream_indexes: HashMap<StreamIndexId, StreamIndex>,
@@ -2429,6 +2613,7 @@ pub struct ArchiveReader<R> {
     stage_offsets: HashMap<StageId, u64>,
     exchanges: HashMap<ExchangeId, Exchange>,
     exchange_offsets: HashMap<ExchangeId, u64>,
+    exchange_metadata: HashMap<ExchangeId, ExchangeMetadata>,
     traces: HashMap<Vec<u8>, ExchangeId>,
     sessions: HashMap<Vec<u8>, Vec<ExchangeId>>,
     conversation_entries: HashMap<ConversationEntryId, ConversationEntry>,
@@ -2615,6 +2800,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             stage_offsets: loaded.stage_offsets,
             exchanges: loaded.exchanges,
             exchange_offsets: loaded.exchange_offsets,
+            exchange_metadata: loaded.exchange_metadata,
             traces: loaded.traces,
             sessions: loaded.sessions,
             conversation_entries: loaded.conversation_entries,
@@ -2871,7 +3057,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
             validate_manifest_references(&value, &chunks)?;
             body_identities
-                .entry((value.whole_body_hash, value.total_length))
+                .entry((
+                    value.whole_body_hash,
+                    value.total_length,
+                    value.media_type.clone(),
+                    value.content_encoding.clone(),
+                ))
                 .or_insert(value.id);
             manifests.insert(value.id, value);
         }
@@ -2962,6 +3153,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 return Err(Error::Invalid("exchange index has a missing stage"));
             }
             exchanges.insert(value.id, value);
+        }
+
+        let mut exchange_metadata = HashMap::new();
+        for (id, offset) in sorted_offsets(&exchange_offsets) {
+            if let Some(value) =
+                read_adjacent_exchange_metadata(io, limits, offset, checkpoint.indexed_end, id)?
+            {
+                exchange_metadata.insert(id, value);
+            }
         }
 
         let mut conversation_entries = HashMap::new();
@@ -3117,6 +3317,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             stage_offsets,
             exchanges,
             exchange_offsets,
+            exchange_metadata,
             traces,
             sessions,
             conversation_entries,
@@ -3180,6 +3381,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let mut stage_offsets = HashMap::new();
         let mut exchanges = HashMap::new();
         let mut exchange_offsets = HashMap::new();
+        let mut exchange_metadata = HashMap::new();
         let mut traces = HashMap::new();
         let mut sessions: HashMap<Vec<u8>, Vec<ExchangeId>> = HashMap::new();
         let mut conversation_entries = HashMap::new();
@@ -3192,6 +3394,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let mut record_count = 0;
         let mut derived_start = None;
         let mut dangling_checkpoint = false;
+        let mut adjacent_direct_exchange = None;
         let (last_valid, truncated) = loop {
             let before = io.stream_position()?;
             if scan_end.is_some_and(|end| before >= end) {
@@ -3214,6 +3417,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 (FrameRead::CleanEof, _) => break (before, false),
                 (FrameRead::Truncated, _) => break (before, true),
                 (FrameRead::Frame, Some(frame)) => {
+                    let previous_direct_exchange = adjacent_direct_exchange.take();
                     if frame.schema_version != RECORD_SCHEMA_V1 {
                         if frame.flags & RecordFrame::REQUIRED != 0 {
                             return Err(Error::Unsupported(format!(
@@ -3248,7 +3452,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
                             let value = BodyManifest::decode(&frame.payload, &limits)?;
                             validate_manifest_references(&value, &chunks)?;
                             body_identities
-                                .entry((value.whole_body_hash, value.total_length))
+                                .entry((
+                                    value.whole_body_hash,
+                                    value.total_length,
+                                    value.media_type.clone(),
+                                    value.content_encoding.clone(),
+                                ))
                                 .or_insert(value.id);
                             manifest_offsets.insert(value.id, frame.offset);
                             if manifests.insert(value.id, value).is_some() {
@@ -3343,8 +3552,41 @@ impl<R: Read + Seek> ArchiveReader<R> {
                                 session.push(value.id);
                             }
                             exchange_offsets.insert(value.id, frame.offset);
+                            adjacent_direct_exchange = Some(value.id);
                             if exchanges.insert(value.id, value).is_some() {
                                 return Err(Error::Invalid("duplicate exchange record"));
+                            }
+                        }
+                        RecordType::ExchangeMetadata => {
+                            derived_start = None;
+                            dangling_checkpoint = false;
+                            if frame.flags & RecordFrame::REQUIRED != 0 {
+                                return Err(Error::Unsupported(
+                                    "required exchange metadata companion is unsupported".into(),
+                                ));
+                            }
+                            if frame.flags != 0 {
+                                // Unknown optional flags are safe to skip. The
+                                // adjacency slot remains consumed.
+                            } else {
+                                let value = ExchangeMetadata::decode(&frame.payload, &limits)?;
+                                let expected = previous_direct_exchange
+                                    .ok_or(Error::Invalid("orphan exchange metadata companion"))?;
+                                if value.exchange_id != expected {
+                                    return Err(Error::Invalid(
+                                        "exchange metadata companion identity mismatch",
+                                    ));
+                                }
+                                if !exchanges.contains_key(&value.exchange_id) {
+                                    return Err(Error::Invalid(
+                                        "exchange metadata companion references a missing exchange",
+                                    ));
+                                }
+                                if exchange_metadata.insert(value.exchange_id, value).is_some() {
+                                    return Err(Error::Invalid(
+                                        "duplicate exchange metadata companion",
+                                    ));
+                                }
                             }
                         }
                         RecordType::ConversationEntry => {
@@ -3453,7 +3695,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
                                         let value = BodyManifest::decode(&inner.payload, &limits)?;
                                         validate_manifest_references(&value, &chunks)?;
                                         body_identities
-                                            .entry((value.whole_body_hash, value.total_length))
+                                            .entry((
+                                                value.whole_body_hash,
+                                                value.total_length,
+                                                value.media_type.clone(),
+                                                value.content_encoding.clone(),
+                                            ))
                                             .or_insert(value.id);
                                         manifest_offsets.insert(value.id, frame.offset);
                                         if manifests.insert(value.id, value).is_some() {
@@ -3699,6 +3946,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             stage_offsets,
             exchanges,
             exchange_offsets,
+            exchange_metadata,
             traces,
             sessions,
             conversation_entries,
@@ -3787,6 +4035,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
     pub fn exchange(&self, id: &ExchangeId) -> Option<&Exchange> {
         self.exchanges.get(id)
     }
+    pub fn exchange_metadata(&self, id: &ExchangeId) -> Option<&ExchangeMetadata> {
+        self.exchange_metadata.get(id)
+    }
     pub fn conversation_entry(&self, id: &ConversationEntryId) -> Option<&ConversationEntry> {
         self.conversation_entries.get(id)
     }
@@ -3800,6 +4051,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         self.traces
             .get(trace_id)
             .and_then(|id| self.exchanges.get(id))
+    }
+    pub fn exchange_metadata_by_trace(&self, trace_id: &[u8]) -> Option<&ExchangeMetadata> {
+        self.traces
+            .get(trace_id)
+            .and_then(|id| self.exchange_metadata.get(id))
     }
     pub fn exchanges_for_session(&self, session_id: &[u8]) -> Option<&[ExchangeId]> {
         self.sessions.get(session_id).map(Vec::as_slice)
@@ -4276,6 +4532,32 @@ mod tests {
         assert_eq!(reader.header_block(&block_id), Some(&block));
         assert_eq!(reader.header_block_count(), 1);
         assert_eq!(reader.recovery_status(), RecoveryStatus::Clean);
+    }
+
+    #[test]
+    fn manifest_metadata_variants_share_the_same_physical_chunks() {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ArchiveWriter::create(cursor, header(), small_config(), limits()).unwrap();
+        let body = br#"{"same":"bytes"}"#;
+        let plain = writer.append_body(body).unwrap();
+        let chunks = writer.chunk_count();
+        let json = writer
+            .append_body_with_metadata(body, Some(b"application/json".to_vec()), None)
+            .unwrap();
+        assert_ne!(plain, json);
+        assert_eq!(writer.chunk_count(), chunks);
+        assert_eq!(writer.manifest_count(), 2);
+        writer.seal().unwrap();
+        let bytes = writer.into_inner().unwrap().into_inner();
+        let mut reader = ArchiveReader::open(Cursor::new(bytes), limits()).unwrap();
+        assert_eq!(reader.chunk_count(), chunks);
+        assert_eq!(reader.manifest_count(), 2);
+        assert_eq!(reader.read_body(&plain).unwrap(), body);
+        assert_eq!(reader.read_body(&json).unwrap(), body);
+        assert_eq!(
+            reader.manifest(&json).unwrap().media_type.as_deref(),
+            Some(b"application/json".as_slice())
+        );
     }
 
     #[test]
@@ -5073,7 +5355,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_rejects_unknown_optional_frames_and_dictionary_mismatch() {
+    fn upgrade_preserves_unknown_optional_frames_and_rejects_dictionary_mismatch() {
         let mut writer =
             ArchiveWriter::create(Cursor::new(Vec::new()), header(), small_config(), limits())
                 .unwrap();
@@ -5088,17 +5370,18 @@ mod tests {
         .unwrap();
         writer.seal().unwrap();
         let mut unknown = writer.into_inner().unwrap();
-        assert!(matches!(
-            upgrade_archive(
-                &mut unknown,
-                Cursor::new(Vec::new()),
-                [1; 16],
-                1,
-                b"test".to_vec(),
-                limits(),
-            ),
-            Err(Error::Unsupported(_))
-        ));
+        let (upgraded, _) = upgrade_archive(
+            &mut unknown,
+            Cursor::new(Vec::new()),
+            [1; 16],
+            1,
+            b"test".to_vec(),
+            limits(),
+        )
+        .unwrap();
+        let mut upgraded = Cursor::new(upgraded.into_inner());
+        unknown.rewind().unwrap();
+        verify_upgraded_archive(&mut unknown, &mut upgraded, limits()).unwrap();
 
         let mut writer =
             ArchiveWriter::create(Cursor::new(Vec::new()), header(), small_config(), limits())

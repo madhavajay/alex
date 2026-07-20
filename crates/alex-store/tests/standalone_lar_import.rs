@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alex_lar::{
-    ArchiveWriter, ChunkerConfig, Exchange, ExchangeData, FileHeader, HeaderAtom, HeaderBlock,
-    HeaderFidelity, Limits, Stage, StageData, StageKind,
+    ArchiveReader, ArchiveWriter, ArtifactRangeRef, ChunkerConfig, ConversationEntry,
+    ConversationEntryData, Exchange, ExchangeData, FileHeader, Generation, GenerationData,
+    GenerationReason, HeaderAtom, HeaderBlock, HeaderFidelity, Limits, Stage, StageData, StageKind,
+    TurnView, TurnViewData, REQUIRED_FEATURE_CONVERSATION_DAG,
 };
 use alex_store::{
     LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, LarStandaloneImportOptions, Store,
@@ -150,6 +152,114 @@ fn write_body_archive(path: &Path, file_uuid: [u8; 16], chunk_size: usize, body:
     )
     .unwrap();
     writer.append_body(body).unwrap();
+    writer.seal().unwrap();
+    writer.get_ref().sync_all().unwrap();
+}
+
+fn write_shared_stage_archive(path: &Path) {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut writer = ArchiveWriter::create(
+        file,
+        FileHeader::standalone(
+            [81; 16],
+            1_700_000_000_000_000_000,
+            b"stage-sharing".to_vec(),
+        ),
+        ChunkerConfig::default(),
+        Limits::default(),
+    )
+    .unwrap();
+    let shared = writer
+        .append_stage(Stage::new(StageData::new(
+            StageKind::RouterDecision,
+            1_700_000_000_000_000_000,
+        )))
+        .unwrap();
+    for (trace, sequence, stages) in [
+        ("trace-repeat", 1, vec![shared, shared]),
+        ("trace-shared", 2, vec![shared]),
+        ("trace-zero", 3, vec![]),
+    ] {
+        writer
+            .append_exchange(Exchange::new(ExchangeData::new(
+                trace.as_bytes(),
+                sequence,
+                1_700_000_000_000_000_000 + sequence,
+                stages,
+            )))
+            .unwrap();
+    }
+    writer.seal().unwrap();
+    writer.get_ref().sync_all().unwrap();
+}
+
+fn write_conversation_archive(path: &Path, body: &[u8]) {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut header = FileHeader::standalone(
+        [92; 16],
+        1_700_000_000_000_000_000,
+        b"conversation-rekey".to_vec(),
+    );
+    header.required_feature_bits |= REQUIRED_FEATURE_CONVERSATION_DAG;
+    let mut writer = ArchiveWriter::create(
+        file,
+        header,
+        ChunkerConfig {
+            min_size: 4,
+            target_size: 4,
+            max_size: 4,
+        },
+        Limits::default(),
+    )
+    .unwrap();
+    let manifest = writer.append_body(body).unwrap();
+    let entry = writer
+        .append_conversation_entry(ConversationEntry::new(ConversationEntryData::raw_only(
+            vec![ArtifactRangeRef {
+                manifest_id: manifest,
+                byte_offset: 0,
+                byte_length: body.len() as u64,
+            }],
+        )))
+        .unwrap();
+    let generation = writer
+        .append_generation(Generation::new(GenerationData {
+            parent_generation_id: None,
+            entries: vec![entry],
+            reason: GenerationReason::Initial,
+        }))
+        .unwrap();
+    let mut stage = StageData::new(StageKind::ClientRequest, 1_700_000_000_000_000_000);
+    stage.request_body_manifest_ref = Some(manifest);
+    let stage = writer.append_stage(Stage::new(stage)).unwrap();
+    let mut exchange = ExchangeData::new(
+        b"trace-conversation-rekey",
+        1,
+        1_700_000_000_000_000_000,
+        vec![stage],
+    );
+    exchange.session_id = Some(b"session-conversation-rekey".to_vec());
+    writer.append_exchange(Exchange::new(exchange)).unwrap();
+    writer
+        .append_turn_view(TurnView::new(TurnViewData {
+            trace_id: b"trace-conversation-rekey".to_vec(),
+            generation_id: generation,
+            upto_index: 0,
+            response_entry_refs: Vec::new(),
+        }))
+        .unwrap();
     writer.seal().unwrap();
     writer.get_ref().sync_all().unwrap();
 }
@@ -470,6 +580,134 @@ fn repeated_import_rejects_incompatible_stage_catalog_binding() {
     let error = store
         .import_sealed_lar_archive(&archive, &LarStandaloneImportOptions::default())
         .unwrap_err();
-    assert!(error.to_string().contains("incompatible catalog metadata"));
+    assert!(error.to_string().contains("incompatible"));
     assert_eq!(catalog_count(&data_dir, "lar_files"), 1);
+}
+
+#[test]
+fn first_import_rejects_an_existing_legacy_trace_without_rebinding_its_body() {
+    let root = tmpdir("legacy-trace-collision");
+    let archive = root.join("source.lar");
+    write_archive(&archive, true);
+    let data_dir = root.join("store");
+    let store = Store::open(data_dir.clone()).unwrap();
+    let original = b"legacy body must remain authoritative";
+    let path = store
+        .write_body("trace-standalone", "request.json", original)
+        .unwrap();
+    store
+        .insert_trace(&alex_core::TraceRecord {
+            id: "trace-standalone".into(),
+            req_body_path: Some(path),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let error = store
+        .import_sealed_lar_archive(&archive, &LarStandaloneImportOptions::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(catalog_count(&data_dir, "lar_files"), 0);
+    assert_eq!(catalog_count(&data_dir, "lar_trace_artifacts"), 0);
+    assert_eq!(
+        store
+            .read_lar_or_legacy_artifact("trace", "trace-standalone", "client_request", None,)
+            .unwrap()
+            .unwrap(),
+        original
+    );
+}
+
+#[test]
+fn shared_repeated_and_zero_stage_exchanges_keep_explicit_ownership() {
+    let root = tmpdir("stage-occurrences");
+    let archive = root.join("source.lar");
+    write_shared_stage_archive(&archive);
+    let data_dir = root.join("store");
+    let store = Store::open(data_dir.clone()).unwrap();
+    let report = store
+        .import_sealed_lar_archive(&archive, &LarStandaloneImportOptions::default())
+        .unwrap();
+    assert_eq!(report.exchanges, 3);
+    assert_eq!(report.stages, 3);
+    assert_eq!(catalog_count(&data_dir, "lar_stage_records"), 3);
+    assert_eq!(catalog_count(&data_dir, "lar_exchange_records"), 3);
+
+    let exported = root.join("zero-export.lar");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&exported)
+        .unwrap();
+    let mut writer = ArchiveWriter::create(
+        file,
+        FileHeader::standalone([82; 16], 1_700_000_000_100_000_000, b"zero-export".to_vec()),
+        ChunkerConfig::default(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(store
+        .append_exact_trace_to_standalone(&mut writer, "trace-zero")
+        .unwrap());
+    writer.seal().unwrap();
+    let reader = ArchiveReader::open(File::open(exported).unwrap(), Limits::default()).unwrap();
+    assert!(reader
+        .exchange_by_trace(b"trace-zero")
+        .unwrap()
+        .data
+        .stages
+        .is_empty());
+}
+
+#[test]
+fn logical_body_reuse_transitively_rekeys_and_reexports_conversation_ids() {
+    let root = tmpdir("conversation-rekey");
+    let body = b"AAAABBBBCCCCDDDD";
+    let donor = root.join("donor.lar");
+    let source = root.join("source.lar");
+    write_body_archive(&donor, [91; 16], 16, body);
+    write_conversation_archive(&source, body);
+    let data_dir = root.join("store");
+    let store = Store::open(data_dir).unwrap();
+    store
+        .import_sealed_lar_archive(&donor, &LarStandaloneImportOptions::default())
+        .unwrap();
+    let imported = store
+        .import_sealed_lar_archive(&source, &LarStandaloneImportOptions::default())
+        .unwrap();
+    assert_eq!(imported.manifests_reused, 1);
+
+    let destination = root.join("roundtrip.lar");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&destination)
+        .unwrap();
+    let mut header = FileHeader::standalone(
+        [93; 16],
+        1_700_000_000_100_000_000,
+        b"conversation-roundtrip".to_vec(),
+    );
+    header.required_feature_bits |= REQUIRED_FEATURE_CONVERSATION_DAG;
+    let mut writer =
+        ArchiveWriter::create(file, header, ChunkerConfig::default(), Limits::default()).unwrap();
+    assert!(store
+        .append_exact_trace_to_standalone(&mut writer, "trace-conversation-rekey")
+        .unwrap());
+    writer.seal().unwrap();
+    let mut reader =
+        ArchiveReader::open(File::open(destination).unwrap(), Limits::default()).unwrap();
+    let turn = reader
+        .turn_view_by_trace(b"trace-conversation-rekey")
+        .unwrap();
+    let generation = reader.generation(&turn.data.generation_id).unwrap();
+    let manifest_id = reader
+        .conversation_entry(&generation.data.entries[0])
+        .unwrap()
+        .data
+        .raw_ranges[0]
+        .manifest_id;
+    assert_eq!(reader.read_body(&manifest_id).unwrap(), body);
 }

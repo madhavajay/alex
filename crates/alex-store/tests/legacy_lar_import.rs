@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alex_core::TraceRecord;
-use alex_lar::{ArchiveReader, Limits, OpenPath};
+use alex_lar::{ArchiveReader, HeaderFidelity, Limits, OpenPath, StageKind};
 use alex_store::{
     LarArtifactLocation, LarArtifactReadRequest, LarBodyArtifact, LarBodyStoreConfig,
     LarBodyStoreMode, LarLegacyImportOptions, LarLegacyResourceControls, Store, ToolCallRecord,
+    LAR_HEADER_FLAG_REDACTED,
 };
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -129,11 +130,11 @@ fn worker_pool_and_progress_controls_are_observable() {
             report.completed_items,
             report.remaining_items
         ),
-        (4, 4, 0)
+        (8, 8, 0)
     );
     assert_eq!(report.progress_percent, 100.0);
     assert_eq!(report.eta_seconds, None);
-    assert_eq!(report.yield_count, 4);
+    assert_eq!(report.yield_count, 8);
     assert_eq!(report.last_error, None);
 }
 
@@ -483,8 +484,8 @@ fn pack_index_cap_rotates_between_validated_artifacts_and_bounds_each_reader() {
         .unwrap();
     assert_eq!((report.migrated, report.failed), (5, 0));
     assert_eq!(report.effective_max_pack_index_entries, 2);
-    assert_eq!(report.pack_sequence, 4);
-    assert_eq!(report.packs_rotated, 4);
+    assert_eq!(report.pack_sequence, 5);
+    assert_eq!(report.packs_rotated, 5);
 
     let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
     let packs: Vec<(String, String)> = catalog
@@ -499,19 +500,19 @@ fn pack_index_cap_rotates_between_validated_artifacts_and_bounds_each_reader() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(packs.len(), 5);
+    assert_eq!(packs.len(), 6);
     assert_eq!(
         packs.iter().filter(|(_, state)| state == "sealed").count(),
-        4
+        5
     );
     assert_eq!(
         packs.iter().filter(|(_, state)| state == "active").count(),
         1
     );
-    for (path, _) in packs {
+    for (index, (path, _)) in packs.into_iter().enumerate() {
         let reader =
             ArchiveReader::open(std::fs::File::open(path).unwrap(), Limits::default()).unwrap();
-        assert_eq!(reader.manifest_count(), 1);
+        assert_eq!(reader.manifest_count(), usize::from(index < 5));
     }
     for (id, body) in expected {
         assert_eq!(
@@ -561,8 +562,8 @@ fn capped_pack_continuation_resumes_on_a_new_deterministic_pack() {
             ..LarLegacyImportOptions::default()
         })
         .unwrap();
-    assert_eq!((resumed.migrated, resumed.pack_sequence), (1, 2));
-    assert_eq!(resumed.packs_rotated, 1);
+    assert_eq!((resumed.migrated, resumed.pack_sequence), (1, 3));
+    assert_eq!(resumed.packs_rotated, 2);
     assert_eq!(resumed.job_id, first.job_id);
     assert_eq!(resumed.job_state, "complete");
 
@@ -574,7 +575,7 @@ fn capped_pack_continuation_resumes_on_a_new_deterministic_pack() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(pack_count, 3);
+    assert_eq!(pack_count, 4);
     let sealed_count: i64 = catalog
         .query_row(
             "SELECT COUNT(*) FROM lar_files
@@ -583,7 +584,7 @@ fn capped_pack_continuation_resumes_on_a_new_deterministic_pack() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(sealed_count, 2);
+    assert_eq!(sealed_count, 3);
 }
 
 #[test]
@@ -613,8 +614,8 @@ fn pack_byte_cap_rotates_after_the_artifact_that_crosses_it() {
             ..LarLegacyImportOptions::default()
         })
         .unwrap();
-    assert_eq!((report.migrated, report.pack_sequence), (2, 1));
-    assert_eq!(report.packs_rotated, 1);
+    assert_eq!((report.migrated, report.pack_sequence), (2, 2));
+    assert_eq!(report.packs_rotated, 2);
     let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
     let pack_count: i64 = catalog
         .query_row(
@@ -623,7 +624,7 @@ fn pack_byte_cap_rotates_after_the_artifact_that_crosses_it() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(pack_count, 2);
+    assert_eq!(pack_count, 3);
 }
 
 #[test]
@@ -912,4 +913,435 @@ fn completed_import_starts_one_deterministic_generation_for_new_legacy_writes() 
         })
         .unwrap();
     assert_eq!(job_count, 2, "an empty rerun created another generation");
+}
+
+#[test]
+fn metadata_import_preserves_proven_headers_routes_tool_order_and_shared_bodies() {
+    let data_dir = tmpdir("metadata-fidelity");
+    let store = Store::open(data_dir.clone()).unwrap();
+    let request = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+    let request_path = store
+        .write_body("trace-metadata", "request.json", request)
+        .unwrap();
+    let upstream_path = store
+        .write_body("trace-metadata", "upstream-request.json", request)
+        .unwrap();
+    let response_path = store
+        .write_body("trace-metadata", "response.body", br#"{"ok":true}"#)
+        .unwrap();
+    let mut row = trace("trace-metadata", "session-metadata");
+    row.ts_request_ms = 100;
+    row.ts_response_ms = Some(400);
+    row.run_id = Some("run-metadata".into());
+    row.harness = Some("pi".into());
+    row.client_format = Some("openai-responses".into());
+    row.upstream_format = Some("openai-chat".into());
+    row.method = Some("POST".into());
+    row.path = Some("/v1/responses".into());
+    row.streamed = Some(true);
+    row.req_body_path = Some(request_path.clone());
+    row.upstream_req_body_path = Some(upstream_path.clone());
+    row.resp_body_path = Some(response_path.clone());
+    row.req_headers_json =
+        Some(r#"[["X-Dupe","one"],["x-dupe","two"],["Authorization","secret"]]"#.into());
+    row.resp_headers_json = Some(r#"{"Set-Cookie":["a=1","b=2"],"X-Response":"yes"}"#.into());
+    row.upstream_provider = Some("openai".into());
+    row.requested_model = Some("requested".into());
+    row.routed_model = Some("served".into());
+    row.status = Some(200);
+    row.usage.input_tokens = Some(120);
+    row.usage.cached_input_tokens = Some(80);
+    row.usage.cache_creation_tokens = Some(12);
+    row.usage.output_tokens = Some(30);
+    row.usage.reasoning_tokens = Some(9);
+    row.cost_usd = Some(0.000_123_456);
+    row.billing_bucket = Some("standard".into());
+    row.error_kind = Some("provider_error_type".into());
+    row.error_code = Some("provider_error_code".into());
+    row.subscription_identity = Some("subscription-stable".into());
+    row.tags = Some(r#"{"feature":"lar"}"#.into());
+    row.client_ip = Some("127.0.0.1".into());
+    row.key_fingerprint = Some("key-fingerprint".into());
+    row.reasoning_effort = Some("high".into());
+    row.thinking_budget = Some(4096);
+    row.substituted = true;
+    row.original_model = Some("requested".into());
+    row.served_model = Some("served".into());
+    row.substitution_reason = Some("capacity".into());
+    row.original_account_id = Some("account-a".into());
+    row.served_account_id = Some("account-b".into());
+    row.attempts = Some(
+        r#"[{"account_id":"account-a","model":"requested","rung":"primary"},{"account_id":"account-b","model":"served","retry":1,"legacy_extra":"kept"}]"#.into(),
+    );
+    store.insert_trace(&row).unwrap();
+
+    let args_path = store
+        .write_body("tool-linked", "tool-args.json", br#"{"cmd":"pwd"}"#)
+        .unwrap();
+    let result_path = store
+        .write_body("tool-linked", "tool-result.json", b"/tmp\n")
+        .unwrap();
+    store
+        .upsert_tool_call(&ToolCallRecord {
+            id: "tool-linked".into(),
+            harness: "pi".into(),
+            session_id: "session-metadata".into(),
+            turn_id: Some("turn-linked".into()),
+            tool_call_id: "call-linked".into(),
+            trace_id: Some("trace-metadata".into()),
+            tool_name: "bash".into(),
+            ts_start_ms: 250,
+            ts_end_ms: Some(300),
+            is_error: Some(false),
+            exit_status: Some(7),
+            args_body_path: Some(args_path.clone()),
+            result_body_path: Some(result_path.clone()),
+        })
+        .unwrap();
+
+    let unlinked_result_path = store
+        .write_body("tool-unlinked", "tool-result.json", b"orphan result")
+        .unwrap();
+    store
+        .upsert_tool_call(&ToolCallRecord {
+            id: "tool-unlinked".into(),
+            harness: "pi".into(),
+            session_id: "session-metadata".into(),
+            turn_id: None,
+            tool_call_id: "call-unlinked".into(),
+            trace_id: Some("missing-trace".into()),
+            tool_name: "read".into(),
+            ts_start_ms: 500,
+            ts_end_ms: Some(510),
+            is_error: Some(true),
+            exit_status: Some(1),
+            args_body_path: None,
+            result_body_path: Some(unlinked_result_path.clone()),
+        })
+        .unwrap();
+
+    let first = store
+        .run_lar_legacy_import(&LarLegacyImportOptions::default())
+        .unwrap();
+    assert_eq!((first.metadata_migrated, first.metadata_failed), (2, 0));
+    assert!(first.metadata_unsupported >= 2);
+    for path in [
+        request_path,
+        upstream_path,
+        response_path,
+        args_path,
+        result_path,
+        unlinked_result_path,
+    ] {
+        assert!(Path::new(&path).exists(), "legacy source changed: {path}");
+    }
+
+    let reader = ArchiveReader::open(
+        std::fs::File::open(&first.file_path).unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    let exchange = reader.exchange_by_trace(b"trace-metadata").unwrap();
+    let companion = &reader.exchange_metadata(&exchange.id).unwrap().data;
+    assert_eq!(companion.ts_request_ms, Some(100));
+    assert_eq!(companion.ts_response_ms, Some(400));
+    assert_eq!(companion.harness.as_deref(), Some(b"pi".as_slice()));
+    assert_eq!(
+        companion.client_format.as_deref(),
+        Some(b"openai-responses".as_slice())
+    );
+    assert_eq!(
+        companion.upstream_format.as_deref(),
+        Some(b"openai-chat".as_slice())
+    );
+    assert_eq!(companion.method.as_deref(), Some(b"POST".as_slice()));
+    assert_eq!(companion.path.as_deref(), Some(b"/v1/responses".as_slice()));
+    assert_eq!(companion.streamed, Some(true));
+    assert_eq!(companion.status, Some(200));
+    assert_eq!(companion.cost_usd_bits, Some(0.000_123_456f64.to_bits()));
+    assert_eq!(
+        companion.billing_bucket.as_deref(),
+        Some(b"standard".as_slice())
+    );
+    assert_eq!(
+        companion.error_kind.as_deref(),
+        Some(b"provider_error_type".as_slice())
+    );
+    assert_eq!(
+        companion.error_code.as_deref(),
+        Some(b"provider_error_code".as_slice())
+    );
+    assert_eq!(
+        companion.subscription_identity.as_deref(),
+        Some(b"subscription-stable".as_slice())
+    );
+    assert_eq!(
+        companion.tags_json.as_deref(),
+        Some(br#"{"feature":"lar"}"#.as_slice())
+    );
+    assert_eq!(
+        companion.client_ip.as_deref(),
+        Some(b"127.0.0.1".as_slice())
+    );
+    assert_eq!(
+        companion.key_fingerprint.as_deref(),
+        Some(b"key-fingerprint".as_slice())
+    );
+    assert_eq!(
+        companion.reasoning_effort.as_deref(),
+        Some(b"high".as_slice())
+    );
+    assert_eq!(companion.thinking_budget, Some(4096));
+    assert_eq!(companion.input_tokens, Some(120));
+    assert_eq!(companion.cached_input_tokens, Some(80));
+    assert_eq!(companion.cache_creation_tokens, Some(12));
+    assert_eq!(companion.output_tokens, Some(30));
+    assert_eq!(companion.reasoning_tokens, Some(9));
+    let stages = exchange
+        .data
+        .stages
+        .iter()
+        .map(|id| reader.stage(id).unwrap())
+        .collect::<Vec<_>>();
+    let kinds = stages
+        .iter()
+        .map(|stage| stage.data.kind)
+        .collect::<Vec<_>>();
+    let tool_call = kinds
+        .iter()
+        .position(|kind| *kind == StageKind::ToolCall)
+        .unwrap();
+    let tool_result = kinds
+        .iter()
+        .position(|kind| *kind == StageKind::ToolResult)
+        .unwrap();
+    let client_response = kinds
+        .iter()
+        .position(|kind| *kind == StageKind::ClientResponse)
+        .unwrap();
+    assert!(tool_call < tool_result && tool_result < client_response);
+    let linked_provenance =
+        std::str::from_utf8(stages[tool_call].data.routing_reason.as_deref().unwrap()).unwrap();
+    assert!(linked_provenance.starts_with("legacy_tool_metadata_json:"));
+    assert!(linked_provenance.contains(r#""harness":"pi""#));
+    assert!(linked_provenance.contains(r#""turn_id":"turn-linked""#));
+    assert!(linked_provenance.contains(r#""legacy_trace_id":"trace-metadata""#));
+    let client_request = stages
+        .iter()
+        .find(|stage| stage.data.kind == StageKind::ClientRequest)
+        .unwrap();
+    let upstream_request = stages
+        .iter()
+        .find(|stage| stage.data.kind == StageKind::UpstreamRequest)
+        .unwrap();
+    assert_eq!(
+        client_request.data.request_body_manifest_ref,
+        upstream_request.data.request_body_manifest_ref,
+        "unchanged upstream request must reference the one stored body manifest"
+    );
+    let request_headers = reader
+        .header_block(&client_request.data.request_headers_ref.unwrap())
+        .unwrap();
+    assert_eq!(
+        request_headers.fidelity,
+        HeaderFidelity::LegacyCasingUnknown
+    );
+    assert_eq!(request_headers.atoms[0].original_name, b"X-Dupe");
+    assert_eq!(request_headers.atoms[0].value, b"one");
+    assert_eq!(request_headers.atoms[1].original_name, b"x-dupe");
+    assert_eq!(request_headers.atoms[1].value, b"two");
+    assert_eq!(request_headers.atoms[2].value, b"<redacted>");
+    assert_ne!(request_headers.atoms[2].flags & LAR_HEADER_FLAG_REDACTED, 0);
+    let attempts = stages
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.data.kind,
+                StageKind::AccountRouting | StageKind::RetryDecision | StageKind::FailoverDecision
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].data.attempt_number, Some(1));
+    assert_eq!(attempts[1].data.attempt_number, Some(2));
+    assert_eq!(
+        attempts[1].data.account_id.as_deref(),
+        Some(b"account-b".as_slice())
+    );
+    assert_eq!(
+        attempts[1].data.error_class.as_deref(),
+        Some(b"legacy_opaque_metadata".as_slice())
+    );
+    assert_eq!(
+        stages[tool_result].data.routing_reason.as_deref(),
+        Some(b"legacy_tool_exit_status:7".as_slice())
+    );
+    assert_eq!(stages[tool_result].data.status_code, None);
+    let response = stages
+        .iter()
+        .find(|stage| stage.data.kind == StageKind::UpstreamResponse)
+        .unwrap();
+    let usage = response.data.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, 120);
+    assert_eq!(usage.cached_tokens, 80);
+    assert_eq!(usage.output_tokens, 30);
+    assert_eq!(usage.reasoning_tokens, 9);
+    assert_eq!(response.data.cost_nanos, Some(123_456));
+    assert_eq!(
+        response.data.cost_currency.as_deref(),
+        Some(b"USD".as_slice())
+    );
+
+    let unlinked = reader
+        .exchange_by_trace(b"legacy-tool:tool-unlinked")
+        .unwrap();
+    let unlinked_stages = unlinked
+        .data
+        .stages
+        .iter()
+        .map(|id| reader.stage(id).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(unlinked_stages.len(), 2);
+    assert_eq!(unlinked_stages[0].data.kind, StageKind::ToolCall);
+    assert_eq!(unlinked_stages[1].data.kind, StageKind::ToolResult);
+    let unlinked_provenance =
+        std::str::from_utf8(unlinked_stages[0].data.routing_reason.as_deref().unwrap()).unwrap();
+    assert!(unlinked_provenance.contains(r#""harness":"pi""#));
+    assert!(unlinked_provenance.contains(r#""turn_id":null"#));
+    assert!(unlinked_provenance.contains(r#""legacy_trace_id":"missing-trace""#));
+    assert_eq!(
+        unlinked_stages[1].data.error_class.as_deref(),
+        Some(b"tool_error".as_slice())
+    );
+
+    let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
+    let fidelity_detail: String = catalog
+        .query_row(
+            "SELECT h.fidelity_detail FROM lar_header_blocks h
+             JOIN lar_stage_records s ON s.request_headers_ref=h.block_id
+             WHERE s.trace_id='trace-metadata' AND s.kind='client_request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fidelity_detail, "legacy_casing_unknown");
+    let before_counts: (i64, i64, i64) = catalog
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM lar_header_blocks),
+                    (SELECT COUNT(*) FROM lar_stage_records),
+                    (SELECT COUNT(*) FROM lar_migration_items
+                       WHERE artifact_kind='exchange_metadata')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    drop(catalog);
+    let repeated = store
+        .run_lar_legacy_import(&LarLegacyImportOptions::default())
+        .unwrap();
+    assert!(!repeated.claimed);
+    let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
+    let after_counts: (i64, i64, i64) = catalog
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM lar_header_blocks),
+                    (SELECT COUNT(*) FROM lar_stage_records),
+                    (SELECT COUNT(*) FROM lar_migration_items
+                       WHERE artifact_kind='exchange_metadata')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after_counts, before_counts);
+}
+
+#[test]
+fn v2_metadata_upgrade_reuses_v1_pointer_after_legacy_gzip_cleanup() {
+    let data_dir = tmpdir("v1-cleaned-upgrade");
+    let store = Store::open(data_dir.clone()).unwrap();
+    let legacy_path = store
+        .write_body("trace-v1", "request.json", b"body retained only in LAR")
+        .unwrap();
+    let mut row = trace("trace-v1", "session-v1");
+    row.req_body_path = Some(legacy_path.clone());
+    row.req_headers_json = Some(r#"{"X-Legacy":"yes"}"#.into());
+    store.insert_trace(&row).unwrap();
+
+    // Stop after the one body item, matching a completed body-only v1
+    // installation before exchange metadata existed.
+    let body_only = store
+        .run_lar_legacy_import(&LarLegacyImportOptions {
+            limit: Some(1),
+            ..LarLegacyImportOptions::default()
+        })
+        .unwrap();
+    assert_eq!((body_only.migrated, body_only.metadata_migrated), (1, 0));
+    let source_key = data_dir
+        .join("alexandria.sqlite3")
+        .to_string_lossy()
+        .into_owned();
+    let mut old_hasher = blake3::Hasher::new();
+    old_hasher.update(b"alex-lar-legacy-job-v1");
+    old_hasher.update(source_key.as_bytes());
+    let old_job_id = format!(
+        "legacy-{}",
+        old_hasher.finalize().as_bytes()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
+    catalog
+        .execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;")
+        .unwrap();
+    catalog
+        .execute(
+            "UPDATE lar_migration_jobs
+                SET job_id=?2, source_version='legacy-gzip-v1', state='complete',
+                    pending_count=0, failed_count=0, completed_at_ms=updated_at_ms,
+                    lease_owner=NULL, lease_expires_at_ms=NULL
+              WHERE job_id=?1",
+            rusqlite::params![body_only.job_id, old_job_id],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "UPDATE lar_migration_items SET job_id=?2 WHERE job_id=?1",
+            rusqlite::params![body_only.job_id, old_job_id],
+        )
+        .unwrap();
+    catalog.execute_batch("COMMIT;").unwrap();
+    let before: (i64, i64) = catalog
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM lar_manifests),
+                    (SELECT COUNT(*) FROM lar_chunks)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(catalog);
+    std::fs::remove_file(&legacy_path).unwrap();
+
+    let upgraded = store
+        .run_lar_legacy_import(&LarLegacyImportOptions::default())
+        .unwrap();
+    assert_ne!(upgraded.job_id, old_job_id);
+    assert_eq!((upgraded.attempted, upgraded.metadata_migrated), (0, 1));
+    assert_eq!(upgraded.job_state, "complete");
+    assert_eq!(
+        store
+            .read_lar_or_legacy_artifact("trace", "trace-v1", "client_request", None)
+            .unwrap()
+            .unwrap(),
+        b"body retained only in LAR"
+    );
+    let catalog = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3")).unwrap();
+    let after: (i64, i64) = catalog
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM lar_manifests),
+                    (SELECT COUNT(*) FROM lar_chunks)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before, "metadata upgrade recopied body bytes");
 }

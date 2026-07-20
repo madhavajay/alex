@@ -429,6 +429,10 @@ pub(crate) fn delete_trace_references(conn: &Connection, trace_id: &str) -> Resu
         "DELETE FROM lar_stage_records WHERE trace_id=?1",
         [trace_id],
     )?;
+    conn.execute(
+        "DELETE FROM lar_exchange_records WHERE trace_id=?1",
+        [trace_id],
+    )?;
     Ok(())
 }
 
@@ -436,6 +440,7 @@ pub(crate) fn clear_all_trace_references(conn: &Connection) -> Result<()> {
     crate::lar_fts::clear_all_references(conn)?;
     conn.execute("DELETE FROM lar_trace_artifacts", [])?;
     conn.execute("DELETE FROM lar_stage_records", [])?;
+    conn.execute("DELETE FROM lar_exchange_records", [])?;
     Ok(())
 }
 
@@ -483,6 +488,11 @@ pub(crate) fn prune_references(
         )?;
         conn.execute(
             "DELETE FROM lar_stage_records
+              WHERE trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
+            [older_than_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM lar_exchange_records
               WHERE trace_id IN (SELECT id FROM traces WHERE ts_request_ms < ?1)",
             [older_than_ms],
         )?;

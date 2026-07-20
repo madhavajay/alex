@@ -13,6 +13,8 @@ use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+pub use alex_lar::ExchangeMetadataData as LarExchangeMetadataCapture;
+
 mod lar_archive_ops;
 mod lar_catalog;
 mod lar_conversation;
@@ -22,10 +24,12 @@ mod lar_gc;
 mod lar_grep;
 mod lar_jsonl_import;
 mod lar_repack;
+mod lar_stage_content;
 mod lar_stream_replay;
 mod lar_verify;
 mod legacy_import;
 mod live_body_store;
+mod standalone_export;
 mod standalone_import;
 
 pub use lar_archive_ops::{
@@ -48,6 +52,13 @@ pub use lar_gc::LarGcReport;
 pub use lar_grep::{LarCatalogGrepMatch, LarCatalogGrepReport};
 pub use lar_jsonl_import::{LarJsonlImportOptions, LarJsonlImportReport};
 pub use lar_repack::{LarRepackCandidate, LarRepackConfig, LarRepackReport};
+pub use lar_stage_content::{
+    LarStageArtifactContent, LarStageContentCursor, LarStageContentError,
+    LarStageContentHeaderAtom, LarStageContentHeaderBlock, LarStageContentOptions,
+    LarStageContentPage, LarStageContentRecord, DEFAULT_STAGE_CONTENT_BODY_BYTES,
+    DEFAULT_STAGE_CONTENT_HEADER_BYTES, DEFAULT_STAGE_CONTENT_LIMIT, MAX_STAGE_CONTENT_BODY_BYTES,
+    MAX_STAGE_CONTENT_HEADER_BYTES, MAX_STAGE_CONTENT_LIMIT,
+};
 pub use lar_stream_replay::{
     LarStreamReplayError, LarStreamReplayPage, LarStreamReplayPageEvent,
     LarStreamReplayPageOptions, LarStreamReplaySource, DEFAULT_STREAM_REPLAY_PAGE_BYTES,
@@ -61,8 +72,8 @@ pub use legacy_import::{
 };
 pub use live_body_store::{
     LarBodyArtifact, LarBodyOwnerKind, LarBodyStoreConfig, LarBodyStoreMode, LarBodyWriteResult,
-    LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture, LarStreamReadCapture,
-    LarUpstreamAttemptCapture, LAR_HEADER_FLAG_REDACTED,
+    LarDurabilityMode, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
+    LarStreamReadCapture, LarUpstreamAttemptCapture, LAR_HEADER_FLAG_REDACTED,
 };
 pub use standalone_import::{
     LarBackupArtifactRef, LarStandaloneImportOptions, LarStandaloneImportReport,
@@ -730,6 +741,8 @@ pub struct TraceFilter {
     /// Provider-neutral body text, resolved through the disposable LAR FTS
     /// index. Raw archive bytes remain authoritative.
     pub text: Option<String>,
+    /// Exclusive stable cursor for bounded reverse-chronological scans.
+    pub before: Option<(i64, String)>,
     pub limit: usize,
 }
 
@@ -786,6 +799,7 @@ impl Default for TraceFilter {
             key_fingerprint: None,
             reasoning_effort: None,
             text: None,
+            before: None,
             limit: DEFAULT_SEARCH_LIMIT,
         }
     }
@@ -825,7 +839,7 @@ pub struct Store {
     pub data_dir: PathBuf,
     live_lar: Mutex<live_body_store::LiveLarCoordinator>,
     live_lar_mode: LarBodyStoreMode,
-    live_lar_lock_timeout: std::time::Duration,
+    live_lar_contention_warning_after: std::time::Duration,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -847,7 +861,7 @@ impl Store {
 
     fn open_inner(data_dir: PathBuf, lar_config: LarBodyStoreConfig) -> Result<Self> {
         let live_lar_mode = lar_config.mode;
-        let live_lar_lock_timeout = lar_config.writer_lock_timeout;
+        let live_lar_contention_warning_after = lar_config.writer_lock_timeout;
         std::fs::create_dir_all(&data_dir)?;
         let db_path = data_dir.join("alexandria.sqlite3");
         let mut conn =
@@ -871,7 +885,7 @@ impl Store {
             data_dir,
             live_lar: Mutex::new(live_body_store::LiveLarCoordinator::new(lar_config)?),
             live_lar_mode,
-            live_lar_lock_timeout,
+            live_lar_contention_warning_after,
         };
         if live_lar_mode != LarBodyStoreMode::Legacy {
             if let Err(error) = store.recover_lar_body_store_orphans() {
@@ -1283,6 +1297,7 @@ impl Store {
             ],
         )?;
         lar_fts::refresh_trace_anchor(&conn, &t.id, t.session_id.as_deref(), t.ts_request_ms)?;
+        lar_fts::index_trace_headers(&conn, t)?;
         Ok(())
     }
 
@@ -1557,7 +1572,13 @@ impl Store {
             );
             args.push(match_query);
         }
-        sql.push_str(" ORDER BY ts_request_ms DESC LIMIT ?");
+        if let Some((timestamp, trace_id)) = &f.before {
+            sql.push_str(" AND (ts_request_ms < ? OR (ts_request_ms = ? AND id < ?))");
+            args.push(timestamp.to_string());
+            args.push(timestamp.to_string());
+            args.push(trace_id.clone());
+        }
+        sql.push_str(" ORDER BY ts_request_ms DESC, id DESC LIMIT ?");
         args.push(effective_limit(f.limit).to_string());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;

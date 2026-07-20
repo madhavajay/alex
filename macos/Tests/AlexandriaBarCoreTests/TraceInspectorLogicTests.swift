@@ -6,6 +6,77 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite struct TraceInspectorLogicTests {
+    @Test func stageContentDecodesRawBytesAndComparesRetryContent() throws {
+        let page = try JSONDecoder().decode(TraceStageContentPage.self, from: Data(#"""
+        {
+          "trace_id":"trace-1","total_stages":3,"has_more":true,"stages_truncated":true,
+          "next_cursor":{"capture_sequence":1,"stage_id":"s2"},"stage_limit":2,
+          "body_byte_budget":2097152,"body_bytes_loaded":2,
+          "header_byte_budget":262144,"header_bytes_loaded":32,
+          "stages":[
+            {"stage_id":"s1","capture_sequence":0,"kind":"upstream_request","attempt_number":1,"wall_time_ns":1,"monotonic_delta_ns":0,"fidelity":"captured","request_headers_ref":"h1","request_headers_content_id":"h1","request_body_manifest_ref":"b1","request_body_content_id":"b1","response_headers_ref":"h-removed","response_headers_content_id":"h-removed","response_body_manifest_ref":null,"response_body_content_id":null,"trailers_ref":null,"trailers_content_id":null,"stream_index_ref":null,"limitations":[]},
+            {"stage_id":"s2","capture_sequence":1,"kind":"upstream_request","attempt_number":2,"wall_time_ns":2,"monotonic_delta_ns":1,"fidelity":"captured","request_headers_ref":"h2","request_headers_content_id":"h2","request_body_manifest_ref":"b1","request_body_content_id":"b1","response_headers_ref":null,"response_headers_content_id":null,"response_body_manifest_ref":null,"response_body_content_id":null,"trailers_ref":"h-added","trailers_content_id":"h-added","stream_index_ref":null,"limitations":[]}
+          ],
+          "header_blocks":[
+            {"content_id":"h1","block_id":"h1","state":"available","fidelity":"wire_exact_ordered","total_atoms":2,"total_bytes":12,"atoms":[{"ordinal":0,"name_b64":"WA==","value_b64":"b25l","flags":0},{"ordinal":1,"name_b64":"WA==","value_b64":"dHdv","flags":0}],"error_kind":null,"message":null},
+            {"content_id":"h2","block_id":"h2","state":"available","fidelity":"wire_exact_ordered","total_atoms":2,"total_bytes":14,"atoms":[{"ordinal":0,"name_b64":"WA==","value_b64":"b25l","flags":0},{"ordinal":1,"name_b64":"WA==","value_b64":"dGhyZWU=","flags":0}],"error_kind":null,"message":null},
+            {"content_id":"h-removed","block_id":"h-removed","state":"available","fidelity":"wire_exact_ordered","total_atoms":0,"total_bytes":0,"atoms":[],"error_kind":null,"message":null},
+            {"content_id":"h-added","block_id":"h-added","state":"available","fidelity":"wire_exact_ordered","total_atoms":0,"total_bytes":0,"atoms":[],"error_kind":null,"message":null}
+          ],
+          "bodies":[{"content_id":"b1","manifest_id":"b1","artifact_kind":null,"state":"available","fidelity":"captured","total_bytes":2,"media_type_b64":"YXBwbGljYXRpb24vanNvbg==","content_encoding_b64":"Z3ppcA==","bytes_b64":"e30=","error_kind":null,"message":null,"archive_file_uuid":null,"archive_path":null}]
+        }
+        """#.utf8))
+
+        #expect(page.nextCursor == TraceStageContentCursor(captureSequence: 1, stageId: "s2"))
+        #expect(page.headerBlocks[0].atoms.map {
+            TraceStageContentDisplay.headerBytes($0.valueBytes)
+        } == ["one", "two"])
+        #expect(String(data: page.bodies[0].bytes!, encoding: .utf8) == "{}")
+        #expect(TraceStageContentDisplay.headerBytes(page.bodies[0].mediaTypeBytes)
+            == "application/json")
+        #expect(TraceStageContentDisplay.headerBytes(page.bodies[0].contentEncodingBytes)
+            == "gzip")
+        let comparison = TraceStageContentComparisons.comparison(
+            for: page.stages[1], in: page)
+        #expect(comparison?.previousStageId == "s1")
+        #expect(comparison?.facts.contains("changed request headers") == true)
+        #expect(comparison?.facts.contains("same request body") == true)
+        #expect(comparison?.facts.contains("response headers removed") == true)
+        #expect(comparison?.facts.contains("trailers added") == true)
+    }
+
+    @Test func stageContentPagingRenderingAndStaleResponseGuardsAreBounded() throws {
+        let first = try JSONDecoder().decode(TraceStageContentPage.self, from: Data(#"""
+        {"trace_id":"t","total_stages":2,"has_more":true,"stages_truncated":true,"next_cursor":{"capture_sequence":0,"stage_id":"a"},"stage_limit":1,"body_byte_budget":1,"body_bytes_loaded":0,"header_byte_budget":1,"header_bytes_loaded":0,"stages":[{"stage_id":"a","capture_sequence":0,"kind":"client_request","attempt_number":null,"wall_time_ns":null,"monotonic_delta_ns":null,"fidelity":"legacy","request_headers_ref":null,"request_headers_content_id":null,"request_body_manifest_ref":null,"request_body_content_id":null,"response_headers_ref":null,"response_headers_content_id":null,"response_body_manifest_ref":null,"response_body_content_id":null,"trailers_ref":null,"trailers_content_id":null,"stream_index_ref":null,"limitations":["ordered headers unavailable"]}],"header_blocks":[],"bodies":[]}
+        """#.utf8))
+        let second = try JSONDecoder().decode(TraceStageContentPage.self, from: Data(#"""
+        {"trace_id":"t","total_stages":2,"has_more":false,"stages_truncated":false,"next_cursor":null,"stage_limit":1,"body_byte_budget":1,"body_bytes_loaded":0,"header_byte_budget":1,"header_bytes_loaded":0,"stages":[{"stage_id":"b","capture_sequence":1,"kind":"client_response","attempt_number":null,"wall_time_ns":null,"monotonic_delta_ns":null,"fidelity":"legacy","request_headers_ref":null,"request_headers_content_id":null,"request_body_manifest_ref":null,"request_body_content_id":null,"response_headers_ref":null,"response_headers_content_id":null,"response_body_manifest_ref":null,"response_body_content_id":null,"trailers_ref":null,"trailers_content_id":null,"stream_index_ref":null,"limitations":[]}],"header_blocks":[],"bodies":[]}
+        """#.utf8))
+        let merged = TraceStageContentPaging.merge(existing: first, incoming: second)
+        #expect(merged.stages.map(\.id) == ["a", "b"])
+        #expect(!merged.hasMore)
+        #expect(TraceStageHeaderRendering.visibleCount(total: 65_536, requested: nil) == 256)
+        #expect(TraceStageHeaderRendering.nextVisibleCount(total: 65_536, current: 256) == 512)
+        #expect(TraceStageHeaderRendering.nextVisibleCount(total: 300, current: 256) == 300)
+        #expect(TraceStageContentDisplay.headerBytes(
+            Data(repeating: 0x61, count: 20_000), limit: 100).contains("19900 bytes omitted"))
+        let binaryDisplay = TraceStageContentDisplay.body(
+            Data(repeating: 0, count: 300), limit: 300)
+        #expect(binaryDisplay.omitted == 44)
+        #expect(TraceStageContentLoad.shouldApply(
+            requestTraceId: "t", incomingTraceId: "t", generation: 3,
+            currentGeneration: 3, isCancelled: false))
+        #expect(!TraceStageContentLoad.shouldApply(
+            requestTraceId: "old", incomingTraceId: "old", generation: 2,
+            currentGeneration: 3, isCancelled: false))
+        #expect(!TraceStageContentLoad.shouldApply(
+            requestTraceId: "t", incomingTraceId: "other", generation: 3,
+            currentGeneration: 3, isCancelled: false))
+        #expect(!TraceStageContentLoad.shouldApply(
+            requestTraceId: "t", incomingTraceId: "t", generation: 3,
+            currentGeneration: 3, isCancelled: true))
+    }
+
     @Test func errorDisplayFormatterIsPortableAndStructured() {
         #expect(TraceErrorDisplay.line(
             kind: "rate_limit_error", code: "429", message: "slow down")

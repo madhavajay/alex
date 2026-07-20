@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use alex_lar::{
     upgrade_archive as rewrite_archive, verify_upgraded_archive, ArchiveReader, ArchiveWriter,
-    ChunkerConfig, Exchange, ExchangeData, FileHeader, HeaderAtom, HeaderBlock, HeaderFidelity,
-    Limits, ManifestId, RawBodyScanner, RawSearchLimits, RawSearchStats, RecoveryStatus, Stage,
-    StageData, StageId, StageKind, StreamReplaySource, StreamReplayTiming, TokenUsage,
+    ChunkerConfig, Exchange, ExchangeData, ExchangeMetadataData, FileHeader, HeaderAtom,
+    HeaderBlock, HeaderFidelity, Limits, ManifestId, RawBodyScanner, RawSearchLimits,
+    RawSearchStats, RecoveryStatus, Stage, StageData, StageId, StageKind, StreamReplaySource,
+    StreamReplayTiming, TokenUsage, REQUIRED_FEATURE_CONVERSATION_DAG,
 };
 use alex_store::{
     LarArtifactLocation, LarBackupArtifactRef, LarBodyStoreConfig, LarBodyStoreMode,
@@ -2417,40 +2418,35 @@ struct ExportReport {
     output: PathBuf,
     format: &'static str,
     traces: usize,
-    bytes: usize,
+    bytes: u64,
     verified: bool,
     loss_report: Vec<&'static str>,
 }
 
 fn export_records(data_dir: &Path, args: &ExportArgs) -> Result<LarCommandOutput> {
     let store = Store::open(data_dir.to_path_buf()).context("opening the Alex storage catalog")?;
-    let traces = load_export_traces(&store, args)?;
+    let traces = load_export_traces(&store, args, !matches!(args.format, LarExportFormat::Lar))?;
     if traces.is_empty() {
         bail!("no traces matched the requested export selection");
     }
     let losses = export_loss_report();
-    let bytes = match args.format {
-        LarExportFormat::Lar => build_standalone_lar(&traces)?,
-        LarExportFormat::Har => build_har(&traces, &losses)?,
-        LarExportFormat::Warc => build_warc(&traces, &losses)?,
-        LarExportFormat::Jsonl => build_jsonl(&traces, &losses)?,
-        LarExportFormat::OpenTelemetry => build_otel_jsonl(&traces, &losses)?,
-        LarExportFormat::OpenInference => build_openinference_jsonl(&traces, &losses)?,
-    };
-    write_export_file(&args.output, &bytes, args.force)?;
-    let verified = match args.format {
+    let (byte_count, verified) = match args.format {
         LarExportFormat::Lar => {
-            let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes), Limits::default())
-                .map_err(|error| anyhow::anyhow!(error))?;
-            let manifest_ids = reader.manifest_ids().copied().collect::<Vec<_>>();
-            for id in manifest_ids {
-                reader
-                    .write_body(&id, std::io::sink())
-                    .map_err(|error| anyhow::anyhow!(error))?;
-            }
-            reader.recovery_status() == RecoveryStatus::Clean && reader.is_sealed()
+            let bytes = write_standalone_lar_export(&store, &traces, &args.output, args.force)?;
+            (bytes, true)
         }
-        _ => true,
+        format => {
+            let bytes = match format {
+                LarExportFormat::Har => build_har(&traces, &losses)?,
+                LarExportFormat::Warc => build_warc(&traces, &losses)?,
+                LarExportFormat::Jsonl => build_jsonl(&traces, &losses)?,
+                LarExportFormat::OpenTelemetry => build_otel_jsonl(&traces, &losses)?,
+                LarExportFormat::OpenInference => build_openinference_jsonl(&traces, &losses)?,
+                LarExportFormat::Lar => unreachable!("LAR handled by streaming branch"),
+            };
+            write_export_file(&args.output, &bytes, args.force)?;
+            (bytes.len() as u64, true)
+        }
     };
     if !verified {
         bail!(
@@ -2462,7 +2458,7 @@ fn export_records(data_dir: &Path, args: &ExportArgs) -> Result<LarCommandOutput
         output: args.output.clone(),
         format: export_format_name(args.format),
         traces: traces.len(),
-        bytes: bytes.len(),
+        bytes: byte_count,
         verified,
         loss_report: losses,
     };
@@ -2501,7 +2497,11 @@ fn export_loss_report() -> Vec<&'static str> {
     ]
 }
 
-fn load_export_traces(store: &Store, args: &ExportArgs) -> Result<Vec<ExportTrace>> {
+fn load_export_traces(
+    store: &Store,
+    args: &ExportArgs,
+    load_bodies: bool,
+) -> Result<Vec<ExportTrace>> {
     let rows = store
         .export_trace_backup_rows()
         .context("reading trace metadata for export")?;
@@ -2521,15 +2521,21 @@ fn load_export_traces(store: &Store, args: &ExportArgs) -> Result<Vec<ExportTrac
         {
             continue;
         }
-        let request = store
-            .read_lar_or_legacy_artifact("trace", id, "client_request", None)
-            .with_context(|| format!("reading request body for trace {id}"))?;
-        let upstream_request = store
-            .read_lar_or_legacy_artifact("trace", id, "upstream_request", None)
-            .with_context(|| format!("reading upstream request body for trace {id}"))?;
-        let response = store
-            .read_lar_or_legacy_artifact("trace", id, "client_response", None)
-            .with_context(|| format!("reading response body for trace {id}"))?;
+        let (request, upstream_request, response) = if load_bodies {
+            (
+                store
+                    .read_lar_or_legacy_artifact("trace", id, "client_request", None)
+                    .with_context(|| format!("reading request body for trace {id}"))?,
+                store
+                    .read_lar_or_legacy_artifact("trace", id, "upstream_request", None)
+                    .with_context(|| format!("reading upstream request body for trace {id}"))?,
+                store
+                    .read_lar_or_legacy_artifact("trace", id, "client_response", None)
+                    .with_context(|| format!("reading response body for trace {id}"))?,
+            )
+        } else {
+            (None, None, None)
+        };
         let request_headers = parse_legacy_headers(row.get("req_headers_json"));
         let response_headers = parse_legacy_headers(row.get("resp_headers_json"));
         selected.push(ExportTrace {
@@ -3068,10 +3074,6 @@ fn openinference_provider(value: &Value) -> Value {
     })
 }
 
-fn build_standalone_lar(traces: &[ExportTrace]) -> Result<Vec<u8>> {
-    build_standalone_lar_with_extras(traces, &[]).map(|(bytes, _)| bytes)
-}
-
 /// Build the self-contained body closure used by trace-backup v2. Trace
 /// exchanges retain their ordinary standalone records; tool bodies are stored
 /// once as manifests and returned as explicit owner edges for restore.
@@ -3120,47 +3122,104 @@ pub(crate) fn build_trace_backup_lar(
             }
         }
     }
-    build_standalone_lar_with_extras(&traces, &extras)
+    build_standalone_lar_with_extras(Some(store), &traces, &extras)
 }
 
 fn build_standalone_lar_with_extras(
+    store: Option<&Store>,
     traces: &[ExportTrace],
     extras: &[BackupExtraBody],
 ) -> Result<(Vec<u8>, Vec<LarBackupArtifactRef>)> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let (cursor, artifacts) = write_standalone_lar_to(store, traces, extras, cursor)?;
+    Ok((cursor.into_inner(), artifacts))
+}
+
+fn write_standalone_lar_to<W: Read + Write + Seek>(
+    store: Option<&Store>,
+    traces: &[ExportTrace],
+    extras: &[BackupExtraBody],
+    output: W,
+) -> Result<(W, Vec<LarBackupArtifactRef>)> {
     let created_at_ns = traces
         .first()
         .and_then(|trace| trace.row["ts_request_ms"].as_u64())
         .unwrap_or_default()
         .saturating_mul(1_000_000);
-    let mut file_uuid = [0u8; 16];
-    file_uuid[..8].copy_from_slice(&created_at_ns.to_le_bytes());
-    file_uuid[8..12].copy_from_slice(&std::process::id().to_le_bytes());
-    file_uuid[12..].copy_from_slice(&(traces.len() as u32).to_le_bytes());
-    let cursor = std::io::Cursor::new(Vec::new());
-    let mut writer = ArchiveWriter::create(
-        cursor,
-        FileHeader::standalone(file_uuid, created_at_ns, b"alex-lar-export".to_vec()),
-        ChunkerConfig::default(),
-        Limits::default(),
-    )
-    .map_err(|error| anyhow::anyhow!(error))?;
+    let file_uuid = *uuid::Uuid::new_v4().as_bytes();
+    let mut header = FileHeader::standalone(file_uuid, created_at_ns, b"alex-lar-export".to_vec());
+    if let Some(store) = store {
+        for trace in traces {
+            let trace_id = trace.row["id"]
+                .as_str()
+                .context("trace export row has no id")?;
+            if store.lar_conversation_has_turn(trace_id)? {
+                header.required_feature_bits |= REQUIRED_FEATURE_CONVERSATION_DAG;
+                break;
+            }
+        }
+    }
+    let mut writer =
+        ArchiveWriter::create(output, header, ChunkerConfig::default(), Limits::default())
+            .map_err(|error| anyhow::anyhow!(error))?;
 
     for (capture_sequence, trace) in traces.iter().enumerate() {
+        let trace_id = trace.row["id"]
+            .as_str()
+            .context("trace export row has no id")?;
+        if let Some(store) = store {
+            if store.append_exact_trace_to_standalone(&mut writer, trace_id)? {
+                continue;
+            }
+        }
+        let request_fallback = if trace.request.is_none() {
+            store
+                .map(|store| {
+                    store.read_lar_or_legacy_artifact("trace", trace_id, "client_request", None)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let upstream_fallback = if trace.upstream_request.is_none() {
+            store
+                .map(|store| {
+                    store.read_lar_or_legacy_artifact("trace", trace_id, "upstream_request", None)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let response_fallback = if trace.response.is_none() {
+            store
+                .map(|store| {
+                    store.read_lar_or_legacy_artifact("trace", trace_id, "client_response", None)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         let request_manifest = trace
             .request
             .as_deref()
+            .or(request_fallback.as_deref())
             .map(|bytes| writer.append_body(bytes))
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
         let upstream_manifest = trace
             .upstream_request
             .as_deref()
+            .or(upstream_fallback.as_deref())
             .map(|bytes| writer.append_body(bytes))
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
         let response_manifest = trace
             .response
             .as_deref()
+            .or(response_fallback.as_deref())
             .map(|bytes| writer.append_body(bytes))
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -3247,9 +3306,6 @@ fn build_standalone_lar_with_extras(
                 .map_err(|error| anyhow::anyhow!(error))?,
         );
 
-        let trace_id = trace.row["id"]
-            .as_str()
-            .context("trace export row has no id")?;
         let mut exchange = ExchangeData::new(
             trace_id.as_bytes(),
             capture_sequence as u64,
@@ -3259,7 +3315,10 @@ fn build_standalone_lar_with_extras(
         exchange.session_id = json_bytes(&trace.row["session_id"]);
         exchange.run_id = json_bytes(&trace.row["run_id"]);
         writer
-            .append_exchange(Exchange::new(exchange))
+            .append_exchange_with_metadata(
+                Exchange::new(exchange),
+                export_exchange_metadata(&trace.row),
+            )
             .map_err(|error| anyhow::anyhow!(error))?;
     }
     let mut artifact_refs = Vec::with_capacity(extras.len());
@@ -3277,10 +3336,66 @@ fn build_standalone_lar_with_extras(
         });
     }
     writer.seal().map_err(|error| anyhow::anyhow!(error))?;
-    let cursor = writer
+    let output = writer
         .into_inner()
         .map_err(|error| anyhow::anyhow!(error))?;
-    Ok((cursor.into_inner(), artifact_refs))
+    Ok((output, artifact_refs))
+}
+
+fn export_exchange_metadata(row: &Value) -> ExchangeMetadataData {
+    let string_bytes = |name: &str| row[name].as_str().map(str::as_bytes).map(Vec::from);
+    ExchangeMetadataData {
+        ts_request_ms: row["ts_request_ms"].as_i64(),
+        ts_response_ms: row["ts_response_ms"].as_i64(),
+        harness: string_bytes("harness"),
+        client_format: string_bytes("client_format"),
+        upstream_format: string_bytes("upstream_format"),
+        method: string_bytes("method"),
+        path: string_bytes("path"),
+        streamed: json_bool(&row["streamed"]),
+        status: row["status"].as_i64(),
+        cost_usd_bits: row["cost_usd"].as_f64().map(f64::to_bits),
+        billing_bucket: string_bytes("billing_bucket"),
+        error_kind: string_bytes("error_kind"),
+        error_code: string_bytes("error_code"),
+        substituted: json_bool(&row["substituted"]).unwrap_or(false),
+        original_model: string_bytes("original_model"),
+        served_model: string_bytes("served_model"),
+        substitution_reason: string_bytes("substitution_reason"),
+        injected: json_bool(&row["injected"]).unwrap_or(false),
+        fixture_name: string_bytes("fixture_name"),
+        attempts_json: json_encoded_bytes(&row["attempts"]),
+        original_account_id: string_bytes("original_account_id"),
+        served_account_id: string_bytes("served_account_id"),
+        subscription_identity: string_bytes("subscription_identity"),
+        via_dario: json_bool(&row["via_dario"]).unwrap_or(false),
+        dario_generation: string_bytes("dario_generation"),
+        tags_json: string_bytes("tags_json"),
+        client_ip: string_bytes("client_ip"),
+        key_fingerprint: string_bytes("key_fingerprint"),
+        reasoning_effort: string_bytes("reasoning_effort"),
+        thinking_budget: row["thinking_budget"].as_i64(),
+        input_tokens: row["input_tokens"].as_i64(),
+        cached_input_tokens: row["cached_input_tokens"].as_i64(),
+        cache_creation_tokens: row["cache_creation_tokens"].as_i64(),
+        output_tokens: row["output_tokens"].as_i64(),
+        reasoning_tokens: row["reasoning_tokens"].as_i64(),
+        unknown_attributes: Vec::new(),
+    }
+}
+
+fn json_bool(value: &Value) -> Option<bool> {
+    value
+        .as_bool()
+        .or_else(|| value.as_i64().map(|value| value != 0))
+}
+
+fn json_encoded_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.as_bytes().to_vec()),
+        value => serde_json::to_vec(value).ok(),
+    }
 }
 
 fn append_export_headers<W: Read + Write + std::io::Seek>(
@@ -3318,6 +3433,69 @@ fn json_u64(value: &Value) -> u64 {
         .unwrap_or_default()
 }
 
+fn write_standalone_lar_export(
+    store: &Store,
+    traces: &[ExportTrace],
+    output: &Path,
+    force: bool,
+) -> Result<u64> {
+    if output.exists() && !force {
+        bail!(
+            "export output already exists: {} (use --force to replace it)",
+            output.display()
+        );
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+    let temporary = parent.join(format!(".{name}.{}.lar-export.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<u64> {
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        let (file, _) = write_standalone_lar_to(Some(store), traces, &[], file)?;
+        file.sync_all()?;
+        drop(file);
+        verify_standalone_lar_export(&temporary)?;
+        let bytes = fs::metadata(&temporary)?.len();
+        publish_export_temp(&temporary, output, force)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn verify_standalone_lar_export(path: &Path) -> Result<()> {
+    let file = fs::File::open(path)?;
+    let mut reader =
+        ArchiveReader::open(file, Limits::default()).map_err(|error| anyhow::anyhow!(error))?;
+    if reader.header().file_role != alex_lar::FileRole::Standalone
+        || reader.recovery_status() != RecoveryStatus::Clean
+        || !reader.is_sealed()
+    {
+        bail!("standalone LAR export did not seal cleanly");
+    }
+    let manifest_ids = reader.manifest_ids().copied().collect::<Vec<_>>();
+    for id in manifest_ids {
+        reader
+            .write_body(&id, std::io::sink())
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    Ok(())
+}
+
 fn write_export_file(output: &Path, bytes: &[u8], force: bool) -> Result<()> {
     if output.exists() && !force {
         bail!(
@@ -3348,18 +3526,37 @@ fn write_export_file(output: &Path, bytes: &[u8], force: bool) -> Result<()> {
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        if output.exists() {
-            fs::remove_file(output)
-                .with_context(|| format!("replacing export output {}", output.display()))?;
-        }
-        fs::rename(&temporary, output)?;
+        publish_export_temp(&temporary, output, force)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn publish_export_temp(temporary: &Path, output: &Path, force: bool) -> Result<()> {
+    if !force {
+        // A sibling hard-link is an atomic no-clobber publish. If another
+        // process creates OUTPUT after the initial check, the link fails and
+        // that process's file remains untouched.
+        fs::hard_link(temporary, output).with_context(|| {
+            format!(
+                "publishing export without replacing {} (use --force to replace it)",
+                output.display()
+            )
+        })?;
+        fs::remove_file(temporary)?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    if output.exists() {
+        fs::remove_file(output)
+            .with_context(|| format!("replacing export output {}", output.display()))?;
+    }
+    fs::rename(temporary, output)
+        .with_context(|| format!("publishing export output {}", output.display()))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -4878,6 +5075,284 @@ mod tests {
     }
 
     #[test]
+    fn standalone_lar_export_preserves_exact_stage_closure_and_metadata() {
+        use alex_store::{
+            LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, LarConversationEntryCapture,
+            LarConversationEntryKind, LarConversationGenerationEvent, LarConversationRawRange,
+            LarConversationRole, LarConversationSemantics, LarConversationTurnCapture,
+            LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture, LarStreamReadCapture,
+            LarUpstreamAttemptCapture,
+        };
+
+        let dir = tmpdir("exact-standalone-export");
+        let store = Store::open_with_lar_body_store(
+            dir.clone(),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trace_id = "trace-exact-closure";
+        let client_request = br#"{"client":true}"#;
+        let upstream_request = br#"{"upstream":true}"#;
+        let upstream_response = b"data: one\n\n";
+        let client_response = br#"{"translated":true}"#;
+        let append = |kind: &str, legacy: &str, bytes: &[u8]| {
+            store
+                .write_body_artifact(&LarBodyArtifact::trace(trace_id, kind), legacy, bytes)
+                .unwrap()
+                .manifest_id
+                .unwrap()
+        };
+        let bodies = LarExchangeBodyRefs {
+            client_request_manifest_id: Some(append(
+                "client_request",
+                "request.json",
+                client_request,
+            )),
+            upstream_request_manifest_id: Some(append(
+                "upstream_request",
+                "upstream-request.json",
+                upstream_request,
+            )),
+            upstream_response_manifest_id: Some(append(
+                "upstream_response",
+                "upstream-response.body",
+                upstream_response,
+            )),
+            client_response_manifest_id: Some(append(
+                "client_response",
+                "response.body",
+                client_response,
+            )),
+        };
+        let mut trace = alex_core::TraceRecord {
+            id: trace_id.into(),
+            ts_request_ms: 1_700_100_000_000,
+            ts_response_ms: Some(1_700_100_000_250),
+            session_id: Some("session-exact-closure".into()),
+            harness: Some("pi".into()),
+            client_format: Some("openai-chat".into()),
+            upstream_provider: Some("xai".into()),
+            upstream_format: Some("openai-chat".into()),
+            requested_model: Some("alex/grok-code-fast-1".into()),
+            routed_model: Some("grok-code-fast-1".into()),
+            method: Some("POST".into()),
+            path: Some("/v1/chat/completions".into()),
+            status: Some(200),
+            streamed: Some(true),
+            usage: alex_core::Usage {
+                input_tokens: Some(41),
+                cached_input_tokens: Some(7),
+                cache_creation_tokens: Some(3),
+                output_tokens: Some(11),
+                reasoning_tokens: Some(5),
+            },
+            cost_usd: Some(0.0123456789),
+            billing_bucket: Some("subscription".into()),
+            attempts: Some(r#"[{"account":"first"},{"account":"second"}]"#.into()),
+            substituted: true,
+            original_model: Some("grok-code-fast-1".into()),
+            served_model: Some("grok-code-fast-1".into()),
+            substitution_reason: Some("rate_limit".into()),
+            original_account_id: Some("xai-a".into()),
+            served_account_id: Some("xai-b".into()),
+            account_id: Some("xai-b".into()),
+            subscription_identity: Some("xai-subscription".into()),
+            run_id: Some("run-exact".into()),
+            tags: Some(r#"{"suite":"lar"}"#.into()),
+            client_ip: Some("127.0.0.1".into()),
+            key_fingerprint: Some("fingerprint".into()),
+            reasoning_effort: Some("high".into()),
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        trace.req_headers_json = Some(r#"[["x-repeat","one"],["x-repeat","two"]]"#.into());
+        trace.resp_headers_json = Some(r#"[["content-type","application/json"]]"#.into());
+        store.insert_trace(&trace).unwrap();
+        let capture = LarExchangeCapture {
+            trace_id: trace_id.into(),
+            session_id: trace.session_id.clone(),
+            run_id: trace.run_id.clone(),
+            wall_time_ns: trace.ts_request_ms as u64 * 1_000_000,
+            client_request_headers: Some(LarHeaderCapture::observed([
+                ("x-repeat", "one"),
+                ("x-repeat", "two"),
+            ])),
+            client_response_headers: Some(LarHeaderCapture::observed([(
+                "content-type",
+                "application/json",
+            )])),
+            upstream_attempts: vec![
+                LarUpstreamAttemptCapture {
+                    attempt_number: 1,
+                    wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 10,
+                    request_headers: Some(LarHeaderCapture::observed([("x-attempt", "one")])),
+                    response_headers: Some(LarHeaderCapture::observed([("retry-after", "1")])),
+                    status_code: Some(429),
+                    error_class: Some("rate_limit".into()),
+                    error_message: Some("retry".into()),
+                },
+                LarUpstreamAttemptCapture {
+                    attempt_number: 2,
+                    wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 20,
+                    request_headers: Some(LarHeaderCapture::observed([("x-attempt", "two")])),
+                    response_headers: Some(LarHeaderCapture::observed([(
+                        "content-type",
+                        "text/event-stream",
+                    )])),
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+            ],
+            upstream_stream_reads: Some(vec![LarStreamReadCapture {
+                byte_offset: 0,
+                byte_length: upstream_response.len() as u64,
+                delta_from_first_byte_ns: 0,
+            }]),
+            provider: trace.upstream_provider.clone(),
+            requested_model: trace.requested_model.clone(),
+            routed_model: trace.routed_model.clone(),
+            account_id: trace.account_id.clone(),
+            routing_reason: trace.substitution_reason.clone(),
+            status_code: Some(200),
+            error_class: None,
+            error_message: None,
+        };
+        let metadata = export_exchange_metadata(&store.get_trace(trace_id).unwrap().unwrap());
+        store
+            .write_lar_exchange_capture_with_metadata(&capture, &bodies, &metadata)
+            .unwrap()
+            .unwrap();
+        let entry_id = store
+            .register_lar_conversation_entry(&LarConversationEntryCapture {
+                semantics: LarConversationSemantics::Known {
+                    source_format: "openai-chat".into(),
+                    role: LarConversationRole::User,
+                    kind: LarConversationEntryKind::Message,
+                    name: None,
+                    tool_call_id: None,
+                },
+                raw_ranges: vec![LarConversationRawRange {
+                    manifest_id: bodies.client_request_manifest_id.clone().unwrap(),
+                    byte_offset: 0,
+                    byte_length: client_request.len() as u64,
+                }],
+            })
+            .unwrap();
+        store
+            .record_lar_conversation_turn(&LarConversationTurnCapture {
+                trace_id: trace_id.into(),
+                session_id: trace.session_id.clone().unwrap(),
+                event: LarConversationGenerationEvent::Initial,
+                generation_entry_ids: vec![entry_id],
+                upto_index: 0,
+                response_entry_ids: Vec::new(),
+            })
+            .unwrap();
+        drop(store);
+
+        let output = dir.join("exact.lar");
+        LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "export",
+                    output.to_str().unwrap(),
+                    "--format",
+                    "lar",
+                    "--trace-id",
+                    trace_id,
+                ]),
+            )
+            .unwrap();
+        let mut reader =
+            ArchiveReader::open(fs::File::open(&output).unwrap(), Limits::default()).unwrap();
+        let exchange = reader.exchange_by_trace(trace_id.as_bytes()).unwrap();
+        let kinds = exchange
+            .data
+            .stages
+            .iter()
+            .map(|id| reader.stage(id).unwrap().data.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                StageKind::ClientRequest,
+                StageKind::RouterDecision,
+                StageKind::UpstreamRequest,
+                StageKind::UpstreamResponse,
+                StageKind::UpstreamRequest,
+                StageKind::UpstreamResponse,
+                StageKind::ClientResponse,
+            ]
+        );
+        assert_eq!(reader.stream_index_count(), 1);
+        assert_eq!(reader.conversation_entry_count(), 1);
+        assert_eq!(reader.generation_count(), 1);
+        assert_eq!(reader.turn_view_count(), 1);
+        assert_eq!(
+            reader.exchange_metadata(&exchange.id).unwrap().data,
+            metadata
+        );
+        let archived_bodies = reader
+            .manifest_ids()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|id| reader.read_body(&id).unwrap())
+            .collect::<Vec<_>>();
+        for body in [
+            client_request.as_slice(),
+            upstream_request.as_slice(),
+            upstream_response.as_slice(),
+            client_response.as_slice(),
+        ] {
+            assert!(archived_bodies.iter().any(|value| value == body));
+        }
+
+        let imported_dir = dir.join("imported");
+        fs::create_dir_all(&imported_dir).unwrap();
+        LocalLarBackend
+            .execute(&imported_dir, &parse(&["import", output.to_str().unwrap()]))
+            .unwrap();
+        let imported = Store::open(imported_dir).unwrap();
+        let row = imported.get_trace(trace_id).unwrap().unwrap();
+        assert_eq!(row["harness"], "pi");
+        assert_eq!(row["method"], "POST");
+        assert_eq!(row["input_tokens"], 41);
+        assert_eq!(row["cache_creation_tokens"], 3);
+        assert_eq!(
+            row["attempts"],
+            serde_json::from_str::<Value>(trace.attempts.as_deref().unwrap()).unwrap()
+        );
+        assert_eq!(row["req_headers_json"], trace.req_headers_json.unwrap());
+        let conversation = imported
+            .lar_conversation_events_page("session-exact-closure", None, 10)
+            .unwrap();
+        assert_eq!(conversation.events.len(), 1);
+        assert_eq!(conversation.events[0].trace_id, trace_id);
+        assert_eq!(conversation.events[0].entries.len(), 1);
+        assert_eq!(
+            imported
+                .read_lar_or_legacy_artifact("trace", trace_id, "upstream_response", None)
+                .unwrap()
+                .unwrap(),
+            upstream_response
+        );
+        assert_eq!(
+            imported
+                .read_lar_or_legacy_artifact("trace", trace_id, "client_response", None)
+                .unwrap()
+                .unwrap(),
+            client_response
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn cleanup_requires_completed_verified_migration_then_quarantines_legacy_files() {
         let dir = tmpdir("cleanup");
         let store = Store::open(dir.clone()).unwrap();
@@ -4933,6 +5408,21 @@ mod tests {
                 .as_deref(),
             Some(expected.as_slice())
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn no_force_publication_cannot_clobber_a_racing_destination() {
+        let dir = tmpdir("publish-no-clobber");
+        let temporary = dir.join(".export.tmp");
+        let output = dir.join("archive.lar");
+        fs::write(&temporary, b"new archive").unwrap();
+        fs::write(&output, b"racing writer").unwrap();
+
+        let error = publish_export_temp(&temporary, &output, false).unwrap_err();
+        assert!(error.to_string().contains("without replacing"));
+        assert_eq!(fs::read(&output).unwrap(), b"racing writer");
+        assert_eq!(fs::read(&temporary).unwrap(), b"new archive");
         fs::remove_dir_all(dir).unwrap();
     }
 }

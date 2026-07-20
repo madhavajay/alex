@@ -1,12 +1,11 @@
 //! Shared legacy gzip-to-LAR importer used by both foreground commands and the
 //! startup worker. The importer never deletes or clears legacy paths.
 //!
-//! This vertical slice is intentionally body-only: the three trace body
-//! columns, two tool body columns, and conventionally named suffix artifacts.
-//! Legacy header JSON plus attempt/stage metadata require the event-log writer
-//! and are not represented by this body-pack importer.
+//! Body bytes and legacy-normalized exchange metadata are written into the same
+//! deterministic rolling body packs. Metadata records reference validated body
+//! manifests and never copy request, response, Dario, or tool bytes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,20 +15,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alex_lar::{
-    ArchiveReader, ArchiveWriter, ChunkerConfig, FileHeader, FileRole, Limits, ManifestId,
-    RangeMatchConfig,
+    ArchiveReader, ArchiveWriter, ChunkerConfig, Exchange, ExchangeData, ExchangeMetadataData,
+    FileHeader, FileRole, Limits, ManifestId, RangeMatchConfig, Stage, StageData, StageKind,
+    TokenUsage, UnknownExchangeMetadataAttribute, REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS,
 };
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::{
-    LarArchiveUnavailableError, LarArtifactLocation, LarMigrationItem, LarMigrationJobSpec,
-    LarPointerSwitch, LarValidation, Store,
+    LarArchiveUnavailableError, LarArtifactError, LarArtifactLocation, LarExchangeCapture,
+    LarHeaderCapture, LarMigrationItem, LarMigrationJobSpec, LarPointerSwitch, LarValidation,
+    Store,
 };
 
 const FORMAT_VERSION: i64 = 1;
-const SOURCE_VERSION: &str = "legacy-gzip-v1";
+// v2 adds exchange/header/stage metadata. Keeping this distinct from the
+// body-only v1 source version forces existing completed installations to run
+// the additive metadata backfill while reusing their validated manifests.
+const SOURCE_VERSION: &str = "legacy-gzip-v2";
 const DEFAULT_BATCH_SIZE: usize = 64;
 const MAX_BATCH_SIZE: usize = 4096;
 const MAX_WORKER_COUNT: usize = 16;
@@ -41,6 +45,14 @@ const ESTIMATED_PENDING_ARTIFACT_BYTES: u64 = 4 * 1024;
 /// Conservative planning charge for one chunk or manifest entry retained by
 /// both the active writer and the validation reader during a batch.
 const ESTIMATED_INDEX_ENTRY_BYTES: u64 = 256;
+
+#[cfg(test)]
+static LEGACY_METADATA_PLAN_QUERY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn note_legacy_metadata_plan_query() {
+    LEGACY_METADATA_PLAN_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Resource policy shared by foreground and startup legacy importers. Defaults
 /// retain the former single-worker, unthrottled behavior.
@@ -197,6 +209,9 @@ pub enum LarLegacyImportBoundary {
     BodyAppended,
     BodyValidated,
     PointerSwitched,
+    MetadataAppended,
+    MetadataValidated,
+    MetadataPublished,
     JobCompleted,
 }
 
@@ -303,6 +318,12 @@ pub struct LarLegacyImportReport {
     pub bytes_read: u64,
     pub unique_bytes_written: u64,
     pub bytes_deduplicated: u64,
+    pub metadata_inventoried: u64,
+    pub metadata_attempted: u64,
+    pub metadata_migrated: u64,
+    pub metadata_skipped: u64,
+    pub metadata_failed: u64,
+    pub metadata_unsupported: u64,
     pub total_items: u64,
     pub completed_items: u64,
     pub remaining_items: u64,
@@ -351,6 +372,12 @@ impl LarLegacyImportReport {
             bytes_read: 0,
             unique_bytes_written: 0,
             bytes_deduplicated: 0,
+            metadata_inventoried: 0,
+            metadata_attempted: 0,
+            metadata_migrated: 0,
+            metadata_skipped: 0,
+            metadata_failed: 0,
+            metadata_unsupported: 0,
             total_items: 0,
             completed_items: 0,
             remaining_items: 0,
@@ -432,6 +459,113 @@ struct PendingValidation {
     source_length: u64,
     source_hash: [u8; 32],
     unique_bytes_written: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LegacyTraceMetadata {
+    trace_id: String,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    ts_request_ms: i64,
+    ts_response_ms: Option<i64>,
+    request_headers_json: Option<String>,
+    response_headers_json: Option<String>,
+    request_body_path: Option<String>,
+    upstream_request_body_path: Option<String>,
+    response_body_path: Option<String>,
+    provider: Option<String>,
+    requested_model: Option<String>,
+    routed_model: Option<String>,
+    account_id: Option<String>,
+    status: Option<i64>,
+    error_class: Option<String>,
+    error: Option<String>,
+    substituted: bool,
+    original_model: Option<String>,
+    served_model: Option<String>,
+    substitution_reason: Option<String>,
+    attempts_json: Option<String>,
+    original_account_id: Option<String>,
+    served_account_id: Option<String>,
+    injected: bool,
+    fixture_name: Option<String>,
+    via_dario: bool,
+    dario_generation: Option<String>,
+    harness: Option<String>,
+    client_format: Option<String>,
+    upstream_format: Option<String>,
+    method: Option<String>,
+    path: Option<String>,
+    streamed: Option<bool>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cost_usd: Option<f64>,
+    billing_bucket: Option<String>,
+    error_kind: Option<String>,
+    error_code: Option<String>,
+    subscription_identity: Option<String>,
+    tags_json: Option<String>,
+    client_ip: Option<String>,
+    key_fingerprint: Option<String>,
+    reasoning_effort: Option<String>,
+    thinking_budget: Option<i64>,
+    synthetic_tool: Option<LegacyToolMetadata>,
+}
+
+#[derive(Clone, Debug)]
+struct LegacyToolMetadata {
+    id: String,
+    harness: String,
+    session_id: String,
+    turn_id: Option<String>,
+    trace_id: Option<String>,
+    tool_call_id: String,
+    tool_name: String,
+    ts_start_ms: i64,
+    ts_end_ms: Option<i64>,
+    is_error: Option<bool>,
+    exit_status: Option<i64>,
+    arguments_path: Option<String>,
+    result_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedLegacyHeaders {
+    capture: Option<LarHeaderCapture>,
+    unsupported: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LegacyAttemptMetadata {
+    account_id: Option<String>,
+    model: Option<String>,
+    routing_reason: Option<String>,
+    opaque_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct LegacyMetadataPlan {
+    owner_kind: &'static str,
+    owner_id: String,
+    trace_id: String,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    /// Complete SQLite source row retained for the optional exchange
+    /// companion record. Stage fields consume the representable subset; the
+    /// companion carries the remainder without copying any body bytes.
+    #[allow(dead_code)]
+    source_metadata: LegacyTraceMetadata,
+    exchange_metadata: ExchangeMetadataData,
+    catalog_capture: LarExchangeCapture,
+    stages: Vec<StageData>,
+    external_manifests: Vec<ManifestId>,
+    fingerprint: String,
+    source_size: u64,
+    unsupported_count: u64,
+    missing_manifests: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -743,7 +877,9 @@ fn import_ids(store: &Store, generation: u64) -> ImportIds {
     let (file_uuid_bytes, file_uuid) =
         deterministic_uuid(b"alex-lar-body-pack-v1", &base_source_key);
     let mut job_hasher = blake3::Hasher::new();
-    job_hasher.update(b"alex-lar-legacy-job-v1");
+    job_hasher.update(b"alex-lar-legacy-job-v2");
+    job_hasher.update(SOURCE_VERSION.as_bytes());
+    job_hasher.update(&[0]);
     job_hasher.update(source_key.as_bytes());
     let job_id = format!("legacy-{}", hex(&job_hasher.finalize().as_bytes()[..16]));
     let file_path = store.data_dir.join("lar").join(format!("{file_uuid}.lar"));
@@ -917,6 +1053,389 @@ fn item_id(job_id: &str, source: &LarLegacyArtifact, fingerprint: &str) -> Strin
     format!("item-{}", hex(hasher.finalize().as_bytes()))
 }
 
+fn metadata_item_id(job_id: &str, owner_kind: &str, owner_id: &str, fingerprint: &str) -> String {
+    let source = LarLegacyArtifact {
+        owner_kind: owner_kind.into(),
+        owner_id: owner_id.into(),
+        session_id: None,
+        artifact_kind: "exchange_metadata".into(),
+        stage_id: None,
+        source_path: String::new(),
+        fidelity: "legacy_normalized".into(),
+    };
+    item_id(job_id, &source, fingerprint)
+}
+
+fn legacy_header_value(value: &serde_json::Value) -> Option<Vec<u8>> {
+    match value {
+        serde_json::Value::String(value) => Some(value.as_bytes().to_vec()),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+            Some(value.to_string().into_bytes())
+        }
+        _ => None,
+    }
+}
+
+fn parse_legacy_headers(source: Option<&str>) -> ParsedLegacyHeaders {
+    let Some(source) = source else {
+        return ParsedLegacyHeaders {
+            capture: None,
+            unsupported: None,
+        };
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(source) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return ParsedLegacyHeaders {
+                capture: None,
+                unsupported: Some(format!("invalid legacy header JSON: {error}")),
+            };
+        }
+    };
+    let mut pairs = Vec::<(Vec<u8>, Vec<u8>)>::new();
+    let represented_order = matches!(parsed, serde_json::Value::Array(_));
+    let mut unsupported = Vec::new();
+    match parsed {
+        serde_json::Value::Object(values) => {
+            // A JSON object has no fidelity promise for member order. Sorting
+            // makes the derived block stable across serde/platform versions.
+            let mut values = values.into_iter().collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, value) in values {
+                match value {
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            if let Some(value) = legacy_header_value(&value) {
+                                pairs.push((name.as_bytes().to_vec(), value));
+                            } else {
+                                unsupported.push(format!(
+                                    "header {name} contains a non-scalar array value"
+                                ));
+                            }
+                        }
+                    }
+                    value => {
+                        if let Some(value) = legacy_header_value(&value) {
+                            pairs.push((name.as_bytes().to_vec(), value));
+                        } else {
+                            unsupported.push(format!("header {name} has a non-scalar value"));
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.into_iter().enumerate() {
+                let pair = match value {
+                    serde_json::Value::Array(mut pair) if pair.len() == 2 => {
+                        let value = pair.pop().expect("pair length checked");
+                        let name = pair.pop().expect("pair length checked");
+                        name.as_str()
+                            .zip(legacy_header_value(&value))
+                            .map(|(name, value)| (name.as_bytes().to_vec(), value))
+                    }
+                    serde_json::Value::Object(mut pair) => {
+                        let name = pair.remove("name");
+                        let value = pair.remove("value");
+                        name.as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .zip(value.as_ref().and_then(legacy_header_value))
+                            .map(|(name, value)| (name.as_bytes().to_vec(), value))
+                    }
+                    _ => None,
+                };
+                if let Some(pair) = pair {
+                    pairs.push(pair);
+                } else {
+                    unsupported.push(format!("header entry {index} is not a name/value pair"));
+                }
+            }
+        }
+        _ => unsupported.push("legacy headers are neither an object nor an ordered list".into()),
+    }
+    let capture = (!pairs.is_empty()).then(|| {
+        if represented_order {
+            LarHeaderCapture::legacy_ordered(pairs)
+        } else {
+            LarHeaderCapture::legacy_normalized(pairs)
+        }
+    });
+    ParsedLegacyHeaders {
+        capture,
+        unsupported: (!unsupported.is_empty()).then(|| unsupported.join("; ")),
+    }
+}
+
+fn parse_legacy_attempts(source: Option<&str>) -> (Vec<LegacyAttemptMetadata>, Option<String>) {
+    let Some(source) = source else {
+        return (Vec::new(), None);
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(source) {
+        Ok(serde_json::Value::Array(values)) => values,
+        Ok(_) => {
+            return (
+                Vec::new(),
+                Some("legacy attempts JSON is not an array".into()),
+            )
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!("invalid legacy attempts JSON: {error}")),
+            )
+        }
+    };
+    let mut attempts = Vec::with_capacity(parsed.len());
+    let mut unsupported = Vec::new();
+    for (index, value) in parsed.into_iter().enumerate() {
+        let serde_json::Value::Object(fields) = &value else {
+            unsupported.push(format!("attempt {index} is not an object"));
+            continue;
+        };
+        let account_id = fields
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let model = fields
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let rung = fields
+            .get("rung")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let retry = fields.get("retry").and_then(serde_json::Value::as_u64);
+        for (name, valid) in [
+            (
+                "account_id",
+                fields
+                    .get("account_id")
+                    .is_none_or(serde_json::Value::is_string),
+            ),
+            (
+                "model",
+                fields.get("model").is_none_or(serde_json::Value::is_string),
+            ),
+            (
+                "rung",
+                fields.get("rung").is_none_or(serde_json::Value::is_string),
+            ),
+            (
+                "retry",
+                fields.get("retry").is_none_or(serde_json::Value::is_u64),
+            ),
+        ] {
+            if !valid {
+                unsupported.push(format!(
+                    "attempt {index} field {name} has an unsupported type"
+                ));
+            }
+        }
+        let routing_reason = rung.or_else(|| retry.map(|retry| format!("retry {retry}")));
+        let has_opaque_fields = fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "account_id" | "model" | "rung" | "retry"));
+        let opaque_json = has_opaque_fields.then(|| value.to_string());
+        attempts.push(LegacyAttemptMetadata {
+            account_id,
+            model,
+            routing_reason,
+            opaque_json,
+        });
+    }
+    (
+        attempts,
+        (!unsupported.is_empty()).then(|| unsupported.join("; ")),
+    )
+}
+
+fn hash_metadata_field(hasher: &mut blake3::Hasher, label: &str, value: Option<&str>) {
+    hasher.update(&(label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    match value {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    };
+}
+
+fn append_metadata_note(stage: &mut StageData, detail: impl Into<String>) {
+    let detail = detail.into();
+    stage.error_class = Some(b"legacy_metadata_unsupported".to_vec());
+    stage.error_message = Some(detail.into_bytes());
+}
+
+fn legacy_stage_field(
+    value: Option<&str>,
+    label: &str,
+    unsupported_count: &mut u64,
+) -> Option<Vec<u8>> {
+    let value = value?;
+    let limit = usize::try_from(Limits::default().max_field_length).unwrap_or(usize::MAX);
+    if value.len() <= limit {
+        return Some(value.as_bytes().to_vec());
+    }
+    *unsupported_count = unsupported_count.saturating_add(1);
+    Some(
+        format!(
+            "legacy metadata field {label} was not embedded: {} bytes exceeds LAR limit {limit}; source remains in SQLite",
+            value.len()
+        )
+        .into_bytes(),
+    )
+}
+
+fn legacy_tool_provenance(tool: &LegacyToolMetadata) -> String {
+    format!(
+        "legacy_tool_metadata_json:{}",
+        serde_json::json!({
+            "harness": tool.harness,
+            "turn_id": tool.turn_id,
+            "legacy_trace_id": tool.trace_id,
+            "tool_call_id": tool.tool_call_id,
+            "tool_name": tool.tool_name,
+        })
+    )
+}
+
+fn nonnegative_legacy_token(value: Option<i64>, _label: &str, unsupported_count: &mut u64) -> u64 {
+    match value {
+        Some(value) => match u64::try_from(value) {
+            Ok(value) => value,
+            Err(_) => {
+                *unsupported_count = unsupported_count.saturating_add(1);
+                0
+            }
+        },
+        None => 0,
+    }
+}
+
+fn legacy_token_usage(
+    source: &LegacyTraceMetadata,
+    unsupported_count: &mut u64,
+) -> Option<TokenUsage> {
+    let represented = [
+        source.input_tokens,
+        source.output_tokens,
+        source.cached_input_tokens,
+        source.reasoning_tokens,
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    represented.then(|| TokenUsage {
+        input_tokens: nonnegative_legacy_token(
+            source.input_tokens,
+            "input_tokens",
+            unsupported_count,
+        ),
+        output_tokens: nonnegative_legacy_token(
+            source.output_tokens,
+            "output_tokens",
+            unsupported_count,
+        ),
+        cached_tokens: nonnegative_legacy_token(
+            source.cached_input_tokens,
+            "cached_input_tokens",
+            unsupported_count,
+        ),
+        reasoning_tokens: nonnegative_legacy_token(
+            source.reasoning_tokens,
+            "reasoning_tokens",
+            unsupported_count,
+        ),
+    })
+}
+
+fn legacy_cost_nanos(value: Option<f64>, unsupported_count: &mut u64) -> Option<u64> {
+    let value = value?;
+    let nanos = value * 1_000_000_000.0;
+    if !nanos.is_finite() || nanos < 0.0 || nanos > u64::MAX as f64 {
+        *unsupported_count = unsupported_count.saturating_add(1);
+        return None;
+    }
+    Some(nanos.round() as u64)
+}
+
+fn legacy_companion_text(
+    value: Option<&str>,
+    label: &str,
+    unsupported_count: &mut u64,
+    unsupported: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let value = value?;
+    let limit = usize::try_from(Limits::default().max_field_length).unwrap_or(usize::MAX);
+    if value.len() <= limit {
+        return Some(value.as_bytes().to_vec());
+    }
+    *unsupported_count = unsupported_count.saturating_add(1);
+    unsupported.push(format!("{label}:{}>{limit}", value.len()));
+    None
+}
+
+fn legacy_exchange_metadata(
+    source: &LegacyTraceMetadata,
+    unsupported_count: &mut u64,
+) -> ExchangeMetadataData {
+    let mut unsupported = Vec::new();
+    let mut text =
+        |value, label| legacy_companion_text(value, label, unsupported_count, &mut unsupported);
+    let mut data = ExchangeMetadataData {
+        ts_request_ms: Some(source.ts_request_ms),
+        ts_response_ms: source.ts_response_ms,
+        harness: text(source.harness.as_deref(), "harness"),
+        client_format: text(source.client_format.as_deref(), "client_format"),
+        upstream_format: text(source.upstream_format.as_deref(), "upstream_format"),
+        method: text(source.method.as_deref(), "method"),
+        path: text(source.path.as_deref(), "path"),
+        streamed: source.streamed,
+        status: source.status,
+        cost_usd_bits: source.cost_usd.map(f64::to_bits),
+        billing_bucket: text(source.billing_bucket.as_deref(), "billing_bucket"),
+        error_kind: text(source.error_kind.as_deref(), "error_kind"),
+        error_code: text(source.error_code.as_deref(), "error_code"),
+        substituted: source.substituted,
+        original_model: text(source.original_model.as_deref(), "original_model"),
+        served_model: text(source.served_model.as_deref(), "served_model"),
+        substitution_reason: text(source.substitution_reason.as_deref(), "substitution_reason"),
+        injected: source.injected,
+        fixture_name: text(source.fixture_name.as_deref(), "fixture_name"),
+        attempts_json: text(source.attempts_json.as_deref(), "attempts_json"),
+        original_account_id: text(source.original_account_id.as_deref(), "original_account_id"),
+        served_account_id: text(source.served_account_id.as_deref(), "served_account_id"),
+        subscription_identity: text(
+            source.subscription_identity.as_deref(),
+            "subscription_identity",
+        ),
+        via_dario: source.via_dario,
+        dario_generation: text(source.dario_generation.as_deref(), "dario_generation"),
+        tags_json: text(source.tags_json.as_deref(), "tags_json"),
+        client_ip: text(source.client_ip.as_deref(), "client_ip"),
+        key_fingerprint: text(source.key_fingerprint.as_deref(), "key_fingerprint"),
+        reasoning_effort: text(source.reasoning_effort.as_deref(), "reasoning_effort"),
+        thinking_budget: source.thinking_budget,
+        input_tokens: source.input_tokens,
+        cached_input_tokens: source.cached_input_tokens,
+        cache_creation_tokens: source.cache_creation_tokens,
+        output_tokens: source.output_tokens,
+        reasoning_tokens: source.reasoning_tokens,
+        unknown_attributes: Vec::new(),
+    };
+    if !unsupported.is_empty() {
+        data.unknown_attributes
+            .push(UnknownExchangeMetadataAttribute {
+                key: b"alex.legacy_unsupported_metadata".to_vec(),
+                value: unsupported.join(";").into_bytes(),
+            });
+    }
+    data
+}
+
 fn semantic_predecessor_key(source: &LarLegacyArtifact) -> Option<(String, String)> {
     if source.owner_kind != "trace"
         || !matches!(
@@ -947,32 +1466,1080 @@ fn same_trace_predecessor_kinds(source: &LarLegacyArtifact) -> &'static [&'stati
 }
 
 impl Store {
+    fn legacy_trace_metadata_rows(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<LegacyTraceMetadata>> {
+        let offset = i64::try_from(offset).context("legacy metadata offset is too large")?;
+        let limit = i64::try_from(limit).context("legacy metadata limit is too large")?;
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, run_id, ts_request_ms, ts_response_ms,
+                    req_headers_json, resp_headers_json, req_body_path,
+                    upstream_req_body_path, resp_body_path, upstream_provider,
+                    requested_model, routed_model, account_id, status,
+                    error_class, error, substituted, original_model, served_model,
+                    substitution_reason, attempts, original_account_id,
+                    served_account_id, injected, fixture_name, via_dario,
+                    dario_generation, harness, client_format, upstream_format,
+                    method, path, streamed, input_tokens, cached_input_tokens,
+                    cache_creation_tokens, output_tokens, reasoning_tokens,
+                    cost_usd, billing_bucket, error_kind, error_code,
+                    subscription_identity, tags_json, client_ip, key_fingerprint,
+                    reasoning_effort, thinking_budget
+               FROM traces ORDER BY ts_request_ms, id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit, offset], |row| {
+            Ok(LegacyTraceMetadata {
+                trace_id: row.get(0)?,
+                session_id: row.get(1)?,
+                run_id: row.get(2)?,
+                ts_request_ms: row.get(3)?,
+                ts_response_ms: row.get(4)?,
+                request_headers_json: row.get(5)?,
+                response_headers_json: row.get(6)?,
+                request_body_path: row.get(7)?,
+                upstream_request_body_path: row.get(8)?,
+                response_body_path: row.get(9)?,
+                provider: row.get(10)?,
+                requested_model: row.get(11)?,
+                routed_model: row.get(12)?,
+                account_id: row.get(13)?,
+                status: row.get(14)?,
+                error_class: row.get(15)?,
+                error: row.get(16)?,
+                substituted: row.get::<_, i64>(17)? != 0,
+                original_model: row.get(18)?,
+                served_model: row.get(19)?,
+                substitution_reason: row.get(20)?,
+                attempts_json: row.get(21)?,
+                original_account_id: row.get(22)?,
+                served_account_id: row.get(23)?,
+                injected: row.get::<_, i64>(24)? != 0,
+                fixture_name: row.get(25)?,
+                via_dario: row.get::<_, i64>(26)? != 0,
+                dario_generation: row.get(27)?,
+                harness: row.get(28)?,
+                client_format: row.get(29)?,
+                upstream_format: row.get(30)?,
+                method: row.get(31)?,
+                path: row.get(32)?,
+                streamed: row.get::<_, Option<i64>>(33)?.map(|value| value != 0),
+                input_tokens: row.get(34)?,
+                cached_input_tokens: row.get(35)?,
+                cache_creation_tokens: row.get(36)?,
+                output_tokens: row.get(37)?,
+                reasoning_tokens: row.get(38)?,
+                cost_usd: row.get(39)?,
+                billing_bucket: row.get(40)?,
+                error_kind: row.get(41)?,
+                error_code: row.get(42)?,
+                subscription_identity: row.get(43)?,
+                tags_json: row.get(44)?,
+                client_ip: row.get(45)?,
+                key_fingerprint: row.get(46)?,
+                reasoning_effort: row.get(47)?,
+                thinking_budget: row.get(48)?,
+                synthetic_tool: None,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn legacy_unlinked_tool_metadata_rows(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<LegacyTraceMetadata>> {
+        let offset = i64::try_from(offset).context("legacy tool metadata offset is too large")?;
+        let limit = i64::try_from(limit).context("legacy tool metadata limit is too large")?;
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT c.id, c.harness, c.session_id, c.turn_id, c.trace_id,
+                    c.tool_call_id, c.tool_name,
+                    c.ts_start_ms, c.ts_end_ms, c.is_error, c.exit_status,
+                    c.args_body_path, c.result_body_path
+               FROM tool_calls c
+              WHERE c.trace_id IS NULL
+                 OR NOT EXISTS(SELECT 1 FROM traces t WHERE t.id=c.trace_id)
+              ORDER BY c.ts_start_ms, c.id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit, offset], |row| {
+            let tool = LegacyToolMetadata {
+                id: row.get(0)?,
+                harness: row.get(1)?,
+                session_id: row.get(2)?,
+                turn_id: row.get(3)?,
+                trace_id: row.get(4)?,
+                tool_call_id: row.get(5)?,
+                tool_name: row.get(6)?,
+                ts_start_ms: row.get(7)?,
+                ts_end_ms: row.get(8)?,
+                is_error: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+                exit_status: row.get(10)?,
+                arguments_path: row.get(11)?,
+                result_path: row.get(12)?,
+            };
+            Ok(LegacyTraceMetadata {
+                trace_id: format!("legacy-tool:{}", tool.id),
+                session_id: Some(tool.session_id.clone()),
+                run_id: None,
+                ts_request_ms: tool.ts_start_ms,
+                ts_response_ms: tool.ts_end_ms,
+                request_headers_json: None,
+                response_headers_json: None,
+                request_body_path: None,
+                upstream_request_body_path: None,
+                response_body_path: None,
+                provider: None,
+                requested_model: None,
+                routed_model: None,
+                account_id: None,
+                status: None,
+                error_class: None,
+                error: None,
+                substituted: false,
+                original_model: None,
+                served_model: None,
+                substitution_reason: None,
+                attempts_json: None,
+                original_account_id: None,
+                served_account_id: None,
+                injected: false,
+                fixture_name: None,
+                via_dario: false,
+                dario_generation: None,
+                harness: None,
+                client_format: None,
+                upstream_format: None,
+                method: None,
+                path: None,
+                streamed: None,
+                input_tokens: None,
+                cached_input_tokens: None,
+                cache_creation_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
+                billing_bucket: None,
+                error_kind: None,
+                error_code: None,
+                subscription_identity: None,
+                tags_json: None,
+                client_ip: None,
+                key_fingerprint: None,
+                reasoning_effort: None,
+                thinking_budget: None,
+                synthetic_tool: Some(tool),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn legacy_metadata_plans(
+        &self,
+        sources: &[LegacyTraceMetadata],
+    ) -> Result<Vec<LegacyMetadataPlan>> {
+        let mut trace_manifests = HashMap::<String, HashMap<String, ManifestId>>::new();
+        let mut tools_by_trace = HashMap::<String, Vec<LegacyToolMetadata>>::new();
+        for source in sources {
+            if let Some(tool) = source.synthetic_tool.clone() {
+                tools_by_trace
+                    .entry(source.trace_id.clone())
+                    .or_default()
+                    .push(tool);
+            }
+        }
+        let conn = self.conn.lock().unwrap();
+        for chunk in sources.chunks(400) {
+            let ids = chunk
+                .iter()
+                .filter(|source| source.synthetic_tool.is_none())
+                .map(|source| source.trace_id.as_str())
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            #[cfg(test)]
+            note_legacy_metadata_plan_query();
+            let mut statement = conn.prepare(&format!(
+                "SELECT a.owner_id, a.artifact_kind, a.manifest_id
+                   FROM lar_trace_artifacts a
+                   JOIN lar_manifests m ON m.manifest_id=a.manifest_id AND m.state='ready'
+                  WHERE a.owner_kind='trace' AND a.stage_id=''
+                    AND a.validation_state='validated' AND a.manifest_id IS NOT NULL
+                    AND a.owner_id IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (trace_id, kind, manifest) = row?;
+                trace_manifests
+                    .entry(trace_id)
+                    .or_default()
+                    .insert(kind, ManifestId::from_str(&manifest)?);
+            }
+
+            let ids = chunk
+                .iter()
+                .filter(|source| source.synthetic_tool.is_none())
+                .map(|source| source.trace_id.as_str())
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            note_legacy_metadata_plan_query();
+            let mut statement = conn.prepare(&format!(
+                "SELECT id, harness, session_id, turn_id, trace_id, tool_call_id,
+                        tool_name, ts_start_ms,
+                        ts_end_ms, is_error, exit_status, args_body_path, result_body_path
+                   FROM tool_calls WHERE trace_id IN ({placeholders})
+                   ORDER BY trace_id, ts_start_ms, id"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok(LegacyToolMetadata {
+                    id: row.get(0)?,
+                    harness: row.get(1)?,
+                    session_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    trace_id: row.get(4)?,
+                    tool_call_id: row.get(5)?,
+                    tool_name: row.get(6)?,
+                    ts_start_ms: row.get(7)?,
+                    ts_end_ms: row.get(8)?,
+                    is_error: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+                    exit_status: row.get(10)?,
+                    arguments_path: row.get(11)?,
+                    result_path: row.get(12)?,
+                })
+            })?;
+            for row in rows {
+                let tool = row?;
+                if let Some(trace_id) = tool.trace_id.clone() {
+                    tools_by_trace.entry(trace_id).or_default().push(tool);
+                }
+            }
+        }
+
+        let tool_ids = tools_by_trace
+            .values()
+            .flatten()
+            .map(|tool| tool.id.clone())
+            .collect::<Vec<_>>();
+        let mut tool_manifests = HashMap::<String, HashMap<String, ManifestId>>::new();
+        for chunk in tool_ids.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            #[cfg(test)]
+            note_legacy_metadata_plan_query();
+            let mut statement = conn.prepare(&format!(
+                "SELECT a.owner_id, a.artifact_kind, a.manifest_id
+                   FROM lar_trace_artifacts a
+                   JOIN lar_manifests m ON m.manifest_id=a.manifest_id AND m.state='ready'
+                  WHERE a.owner_kind='tool_call' AND a.stage_id=''
+                    AND a.validation_state='validated' AND a.manifest_id IS NOT NULL
+                    AND a.owner_id IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (tool_id, kind, manifest) = row?;
+                tool_manifests
+                    .entry(tool_id)
+                    .or_default()
+                    .insert(kind, ManifestId::from_str(&manifest)?);
+            }
+        }
+        drop(conn);
+
+        sources
+            .iter()
+            .map(|source| {
+                let manifests = trace_manifests.remove(&source.trace_id).unwrap_or_default();
+                let tools = tools_by_trace
+                    .remove(&source.trace_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tool| {
+                        let manifests = tool_manifests.remove(&tool.id).unwrap_or_default();
+                        (tool, manifests)
+                    })
+                    .collect();
+                self.legacy_metadata_plan_from_parts(source, manifests, tools)
+            })
+            .collect()
+    }
+
+    fn legacy_metadata_plan_from_parts(
+        &self,
+        source: &LegacyTraceMetadata,
+        manifests: HashMap<String, ManifestId>,
+        tools: Vec<(LegacyToolMetadata, HashMap<String, ManifestId>)>,
+    ) -> Result<LegacyMetadataPlan> {
+        let mut missing_manifests = Vec::new();
+        for (path, kind) in [
+            (source.request_body_path.as_ref(), "client_request"),
+            (
+                source.upstream_request_body_path.as_ref(),
+                "upstream_request",
+            ),
+            (source.response_body_path.as_ref(), "client_response"),
+        ] {
+            if path.is_some() && !manifests.contains_key(kind) {
+                missing_manifests.push(kind.to_string());
+            }
+        }
+        for (tool, tool_manifests) in &tools {
+            for (path, kind) in [
+                (tool.arguments_path.as_ref(), "tool_arguments"),
+                (tool.result_path.as_ref(), "tool_result"),
+            ] {
+                if path.is_some() && !tool_manifests.contains_key(kind) {
+                    missing_manifests.push(format!("tool:{}:{kind}", tool.id));
+                }
+            }
+        }
+        if source.synthetic_tool.is_some() {
+            return self.legacy_unlinked_tool_plan(source, tools, missing_manifests);
+        }
+
+        let request_headers = parse_legacy_headers(source.request_headers_json.as_deref());
+        let response_headers = parse_legacy_headers(source.response_headers_json.as_deref());
+        let (attempts, attempts_unsupported) =
+            parse_legacy_attempts(source.attempts_json.as_deref());
+        let mut unsupported_count = u64::from(request_headers.unsupported.is_some())
+            + u64::from(response_headers.unsupported.is_some())
+            + u64::from(attempts_unsupported.is_some());
+        let exchange_metadata = legacy_exchange_metadata(source, &mut unsupported_count);
+
+        let wall_time_ns = u64::try_from(source.ts_request_ms.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1_000_000);
+        let response_time_ns = source
+            .ts_response_ms
+            .and_then(|value| u64::try_from(value.max(0)).ok())
+            .map(|value| value.saturating_mul(1_000_000))
+            .unwrap_or(wall_time_ns);
+        let mut stages = Vec::new();
+        let mut request = StageData::new(StageKind::ClientRequest, wall_time_ns);
+        request.request_body_manifest_ref = manifests.get("client_request").copied();
+        if let Some(detail) = request_headers.unsupported.as_deref() {
+            append_metadata_note(&mut request, detail);
+        }
+        stages.push(request);
+
+        let mut router = StageData::new(StageKind::RouterDecision, wall_time_ns);
+        router.provider = source.provider.as_deref().map(str::as_bytes).map(Vec::from);
+        router.requested_model = source
+            .original_model
+            .as_deref()
+            .or(source.requested_model.as_deref())
+            .map(str::as_bytes)
+            .map(Vec::from);
+        router.routed_model = source
+            .served_model
+            .as_deref()
+            .or(source.routed_model.as_deref())
+            .map(str::as_bytes)
+            .map(Vec::from);
+        router.account_id = source
+            .served_account_id
+            .as_deref()
+            .or(source.account_id.as_deref())
+            .map(str::as_bytes)
+            .map(Vec::from);
+        router.routing_reason = source
+            .substitution_reason
+            .as_deref()
+            .or(source.substituted.then_some("legacy_substituted"))
+            .map(str::as_bytes)
+            .map(Vec::from);
+        if let Some(detail) = attempts_unsupported.as_deref() {
+            append_metadata_note(&mut router, detail);
+        }
+        stages.push(router);
+
+        let mut previous_model = source.original_model.as_deref();
+        let mut previous_account = source.original_account_id.as_deref();
+        for (index, attempt) in attempts.iter().enumerate() {
+            let changed_route = previous_model
+                .is_some_and(|value| attempt.model.as_deref().is_some_and(|model| model != value))
+                || previous_account.is_some_and(|value| {
+                    attempt
+                        .account_id
+                        .as_deref()
+                        .is_some_and(|account| account != value)
+                });
+            let kind = if index == 0 {
+                StageKind::AccountRouting
+            } else if changed_route {
+                StageKind::FailoverDecision
+            } else {
+                StageKind::RetryDecision
+            };
+            let mut stage = StageData::new(kind, wall_time_ns);
+            stage.attempt_number = Some(u32::try_from(index + 1).unwrap_or(u32::MAX));
+            stage.requested_model = previous_model.map(str::as_bytes).map(Vec::from);
+            stage.routed_model = attempt.model.as_deref().map(str::as_bytes).map(Vec::from);
+            stage.account_id = attempt
+                .account_id
+                .as_deref()
+                .map(str::as_bytes)
+                .map(Vec::from);
+            stage.routing_reason = legacy_stage_field(
+                attempt.routing_reason.as_deref(),
+                "attempt routing reason",
+                &mut unsupported_count,
+            );
+            if let Some(opaque) = attempt.opaque_json.as_deref() {
+                unsupported_count = unsupported_count.saturating_add(1);
+                let detail = format!("legacy_opaque_attempt_json:{opaque}");
+                let embedded = legacy_stage_field(
+                    Some(&detail),
+                    "opaque attempt JSON",
+                    &mut unsupported_count,
+                );
+                stage.error_class = Some(b"legacy_opaque_metadata".to_vec());
+                stage.error_message = embedded;
+            }
+            stages.push(stage);
+            previous_model = attempt.model.as_deref().or(previous_model);
+            previous_account = attempt.account_id.as_deref().or(previous_account);
+        }
+
+        let upstream_evidence = source.upstream_request_body_path.is_some()
+            || source.response_headers_json.is_some()
+            || !attempts.is_empty()
+            || source.via_dario;
+        if upstream_evidence && !source.injected {
+            let mut upstream_request = StageData::new(StageKind::UpstreamRequest, wall_time_ns);
+            upstream_request.attempt_number =
+                Some(u32::try_from(attempts.len().max(1)).unwrap_or(u32::MAX));
+            upstream_request.request_body_manifest_ref = manifests
+                .get("upstream_request")
+                .or_else(|| manifests.get("client_request"))
+                .copied();
+            stages.push(upstream_request);
+
+            if source.via_dario {
+                if let Some(manifest) = manifests.get("dario_upstream_request") {
+                    let mut dario = StageData::new(StageKind::DarioRequest, wall_time_ns);
+                    dario.request_body_manifest_ref = Some(*manifest);
+                    dario.routing_reason = source
+                        .dario_generation
+                        .as_deref()
+                        .map(str::as_bytes)
+                        .map(Vec::from);
+                    stages.push(dario);
+                }
+                if let Some(manifest) = manifests.get("dario_upstream_response") {
+                    let mut dario = StageData::new(StageKind::DarioResponse, response_time_ns);
+                    dario.response_body_manifest_ref = Some(*manifest);
+                    dario.routing_reason = source
+                        .dario_generation
+                        .as_deref()
+                        .map(str::as_bytes)
+                        .map(Vec::from);
+                    stages.push(dario);
+                }
+            }
+
+            if response_headers.capture.is_some()
+                || source.status.is_some()
+                || source.error.is_some()
+            {
+                let response_kind = if source.status.is_some() {
+                    StageKind::UpstreamResponse
+                } else {
+                    StageKind::UpstreamFailure
+                };
+                let mut upstream_response = StageData::new(response_kind, response_time_ns);
+                upstream_response.attempt_number =
+                    Some(u32::try_from(attempts.len().max(1)).unwrap_or(u32::MAX));
+                upstream_response.status_code =
+                    source.status.and_then(|value| u16::try_from(value).ok());
+                upstream_response.error_class = source
+                    .error_class
+                    .as_deref()
+                    .map(str::as_bytes)
+                    .map(Vec::from);
+                upstream_response.error_message = legacy_stage_field(
+                    source.error.as_deref(),
+                    "upstream error",
+                    &mut unsupported_count,
+                );
+                if let Some(detail) = response_headers.unsupported.as_deref() {
+                    append_metadata_note(&mut upstream_response, detail);
+                }
+                stages.push(upstream_response);
+            }
+        } else if let Some(detail) = response_headers.unsupported.as_deref() {
+            if let Some(router) = stages
+                .iter_mut()
+                .find(|stage| stage.kind == StageKind::RouterDecision)
+            {
+                append_metadata_note(router, detail);
+            }
+        }
+
+        if source.injected {
+            let mut injected = StageData::new(StageKind::InjectedResponse, response_time_ns);
+            injected.response_body_manifest_ref = manifests.get("client_response").copied();
+            injected.routing_reason = source
+                .fixture_name
+                .as_deref()
+                .map(str::as_bytes)
+                .map(Vec::from);
+            stages.push(injected);
+        }
+
+        let mut client_response = StageData::new(StageKind::ClientResponse, response_time_ns);
+        client_response.response_body_manifest_ref = manifests.get("client_response").copied();
+        client_response.status_code = source.status.and_then(|value| u16::try_from(value).ok());
+        client_response.error_class = source
+            .error_class
+            .as_deref()
+            .map(str::as_bytes)
+            .map(Vec::from);
+        client_response.error_message = legacy_stage_field(
+            source.error.as_deref(),
+            "client error",
+            &mut unsupported_count,
+        );
+        stages.push(client_response);
+
+        let usage = legacy_token_usage(source, &mut unsupported_count);
+        let cost_nanos = legacy_cost_nanos(source.cost_usd, &mut unsupported_count);
+        if let Some(response) = stages.iter_mut().find(|stage| {
+            matches!(
+                stage.kind,
+                StageKind::UpstreamResponse
+                    | StageKind::InjectedResponse
+                    | StageKind::ClientResponse
+            )
+        }) {
+            response.usage = usage;
+            response.cost_nanos = cost_nanos;
+            if response.cost_nanos.is_some() {
+                response.cost_currency = Some(b"USD".to_vec());
+            }
+        }
+
+        for (tool, tool_manifests) in &tools {
+            let tool_time_ns = u64::try_from(tool.ts_start_ms.max(0))
+                .unwrap_or(0)
+                .saturating_mul(1_000_000);
+            let mut call = StageData::new(StageKind::ToolCall, tool_time_ns);
+            call.request_body_manifest_ref = tool_manifests.get("tool_arguments").copied();
+            let provenance = legacy_tool_provenance(tool);
+            call.routing_reason = legacy_stage_field(
+                Some(&provenance),
+                "tool-call provenance",
+                &mut unsupported_count,
+            );
+            stages.push(call);
+
+            let result_time_ns = tool
+                .ts_end_ms
+                .and_then(|value| u64::try_from(value.max(0)).ok())
+                .map(|value| value.saturating_mul(1_000_000))
+                .unwrap_or(tool_time_ns)
+                .max(tool_time_ns);
+            let mut result = StageData::new(StageKind::ToolResult, result_time_ns);
+            result.response_body_manifest_ref = tool_manifests.get("tool_result").copied();
+            result.routing_reason = tool
+                .exit_status
+                .map(|value| format!("legacy_tool_exit_status:{value}").into_bytes());
+            if tool.is_error == Some(true) {
+                result.error_class = Some(b"tool_error".to_vec());
+            }
+            stages.push(result);
+        }
+        // Legacy tool callbacks were recorded asynchronously. Merge their
+        // source timestamps into the exchange timeline instead of placing all
+        // tools after ClientResponse. Stable sorting retains the semantic
+        // construction order when legacy timestamps are equal and therefore
+        // do not prove a finer ordering.
+        stages.sort_by_key(|stage| stage.wall_time_ns);
+
+        let catalog_capture = LarExchangeCapture {
+            trace_id: source.trace_id.clone(),
+            session_id: source.session_id.clone(),
+            run_id: source.run_id.clone(),
+            wall_time_ns,
+            client_request_headers: request_headers.capture,
+            // The old field was populated from upstream response headers. It
+            // is carried here only so the shared catalog helper emits atoms;
+            // the stage builder attaches it to UpstreamResponse below.
+            client_response_headers: response_headers.capture,
+            upstream_attempts: Vec::new(),
+            upstream_stream_reads: None,
+            provider: source.provider.clone(),
+            requested_model: source.requested_model.clone(),
+            routed_model: source.routed_model.clone(),
+            account_id: source.account_id.clone(),
+            routing_reason: source.substitution_reason.clone(),
+            status_code: source.status.and_then(|value| u16::try_from(value).ok()),
+            error_class: source.error_class.clone(),
+            error_message: source.error.clone(),
+        };
+
+        let mut external_manifests = manifests.values().copied().collect::<Vec<_>>();
+        for (_, tool_manifests) in &tools {
+            external_manifests.extend(tool_manifests.values().copied());
+        }
+        external_manifests.sort_by_key(|id| id.0);
+        external_manifests.dedup();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"alex-legacy-exchange-metadata-v2\0");
+        for (label, value) in [
+            ("trace_id", Some(source.trace_id.as_str())),
+            ("session_id", source.session_id.as_deref()),
+            ("run_id", source.run_id.as_deref()),
+            ("request_headers", source.request_headers_json.as_deref()),
+            ("response_headers", source.response_headers_json.as_deref()),
+            ("provider", source.provider.as_deref()),
+            ("requested_model", source.requested_model.as_deref()),
+            ("routed_model", source.routed_model.as_deref()),
+            ("account_id", source.account_id.as_deref()),
+            ("error_class", source.error_class.as_deref()),
+            ("error", source.error.as_deref()),
+            ("original_model", source.original_model.as_deref()),
+            ("served_model", source.served_model.as_deref()),
+            ("substitution_reason", source.substitution_reason.as_deref()),
+            ("attempts", source.attempts_json.as_deref()),
+            ("original_account_id", source.original_account_id.as_deref()),
+            ("served_account_id", source.served_account_id.as_deref()),
+            ("fixture_name", source.fixture_name.as_deref()),
+            ("dario_generation", source.dario_generation.as_deref()),
+            ("harness", source.harness.as_deref()),
+            ("client_format", source.client_format.as_deref()),
+            ("upstream_format", source.upstream_format.as_deref()),
+            ("method", source.method.as_deref()),
+            ("path", source.path.as_deref()),
+            ("billing_bucket", source.billing_bucket.as_deref()),
+            ("error_kind", source.error_kind.as_deref()),
+            ("error_code", source.error_code.as_deref()),
+            (
+                "subscription_identity",
+                source.subscription_identity.as_deref(),
+            ),
+            ("tags_json", source.tags_json.as_deref()),
+            ("client_ip", source.client_ip.as_deref()),
+            ("key_fingerprint", source.key_fingerprint.as_deref()),
+            ("reasoning_effort", source.reasoning_effort.as_deref()),
+        ] {
+            hash_metadata_field(&mut hasher, label, value);
+        }
+        for (label, value) in [
+            ("ts_request_ms", source.ts_request_ms),
+            ("ts_response_ms", source.ts_response_ms.unwrap_or(i64::MIN)),
+            ("status", source.status.unwrap_or(i64::MIN)),
+            ("substituted", i64::from(source.substituted)),
+            ("injected", i64::from(source.injected)),
+            ("via_dario", i64::from(source.via_dario)),
+            (
+                "streamed",
+                source.streamed.map(i64::from).unwrap_or(i64::MIN),
+            ),
+            ("input_tokens", source.input_tokens.unwrap_or(i64::MIN)),
+            (
+                "cached_input_tokens",
+                source.cached_input_tokens.unwrap_or(i64::MIN),
+            ),
+            (
+                "cache_creation_tokens",
+                source.cache_creation_tokens.unwrap_or(i64::MIN),
+            ),
+            ("output_tokens", source.output_tokens.unwrap_or(i64::MIN)),
+            (
+                "reasoning_tokens",
+                source.reasoning_tokens.unwrap_or(i64::MIN),
+            ),
+            (
+                "thinking_budget",
+                source.thinking_budget.unwrap_or(i64::MIN),
+            ),
+        ] {
+            hash_metadata_field(&mut hasher, label, Some(&value.to_string()));
+        }
+        hash_metadata_field(
+            &mut hasher,
+            "cost_usd_bits",
+            source
+                .cost_usd
+                .map(f64::to_bits)
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+        );
+        let mut manifest_pairs = manifests.into_iter().collect::<Vec<_>>();
+        manifest_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        for (kind, manifest) in manifest_pairs {
+            hash_metadata_field(
+                &mut hasher,
+                &format!("manifest:{kind}"),
+                Some(&manifest.to_string()),
+            );
+        }
+        for missing in &missing_manifests {
+            hash_metadata_field(&mut hasher, "missing_manifest", Some(missing));
+        }
+        for (tool, tool_manifests) in &tools {
+            for (label, value) in [
+                ("tool_id", Some(tool.id.as_str())),
+                ("tool_harness", Some(tool.harness.as_str())),
+                ("tool_session", Some(tool.session_id.as_str())),
+                ("tool_turn", tool.turn_id.as_deref()),
+                ("tool_trace", tool.trace_id.as_deref()),
+                ("tool_call_id", Some(tool.tool_call_id.as_str())),
+                ("tool_name", Some(tool.tool_name.as_str())),
+                ("tool_arguments_path", tool.arguments_path.as_deref()),
+                ("tool_result_path", tool.result_path.as_deref()),
+            ] {
+                hash_metadata_field(&mut hasher, label, value);
+            }
+            for (label, value) in [
+                ("tool_start_ms", tool.ts_start_ms),
+                ("tool_end_ms", tool.ts_end_ms.unwrap_or(i64::MIN)),
+                (
+                    "tool_is_error",
+                    tool.is_error.map(i64::from).unwrap_or(i64::MIN),
+                ),
+                ("tool_exit_status", tool.exit_status.unwrap_or(i64::MIN)),
+            ] {
+                hash_metadata_field(&mut hasher, label, Some(&value.to_string()));
+            }
+            let mut pairs = tool_manifests.iter().collect::<Vec<_>>();
+            pairs.sort_by(|left, right| left.0.cmp(right.0));
+            for (kind, manifest) in pairs {
+                hash_metadata_field(
+                    &mut hasher,
+                    &format!("tool_manifest:{}:{kind}", tool.id),
+                    Some(&manifest.to_string()),
+                );
+            }
+        }
+        let source_size = [
+            source.request_headers_json.as_deref(),
+            source.response_headers_json.as_deref(),
+            source.attempts_json.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, |total, value| {
+            total.saturating_add(value.len() as u64)
+        });
+        Ok(LegacyMetadataPlan {
+            owner_kind: "trace",
+            owner_id: source.trace_id.clone(),
+            trace_id: source.trace_id.clone(),
+            session_id: source.session_id.clone(),
+            run_id: source.run_id.clone(),
+            source_metadata: source.clone(),
+            exchange_metadata,
+            catalog_capture,
+            stages,
+            external_manifests,
+            fingerprint: hex(hasher.finalize().as_bytes()),
+            source_size,
+            unsupported_count,
+            missing_manifests,
+        })
+    }
+
+    fn legacy_unlinked_tool_plan(
+        &self,
+        source: &LegacyTraceMetadata,
+        tools: Vec<(LegacyToolMetadata, HashMap<String, ManifestId>)>,
+        missing_manifests: Vec<String>,
+    ) -> Result<LegacyMetadataPlan> {
+        let tool = source
+            .synthetic_tool
+            .as_ref()
+            .context("synthetic legacy tool source lost its tool metadata")?;
+        let wall_time_ns = u64::try_from(tool.ts_start_ms.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1_000_000);
+        let mut stages = Vec::with_capacity(tools.len().saturating_mul(2));
+        // The synthetic exchange itself is an explicit fidelity limitation:
+        // the original trace anchor was absent or dangling.
+        let mut unsupported_count = 1u64;
+        let exchange_metadata = legacy_exchange_metadata(source, &mut unsupported_count);
+        let mut external_manifests = Vec::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"alex-legacy-unlinked-tool-metadata-v2\0");
+        hash_metadata_field(&mut hasher, "synthetic_trace_id", Some(&source.trace_id));
+        for (tool, manifests) in &tools {
+            let tool_time_ns = u64::try_from(tool.ts_start_ms.max(0))
+                .unwrap_or(0)
+                .saturating_mul(1_000_000);
+            let mut call = StageData::new(StageKind::ToolCall, tool_time_ns);
+            call.request_body_manifest_ref = manifests.get("tool_arguments").copied();
+            let provenance = legacy_tool_provenance(tool);
+            call.routing_reason = legacy_stage_field(
+                Some(&provenance),
+                "unlinked tool-call provenance",
+                &mut unsupported_count,
+            );
+            stages.push(call);
+
+            let result_time_ns = tool
+                .ts_end_ms
+                .and_then(|value| u64::try_from(value.max(0)).ok())
+                .map(|value| value.saturating_mul(1_000_000))
+                .unwrap_or(tool_time_ns)
+                .max(tool_time_ns);
+            let mut result = StageData::new(StageKind::ToolResult, result_time_ns);
+            result.response_body_manifest_ref = manifests.get("tool_result").copied();
+            result.routing_reason = tool
+                .exit_status
+                .map(|value| format!("legacy_tool_exit_status:{value}").into_bytes());
+            if tool.is_error == Some(true) {
+                result.error_class = Some(b"tool_error".to_vec());
+            }
+            stages.push(result);
+            external_manifests.extend(manifests.values().copied());
+
+            for (label, value) in [
+                ("tool_id", Some(tool.id.as_str())),
+                ("tool_harness", Some(tool.harness.as_str())),
+                ("tool_session", Some(tool.session_id.as_str())),
+                ("tool_turn", tool.turn_id.as_deref()),
+                ("legacy_trace_id", tool.trace_id.as_deref()),
+                ("tool_call_id", Some(tool.tool_call_id.as_str())),
+                ("tool_name", Some(tool.tool_name.as_str())),
+                ("tool_arguments_path", tool.arguments_path.as_deref()),
+                ("tool_result_path", tool.result_path.as_deref()),
+            ] {
+                hash_metadata_field(&mut hasher, label, value);
+            }
+            for (label, value) in [
+                ("tool_start_ms", tool.ts_start_ms),
+                ("tool_end_ms", tool.ts_end_ms.unwrap_or(i64::MIN)),
+                (
+                    "tool_is_error",
+                    tool.is_error.map(i64::from).unwrap_or(i64::MIN),
+                ),
+                ("tool_exit_status", tool.exit_status.unwrap_or(i64::MIN)),
+            ] {
+                hash_metadata_field(&mut hasher, label, Some(&value.to_string()));
+            }
+            let mut pairs = manifests.iter().collect::<Vec<_>>();
+            pairs.sort_by(|left, right| left.0.cmp(right.0));
+            for (kind, manifest) in pairs {
+                hash_metadata_field(
+                    &mut hasher,
+                    &format!("tool_manifest:{}:{kind}", tool.id),
+                    Some(&manifest.to_string()),
+                );
+            }
+        }
+        for missing in &missing_manifests {
+            hash_metadata_field(&mut hasher, "missing_manifest", Some(missing));
+        }
+        external_manifests.sort_by_key(|id| id.0);
+        external_manifests.dedup();
+        stages.sort_by_key(|stage| stage.wall_time_ns);
+        let source_size = tools.iter().fold(0u64, |total, (tool, _)| {
+            [
+                Some(tool.id.as_str()),
+                Some(tool.harness.as_str()),
+                Some(tool.session_id.as_str()),
+                tool.turn_id.as_deref(),
+                tool.trace_id.as_deref(),
+                Some(tool.tool_call_id.as_str()),
+                Some(tool.tool_name.as_str()),
+                tool.arguments_path.as_deref(),
+                tool.result_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(total, |total, value| {
+                total.saturating_add(value.len() as u64)
+            })
+        });
+        let catalog_capture = LarExchangeCapture {
+            trace_id: source.trace_id.clone(),
+            session_id: source.session_id.clone(),
+            run_id: None,
+            wall_time_ns,
+            client_request_headers: None,
+            client_response_headers: None,
+            upstream_attempts: Vec::new(),
+            upstream_stream_reads: None,
+            provider: None,
+            requested_model: None,
+            routed_model: None,
+            account_id: None,
+            routing_reason: Some("legacy_unlinked_tool_call".into()),
+            status_code: None,
+            error_class: None,
+            error_message: None,
+        };
+        Ok(LegacyMetadataPlan {
+            owner_kind: "tool_call",
+            owner_id: tool.id.clone(),
+            trace_id: source.trace_id.clone(),
+            session_id: source.session_id.clone(),
+            run_id: None,
+            source_metadata: source.clone(),
+            exchange_metadata,
+            catalog_capture,
+            stages,
+            external_manifests,
+            fingerprint: hex(hasher.finalize().as_bytes()),
+            source_size,
+            unsupported_count,
+            missing_manifests,
+        })
+    }
+
+    fn legacy_metadata_page_needs_import(&self, plans: &[LegacyMetadataPlan]) -> Result<bool> {
+        if plans.is_empty() {
+            return Ok(false);
+        }
+        let mut migrated = HashSet::<(String, String, String)>::new();
+        let conn = self.conn.lock().unwrap();
+        for chunk in plans.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn.prepare(&format!(
+                "SELECT owner_kind, owner_id, source_fingerprint
+                   FROM lar_migration_items
+                  WHERE artifact_kind='exchange_metadata'
+                    AND stage_id='' AND state='migrated'
+                    AND validation_state='validated'
+                    AND owner_id IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|plan| plan.owner_id.as_str())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                migrated.insert(row?);
+            }
+        }
+        Ok(plans.iter().any(|plan| {
+            !migrated.contains(&(
+                plan.owner_kind.to_string(),
+                plan.owner_id.clone(),
+                plan.fingerprint.clone(),
+            ))
+        }))
+    }
+
+    fn legacy_metadata_item_states(
+        &self,
+        job_id: &str,
+        plans: &[LegacyMetadataPlan],
+    ) -> Result<HashMap<String, String>> {
+        let item_ids = plans
+            .iter()
+            .map(|plan| {
+                metadata_item_id(job_id, plan.owner_kind, &plan.owner_id, &plan.fingerprint)
+            })
+            .collect::<Vec<_>>();
+        let mut states = HashMap::new();
+        let conn = self.conn.lock().unwrap();
+        for chunk in item_ids.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn.prepare(&format!(
+                "SELECT item_id, state FROM lar_migration_items
+                  WHERE item_id IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (item_id, state) = row?;
+                states.insert(item_id, state);
+            }
+        }
+        Ok(states)
+    }
+
+    fn validate_ready_metadata_manifests(&self, plans: &[LegacyMetadataPlan]) -> Result<()> {
+        let mut ids = plans
+            .iter()
+            .flat_map(|plan| plan.external_manifests.iter().copied())
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        let conn = self.conn.lock().unwrap();
+        for chunk in ids.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let ready: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM lar_manifests
+                      WHERE state='ready' AND manifest_id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(chunk.iter().map(ToString::to_string)),
+                |row| row.get(0),
+            )?;
+            if usize::try_from(ready)? != chunk.len() {
+                bail!("a legacy metadata body manifest became unavailable during import");
+            }
+        }
+        Ok(())
+    }
+
     fn legacy_source_needs_import(&self, source: &LarLegacyArtifact) -> Result<bool> {
         // LAR-with-fallback deliberately retains a gzip copy. If that live
         // capture became visible after this migration pass began, its already
         // validated pointer is authoritative and the fallback must not be
         // rediscovered as legacy work on a later inventory page.
-        let captured_pointer: bool = self.conn.lock().unwrap().query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM lar_trace_artifacts a
+        let validated_pointer: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT a.fidelity FROM lar_trace_artifacts a
                JOIN lar_manifests m ON m.manifest_id=a.manifest_id
-                WHERE a.owner_kind=?1 AND a.owner_id=?2 AND a.artifact_kind=?3
+               WHERE a.owner_kind=?1 AND a.owner_id=?2 AND a.artifact_kind=?3
                   AND a.stage_id=?4 AND a.validation_state='validated'
-                  AND a.fidelity='captured' AND m.state='ready'
-             )",
-            params![
-                source.owner_kind,
-                source.owner_id,
-                source.artifact_kind,
-                source.stage_id.as_deref().unwrap_or(""),
-            ],
-            |row| row.get(0),
-        )?;
-        if captured_pointer {
+                  AND m.state='ready' LIMIT 1",
+                params![
+                    source.owner_kind,
+                    source.owner_id,
+                    source.artifact_kind,
+                    source.stage_id.as_deref().unwrap_or(""),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if validated_pointer.as_deref() == Some("captured") {
             return Ok(false);
         }
         let resolved = resolve_source_path(&self.data_dir, &source.source_path);
         let (size, mtime_ms) = source_metadata(&resolved);
+        if size.is_none() && validated_pointer.is_some() {
+            return Ok(false);
+        }
         let size = size.and_then(|value| i64::try_from(value).ok());
         let metadata_matches: bool = self.conn.lock().unwrap().query_row(
             "SELECT EXISTS(
@@ -1037,6 +2604,30 @@ impl Store {
         }
         for source in &options.additional_artifacts {
             if self.legacy_source_needs_import(&source)? {
+                return Ok(true);
+            }
+        }
+        let mut offset = 0usize;
+        loop {
+            let rows = self.legacy_trace_metadata_rows(offset, inventory_batch)?;
+            if rows.is_empty() {
+                break;
+            }
+            offset += rows.len();
+            let plans = self.legacy_metadata_plans(&rows)?;
+            if self.legacy_metadata_page_needs_import(&plans)? {
+                return Ok(true);
+            }
+        }
+        let mut offset = 0usize;
+        loop {
+            let rows = self.legacy_unlinked_tool_metadata_rows(offset, inventory_batch)?;
+            if rows.is_empty() {
+                break;
+            }
+            offset += rows.len();
+            let plans = self.legacy_metadata_plans(&rows)?;
+            if self.legacy_metadata_page_needs_import(&plans)? {
                 return Ok(true);
             }
         }
@@ -1152,16 +2743,13 @@ impl Store {
             .open(&ids.file_path)
             .with_context(|| format!("opening LAR body pack at {}", ids.file_path.display()))?;
         let mut writer = if file.metadata()?.len() == 0 {
-            ArchiveWriter::create(
-                file,
-                FileHeader::body_pack(
-                    ids.file_uuid_bytes,
-                    u64::try_from(started_ms.max(0)).unwrap_or(0) * 1_000_000,
-                    b"alex-store legacy importer v1".to_vec(),
-                ),
-                chunker,
-                limits.clone(),
-            )?
+            let mut header = FileHeader::body_pack(
+                ids.file_uuid_bytes,
+                u64::try_from(started_ms.max(0)).unwrap_or(0) * 1_000_000,
+                b"alex-store legacy importer v2".to_vec(),
+            );
+            header.required_feature_bits |= REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS;
+            ArchiveWriter::create(file, header, chunker, limits.clone())?
         } else {
             ArchiveWriter::open_append(file, chunker, limits.clone())?
         };
@@ -1175,6 +2763,11 @@ impl Store {
         writer.get_ref().sync_all()?;
         self.ensure_import_archive_file(ids, started_ms)?;
         Ok(writer)
+    }
+
+    fn import_pack_supports_external_body_refs(&self, ids: &ImportIds) -> Result<bool> {
+        let reader = ArchiveReader::open(File::open(&ids.file_path)?, Limits::default())?;
+        Ok(reader.header().required_feature_bits & REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS != 0)
     }
 
     fn backfill_import_archive_catalogs(
@@ -1378,6 +2971,22 @@ impl Store {
         let (mut ids, rolled_over_existing) = match latest_pack {
             None => (base_ids.clone(), false),
             Some((ids, state))
+                if state == "active" && !self.import_pack_supports_external_body_refs(&ids)? =>
+            {
+                let mut old_writer = self.open_import_pack(&ids, started_ms, chunker, &limits)?;
+                self.seal_import_pack(&ids, &mut old_writer)?;
+                (
+                    import_pack_ids(
+                        self,
+                        &base_ids,
+                        ids.pack_sequence
+                            .checked_add(1)
+                            .context("legacy import pack sequence overflow")?,
+                    ),
+                    true,
+                )
+            }
+            Some((ids, state))
                 if state == "active"
                     && self
                         .catalog_import_pack_exceeds_index_limit(&ids, &options.resources)? =>
@@ -1567,12 +3176,26 @@ impl Store {
                 )?;
             }
         }
+        if inventory_complete && !resource_paused {
+            inventory_complete = self.import_legacy_trace_metadata(
+                &base_ids,
+                &mut ids,
+                options,
+                &mut writer,
+                &mut report,
+                started_ms,
+                chunker,
+                &limits,
+                max_attempts,
+                &resources,
+            )?;
+        }
         report.limit_reached = !inventory_complete;
         // A completed batch ends in an append-only persisted checkpoint so
         // mixed-mode trace pages can open this active pack through its index
         // instead of rescanning every preceding body record. Empty resumptions
         // do not append another identical snapshot.
-        if report.attempted > 0 {
+        if report.attempted > 0 || report.metadata_attempted > 0 {
             writer.checkpoint()?;
         } else {
             writer.flush()?;
@@ -1601,6 +3224,244 @@ impl Store {
         self.backfill_import_conversations(options, &mut report)?;
         self.finalize_import_report(&mut report, &resources, run_started.elapsed())?;
         Ok(report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_legacy_trace_metadata(
+        &self,
+        base: &ImportIds,
+        ids: &mut ImportIds,
+        options: &LarLegacyImportOptions,
+        writer: &mut ArchiveWriter<File>,
+        report: &mut LarLegacyImportReport,
+        started_ms: i64,
+        chunker: ChunkerConfig,
+        limits: &Limits,
+        max_attempts: usize,
+        resources: &ResourceController,
+    ) -> Result<bool> {
+        let batch_size = options.resources.effective_batch_size(options.batch_size);
+        for tool_only in [false, true] {
+            let mut offset = 0usize;
+            loop {
+                let rows = if tool_only {
+                    self.legacy_unlinked_tool_metadata_rows(offset, batch_size)?
+                } else {
+                    self.legacy_trace_metadata_rows(offset, batch_size)?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                offset += rows.len();
+                let plans = self.legacy_metadata_plans(&rows)?;
+                let item_states = self.legacy_metadata_item_states(&ids.job_id, &plans)?;
+                self.validate_ready_metadata_manifests(&plans)?;
+                for plan in plans {
+                    let cpu_started = Instant::now();
+                    report.metadata_inventoried = report.metadata_inventoried.saturating_add(1);
+                    let item_id = metadata_item_id(
+                        &ids.job_id,
+                        plan.owner_kind,
+                        &plan.owner_id,
+                        &plan.fingerprint,
+                    );
+                    self.discover_lar_migration_item(
+                        &LarMigrationItem {
+                            item_id: item_id.clone(),
+                            job_id: ids.job_id.clone(),
+                            owner_kind: plan.owner_kind.into(),
+                            owner_id: plan.owner_id.clone(),
+                            artifact_kind: "exchange_metadata".into(),
+                            stage_id: None,
+                            source_path: None,
+                            source_size: Some(plan.source_size),
+                            source_mtime_ms: None,
+                            source_fingerprint: plan.fingerprint.clone(),
+                            fidelity: "legacy_normalized".into(),
+                        },
+                        now_ms(),
+                    )?;
+                    let state = item_states.get(&item_id).map(String::as_str);
+                    if matches!(state, Some("migrated" | "skipped")) {
+                        report.metadata_skipped = report.metadata_skipped.saturating_add(1);
+                        resources.finish_cpu_slice(cpu_started.elapsed());
+                        continue;
+                    }
+                    if report.attempted.saturating_add(report.metadata_attempted) as usize
+                        >= max_attempts
+                    {
+                        resources.finish_cpu_slice(cpu_started.elapsed());
+                        return Ok(false);
+                    }
+                    report.metadata_attempted = report.metadata_attempted.saturating_add(1);
+                    if !plan.missing_manifests.is_empty() {
+                        let detail = format!(
+                        "legacy exchange metadata references body artifacts that are not validated: {}",
+                        plan.missing_manifests.join(", ")
+                    );
+                        self.record_lar_migration_item_failure(
+                            &ids.job_id,
+                            &item_id,
+                            &options.lease_owner,
+                            "body_unavailable",
+                            &detail,
+                            now_ms(),
+                        )?;
+                        report.metadata_failed = report.metadata_failed.saturating_add(1);
+                        report.push_error(LarLegacyImportError {
+                            item_id,
+                            owner_kind: plan.owner_kind.into(),
+                            owner_id: plan.owner_id.clone(),
+                            artifact_kind: "exchange_metadata".into(),
+                            error_kind: "body_unavailable".into(),
+                            detail,
+                        });
+                        resources.finish_cpu_slice(cpu_started.elapsed());
+                        continue;
+                    }
+
+                    if import_pack_limit_reached(writer, &options.resources)? {
+                        self.rotate_import_pack(
+                            base, ids, writer, report, started_ms, chunker, limits,
+                        )?;
+                    }
+                    let request_header = crate::live_body_store::append_capture_header(
+                        writer,
+                        plan.catalog_capture.client_request_headers.as_ref(),
+                    )?;
+                    let response_header = crate::live_body_store::append_capture_header(
+                        writer,
+                        plan.catalog_capture.client_response_headers.as_ref(),
+                    )?;
+                    let mut stage_ids = Vec::with_capacity(plan.stages.len());
+                    for mut stage in plan.stages.clone() {
+                        if stage.kind == StageKind::ClientRequest {
+                            stage.request_headers_ref = request_header;
+                        }
+                        if matches!(
+                            stage.kind,
+                            StageKind::UpstreamResponse
+                                | StageKind::UpstreamFailure
+                                | StageKind::InjectedResponse
+                        ) {
+                            stage.response_headers_ref = response_header;
+                        }
+                        stage_ids.push(writer.append_stage_with_external_manifests(
+                            Stage::new(stage),
+                            &plan.external_manifests,
+                        )?);
+                    }
+                    let mut exchange_data = ExchangeData::new(
+                        plan.trace_id.as_bytes(),
+                        plan.catalog_capture.wall_time_ns,
+                        plan.catalog_capture.wall_time_ns,
+                        stage_ids.clone(),
+                    );
+                    exchange_data.session_id =
+                        plan.session_id.as_deref().map(str::as_bytes).map(Vec::from);
+                    exchange_data.run_id = plan.run_id.as_deref().map(str::as_bytes).map(Vec::from);
+                    let exchange_id = writer.append_exchange_with_metadata(
+                        Exchange::new(exchange_data),
+                        plan.exchange_metadata.clone(),
+                    )?;
+                    writer.flush()?;
+                    writer.get_ref().sync_all()?;
+                    self.update_import_file_size(ids)?;
+                    visit_import_boundary(options, LarLegacyImportBoundary::MetadataAppended)?;
+
+                    let reader = ArchiveReader::open(File::open(&ids.file_path)?, limits.clone())?;
+                    let exchange = reader.exchange(&exchange_id).with_context(|| {
+                        format!("synced legacy exchange {exchange_id} is missing")
+                    })?;
+                    if exchange.data.stages != stage_ids {
+                        bail!("synced legacy exchange stage order changed during validation");
+                    }
+                    if reader
+                        .exchange_metadata(&exchange_id)
+                        .map(|value| &value.data)
+                        != Some(&plan.exchange_metadata)
+                    {
+                        bail!("synced legacy exchange metadata changed during validation");
+                    }
+                    for stage_id in &stage_ids {
+                        if reader.stage(stage_id).is_none() {
+                            bail!("synced legacy stage {stage_id} is missing");
+                        }
+                    }
+                    for header_id in [request_header, response_header].into_iter().flatten() {
+                        if reader.header_block(&header_id).is_none() {
+                            bail!("synced legacy header block {header_id} is missing");
+                        }
+                    }
+                    visit_import_boundary(options, LarLegacyImportBoundary::MetadataValidated)?;
+
+                    let file_uuid = ids.file_uuid.clone();
+                    let file_size = std::fs::metadata(&ids.file_path)?.len();
+                    let header_count =
+                        u64::from(request_header.is_some()) + u64::from(response_header.is_some());
+                    let published = self.publish_lar_migration_exchange(
+                        &ids.job_id,
+                        &item_id,
+                        &options.lease_owner,
+                        &exchange_id.to_string(),
+                        &file_uuid,
+                        plan.session_id.as_deref(),
+                        stage_ids.len() as u64,
+                        header_count,
+                        plan.unsupported_count,
+                        now_ms(),
+                        |tx| {
+                            crate::live_body_store::catalog_capture_headers(
+                                tx,
+                                &file_uuid,
+                                &plan.catalog_capture,
+                                now_ms(),
+                            )?;
+                            crate::live_body_store::catalog_capture_exchange(
+                                tx,
+                                &file_uuid,
+                                &plan.trace_id,
+                                &exchange_id.to_string(),
+                                plan.catalog_capture.wall_time_ns,
+                                stage_ids.len() as u64,
+                                "legacy_normalized",
+                            )?;
+                            crate::live_body_store::catalog_capture_stages(
+                                tx,
+                                &file_uuid,
+                                &plan.trace_id,
+                                &stage_ids,
+                                writer,
+                                "legacy_normalized",
+                                now_ms(),
+                            )?;
+                            tx.execute(
+                                "UPDATE lar_files SET size_bytes=?2 WHERE file_uuid=?1",
+                                params![file_uuid, file_size],
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                    visit_import_boundary(options, LarLegacyImportBoundary::MetadataPublished)?;
+                    if published {
+                        report.metadata_migrated = report.metadata_migrated.saturating_add(1);
+                        report.metadata_unsupported = report
+                            .metadata_unsupported
+                            .saturating_add(plan.unsupported_count);
+                    } else {
+                        report.metadata_skipped = report.metadata_skipped.saturating_add(1);
+                    }
+                    self.checkpoint_lar_migration_job(
+                        &ids.job_id,
+                        &options.lease_owner,
+                        &item_id,
+                        now_ms(),
+                    )?;
+                    resources.finish_cpu_slice(cpu_started.elapsed());
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn backfill_import_conversations(
@@ -1668,6 +3529,138 @@ impl Store {
     /// budget. Archive-backed manifests share readers, catalog-only manifests
     /// may span several live packs, and every request receives an explicit
     /// result rather than allowing one failure to erase the whole batch.
+    fn lar_artifact_locations_batched(
+        &self,
+        requests: &[LarArtifactReadRequest],
+    ) -> Vec<Result<Option<LarArtifactLocation>>> {
+        let mut output = (0..requests.len())
+            .map(|_| Ok(None))
+            .collect::<Vec<Result<Option<LarArtifactLocation>>>>();
+        let conn = self.conn.lock().unwrap();
+        for indexed in requests.iter().enumerate().collect::<Vec<_>>().chunks(150) {
+            let valid = indexed
+                .iter()
+                .filter(|(_, request)| matches!(request.owner_kind.as_str(), "trace" | "tool_call"))
+                .copied()
+                .collect::<Vec<_>>();
+            for (index, request) in indexed.iter().copied().filter(|(_, request)| {
+                !matches!(request.owner_kind.as_str(), "trace" | "tool_call")
+            }) {
+                output[index] = Err(anyhow::anyhow!(
+                    "unsupported LAR artifact owner kind {}",
+                    request.owner_kind
+                ));
+            }
+            if valid.is_empty() {
+                continue;
+            }
+            let values_clause = std::iter::repeat_n("(?,?,?,?,?)", valid.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "WITH requested(idx, owner_kind, owner_id, artifact_kind, stage_id) AS
+                     (VALUES {values_clause})
+                 SELECT r.idx,
+                        m.manifest_id, m.total_length, m.hash_algorithm,
+                        m.whole_body_hash, a.fidelity,
+                        mi.source_path, mi.state, mi.error_kind, mi.validation_error,
+                        CASE
+                          WHEN r.owner_kind='trace' AND r.artifact_kind='client_request'
+                            THEN t.req_body_path
+                          WHEN r.owner_kind='trace' AND r.artifact_kind='upstream_request'
+                            THEN t.upstream_req_body_path
+                          WHEN r.owner_kind='trace' AND r.artifact_kind='client_response'
+                            THEN t.resp_body_path
+                          WHEN r.owner_kind='tool_call' AND r.artifact_kind='tool_arguments'
+                            THEN c.args_body_path
+                          WHEN r.owner_kind='tool_call' AND r.artifact_kind='tool_result'
+                            THEN c.result_body_path
+                        END legacy_path
+                   FROM requested r
+                   LEFT JOIN lar_trace_artifacts a
+                     ON a.owner_kind=r.owner_kind AND a.owner_id=r.owner_id
+                    AND a.artifact_kind=r.artifact_kind AND a.stage_id=r.stage_id
+                    AND a.validation_state='validated'
+                   LEFT JOIN lar_manifests m
+                     ON m.manifest_id=a.manifest_id AND m.state='ready'
+                   LEFT JOIN lar_migration_items mi ON mi.item_id=(
+                     SELECT newest.item_id FROM lar_migration_items newest
+                      WHERE newest.owner_kind=r.owner_kind
+                        AND newest.owner_id=r.owner_id
+                        AND newest.artifact_kind=r.artifact_kind
+                        AND newest.stage_id=r.stage_id
+                      ORDER BY newest.updated_at_ms DESC LIMIT 1)
+                   LEFT JOIN traces t
+                     ON r.owner_kind='trace' AND t.id=r.owner_id
+                   LEFT JOIN tool_calls c
+                     ON r.owner_kind='tool_call' AND c.id=r.owner_id
+                  ORDER BY r.idx"
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(valid.len() * 5);
+            for (index, request) in &valid {
+                values.push(i64::try_from(*index).unwrap_or(i64::MAX).into());
+                values.push(request.owner_kind.clone().into());
+                values.push(request.owner_id.clone().into());
+                values.push(request.artifact_kind.clone().into());
+                values.push(request.stage_id.clone().unwrap_or_default().into());
+            }
+            let queried = (|| -> Result<()> {
+                let mut statement = conn.prepare(&sql)?;
+                let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+                while let Some(row) = rows.next()? {
+                    let index = usize::try_from(row.get::<_, i64>(0)?)?;
+                    let manifest_id = row.get::<_, Option<String>>(1)?;
+                    if let Some(manifest_id) = manifest_id {
+                        let length = row.get::<_, i64>(2)?;
+                        output[index] = Ok(Some(LarArtifactLocation::Lar {
+                            manifest_id,
+                            total_length: u64::try_from(length)
+                                .context("manifest length is negative")?,
+                            hash_algorithm: row.get(3)?,
+                            whole_body_hash: row.get(4)?,
+                            fidelity: row.get(5)?,
+                        }));
+                        continue;
+                    }
+                    let migration_path = row.get::<_, Option<String>>(6)?;
+                    let migration_state = row.get::<_, Option<String>>(7)?;
+                    let migration_error = row
+                        .get::<_, Option<String>>(8)?
+                        .zip(row.get::<_, Option<String>>(9)?)
+                        .map(|(kind, detail)| LarArtifactError { kind, detail });
+                    if migration_state.as_deref() == Some("failed")
+                        && migration_error.as_ref().is_some_and(|error| {
+                            matches!(error.kind.as_str(), "missing" | "corrupt" | "unsupported")
+                        })
+                    {
+                        output[index] = Ok(Some(LarArtifactLocation::Unavailable {
+                            source_path: migration_path,
+                            error: migration_error.expect("failed source error was checked"),
+                        }));
+                    } else if let Some(path) = migration_path {
+                        output[index] = Ok(Some(LarArtifactLocation::Legacy {
+                            path,
+                            migration_error,
+                        }));
+                    } else if let Some(path) = row.get::<_, Option<String>>(10)? {
+                        output[index] = Ok(Some(LarArtifactLocation::Legacy {
+                            path,
+                            migration_error: None,
+                        }));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = queried {
+                let detail = format!("batching LAR artifact locations: {error:#}");
+                for (index, _) in valid {
+                    output[index] = Err(anyhow::anyhow!(detail.clone()));
+                }
+            }
+        }
+        output
+    }
+
     pub fn read_lar_or_legacy_artifact_batch_bounded(
         &self,
         requests: &[LarArtifactReadRequest],
@@ -1676,13 +3669,11 @@ impl Store {
         let mut output = vec![LarArtifactBatchRead::Missing; requests.len()];
         let mut lar = Vec::new();
         let mut remaining = byte_budget;
-        for (index, request) in requests.iter().enumerate() {
-            let location = self.lar_artifact_location(
-                &request.owner_kind,
-                &request.owner_id,
-                &request.artifact_kind,
-                request.stage_id.as_deref(),
-            );
+        for (index, location) in self
+            .lar_artifact_locations_batched(requests)
+            .into_iter()
+            .enumerate()
+        {
             match location {
                 Ok(Some(LarArtifactLocation::Lar {
                     manifest_id,
@@ -1755,72 +3746,101 @@ impl Store {
         let mut archives: HashMap<(PathBuf, String), Vec<(usize, ManifestId)>> = HashMap::new();
         let mut catalog_manifests = Vec::new();
         if !lar.is_empty() {
+            let mut requests_by_manifest = HashMap::<String, Vec<usize>>::new();
+            for (index, manifest_id) in lar {
+                requests_by_manifest
+                    .entry(manifest_id)
+                    .or_default()
+                    .push(index);
+            }
+            let manifest_ids = requests_by_manifest.keys().cloned().collect::<Vec<_>>();
+            let mut located = HashSet::<String>::new();
             let conn = self.conn.lock().unwrap();
-            let statement = conn.prepare(
-                "SELECT f.path, f.file_uuid, f.state FROM lar_manifests m
-                 JOIN lar_files f ON f.file_uuid=m.file_uuid
-                 WHERE m.manifest_id=?1 AND m.state='ready'",
-            );
-            match statement {
-                Ok(mut statement) => {
-                    for (index, manifest_id) in lar {
-                        let location = statement
-                            .query_row([&manifest_id], |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            })
-                            .optional();
-                        match location {
-                            Ok(Some((path, file_uuid, state))) => {
-                                let resolved = resolve_source_path(&self.data_dir, &path);
-                                if !matches!(state.as_str(), "active" | "sealed") {
-                                    let error = LarArchiveUnavailableError::offline(
-                                        file_uuid,
+            for chunk in manifest_ids.chunks(400) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let queried = (|| -> Result<()> {
+                    let mut statement = conn.prepare(&format!(
+                        "SELECT m.manifest_id, f.path, f.file_uuid, f.state
+                           FROM lar_manifests m JOIN lar_files f ON f.file_uuid=m.file_uuid
+                          WHERE m.manifest_id IN ({placeholders}) AND m.state='ready'"
+                    ))?;
+                    let rows =
+                        statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })?;
+                    for row in rows {
+                        let (manifest_id, path, file_uuid, state) = row?;
+                        located.insert(manifest_id.clone());
+                        let indexes = requests_by_manifest
+                            .get(&manifest_id)
+                            .expect("queried manifest originated in request batch");
+                        let resolved = resolve_source_path(&self.data_dir, &path);
+                        for index in indexes.iter().copied() {
+                            if !matches!(state.as_str(), "active" | "sealed") {
+                                output[index] = LarArtifactBatchRead::ArchiveUnavailable(
+                                    LarArchiveUnavailableError::offline(
+                                        file_uuid.clone(),
                                         resolved.to_string_lossy(),
-                                    );
-                                    output[index] = LarArtifactBatchRead::ArchiveUnavailable(error);
-                                    continue;
-                                }
-                                if !resolved.exists() {
-                                    let error = LarArchiveUnavailableError::missing(
-                                        file_uuid,
-                                        resolved.to_string_lossy(),
-                                    );
-                                    output[index] = LarArtifactBatchRead::ArchiveUnavailable(error);
-                                    continue;
-                                }
-                                match ManifestId::from_str(&manifest_id) {
-                                    Ok(id) => archives
-                                        .entry((resolved, file_uuid))
-                                        .or_default()
-                                        .push((index, id)),
-                                    Err(error) => {
-                                        output[index] = LarArtifactBatchRead::Error {
-                                            kind: "manifest_id".into(),
-                                            detail: error.to_string(),
-                                        };
-                                    }
-                                }
+                                    ),
+                                );
+                                continue;
                             }
-                            Ok(None) => catalog_manifests.push((index, manifest_id)),
-                            Err(error) => {
-                                output[index] = LarArtifactBatchRead::Error {
-                                    kind: "catalog".into(),
-                                    detail: format!("locating LAR manifest {manifest_id}: {error}"),
-                                };
+                            if !resolved.exists() {
+                                output[index] = LarArtifactBatchRead::ArchiveUnavailable(
+                                    LarArchiveUnavailableError::missing(
+                                        file_uuid.clone(),
+                                        resolved.to_string_lossy(),
+                                    ),
+                                );
+                                continue;
+                            }
+                            match ManifestId::from_str(&manifest_id) {
+                                Ok(id) => archives
+                                    .entry((resolved.clone(), file_uuid.clone()))
+                                    .or_default()
+                                    .push((index, id)),
+                                Err(error) => {
+                                    output[index] = LarArtifactBatchRead::Error {
+                                        kind: "manifest_id".into(),
+                                        detail: error.to_string(),
+                                    };
+                                }
                             }
                         }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = queried {
+                    for manifest_id in chunk {
+                        for index in requests_by_manifest
+                            .get(manifest_id)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                        {
+                            located.insert(manifest_id.clone());
+                            output[index] = LarArtifactBatchRead::Error {
+                                kind: "catalog".into(),
+                                detail: format!("batch locating LAR manifests: {error:#}"),
+                            };
+                        }
+                    }
                 }
-                Err(error) => {
-                    for (index, _) in lar {
-                        output[index] = LarArtifactBatchRead::Error {
-                            kind: "catalog".into(),
-                            detail: format!("preparing LAR manifest lookup: {error}"),
-                        };
+            }
+            for manifest_id in manifest_ids {
+                if !located.contains(&manifest_id) {
+                    for index in requests_by_manifest
+                        .remove(&manifest_id)
+                        .unwrap_or_default()
+                    {
+                        catalog_manifests.push((index, manifest_id.clone()));
                     }
                 }
             }
@@ -2782,6 +4802,7 @@ impl Store {
 #[cfg(test)]
 mod resource_control_tests {
     use super::*;
+    use alex_core::TraceRecord;
 
     #[test]
     fn rate_and_cpu_delay_calculations_are_deterministic() {
@@ -2854,5 +4875,36 @@ mod resource_control_tests {
         };
         assert_eq!(controls.effective_batch_size(MAX_BATCH_SIZE), 256);
         assert_eq!(controls.effective_pack_index_entries(), 4096);
+    }
+
+    #[test]
+    fn metadata_planning_queries_scale_by_page_chunk_not_trace() {
+        let path = std::env::temp_dir().join(format!(
+            "alex-lar-metadata-plan-query-shape-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = Store::open(path.clone()).unwrap();
+        for index in 0..401 {
+            store
+                .insert_trace(&TraceRecord {
+                    id: format!("trace-{index:04}"),
+                    ts_request_ms: index,
+                    session_id: Some("query-shape".into()),
+                    ..TraceRecord::default()
+                })
+                .unwrap();
+        }
+        let rows = store.legacy_trace_metadata_rows(0, 500).unwrap();
+        LEGACY_METADATA_PLAN_QUERY_COUNT.store(0, Ordering::Relaxed);
+        let plans = store.legacy_metadata_plans(&rows).unwrap();
+        assert_eq!(plans.len(), 401);
+        assert_eq!(
+            LEGACY_METADATA_PLAN_QUERY_COUNT.load(Ordering::Relaxed),
+            4,
+            "planning should issue two set queries per 400-row SQLite chunk"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
     }
 }

@@ -225,7 +225,9 @@ BodyManifest {
 Requirements:
 
 - Reconstruct the exact captured bytes by concatenating referenced ranges.
-- Content-address manifests so identical complete bodies share one manifest.
+- Content-address manifests so identical complete bodies with the same
+  manifest metadata share one manifest. Media/encoding variants may keep tiny
+  distinct manifests while their content-addressed chunks remain single-copy.
 - Permit byte ranges into chunks for import, segmentation, and future packing.
 - Permit a writer to segment a body against a known predecessor manifest and
   reference matching predecessor chunk ranges directly. Store only literal
@@ -495,8 +497,12 @@ Rules:
 - Compression, hashing, body parsing, and disk reads must not run on Tokio's
   async executor threads.
 - Bound queues and apply backpressure rather than growing memory without limit.
-- The durability mode must be configurable and documented (`sync`, `batch`,
-  `best-effort`) with a safe default.
+- The durability mode is configurable as `sync` (full `sync_all` per publication
+  boundary, the default), `batch` (one `sync_data` per publication boundary),
+  or `best-effort` (writer flush with no file-sync call). `best-effort` is valid
+  only while legacy gzip remains authoritative (`legacy` or
+  `dual-write-validated`) and is rejected for `lar-with-fallback`; `batch` is
+  not a delayed multi-capture queue.
 - Chunk and manifest insertion must be idempotent under retries.
 
 ## 10. SQLite integration
@@ -558,10 +564,45 @@ Requirements:
 - Bound live/rebuild extraction by body bytes, JSON depth/nodes, entry count,
   per-entry characters, and total characters. A partial rebuild remains marked
   `needs_rebuild` rather than presenting partial coverage as complete.
+- The initial extractor indexes bodies up to 64 MiB and at most 1 MiB of unique
+  normalized semantic text per artifact, split into 64 KiB FTS entries. Hitting
+  any byte, parse, depth, node, entry, or character bound records
+  `skipped_limit`; already-extracted text remains useful, but is never treated
+  as complete coverage.
+- Search only an explicit low-risk header allow-list (content negotiation and
+  encoding, user agent, provider/API versions and beta flags, request IDs, and
+  SDK runtime-identification fields). Authentication, cookies, API keys,
+  credentials, secrets, tokens, and arbitrary extension headers never enter
+  the semantic index or compatibility fallback, even if capture redaction was
+  accidentally omitted.
+- Index new trace request/response header metadata synchronously with its trace
+  anchor. A bounded rebuild restores those derived rows from SQLite alongside
+  normalized LAR bodies.
+- Mixed-mode compatibility search uses stable timestamp/trace-ID cursor pages,
+  rather than a newest-N window. One request scans at most 100,000 trace rows
+  and 256 MiB of otherwise-unindexed bodies, with 64 MiB per read page. The API
+  returns `coverage_complete`, `coverage_limit_reasons`, bytes read, and bounded
+  body errors; reaching a limit is an explicit partial result, not a silent
+  claim that older or larger traces did not match. A dropped HTTP request sets
+  a cooperative cancellation flag checked between cursor pages.
 
 ### 11.3 Raw byte grep
 
 - Provide `lar grep <literal>` for exact raw artifact search.
+- Search logical manifest ranges with matcher state carried across range/chunk
+  boundaries. Verify BLAKE3 after decompression and reuse each unique chunk per
+  source instead of rescanning bytes for every referencing body.
+- Treat `max_cached_chunk_bytes` as a RAM budget, not a corpus-size limit. The
+  current scanner keeps a bounded LRU-style hot set (including per-entry
+  overhead), spills verified decompressed chunks to an append-only temporary
+  file, and reuses spilled bytes without decompressing the source again. The
+  temporary file and its on-disk hash buckets are removed on normal scanner
+  drop; temporary-disk exhaustion or spill corruption fails the exact search.
+- Keep explicit hard limits for literal bytes, manifests, manifest ranges,
+  logical bytes scanned, and returned reverse references. Exceeding a limit
+  fails rather than returning an apparently complete partial result. Current
+  defaults allow a 1 MiB literal, 1,000,000 manifests, 8,000,000 ranges,
+  512 MiB of charged chunk-cache RAM, and 64 GiB of logical bytes per source.
 - Add optional per-page trigram/Bloom filters to skip impossible compressed
   pages; always verify matches after decompression.
 - Regex without an extractable literal may fall back to a full scan.
@@ -595,6 +636,12 @@ Inventory and import every legacy artifact category, including:
 - Import headers exactly as represented by the old database.
 - Mark headers reconstructed from JSON maps as `legacy_normalized` when order,
   casing, duplicates, or original wire representation were not retained.
+- Store the supported legacy non-body trace fields in an optional
+  exchange-metadata companion frame adjacent to its exchange. This preserves
+  exact request and response millisecond timestamps, nullable token fields, f64
+  cost bits, transport formats, routing/error fields, tags, and the other fields
+  enumerated by the Type 15 schema; IDs, stages, body/header bytes, and catalog
+  provenance remain in their ordinary records or SQLite projections.
 - Do not infer missing stream timing or transport details.
 - Preserve missing/corrupt state as an explicit artifact error.
 
@@ -633,6 +680,12 @@ Persist:
 - Artifact identity uses trace/stage/kind plus a source fingerprint.
 - Reprocessing a completed item verifies/reuses its manifest and does not write
   duplicate chunks.
+- Metadata conversion uses a versioned job namespace independent of the older
+  body-only job, and reuses validated body manifests even when their original
+  gzip files have already been cleaned up.
+- Inventory planning prefetches manifests, tool rows, and completed metadata
+  fingerprints in bounded pages; startup must not issue per-trace planning
+  queries across a large corpus.
 - Commit each bounded batch transactionally.
 - Migration may be interrupted at any record boundary and resumed.
 - New live captures and legacy migration may write concurrently through the
@@ -722,11 +775,55 @@ deletion.
 
 Standalone export:
 
-- walks selected traces/sessions and all transitive manifest/chunk refs;
-- writes one self-contained `.lar` with no external dependencies;
-- verifies every copied object;
+- for every already-cataloged LAR trace, copies its authoritative ordered stage
+  list, duplicate-preserving request/response/trailer header blocks, every
+  referenced logical body into self-contained destination manifests/chunks,
+  its stream read/frame index, an existing ExchangeMetadata companion, and the
+  turn's complete conversation closure. When an older source has no companion,
+  the exporter derives the supported metadata fields from the current trace row;
+- includes every conversation entry raw-range manifest, response entry,
+  generation, and ancestor generation needed to preserve compaction/branch
+  history; IDs are recomputed only from equivalent rewritten references;
+- writes one sealed `.lar` with no external archive-set body references and
+  verifies its footer plus every reconstructed body before publication;
+- preserves manifest media type and content encoding. Destination chunking may
+  produce a different manifest ID/topology, so dependent content IDs are
+  transitively recomputed while the reconstructed body bytes remain exact;
 - may duplicate chunks across separate standalone exports by design;
-- records provenance back to the live archive set.
+- treats an offline or inconsistent cataloged LAR trace as an error rather than
+  silently downgrading it. A genuinely legacy-only trace is exported through a
+  separate, explicitly declared legacy-fidelity synthesis path;
+- writes directly to a uniquely named sibling temporary file, syncs it, and
+  verifies it. Without `--force`, a sibling hard-link provides atomic
+  no-clobber publication even if another process races to create the output.
+  Forced replacement is atomic on Unix; platforms that cannot replace by
+  rename may remove the old destination immediately before publication. It
+  does not build the complete archive bytes in a `Vec`; body copying currently
+  reconstructs one logical body at a time and can therefore use memory
+  proportional to the largest single artifact. Writer indexes/record metadata
+  and multi-trace selection metadata still scale with the selected archive,
+  subject to format limits. Trace backup construction is a separate path and
+  still materializes its embedded LAR before packaging.
+
+Standalone import validates a regular, clean, sealed file with the standalone
+role, rejects external archive-set body references, verifies the whole-file
+identity, every chunk, and every reconstructed manifest, then rechecks the file
+identity before one SQLite publication transaction. It attaches ordered stages,
+headers, ExchangeMetadata, streams, conversation entries/ranges, generations,
+turn response references, and each turn's ancestor-generation/session evidence.
+Conflicting content-addressed IDs and generation cycles fail; exact re-imports
+are idempotent and existing logical bodies may be reused. Manifest validation
+streams verified chunks to a sink rather than allocating a complete body;
+canonical record/index metadata still scales with the archive within explicit
+format limits.
+
+The v1 conversation record does not encode the parser's local `source_format`
+label. Standalone import therefore leaves that derived catalog field empty
+instead of inventing a value. Raw ranges, normalized schema version, role,
+kind, name, and tool-call ID remain preserved. Selective exact export is
+version-scoped to canonical record types understood by the current reader;
+future optional record types require an ownership envelope before they can be
+carried through unchanged.
 
 ### 13.1 Trace backup, restore, and reset
 
@@ -958,8 +1055,13 @@ work, even when a narrower prototype exists.
 ### Phase 2 — SQLite catalog and live body store
 
 - [x] Add additive LAR catalog schema and migrations.
-- [x] Implement rolling body packs and event logs.
+- [x] Implement rolling combined body/event packs. Body manifests, exchange
+      metadata, stages, headers, and stream indexes share the same append-only
+      archive without duplicating body bytes into a second event log.
 - [x] Implement LAR/SQLite durability ordering and orphan recovery.
+      `sync` performs `sync_all`, `batch` performs `sync_data`, and
+      shadow-only `best-effort` performs no file-sync call after flush;
+      authoritative mode rejects `best-effort`.
 - [x] Add unified artifact references and legacy fallback reads.
 - [x] Route new request, upstream-request, response, tool, Dario, and fixture
       artifacts through manifests.
@@ -986,6 +1088,13 @@ work, even when a narrower prototype exists.
 - [x] Implement pause/resume/status/verify admin and CLI commands.
 - [x] Implement crash, restart, stale lease, and duplicate work recovery.
 - [x] Implement missing/corrupt file reporting without data loss.
+- [x] Import legacy headers, routing attempts, exchange/stage ordering, linked
+      tool stages, and explicitly represented unlinked tools into the same
+      combined body/event packs without copying body bytes.
+- [x] Give the metadata importer a distinct v2 job namespace and reuse
+      validated body-only v1 manifests after legacy gzip cleanup.
+- [x] Batch metadata planning and mixed-reader catalog lookups by bounded page,
+      preserving request order and a global reconstructed-byte budget.
 - [x] Add migration progress to the macOS app.
 - [x] Implement dry-run and full-corpus verification reports.
 - [x] Implement cleanup eligibility and a separate dry-run/apply workflow.
@@ -995,16 +1104,19 @@ work, even when a narrower prototype exists.
 ### Phase 4 — Trace Browser and search
 
 - [x] Read paged transcript bodies through LAR manifests.
-- [ ] Display stage/attempt timelines and body/header differences.
-      Stage and attempt ordering, fidelity, and content-reference change markers
-      are visible, but this remains open until the browser can inspect and diff
-      each stage's actual ordered duplicate headers and body bytes rather than
-      only comparing content-addressed reference IDs.
+- [x] Display stage/attempt timelines and body/header differences.
+      The authenticated, bounded, cursor-paged inspector exposes each stage's
+      actual ordered duplicate header bytes and raw body bytes through deduped
+      content tables, compares adjacent/retry content using bytes as the source
+      of truth, and reports truncation plus offline/missing archive states.
 - [x] Display compaction/generation/branch events.
 - [x] Add raw stream replay with speed controls.
 - [x] Build normalized-entry FTS indexing and reverse references.
 - [x] Preserve search trace/timestamp anchors.
 - [x] Implement raw `lar grep` with unique-chunk scanning.
+      The scanner has bounded charged RAM, spills verified decompressed chunks
+      to an auto-cleaned temporary file for reuse, carries matches across
+      manifest ranges, and fails explicitly on scan/result limits.
 - [x] Prototype page Bloom/trigram filters and measure value/size/privacy cost.
 - [x] Add offline/archive-missing states without showing daemon down.
 - [ ] Run an end-to-end macOS long-session Trace Browser benchmark covering
@@ -1022,10 +1134,23 @@ work, even when a narrower prototype exists.
 - [x] Implement reference-aware trace deletion.
 - [x] Implement verified mark-and-sweep.
 - [x] Implement pack garbage accounting and repack thresholds.
-- [x] Implement copy-verify-switch-retire pack compaction.
+- [x] Implement copy-verify-switch-retire compaction for sealed chunk-only
+      packs, including a final catalog-ownership recheck and recoverable source
+      quarantine after the atomic switch.
+- [ ] Implement copy-verify-switch-retire pack compaction for canonical
+      combined packs. Packs containing manifests, headers, stream indexes,
+      stages, exchanges, exchange-metadata companions, or conversation DAG
+      records remain authoritative and are not selected until repack can
+      rewrite and atomically switch the complete canonical graph.
 - [x] Implement archive catalog relocation/offline/reattach behavior.
 - [x] Implement `lar verify` and non-mutating `lar repair`.
-- [x] Implement standalone archive packing/import.
+- [x] Implement exact standalone archive packing/import for cataloged LAR
+      traces, including ordered stages and headers, all manifest/stream refs,
+      ExchangeMetadata, and the transitive conversation generation/entry/turn
+      closure. Export uses a sibling temp file and atomic publication; body
+      copy/validation is bounded by the largest single artifact, not yet by a
+      smaller streaming window within that artifact. Legacy-only traces retain
+      their explicitly declared synthesized-fidelity path.
 - [x] Integrate reset, backup, and restore flows.
 - [x] Add interrupted GC recovery tests.
 - [x] Add interrupted repack recovery tests.
@@ -1076,7 +1201,9 @@ work, even when a narrower prototype exists.
       entry bytes across footer, checkpoint, and forward recovery paths.
 - [x] Unknown provider data round-trips as bounded raw-only conversation
       entries without core parsing.
-- [x] Repacking preserves logical IDs and reconstructed hashes.
+- [x] Eligible chunk-only repacking preserves chunk IDs and reconstructed body
+      hashes; combined canonical packs remain covered by the unchecked Phase 5
+      gate.
 
 ### Integration tests
 
@@ -1091,6 +1218,9 @@ work, even when a narrower prototype exists.
 - [x] Offline archive detach and reattach.
 - [x] Standalone and JSONL export/import into an empty store.
 - [x] Legacy fallback after an intentionally failed migration item.
+- [x] Legacy metadata/header/attempt/tool import is idempotent, shares existing
+      manifests, and survives upgrade from a completed v1 job after gzip
+      cleanup.
 
 ### Performance tests
 

@@ -10,14 +10,17 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
+use alex_core::TraceRecord;
+
 use crate::{
     LarArtifactBatchRead, LarArtifactReadRequest, LarBodyArtifact, LarBodyOwnerKind, Store,
 };
 
-pub const LAR_NORMALIZED_INDEX_SCHEMA_VERSION: i64 = 1;
-const EXTRACTOR_VERSION: &str = "provider-neutral-json-v1";
+pub const LAR_NORMALIZED_INDEX_SCHEMA_VERSION: i64 = 2;
+const EXTRACTOR_VERSION: &str = "provider-neutral-json-headers-v2";
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_NODES: usize = 100_000;
+pub const DEFAULT_MAX_NORMALIZED_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS lar_normalized_index_meta (
@@ -102,8 +105,8 @@ impl Default for LarFtsRebuildOptions {
     fn default() -> Self {
         Self {
             max_artifacts: 100_000,
-            max_body_bytes: 4 * 1024 * 1024,
-            max_total_body_bytes: 1024 * 1024 * 1024,
+            max_body_bytes: DEFAULT_MAX_NORMALIZED_BODY_BYTES,
+            max_total_body_bytes: 4 * 1024 * 1024 * 1024,
             max_entries_per_artifact: 4096,
             max_entry_chars: 64 * 1024,
             max_total_chars_per_artifact: 1024 * 1024,
@@ -151,6 +154,11 @@ struct Candidate {
 struct NormalizedEntry {
     kind: String,
     text: String,
+}
+
+struct Extraction {
+    entries: Vec<NormalizedEntry>,
+    complete: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -253,7 +261,7 @@ pub(crate) fn index_artifact_bytes(
         record_artifact_state(conn, &candidate, "skipped_limit", created_at_ms)?;
         return Ok((0, 0));
     }
-    index_bytes(
+    let (entries, references, _) = index_bytes(
         conn,
         &candidate,
         bytes,
@@ -263,6 +271,26 @@ pub(crate) fn index_artifact_bytes(
             max_total_chars: defaults.max_total_chars_per_artifact,
         },
         created_at_ms,
+    )?;
+    Ok((entries, references))
+}
+
+/// Remove derived search coverage for an artifact whose authoritative LAR
+/// pointer is being cleared in favor of a newer legacy fallback.
+pub(crate) fn clear_artifact_index(conn: &Connection, artifact: &LarBodyArtifact) -> Result<()> {
+    let owner_kind = match artifact.owner_kind {
+        LarBodyOwnerKind::Trace => "trace",
+        LarBodyOwnerKind::ToolCall => "tool_call",
+    };
+    reset_artifact_derived(
+        conn,
+        &Candidate {
+            owner_kind: owner_kind.into(),
+            owner_id: artifact.owner_id.clone(),
+            artifact_kind: artifact.artifact_kind.clone(),
+            stage_id: artifact.stage_id.clone().unwrap_or_default(),
+            manifest_id: String::new(),
+        },
     )
 }
 
@@ -283,6 +311,42 @@ pub(crate) fn refresh_trace_anchor(
          WHERE trace_id=?1",
         params![trace_id, session_id, ts_request_ms],
     )?;
+    Ok(())
+}
+
+/// Index only an intentionally small allow-list of already-redacted transport
+/// headers. Authentication, cookie, and arbitrary extension headers never
+/// enter the searchable derivative, even if a caller accidentally supplies an
+/// unredacted TraceRecord.
+pub(crate) fn index_trace_headers(conn: &Connection, trace: &TraceRecord) -> Result<()> {
+    let defaults = LarFtsRebuildOptions::default();
+    let limits = ExtractionLimits {
+        max_entries: 128,
+        max_entry_chars: 8 * 1024,
+        max_total_chars: 64 * 1024,
+    };
+    for (artifact_kind, json) in [
+        ("request_headers", trace.req_headers_json.as_deref()),
+        ("response_headers", trace.resp_headers_json.as_deref()),
+    ] {
+        let candidate = Candidate {
+            owner_kind: "trace".into(),
+            owner_id: trace.id.clone(),
+            artifact_kind: artifact_kind.into(),
+            stage_id: String::new(),
+            manifest_id: String::new(),
+        };
+        let Some(bytes) = json.map(str::as_bytes) else {
+            reset_artifact_derived(conn, &candidate)?;
+            continue;
+        };
+        if bytes.len() as u64 > defaults.max_body_bytes {
+            reset_artifact_derived(conn, &candidate)?;
+            record_artifact_state(conn, &candidate, "skipped_limit", trace.ts_request_ms)?;
+            continue;
+        }
+        index_bytes(conn, &candidate, bytes, limits, trace.ts_request_ms)?;
+    }
     Ok(())
 }
 
@@ -365,6 +429,58 @@ pub(crate) fn prune_references(conn: &Connection, older_than_ms: i64) -> Result<
 }
 
 impl Store {
+    /// Apply the same privacy-filtered semantic extraction as the disposable
+    /// FTS index to an artifact that is not fully indexed. The second return
+    /// value is false when any extraction bound or parse limitation was hit.
+    pub fn lar_normalized_fallback_matches(
+        &self,
+        artifact_kind: &str,
+        bytes: &[u8],
+        query: &str,
+    ) -> (bool, bool) {
+        let defaults = LarFtsRebuildOptions::default();
+        let extraction = extract_entries(
+            artifact_kind,
+            bytes,
+            ExtractionLimits {
+                max_entries: defaults.max_entries_per_artifact,
+                max_entry_chars: defaults.max_entry_chars,
+                max_total_chars: defaults.max_total_chars_per_artifact,
+            },
+        );
+        (
+            normalized_entries_match(&extraction.entries, query),
+            extraction.complete,
+        )
+    }
+
+    /// Search the selected safe header allow-list without ever scanning raw
+    /// arbitrary header JSON for secrets.
+    pub fn lar_selected_headers_match(
+        &self,
+        request_headers_json: Option<&str>,
+        response_headers_json: Option<&str>,
+        query: &str,
+    ) -> (bool, bool) {
+        let limits = ExtractionLimits {
+            max_entries: 128,
+            max_entry_chars: 8 * 1024,
+            max_total_chars: 64 * 1024,
+        };
+        let mut matched = false;
+        let mut complete = true;
+        for (kind, json) in [
+            ("request_headers", request_headers_json),
+            ("response_headers", response_headers_json),
+        ] {
+            let Some(json) = json else { continue };
+            let extraction = extract_entries(kind, json.as_bytes(), limits);
+            matched |= normalized_entries_match(&extraction.entries, query);
+            complete &= extraction.complete;
+        }
+        (matched, complete)
+    }
+
     /// Return trace/artifact slots completely covered by the normalized index.
     /// Callers can use this bounded batch result to avoid compatibility gzip
     /// reads while still scanning genuinely legacy or skipped artifacts.
@@ -486,7 +602,7 @@ impl Store {
                     break;
                 }
                 report.body_bytes_read += body_length;
-                let (entries, refs) = {
+                let (entries, refs, complete) = {
                     let mut conn = self.conn.lock().unwrap();
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let counts = index_bytes(
@@ -499,10 +615,15 @@ impl Store {
                     tx.commit()?;
                     counts
                 };
-                report.artifacts_indexed += 1;
+                if complete {
+                    report.artifacts_indexed += 1;
+                } else {
+                    report.artifacts_skipped += 1;
+                }
                 report.entries += entries;
                 report.reverse_references += refs;
             }
+            rebuild_trace_headers(self, options, &mut report)?;
             {
                 let conn = self.conn.lock().unwrap();
                 attach_all_stage_references(&conn)?;
@@ -542,19 +663,129 @@ impl Store {
     }
 }
 
+fn normalized_entries_match(entries: &[NormalizedEntry], query: &str) -> bool {
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .take(16)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return false;
+    }
+    let words = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .text
+                .split(|character: char| !character.is_alphanumeric())
+        })
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    terms
+        .iter()
+        .all(|term| words.iter().any(|word| word.starts_with(term)))
+}
+
+fn rebuild_trace_headers(
+    store: &Store,
+    options: &LarFtsRebuildOptions,
+    report: &mut LarFtsRebuildReport,
+) -> Result<()> {
+    let rows = {
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT id, ts_request_ms, req_headers_json, resp_headers_json
+             FROM traces
+             WHERE req_headers_json IS NOT NULL OR resp_headers_json IS NOT NULL
+             ORDER BY ts_request_ms DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map(
+                [i64::try_from(options.max_artifacts.saturating_add(1))?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if rows.len() > options.max_artifacts {
+        report.limit_reached = true;
+    }
+    let limits = ExtractionLimits {
+        max_entries: options.max_entries_per_artifact.min(128),
+        max_entry_chars: options.max_entry_chars.min(8 * 1024),
+        max_total_chars: options.max_total_chars_per_artifact.min(64 * 1024),
+    };
+    for (trace_id, timestamp, request, response) in rows.into_iter().take(options.max_artifacts) {
+        for (artifact_kind, json) in [
+            ("request_headers", request.as_deref()),
+            ("response_headers", response.as_deref()),
+        ] {
+            let Some(bytes) = json.map(str::as_bytes) else {
+                continue;
+            };
+            report.artifacts_seen += 1;
+            let candidate = Candidate {
+                owner_kind: "trace".into(),
+                owner_id: trace_id.clone(),
+                artifact_kind: artifact_kind.into(),
+                stage_id: String::new(),
+                manifest_id: String::new(),
+            };
+            if bytes.len() as u64 > options.max_body_bytes
+                || report.body_bytes_read.saturating_add(bytes.len() as u64)
+                    > options.max_total_body_bytes
+            {
+                let conn = store.conn.lock().unwrap();
+                reset_artifact_derived(&conn, &candidate)?;
+                record_artifact_state(&conn, &candidate, "skipped_limit", timestamp)?;
+                report.artifacts_skipped += 1;
+                report.limit_reached = true;
+                continue;
+            }
+            report.body_bytes_read += bytes.len() as u64;
+            let (entries, refs, complete) = {
+                let mut conn = store.conn.lock().unwrap();
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let counts = index_bytes(&tx, &candidate, bytes, limits, timestamp)?;
+                tx.commit()?;
+                counts
+            };
+            if complete {
+                report.artifacts_indexed += 1;
+            } else {
+                report.artifacts_skipped += 1;
+            }
+            report.entries += entries;
+            report.reverse_references += refs;
+        }
+    }
+    Ok(())
+}
+
 fn index_bytes(
     conn: &Connection,
     candidate: &Candidate,
     bytes: &[u8],
     limits: ExtractionLimits,
     created_at_ms: i64,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, bool)> {
     reset_artifact_derived(conn, candidate)?;
-    let entries = extract_entries(&candidate.artifact_kind, bytes, limits);
+    let extraction = extract_entries(&candidate.artifact_kind, bytes, limits);
     record_artifact_state(
         conn,
         candidate,
-        if entries.is_empty() {
+        if !extraction.complete {
+            "skipped_limit"
+        } else if extraction.entries.is_empty() {
             "no_text"
         } else {
             "indexed"
@@ -564,7 +795,7 @@ fn index_bytes(
     let (trace_id, session_id, ts_request_ms) = resolve_anchor(conn, candidate)?;
     let mut new_entries = 0u64;
     let mut new_refs = 0u64;
-    for entry in entries {
+    for entry in extraction.entries {
         let entry_id = entry_id(&entry);
         let digest = blake3::hash(entry.text.as_bytes());
         let entry_kind = &entry.kind;
@@ -618,7 +849,7 @@ fn index_bytes(
     if let Some(trace_id) = trace_id.as_deref() {
         attach_matching_stages(conn, trace_id, &candidate.manifest_id, created_at_ms)?;
     }
-    Ok((new_entries, new_refs))
+    Ok((new_entries, new_refs, extraction.complete))
 }
 
 fn reset_artifact_derived(conn: &Connection, candidate: &Candidate) -> Result<()> {
@@ -789,13 +1020,15 @@ fn entry_id(entry: &NormalizedEntry) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn extract_entries(
-    artifact_kind: &str,
-    bytes: &[u8],
-    limits: ExtractionLimits,
-) -> Vec<NormalizedEntry> {
+fn extract_entries(artifact_kind: &str, bytes: &[u8], limits: ExtractionLimits) -> Extraction {
+    if matches!(artifact_kind, "request_headers" | "response_headers") {
+        return extract_selected_headers(artifact_kind, bytes, limits);
+    }
     if !supported_artifact(artifact_kind) {
-        return Vec::new();
+        return Extraction {
+            entries: Vec::new(),
+            complete: false,
+        };
     }
     let mut extractor = Extractor {
         artifact_kind,
@@ -804,8 +1037,11 @@ fn extract_entries(
         seen: HashSet::new(),
         nodes: 0,
         total_chars: 0,
+        stopped: false,
     };
+    let mut recognized = false;
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        recognized = true;
         extractor.walk(&value, None, None, false, 0);
     } else if let Ok(text) = std::str::from_utf8(bytes) {
         for line in text.lines() {
@@ -817,11 +1053,127 @@ fn extract_entries(
                 continue;
             }
             if let Ok(value) = serde_json::from_str::<Value>(data) {
+                recognized = true;
                 extractor.walk(&value, None, None, false, 0);
+            } else {
+                extractor.stopped = true;
             }
         }
     }
-    extractor.entries
+    Extraction {
+        entries: extractor.entries,
+        complete: recognized && !extractor.stopped,
+    }
+}
+
+fn extract_selected_headers(
+    artifact_kind: &str,
+    bytes: &[u8],
+    limits: ExtractionLimits,
+) -> Extraction {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Extraction {
+            entries: Vec::new(),
+            complete: false,
+        };
+    };
+    let mut extractor = Extractor {
+        artifact_kind,
+        limits,
+        entries: Vec::new(),
+        seen: HashSet::new(),
+        nodes: 0,
+        total_chars: 0,
+        stopped: false,
+    };
+    let mut pairs = Vec::new();
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                match value {
+                    Value::String(value) => pairs.push((name.clone(), value)),
+                    Value::Array(values) => {
+                        for value in values
+                            .into_iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                        {
+                            pairs.push((name.clone(), value));
+                        }
+                    }
+                    _ => extractor.stopped = true,
+                }
+            }
+        }
+        Value::Array(values) => {
+            for pair in values {
+                let Value::Array(pair) = pair else {
+                    extractor.stopped = true;
+                    continue;
+                };
+                if pair.len() != 2 {
+                    extractor.stopped = true;
+                    continue;
+                }
+                match (pair[0].as_str(), pair[1].as_str()) {
+                    (Some(name), Some(value)) => pairs.push((name.to_owned(), value.to_owned())),
+                    _ => extractor.stopped = true,
+                }
+            }
+        }
+        _ => extractor.stopped = true,
+    }
+    for (name, value) in pairs {
+        let name = name.to_ascii_lowercase();
+        if selected_search_header(&name) && !sensitive_header_name(&name) {
+            extractor.push("header".into(), &format!("{name} {value}"));
+        }
+    }
+    Extraction {
+        entries: extractor.entries,
+        complete: !extractor.stopped,
+    }
+}
+
+fn selected_search_header(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "content-encoding"
+            | "content-type"
+            | "user-agent"
+            | "anthropic-version"
+            | "anthropic-beta"
+            | "openai-version"
+            | "request-id"
+            | "x-request-id"
+            | "x-goog-api-client"
+            | "x-stainless-arch"
+            | "x-stainless-lang"
+            | "x-stainless-os"
+            | "x-stainless-package-version"
+            | "x-stainless-retry-count"
+            | "x-stainless-runtime"
+            | "x-stainless-runtime-version"
+    )
+}
+
+fn sensitive_header_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-openai-api-key"
+            | "anthropic-api-key"
+    ) || name.contains("credential")
+        || name.contains("secret")
+        || name.ends_with("token")
 }
 
 fn supported_artifact(kind: &str) -> bool {
@@ -845,6 +1197,7 @@ struct Extractor<'a> {
     seen: HashSet<NormalizedEntry>,
     nodes: usize,
     total_chars: usize,
+    stopped: bool,
 }
 
 impl Extractor<'_> {
@@ -861,6 +1214,7 @@ impl Extractor<'_> {
             || self.entries.len() >= self.limits.max_entries
             || self.total_chars >= self.limits.max_total_chars
         {
+            self.stopped = true;
             return;
         }
         let role = role.or_else(|| {
@@ -943,16 +1297,29 @@ impl Extractor<'_> {
         if text.is_empty() {
             return;
         }
-        let remaining = self.limits.max_total_chars.saturating_sub(self.total_chars);
-        let limit = self.limits.max_entry_chars.min(remaining);
-        let text = text.chars().take(limit).collect::<String>();
-        if text.is_empty() {
-            return;
-        }
-        let entry = NormalizedEntry { kind, text };
-        if self.seen.insert(entry.clone()) {
-            self.total_chars = self.total_chars.saturating_add(entry.text.chars().count());
-            self.entries.push(entry);
+        let mut characters = text.chars().peekable();
+        while characters.peek().is_some() {
+            if self.entries.len() >= self.limits.max_entries
+                || self.total_chars >= self.limits.max_total_chars
+            {
+                self.stopped = true;
+                return;
+            }
+            let remaining = self.limits.max_total_chars.saturating_sub(self.total_chars);
+            let limit = self.limits.max_entry_chars.min(remaining);
+            let segment = characters.by_ref().take(limit).collect::<String>();
+            if segment.is_empty() {
+                self.stopped = true;
+                return;
+            }
+            let entry = NormalizedEntry {
+                kind: kind.clone(),
+                text: segment,
+            };
+            if self.seen.insert(entry.clone()) {
+                self.total_chars = self.total_chars.saturating_add(entry.text.chars().count());
+                self.entries.push(entry);
+            }
         }
     }
 }
@@ -1068,7 +1435,7 @@ mod tests {
             {"role":"tool","content":"tool output", "api_key":"never index me"}
           ]
         }"#;
-        let entries = extract_entries(
+        let extraction = extract_entries(
             "client_request",
             bytes,
             ExtractionLimits {
@@ -1077,6 +1444,8 @@ mod tests {
                 max_total_chars: 4096,
             },
         );
+        let entries = extraction.entries;
+        assert!(extraction.complete);
         assert!(entries
             .iter()
             .any(|entry| entry.kind == "user" && entry.text.contains("lunar widget")));
@@ -1105,5 +1474,61 @@ mod tests {
             Some("\"lunar\"* AND \"widget\"*")
         );
         assert_eq!(fts_match_query("---"), None);
+    }
+
+    #[test]
+    fn selected_headers_are_searchable_without_credentials_or_arbitrary_extensions() {
+        let extraction = extract_entries(
+            "request_headers",
+            br#"{"Content-Type":"application/json","X-Request-Id":"safe-needle","Authorization":"Bearer leaked-needle","X-Custom-Private":"private-needle"}"#,
+            ExtractionLimits {
+                max_entries: 32,
+                max_entry_chars: 1024,
+                max_total_chars: 4096,
+            },
+        );
+        assert!(extraction.complete);
+        let text = extraction
+            .entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("application/json"));
+        assert!(text.contains("safe-needle"));
+        assert!(!text.contains("leaked-needle"));
+        assert!(!text.contains("private-needle"));
+    }
+
+    #[test]
+    fn long_semantic_strings_are_segmented_and_partial_coverage_is_explicit() {
+        let value = format!("{{\"content\":\"{}tail-needle\"}}", "x".repeat(80));
+        let complete = extract_entries(
+            "client_request",
+            value.as_bytes(),
+            ExtractionLimits {
+                max_entries: 16,
+                max_entry_chars: 32,
+                max_total_chars: 256,
+            },
+        );
+        assert!(complete.complete);
+        assert!(complete.entries.len() > 1);
+        assert!(complete
+            .entries
+            .iter()
+            .any(|entry| entry.text.contains("tail-needle")));
+
+        let partial = extract_entries(
+            "client_request",
+            value.as_bytes(),
+            ExtractionLimits {
+                max_entries: 1,
+                max_entry_chars: 32,
+                max_total_chars: 32,
+            },
+        );
+        assert!(!partial.complete);
+        assert_eq!(partial.entries.len(), 1);
     }
 }

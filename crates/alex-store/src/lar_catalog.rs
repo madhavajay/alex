@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::Store;
 
-const LAR_CATALOG_SCHEMA_VERSION: i64 = 1;
+const LAR_CATALOG_SCHEMA_VERSION: i64 = 3;
 
 const LAR_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS lar_schema_versions (
@@ -100,7 +100,6 @@ CREATE TABLE IF NOT EXISTS lar_manifests (
   created_at_ms        INTEGER NOT NULL,
   state                TEXT NOT NULL DEFAULT 'ready'
                        CHECK (state IN ('ready', 'quarantined', 'unreachable')),
-  UNIQUE (hash_algorithm, whole_body_hash, total_length),
   UNIQUE (file_uuid, record_id),
   FOREIGN KEY (file_uuid) REFERENCES lar_files(file_uuid)
 );
@@ -134,6 +133,7 @@ CREATE TABLE IF NOT EXISTS lar_header_blocks (
   block_id               TEXT PRIMARY KEY,
   fidelity               TEXT NOT NULL
                          CHECK (fidelity IN ('observed_ordered', 'legacy_normalized', 'derived')),
+  fidelity_detail        TEXT,
   atom_count             INTEGER NOT NULL CHECK (atom_count >= 0),
   file_uuid              TEXT,
   record_id              TEXT,
@@ -175,6 +175,22 @@ CREATE TABLE IF NOT EXISTS lar_stage_records (
 );
 CREATE INDEX IF NOT EXISTS lar_stage_records_trace
   ON lar_stage_records(trace_id, capture_sequence);
+
+-- Trace-to-exchange ownership is explicit rather than inferred from stages:
+-- an exchange may contain zero stages, and content-addressed stages may be
+-- repeated or shared by multiple exchanges.
+CREATE TABLE IF NOT EXISTS lar_exchange_records (
+  trace_id          TEXT PRIMARY KEY,
+  exchange_id       TEXT NOT NULL,
+  capture_sequence  INTEGER NOT NULL,
+  stage_count       INTEGER NOT NULL CHECK (stage_count >= 0),
+  file_uuid         TEXT NOT NULL,
+  fidelity          TEXT NOT NULL DEFAULT 'captured',
+  UNIQUE (file_uuid, exchange_id),
+  FOREIGN KEY (file_uuid) REFERENCES lar_files(file_uuid)
+);
+CREATE INDEX IF NOT EXISTS lar_exchange_records_file
+  ON lar_exchange_records(file_uuid, capture_sequence);
 
 CREATE TABLE IF NOT EXISTS lar_trace_artifacts (
   owner_kind          TEXT NOT NULL CHECK (owner_kind IN ('trace', 'tool_call')),
@@ -248,6 +264,11 @@ CREATE TABLE IF NOT EXISTS lar_migration_items (
   state                     TEXT NOT NULL DEFAULT 'pending'
                             CHECK (state IN ('pending', 'migrating', 'migrated', 'skipped', 'failed')),
   destination_manifest_id   TEXT,
+  destination_exchange_id   TEXT,
+  destination_file_uuid     TEXT,
+  metadata_stage_count      INTEGER NOT NULL DEFAULT 0 CHECK (metadata_stage_count >= 0),
+  metadata_header_count     INTEGER NOT NULL DEFAULT 0 CHECK (metadata_header_count >= 0),
+  metadata_unsupported_count INTEGER NOT NULL DEFAULT 0 CHECK (metadata_unsupported_count >= 0),
   source_length             INTEGER,
   source_hash_algorithm     TEXT,
   source_hash               BLOB,
@@ -264,7 +285,8 @@ CREATE TABLE IF NOT EXISTS lar_migration_items (
   completed_at_ms           INTEGER,
   UNIQUE (job_id, owner_kind, owner_id, artifact_kind, stage_id, source_fingerprint),
   FOREIGN KEY (job_id) REFERENCES lar_migration_jobs(job_id),
-  FOREIGN KEY (destination_manifest_id) REFERENCES lar_manifests(manifest_id)
+  FOREIGN KEY (destination_manifest_id) REFERENCES lar_manifests(manifest_id),
+  FOREIGN KEY (destination_file_uuid) REFERENCES lar_files(file_uuid)
 );
 CREATE INDEX IF NOT EXISTS lar_migration_items_job_state
   ON lar_migration_items(job_id, state, updated_at_ms);
@@ -291,6 +313,81 @@ CREATE TABLE IF NOT EXISTS lar_gc_runs (
 pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(LAR_SCHEMA)?;
+    let manifest_schema: String = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='lar_manifests'",
+        [],
+        |row| row.get(0),
+    )?;
+    if manifest_schema.contains("UNIQUE (hash_algorithm, whole_body_hash, total_length)") {
+        // Catalog v2 conflated byte identity with manifest identity. Rebuild
+        // the small manifest table so media/encoding variants and alternate
+        // chunk topology can share chunks without losing their own IDs.
+        tx.execute_batch(
+            "PRAGMA defer_foreign_keys=ON;
+             CREATE TABLE lar_manifests_v3 (
+               manifest_id TEXT PRIMARY KEY,
+               total_length INTEGER NOT NULL CHECK (total_length >= 0),
+               hash_algorithm TEXT NOT NULL,
+               whole_body_hash BLOB NOT NULL,
+               media_type TEXT,
+               content_encoding TEXT,
+               file_uuid TEXT,
+               record_id TEXT,
+               created_at_ms INTEGER NOT NULL,
+               state TEXT NOT NULL DEFAULT 'ready'
+                 CHECK (state IN ('ready', 'quarantined', 'unreachable')),
+               UNIQUE (file_uuid, record_id),
+               FOREIGN KEY (file_uuid) REFERENCES lar_files(file_uuid)
+             );
+             INSERT INTO lar_manifests_v3
+               (manifest_id, total_length, hash_algorithm, whole_body_hash,
+                media_type, content_encoding, file_uuid, record_id,
+                created_at_ms, state)
+             SELECT manifest_id, total_length, hash_algorithm, whole_body_hash,
+                    media_type, content_encoding, file_uuid, record_id,
+                    created_at_ms, state
+               FROM lar_manifests;
+             DROP TABLE lar_manifests;
+             ALTER TABLE lar_manifests_v3 RENAME TO lar_manifests;
+             CREATE INDEX lar_manifests_hash
+               ON lar_manifests(hash_algorithm, whole_body_hash, total_length);",
+        )?;
+    }
+    for (name, declaration) in [
+        ("destination_exchange_id", "TEXT"),
+        ("destination_file_uuid", "TEXT"),
+        (
+            "metadata_stage_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (metadata_stage_count >= 0)",
+        ),
+        (
+            "metadata_header_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (metadata_header_count >= 0)",
+        ),
+        (
+            "metadata_unsupported_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (metadata_unsupported_count >= 0)",
+        ),
+    ] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('lar_migration_items') WHERE name=?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute_batch(&format!(
+                "ALTER TABLE lar_migration_items ADD COLUMN {name} {declaration}"
+            ))?;
+        }
+    }
+    let has_header_fidelity_detail: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('lar_header_blocks') WHERE name='fidelity_detail')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_header_fidelity_detail {
+        tx.execute_batch("ALTER TABLE lar_header_blocks ADD COLUMN fidelity_detail TEXT")?;
+    }
     tx.execute(
         "INSERT OR IGNORE INTO lar_schema_versions (version, applied_at_ms)
          VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
@@ -1072,6 +1169,109 @@ impl Store {
         })
     }
 
+    /// Publish a legacy exchange only after its combined-pack records have
+    /// been synced and validated through the normal archive reader. The
+    /// caller's catalog closure and the durable migration receipt commit in
+    /// one transaction, so a completed item can never name partially
+    /// published headers or stages.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_lar_migration_exchange<F>(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        lease_owner: &str,
+        exchange_id: &str,
+        file_uuid: &str,
+        session_id: Option<&str>,
+        stage_count: u64,
+        header_count: u64,
+        unsupported_count: u64,
+        now_ms: i64,
+        publish_catalog: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    {
+        require_nonempty(exchange_id, "exchange_id")?;
+        require_nonempty(file_uuid, "exchange file UUID")?;
+        let stage_count = u64_to_i64(stage_count, "metadata_stage_count")?;
+        let header_count = u64_to_i64(header_count, "metadata_header_count")?;
+        let unsupported_count = u64_to_i64(unsupported_count, "metadata_unsupported_count")?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(&tx, job_id, lease_owner, now_ms)?;
+
+        let item: Option<(String, String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT state, artifact_kind, destination_exchange_id, destination_file_uuid
+                   FROM lar_migration_items WHERE item_id=?1 AND job_id=?2",
+                params![item_id, job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((state, artifact_kind, existing_exchange, existing_file)) = item else {
+            bail!("migration metadata item {item_id} does not belong to job {job_id}");
+        };
+        if artifact_kind != "exchange_metadata" {
+            bail!("migration item {item_id} is not exchange metadata");
+        }
+        if state == "migrated" {
+            if existing_exchange.as_deref() != Some(exchange_id)
+                || existing_file.as_deref() != Some(file_uuid)
+            {
+                bail!("migration metadata item {item_id} is already bound to another exchange");
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let file_ready: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lar_files WHERE file_uuid=?1 AND state IN ('active','sealed'))",
+            [file_uuid],
+            |row| row.get(0),
+        )?;
+        if !file_ready {
+            bail!("metadata exchange destination pack {file_uuid} is not available");
+        }
+        publish_catalog(&tx)?;
+        let changed = tx.execute(
+            "UPDATE lar_migration_items
+                SET state='migrated', validation_state='validated',
+                    destination_exchange_id=?2, destination_file_uuid=?3,
+                    metadata_stage_count=?4, metadata_header_count=?5,
+                    metadata_unsupported_count=?6, error_kind=NULL,
+                    validation_error=NULL, cleanup_eligible=0,
+                    updated_at_ms=?7, completed_at_ms=?7
+              WHERE item_id=?1 AND job_id=?8 AND state IN ('pending','migrating','failed')",
+            params![
+                item_id,
+                exchange_id,
+                file_uuid,
+                stage_count,
+                header_count,
+                unsupported_count,
+                now_ms,
+                job_id,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("migration metadata item {item_id} was not publishable");
+        }
+        if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
+            tx.execute(
+                "INSERT INTO lar_session_revisions (session_id, revision, updated_at_ms)
+                 VALUES (?1, 1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   revision=lar_session_revisions.revision+1,
+                   updated_at_ms=excluded.updated_at_ms",
+                params![session_id, now_ms],
+            )?;
+        }
+        recount_job(&tx, job_id, now_ms)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Resolve a body for mixed-mode reads. Only validated LAR pointers win;
     /// otherwise the original trace/tool path remains available.
     pub fn lar_artifact_location(
@@ -1336,7 +1536,7 @@ mod tests {
             .unwrap();
 
         let store = Store::open(data_dir.clone()).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 1);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 3);
         {
             let conn = store.conn.lock().unwrap();
             let lar_tables: i64 = conn
@@ -1368,7 +1568,7 @@ mod tests {
         drop(store);
 
         let reopened = Store::open(data_dir).unwrap();
-        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 1);
+        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 3);
         let conn = reopened.conn.lock().unwrap();
         let version_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM lar_schema_versions", [], |row| {
@@ -1376,6 +1576,71 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version_rows, 1, "startup migration must be repeatable");
+    }
+
+    #[test]
+    fn v2_manifest_identity_upgrade_preserves_rows_and_allows_metadata_variants() {
+        let data_dir = tmpdir("manifest-v2-upgrade");
+        let db_path = data_dir.join("alexandria.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(crate::SCHEMA).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lar_manifests (
+               manifest_id TEXT PRIMARY KEY,
+               total_length INTEGER NOT NULL CHECK (total_length >= 0),
+               hash_algorithm TEXT NOT NULL,
+               whole_body_hash BLOB NOT NULL,
+               media_type TEXT,
+               content_encoding TEXT,
+               file_uuid TEXT,
+               record_id TEXT,
+               created_at_ms INTEGER NOT NULL,
+               state TEXT NOT NULL DEFAULT 'ready'
+                 CHECK (state IN ('ready', 'quarantined', 'unreachable')),
+               UNIQUE (hash_algorithm, whole_body_hash, total_length),
+               UNIQUE (file_uuid, record_id)
+             );",
+        )
+        .unwrap();
+        let digest = vec![7u8; 32];
+        conn.execute(
+            "INSERT INTO lar_manifests
+               (manifest_id, total_length, hash_algorithm, whole_body_hash,
+                media_type, content_encoding, created_at_ms, state)
+             VALUES ('manifest-v2', 4, 'blake3', ?1, NULL, NULL, 1, 'ready')",
+            [&digest],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(data_dir).unwrap();
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 3);
+        let conn = store.conn.lock().unwrap();
+        let preserved: String = conn
+            .query_row(
+                "SELECT manifest_id FROM lar_manifests WHERE whole_body_hash=?1",
+                [&digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "manifest-v2");
+        conn.execute(
+            "INSERT INTO lar_manifests
+               (manifest_id, total_length, hash_algorithm, whole_body_hash,
+                media_type, content_encoding, created_at_ms, state)
+             VALUES ('manifest-v3', 4, 'blake3', ?1,
+                     'application/json', NULL, 2, 'ready')",
+            [&digest],
+        )
+        .unwrap();
+        let variants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lar_manifests WHERE whole_body_hash=?1",
+                [&digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(variants, 2);
     }
 
     #[test]

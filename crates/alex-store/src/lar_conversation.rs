@@ -6,6 +6,9 @@
 //! ranges. Canonical IDs come from `alex-lar`, while SQLite supplies the paged
 //! Trace Browser projection.
 
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+
 use alex_lar::{
     ArtifactRangeRef, ConversationEntry, ConversationEntryData, ConversationEntryId,
     ConversationEntryKind, ConversationRole, Generation, GenerationData, GenerationId,
@@ -308,7 +311,77 @@ pub struct LarConversationEventPage {
     pub next_after: Option<(i64, String)>,
 }
 
+pub(crate) struct LarConversationArchiveClosure {
+    pub entries: Vec<ConversationEntry>,
+    pub generations: Vec<Generation>,
+    pub turn: TurnView,
+}
+
 impl Store {
+    pub fn lar_conversation_has_turn(&self, trace_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lar_conversation_turn_views WHERE trace_id=?1)",
+            [trace_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Load the canonical conversation records needed to make one exported turn
+    /// self-contained. Parent generations are returned before descendants and
+    /// shared entries appear once. No raw body bytes are loaded here.
+    pub(crate) fn lar_conversation_archive_closure(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<LarConversationArchiveClosure>> {
+        let conn = self.conn.lock().unwrap();
+        let turn: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT turn_view_id, generation_id, upto_index
+                   FROM lar_conversation_turn_views WHERE trace_id=?1",
+                [trace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((turn_id, generation_id, upto_index)) = turn else {
+            return Ok(None);
+        };
+        let mut entries = HashMap::<String, ConversationEntry>::new();
+        let mut generations = Vec::new();
+        load_archive_generation(&conn, &generation_id, &mut entries, &mut generations)?;
+        let response_ids = load_ordered_ids(
+            &conn,
+            "lar_conversation_turn_responses",
+            "turn_view_id",
+            "entry_id",
+            &turn_id,
+        )?;
+        for entry_id in &response_ids {
+            load_archive_entry(&conn, entry_id, &mut entries)?;
+        }
+        let turn = TurnView::new(TurnViewData {
+            trace_id: trace_id.as_bytes().to_vec(),
+            generation_id: parse_generation_id(&generation_id)?,
+            upto_index: u64::try_from(upto_index)
+                .context("negative conversation turn prefix cursor")?,
+            response_entry_refs: response_ids
+                .iter()
+                .map(|value| parse_entry_id(value))
+                .collect::<Result<Vec<_>>>()?,
+        });
+        if turn.id.to_string() != turn_id {
+            bail!("conversation turn catalog identity does not match its contents");
+        }
+        let mut entries = entries.into_values().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.id.0);
+        Ok(Some(LarConversationArchiveClosure {
+            entries,
+            generations,
+            turn,
+        }))
+    }
+
     /// Register one semantic entry over already validated raw body ranges.
     /// Only IDs, labels, and ranges are written; body bytes are never copied.
     pub fn register_lar_conversation_entry(
@@ -1673,6 +1746,174 @@ fn load_event_view(
             vec![]
         },
     })
+}
+
+fn load_archive_generation(
+    conn: &Connection,
+    generation_id: &str,
+    entries: &mut HashMap<String, ConversationEntry>,
+    generations: &mut Vec<Generation>,
+) -> Result<()> {
+    let mut ancestry = Vec::<(String, Option<String>, String)>::new();
+    let mut visited = HashSet::new();
+    let mut current = Some(generation_id.to_owned());
+    while let Some(id) = current {
+        if !visited.insert(id.clone()) {
+            bail!("conversation generation catalog contains a cycle");
+        }
+        let (parent, reason): (Option<String>, String) = conn
+            .query_row(
+                "SELECT parent_generation_id, reason FROM lar_conversation_generations
+                 WHERE generation_id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| format!("loading conversation generation {id}"))?;
+        current = parent.clone();
+        ancestry.push((id, parent, reason));
+    }
+
+    for (id, parent, reason) in ancestry.into_iter().rev() {
+        let entry_ids = load_ordered_ids(
+            conn,
+            "lar_conversation_generation_entries",
+            "generation_id",
+            "entry_id",
+            &id,
+        )?;
+        for entry_id in &entry_ids {
+            load_archive_entry(conn, entry_id, entries)?;
+        }
+        let generation = Generation::new(GenerationData {
+            parent_generation_id: parent.as_deref().map(parse_generation_id).transpose()?,
+            entries: entry_ids
+                .iter()
+                .map(|value| parse_entry_id(value))
+                .collect::<Result<Vec<_>>>()?,
+            reason: parse_generation_reason(&reason)?,
+        });
+        if generation.id.to_string() != id {
+            bail!("conversation generation catalog identity does not match its contents");
+        }
+        generations.push(generation);
+    }
+    Ok(())
+}
+
+fn load_archive_entry(
+    conn: &Connection,
+    entry_id: &str,
+    loaded: &mut HashMap<String, ConversationEntry>,
+) -> Result<()> {
+    if loaded.contains_key(entry_id) {
+        return Ok(());
+    }
+    let (semantic_schema, role, kind, name, tool_call_id): (
+        i64,
+        String,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) = conn
+        .query_row(
+            "SELECT semantic_schema, role, kind, name, tool_call_id
+               FROM lar_conversation_entries WHERE entry_id=?1",
+            [entry_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .with_context(|| format!("loading conversation entry {entry_id}"))?;
+    let mut statement = conn.prepare(
+        "SELECT manifest_id, byte_offset, byte_length
+           FROM lar_conversation_entry_ranges WHERE entry_id=?1 ORDER BY ordinal",
+    )?;
+    let ranges = statement
+        .query_map([entry_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (manifest_id, byte_offset, byte_length) = row?;
+            Ok(ArtifactRangeRef {
+                manifest_id: ManifestId::from_str(&manifest_id)?,
+                byte_offset: u64::try_from(byte_offset)
+                    .context("negative conversation entry byte offset")?,
+                byte_length: u64::try_from(byte_length)
+                    .context("negative conversation entry byte length")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let semantic_schema =
+        u16::try_from(semantic_schema).context("conversation semantic schema is outside u16")?;
+    let entry = ConversationEntry::new(ConversationEntryData {
+        semantic_schema,
+        role: parse_conversation_role(&role)?,
+        kind: parse_conversation_kind(&kind)?,
+        raw_ranges: ranges,
+        name,
+        tool_call_id,
+    });
+    if entry.id.to_string() != entry_id {
+        bail!("conversation entry catalog identity does not match its contents");
+    }
+    loaded.insert(entry_id.to_owned(), entry);
+    Ok(())
+}
+
+fn parse_conversation_role(value: &str) -> Result<ConversationRole> {
+    Ok(match value {
+        "opaque" => ConversationRole::Opaque,
+        "system" => ConversationRole::System,
+        "user" => ConversationRole::User,
+        "assistant" => ConversationRole::Assistant,
+        "tool" => ConversationRole::Tool,
+        value => ConversationRole::Unknown(parse_unknown_code(value, "conversation role")?),
+    })
+}
+
+fn parse_conversation_kind(value: &str) -> Result<ConversationEntryKind> {
+    Ok(match value {
+        "opaque" => ConversationEntryKind::Opaque,
+        "message" => ConversationEntryKind::Message,
+        "tool_call" => ConversationEntryKind::ToolCall,
+        "tool_result" => ConversationEntryKind::ToolResult,
+        "summary" => ConversationEntryKind::Summary,
+        value => {
+            ConversationEntryKind::Unknown(parse_unknown_code(value, "conversation entry kind")?)
+        }
+    })
+}
+
+fn parse_generation_reason(value: &str) -> Result<GenerationReason> {
+    Ok(match value {
+        "initial" => GenerationReason::Initial,
+        "append" => GenerationReason::Append,
+        "compaction" => GenerationReason::Compaction,
+        "branch" => GenerationReason::Branch,
+        "mutation" => GenerationReason::Mutation,
+        "import" => GenerationReason::Import,
+        value => {
+            GenerationReason::Unknown(parse_unknown_code(value, "conversation generation reason")?)
+        }
+    })
+}
+
+fn parse_unknown_code(value: &str, label: &str) -> Result<u16> {
+    value
+        .strip_prefix("unknown:")
+        .with_context(|| format!("unknown {label} value {value:?}"))?
+        .parse::<u16>()
+        .with_context(|| format!("invalid {label} code {value:?}"))
 }
 
 fn reason_name(reason: GenerationReason) -> &'static str {

@@ -1045,6 +1045,10 @@ struct Config {
     /// startup without rewriting config.toml.
     #[serde(default)]
     lar_body_store_mode: alex_store::LarBodyStoreMode,
+    /// Persistence boundary for live LAR appends. Sync is the safe default;
+    /// ALEXANDRIA_LAR_DURABILITY can override it for one daemon process.
+    #[serde(default)]
+    lar_durability: alex_store::LarDurabilityMode,
     #[serde(default = "default_lar_migration_batch_size")]
     lar_migration_batch_size: usize,
     #[serde(default)]
@@ -1241,16 +1245,24 @@ fn default_trace_body_retention_days() -> u64 {
 
 fn lar_body_store_config(
     config: &Config,
-    env_override: Option<&str>,
+    mode_env_override: Option<&str>,
+    durability_env_override: Option<&str>,
 ) -> Result<alex_store::LarBodyStoreConfig> {
-    let mode = match env_override.filter(|value| !value.trim().is_empty()) {
+    let mode = match mode_env_override.filter(|value| !value.trim().is_empty()) {
         Some(value) => value.parse().with_context(|| {
             "parsing ALEXANDRIA_LAR_BODY_STORE; use legacy, dual-write-validated, or lar-with-fallback"
         })?,
         None => config.lar_body_store_mode,
     };
+    let durability = match durability_env_override.filter(|value| !value.trim().is_empty()) {
+        Some(value) => value.parse().with_context(|| {
+            "parsing ALEXANDRIA_LAR_DURABILITY; use sync, batch, or best-effort"
+        })?,
+        None => config.lar_durability,
+    };
     Ok(alex_store::LarBodyStoreConfig {
         mode,
+        durability,
         ..Default::default()
     })
 }
@@ -1420,6 +1432,7 @@ impl Config {
             dario_probe_model: default_dario_probe_model(),
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_durability: alex_store::LarDurabilityMode::Sync,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -3531,9 +3544,11 @@ async fn main() -> Result<()> {
             let lar_body_store = lar_body_store_config(
                 &config,
                 std::env::var("ALEXANDRIA_LAR_BODY_STORE").ok().as_deref(),
+                std::env::var("ALEXANDRIA_LAR_DURABILITY").ok().as_deref(),
             )?;
             tracing::info!(
                 mode = %lar_body_store.mode,
+                durability = %lar_body_store.durability,
                 "configured trace body storage mode"
             );
             if lar_body_store.mode != alex_store::LarBodyStoreMode::Legacy {
@@ -6745,6 +6760,7 @@ fn agent_trace_bodies_for_model(
     (req, resp)
 }
 
+#[cfg(test)]
 fn read_gzip_json(path: &std::path::Path) -> Result<serde_json::Value> {
     use std::io::Read;
 
@@ -6759,19 +6775,6 @@ fn read_gzip_json(path: &std::path::Path) -> Result<serde_json::Value> {
         .with_context(|| format!("parse compressed trace body {}", path.display()))
 }
 
-fn read_gzip_bytes(path: &std::path::Path) -> Result<Vec<u8>> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open compressed trace body {}", path.display()))?;
-    let mut decoder = flate2::read::GzDecoder::new(file);
-    let mut bytes = Vec::new();
-    decoder
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read compressed trace body {}", path.display()))?;
-    Ok(bytes)
-}
-
 fn trace_ingest_payload_from_store(
     store: &Store,
     trace_id: &str,
@@ -6782,14 +6785,13 @@ fn trace_ingest_payload_from_store(
         .get_trace(trace_id)?
         .with_context(|| format!("trace disappeared before upload: {trace_id}"))?;
     let string = |key: &str| row[key].as_str().map(String::from);
-    let body = |key: &str| -> Result<Option<String>> {
-        let Some(path) = row[key].as_str() else {
-            return Ok(None);
-        };
-        Ok(Some(
-            base64::engine::general_purpose::STANDARD
-                .encode(read_gzip_bytes(std::path::Path::new(path))?),
-        ))
+    let body = |artifact_kind: &str| -> Result<Option<String>> {
+        store
+            .read_lar_or_legacy_artifact("trace", trace_id, artifact_kind, None)
+            .with_context(|| {
+                format!("read {artifact_kind} body for remote trace upload {trace_id}")
+            })
+            .map(|bytes| bytes.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
     };
     let trace = alex_core::TraceRecord {
         id: trace_id.to_string(),
@@ -6830,9 +6832,9 @@ fn trace_ingest_payload_from_store(
     };
     Ok(alex_core::TraceIngestPayload {
         trace,
-        request_body_b64: body("req_body_path")?,
-        upstream_request_body_b64: body("upstream_req_body_path")?,
-        response_body_b64: body("resp_body_path")?,
+        request_body_b64: body("client_request")?,
+        upstream_request_body_b64: body("upstream_request")?,
+        response_body_b64: body("client_response")?,
     })
 }
 
@@ -6844,46 +6846,6 @@ fn queue_remote_trace_update(remote: &RemoteTraceSender, store: &Store, trace_id
             "alex wrap: could not queue remote trace {trace_id}: {error:#}; it remains in the local spool"
         );
     }
-}
-
-fn write_gzip_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .with_context(|| format!("trace body has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("body.gz");
-    let tmp = parent.join(format!(
-        ".{file_name}.{}-{:08x}.tmp",
-        std::process::id(),
-        rand::thread_rng().gen::<u32>()
-    ));
-    let result = (|| -> Result<()> {
-        let file = std::fs::File::create(&tmp)
-            .with_context(|| format!("create temporary trace body {}", tmp.display()))?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
-        encoder.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
-        let file = encoder.finish()?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "replace compressed trace body {} with {}",
-                path.display(),
-                tmp.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6923,22 +6885,21 @@ fn reconcile_agent_turn(
             && expected_subscription_identity.is_none_or(|expected| {
                 existing["subscription_identity"].as_str() == Some(expected)
             });
-        let req_path = existing["req_body_path"]
-            .as_str()
-            .map(std::path::PathBuf::from);
-        let resp_path = existing["resp_body_path"]
-            .as_str()
-            .map(std::path::PathBuf::from);
-        let req_matches = req_path
-            .as_deref()
-            .and_then(|path| read_gzip_json(path).ok())
-            .as_ref()
-            == Some(&req);
-        let resp_matches = resp_path
-            .as_deref()
-            .and_then(|path| read_gzip_json(path).ok())
-            .as_ref()
-            == Some(&resp);
+        let read_json = |artifact_kind: &str| -> Result<Option<serde_json::Value>> {
+            store
+                .read_lar_or_legacy_artifact("trace", &trace_id, artifact_kind, None)
+                .with_context(|| {
+                    format!("read {artifact_kind} for existing Agent trace {trace_id}")
+                })?
+                .map(|bytes| {
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!("parse {artifact_kind} for existing Agent trace {trace_id}")
+                    })
+                })
+                .transpose()
+        };
+        let req_matches = read_json("client_request")?.as_ref() == Some(&req);
+        let resp_matches = read_json("client_response")?.as_ref() == Some(&resp);
         if req_matches && resp_matches && metadata_matches {
             return Ok(AgentReconcileOutcome::Unchanged);
         }
@@ -6957,16 +6918,20 @@ fn reconcile_agent_turn(
                 )?;
             }
             if !req_matches {
-                let path = req_path.with_context(|| {
-                    format!("existing Agent trace {trace_id} has no request body path")
-                })?;
-                write_gzip_json_atomic(&path, &req)?;
+                store.replace_trace_body_artifact(
+                    &trace_id,
+                    "client_request",
+                    "request.json",
+                    serde_json::to_string_pretty(&req)?.as_bytes(),
+                )?;
             }
             if !resp_matches {
-                let path = resp_path.with_context(|| {
-                    format!("existing Agent trace {trace_id} has no response body path")
-                })?;
-                write_gzip_json_atomic(&path, &resp)?;
+                store.replace_trace_body_artifact(
+                    &trace_id,
+                    "client_response",
+                    "response.body",
+                    serde_json::to_string_pretty(&resp)?.as_bytes(),
+                )?;
             }
         }
         return Ok(AgentReconcileOutcome::Updated);
@@ -11121,7 +11086,13 @@ mod tests {
         let first_ts = first["ts_request_ms"].as_i64().unwrap();
         let first_run = first["run_id"].as_str().unwrap().to_string();
         let first_path = first["resp_body_path"].as_str().unwrap().to_string();
-        let first_response = read_gzip_json(std::path::Path::new(&first_path)).unwrap();
+        let first_response: serde_json::Value = serde_json::from_slice(
+            &store
+                .read_lar_or_legacy_artifact("trace", &trace_id, "client_response", None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             first_response["choices"][0]["message"]["content"],
             "Checking."
@@ -11167,11 +11138,17 @@ mod tests {
         let updated = store.get_trace(&trace_id).unwrap().unwrap();
         assert_eq!(updated["ts_request_ms"].as_i64(), Some(first_ts));
         assert_eq!(updated["run_id"].as_str(), Some(first_run.as_str()));
-        assert_eq!(
-            updated["resp_body_path"].as_str(),
-            Some(first_path.as_str())
-        );
-        let response = read_gzip_json(std::path::Path::new(&first_path)).unwrap();
+        let updated_path = updated["resp_body_path"].as_str().unwrap();
+        assert_ne!(updated_path, first_path);
+        assert!(std::path::Path::new(&first_path).is_file());
+        assert!(updated_path.contains(".replacement-"));
+        let response: serde_json::Value = serde_json::from_slice(
+            &store
+                .read_lar_or_legacy_artifact("trace", &trace_id, "client_response", None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             response["choices"][0]["message"]["content"],
             "Checking.\n\nFinal answer."
@@ -11189,6 +11166,146 @@ mod tests {
         assert_eq!(
             response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "Shell"
+        );
+    }
+
+    #[test]
+    fn agent_reconcile_replaces_lar_manifest_idempotently_and_falls_back_on_failure() {
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store = Store::open_with_lar_body_store(tmpdir("agent-lar-reconcile"), config).unwrap();
+        let metadata = CursorTraceMetadata::default();
+        let mut turn = AgentTranscriptTurn {
+            user: "hello".into(),
+            assistant: "partial".into(),
+            tool_calls: vec![],
+            assistant_blocks: vec![],
+            complete: false,
+            end_status: None,
+        };
+        let trace_id = "agent-lar-reconcile-session-1";
+        assert_eq!(
+            reconcile_agent_turn(
+                &store,
+                "wrap-agent-lar",
+                "lar-reconcile-session",
+                1,
+                100,
+                &turn,
+                false,
+                &metadata,
+            )
+            .unwrap(),
+            AgentReconcileOutcome::Inserted
+        );
+        let first_row = store.get_trace(trace_id).unwrap().unwrap();
+        let first_path = first_row["resp_body_path"].as_str().unwrap().to_string();
+        let first_manifest = match store
+            .lar_artifact_location("trace", trace_id, "client_response", None)
+            .unwrap()
+            .unwrap()
+        {
+            alex_store::LarArtifactLocation::Lar { manifest_id, .. } => manifest_id,
+            other => panic!("expected initial LAR response, got {other:?}"),
+        };
+
+        turn.assistant = "complete replacement".into();
+        turn.complete = true;
+        assert_eq!(
+            reconcile_agent_turn(
+                &store,
+                "wrap-agent-lar",
+                "lar-reconcile-session",
+                1,
+                100,
+                &turn,
+                false,
+                &metadata,
+            )
+            .unwrap(),
+            AgentReconcileOutcome::Updated
+        );
+        let replacement_row = store.get_trace(trace_id).unwrap().unwrap();
+        let replacement_path = replacement_row["resp_body_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let replacement_manifest = match store
+            .lar_artifact_location("trace", trace_id, "client_response", None)
+            .unwrap()
+            .unwrap()
+        {
+            alex_store::LarArtifactLocation::Lar { manifest_id, .. } => manifest_id,
+            other => panic!("expected replacement LAR response, got {other:?}"),
+        };
+        assert_ne!(replacement_manifest, first_manifest);
+        assert_ne!(replacement_path, first_path);
+        assert!(std::path::Path::new(&first_path).is_file());
+        assert!(std::path::Path::new(&replacement_path).is_file());
+
+        assert_eq!(
+            reconcile_agent_turn(
+                &store,
+                "wrap-agent-lar",
+                "lar-reconcile-session",
+                1,
+                100,
+                &turn,
+                false,
+                &metadata,
+            )
+            .unwrap(),
+            AgentReconcileOutcome::Unchanged
+        );
+        assert_eq!(
+            store.get_trace(trace_id).unwrap().unwrap()["resp_body_path"],
+            replacement_path
+        );
+        assert!(matches!(
+            store
+                .lar_artifact_location("trace", trace_id, "client_response", None)
+                .unwrap(),
+            Some(alex_store::LarArtifactLocation::Lar { manifest_id, .. })
+                if manifest_id == replacement_manifest
+        ));
+
+        store.inject_lar_disk_full_before_append_once();
+        turn.assistant = "fallback after injected LAR failure".into();
+        assert_eq!(
+            reconcile_agent_turn(
+                &store,
+                "wrap-agent-lar",
+                "lar-reconcile-session",
+                1,
+                100,
+                &turn,
+                false,
+                &metadata,
+            )
+            .unwrap(),
+            AgentReconcileOutcome::Updated
+        );
+        let fallback_row = store.get_trace(trace_id).unwrap().unwrap();
+        let fallback_path = fallback_row["resp_body_path"].as_str().unwrap();
+        assert_ne!(fallback_path, replacement_path);
+        assert!(std::path::Path::new(&replacement_path).is_file());
+        assert!(matches!(
+            store
+                .lar_artifact_location("trace", trace_id, "client_response", None)
+                .unwrap(),
+            Some(alex_store::LarArtifactLocation::Legacy { ref path, .. })
+                if path == fallback_path
+        ));
+        let fallback: serde_json::Value = serde_json::from_slice(
+            &store
+                .read_lar_or_legacy_artifact("trace", trace_id, "client_response", None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fallback["choices"][0]["message"]["content"],
+            "fallback after injected LAR failure"
         );
     }
 
@@ -11323,6 +11440,82 @@ mod tests {
                 .unwrap(),
             br#"{"answer":"hello"}"#
         );
+    }
+
+    #[test]
+    fn remote_trace_payload_reads_exact_lar_bodies_after_legacy_cleanup() {
+        use base64::Engine;
+
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store =
+            Store::open_with_lar_body_store(tmpdir("remote-trace-lar-payload"), config).unwrap();
+        let request = b"\0exact request\nbytes\xff";
+        let upstream = b"\x01changed upstream\r\n";
+        let response = b"data: exact response\n\n\0";
+        let request_path = store
+            .write_body("remote-lar-1", "request.json", request)
+            .unwrap();
+        let upstream_path = store
+            .write_body("remote-lar-1", "upstream-request.json", upstream)
+            .unwrap();
+        let response_path = store
+            .write_body("remote-lar-1", "response.body", response)
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "remote-lar-1".into(),
+                ts_request_ms: 100,
+                req_body_path: Some(request_path.clone()),
+                upstream_req_body_path: Some(upstream_path.clone()),
+                resp_body_path: Some(response_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(request_path).unwrap();
+        std::fs::remove_file(upstream_path).unwrap();
+        std::fs::remove_file(response_path).unwrap();
+
+        let payload = trace_ingest_payload_from_store(&store, "remote-lar-1").unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.request_body_b64.unwrap())
+                .unwrap(),
+            request
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.upstream_request_body_b64.unwrap())
+                .unwrap(),
+            upstream
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.response_body_b64.unwrap())
+                .unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn remote_trace_payload_reports_missing_body_explicitly() {
+        let data_dir = tmpdir("remote-trace-missing-body");
+        let store = Store::open(data_dir.clone()).unwrap();
+        let missing = data_dir.join("bodies/never-created.request.json.gz");
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "remote-missing-1".into(),
+                ts_request_ms: 100,
+                req_body_path: Some(missing.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let error = trace_ingest_payload_from_store(&store, "remote-missing-1").unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("read client_request body for remote trace upload"));
+        assert!(detail.contains("opening legacy body"));
+        assert!(detail.contains("never-created.request.json.gz"));
     }
 
     #[test]
@@ -11717,6 +11910,7 @@ mod tests {
             dario_probe_model: "claude-haiku-4-5".into(),
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_durability: alex_store::LarDurabilityMode::Sync,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -12533,6 +12727,7 @@ mod tests {
             dario_probe_model: "claude-haiku-4-5".into(),
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_durability: alex_store::LarDurabilityMode::Sync,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -12557,6 +12752,7 @@ mod tests {
             reloaded.lar_body_store_mode,
             alex_store::LarBodyStoreMode::Legacy
         );
+        assert_eq!(reloaded.lar_durability, alex_store::LarDurabilityMode::Sync);
         assert!(reloaded.data_dir.is_absolute());
     }
 
@@ -12609,6 +12805,7 @@ local_key = "alx-test"
             config.lar_body_store_mode,
             alex_store::LarBodyStoreMode::Legacy
         );
+        assert_eq!(config.lar_durability, alex_store::LarDurabilityMode::Sync);
         assert_eq!(
             config.lar_migration_batch_size,
             default_lar_migration_batch_size()
@@ -12659,16 +12856,23 @@ min_free_disk_bytes = 1073741824
         let mut config = test_config(tmpdir("lar-body-mode"));
         config.lar_body_store_mode = alex_store::LarBodyStoreMode::DualWriteValidated;
         assert_eq!(
-            lar_body_store_config(&config, None).unwrap().mode,
+            lar_body_store_config(&config, None, None).unwrap().mode,
             alex_store::LarBodyStoreMode::DualWriteValidated
         );
         assert_eq!(
-            lar_body_store_config(&config, Some("lar-with-fallback"))
+            lar_body_store_config(&config, Some("lar-with-fallback"), None)
                 .unwrap()
                 .mode,
             alex_store::LarBodyStoreMode::LarWithFallback
         );
-        assert!(lar_body_store_config(&config, Some("lar")).is_err());
+        assert_eq!(
+            lar_body_store_config(&config, None, Some("batch"))
+                .unwrap()
+                .durability,
+            alex_store::LarDurabilityMode::Batch
+        );
+        assert!(lar_body_store_config(&config, Some("lar"), None).is_err());
+        assert!(lar_body_store_config(&config, None, Some("eventually")).is_err());
     }
 
     #[test]

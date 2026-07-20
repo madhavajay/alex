@@ -9,6 +9,7 @@ description = "Seekable, deduplicated archive primitives for Alex LLM traffic"
 [dependencies]
 blake3 = "1"
 crc32fast = "1"
+tempfile = "3"
 zstd = "0.13"
 
 [dev-dependencies]

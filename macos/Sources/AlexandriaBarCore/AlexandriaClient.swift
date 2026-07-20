@@ -892,6 +892,29 @@ public struct AlexandriaClient: Sendable {
             as: TraceStreamReplayPage.self)
     }
 
+    public func traceStageContent(
+        traceId: String,
+        after: TraceStageContentCursor? = nil,
+        stageLimit: Int = 64,
+        bodyByteBudget: Int = 2 * 1024 * 1024,
+        headerByteBudget: Int = 256 * 1024
+    ) async throws -> TraceStageContentPage {
+        var query = [
+            URLQueryItem(name: "stage_limit", value: "\(stageLimit)"),
+            URLQueryItem(name: "body_byte_budget", value: "\(bodyByteBudget)"),
+            URLQueryItem(name: "header_byte_budget", value: "\(headerByteBudget)"),
+        ]
+        if let after {
+            query.append(URLQueryItem(
+                name: "after_capture_sequence", value: "\(after.captureSequence)"))
+            query.append(URLQueryItem(name: "after_stage_id", value: after.stageId))
+        }
+        return try await get(
+            "traces/\(encodedPathComponent(traceId))/stages/content",
+            query: query,
+            as: TraceStageContentPage.self)
+    }
+
     public func toolBody(id: String, kind: String) async throws -> TraceBodyContent {
         var req = URLRequest(url: url("tools/\(id)/body/\(kind)"))
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")

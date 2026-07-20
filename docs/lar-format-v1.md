@@ -134,12 +134,15 @@ Implemented record types are:
 | 12 | conversation entry | 1 |
 | 13 | conversation generation | 1 |
 | 14 | turn view | 1 |
+| 15 | exchange metadata (optional companion) | 1 |
 
 Canonical record types 1–6 and 10–14 are written with the required flag.
 Metadata pages currently batch body manifests, header blocks, stream indexes,
 stages, exchanges, conversation entries, generations, and turn views; a reader
 that does not understand them must reject rather than silently lose canonical
-records.
+records. Type 15 is deliberately an optional outer frame and is never placed
+inside a metadata page; its compatibility and adjacency rules are defined
+below.
 Dictionary records are required whenever later pages reference them. Derived
 index types 7–9 are written without it, so v1 readers predating persisted
 indexes can skip them and reconstruct the same capture. An unknown record type
@@ -272,8 +275,10 @@ logical offset zero, and their lengths must cover `total_length` exactly. When
 reconstructing a body, the reader also verifies the complete body length and
 `whole_body_hash`.
 
-The byte-slice writer stores `media_type` and `content_encoding` as absent and
-orders every newly written literal chunk before its manifest. Its predecessor-
+The ordinary byte-slice writer stores `media_type` and `content_encoding` as
+absent; `append_body_with_metadata` retains those fields while still reusing
+content-addressed chunks. Both order every newly written literal chunk before
+its manifest. The predecessor-
 aware path may use a nonzero `chunk_offset` to reference an exact byte range in
 an earlier chunk. Those references remain direct: a manifest never names or
 depends on another manifest. The writer validates every range against the
@@ -469,6 +474,55 @@ and append-ordered session-to-exchange lookup tables from a validated persisted
 index, or rebuilds them during its bounded recovery scan.
 Session, run, parent, and clock identifiers are optional byte strings rather
 than assumed UUIDs so existing Alex identifiers survive migration exactly.
+
+## Type 15: exchange metadata companion, record schema 1
+
+This optional extension carries transport, accounting, and Alex trace metadata
+that is not part of the stable, content-addressed Type 6 exchange. When present,
+it is the frame immediately following a direct (non-metadata-page) Exchange:
+
+```text
+exchange_id          [u8;32]
+payload_magic        [u8;4] = ASCII `LEM1`
+payload_schema       u16 = 1
+attribute_count      u16, maximum 128
+repeated attribute_count times:
+  flags              u8; bit 0 means required
+  reserved           u8 = 0
+  key_length         u16
+  value_length       u32
+  key                 key_length bytes
+  value               value_length bytes
+```
+
+Keys are non-empty, strictly byte-sorted, and unique. A key is at most the
+smaller of 128 bytes and the configured identifier limit; a value is bounded by
+the configured field-length limit. Known value encodings are:
+
+| Encoding | Keys |
+| --- | --- |
+| little-endian two's-complement `i64` | `alex.ts_request_ms`, `alex.ts_response_ms`, `http.status`, `gen_ai.thinking_budget`, `gen_ai.input_tokens`, `gen_ai.cached_input_tokens`, `gen_ai.cache_creation_tokens`, `gen_ai.output_tokens`, `gen_ai.reasoning_tokens` |
+| little-endian `u64` containing exact IEEE-754 bits | `alex.cost_usd_f64_bits` |
+| one byte, `0` or `1` | `http.streamed`, `alex.substituted`, `alex.injected`, `alex.via_dario` |
+| uninterpreted bytes | `alex.harness`, `alex.client_format`, `alex.upstream_format`, `http.method`, `http.path`, `alex.billing_bucket`, `alex.error.kind`, `alex.error.code`, `alex.original_model`, `alex.served_model`, `alex.substitution_reason`, `alex.fixture_name`, `alex.attempts_json`, `alex.original_account_id`, `alex.served_account_id`, `alex.subscription_identity`, `alex.dario_generation`, `alex.tags_json`, `network.client_ip`, `alex.key_fingerprint`, `gen_ai.reasoning_effort` |
+
+All attributes written by this version are optional. Unknown optional
+attributes must use canonical lowercase ASCII keys containing only letters,
+digits, `.`, `_`, and `-`; their values are retained across decode/re-encode.
+Unknown required attributes are rejected. Unknown extension keys containing a
+`body`, `header`, `manifest`, `chunk`, `ref`, or `path` token (including the
+listed plurals) are rejected: body bytes, ordered header atoms, manifests, and
+their references remain solely on the ordinary stage/header/manifest graph.
+
+The outer Type 15 frame is written with flags `0`, never `required`, so shipped
+v1 readers that know only Types 1–14 skip it while retaining the complete older
+exchange semantics. Current readers consume at most one immediate companion
+and reject an orphan, duplicate, or exchange-ID mismatch. A future optional
+outer schema or optional outer flags are skipped; setting the outer required
+flag is rejected. Footer/checkpoint readers find the companion by seeking just
+past the indexed direct Exchange, so no new required index kind is introduced.
+The upgrade operation copies optional companion frames, including unknown
+future forms, in canonical order rather than silently dropping them.
 
 ## Type 12: conversation entry, schema 1
 
@@ -697,7 +751,8 @@ The following design items are not part of the current on-disk implementation:
 - a special standalone closure record (standalone exporters instead copy the
   ordinary transitive chunk/manifest/event closure);
 - encryption, signatures, or authenticated checksums; and
-- an automatic legacy-trace migration record/provenance schema.
+- a generic provenance record beyond the optional ExchangeMetadata fields and
+  the migration/catalog provenance maintained by Alex.
 
 Until the remaining records and integrations exist, the implemented container
 must not be described as a complete LLM traffic archive or byte-exact HTTP

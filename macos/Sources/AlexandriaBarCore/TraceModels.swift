@@ -252,6 +252,386 @@ public struct TranscriptStage: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct TraceStageContentCursor: Codable, Sendable, Equatable {
+    public let captureSequence: UInt64
+    public let stageId: String
+
+    enum CodingKeys: String, CodingKey {
+        case captureSequence = "capture_sequence"
+        case stageId = "stage_id"
+    }
+}
+
+public struct TraceStageContentRecord: Codable, Sendable, Equatable, Identifiable {
+    public let stageId: String
+    public let captureSequence: UInt64
+    public let kind: String
+    public let attemptNumber: UInt64?
+    public let wallTimeNs: UInt64?
+    public let monotonicDeltaNs: UInt64?
+    public let fidelity: String
+    public let requestHeadersRef: String?
+    public let requestHeadersContentId: String?
+    public let requestBodyManifestRef: String?
+    public let requestBodyContentId: String?
+    public let responseHeadersRef: String?
+    public let responseHeadersContentId: String?
+    public let responseBodyManifestRef: String?
+    public let responseBodyContentId: String?
+    public let trailersRef: String?
+    public let trailersContentId: String?
+    public let streamIndexRef: String?
+    public let limitations: [String]
+
+    public var id: String { stageId }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, fidelity, limitations
+        case stageId = "stage_id"
+        case captureSequence = "capture_sequence"
+        case attemptNumber = "attempt_number"
+        case wallTimeNs = "wall_time_ns"
+        case monotonicDeltaNs = "monotonic_delta_ns"
+        case requestHeadersRef = "request_headers_ref"
+        case requestHeadersContentId = "request_headers_content_id"
+        case requestBodyManifestRef = "request_body_manifest_ref"
+        case requestBodyContentId = "request_body_content_id"
+        case responseHeadersRef = "response_headers_ref"
+        case responseHeadersContentId = "response_headers_content_id"
+        case responseBodyManifestRef = "response_body_manifest_ref"
+        case responseBodyContentId = "response_body_content_id"
+        case trailersRef = "trailers_ref"
+        case trailersContentId = "trailers_content_id"
+        case streamIndexRef = "stream_index_ref"
+    }
+}
+
+public struct TraceStageHeaderAtom: Codable, Sendable, Equatable, Identifiable {
+    public let ordinal: UInt64
+    public let nameBytes: Data
+    public let valueBytes: Data
+    public let flags: UInt32
+
+    public var id: UInt64 { ordinal }
+
+    enum CodingKeys: String, CodingKey {
+        case ordinal, flags
+        case nameBytes = "name_b64"
+        case valueBytes = "value_b64"
+    }
+}
+
+public struct TraceStageHeaderBlock: Codable, Sendable, Equatable, Identifiable {
+    public let contentId: String
+    public let blockId: String?
+    public let state: String
+    public let fidelity: String?
+    public let totalAtoms: UInt64?
+    public let totalBytes: UInt64?
+    public let atoms: [TraceStageHeaderAtom]
+    public let errorKind: String?
+    public let message: String?
+
+    public var id: String { contentId }
+
+    enum CodingKeys: String, CodingKey {
+        case state, fidelity, atoms, message
+        case contentId = "content_id"
+        case blockId = "block_id"
+        case totalAtoms = "total_atoms"
+        case totalBytes = "total_bytes"
+        case errorKind = "error_kind"
+    }
+}
+
+public struct TraceStageBodyContent: Codable, Sendable, Equatable, Identifiable {
+    public let contentId: String
+    public let manifestId: String?
+    public let artifactKind: String?
+    public let state: String
+    public let fidelity: String
+    public let totalBytes: UInt64?
+    public let mediaTypeBytes: Data?
+    public let contentEncodingBytes: Data?
+    public let bytes: Data?
+    public let errorKind: String?
+    public let message: String?
+    public let archiveFileUuid: String?
+    public let archivePath: String?
+
+    public var id: String { contentId }
+
+    enum CodingKeys: String, CodingKey {
+        case state, fidelity, message
+        case contentId = "content_id"
+        case manifestId = "manifest_id"
+        case artifactKind = "artifact_kind"
+        case totalBytes = "total_bytes"
+        case mediaTypeBytes = "media_type_b64"
+        case contentEncodingBytes = "content_encoding_b64"
+        case bytes = "bytes_b64"
+        case errorKind = "error_kind"
+        case archiveFileUuid = "archive_file_uuid"
+        case archivePath = "archive_path"
+    }
+}
+
+public struct TraceStageContentPage: Codable, Sendable, Equatable {
+    public let traceId: String
+    public let totalStages: UInt64
+    public let hasMore: Bool
+    public let stagesTruncated: Bool
+    public let nextCursor: TraceStageContentCursor?
+    public let stageLimit: Int
+    public let bodyByteBudget: UInt64
+    public let bodyBytesLoaded: UInt64
+    public let headerByteBudget: UInt64
+    public let headerBytesLoaded: UInt64
+    public let stages: [TraceStageContentRecord]
+    public let headerBlocks: [TraceStageHeaderBlock]
+    public let bodies: [TraceStageBodyContent]
+
+    enum CodingKeys: String, CodingKey {
+        case stages, bodies
+        case traceId = "trace_id"
+        case totalStages = "total_stages"
+        case hasMore = "has_more"
+        case stagesTruncated = "stages_truncated"
+        case nextCursor = "next_cursor"
+        case stageLimit = "stage_limit"
+        case bodyByteBudget = "body_byte_budget"
+        case bodyBytesLoaded = "body_bytes_loaded"
+        case headerByteBudget = "header_byte_budget"
+        case headerBytesLoaded = "header_bytes_loaded"
+        case headerBlocks = "header_blocks"
+    }
+
+    public func headerBlock(_ contentId: String?) -> TraceStageHeaderBlock? {
+        guard let contentId else { return nil }
+        return headerBlocks.first { $0.contentId == contentId }
+    }
+
+    public func bodyContent(_ contentId: String?) -> TraceStageBodyContent? {
+        guard let contentId else { return nil }
+        return bodies.first { $0.contentId == contentId }
+    }
+}
+
+public enum TraceStageContentPaging {
+    public static func merge(
+        existing: TraceStageContentPage?, incoming: TraceStageContentPage
+    ) -> TraceStageContentPage {
+        guard let existing, existing.traceId == incoming.traceId else { return incoming }
+        var stages = Dictionary(uniqueKeysWithValues: existing.stages.map { ($0.id, $0) })
+        var headers = Dictionary(uniqueKeysWithValues: existing.headerBlocks.map { ($0.id, $0) })
+        var bodies = Dictionary(uniqueKeysWithValues: existing.bodies.map { ($0.id, $0) })
+        for stage in incoming.stages { stages[stage.id] = stage }
+        for block in incoming.headerBlocks { headers[block.id] = block }
+        for body in incoming.bodies { bodies[body.id] = body }
+        return TraceStageContentPage(
+            traceId: incoming.traceId,
+            totalStages: incoming.totalStages,
+            hasMore: incoming.hasMore,
+            stagesTruncated: incoming.stagesTruncated,
+            nextCursor: incoming.nextCursor,
+            stageLimit: incoming.stageLimit,
+            bodyByteBudget: existing.bodyByteBudget + incoming.bodyByteBudget,
+            bodyBytesLoaded: existing.bodyBytesLoaded + incoming.bodyBytesLoaded,
+            headerByteBudget: existing.headerByteBudget + incoming.headerByteBudget,
+            headerBytesLoaded: existing.headerBytesLoaded + incoming.headerBytesLoaded,
+            stages: stages.values.sorted {
+                if $0.captureSequence != $1.captureSequence {
+                    return $0.captureSequence < $1.captureSequence
+                }
+                return $0.stageId < $1.stageId
+            },
+            headerBlocks: headers.values.sorted { $0.contentId < $1.contentId },
+            bodies: bodies.values.sorted { $0.contentId < $1.contentId })
+    }
+}
+
+public struct TraceStageContentComparison: Sendable, Equatable {
+    public let previousStageId: String
+    public let previousLabel: String
+    public let facts: [String]
+}
+
+public enum TraceStageContentComparisons {
+    public static func comparison(
+        for stage: TraceStageContentRecord, in page: TraceStageContentPage
+    ) -> TraceStageContentComparison? {
+        let ordered = page.stages.sorted {
+            ($0.captureSequence, $0.stageId) < ($1.captureSequence, $1.stageId)
+        }
+        guard let index = ordered.firstIndex(where: { $0.id == stage.id }) else { return nil }
+        let candidates = ordered[..<index].reversed()
+        guard let previous = candidates.first(where: { comparable($0, stage) }) else { return nil }
+        var facts = [String]()
+        compareHeaders(
+            "request headers", previous.requestHeadersContentId, stage.requestHeadersContentId,
+            page, into: &facts)
+        compareBody(
+            "request body", previous.requestBodyContentId, stage.requestBodyContentId,
+            page, into: &facts)
+        compareHeaders(
+            "response headers", previous.responseHeadersContentId, stage.responseHeadersContentId,
+            page, into: &facts)
+        compareBody(
+            "response body", previous.responseBodyContentId, stage.responseBodyContentId,
+            page, into: &facts)
+        compareHeaders(
+            "trailers", previous.trailersContentId, stage.trailersContentId,
+            page, into: &facts)
+        guard !facts.isEmpty else { return nil }
+        return TraceStageContentComparison(
+            previousStageId: previous.id,
+            previousLabel: label(previous),
+            facts: facts)
+    }
+
+    private static func comparable(
+        _ previous: TraceStageContentRecord, _ current: TraceStageContentRecord
+    ) -> Bool {
+        switch current.kind {
+        case "upstream_request":
+            return previous.kind == "upstream_request" || previous.kind == "client_request"
+        case "upstream_response":
+            return previous.kind == "upstream_response"
+        case "client_response":
+            return previous.kind == "upstream_response"
+        default:
+            return sharesAContentLane(previous, current)
+        }
+    }
+
+    private static func sharesAContentLane(
+        _ left: TraceStageContentRecord, _ right: TraceStageContentRecord
+    ) -> Bool {
+        (left.requestHeadersContentId != nil && right.requestHeadersContentId != nil)
+            || (left.requestBodyContentId != nil && right.requestBodyContentId != nil)
+            || (left.responseHeadersContentId != nil && right.responseHeadersContentId != nil)
+            || (left.responseBodyContentId != nil && right.responseBodyContentId != nil)
+            || (left.trailersContentId != nil && right.trailersContentId != nil)
+    }
+
+    private static func compareHeaders(
+        _ label: String, _ leftId: String?, _ rightId: String?, _ page: TraceStageContentPage,
+        into facts: inout [String]
+    ) {
+        switch (leftId, rightId) {
+        case (nil, nil): return
+        case (nil, .some):
+            facts.append("\(label) added")
+            return
+        case (.some, nil):
+            facts.append("\(label) removed")
+            return
+        default: break
+        }
+        guard let left = page.headerBlock(leftId), let right = page.headerBlock(rightId) else {
+            facts.append("\(label) unavailable")
+            return
+        }
+        guard left.state == "available", right.state == "available" else {
+            facts.append("\(label) unavailable")
+            return
+        }
+        facts.append(left.atoms == right.atoms ? "same \(label)" : "changed \(label)")
+    }
+
+    private static func compareBody(
+        _ label: String, _ leftId: String?, _ rightId: String?, _ page: TraceStageContentPage,
+        into facts: inout [String]
+    ) {
+        switch (leftId, rightId) {
+        case (nil, nil): return
+        case (nil, .some):
+            facts.append("\(label) added")
+            return
+        case (.some, nil):
+            facts.append("\(label) removed")
+            return
+        default: break
+        }
+        guard let left = page.bodyContent(leftId), let right = page.bodyContent(rightId) else {
+            facts.append("\(label) unavailable")
+            return
+        }
+        guard left.state == "available", right.state == "available",
+            let leftBytes = left.bytes, let rightBytes = right.bytes
+        else {
+            facts.append("\(label) unavailable")
+            return
+        }
+        facts.append(leftBytes == rightBytes ? "same \(label)" : "changed \(label)")
+    }
+
+    private static func label(_ stage: TraceStageContentRecord) -> String {
+        let base = stage.kind.replacingOccurrences(of: "_", with: " ")
+        return stage.attemptNumber.map { "\(base) #\($0)" } ?? base
+    }
+}
+
+public enum TraceStageContentLoad {
+    public static func shouldApply(
+        requestTraceId: String, incomingTraceId: String,
+        generation: UInt64, currentGeneration: UInt64,
+        isCancelled: Bool
+    ) -> Bool {
+        !isCancelled
+            && requestTraceId == incomingTraceId
+            && generation == currentGeneration
+    }
+}
+
+public enum TraceStageContentDisplay {
+    public static let byteLimit = 256 * 1024
+    public static let headerByteLimit = 16 * 1024
+
+    public static func headerBytes(_ data: Data?, limit: Int = headerByteLimit) -> String {
+        guard let data else { return "<invalid base64>" }
+        let accepted = data.prefix(max(0, limit))
+        let suffix = data.count > accepted.count
+            ? " … <\(data.count - accepted.count) bytes omitted>" : ""
+        if let text = String(data: accepted, encoding: .utf8),
+            !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0.value != 0x09 })
+        {
+            return text + suffix
+        }
+        return "0x" + accepted.map { String(format: "%02x", $0) }.joined() + suffix
+    }
+
+    public static func body(_ data: Data?, limit: Int = byteLimit) -> (text: String, omitted: Int) {
+        guard let data else { return ("<body bytes unavailable>", 0) }
+        let accepted = data.prefix(max(0, limit))
+        let text: String
+        let displayedByteCount: Int
+        if !accepted.contains(0), let decoded = String(data: accepted, encoding: .utf8) {
+            text = decoded
+            displayedByteCount = accepted.count
+        } else {
+            let preview = accepted.prefix(256)
+            text = preview.map { String(format: "%02x", $0) }
+                .joined(separator: " ")
+            displayedByteCount = preview.count
+        }
+        return (text, data.count - displayedByteCount)
+    }
+}
+
+public enum TraceStageHeaderRendering {
+    public static let initialCount = 256
+    public static let increment = 256
+
+    public static func visibleCount(total: Int, requested: Int?) -> Int {
+        min(max(0, total), max(0, requested ?? initialCount))
+    }
+
+    public static func nextVisibleCount(total: Int, current: Int) -> Int {
+        min(max(0, total), max(0, current) + increment)
+    }
+}
+
 public enum TraceStreamReplaySource: Sendable, Equatable, Codable, Hashable {
     case observedReads
     case parsedFrames

@@ -22,12 +22,15 @@ use alex_core::{
 };
 use alex_store::{
     KnownAccount, LarArtifactBatchRead, LarArtifactReadRequest, LarBodyArtifact,
-    LarConversationEvidenceSource, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
-    LarStreamReadCapture, LarStreamReplayError, LarStreamReplayPageOptions, LarStreamReplaySource,
-    LarUpstreamAttemptCapture, Store, ToolCallRecord, TraceFilter,
-    DEFAULT_STREAM_REPLAY_PAGE_BYTES, DEFAULT_STREAM_REPLAY_PAGE_LIMIT,
+    LarConversationEvidenceSource, LarExchangeBodyRefs, LarExchangeCapture,
+    LarExchangeMetadataCapture, LarHeaderCapture, LarStageContentError, LarStageContentOptions,
+    LarStageContentPage, LarStreamReadCapture, LarStreamReplayError, LarStreamReplayPageOptions,
+    LarStreamReplaySource, LarUpstreamAttemptCapture, Store, ToolCallRecord, TraceFilter,
+    DEFAULT_STAGE_CONTENT_BODY_BYTES, DEFAULT_STAGE_CONTENT_HEADER_BYTES,
+    DEFAULT_STAGE_CONTENT_LIMIT, DEFAULT_STREAM_REPLAY_PAGE_BYTES,
+    DEFAULT_STREAM_REPLAY_PAGE_LIMIT,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -1663,6 +1666,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/{id}/body/{kind}", get(trace_body))
+        .route("/traces/{id}/stages/content", get(trace_stage_content))
         .route(
             "/traces/{id}/stages/{stage_id}/replay",
             get(trace_stage_replay),
@@ -4385,34 +4389,39 @@ async fn admin_traces(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .min(5_000);
     // Keep the small `/admin/traces` fixture endpoint useful to harness
     // certification: a scoped run key gives every request a unique run id.
     // `list_traces` predates run keys, so delegate only run-id queries to the
     // richer filter API while retaining its established response shape.
-    if q.contains_key("run_id")
+    let use_filter = q.contains_key("run_id")
         || q.contains_key("error_class")
         || q.contains_key("errors")
-        || q.contains_key("key_fingerprint")
-    {
-        let mut filter = filter_from_query(&q);
-        filter.limit = limit;
-        return match state.store.search_traces(&filter) {
-            Ok(rows) => {
-                axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
-            }
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        || q.contains_key("key_fingerprint");
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || -> Result<Value> {
+        let rows = if use_filter {
+            let mut filter = filter_from_query(&q);
+            filter.limit = limit;
+            store.search_traces(&filter)?
+        } else {
+            store.list_traces(
+                limit,
+                q.get("session").map(String::as_str),
+                q.get("model").map(String::as_str),
+            )?
         };
-    }
-    match state.store.list_traces(
-        limit,
-        q.get("session").map(|s| s.as_str()),
-        q.get("model").map(|s| s.as_str()),
-    ) {
-        Ok(rows) => {
-            axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(json!({"traces": trace_rows_with_display_fields(rows)}))
+    })
+    .await
+    {
+        Ok(Ok(value)) => axum::Json(value).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -4558,28 +4567,37 @@ async fn admin_fixture_save(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     let fixture = if let Some(trace_id) = body["from_trace_id"].as_str() {
+        let trace_id = trace_id.to_string();
         let kind = body["kind"].as_str().unwrap_or("resp");
         if kind != "resp" {
             return error_response(StatusCode::BAD_REQUEST, "only kind='resp' is supported");
         }
-        let row = match state.store.get_trace(trace_id) {
-            Ok(Some(row)) => row,
-            Ok(None) => return error_response(StatusCode::NOT_FOUND, "source trace not found"),
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        };
-        let bytes = match state.store.read_lar_or_legacy_artifact(
-            "trace",
-            trace_id,
-            "client_response",
-            None,
-        ) {
-            Ok(Some(body)) => body,
-            Ok(None) => {
+        let store = state.store.clone();
+        let trace_id_for_read = trace_id.clone();
+        let source =
+            tokio::task::spawn_blocking(move || -> Result<Option<(Value, Option<Vec<u8>>)>> {
+                let Some(row) = store.get_trace(&trace_id_for_read)? else {
+                    return Ok(None);
+                };
+                let bytes = store.read_lar_or_legacy_artifact(
+                    "trace",
+                    &trace_id_for_read,
+                    "client_response",
+                    None,
+                )?;
+                Ok(Some((row, bytes)))
+            })
+            .await;
+        let (row, bytes) = match source {
+            Ok(Ok(Some((row, Some(bytes))))) => (row, bytes),
+            Ok(Ok(Some((_, None)))) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "source trace has no captured response body",
                 )
             }
+            Ok(Ok(None)) => return error_response(StatusCode::NOT_FOUND, "source trace not found"),
+            Ok(Err(error)) => return body_artifact_error_response(&error),
             Err(error) => {
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
             }
@@ -4598,7 +4616,7 @@ async fn admin_fixture_save(
             body: String::from_utf8_lossy(&bytes).into_owned(),
             direction: Direction::UpstreamToClient,
             created_ms: now_ms(),
-            source_trace_id: Some(trace_id.into()),
+            source_trace_id: Some(trace_id),
         }
     } else {
         let status = match body["status"]
@@ -4811,6 +4829,7 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
         key_fingerprint: q.get("key_fingerprint").cloned(),
         reasoning_effort: q.get("effort").cloned(),
         text: None,
+        before: None,
         limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
     }
 }
@@ -4821,38 +4840,114 @@ fn wants_bodies(q: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-fn read_gz_file(path: &str) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut decoder = flate2::read::GzDecoder::new(file);
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut buf).ok()?;
-    Some(buf)
-}
+const NDJSON_BODY_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+const TRACE_BODY_FIELDS: [(&str, &str, &str); 3] = [
+    ("req_body_path", "req_body_b64", "client_request"),
+    (
+        "upstream_req_body_path",
+        "upstream_req_body_b64",
+        "upstream_request",
+    ),
+    ("resp_body_path", "resp_body_b64", "client_response"),
+];
 
-fn inline_row_bodies(row: &mut Value) {
-    use base64::Engine;
-    for (path_key, out_key) in [
-        ("req_body_path", "req_body_b64"),
-        ("upstream_req_body_path", "upstream_req_body_b64"),
-        ("resp_body_path", "resp_body_b64"),
-    ] {
-        let Some(buf) = row[path_key].as_str().and_then(read_gz_file) else {
-            continue;
-        };
-        row[out_key] = json!(base64::engine::general_purpose::STANDARD.encode(&buf));
+fn body_batch_error(
+    trace_id: &str,
+    artifact_kind: &str,
+    outcome: LarArtifactBatchRead,
+) -> Option<Value> {
+    match outcome {
+        LarArtifactBatchRead::Read(_) | LarArtifactBatchRead::Missing => None,
+        LarArtifactBatchRead::Truncated {
+            total_length,
+            budget_remaining,
+        } => Some(json!({
+            "trace_id": trace_id,
+            "artifact_kind": artifact_kind,
+            "kind": "body_byte_budget",
+            "message": "artifact omitted because the body byte budget was exhausted",
+            "total_bytes": total_length,
+            "budget_remaining_bytes": budget_remaining,
+        })),
+        LarArtifactBatchRead::Error { kind, detail } => Some(json!({
+            "trace_id": trace_id,
+            "artifact_kind": artifact_kind,
+            "kind": kind,
+            "message": detail,
+        })),
+        LarArtifactBatchRead::ArchiveUnavailable(error) => Some(json!({
+            "trace_id": trace_id,
+            "artifact_kind": artifact_kind,
+            "kind": error.code(),
+            "message": error.to_string(),
+            "archive_availability": error.code(),
+            "archive_file_uuid": error.file_uuid,
+            "archive_path": error.path,
+        })),
     }
 }
 
-fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
+fn inline_row_bodies(row: &mut Value, bodies: &mut impl Iterator<Item = LarArtifactBatchRead>) {
+    use base64::Engine;
+    let trace_id = row["id"].as_str().unwrap_or_default().to_string();
+    let mut errors = Vec::new();
+    for (path_key, out_key, artifact_kind) in TRACE_BODY_FIELDS {
+        let outcome = bodies.next().unwrap_or(LarArtifactBatchRead::Missing);
+        match outcome {
+            LarArtifactBatchRead::Read(bytes) => {
+                row[out_key] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+            }
+            LarArtifactBatchRead::Missing if row[path_key].is_string() => {
+                errors.push(json!({
+                    "trace_id": trace_id,
+                    "artifact_kind": artifact_kind,
+                    "kind": "body_missing",
+                    "message": format!("catalog and legacy path contain no {artifact_kind} body"),
+                }));
+            }
+            LarArtifactBatchRead::Missing => {}
+            other => {
+                if let Some(error) = body_batch_error(&trace_id, artifact_kind, other) {
+                    errors.push(error);
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        row["body_errors"] = Value::Array(errors);
+    }
+}
+
+fn ndjson_body(store: &Store, mut rows: Vec<Value>, inline_bodies: bool) -> Result<String> {
     rows.sort_by_key(|r| r["ts_request_ms"].as_i64().unwrap_or(0));
+    let mut bodies = if inline_bodies {
+        let requests = rows
+            .iter()
+            .flat_map(|row| {
+                let trace_id = row["id"].as_str().unwrap_or_default();
+                TRACE_BODY_FIELDS.map(|(_, _, artifact_kind)| {
+                    LarArtifactReadRequest::new("trace", trace_id, artifact_kind)
+                })
+            })
+            .collect::<Vec<_>>();
+        store
+            .read_lar_or_legacy_artifact_batch_bounded(&requests, NDJSON_BODY_BYTE_BUDGET)
+            .into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
     let mut out = String::new();
     for mut row in rows {
         if inline_bodies {
-            inline_row_bodies(&mut row);
+            inline_row_bodies(&mut row, &mut bodies);
         }
-        out.push_str(&serde_json::to_string(&row).unwrap_or_default());
+        out.push_str(&serde_json::to_string(&row)?);
         out.push('\n');
     }
+    Ok(out)
+}
+
+fn ndjson_response(out: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/x-ndjson")
@@ -4860,43 +4955,92 @@ fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
         .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
 }
 
-const TEXT_SCAN_CAP: usize = 300;
-const TEXT_BODY_SCAN_BYTE_CAP: u64 = 4 * 1024 * 1024;
+const TEXT_SCAN_PAGE: usize = 500;
+const TEXT_SCAN_TRACE_CAP: usize = 100_000;
+const TEXT_BODY_SCAN_PAGE_BYTE_CAP: u64 = 64 * 1024 * 1024;
+const TEXT_BODY_SCAN_TOTAL_BYTE_CAP: u64 = 256 * 1024 * 1024;
+const TEXT_SCAN_ERROR_CAP: usize = 256;
 
-fn trace_matches_text(
-    row: &Value,
+struct FallbackTextPage {
+    matches: HashSet<String>,
+    errors: Vec<Value>,
+    bytes_read: u64,
+    coverage_complete: bool,
+}
+
+struct CancelSearchOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelSearchOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn fallback_text_matches(
+    store: &Store,
+    rows: &[Value],
     needle: &str,
     indexed_artifacts: &HashSet<(String, String)>,
-) -> bool {
-    let trace_id = row["id"].as_str().unwrap_or_default();
-    for (key, artifact_kind) in [
-        ("req_body_path", "client_request"),
-        ("resp_body_path", "client_response"),
-    ] {
-        if indexed_artifacts.contains(&(trace_id.to_string(), artifact_kind.to_string())) {
-            continue;
+    body_byte_budget: u64,
+) -> FallbackTextPage {
+    let mut metadata = Vec::new();
+    let mut requests = Vec::new();
+    let mut matches = HashSet::new();
+    let mut coverage_complete = true;
+    for row in rows {
+        let trace_id = row["id"].as_str().unwrap_or_default().to_string();
+        let (header_match, header_complete) = store.lar_selected_headers_match(
+            row["req_headers_json"].as_str(),
+            row["resp_headers_json"].as_str(),
+            needle,
+        );
+        if header_match {
+            matches.insert(trace_id.clone());
         }
-        if let Some(path) = row.get(key).and_then(|v| v.as_str()) {
-            if let Some(bytes) = read_gz_file_bounded(path, TEXT_BODY_SCAN_BYTE_CAP) {
-                if String::from_utf8_lossy(&bytes)
-                    .to_lowercase()
-                    .contains(needle)
-                {
-                    return true;
+        coverage_complete &= header_complete;
+        for artifact_kind in ["client_request", "client_response"] {
+            if indexed_artifacts.contains(&(trace_id.clone(), artifact_kind.to_string())) {
+                continue;
+            }
+            metadata.push((trace_id.clone(), artifact_kind));
+            requests.push(LarArtifactReadRequest::new(
+                "trace",
+                &trace_id,
+                artifact_kind,
+            ));
+        }
+    }
+    let outcomes = store.read_lar_or_legacy_artifact_batch_bounded(&requests, body_byte_budget);
+    let mut errors = Vec::new();
+    let mut bytes_read = 0u64;
+    for ((trace_id, artifact_kind), outcome) in metadata.into_iter().zip(outcomes) {
+        match outcome {
+            LarArtifactBatchRead::Read(bytes) => {
+                bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+                let (matched, complete) =
+                    store.lar_normalized_fallback_matches(artifact_kind, &bytes, needle);
+                if matched {
+                    matches.insert(trace_id);
+                }
+                coverage_complete &= complete;
+            }
+            LarArtifactBatchRead::Missing => {}
+            other => {
+                coverage_complete = false;
+                if let Some(error) = body_batch_error(&trace_id, artifact_kind, other) {
+                    if errors.len() < TEXT_SCAN_ERROR_CAP {
+                        errors.push(error);
+                    }
                 }
             }
         }
     }
-    false
-}
-
-fn read_gz_file_bounded(path: &str, byte_cap: u64) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut bounded = std::io::Read::take(decoder, byte_cap.saturating_add(1));
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut bounded, &mut buf).ok()?;
-    (buf.len() as u64 <= byte_cap).then_some(buf)
+    FallbackTextPage {
+        matches,
+        errors,
+        bytes_read,
+        coverage_complete,
+    }
 }
 
 async fn traces_search(
@@ -4915,6 +5059,8 @@ async fn traces_search(
         .map(|t| t.trim().to_lowercase())
         .filter(|t| !t.is_empty());
     let store = state.store.clone();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_search_on_drop = CancelSearchOnDrop(cancelled.clone());
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
         Ok(match text {
             Some(needle) => {
@@ -4932,31 +5078,106 @@ async fn traces_search(
                     .collect::<HashSet<_>>();
 
                 let mut fallback_filter = filter;
-                fallback_filter.limit = TEXT_SCAN_CAP;
-                let fallback_rows = store.search_traces(&fallback_filter)?;
-                let scanned = fallback_rows.len();
-                let fallback_ids = fallback_rows
-                    .iter()
-                    .filter_map(|row| row["id"].as_str().map(String::from))
-                    .collect::<Vec<_>>();
-                let indexed_artifacts = store.lar_normalized_indexed_artifacts(&fallback_ids)?;
-                rows.extend(
-                    fallback_rows
-                        .into_iter()
-                        .filter(|row| trace_matches_text(row, &needle, &indexed_artifacts))
-                        .filter(|row| {
-                            row["id"]
-                                .as_str()
-                                .is_none_or(|id| seen.insert(id.to_string()))
-                        }),
-                );
-                rows.sort_by_key(|row| std::cmp::Reverse(row["ts_request_ms"].as_i64()));
+                fallback_filter.limit = TEXT_SCAN_PAGE;
+                let mut scanned = 0usize;
+                let mut body_bytes_read = 0u64;
+                let mut body_errors = Vec::new();
+                let mut coverage_complete = true;
+                let mut coverage_limit_reasons = Vec::new();
+                loop {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        coverage_complete = false;
+                        coverage_limit_reasons.push("cancelled");
+                        break;
+                    }
+                    if scanned >= TEXT_SCAN_TRACE_CAP {
+                        coverage_complete = false;
+                        coverage_limit_reasons.push("trace_cap");
+                        break;
+                    }
+                    let fallback_rows = store.search_traces(&fallback_filter)?;
+                    if fallback_rows.is_empty() {
+                        break;
+                    }
+                    let page_len = fallback_rows.len();
+                    scanned = scanned.saturating_add(page_len);
+                    let fallback_ids = fallback_rows
+                        .iter()
+                        .filter_map(|row| row["id"].as_str().map(String::from))
+                        .collect::<Vec<_>>();
+                    let indexed_artifacts =
+                        store.lar_normalized_indexed_artifacts(&fallback_ids)?;
+                    let page = fallback_text_matches(
+                        &store,
+                        &fallback_rows,
+                        &needle,
+                        &indexed_artifacts,
+                        TEXT_BODY_SCAN_PAGE_BYTE_CAP
+                            .min(TEXT_BODY_SCAN_TOTAL_BYTE_CAP.saturating_sub(body_bytes_read)),
+                    );
+                    body_bytes_read = body_bytes_read.saturating_add(page.bytes_read);
+                    coverage_complete &= page.coverage_complete;
+                    for error in page.errors {
+                        if body_errors.len() < TEXT_SCAN_ERROR_CAP {
+                            body_errors.push(error);
+                        }
+                    }
+                    rows.extend(
+                        fallback_rows
+                            .iter()
+                            .filter(|row| {
+                                row["id"]
+                                    .as_str()
+                                    .is_some_and(|id| page.matches.contains(id))
+                            })
+                            .filter(|row| {
+                                row["id"]
+                                    .as_str()
+                                    .is_none_or(|id| seen.insert(id.to_string()))
+                            })
+                            .cloned(),
+                    );
+                    let last_cursor = fallback_rows.last().and_then(|row| {
+                        Some((
+                            row["ts_request_ms"].as_i64()?,
+                            row["id"].as_str()?.to_string(),
+                        ))
+                    });
+                    if body_bytes_read >= TEXT_BODY_SCAN_TOTAL_BYTE_CAP {
+                        coverage_complete = false;
+                        coverage_limit_reasons.push("body_byte_cap");
+                        break;
+                    }
+                    if page_len < TEXT_SCAN_PAGE {
+                        break;
+                    }
+                    let Some(cursor) = last_cursor else {
+                        coverage_complete = false;
+                        coverage_limit_reasons.push("invalid_cursor");
+                        break;
+                    };
+                    fallback_filter.before = Some(cursor);
+                }
+                if !coverage_complete && coverage_limit_reasons.is_empty() {
+                    coverage_limit_reasons.push("artifact_or_extraction_limit");
+                }
+                rows.sort_by(|left, right| {
+                    right["ts_request_ms"]
+                        .as_i64()
+                        .cmp(&left["ts_request_ms"].as_i64())
+                        .then_with(|| right["id"].as_str().cmp(&left["id"].as_str()))
+                });
                 rows.truncate(requested_limit);
                 json!({
                     "traces": trace_rows_with_display_fields(rows),
                     "indexed_matches": indexed_matches,
                     "scanned": scanned,
-                    "scan_cap": TEXT_SCAN_CAP,
+                    "scan_cap": TEXT_SCAN_TRACE_CAP,
+                    "body_byte_budget": TEXT_BODY_SCAN_TOTAL_BYTE_CAP,
+                    "body_bytes_read": body_bytes_read,
+                    "coverage_complete": coverage_complete,
+                    "coverage_limit_reasons": coverage_limit_reasons,
+                    "body_errors": body_errors,
                 })
             }
             None => {
@@ -4988,9 +5209,19 @@ async fn traces_export(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    match state.store.search_traces(&filter_from_query(&q)) {
-        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let mut filter = filter_from_query(&q);
+    filter.limit = filter.limit.min(5_000);
+    let inline_bodies = wants_bodies(&q);
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || -> Result<String> {
+        let rows = store.search_traces(&filter)?;
+        ndjson_body(&store, rows, inline_bodies)
+    })
+    .await
+    {
+        Ok(Ok(out)) => ndjson_response(out),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -5002,6 +5233,16 @@ fn truncate_chars(s: String, max: usize) -> String {
     }
 }
 
+#[cfg(test)]
+fn read_gz_file(path: &str) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut buf).ok()?;
+    Some(buf)
+}
+
+#[cfg(test)]
 fn read_gz_json(path: Option<&str>) -> Option<Value> {
     let buf = path.and_then(read_gz_file)?;
     serde_json::from_slice(&buf).ok()
@@ -5043,51 +5284,145 @@ fn find_dario_capture_path(state: &AppState, row: &Value, kind: &str) -> Option<
     let trace_id = row["id"].as_str()?;
     let suffix = dario_capture_suffix(kind)?;
     let filename = format!("{trace_id}.{suffix}");
-    let bodies = state.store.data_dir.join("bodies");
-    let mut days: Vec<PathBuf> = std::fs::read_dir(&bodies)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (entry.path().is_dir() && body_date_dir_name(&name)).then(|| entry.path())
-        })
-        .collect();
-    days.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    for day in days {
-        let path = day.join(&filename);
-        if path.is_file() {
-            return Some(path.to_string_lossy().to_string());
+    for root in ["bodies", "dario-capture-spool"] {
+        let root = state.store.data_dir.join(root);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        let mut days: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                (entry.path().is_dir() && body_date_dir_name(&name)).then(|| entry.path())
+            })
+            .collect();
+        days.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        for day in days {
+            let path = day.join(&filename);
+            if path.is_file() {
+                return Some(path.to_string_lossy().to_string());
+            }
         }
     }
     None
 }
 
-fn dario_capture_summary(state: &AppState, row: &Value) -> Option<Value> {
-    if let Some(trace_id) = row["id"].as_str() {
-        if let Err(error) = state.store.ingest_dario_capture_spool(trace_id) {
-            tracing::warn!(trace_id, "failed to ingest Dario capture spool: {error:#}");
-        }
+const DARIO_SUMMARY_BODY_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
+const DARIO_UNCATALOGED_BODY_BYTE_CAP: u64 = 64 * 1024 * 1024;
+
+fn read_uncataloged_dario_capture(path: &str) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening uncataloged Dario capture at {path}"))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut bounded =
+        std::io::Read::take(decoder, DARIO_UNCATALOGED_BODY_BYTE_CAP.saturating_add(1));
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .with_context(|| format!("decompressing uncataloged Dario capture at {path}"))?;
+    if bytes.len() as u64 > DARIO_UNCATALOGED_BODY_BYTE_CAP {
+        anyhow::bail!(
+            "uncataloged Dario capture at {path} exceeds {} bytes",
+            DARIO_UNCATALOGED_BODY_BYTE_CAP
+        );
+    }
+    Ok(bytes)
+}
+
+fn dario_capture_summary(state: &AppState, row: &Value) -> Result<Option<Value>> {
+    if !is_dario_trace(row) {
+        return Ok(None);
+    }
+    let Some(trace_id) = row["id"].as_str() else {
+        return Ok(None);
+    };
+    if let Err(error) = state.store.ingest_dario_capture_spool(trace_id) {
+        tracing::warn!(trace_id, "failed to ingest Dario capture spool: {error:#}");
     }
     let request_path = find_dario_capture_path(state, row, "dario-upstream-request");
     let response_path = find_dario_capture_path(state, row, "dario-upstream-response");
-    if request_path.is_none() && response_path.is_none() {
-        return None;
+    let requests = [
+        LarArtifactReadRequest::new("trace", trace_id, "dario_upstream_request"),
+        LarArtifactReadRequest::new("trace", trace_id, "dario_upstream_response"),
+    ];
+    let outcomes = state
+        .store
+        .read_lar_or_legacy_artifact_batch_bounded(&requests, DARIO_SUMMARY_BODY_BYTE_BUDGET);
+    let mut request_bytes = None;
+    let mut availability = [false; 2];
+    let mut body_errors = Vec::new();
+    for (index, ((artifact_kind, path), outcome)) in [
+        ("dario_upstream_request", request_path.as_deref()),
+        ("dario_upstream_response", response_path.as_deref()),
+    ]
+    .into_iter()
+    .zip(outcomes)
+    .enumerate()
+    {
+        match outcome {
+            LarArtifactBatchRead::Read(bytes) => {
+                availability[index] = true;
+                if index == 0 {
+                    request_bytes = Some(bytes);
+                }
+            }
+            LarArtifactBatchRead::Missing => {
+                // Dario's preload can leave a complete legacy suffix capture
+                // before its catalog publication. This is the only production
+                // body-path read outside Store, and only runs after the mixed
+                // reader proved that no artifact has been cataloged.
+                if let Some(path) = path {
+                    match read_uncataloged_dario_capture(path) {
+                        Ok(bytes) => {
+                            availability[index] = true;
+                            if index == 0 {
+                                request_bytes = Some(bytes);
+                            }
+                        }
+                        Err(error) => body_errors.push(json!({
+                            "trace_id": trace_id,
+                            "artifact_kind": artifact_kind,
+                            "kind": "uncataloged_dario_read",
+                            "message": format!("{error:#}"),
+                            "legacy_path": path,
+                        })),
+                    }
+                }
+            }
+            other @ LarArtifactBatchRead::Truncated { .. } => {
+                availability[index] = true;
+                if let Some(error) = body_batch_error(trace_id, artifact_kind, other) {
+                    body_errors.push(error);
+                }
+            }
+            other => {
+                if let Some(error) = body_batch_error(trace_id, artifact_kind, other) {
+                    body_errors.push(error);
+                }
+            }
+        }
     }
-    let prompt_cache = request_path
+    if !availability[0] && !availability[1] && body_errors.is_empty() {
+        return Ok(None);
+    }
+    let prompt_cache = request_bytes
         .as_deref()
-        .and_then(|path| read_gz_json(Some(path)))
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
         .and_then(|body| {
             body["prompt_cache"]
                 .as_object()
                 .map(|_| body["prompt_cache"].clone())
         });
-    Some(json!({
-        "request_available": request_path.is_some(),
-        "response_available": response_path.is_some(),
+    Ok(Some(json!({
+        "request_available": availability[0],
+        "response_available": availability[1],
         "request_path": request_path,
         "response_path": response_path,
         "prompt_cache": prompt_cache,
-    }))
+        "body_byte_budget": DARIO_SUMMARY_BODY_BYTE_BUDGET,
+        "body_errors": body_errors,
+    })))
 }
 
 async fn traces_sessions(
@@ -5969,29 +6304,82 @@ fn trace_extras(req: &Value) -> Value {
     })
 }
 
+fn body_artifact_error_response(error: &anyhow::Error) -> Response {
+    if let Some(unavailable) = error.downcast_ref::<alex_store::LarArchiveUnavailableError>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "error": {
+                    "type": unavailable.code(),
+                    "message": unavailable.to_string(),
+                    "archive_availability": unavailable.code(),
+                    "archive_file_uuid": unavailable.file_uuid,
+                    "archive_path": unavailable.path,
+                }
+            })),
+        )
+            .into_response();
+    }
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{error:#}"))
+}
+
 async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.store.get_trace(&id) {
-        Ok(Some(row)) => {
-            let mut extras = state
-                .store
-                .read_lar_or_legacy_artifact("trace", &id, "client_request", None)
+    let state_for_read = state.clone();
+    let id_for_read = id.clone();
+    match tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
+        let Some(row) = state_for_read.store.get_trace(&id_for_read)? else {
+            return Ok(None);
+        };
+        let request = state_for_read.store.read_lar_or_legacy_artifact(
+            "trace",
+            &id_for_read,
+            "client_request",
+            None,
+        );
+        let mut extras = match request {
+            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
                 .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .map(|req| trace_extras(&req))
-                .unwrap_or_else(|| json!({}));
-            if let Some(summary) = dario_capture_summary(&state, &row) {
-                if !extras.is_object() {
-                    extras = json!({});
-                }
-                if let Some(obj) = extras.as_object_mut() {
-                    obj.insert("dario_capture".into(), summary);
-                }
+                .unwrap_or_else(|| json!({})),
+            Ok(None) => json!({}),
+            Err(error) => {
+                let Some(unavailable) =
+                    error.downcast_ref::<alex_store::LarArchiveUnavailableError>()
+                else {
+                    return Err(error);
+                };
+                // Trace metadata remains useful while a cold archive is
+                // detached. Surface the body condition inside the successful
+                // detail response so the browser does not mistake it for a
+                // daemon outage or enter a retry-spinner loop.
+                json!({
+                    "body_errors": [{
+                        "artifact_kind": "client_request",
+                        "kind": unavailable.code(),
+                        "message": unavailable.to_string(),
+                        "archive_availability": unavailable.code(),
+                        "archive_file_uuid": unavailable.file_uuid,
+                        "archive_path": unavailable.path,
+                    }]
+                })
             }
-            axum::Json(json!({"trace": row, "extras": extras})).into_response()
+        };
+        if let Some(summary) = dario_capture_summary(&state_for_read, &row)? {
+            if !extras.is_object() {
+                extras = json!({});
+            }
+            if let Some(obj) = extras.as_object_mut() {
+                obj.insert("dario_capture".into(), summary);
+            }
         }
-        Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Some(json!({"trace": row, "extras": extras})))
+    })
+    .await
+    {
+        Ok(Ok(Some(value))) => axum::Json(value).into_response(),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Ok(Err(error)) => body_artifact_error_response(&error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -5999,40 +6387,16 @@ async fn trace_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
-    let row = match state.store.get_trace(&id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    if kind.starts_with("dario-") {
-        if let Err(error) = state.store.ingest_dario_capture_spool(&id) {
-            tracing::warn!(
-                trace_id = id,
-                "failed to ingest Dario capture spool: {error:#}"
-            );
-        }
-    }
-    let (artifact_kind, path) = match kind.as_str() {
-        "request" => (
-            "client_request",
-            row["req_body_path"].as_str().map(String::from),
-        ),
+    let (artifact_kind, path_key, is_dario) = match kind.as_str() {
+        "request" => ("client_request", Some("req_body_path"), false),
         "upstream-request" => (
             "upstream_request",
-            row["upstream_req_body_path"].as_str().map(String::from),
+            Some("upstream_req_body_path"),
+            false,
         ),
-        "response" => (
-            "client_response",
-            row["resp_body_path"].as_str().map(String::from),
-        ),
-        "dario-upstream-request" | "dario-upstream-response" => {
-            let artifact_kind = if kind == "dario-upstream-request" {
-                "dario_upstream_request"
-            } else {
-                "dario_upstream_response"
-            };
-            (artifact_kind, find_dario_capture_path(&state, &row, &kind))
-        }
+        "response" => ("client_response", Some("resp_body_path"), false),
+        "dario-upstream-request" => ("dario_upstream_request", None, true),
+        "dario-upstream-response" => ("dario_upstream_response", None, true),
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -6040,38 +6404,75 @@ async fn trace_body(
             )
         }
     };
-    let bytes = match state
-        .store
-        .read_lar_or_legacy_artifact("trace", &id, artifact_kind, None)
-    {
-        Ok(Some(bytes)) => Some(bytes),
-        // Dario suffix captures predate their catalog rows, so retain the
-        // convention-based fallback until their importer inventories them.
-        Ok(None) if artifact_kind.starts_with("dario_") => path.as_deref().and_then(read_gz_file),
-        Ok(None) => None,
-        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
-    match bytes {
-        Some(bytes) => {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            let ct = if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
-                "application/json; charset=utf-8"
+    let state_for_read = state.clone();
+    let id_for_read = id.clone();
+    let kind_for_read = kind.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Option<(Option<Vec<u8>>, Option<String>)>> {
+            let Some(row) = state_for_read.store.get_trace(&id_for_read)? else {
+                return Ok(None);
+            };
+            if is_dario {
+                if let Err(error) = state_for_read
+                    .store
+                    .ingest_dario_capture_spool(&id_for_read)
+                {
+                    tracing::warn!(
+                        trace_id = id_for_read,
+                        "failed to ingest Dario capture spool: {error:#}"
+                    );
+                }
+            }
+            let path = if let Some(key) = path_key {
+                row[key].as_str().map(String::from)
+            } else if is_dario {
+                find_dario_capture_path(&state_for_read, &row, &kind_for_read)
             } else {
+                None
+            };
+            let mut bytes = state_for_read.store.read_lar_or_legacy_artifact(
+                "trace",
+                &id_for_read,
+                artifact_kind,
+                None,
+            )?;
+            if bytes.is_none() && is_dario {
+                // The preload fallback is allowed only after the catalog says
+                // the Dario artifact does not exist yet.
+                bytes = path
+                    .as_deref()
+                    .map(read_uncataloged_dario_capture)
+                    .transpose()?;
+            }
+            Ok(Some((bytes, path)))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(Some((Some(bytes), path)))) => {
+            let ct = if serde_json::from_slice::<Value>(&bytes).is_ok() {
+                "application/json; charset=utf-8"
+            } else if std::str::from_utf8(&bytes).is_ok() {
                 "text/plain; charset=utf-8"
+            } else {
+                "application/octet-stream"
             };
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", ct)
                 .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
-                .body(Body::from(text))
+                .body(Body::from(bytes))
                 .unwrap_or_else(|e| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
                 })
         }
-        None => error_response(
+        Ok(Ok(Some((None, _)))) => error_response(
             StatusCode::NOT_FOUND,
             &format!("no {kind} body stored for trace '{id}'"),
         ),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Ok(Err(error)) => body_artifact_error_response(&error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -6194,6 +6595,236 @@ async fn trace_stage_replay(
     }
 }
 
+async fn trace_stage_content(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let stage_limit = match parse_stage_content_number::<usize>(
+        &query,
+        "stage_limit",
+        DEFAULT_STAGE_CONTENT_LIMIT,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return stage_content_typed_error(
+                StatusCode::BAD_REQUEST,
+                "stage_content_invalid_request",
+                &message,
+            )
+        }
+    };
+    let body_byte_budget = match parse_stage_content_number::<u64>(
+        &query,
+        "body_byte_budget",
+        DEFAULT_STAGE_CONTENT_BODY_BYTES,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return stage_content_typed_error(
+                StatusCode::BAD_REQUEST,
+                "stage_content_invalid_request",
+                &message,
+            )
+        }
+    };
+    let header_byte_budget = match parse_stage_content_number::<u64>(
+        &query,
+        "header_byte_budget",
+        DEFAULT_STAGE_CONTENT_HEADER_BYTES,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return stage_content_typed_error(
+                StatusCode::BAD_REQUEST,
+                "stage_content_invalid_request",
+                &message,
+            )
+        }
+    };
+    let after_capture_sequence = match query.get("after_capture_sequence") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return stage_content_typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "stage_content_invalid_request",
+                    "after_capture_sequence must be a non-negative integer",
+                )
+            }
+        },
+        None => None,
+    };
+    let after_stage_id = query.get("after_stage_id").cloned();
+    let options = LarStageContentOptions {
+        stage_limit,
+        body_byte_budget,
+        header_byte_budget,
+        after_capture_sequence,
+        after_stage_id,
+    };
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let page = store.lar_stage_content_page(&trace_id, &options)?;
+        serialize_stage_content_page(page)
+    })
+    .await;
+    match result {
+        Ok(Ok(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|error| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }),
+        Ok(Err(error)) => stage_content_error_response(&error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// Body/header base64 expansion and JSON serialization are intentionally part
+/// of the blocking stage-content job. A maximum-size archive response must not
+/// monopolize an async runtime worker used by the rest of the Trace Browser.
+fn serialize_stage_content_page(page: LarStageContentPage) -> Result<Vec<u8>> {
+    use base64::Engine;
+
+    let stages = page
+        .stages
+        .into_iter()
+        .map(|stage| {
+            json!({
+                "stage_id": stage.stage_id,
+                "capture_sequence": stage.capture_sequence,
+                "kind": stage.kind,
+                "attempt_number": stage.attempt_number,
+                "wall_time_ns": stage.wall_time_ns,
+                "monotonic_delta_ns": stage.monotonic_delta_ns,
+                "fidelity": stage.fidelity,
+                "request_headers_ref": stage.request_headers_ref,
+                "request_headers_content_id": stage.request_headers_content_id,
+                "request_body_manifest_ref": stage.request_body_manifest_ref,
+                "request_body_content_id": stage.request_body_content_id,
+                "response_headers_ref": stage.response_headers_ref,
+                "response_headers_content_id": stage.response_headers_content_id,
+                "response_body_manifest_ref": stage.response_body_manifest_ref,
+                "response_body_content_id": stage.response_body_content_id,
+                "trailers_ref": stage.trailers_ref,
+                "trailers_content_id": stage.trailers_content_id,
+                "stream_index_ref": stage.stream_index_ref,
+                "limitations": stage.limitations,
+            })
+        })
+        .collect::<Vec<_>>();
+    let header_blocks = page
+        .header_blocks
+        .into_iter()
+        .map(|block| {
+            let atoms = block
+                .atoms
+                .into_iter()
+                .map(|atom| {
+                    json!({
+                        "ordinal": atom.ordinal,
+                        "name_b64": base64::engine::general_purpose::STANDARD.encode(atom.original_name),
+                        "value_b64": base64::engine::general_purpose::STANDARD.encode(atom.value),
+                        "flags": atom.flags,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "content_id": block.content_id,
+                "block_id": block.block_id,
+                "state": block.state,
+                "fidelity": block.fidelity,
+                "total_atoms": block.total_atoms,
+                "total_bytes": block.total_bytes,
+                "atoms": atoms,
+                "error_kind": block.error_kind,
+                "message": block.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    let bodies = page
+        .bodies
+        .into_iter()
+        .map(|body| {
+            json!({
+                "content_id": body.content_id,
+                "manifest_id": body.manifest_id,
+                "artifact_kind": body.artifact_kind,
+                "state": body.state,
+                "fidelity": body.fidelity,
+                "total_bytes": body.total_bytes,
+                "media_type_b64": body.media_type.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                "content_encoding_b64": body.content_encoding.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                "bytes_b64": body.bytes.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                "error_kind": body.error_kind,
+                "message": body.message,
+                "archive_file_uuid": body.archive_file_uuid,
+                "archive_path": body.archive_path,
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = page.next_cursor.map(|cursor| {
+        json!({
+            "capture_sequence": cursor.capture_sequence,
+            "stage_id": cursor.stage_id,
+        })
+    });
+    serde_json::to_vec(&json!({
+        "trace_id": page.trace_id,
+        "total_stages": page.total_stages,
+        "has_more": page.has_more,
+        "stages_truncated": page.stages_truncated,
+        "next_cursor": next_cursor,
+        "stage_limit": page.stage_limit,
+        "body_byte_budget": page.body_byte_budget,
+        "body_bytes_loaded": page.body_bytes_loaded,
+        "header_byte_budget": page.header_byte_budget,
+        "header_bytes_loaded": page.header_bytes_loaded,
+        "stages": stages,
+        "header_blocks": header_blocks,
+        "bodies": bodies,
+    }))
+    .context("serializing bounded stage content response")
+}
+
+fn parse_stage_content_number<T>(
+    query: &HashMap<String, String>,
+    name: &str,
+    default: T,
+) -> std::result::Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    match query.get(name) {
+        Some(raw) => raw
+            .parse::<T>()
+            .map_err(|_| format!("{name} must be a non-negative integer")),
+        None => Ok(default),
+    }
+}
+
+fn stage_content_error_response(error: &anyhow::Error) -> Response {
+    if let Some(error) = error.downcast_ref::<LarStageContentError>() {
+        let status = match error.code() {
+            "stage_content_trace_not_found" => StatusCode::NOT_FOUND,
+            "stage_content_invalid_request" => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return stage_content_typed_error(status, error.code(), &error.to_string());
+    }
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+}
+
+fn stage_content_typed_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        axum::Json(json!({"error": {"type": code, "message": message}})),
+    )
+        .into_response()
+}
+
 fn replay_error_response(error: &anyhow::Error) -> Response {
     if let Some(unavailable) = error.downcast_ref::<alex_store::LarArchiveUnavailableError>() {
         return replay_typed_error(
@@ -6239,63 +6870,74 @@ async fn tool_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
-    match state.store.get_tool_call(&id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'"))
-        }
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
     let artifact_kind = match kind.as_str() {
         "args" => "tool_arguments",
         "result" => "tool_result",
         _ => return error_response(StatusCode::BAD_REQUEST, "kind must be args or result"),
     };
-    match state
-        .store
-        .read_lar_or_legacy_artifact("tool_call", &id, artifact_kind, None)
+    let store = state.store.clone();
+    let id_for_read = id.clone();
+    match tokio::task::spawn_blocking(move || -> Result<Option<Option<Vec<u8>>>> {
+        if store.get_tool_call(&id_for_read)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(store.read_lar_or_legacy_artifact(
+            "tool_call",
+            &id_for_read,
+            artifact_kind,
+            None,
+        )?))
+    })
+    .await
     {
-        Ok(Some(bytes)) => Response::builder()
+        Ok(Ok(Some(Some(bytes)))) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json; charset=utf-8")
             .body(Body::from(bytes))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-        Ok(None) => error_response(
+        Ok(Ok(Some(None))) => error_response(
             StatusCode::NOT_FOUND,
             &format!("no {kind} body stored for tool call '{id}'"),
         ),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'")),
+        Ok(Err(error)) => body_artifact_error_response(&error),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    use alex_core::translate;
-    let row = match state.store.get_trace(&id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let fmt = row["upstream_format"]
-        .as_str()
-        .or(row["client_format"].as_str())
-        .unwrap_or("");
-    let reply = state
-        .store
-        .read_lar_or_legacy_artifact("trace", &id, "client_response", None)
-        .ok()
-        .flatten()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .and_then(|text| translate::assistant_reply_text(fmt, &text));
-    match reply {
-        Some(md) => Response::builder()
+    let store = state.store.clone();
+    let id_for_read = id.clone();
+    match tokio::task::spawn_blocking(move || -> Result<Option<Option<String>>> {
+        use alex_core::translate;
+        let Some(row) = store.get_trace(&id_for_read)? else {
+            return Ok(None);
+        };
+        let fmt = row["upstream_format"]
+            .as_str()
+            .or(row["client_format"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let reply = store
+            .read_lar_or_legacy_artifact("trace", &id_for_read, "client_response", None)?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .and_then(|text| translate::assistant_reply_text(&fmt, &text));
+        Ok(Some(reply))
+    })
+    .await
+    {
+        Ok(Ok(Some(Some(md)))) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/markdown; charset=utf-8")
             .body(Body::from(md))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-        None => error_response(
+        Ok(Ok(Some(None))) => error_response(
             StatusCode::NOT_FOUND,
             &format!("no assistant reply available for trace '{id}'"),
         ),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Ok(Err(error)) => body_artifact_error_response(&error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -6354,12 +6996,24 @@ async fn traces_run_export(
 ) -> Response {
     let filter = TraceFilter {
         run_id: Some(run_id),
-        limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(5000),
+        limit: q
+            .get("limit")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5_000)
+            .min(5_000),
         ..Default::default()
     };
-    match state.store.search_traces(&filter) {
-        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let inline_bodies = wants_bodies(&q);
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || -> Result<String> {
+        let rows = store.search_traces(&filter)?;
+        ndjson_body(&store, rows, inline_bodies)
+    })
+    .await
+    {
+        Ok(Ok(out)) => ndjson_response(out),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -12643,7 +13297,10 @@ fn finalize_trace_with_lar(
                 error_class: trace.error_class.clone(),
                 error_message: trace.error.clone(),
             };
-            if let Err(error) = store.write_lar_exchange_capture(&exchange, &body_refs) {
+            let metadata = lar_exchange_metadata_capture(&trace);
+            if let Err(error) =
+                store.write_lar_exchange_capture_with_metadata(&exchange, &body_refs, &metadata)
+            {
                 tracing::warn!(
                     trace_id = trace.id,
                     "failed to write live LAR exchange metadata: {error:#}"
@@ -12681,6 +13338,48 @@ fn finalize_trace_with_lar(
             cost = trace.cost_usd,
             "trace recorded"
         );
+    }
+}
+
+fn lar_exchange_metadata_capture(trace: &TraceRecord) -> LarExchangeMetadataCapture {
+    let bytes = |value: &Option<String>| value.as_deref().map(str::as_bytes).map(Vec::from);
+    LarExchangeMetadataCapture {
+        ts_request_ms: Some(trace.ts_request_ms),
+        ts_response_ms: trace.ts_response_ms,
+        harness: bytes(&trace.harness),
+        client_format: bytes(&trace.client_format),
+        upstream_format: bytes(&trace.upstream_format),
+        method: bytes(&trace.method),
+        path: bytes(&trace.path),
+        streamed: trace.streamed,
+        status: trace.status,
+        cost_usd_bits: trace.cost_usd.map(f64::to_bits),
+        billing_bucket: bytes(&trace.billing_bucket),
+        error_kind: bytes(&trace.error_kind),
+        error_code: bytes(&trace.error_code),
+        substituted: trace.substituted,
+        original_model: bytes(&trace.original_model),
+        served_model: bytes(&trace.served_model),
+        substitution_reason: bytes(&trace.substitution_reason),
+        injected: trace.injected,
+        fixture_name: bytes(&trace.fixture_name),
+        attempts_json: bytes(&trace.attempts),
+        original_account_id: bytes(&trace.original_account_id),
+        served_account_id: bytes(&trace.served_account_id),
+        subscription_identity: bytes(&trace.subscription_identity),
+        via_dario: trace.via_dario,
+        dario_generation: bytes(&trace.dario_generation),
+        tags_json: bytes(&trace.tags),
+        client_ip: bytes(&trace.client_ip),
+        key_fingerprint: bytes(&trace.key_fingerprint),
+        reasoning_effort: bytes(&trace.reasoning_effort),
+        thinking_budget: trace.thinking_budget,
+        input_tokens: trace.usage.input_tokens,
+        cached_input_tokens: trace.usage.cached_input_tokens,
+        cache_creation_tokens: trace.usage.cache_creation_tokens,
+        output_tokens: trace.usage.output_tokens,
+        reasoning_tokens: trace.usage.reasoning_tokens,
+        unknown_attributes: Vec::new(),
     }
 }
 
@@ -14903,12 +15602,19 @@ mod tests {
                     session_id: Some("replay-session".into()),
                     run_id: None,
                     wall_time_ns: 1_000_000,
-                    client_request_headers: None,
+                    client_request_headers: Some(LarHeaderCapture::observed([
+                        ("X-Repeat", "one"),
+                        ("X-Repeat", "two"),
+                    ])),
                     client_response_headers: None,
                     upstream_attempts: vec![LarUpstreamAttemptCapture {
                         attempt_number: 1,
                         wall_time_ns: 1_100_000,
-                        request_headers: None,
+                        request_headers: Some(LarHeaderCapture::observed([
+                            ("x-attempt", "one"),
+                            ("x-repeat", "one"),
+                            ("x-repeat", "two"),
+                        ])),
                         response_headers: None,
                         status_code: Some(200),
                         error_class: None,
@@ -14954,6 +15660,104 @@ mod tests {
             .unwrap()
             .to_string();
         let state = test_state_with_store("trace-replay-state", store);
+
+        let unauthenticated = router(state.clone())
+            .oneshot(
+                axum::http::Request::get("/traces/replay-trace/stages/content")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let stage_content = router(state.clone())
+            .oneshot(
+                axum::http::Request::get(
+                    "/traces/replay-trace/stages/content?stage_limit=2&body_byte_budget=16777216&header_byte_budget=2097152",
+                )
+                .header("x-api-key", "alx-local")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, stage_content) = response_json(stage_content).await;
+        assert_eq!(status, StatusCode::OK, "{stage_content}");
+        assert_eq!(stage_content["total_stages"], 5);
+        assert_eq!(stage_content["stages"].as_array().unwrap().len(), 2);
+        assert_eq!(stage_content["has_more"], true);
+        let cursor = &stage_content["next_cursor"];
+        let second_content = router(state.clone())
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/traces/replay-trace/stages/content?stage_limit=64&after_capture_sequence={}&after_stage_id={}",
+                    cursor["capture_sequence"].as_u64().unwrap(),
+                    cursor["stage_id"].as_str().unwrap(),
+                ))
+                .header("x-api-key", "alx-local")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, second_content) = response_json(second_content).await;
+        assert_eq!(status, StatusCode::OK, "{second_content}");
+        assert_eq!(second_content["stages"].as_array().unwrap().len(), 3);
+        assert_eq!(second_content["has_more"], false);
+
+        let full_content = trace_stage_content(
+            State(state.clone()),
+            Path("replay-trace".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, full_content) = response_json(full_content).await;
+        assert_eq!(status, StatusCode::OK, "{full_content}");
+        let client_headers = full_content["header_blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| {
+                block["content_id"] == full_content["stages"][0]["request_headers_content_id"]
+            })
+            .unwrap();
+        assert_eq!(client_headers["atoms"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(client_headers["atoms"][0]["name_b64"].as_str().unwrap())
+                .unwrap(),
+            b"X-Repeat"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(client_headers["atoms"][1]["value_b64"].as_str().unwrap())
+                .unwrap(),
+            b"two"
+        );
+        assert_eq!(
+            full_content["bodies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|body| body["state"] == "available")
+                .count(),
+            1,
+            "the shared upstream/client response manifest is serialized once"
+        );
+
+        let invalid_content = trace_stage_content(
+            State(state.clone()),
+            Path("replay-trace".into()),
+            Query(HashMap::from([("stage_limit".into(), "257".into())])),
+        )
+        .await;
+        let (status, invalid_content) = response_json(invalid_content).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_content["error"]["type"],
+            "stage_content_invalid_request"
+        );
 
         let first = router(state.clone())
             .oneshot(
@@ -15037,6 +15841,55 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{offline}");
         assert_eq!(offline["error"]["type"], "archived_offline");
         assert_eq!(offline["error"]["archive_file_uuid"], archive_file_uuid);
+    }
+
+    #[test]
+    fn stage_content_blocking_serializer_preserves_binary_body_metadata() {
+        use base64::Engine;
+
+        let bytes = serialize_stage_content_page(LarStageContentPage {
+            trace_id: "binary-trace".into(),
+            total_stages: 0,
+            stages_truncated: false,
+            has_more: false,
+            next_cursor: None,
+            stage_limit: 64,
+            body_byte_budget: 16,
+            body_bytes_loaded: 3,
+            header_byte_budget: 16,
+            header_bytes_loaded: 0,
+            stages: Vec::new(),
+            header_blocks: Vec::new(),
+            bodies: vec![alex_store::LarStageArtifactContent {
+                content_id: "body".into(),
+                manifest_id: Some("manifest".into()),
+                artifact_kind: None,
+                state: "available".into(),
+                fidelity: "captured".into(),
+                total_bytes: Some(3),
+                media_type: Some(b"application/octet-stream".to_vec()),
+                content_encoding: Some(vec![0xff, 0x00]),
+                bytes: Some(vec![0x00, 0xff, 0x01]),
+                error_kind: None,
+                message: None,
+                archive_file_uuid: None,
+                archive_path: None,
+            }],
+        })
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["bodies"][0]["bytes_b64"],
+            base64::engine::general_purpose::STANDARD.encode([0x00, 0xff, 0x01])
+        );
+        assert_eq!(
+            value["bodies"][0]["media_type_b64"],
+            base64::engine::general_purpose::STANDARD.encode(b"application/octet-stream")
+        );
+        assert_eq!(
+            value["bodies"][0]["content_encoding_b64"],
+            base64::engine::general_purpose::STANDARD.encode([0xff, 0x00])
+        );
     }
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -20959,6 +21812,364 @@ mod tests {
             "unknown"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ndjson_exports_inline_exact_lar_only_binary_bodies() {
+        use base64::Engine;
+
+        let data_dir = tmpdir("ndjson-lar-only-binary");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let request = vec![0, 255, 1, b'{', b'}'];
+        let upstream = vec![128, 2, 3, 254];
+        let response = vec![b'd', b'a', b't', b'a', 0, 200];
+        let request_write = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("ndjson-binary", "client_request"),
+                "request.json",
+                &request,
+            )
+            .unwrap();
+        let upstream_write = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("ndjson-binary", "upstream_request"),
+                "upstream-request.json",
+                &upstream,
+            )
+            .unwrap();
+        let response_write = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("ndjson-binary", "client_response"),
+                "response.body",
+                &response,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "ndjson-binary".into(),
+                ts_request_ms: 7,
+                run_id: Some("run-binary".into()),
+                req_body_path: Some(request_write.legacy_path.clone()),
+                upstream_req_body_path: Some(upstream_write.legacy_path.clone()),
+                resp_body_path: Some(response_write.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        for path in [
+            request_write.legacy_path,
+            upstream_write.legacy_path,
+            response_write.legacy_path,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+        let state = test_state_with_store("ndjson-lar-only-binary-state", store);
+        let query = HashMap::from([("bodies".into(), "1".into())]);
+
+        for export in [
+            traces_export(State(state.clone()), Query(query.clone())).await,
+            traces_run_export(
+                State(state.clone()),
+                Path("run-binary".into()),
+                Query(query.clone()),
+            )
+            .await,
+        ] {
+            assert_eq!(export.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(export.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let row: Value = serde_json::from_slice(
+                bytes
+                    .split(|byte| *byte == b'\n')
+                    .find(|line| !line.is_empty())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(row["req_body_b64"].as_str().unwrap())
+                    .unwrap(),
+                request
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(row["upstream_req_body_b64"].as_str().unwrap())
+                    .unwrap(),
+                upstream
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(row["resp_body_b64"].as_str().unwrap())
+                    .unwrap(),
+                response
+            );
+            assert!(row["body_errors"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_text_search_reads_an_unindexed_lar_only_body() {
+        let data_dir = tmpdir("fallback-search-lar-only");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("fallback-search", "client_request"),
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"fallback nebula phrase"}]}"#,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "fallback-search".into(),
+                ts_request_ms: 77,
+                req_body_path: Some(written.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(written.legacy_path).unwrap();
+        store.clear_lar_normalized_index().unwrap();
+        let state = test_state_with_store("fallback-search-lar-only-state", store);
+
+        let (status, body) = response_json(
+            traces_search(
+                State(state),
+                Query(HashMap::from([("text".into(), "nebula".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["indexed_matches"], 0);
+        assert_eq!(body["traces"][0]["id"], "fallback-search");
+        assert_eq!(body["body_errors"], json!([]));
+        assert_eq!(body["coverage_complete"], true);
+    }
+
+    #[tokio::test]
+    async fn fallback_text_search_pages_past_300_and_reads_large_bodies() {
+        let data_dir = tmpdir("fallback-search-paged-large");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        config.max_pack_bytes = 16 * 1024 * 1024;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"pagedlargeneedle {}\"}}]}}",
+            "filler ".repeat(700_000)
+        );
+        assert!(body.len() > 4 * 1024 * 1024);
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("fallback-old-large", "client_request"),
+                "request.json",
+                body.as_bytes(),
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "fallback-old-large".into(),
+                ts_request_ms: 1,
+                req_body_path: Some(written.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(written.legacy_path).unwrap();
+        for index in 2..=305 {
+            store
+                .insert_trace(&TraceRecord {
+                    id: format!("newer-{index:03}"),
+                    ts_request_ms: index,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        store.clear_lar_normalized_index().unwrap();
+        let state = test_state_with_store("fallback-search-paged-large-state", store);
+
+        let (status, response) = response_json(
+            traces_search(
+                State(state),
+                Query(HashMap::from([("text".into(), "pagedlargeneedle".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["traces"][0]["id"], "fallback-old-large");
+        assert_eq!(response["scanned"], 305);
+        assert_eq!(response["coverage_complete"], true);
+        assert!(response["body_bytes_read"].as_u64().unwrap() > 4 * 1024 * 1024);
+        assert_eq!(response["coverage_limit_reasons"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn fallback_header_search_uses_allowlist_even_when_index_is_cleared() {
+        let store = Store::open(tmpdir("fallback-safe-headers")).unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "fallback-headers".into(),
+                ts_request_ms: 91,
+                req_headers_json: Some(
+                    r#"{"content-type":"application/fallbacksafeheader","authorization":"Bearer fallbacksecret","x-private":"fallbackprivate"}"#.into(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        store.clear_lar_normalized_index().unwrap();
+        let state = test_state_with_store("fallback-safe-headers-state", store);
+
+        for (query, expected) in [
+            ("fallbacksafeheader", 1usize),
+            ("fallbacksecret", 0),
+            ("fallbackprivate", 0),
+        ] {
+            let (status, response) = response_json(
+                traces_search(
+                    State(state.clone()),
+                    Query(HashMap::from([("text".into(), query.into())])),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["traces"].as_array().unwrap().len(), expected);
+            assert_eq!(response["coverage_complete"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn dario_summary_and_fixture_capture_read_lar_after_gzip_cleanup() {
+        let data_dir = tmpdir("dario-fixture-lar-only");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let dario_request = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("dario-lar-only", "dario_upstream_request"),
+                "dario-upstream-request.json",
+                br#"{"prompt_cache":{"cache_id":"lar-cache"}}"#,
+            )
+            .unwrap();
+        let response_body = br#"{"error":{"message":"captured from lar"}}"#;
+        let response_write = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("dario-lar-only", "client_response"),
+                "response.body",
+                response_body,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "dario-lar-only".into(),
+                ts_request_ms: 88,
+                via_dario: true,
+                upstream_provider: Some("anthropic".into()),
+                status: Some(500),
+                error_kind: Some("http_status_500".into()),
+                resp_body_path: Some(response_write.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(dario_request.legacy_path).unwrap();
+        std::fs::remove_file(response_write.legacy_path).unwrap();
+        let state = test_state_with_store("dario-fixture-lar-only-state", store);
+        set_fixture_dir(&state, tmpdir("dario-fixture-output"));
+
+        let (status, trace) =
+            response_json(trace_get(State(state.clone()), Path("dario-lar-only".into())).await)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{trace}");
+        assert_eq!(
+            trace["extras"]["dario_capture"]["prompt_cache"]["cache_id"],
+            "lar-cache"
+        );
+        assert_eq!(trace["extras"]["dario_capture"]["body_errors"], json!([]));
+
+        let (status, fixture) = response_json(
+            admin_fixture_save(
+                State(state),
+                axum::Json(json!({
+                    "name": "lar-captured",
+                    "from_trace_id": "dario-lar-only",
+                    "kind": "resp",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{fixture}");
+        assert_eq!(fixture["body"].as_str().unwrap().as_bytes(), response_body);
+    }
+
+    #[tokio::test]
+    async fn trace_body_reports_typed_offline_lar_archive() {
+        let data_dir = tmpdir("trace-body-offline-lar");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        config.max_pack_bytes = 1;
+        config.chunker.min_size = 4;
+        config.chunker.target_size = 4;
+        config.chunker.max_size = 4;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("offline-body", "client_request"),
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"offline"}]}"#,
+            )
+            .unwrap();
+        store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("rotate-body", "client_request"),
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"rotate"}]}"#,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "offline-body".into(),
+                ts_request_ms: 99,
+                req_body_path: Some(written.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(written.legacy_path).unwrap();
+        let sealed = store
+            .lar_archive_file_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|file| file.role == "body-pack" && file.catalog_state == "sealed")
+            .unwrap();
+        store.detach_lar_archive(&sealed.file_uuid).unwrap();
+        let state = test_state_with_store("trace-body-offline-lar-state", store);
+
+        let (status, detail) =
+            response_json(trace_get(State(state.clone()), Path("offline-body".into())).await).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["trace"]["id"], "offline-body");
+        assert_eq!(
+            detail["extras"]["body_errors"][0]["kind"],
+            "archived_offline"
+        );
+        assert_eq!(
+            detail["extras"]["body_errors"][0]["archive_file_uuid"],
+            sealed.file_uuid
+        );
+
+        let (status, body) = response_json(
+            trace_body(
+                State(state),
+                Path(("offline-body".into(), "request".into())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["type"], "archived_offline");
+        assert_eq!(body["error"]["archive_file_uuid"], sealed.file_uuid);
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ use serde::Serialize;
 
 use crate::Store;
 
+const MAX_OPEN_GREP_PACKS: usize = 32;
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct LarCatalogGrepMatch {
     pub manifest_id: String,
@@ -62,7 +64,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let manifest_ids = catalog_manifest_ids(&conn, limits.max_manifests)?;
         let mut scanner = RawBodyScanner::new(literal, limits).map_err(anyhow::Error::new)?;
-        let mut readers = HashMap::<PathBuf, File>::new();
+        let mut readers = CatalogFileReaders::new(MAX_OPEN_GREP_PACKS);
         let mut matches = Vec::new();
 
         for manifest_id in manifest_ids {
@@ -215,7 +217,7 @@ fn load_catalog_manifest(conn: &Connection, manifest_id: &str) -> Result<BodyMan
 fn read_catalog_chunk(
     conn: &Connection,
     data_dir: &Path,
-    readers: &mut HashMap<PathBuf, File>,
+    readers: &mut CatalogFileReaders,
     hash: &ChunkHash,
 ) -> alex_lar::Result<Vec<u8>> {
     let (stored_path, frame_offset, uncompressed_length, compressed_length) = conn
@@ -242,14 +244,8 @@ fn read_catalog_chunk(
             ))
         })?;
     let path = resolve_catalog_path(data_dir, &stored_path);
-    if !readers.contains_key(&path) {
-        let file = File::open(&path).map_err(alex_lar::Error::Io)?;
-        readers.insert(path.clone(), file);
-    }
     read_chunk_record_at(
-        readers
-            .get_mut(&path)
-            .ok_or_else(|| alex_lar::Error::Missing(path.display().to_string()))?,
+        readers.file(&path)?,
         &ChunkRecordDescriptor {
             hash: *hash,
             frame_offset,
@@ -258,6 +254,66 @@ fn read_catalog_chunk(
         },
         &Limits::default(),
     )
+}
+
+struct CatalogFileReader {
+    file: File,
+    last_used: u64,
+}
+
+/// Keeps live grep from accumulating one file descriptor for every rotated
+/// pack in a large catalog. Chunk bytes themselves are cached/spilled by
+/// RawBodyScanner; reopening an evicted pack does not decompress a chunk twice.
+struct CatalogFileReaders {
+    entries: HashMap<PathBuf, CatalogFileReader>,
+    max_open: usize,
+    use_clock: u64,
+}
+
+impl CatalogFileReaders {
+    fn new(max_open: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_open: max_open.max(1),
+            use_clock: 0,
+        }
+    }
+
+    fn file(&mut self, path: &Path) -> alex_lar::Result<&mut File> {
+        self.use_clock = self.use_clock.saturating_add(1);
+        if self.entries.contains_key(path) {
+            let entry = self
+                .entries
+                .get_mut(path)
+                .ok_or_else(|| alex_lar::Error::Missing(path.display().to_string()))?;
+            entry.last_used = self.use_clock;
+            return Ok(&mut entry.file);
+        }
+        if self.entries.len() >= self.max_open {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+                .ok_or(alex_lar::Error::Invalid(
+                    "live grep file cache could not select an eviction",
+                ))?;
+            self.entries.remove(&oldest);
+        }
+        let file = File::open(path).map_err(alex_lar::Error::Io)?;
+        self.entries.insert(
+            path.to_path_buf(),
+            CatalogFileReader {
+                file,
+                last_used: self.use_clock,
+            },
+        );
+        Ok(&mut self
+            .entries
+            .get_mut(path)
+            .ok_or_else(|| alex_lar::Error::Missing(path.display().to_string()))?
+            .file)
+    }
 }
 
 fn resolve_catalog_path(data_dir: &Path, stored_path: &str) -> PathBuf {

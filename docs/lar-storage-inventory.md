@@ -81,6 +81,33 @@ physical copy. A catalog repair that would require opening a pre-rotation pack
 larger than the configured pack/index limits stops with an explicit error
 instead of defeating the migration memory ceiling.
 
+The v2 importer appends legacy exchange records, ordered stage timelines, and
+header blocks to those same rolling body packs. Stages reference the already
+validated manifests, including one shared manifest when the client and
+upstream request bytes are identical; there is no second body copy or separate
+event log. An adjacent optional exchange-metadata frame preserves the complete
+non-body SQLite trace record, including exact nullable token values and f64
+cost bits; older readers skip that frame safely. Catalog publication occurs
+only after the combined records are
+synced and reopened successfully, and the exchange receipt plus header/stage
+catalog rows commit in one SQLite transaction. Linked tool rows are merged by
+their captured timestamps. Tools with no surviving trace receive an explicit
+`legacy-tool:<tool-id>` synthetic exchange containing only ToolCall/ToolResult
+stages, so they remain visible rather than disappearing. ToolCall provenance
+retains the harness, turn ID, original legacy trace ID (including a dangling
+ID), tool-call ID, and tool name as bounded, explicitly legacy JSON metadata;
+exit status remains tool metadata and is never fabricated as an HTTP status.
+
+The metadata inventory prefetches manifests, tools, and migration state once
+per bounded page instead of querying per trace. Mixed body pages likewise
+batch both artifact resolution and manifest-to-file lookup, group reads by
+archive, preserve request order, and enforce one reconstructed-byte budget.
+The v2 job namespace is distinct from the old body-only v1 job. During upgrade
+it reuses validated v1 manifest pointers even when cleanup already removed the
+gzip source; a present but changed gzip is re-imported. An active v1 pack that
+cannot express external body references is sealed before v2 metadata is
+appended to a new deterministic pack.
+
 A completed import is not treated as a permanent end marker while legacy mode
 can still create files. On the next run, the importer stats the inventoried
 paths and starts one deterministic migration generation only when it finds a
@@ -153,9 +180,12 @@ These are not all ordinary trace artifacts and require an explicit policy:
 - Trace backup/export creates gzip-compressed tar archives containing SQLite
   rows and body files. LAR-aware backup must include the selected transitive
   manifest/chunk closure instead of copying arbitrary live pack fragments.
-- Cursor/remote trace editing has helper functions that directly rewrite gzip
-  JSON. These paths must move to immutable new manifests; sealed LAR bytes are
-  never updated in place.
+- Cursor/Agent trace reconciliation now compares through the mixed reader and
+  writes content-addressed, immutable gzip fallbacks plus immutable replacement
+  manifests. One transaction switches the trace path and authoritative LAR
+  pointer; a failed LAR append clears the stale pointer and keeps the new gzip
+  readable. Sealed LAR bytes and prior gzip fallbacks are never updated in
+  place.
 
 ## Legacy read paths
 
@@ -177,14 +207,46 @@ validated LAR reference and falls back to the legacy path:
 No caller should need to know whether an artifact is legacy gzip, a live LAR
 manifest, a sealed standalone archive, corrupt, or temporarily offline.
 
+### Proxy read audit (2026-07-20)
+
+The proxy no longer reopens trace body-path columns for NDJSON export or the
+compatibility text scan. Trace and run exports collect one bounded mixed-store
+batch for the page (256 MiB reconstructed-byte ceiling), reuse archive readers
+inside that batch, and perform body I/O, exact binary base64 encoding, and
+NDJSON serialization on a blocking worker. A requested path that is missing,
+truncated, corrupt, or in an offline/missing archive is represented explicitly
+in that trace row's `body_errors`; it is not silently omitted. `/admin/traces`
+is metadata-only, but its bounded list/query work now also runs off the async
+request executor.
+
+Fallback text search requests only artifacts not already covered by the
+normalized index, reads them in one mixed-store batch under a 4 MiB page
+budget, and returns per-artifact `body_errors`. This retains compatibility with
+new/unindexed legacy and LAR bodies without opening their gzip paths in the
+handler.
+
+Trace details, reply extraction, tool body details, and error-fixture capture
+read through the same LAR-first API on blocking workers. Trace metadata detail
+remains a successful response when a cold body archive is detached and embeds
+the typed archive UUID/path in `extras.body_errors`; body-specific endpoints
+return that condition as a typed `503`. Dario summary and raw detail first
+ingest completed preload records, then use the bounded mixed reader. The sole
+production gzip read left in this proxy region is a 64 MiB-bounded compatibility
+fallback for a conventionally named Dario record, and it runs only after the
+catalog reports that artifact as missing; corrupt or oversized fallback data is
+reported explicitly.
+
 ## Header fidelity
 
 Current trace headers live in `req_headers_json` and `resp_headers_json`.
-Capture redacts values before persistence, but JSON object serialization cannot
-prove original order, duplicate fields, casing, or raw HTTP representation.
-Legacy imports therefore receive `legacy_normalized` fidelity. New capture must
-convert the observed header sequence directly into ordered LAR header atoms and
-blocks before reducing it to any map-shaped API view.
+Capture redacts sensitive values before persistence. A legacy ordered pair list
+retains its represented order and duplicate values, but cannot prove original
+HTTP casing (`legacy_casing_unknown`). A JSON object is deterministically
+key-sorted and labeled `legacy_order_and_casing_unknown`; scalar arrays retain
+their duplicate values, but source field order remains unknown. Invalid or
+non-scalar shapes are recorded as explicit unsupported metadata. New capture
+converts the observed header sequence directly into ordered LAR atoms and
+blocks before reducing it to a map-shaped API view.
 
 ## Required migration order
 
@@ -206,7 +268,16 @@ blocks before reducing it to any map-shaped API view.
       routing seam (production remains legacy by default).
 - [x] Completed Dario request/response spool files route through typed,
       cataloged artifact kinds; incomplete files remain retryable.
-- [ ] Direct gzip rewrite helpers create immutable replacement manifests.
+- [x] Cursor/Agent body changes create immutable, content-addressed fallback
+      files and replacement manifests without rewriting prior bytes.
+- [x] Remote trace upload and Cursor/Agent reconciliation read request,
+      upstream-request, and response bodies through the unified mixed reader.
+- [x] Proxy trace/run NDJSON body inlining, fallback text search, trace/reply
+      detail, tool detail, and captured-response fixtures use bounded unified
+      reads with explicit per-artifact or typed archive errors.
+- [x] Dario summaries/details prefer cataloged artifacts after spool ingestion;
+      only an uncataloged convention capture may use the bounded compatibility
+      gzip fallback.
 - [ ] Every gzip read listed above goes through the unified reader.
 - [x] Headers from new captures use ordered blocks; imported headers are
       fidelity-labeled.

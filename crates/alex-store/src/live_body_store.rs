@@ -6,15 +6,16 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{MutexGuard, TryLockError};
+use std::sync::MutexGuard;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alex_lar::{
     read_chunk_record_at, read_file_header, ArchiveReader, ArchiveWriter, BodyManifest,
     CheckpointRecordDescriptor, ChunkHash, ChunkRecordDescriptor, ChunkRef, ChunkerConfig,
-    Exchange, ExchangeData, FileHeader, FrameRead, FrameReader, HeaderAtom, HeaderBlock,
-    HeaderFidelity, Limits, ManifestId, RecordFrame, RecordType, RecoveryStatus, Stage, StageData,
-    StageKind, StreamIndex, StreamRead, StreamingChunker, REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS,
+    Exchange, ExchangeData, ExchangeMetadataData, FileHeader, FrameRead, FrameReader, HeaderAtom,
+    HeaderBlock, HeaderFidelity, Limits, ManifestId, RecordFrame, RecordType, RecoveryStatus,
+    Stage, StageData, StageKind, StreamIndex, StreamRead, StreamingChunker, TokenUsage,
+    REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS,
 };
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
@@ -34,6 +35,47 @@ pub enum LarBodyStoreMode {
     Legacy,
     DualWriteValidated,
     LarWithFallback,
+}
+
+/// Durability boundary used before publishing LAR locations in SQLite.
+///
+/// `Sync` is the conservative default. `Batch` still establishes a durable
+/// file-content boundary before the SQLite commit, but uses a data-only sync
+/// after batching all records for one artifact/exchange. `BestEffort` only
+/// flushes userspace buffers and is therefore restricted to shadow dual-write
+/// mode, where the already-synced gzip body remains authoritative.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LarDurabilityMode {
+    #[default]
+    Sync,
+    Batch,
+    BestEffort,
+}
+
+impl std::str::FromStr for LarDurabilityMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sync" => Ok(Self::Sync),
+            "batch" => Ok(Self::Batch),
+            "best-effort" | "best_effort" | "besteffort" => Ok(Self::BestEffort),
+            other => bail!(
+                "unsupported LAR durability mode '{other}'; expected sync, batch, or best-effort"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for LarDurabilityMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Sync => "sync",
+            Self::Batch => "batch",
+            Self::BestEffort => "best-effort",
+        })
+    }
 }
 
 impl std::str::FromStr for LarBodyStoreMode {
@@ -64,10 +106,14 @@ impl std::fmt::Display for LarBodyStoreMode {
 #[derive(Clone, Debug)]
 pub struct LarBodyStoreConfig {
     pub mode: LarBodyStoreMode,
+    pub durability: LarDurabilityMode,
     pub max_pack_bytes: u64,
     pub max_pack_age: Duration,
     pub checkpoint_bytes: u64,
     pub checkpoint_interval: Duration,
+    /// Emit a contention warning after this wait. Capture is serialized and
+    /// continues waiting; it never silently degrades to gzip-only because this
+    /// threshold elapsed.
     pub writer_lock_timeout: Duration,
     pub chunker: ChunkerConfig,
     pub limits: Limits,
@@ -77,6 +123,7 @@ impl Default for LarBodyStoreConfig {
     fn default() -> Self {
         Self {
             mode: LarBodyStoreMode::Legacy,
+            durability: LarDurabilityMode::Sync,
             max_pack_bytes: 512 * 1024 * 1024,
             max_pack_age: Duration::from_secs(60 * 60),
             checkpoint_bytes: 8 * 1024 * 1024,
@@ -90,6 +137,13 @@ impl Default for LarBodyStoreConfig {
 
 impl LarBodyStoreConfig {
     fn validate(&self) -> Result<()> {
+        if self.mode == LarBodyStoreMode::LarWithFallback
+            && self.durability == LarDurabilityMode::BestEffort
+        {
+            bail!(
+                "best-effort LAR durability is allowed only for legacy or dual-write-validated mode"
+            );
+        }
         if self.max_pack_bytes == 0
             || self.max_pack_age.is_zero()
             || self.checkpoint_bytes == 0
@@ -160,6 +214,26 @@ pub struct LarBodyWriteResult {
     pub lar_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraceBodyPathColumn {
+    ClientRequest,
+    UpstreamRequest,
+    ClientResponse,
+}
+
+impl TraceBodyPathColumn {
+    fn for_artifact(artifact_kind: &str, legacy_kind: &str) -> Result<Self> {
+        match (artifact_kind, legacy_kind) {
+            ("client_request", "request" | "request.json") => Ok(Self::ClientRequest),
+            ("upstream_request", "upstream-request" | "upstream-request.json") => {
+                Ok(Self::UpstreamRequest)
+            }
+            ("client_response", "response" | "response.body") => Ok(Self::ClientResponse),
+            _ => bail!("unsupported trace body replacement pairing: {artifact_kind}/{legacy_kind}"),
+        }
+    }
+}
+
 pub const LAR_HEADER_FLAG_REDACTED: u32 = 1;
 const REDACTED_HEADER_VALUE: &[u8] = b"<redacted>";
 
@@ -191,6 +265,17 @@ impl LarHeaderCapture {
         V: AsRef<[u8]>,
     {
         Self::from_pairs(HeaderFidelity::LegacyOrderAndCasingUnknown, headers)
+    }
+
+    /// Legacy data whose serialized representation retained field order and
+    /// duplicate entries, but cannot prove the original HTTP name casing.
+    pub fn legacy_ordered<I, N, V>(headers: I) -> Self
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        Self::from_pairs(HeaderFidelity::LegacyCasingUnknown, headers)
     }
 
     fn from_pairs<I, N, V>(fidelity: HeaderFidelity, headers: I) -> Self
@@ -387,6 +472,15 @@ fn now_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn persist_lar_boundary(file: &File, durability: LarDurabilityMode) -> Result<()> {
+    match durability {
+        LarDurabilityMode::Sync => file.sync_all(),
+        LarDurabilityMode::Batch => file.sync_data(),
+        LarDurabilityMode::BestEffort => Ok(()),
+    }
+    .with_context(|| format!("persisting {durability} LAR publication boundary"))
+}
+
 /// Flush every publication boundary, but emit a complete derived index only
 /// after a bounded amount of new data or time. Rewriting the full chunk/event
 /// index after every body would make both write cost and archive growth
@@ -405,7 +499,7 @@ fn flush_active_pack(active: &mut ActivePack, config: &LarBodyStoreConfig) -> Re
     } else {
         None
     };
-    active.writer.get_ref().sync_all()?;
+    persist_lar_boundary(active.writer.get_ref(), config.durability)?;
     let size = active.writer.get_mut().seek(std::io::SeekFrom::End(0))?;
     let checkpoint = if let Some(descriptor) = descriptor {
         if descriptor.append_offset != size {
@@ -597,13 +691,62 @@ impl Store {
         legacy_kind: &str,
         bytes: &[u8],
     ) -> Result<LarBodyWriteResult> {
+        self.write_body_artifact_inner(artifact, legacy_kind, bytes, None)
+    }
+
+    /// Replace one existing trace body without ever mutating its previous
+    /// gzip fallback or sealed LAR bytes. The content-addressed gzip copy is
+    /// durable before one SQLite transaction switches both the trace column
+    /// and the authoritative LAR pointer (or clears that pointer on fallback).
+    pub fn replace_trace_body_artifact(
+        &self,
+        trace_id: &str,
+        artifact_kind: &str,
+        legacy_kind: &str,
+        bytes: &[u8],
+    ) -> Result<LarBodyWriteResult> {
+        let path_column = TraceBodyPathColumn::for_artifact(artifact_kind, legacy_kind)?;
+        let exists: bool = self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM traces WHERE id=?1)",
+            [trace_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            bail!("cannot replace body for missing trace {trace_id}");
+        }
+        self.write_body_artifact_inner(
+            &LarBodyArtifact::trace(trace_id, artifact_kind),
+            legacy_kind,
+            bytes,
+            Some(path_column),
+        )
+    }
+
+    fn write_body_artifact_inner(
+        &self,
+        artifact: &LarBodyArtifact,
+        legacy_kind: &str,
+        bytes: &[u8],
+        replacement: Option<TraceBodyPathColumn>,
+    ) -> Result<LarBodyWriteResult> {
         if artifact.owner_id.is_empty() || artifact.artifact_kind.is_empty() {
             bail!("LAR body artifact owner and kind must not be empty");
         }
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let legacy_path =
-            self.write_legacy_body_dated(&date, &artifact.owner_id, legacy_kind, bytes)?;
+        let legacy_path = if replacement.is_some() {
+            self.write_immutable_trace_replacement_body(
+                &date,
+                &artifact.owner_id,
+                legacy_kind,
+                bytes,
+            )?
+        } else {
+            self.write_legacy_body_dated(&date, &artifact.owner_id, legacy_kind, bytes)?
+        };
         if self.lar_body_store_mode() == LarBodyStoreMode::Legacy {
+            if let Some(path_column) = replacement {
+                self.publish_legacy_trace_replacement(artifact, path_column, &legacy_path)?;
+            }
             return Ok(LarBodyWriteResult {
                 legacy_path,
                 manifest_id: None,
@@ -611,31 +754,27 @@ impl Store {
             });
         }
 
-        let deadline = std::time::Instant::now() + self.live_lar_lock_timeout;
-        let mut state = loop {
-            match self.live_lar.try_lock() {
-                Ok(state) => break state,
-                Err(TryLockError::Poisoned(error)) => {
-                    return Ok(LarBodyWriteResult {
-                        legacy_path,
-                        manifest_id: None,
-                        lar_error: Some(format!("LAR writer lock poisoned: {error}")),
-                    });
+        let mut state = match self.lock_live_lar_writer("body", &artifact.owner_id) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(path_column) = replacement {
+                    self.publish_legacy_trace_replacement(artifact, path_column, &legacy_path)?;
                 }
-                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::yield_now();
-                }
-                Err(TryLockError::WouldBlock) => {
-                    return Ok(LarBodyWriteResult {
-                        legacy_path,
-                        manifest_id: None,
-                        lar_error: Some("LAR writer busy; retained legacy fallback".into()),
-                    });
-                }
+                tracing::warn!(
+                    owner_id = artifact.owner_id,
+                    artifact_kind = artifact.artifact_kind,
+                    error = %error,
+                    "live LAR capture unavailable; retaining synced legacy fallback"
+                );
+                return Ok(LarBodyWriteResult {
+                    legacy_path,
+                    manifest_id: None,
+                    lar_error: Some(error.to_string()),
+                });
             }
         };
 
-        match self.write_lar_body_locked(&mut state, artifact, &legacy_path, bytes) {
+        match self.write_lar_body_locked(&mut state, artifact, &legacy_path, bytes, replacement) {
             Ok(manifest_id) => Ok(LarBodyWriteResult {
                 legacy_path,
                 manifest_id: Some(manifest_id.to_string()),
@@ -653,6 +792,9 @@ impl Store {
                     artifact_kind = artifact.artifact_kind,
                     "live LAR write failed; retaining legacy body: {error:#}"
                 );
+                if let Some(path_column) = replacement {
+                    self.publish_legacy_trace_replacement(artifact, path_column, &legacy_path)?;
+                }
                 Ok(LarBodyWriteResult {
                     legacy_path,
                     manifest_id: None,
@@ -660,6 +802,93 @@ impl Store {
                 })
             }
         }
+    }
+
+    fn publish_legacy_trace_replacement(
+        &self,
+        artifact: &LarBodyArtifact,
+        path_column: TraceBodyPathColumn,
+        legacy_path: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        publish_trace_body_path(&tx, &artifact.owner_id, path_column, legacy_path)?;
+        clear_artifact_publication(&tx, artifact)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn lock_live_lar_writer<'a>(
+        &'a self,
+        operation: &'static str,
+        owner_id: &str,
+    ) -> Result<MutexGuard<'a, LiveLarCoordinator>> {
+        let started = std::time::Instant::now();
+        let state = self
+            .live_lar
+            .lock()
+            .map_err(|error| anyhow::anyhow!("LAR writer lock poisoned: {error}"))?;
+        let waited = started.elapsed();
+        if !self.live_lar_contention_warning_after.is_zero()
+            && waited >= self.live_lar_contention_warning_after
+        {
+            tracing::warn!(
+                operation,
+                owner_id,
+                waited_ms = waited.as_millis() as u64,
+                warning_after_ms = self.live_lar_contention_warning_after.as_millis() as u64,
+                "live LAR capture waited for the serialized writer"
+            );
+        }
+        Ok(state)
+    }
+
+    fn write_immutable_trace_replacement_body(
+        &self,
+        date: &str,
+        trace_id: &str,
+        legacy_kind: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let digest = blake3::hash(bytes).to_hex();
+        let dir = self.data_dir.join("bodies").join(date);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{trace_id}.{legacy_kind}.replacement-{digest}.gz"));
+        if path.exists() {
+            verify_immutable_legacy_body(&path, bytes)?;
+            sync_directory(&dir)?;
+            return Ok(path.to_string_lossy().to_string());
+        }
+
+        let sequence = LIVE_PACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(
+            ".{trace_id}.{legacy_kind}.replacement-{digest}.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .with_context(|| format!("creating replacement body {}", temp.display()))?;
+            let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            encoder.write_all(bytes)?;
+            let file = encoder.finish()?;
+            file.sync_all()?;
+            match std::fs::hard_link(&temp, &path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_immutable_legacy_body(&path, bytes)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("publishing immutable replacement body {}", path.display())
+                }),
+            }?;
+            sync_directory(&dir)
+        })();
+        let _ = std::fs::remove_file(&temp);
+        result?;
+        Ok(path.to_string_lossy().to_string())
     }
 
     /// Append the ordered transport metadata for one completed live exchange.
@@ -670,6 +899,22 @@ impl Store {
         capture: &LarExchangeCapture,
         bodies: &LarExchangeBodyRefs,
     ) -> Result<Option<String>> {
+        self.write_lar_exchange_capture_with_metadata(
+            capture,
+            bodies,
+            &ExchangeMetadataData::default(),
+        )
+    }
+
+    /// Append a live exchange plus its bounded, body-free metadata companion.
+    /// The companion is adjacent to the Exchange record so sealed readers can
+    /// find it through the existing exchange index without a new footer kind.
+    pub fn write_lar_exchange_capture_with_metadata(
+        &self,
+        capture: &LarExchangeCapture,
+        bodies: &LarExchangeBodyRefs,
+        metadata: &ExchangeMetadataData,
+    ) -> Result<Option<String>> {
         if self.lar_body_store_mode() == LarBodyStoreMode::Legacy {
             return Ok(None);
         }
@@ -677,19 +922,7 @@ impl Store {
             bail!("LAR exchange trace ID must not be empty");
         }
 
-        let deadline = std::time::Instant::now() + self.live_lar_lock_timeout;
-        let mut state = loop {
-            match self.live_lar.try_lock() {
-                Ok(state) => break state,
-                Err(TryLockError::Poisoned(error)) => {
-                    bail!("LAR writer lock poisoned: {error}")
-                }
-                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::yield_now();
-                }
-                Err(TryLockError::WouldBlock) => bail!("LAR writer busy"),
-            }
-        };
+        let mut state = self.lock_live_lar_writer("exchange", &capture.trace_id)?;
         let result = (|| -> Result<Option<String>> {
             let mut conn = self.conn.lock().unwrap();
             ensure_active_pack(self, &mut state, &mut conn, 0)?;
@@ -698,9 +931,11 @@ impl Store {
                     & REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS
                     == 0
             }) {
+                let durability = state.config.durability;
                 let active = state.active.as_mut().expect("active pack exists");
                 active.writer.seal().map_err(anyhow::Error::new)?;
-                active.writer.get_ref().sync_all()?;
+                active.writer.flush().map_err(anyhow::Error::new)?;
+                persist_lar_boundary(active.writer.get_ref(), durability)?;
                 let size = active.writer.get_mut().seek(std::io::SeekFrom::End(0))?;
                 conn.execute(
                     "UPDATE lar_files SET state='sealed', sealed_at_ms=?2, size_bytes=?3
@@ -887,6 +1122,29 @@ impl Store {
                 .as_deref()
                 .map(str::as_bytes)
                 .map(Vec::from);
+            let usage_present = metadata.input_tokens.is_some()
+                || metadata.output_tokens.is_some()
+                || metadata.cached_input_tokens.is_some()
+                || metadata.reasoning_tokens.is_some();
+            if usage_present {
+                client_response.usage = Some(TokenUsage {
+                    input_tokens: nonnegative_metadata_token(metadata.input_tokens),
+                    output_tokens: nonnegative_metadata_token(metadata.output_tokens),
+                    cached_tokens: nonnegative_metadata_token(metadata.cached_input_tokens),
+                    reasoning_tokens: nonnegative_metadata_token(metadata.reasoning_tokens),
+                });
+            }
+            if let Some(cost) = metadata
+                .cost_usd_bits
+                .map(f64::from_bits)
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            {
+                let nanos = cost * 1_000_000_000.0;
+                if nanos <= u64::MAX as f64 {
+                    client_response.cost_nanos = Some(nanos.round() as u64);
+                    client_response.cost_currency = Some(b"USD".to_vec());
+                }
+            }
             client_response.response_body_manifest_ref =
                 parse_optional_manifest(bodies.client_response_manifest_id.as_deref())?;
             stages.push(writer.append_stage_with_external_manifests(
@@ -906,17 +1164,28 @@ impl Store {
                 .map(str::as_bytes)
                 .map(Vec::from);
             exchange_data.run_id = capture.run_id.as_deref().map(str::as_bytes).map(Vec::from);
-            let exchange_id = writer.append_exchange(Exchange::new(exchange_data))?;
+            let exchange_id = writer
+                .append_exchange_with_metadata(Exchange::new(exchange_data), metadata.clone())?;
             let file_uuid = active.file_uuid.clone();
             let flush = flush_active_pack(active, &checkpoint_config)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             catalog_capture_headers(&tx, &file_uuid, capture, now_ms())?;
+            catalog_capture_exchange(
+                &tx,
+                &file_uuid,
+                &capture.trace_id,
+                &exchange_id.to_string(),
+                capture_sequence,
+                stages.len() as u64,
+                "captured",
+            )?;
             catalog_capture_stages(
                 &tx,
                 &file_uuid,
                 &capture.trace_id,
                 &stages,
                 &active.writer,
+                "captured",
                 now_ms(),
             )?;
             if let Some(session_id) = capture.session_id.as_deref() {
@@ -939,9 +1208,14 @@ impl Store {
             tx.commit()?;
             Ok(Some(exchange_id.to_string()))
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
             state.active = None;
             state.packs_reconciled = false;
+            tracing::warn!(
+                trace_id = capture.trace_id,
+                error = %format_args!("{error:#}"),
+                "live LAR exchange capture failed"
+            );
         }
         result
     }
@@ -967,6 +1241,7 @@ impl Store {
         artifact: &LarBodyArtifact,
         legacy_path: &str,
         bytes: &[u8],
+        replacement: Option<TraceBodyPathColumn>,
     ) -> Result<ManifestId> {
         if bytes.len() as u64 > state.config.limits.max_body_length {
             bail!("body exceeds configured LAR limit");
@@ -997,17 +1272,24 @@ impl Store {
             if reconstructed != bytes {
                 bail!("catalog body identity reconstructed to different bytes");
             }
-            if state.config.mode == LarBodyStoreMode::LarWithFallback {
+            if state.config.mode == LarBodyStoreMode::LarWithFallback || replacement.is_some() {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let published_at_ms = now_ms();
-                publish_artifact(&tx, artifact, legacy_path, &id, published_at_ms)?;
-                crate::lar_fts::index_artifact_bytes(
-                    &tx,
-                    artifact,
-                    &id.to_string(),
-                    bytes,
-                    published_at_ms,
-                )?;
+                if let Some(path_column) = replacement {
+                    publish_trace_body_path(&tx, &artifact.owner_id, path_column, legacy_path)?;
+                }
+                if state.config.mode == LarBodyStoreMode::LarWithFallback {
+                    publish_artifact(&tx, artifact, legacy_path, &id, published_at_ms)?;
+                    crate::lar_fts::index_artifact_bytes(
+                        &tx,
+                        artifact,
+                        &id.to_string(),
+                        bytes,
+                        published_at_ms,
+                    )?;
+                } else if replacement.is_some() {
+                    clear_artifact_publication(&tx, artifact)?;
+                }
                 tx.commit()?;
             }
             return Ok(id);
@@ -1135,6 +1417,11 @@ impl Store {
                 bytes,
                 published_at_ms,
             )?;
+        } else if replacement.is_some() {
+            clear_artifact_publication(&tx, artifact)?;
+        }
+        if let Some(path_column) = replacement {
+            publish_trace_body_path(&tx, &artifact.owner_id, path_column, legacy_path)?;
         }
         tx.commit()?;
         Ok(manifest.id)
@@ -1414,7 +1701,13 @@ fn body_manifest_ids(bodies: &LarExchangeBodyRefs) -> Result<Vec<ManifestId>> {
     Ok(ids)
 }
 
-fn append_capture_header(
+fn nonnegative_metadata_token(value: Option<i64>) -> u64 {
+    value
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn append_capture_header(
     writer: &mut ArchiveWriter<File>,
     capture: Option<&LarHeaderCapture>,
 ) -> Result<Option<alex_lar::HeaderBlockId>> {
@@ -1457,7 +1750,7 @@ fn header_atom_id(atom: &HeaderAtom) -> String {
     hash.finalize().to_hex().to_string()
 }
 
-fn catalog_capture_headers(
+pub(crate) fn catalog_capture_headers(
     conn: &Connection,
     file_uuid: &str,
     capture: &LarExchangeCapture,
@@ -1468,20 +1761,24 @@ fn catalog_capture_headers(
             continue;
         }
         let block = HeaderBlock::new(captured.fidelity, captured.atoms.clone());
-        let fidelity = match captured.fidelity {
-            HeaderFidelity::Exact | HeaderFidelity::LegacyCasingUnknown => "observed_ordered",
-            HeaderFidelity::LegacyOrderUnknown | HeaderFidelity::LegacyOrderAndCasingUnknown => {
-                "legacy_normalized"
+        let (fidelity, fidelity_detail) = match captured.fidelity {
+            HeaderFidelity::Exact => ("observed_ordered", "exact"),
+            HeaderFidelity::LegacyOrderUnknown => ("legacy_normalized", "legacy_order_unknown"),
+            HeaderFidelity::LegacyCasingUnknown => ("observed_ordered", "legacy_casing_unknown"),
+            HeaderFidelity::LegacyOrderAndCasingUnknown => {
+                ("legacy_normalized", "legacy_order_and_casing_unknown")
             }
         };
         conn.execute(
             "INSERT INTO lar_header_blocks
-               (block_id, fidelity, atom_count, file_uuid, record_id, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?1, ?5)
-             ON CONFLICT(block_id) DO NOTHING",
+               (block_id, fidelity, fidelity_detail, atom_count, file_uuid, record_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?1, ?6)
+             ON CONFLICT(block_id) DO UPDATE SET
+               fidelity_detail=COALESCE(lar_header_blocks.fidelity_detail, excluded.fidelity_detail)",
             params![
                 block.id.to_string(),
                 fidelity,
+                fidelity_detail,
                 block.atoms.len() as u64,
                 file_uuid,
                 created_at_ms
@@ -1513,36 +1810,37 @@ fn catalog_capture_headers(
     Ok(())
 }
 
-fn stage_kind_name(kind: StageKind) -> &'static str {
+fn stage_kind_name(kind: StageKind) -> String {
     match kind {
-        StageKind::ClientRequest => "client_request",
-        StageKind::NormalizedRequest => "normalized_request",
-        StageKind::RouterDecision => "router_decision",
-        StageKind::RetryDecision => "retry_decision",
-        StageKind::FailoverDecision => "failover_decision",
-        StageKind::UpstreamRequest => "upstream_request",
-        StageKind::UpstreamResponse => "upstream_response",
-        StageKind::UpstreamFailure => "upstream_failure",
-        StageKind::ClientResponse => "client_response",
-        StageKind::ClientTrailers => "client_trailers",
-        StageKind::ToolCall => "tool_call",
-        StageKind::ToolResult => "tool_result",
-        StageKind::AuthRefresh => "auth_refresh",
-        StageKind::AccountRouting => "account_routing",
-        StageKind::DarioRequest => "dario_request",
-        StageKind::DarioResponse => "dario_response",
-        StageKind::InjectedResponse => "injected_response",
-        StageKind::Cancellation => "cancellation",
-        StageKind::Unknown(_) => "unknown",
+        StageKind::ClientRequest => "client_request".into(),
+        StageKind::NormalizedRequest => "normalized_request".into(),
+        StageKind::RouterDecision => "router_decision".into(),
+        StageKind::RetryDecision => "retry_decision".into(),
+        StageKind::FailoverDecision => "failover_decision".into(),
+        StageKind::UpstreamRequest => "upstream_request".into(),
+        StageKind::UpstreamResponse => "upstream_response".into(),
+        StageKind::UpstreamFailure => "upstream_failure".into(),
+        StageKind::ClientResponse => "client_response".into(),
+        StageKind::ClientTrailers => "client_trailers".into(),
+        StageKind::ToolCall => "tool_call".into(),
+        StageKind::ToolResult => "tool_result".into(),
+        StageKind::AuthRefresh => "auth_refresh".into(),
+        StageKind::AccountRouting => "account_routing".into(),
+        StageKind::DarioRequest => "dario_request".into(),
+        StageKind::DarioResponse => "dario_response".into(),
+        StageKind::InjectedResponse => "injected_response".into(),
+        StageKind::Cancellation => "cancellation".into(),
+        StageKind::Unknown(code) => format!("unknown:{code}"),
     }
 }
 
-fn catalog_capture_stages(
+pub(crate) fn catalog_capture_stages(
     conn: &Connection,
     file_uuid: &str,
     trace_id: &str,
     stage_ids: &[alex_lar::StageId],
     writer: &ArchiveWriter<File>,
+    fidelity: &str,
     created_at_ms: i64,
 ) -> Result<()> {
     for (sequence, stage_id) in stage_ids.iter().enumerate() {
@@ -1558,7 +1856,7 @@ fn catalog_capture_stages(
                 response_body_manifest_ref, trailers_ref, stream_index_ref,
                 file_uuid, record_id, fidelity)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?1, 'captured')
+                     ?13, ?14, ?1, ?15)
              ON CONFLICT(stage_id) DO NOTHING",
             params![
                 stage_id.to_string(),
@@ -1575,6 +1873,7 @@ fn catalog_capture_stages(
                 data.trailers_ref.map(|id| id.to_string()),
                 data.stream_index_ref.map(|id| id.to_string()),
                 file_uuid,
+                fidelity,
             ],
         )?;
         for manifest_id in [
@@ -1596,6 +1895,56 @@ fn catalog_capture_stages(
     Ok(())
 }
 
+pub(crate) fn catalog_capture_exchange(
+    conn: &Connection,
+    file_uuid: &str,
+    trace_id: &str,
+    exchange_id: &str,
+    capture_sequence: u64,
+    stage_count: u64,
+    fidelity: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO lar_exchange_records
+           (trace_id, exchange_id, capture_sequence, stage_count, file_uuid, fidelity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(trace_id) DO NOTHING",
+        params![
+            trace_id,
+            exchange_id,
+            capture_sequence,
+            stage_count,
+            file_uuid,
+            fidelity,
+        ],
+    )?;
+    let stored: (String, i64, i64, String, String) = conn.query_row(
+        "SELECT exchange_id, capture_sequence, stage_count, file_uuid, fidelity
+           FROM lar_exchange_records WHERE trace_id=?1",
+        [trace_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let expected = (
+        exchange_id.to_string(),
+        i64::try_from(capture_sequence).context("exchange capture sequence exceeds SQLite")?,
+        i64::try_from(stage_count).context("exchange stage count exceeds SQLite")?,
+        file_uuid.to_string(),
+        fidelity.to_string(),
+    );
+    if stored != expected {
+        bail!("trace {trace_id} is already bound to a different LAR exchange");
+    }
+    Ok(())
+}
+
 fn ensure_active_pack(
     store: &Store,
     state: &mut LiveLarCoordinator,
@@ -1603,6 +1952,7 @@ fn ensure_active_pack(
     projected_bytes: u64,
 ) -> Result<()> {
     let current_ms = now_ms();
+    let durability = state.config.durability;
     if let Some(active) = state.active.as_mut() {
         let size = active.writer.get_mut().seek(std::io::SeekFrom::End(0))?;
         let age = current_ms.saturating_sub(active.created_at_ms) as u64;
@@ -1612,7 +1962,8 @@ fn ensure_active_pack(
             return Ok(());
         }
         active.writer.seal().map_err(anyhow::Error::new)?;
-        active.writer.get_ref().sync_all()?;
+        active.writer.flush().map_err(anyhow::Error::new)?;
+        persist_lar_boundary(active.writer.get_ref(), durability)?;
         let size = active.writer.get_mut().seek(std::io::SeekFrom::End(0))?;
         conn.execute(
             "UPDATE lar_files SET state='sealed', sealed_at_ms=?2, size_bytes=?3
@@ -1710,7 +2061,8 @@ fn seal_pack_path(path: &Path, config: &LarBodyStoreConfig) -> Result<u64> {
     let mut writer = ArchiveWriter::open_append(file, config.chunker, config.limits.clone())
         .map_err(anyhow::Error::new)?;
     writer.seal().map_err(anyhow::Error::new)?;
-    writer.get_ref().sync_all()?;
+    writer.flush().map_err(anyhow::Error::new)?;
+    persist_lar_boundary(writer.get_ref(), config.durability)?;
     Ok(writer.get_mut().seek(std::io::SeekFrom::End(0))?)
 }
 
@@ -2634,6 +2986,77 @@ fn publish_artifact(
     Ok(())
 }
 
+fn verify_immutable_legacy_body(path: &Path, expected: &[u8]) -> Result<()> {
+    let file = File::open(path)
+        .with_context(|| format!("opening immutable replacement body {}", path.display()))?;
+    let mut decoder = GzDecoder::new(file);
+    let mut actual = Vec::new();
+    decoder
+        .read_to_end(&mut actual)
+        .with_context(|| format!("reading immutable replacement body {}", path.display()))?;
+    if actual != expected {
+        bail!(
+            "content-addressed replacement body {} contains different bytes",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("opening replacement body directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing replacement body directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn publish_trace_body_path(
+    conn: &Connection,
+    trace_id: &str,
+    path_column: TraceBodyPathColumn,
+    legacy_path: &str,
+) -> Result<()> {
+    let changed = match path_column {
+        TraceBodyPathColumn::ClientRequest => conn.execute(
+            "UPDATE traces SET req_body_path=?2 WHERE id=?1",
+            params![trace_id, legacy_path],
+        )?,
+        TraceBodyPathColumn::UpstreamRequest => conn.execute(
+            "UPDATE traces SET upstream_req_body_path=?2 WHERE id=?1",
+            params![trace_id, legacy_path],
+        )?,
+        TraceBodyPathColumn::ClientResponse => conn.execute(
+            "UPDATE traces SET resp_body_path=?2 WHERE id=?1",
+            params![trace_id, legacy_path],
+        )?,
+    };
+    if changed != 1 {
+        bail!("trace {trace_id} disappeared during body replacement");
+    }
+    Ok(())
+}
+
+fn clear_artifact_publication(conn: &Connection, artifact: &LarBodyArtifact) -> Result<()> {
+    crate::lar_fts::clear_artifact_index(conn, artifact)?;
+    conn.execute(
+        "DELETE FROM lar_trace_artifacts
+         WHERE owner_kind=?1 AND owner_id=?2 AND artifact_kind=?3 AND stage_id=?4",
+        params![
+            artifact.owner_kind.as_str(),
+            artifact.owner_id,
+            artifact.artifact_kind,
+            artifact.stage_id.as_deref().unwrap_or(""),
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2657,6 +3080,7 @@ mod tests {
     fn config(max_pack_bytes: u64) -> LarBodyStoreConfig {
         LarBodyStoreConfig {
             mode: LarBodyStoreMode::DualWriteValidated,
+            durability: LarDurabilityMode::Sync,
             max_pack_bytes,
             max_pack_age: Duration::from_secs(3600),
             checkpoint_bytes: 1024 * 1024,
@@ -2703,6 +3127,191 @@ mod tests {
             })
             .unwrap();
         assert_eq!(pointers, 0, "dual-write remains a shadow mode");
+    }
+
+    #[test]
+    fn contended_captures_wait_for_manifests_and_exchange_metadata() {
+        const CAPTURES: usize = 8;
+        let root = tmpdir("contended-captures");
+        let mut settings = config(16 * 1024 * 1024);
+        settings.mode = LarBodyStoreMode::LarWithFallback;
+        // This used to mean "fall back immediately when busy". It now only
+        // disables slow-wait warnings; capture always waits for the writer.
+        settings.writer_lock_timeout = Duration::ZERO;
+        let store = Arc::new(Store::open_with_lar_body_store(root.clone(), settings).unwrap());
+
+        let writer_guard = store.live_lar.lock().unwrap();
+        let mut threads = Vec::new();
+        for index in 0..CAPTURES {
+            let store = Arc::clone(&store);
+            threads.push(std::thread::spawn(move || {
+                let trace_id = format!("contended-trace-{index}");
+                let body = format!(r#"{{"turn":{index},"message":"capture"}}"#);
+                let body_result = store
+                    .write_body_artifact(
+                        &LarBodyArtifact::trace(&trace_id, "client_request"),
+                        "request.json",
+                        body.as_bytes(),
+                    )
+                    .unwrap();
+                assert!(body_result.lar_error.is_none());
+                let manifest_id = body_result
+                    .manifest_id
+                    .expect("contended body must receive a LAR manifest");
+                let capture = LarExchangeCapture {
+                    trace_id: trace_id.clone(),
+                    session_id: Some(format!("contended-session-{index}")),
+                    run_id: Some("contended-run".into()),
+                    wall_time_ns: 1_000 + index as u64,
+                    client_request_headers: None,
+                    client_response_headers: None,
+                    upstream_attempts: Vec::new(),
+                    upstream_stream_reads: None,
+                    provider: Some("test".into()),
+                    requested_model: Some("test/model".into()),
+                    routed_model: Some("test/model".into()),
+                    account_id: None,
+                    routing_reason: None,
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                };
+                let metadata = ExchangeMetadataData {
+                    harness: Some(b"contention-test".to_vec()),
+                    input_tokens: Some(index as i64),
+                    ..Default::default()
+                };
+                let exchange_id = store
+                    .write_lar_exchange_capture_with_metadata(
+                        &capture,
+                        &LarExchangeBodyRefs {
+                            client_request_manifest_id: Some(manifest_id.clone()),
+                            ..Default::default()
+                        },
+                        &metadata,
+                    )
+                    .unwrap()
+                    .expect("contended exchange must receive a LAR record");
+                (trace_id, manifest_id, exchange_id, metadata)
+            }));
+        }
+
+        // Every worker has completed its durable gzip write and reached (or is
+        // about to reach) the deliberately held LAR writer before it is
+        // released. This makes the contention regression deterministic.
+        let body_dir = root
+            .join("bodies")
+            .join(chrono::Utc::now().format("%Y-%m-%d").to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (0..CAPTURES).any(|index| {
+            !body_dir
+                .join(format!("contended-trace-{index}.request.json.gz"))
+                .is_file()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workers did not reach the contended LAR boundary"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(writer_guard);
+
+        let captures = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let archive_path: String;
+        {
+            let conn = store.conn.lock().unwrap();
+            let manifests: i64 = conn
+                .query_row("SELECT COUNT(*) FROM lar_trace_artifacts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(manifests, CAPTURES as i64);
+            let stages: i64 = conn
+                .query_row("SELECT COUNT(*) FROM lar_stage_records", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(stages, (CAPTURES * 3) as i64);
+            archive_path = conn
+                .query_row(
+                    "SELECT path FROM lar_files WHERE state='active' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        }
+        let reader =
+            ArchiveReader::open(File::open(archive_path).unwrap(), Limits::default()).unwrap();
+        for (trace_id, manifest_id, exchange_id, expected_metadata) in captures {
+            let exchange = reader
+                .exchange_by_trace(trace_id.as_bytes())
+                .expect("contended exchange must be readable");
+            assert_eq!(exchange.id.to_string(), exchange_id);
+            let metadata = reader
+                .exchange_metadata_by_trace(trace_id.as_bytes())
+                .expect("contended exchange metadata must be readable");
+            assert_eq!(metadata.data, expected_metadata);
+            assert!(matches!(
+                store
+                    .lar_artifact_location("trace", &trace_id, "client_request", None)
+                    .unwrap(),
+                Some(crate::LarArtifactLocation::Lar { manifest_id: ref id, .. })
+                    if id == &manifest_id
+            ));
+        }
+    }
+
+    #[test]
+    fn durability_modes_parse_and_keep_authoritative_writes_safe() {
+        assert_eq!(
+            "sync".parse::<LarDurabilityMode>().unwrap(),
+            LarDurabilityMode::Sync
+        );
+        assert_eq!(
+            "batch".parse::<LarDurabilityMode>().unwrap(),
+            LarDurabilityMode::Batch
+        );
+        assert_eq!(
+            "best-effort".parse::<LarDurabilityMode>().unwrap(),
+            LarDurabilityMode::BestEffort
+        );
+        assert!("eventually".parse::<LarDurabilityMode>().is_err());
+
+        let mut unsafe_settings = config(1 << 20);
+        unsafe_settings.mode = LarBodyStoreMode::LarWithFallback;
+        unsafe_settings.durability = LarDurabilityMode::BestEffort;
+        let error = Store::open_with_lar_body_store(
+            tmpdir("best-effort-authoritative-rejected"),
+            unsafe_settings,
+        )
+        .err()
+        .expect("authoritative best-effort mode must be rejected");
+        assert!(format!("{error:#}").contains("best-effort LAR durability"));
+
+        let mut batch_settings = config(1 << 20);
+        batch_settings.mode = LarBodyStoreMode::LarWithFallback;
+        batch_settings.durability = LarDurabilityMode::Batch;
+        let store =
+            Store::open_with_lar_body_store(tmpdir("batch-durable"), batch_settings).unwrap();
+        let result = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("batch-trace", "client_request"),
+                "request.json",
+                b"batch body",
+            )
+            .unwrap();
+        assert!(result.lar_error.is_none());
+        assert!(result.manifest_id.is_some());
+        assert_eq!(
+            store
+                .read_lar_or_legacy_artifact("trace", "batch-trace", "client_request", None,)
+                .unwrap()
+                .unwrap(),
+            b"batch body"
+        );
     }
 
     #[test]
@@ -3024,6 +3633,259 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fallback, replacement.legacy_path);
+    }
+
+    #[test]
+    fn legacy_trace_replacement_is_versioned_immutable_and_idempotent() {
+        let store = Store::open(tmpdir("legacy-immutable-replacement")).unwrap();
+        let old_path = store
+            .write_body("trace-legacy-replace", "request.json", b"old bytes")
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "trace-legacy-replace".into(),
+                ts_request_ms: 1,
+                req_body_path: Some(old_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let first = store
+            .replace_trace_body_artifact(
+                "trace-legacy-replace",
+                "client_request",
+                "request.json",
+                b"replacement bytes",
+            )
+            .unwrap();
+        assert!(first.manifest_id.is_none());
+        assert!(first.legacy_path.contains(".replacement-"));
+        assert_ne!(first.legacy_path, old_path);
+        assert!(Path::new(&old_path).is_file());
+        let before = std::fs::metadata(&first.legacy_path).unwrap();
+
+        let repeated = store
+            .replace_trace_body_artifact(
+                "trace-legacy-replace",
+                "client_request",
+                "request.json",
+                b"replacement bytes",
+            )
+            .unwrap();
+        assert_eq!(repeated.legacy_path, first.legacy_path);
+        let after = std::fs::metadata(&repeated.legacy_path).unwrap();
+        assert_eq!(before.len(), after.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+        }
+        assert_eq!(
+            store
+                .read_lar_or_legacy_artifact(
+                    "trace",
+                    "trace-legacy-replace",
+                    "client_request",
+                    None,
+                )
+                .unwrap()
+                .unwrap(),
+            b"replacement bytes"
+        );
+        assert!(store
+            .replace_trace_body_artifact(
+                "missing-trace",
+                "client_request",
+                "request.json",
+                b"never published",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("missing trace"));
+    }
+
+    #[test]
+    fn failed_lar_trace_replacement_clears_stale_pointer_and_search_coverage() {
+        let mut settings = config(1 << 20);
+        settings.mode = LarBodyStoreMode::LarWithFallback;
+        let store =
+            Store::open_with_lar_body_store(tmpdir("failed-replacement-fallback"), settings)
+                .unwrap();
+        let artifact = LarBodyArtifact::trace("trace-failed-replace", "client_response");
+        let initial = store
+            .write_body_artifact(
+                &artifact,
+                "response.body",
+                br#"{"choices":[{"message":{"content":"old searchable text"}}]}"#,
+            )
+            .unwrap();
+        let initial_manifest = initial.manifest_id.clone().unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "trace-failed-replace".into(),
+                ts_request_ms: 1,
+                resp_body_path: Some(initial.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let indexed_before: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM lar_normalized_artifact_state
+                 WHERE owner_kind='trace' AND owner_id='trace-failed-replace'
+                   AND artifact_kind='client_response'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_before, 1);
+
+        store.inject_lar_disk_full_before_append_once();
+        let failed = store
+            .replace_trace_body_artifact(
+                "trace-failed-replace",
+                "client_response",
+                "response.body",
+                br#"{"choices":[{"message":{"content":"new fallback text"}}]}"#,
+            )
+            .unwrap();
+        assert!(failed.manifest_id.is_none());
+        assert!(failed
+            .lar_error
+            .as_deref()
+            .unwrap()
+            .contains("storage-full"));
+        assert_ne!(failed.legacy_path, initial.legacy_path);
+        assert!(Path::new(&initial.legacy_path).is_file());
+        assert!(matches!(
+            store
+                .lar_artifact_location(
+                    "trace",
+                    "trace-failed-replace",
+                    "client_response",
+                    None,
+                )
+                .unwrap(),
+            Some(crate::LarArtifactLocation::Legacy { ref path, .. })
+                if path == &failed.legacy_path
+        ));
+        assert_eq!(
+            store
+                .read_lar_or_legacy_artifact(
+                    "trace",
+                    "trace-failed-replace",
+                    "client_response",
+                    None,
+                )
+                .unwrap()
+                .unwrap(),
+            br#"{"choices":[{"message":{"content":"new fallback text"}}]}"#
+        );
+        let conn = store.conn.lock().unwrap();
+        let stale_pointer: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lar_trace_artifacts
+                 WHERE owner_kind='trace' AND owner_id='trace-failed-replace'
+                   AND artifact_kind='client_response'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lar_normalized_artifact_state
+                 WHERE owner_kind='trace' AND owner_id='trace-failed-replace'
+                   AND artifact_kind='client_response'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_manifest: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lar_manifests WHERE manifest_id=?1 AND state='ready'",
+                [initial_manifest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_pointer, 0);
+        assert_eq!(stale_index, 0);
+        assert_eq!(
+            old_manifest, 1,
+            "sealed/cataloged old manifests stay immutable"
+        );
+    }
+
+    #[test]
+    fn dual_write_replacement_keeps_new_lar_shadow_but_serves_versioned_legacy() {
+        let data_dir = tmpdir("dual-write-replacement");
+        let artifact = LarBodyArtifact::trace("trace-dual-replace", "client_request");
+        let mut initial_settings = config(1 << 20);
+        initial_settings.mode = LarBodyStoreMode::LarWithFallback;
+        let initial_store =
+            Store::open_with_lar_body_store(data_dir.clone(), initial_settings).unwrap();
+        let initial = initial_store
+            .write_body_artifact(&artifact, "request.json", b"old request")
+            .unwrap();
+        initial_store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "trace-dual-replace".into(),
+                ts_request_ms: 1,
+                req_body_path: Some(initial.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        drop(initial_store);
+
+        let mut dual_settings = config(1 << 20);
+        dual_settings.mode = LarBodyStoreMode::DualWriteValidated;
+        let store = Store::open_with_lar_body_store(data_dir, dual_settings).unwrap();
+        assert!(matches!(
+            store
+                .lar_artifact_location("trace", "trace-dual-replace", "client_request", None,)
+                .unwrap(),
+            Some(crate::LarArtifactLocation::Lar { .. })
+        ));
+        let replacement = store
+            .replace_trace_body_artifact(
+                "trace-dual-replace",
+                "client_request",
+                "request.json",
+                b"dual shadow replacement",
+            )
+            .unwrap();
+        assert!(replacement.manifest_id.is_some());
+        assert!(matches!(
+            store
+                .lar_artifact_location(
+                    "trace",
+                    "trace-dual-replace",
+                    "client_request",
+                    None,
+                )
+                .unwrap(),
+            Some(crate::LarArtifactLocation::Legacy { ref path, .. })
+                if path == &replacement.legacy_path
+        ));
+        assert_eq!(
+            store
+                .read_lar_or_legacy_artifact("trace", "trace-dual-replace", "client_request", None,)
+                .unwrap()
+                .unwrap(),
+            b"dual shadow replacement"
+        );
+        let shadow_ready: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM lar_manifests WHERE manifest_id=?1 AND state='ready'",
+                [replacement.manifest_id.unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shadow_ready, 1);
     }
 
     #[test]

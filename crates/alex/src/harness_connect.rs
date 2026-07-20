@@ -5671,6 +5671,7 @@ mod tests {
             dario_probe_model: crate::default_dario_probe_model(),
             trace_body_retention_days: crate::default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_durability: alex_store::LarDurabilityMode::Sync,
             lar_migration_batch_size: crate::default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,

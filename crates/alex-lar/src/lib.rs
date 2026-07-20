@@ -6,6 +6,7 @@ mod archive;
 mod chunker;
 mod conversation;
 mod event;
+mod exchange_metadata;
 mod format;
 mod index;
 mod model;
@@ -28,6 +29,9 @@ pub use conversation::{
 pub use event::{
     Exchange, ExchangeData, ExchangeId, ParsedFrame, Stage, StageData, StageId, StageKind,
     StreamFrameKind, StreamIndex, StreamIndexId, StreamParser, StreamRead, TokenUsage,
+};
+pub use exchange_metadata::{
+    ExchangeMetadata, ExchangeMetadataData, UnknownExchangeMetadataAttribute,
 };
 pub use format::{
     read_file_header, write_file_header, DictionaryDescriptor, FileHeader, FileRole, FrameRead,

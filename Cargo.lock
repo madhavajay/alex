@@ -98,6 +98,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -142,6 +143,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "sha2",
+ "tempfile",
  "zstd",
 ]
 

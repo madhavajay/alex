@@ -28,6 +28,32 @@ Set the mode in `config.toml` or for one daemon process with
 `ALEXANDRIA_LAR_BODY_STORE`. Invalid values fail startup rather than silently
 selecting another mode.
 
+## Durability and concurrent capture
+
+`lar_durability` controls the boundary completed before a LAR location is
+published in SQLite:
+
+| Durability | Boundary | Allowed modes |
+| --- | --- | --- |
+| `sync` | Flush the complete body/exchange record group and call a full file sync before the SQLite commit. | all; default |
+| `batch` | Flush the complete body/exchange record group and call one data-only sync before the SQLite commit. | all |
+| `best-effort` | Flush userspace buffers without a disk sync. The synced gzip remains authoritative. | `legacy`, `dual-write-validated` only |
+
+`best-effort` is rejected with `lar-with-fallback`: an authoritative SQLite
+pointer is never published without a durable LAR boundary. `batch` means one
+sync for all records produced by a single capture; it does not leave a queue of
+published but unsynced captures. In implementation terms, `sync` calls
+`sync_all`, `batch` calls `sync_data`, and `best-effort` performs no file-sync
+call after the writer flush. Pack seal/rotation uses the same selected boundary;
+explicit archive publication paths that require stronger atomicity still sync
+the file and parent directory independently.
+
+Set the value in `config.toml` or override one daemon process with
+`ALEXANDRIA_LAR_DURABILITY`. Live body and exchange appends share one serialized
+writer. Concurrent captures wait for it; crossing the contention-warning
+threshold emits a warning but does not silently discard the LAR copy or its
+exchange metadata.
+
 ## Before enabling writes
 
 Stop the daemon for the offline backup command, then retain the resulting file
@@ -168,9 +194,54 @@ alex lar repack apply --min-garbage-ratio 0.25 --json
 ```
 
 Interrupted runs are resumed with `gc resume RUN_ID` or
-`repack resume RUN_ID`. Repack copies reachable chunks, verifies the
-replacement, switches catalog locations atomically, and only then moves the
-source to quarantine. It never edits a sealed source in place.
+`repack resume RUN_ID`. Repack currently selects sealed chunk-only packs: it
+copies reachable chunks, verifies the replacement, switches catalog locations
+atomically, and only then moves the source to quarantine. Combined packs that
+also contain manifests, headers, stream indexes, stages, exchanges, exchange
+metadata, or conversation records are deliberately ineligible until repack can
+rewrite and switch their complete canonical graph. It never edits a sealed
+source in place.
+
+Selection is intentionally conservative: a source must be a clean sealed body
+pack under Alex's managed LAR directory, contain no non-chunk canonical records,
+and have no catalog-owned manifests, header blocks, stages, or migration
+destinations. The apply transaction rechecks those conditions before switching
+chunk locations. Logical GC and physical reclamation are distinct; the old pack
+is quarantined after the switch rather than permanently deleted.
+
+## Standalone export and import
+
+For an already-cataloged LAR trace, `alex lar export --format lar` copies the
+complete record closure: authoritative ordered stages, duplicate-preserving
+headers/trailers, referenced logical bodies in self-contained destination
+manifests/chunks, stream timing/index data, existing exchange metadata, and the
+turn's conversation entries, raw ranges, response entries, generation, and
+ancestor generations. For an older LAR exchange without a companion, supported
+metadata fields are derived from the current trace row. An offline or
+inconsistent LAR source is an error. Only a truly legacy-only trace uses the
+declared legacy-fidelity synthesis path.
+
+The exporter writes to a unique sibling temporary file, syncs and seals it,
+and reopens it to verify the clean footer and every body. Without `--force`, it
+publishes through an atomic no-clobber sibling hard-link, so a racing creator is
+not overwritten. Forced replacement uses atomic rename on Unix; platforms that
+cannot replace by rename may remove the old destination first. It syncs the
+parent directory on Unix and never holds the complete
+output archive in memory. Current body copying reconstructs
+one artifact before immediately chunking it into the destination, so peak body
+memory is bounded by the largest single artifact rather than by the complete
+session. Writer indexes/record metadata and selected-trace metadata still scale
+with the selected archive, subject to format limits. The separate trace backup
+builder still materializes its embedded LAR before packaging.
+
+Import accepts only a regular, clean, sealed standalone file with no required
+external body references. Before its single catalog transaction it verifies
+the whole-file identity, chunks, all reconstructed manifests, stages, headers,
+streams, ExchangeMetadata, and conversation graph, then confirms the source did
+not change during validation. Publication preserves generation ancestry and
+turn/session evidence, rejects conflicting IDs or cycles, and is idempotent.
+Import body validation streams verified chunks to a sink. Parsed canonical
+record/index state still scales with the archive within the configured limits.
 
 For a damaged standalone/active file, inspect first:
 

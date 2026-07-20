@@ -521,6 +521,293 @@ private struct TraceStreamReplayView: View {
     }
 }
 
+/// Lazily loads the bounded, byte-safe stage-content endpoint. The endpoint's
+/// body/header tables are content-addressed, so retries that share bytes do not
+/// inflate either the response or this view's retained state.
+private struct TraceStageContentInspectorView: View {
+    let traceId: String
+    let client: AlexandriaClient?
+
+    @State private var expanded = false
+    @State private var page: TraceStageContentPage?
+    @State private var loading = false
+    @State private var errorMessage: String?
+    @State private var loadGeneration: UInt64 = 0
+    @State private var loadTask: Task<Void, Never>?
+    @State private var headerAtomLimits: [String: Int] = [:]
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let page {
+                    Text("\(page.stages.count) of \(page.totalStages) stages · \(page.bodyBytesLoaded) body bytes · \(page.headerBytesLoaded) header bytes")
+                        .font(AlexTheme.Fonts.mono(9))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .textSelection(.enabled)
+                    ForEach(page.stages) { stage in
+                        stageCard(stage, page: page)
+                    }
+                    if page.hasMore, let cursor = page.nextCursor {
+                        Button {
+                            beginLoad(after: cursor)
+                        } label: {
+                            if loading {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Load more stages")
+                            }
+                        }
+                        .controlSize(.small)
+                        .disabled(loading)
+                    }
+                } else if loading {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading captured stage bytes…")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let errorMessage {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(errorMessage)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                        Button("Retry") { beginLoad(after: page?.nextCursor) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "shippingbox")
+                    .foregroundStyle(AlexTheme.Colors.primary)
+                Text("Captured stage content")
+                    .font(.system(size: 11, weight: .medium))
+            }
+        }
+        .onChange(of: expanded) { _, isExpanded in
+            if isExpanded, page == nil, !loading {
+                beginLoad(after: nil)
+            }
+        }
+        .task(id: traceId) {
+            loadGeneration &+= 1
+            loadTask?.cancel()
+            loadTask = nil
+            page = nil
+            headerAtomLimits = [:]
+            errorMessage = nil
+            loading = false
+            if expanded { beginLoad(after: nil) }
+        }
+        .onDisappear {
+            loadGeneration &+= 1
+            loadTask?.cancel()
+            loadTask = nil
+            loading = false
+        }
+    }
+
+    @ViewBuilder
+    private func stageCard(
+        _ stage: TraceStageContentRecord, page: TraceStageContentPage
+    ) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 7) {
+                if let comparison = TraceStageContentComparisons.comparison(for: stage, in: page) {
+                    Text("vs \(comparison.previousLabel): \(comparison.facts.joined(separator: " · "))")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .textSelection(.enabled)
+                }
+                capturedHeaders("Request headers", stage.requestHeadersContentId, page: page)
+                capturedBody("Request body", stage.requestBodyContentId, page: page)
+                capturedHeaders("Response headers", stage.responseHeadersContentId, page: page)
+                capturedBody("Response body", stage.responseBodyContentId, page: page)
+                capturedHeaders("Trailers", stage.trailersContentId, page: page)
+                if !stage.limitations.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Legacy limitations")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.orange)
+                        ForEach(stage.limitations, id: \.self) { limitation in
+                            Text("• \(limitation)")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("\(stage.captureSequence + 1)")
+                    .font(AlexTheme.Fonts.mono(9))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .frame(width: 24, alignment: .trailing)
+                Text(stageLabel(stage))
+                    .font(.system(size: 10, weight: .medium))
+                Spacer(minLength: 4)
+                Text(stage.fidelity)
+                    .font(AlexTheme.Fonts.mono(8.5))
+                    .foregroundStyle(
+                        stage.fidelity == "captured"
+                            ? AlexTheme.Colors.textTertiary : Color.orange)
+            }
+        }
+        .padding(7)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(AlexTheme.Colors.muted.opacity(0.14)))
+    }
+
+    @ViewBuilder
+    private func capturedHeaders(
+        _ title: String, _ contentId: String?, page: TraceStageContentPage
+    ) -> some View {
+        if let contentId, let block = page.headerBlock(contentId) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(title) · \(block.fidelity ?? "unknown")")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                if block.state == "available" {
+                    let visibleCount = TraceStageHeaderRendering.visibleCount(
+                        total: block.atoms.count,
+                        requested: headerAtomLimits[block.contentId])
+                    ForEach(Array(block.atoms.prefix(visibleCount))) { atom in
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text("\(atom.ordinal + 1).")
+                                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                            Text(TraceStageContentDisplay.headerBytes(atom.nameBytes))
+                                .foregroundStyle(AlexTheme.Colors.primary)
+                            Text(":")
+                            Text(TraceStageContentDisplay.headerBytes(atom.valueBytes))
+                            if atom.flags != 0 {
+                                Text("flags=\(atom.flags)")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        .font(AlexTheme.Fonts.mono(9))
+                        .textSelection(.enabled)
+                    }
+                    if visibleCount < block.atoms.count {
+                        Button("Show next \(min(TraceStageHeaderRendering.increment, block.atoms.count - visibleCount)) of \(block.atoms.count) fields") {
+                            headerAtomLimits[block.contentId] =
+                                TraceStageHeaderRendering.nextVisibleCount(
+                                    total: block.atoms.count, current: visibleCount)
+                        }
+                        .controlSize(.small)
+                    }
+                } else {
+                    unavailableLine(state: block.state, message: block.message)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func capturedBody(
+        _ title: String, _ contentId: String?, page: TraceStageContentPage
+    ) -> some View {
+        if let contentId, let body = page.bodyContent(contentId) {
+            VStack(alignment: .leading, spacing: 3) {
+                let total = body.totalBytes.map { String($0) } ?? "?"
+                let mediaType = TraceStageContentDisplay.headerBytes(body.mediaTypeBytes)
+                let encoding = TraceStageContentDisplay.headerBytes(body.contentEncodingBytes)
+                Text("\(title) · \(body.fidelity) · \(total) bytes")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                if body.mediaTypeBytes != nil || body.contentEncodingBytes != nil {
+                    Text("media \(body.mediaTypeBytes == nil ? "—" : mediaType) · encoding \(body.contentEncodingBytes == nil ? "—" : encoding)")
+                        .font(AlexTheme.Fonts.mono(8.5))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .textSelection(.enabled)
+                }
+                if body.state == "available" {
+                    let display = TraceStageContentDisplay.body(body.bytes)
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(display.text)
+                            .font(AlexTheme.Fonts.mono(9))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    .frame(maxHeight: 180)
+                    if display.omitted > 0 {
+                        Text("Display capped; \(display.omitted) loaded bytes omitted")
+                            .font(.system(size: 8.5))
+                            .foregroundStyle(.orange)
+                    }
+                } else {
+                    unavailableLine(state: body.state, message: body.message)
+                    if let path = body.archivePath {
+                        Text(path)
+                            .font(AlexTheme.Fonts.mono(8.5))
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+
+    private func unavailableLine(state: String, message: String?) -> some View {
+        Text([state, message].compactMap(\.self).joined(separator: " · "))
+            .font(.system(size: 9))
+            .foregroundStyle(.orange)
+            .textSelection(.enabled)
+    }
+
+    private func stageLabel(_ stage: TraceStageContentRecord) -> String {
+        let base = stage.kind.replacingOccurrences(of: "_", with: " ")
+        return stage.attemptNumber.map { "\(base) #\($0)" } ?? base
+    }
+
+    @MainActor
+    private func beginLoad(after cursor: TraceStageContentCursor?) {
+        guard !loading else { return }
+        guard let client else {
+            errorMessage = "The daemon client is unavailable."
+            return
+        }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let requestTraceId = traceId
+        loadTask?.cancel()
+        loading = true
+        errorMessage = nil
+        loadTask = Task { @MainActor in
+            do {
+                try Task.checkCancellation()
+                let incoming = try await client.traceStageContent(
+                    traceId: requestTraceId, after: cursor)
+                try Task.checkCancellation()
+                guard TraceStageContentLoad.shouldApply(
+                    requestTraceId: requestTraceId,
+                    incomingTraceId: incoming.traceId,
+                    generation: generation,
+                    currentGeneration: loadGeneration,
+                    isCancelled: Task.isCancelled)
+                else { return }
+                page = TraceStageContentPaging.merge(existing: page, incoming: incoming)
+                loading = false
+                loadTask = nil
+            } catch is CancellationError {
+                guard generation == loadGeneration else { return }
+                loading = false
+                loadTask = nil
+            } catch {
+                guard generation == loadGeneration, !Task.isCancelled else { return }
+                errorMessage = error.localizedDescription
+                loading = false
+                loadTask = nil
+            }
+        }
+    }
+}
+
 struct TraceInspectorView: View {
     let traceId: String
     @Bindable var model: TraceBrowserModel
@@ -795,6 +1082,8 @@ struct TraceInspectorView: View {
         endpointBlock(trace)
         overview(trace)
         transportTimeline
+        TraceStageContentInspectorView(traceId: traceId, client: model.detailClient())
+            .id("stage-content|\(traceId)")
         if let extras = response.extras, extras.hasAny {
             section(
                 "Extras",

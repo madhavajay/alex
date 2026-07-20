@@ -1,4 +1,6 @@
-//! Verified copy/switch/retire compaction for immutable LAR body packs.
+//! Verified copy/switch/retire compaction for immutable, chunk-only LAR body
+//! packs. Canonical combined packs are intentionally excluded until their
+//! complete record graph can be rewritten and switched atomically.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -249,6 +251,40 @@ fn reachable_hashes_for_file(conn: &Connection, file_uuid: &str) -> Result<BTree
         .collect()
 }
 
+/// The v1 repack writer below rewrites chunk frames only. A live/import pack
+/// may also own manifests and canonical trace metadata. Retiring one of those
+/// packs after moving only its chunks would leave catalog pointers and replay
+/// indexes aimed at the quarantined source. Keep such packs authoritative
+/// until repack has a graph-preserving canonical-record rewrite.
+fn has_non_chunk_canonical_records<R: std::io::Read + std::io::Seek>(
+    conn: &Connection,
+    file_uuid: &str,
+    reader: &ArchiveReader<R>,
+) -> Result<bool> {
+    let catalog_references_source: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM lar_manifests WHERE file_uuid=?1
+             UNION ALL
+             SELECT 1 FROM lar_header_blocks WHERE file_uuid=?1
+             UNION ALL
+             SELECT 1 FROM lar_stage_records WHERE file_uuid=?1
+             UNION ALL
+             SELECT 1 FROM lar_migration_items WHERE destination_file_uuid=?1
+         )",
+        [file_uuid],
+        |row| row.get(0),
+    )?;
+    Ok(catalog_references_source
+        || reader.manifest_count() != 0
+        || reader.header_block_count() != 0
+        || reader.stream_index_count() != 0
+        || reader.stage_count() != 0
+        || reader.exchange_count() != 0
+        || reader.conversation_entry_count() != 0
+        || reader.generation_count() != 0
+        || reader.turn_view_count() != 0)
+}
+
 fn inspect_candidate(
     data_dir: &Path,
     conn: &Connection,
@@ -263,6 +299,9 @@ fn inspect_candidate(
     let mut reader =
         ArchiveReader::open(File::open(path)?, Limits::default()).map_err(anyhow::Error::new)?;
     if !reader.is_sealed() || reader.recovery_status() != RecoveryStatus::Clean {
+        return Ok(None);
+    }
+    if has_non_chunk_canonical_records(conn, file_uuid, &reader)? {
         return Ok(None);
     }
     let reachable = reachable_hashes_for_file(conn, file_uuid)?;
@@ -544,8 +583,9 @@ impl Store {
         Ok(candidates)
     }
 
-    /// Select one eligible sealed pack, commit its exact reachable chunk set,
-    /// and copy it to a new sealed pack. No catalog location changes here.
+    /// Select one eligible sealed chunk-only pack, commit its exact reachable
+    /// chunk set, and copy it to a new sealed pack. No catalog location changes
+    /// here.
     pub fn start_lar_repack(
         &self,
         config: &LarRepackConfig,
@@ -805,6 +845,22 @@ impl Store {
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source_reader = ArchiveReader::open(
+            File::open(&run.source_path).with_context(|| {
+                format!(
+                    "reopening source pack {} for final metadata check",
+                    run.source_path.display()
+                )
+            })?,
+            Limits::default(),
+        )
+        .map_err(anyhow::Error::new)?;
+        if has_non_chunk_canonical_records(&tx, &run.source_file_uuid, &source_reader)? {
+            bail!(
+                "source LAR pack gained canonical non-chunk references during repack; \
+                 the chunk-only replacement was not published"
+            );
+        }
         let current_hashes = reachable_hashes_for_file(&tx, &run.source_file_uuid)?;
         if current_hashes != planned_hashes {
             bail!("LAR reachability changed during repack; the copied pack was not published");
@@ -1346,5 +1402,50 @@ mod tests {
             seeded.source_file_uuid
         );
         assert_eq!(seeded.manifest_id.len(), 64);
+    }
+
+    #[test]
+    fn final_recheck_refuses_new_non_chunk_catalog_ownership() {
+        let store = Store::open(tmpdir("final-metadata-recheck")).unwrap();
+        let seeded = seed_pack(&store);
+        let copied = store.start_lar_repack(&config(), 60).unwrap().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE lar_manifests SET file_uuid=?2, record_id=?3
+                  WHERE manifest_id=?1",
+                params![
+                    &seeded.manifest_id,
+                    &seeded.source_file_uuid,
+                    format!("manifest:{}", seeded.manifest_id),
+                ],
+            )
+            .unwrap();
+        }
+
+        let error = store.switch_lar_repack(&copied.run_id, 61).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("canonical non-chunk references"),
+            "unexpected error: {error:#}"
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT file_uuid FROM lar_chunks WHERE chunk_hash=?1",
+                [seeded.reachable_hash.digest.as_slice()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            seeded.source_file_uuid
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM lar_files WHERE file_uuid=?1",
+                [seeded.source_file_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "sealed"
+        );
     }
 }

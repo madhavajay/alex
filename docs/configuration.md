@@ -25,6 +25,7 @@ dario_mode_migrated = true
 dario_api_key = "<redacted-dario-key>"
 trace_body_retention_days = 30
 lar_body_store_mode = "legacy"
+lar_durability = "sync"
 lar_migration_batch_size = 32
 trace_row_retention_days = 0
 update_check_hours = 24
@@ -85,6 +86,7 @@ for a stable build.
 | `dario_probe_model` | string | `claude-haiku-4-5` | Tiny through-Dario readiness model. |
 | `trace_body_retention_days` | integer | `30` | Gzip body/header retention window. |
 | `lar_body_store_mode` | string | `legacy` | Body-store rollout mode: `legacy`, shadow-only `dual-write-validated`, or `lar-with-fallback`. Experimental modes retain gzip rollback copies. Shadow mode disables automatic startup import so it cannot publish owner pointers; manual import remains explicit. |
+| `lar_durability` | string | `sync` | LAR publication durability: full `sync`, per-capture data-only `batch`, or shadow-only `best-effort`. `best-effort` is rejected with authoritative `lar-with-fallback` mode. |
 | `lar_migration_batch_size` | integer | `32` | Maximum legacy artifacts attempted in one startup migration pass; valid range `1..=4096`. |
 | `trace_row_retention_days` | integer | `0` | SQLite trace-row retention; `0` means unlimited. |
 | `update_check_hours` | integer | `24` | Release check interval; `0` disables. |
@@ -273,6 +275,7 @@ launchd, and Dario-child variables are omitted.
 | --- | --- |
 | `ALEXANDRIA_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
 | `ALEXANDRIA_LAR_BODY_STORE` | Daemon-only override for `lar_body_store_mode`; invalid values fail startup instead of silently changing storage behavior. |
+| `ALEXANDRIA_LAR_DURABILITY` | Daemon-only override for `lar_durability`; accepts `sync`, `batch`, or `best-effort`. Invalid values fail startup. |
 | `ALEXANDRIA_URL` | Remote `alex connect`/`alex up` base URL. |
 | `ALEXANDRIA_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
 | `ALEXANDRIA_RUN_ID` | Caller-selected wrap run ID. |

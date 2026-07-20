@@ -292,6 +292,10 @@ pub enum RecordType {
     ConversationEntry,
     Generation,
     TurnView,
+    /// Optional exchange/transport attributes that are not part of the stable
+    /// content-addressed Exchange encoding. It is emitted as a standalone
+    /// frame so v1 readers can skip it safely.
+    ExchangeMetadata,
     Unknown(u16),
 }
 impl RecordType {
@@ -311,6 +315,7 @@ impl RecordType {
             Self::ConversationEntry => 12,
             Self::Generation => 13,
             Self::TurnView => 14,
+            Self::ExchangeMetadata => 15,
             Self::Unknown(value) => value,
         }
     }
@@ -332,6 +337,7 @@ impl From<u16> for RecordType {
             12 => Self::ConversationEntry,
             13 => Self::Generation,
             14 => Self::TurnView,
+            15 => Self::ExchangeMetadata,
             other => Self::Unknown(other),
         }
     }

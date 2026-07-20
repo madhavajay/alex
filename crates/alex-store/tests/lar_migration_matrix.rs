@@ -218,6 +218,9 @@ fn restart_at_every_committed_import_boundary_converges_exactly_once() {
         LarLegacyImportBoundary::BodyAppended,
         LarLegacyImportBoundary::BodyValidated,
         LarLegacyImportBoundary::PointerSwitched,
+        LarLegacyImportBoundary::MetadataAppended,
+        LarLegacyImportBoundary::MetadataValidated,
+        LarLegacyImportBoundary::MetadataPublished,
         LarLegacyImportBoundary::JobCompleted,
     ];
     for boundary in boundaries {
@@ -307,10 +310,25 @@ fn restart_at_every_committed_import_boundary_converges_exactly_once() {
                 );
                 assert_eq!(lease_owner.as_deref(), Some(owner.as_str()));
             }
+            LarLegacyImportBoundary::MetadataAppended
+            | LarLegacyImportBoundary::MetadataValidated => {
+                assert_eq!(
+                    (job_state.as_str(), manifests, pointers, migrated_items),
+                    ("running", 1, 1, 1)
+                );
+                assert_eq!(lease_owner.as_deref(), Some(owner.as_str()));
+            }
+            LarLegacyImportBoundary::MetadataPublished => {
+                assert_eq!(
+                    (job_state.as_str(), manifests, pointers, migrated_items),
+                    ("running", 1, 1, 2)
+                );
+                assert_eq!(lease_owner.as_deref(), Some(owner.as_str()));
+            }
             LarLegacyImportBoundary::JobCompleted => {
                 assert_eq!(
                     (job_state.as_str(), manifests, pointers, migrated_items),
-                    ("complete", 1, 1, 1)
+                    ("complete", 1, 1, 2)
                 );
                 assert_eq!(lease_owner, None);
             }
@@ -366,7 +384,7 @@ fn restart_at_every_committed_import_boundary_converges_exactly_once() {
                 },
             )
             .unwrap();
-        assert_eq!(state, ("complete".into(), None, 0, 1, 0));
+        assert_eq!(state, ("complete".into(), None, 0, 2, 0));
         let pointers: i64 = catalog
             .query_row(
                 "SELECT COUNT(*) FROM lar_trace_artifacts
@@ -479,7 +497,8 @@ fn failed_validation_reads_legacy_then_repaired_source_retries_successfully() {
     let states = catalog
         .prepare(
             "SELECT state, validation_state FROM lar_migration_items
-             WHERE owner_id='fallback-trace' ORDER BY created_at_ms, item_id",
+             WHERE owner_id='fallback-trace' AND artifact_kind='client_request'
+             ORDER BY created_at_ms, item_id",
         )
         .unwrap()
         .query_map([], |row| {

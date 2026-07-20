@@ -113,7 +113,12 @@ struct CatalogManifest {
 #[derive(Debug)]
 struct MigratedItem {
     id: String,
+    artifact_kind: String,
     destination_manifest_id: Option<String>,
+    destination_exchange_id: Option<String>,
+    destination_file_uuid: Option<String>,
+    metadata_stage_count: i64,
+    metadata_header_count: i64,
     source_length: Option<i64>,
     source_hash_algorithm: Option<String>,
     source_hash: Option<Vec<u8>>,
@@ -252,7 +257,9 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             let mut item_statement = conn.prepare(
-                "SELECT item_id, destination_manifest_id, source_length,
+                "SELECT item_id, artifact_kind, destination_manifest_id,
+                        destination_exchange_id, destination_file_uuid,
+                        metadata_stage_count, metadata_header_count, source_length,
                         source_hash_algorithm, source_hash
                    FROM lar_migration_items
                   WHERE state='migrated' AND validation_state='validated'
@@ -262,10 +269,15 @@ impl Store {
                 .query_map([], |row| {
                     Ok(MigratedItem {
                         id: row.get(0)?,
-                        destination_manifest_id: row.get(1)?,
-                        source_length: row.get(2)?,
-                        source_hash_algorithm: row.get(3)?,
-                        source_hash: row.get(4)?,
+                        artifact_kind: row.get(1)?,
+                        destination_manifest_id: row.get(2)?,
+                        destination_exchange_id: row.get(3)?,
+                        destination_file_uuid: row.get(4)?,
+                        metadata_stage_count: row.get(5)?,
+                        metadata_header_count: row.get(6)?,
+                        source_length: row.get(7)?,
+                        source_hash_algorithm: row.get(8)?,
+                        source_hash: row.get(9)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -298,6 +310,7 @@ impl Store {
             .map(|manifest| (manifest.id.as_str(), manifest))
             .collect::<HashMap<_, _>>();
         let mut reconstructed = HashMap::<String, (u64, Vec<u8>)>::new();
+        let mut exchange_records = HashMap::<(String, String), (usize, usize, bool)>::new();
         let mut known_files = HashSet::new();
 
         for catalog_file in files {
@@ -485,6 +498,28 @@ impl Store {
                     ),
                 }
             }
+            for exchange_id in reader.exchange_ids() {
+                let Some(exchange) = reader.exchange(exchange_id) else {
+                    continue;
+                };
+                let mut header_refs = 0usize;
+                for stage_id in &exchange.data.stages {
+                    if let Some(stage) = reader.stage(stage_id) {
+                        header_refs = header_refs
+                            .saturating_add(usize::from(stage.data.request_headers_ref.is_some()))
+                            .saturating_add(usize::from(stage.data.response_headers_ref.is_some()))
+                            .saturating_add(usize::from(stage.data.trailers_ref.is_some()));
+                    }
+                }
+                exchange_records.insert(
+                    (catalog_file.uuid.clone(), exchange_id.to_string()),
+                    (
+                        exchange.data.stages.len(),
+                        header_refs,
+                        reader.exchange_metadata(exchange_id).is_some(),
+                    ),
+                );
+            }
         }
 
         for manifest in &manifests {
@@ -551,6 +586,61 @@ impl Store {
         }
 
         for item in migrated_items {
+            if item.artifact_kind == "exchange_metadata" {
+                let Some(exchange_id) = item.destination_exchange_id.as_deref() else {
+                    issue(
+                        &mut report.issues,
+                        "migration_item",
+                        &item.id,
+                        "missing_exchange_destination",
+                        "validated metadata item has no destination exchange",
+                    );
+                    continue;
+                };
+                let Some(file_uuid) = item.destination_file_uuid.as_deref() else {
+                    issue(
+                        &mut report.issues,
+                        "migration_item",
+                        &item.id,
+                        "missing_exchange_file",
+                        "validated metadata item has no destination file",
+                    );
+                    continue;
+                };
+                let Some((stage_count, header_count, has_metadata)) =
+                    exchange_records.get(&(file_uuid.to_string(), exchange_id.to_string()))
+                else {
+                    issue(
+                        &mut report.issues,
+                        "migration_item",
+                        &item.id,
+                        "unverified_exchange_destination",
+                        format!("exchange {exchange_id} was not found in file {file_uuid}"),
+                    );
+                    continue;
+                };
+                if usize::try_from(item.metadata_stage_count).ok() != Some(*stage_count)
+                    || usize::try_from(item.metadata_header_count).ok() != Some(*header_count)
+                {
+                    issue(
+                        &mut report.issues,
+                        "migration_item",
+                        &item.id,
+                        "exchange_metadata_mismatch",
+                        "catalog stage/header counts differ from the archived exchange",
+                    );
+                }
+                if !has_metadata {
+                    issue(
+                        &mut report.issues,
+                        "migration_item",
+                        &item.id,
+                        "missing_exchange_metadata",
+                        "legacy metadata receipt points to an exchange without its companion record",
+                    );
+                }
+                continue;
+            }
             let Some(manifest_id) = item.destination_manifest_id.as_deref() else {
                 issue(
                     &mut report.issues,
@@ -636,7 +726,7 @@ mod tests {
         assert_eq!(verified.files_checked, 1);
         assert_eq!(verified.manifests_checked, 1);
         assert_eq!(verified.artifacts_checked, 1);
-        assert_eq!(verified.migrated_items_checked, 1);
+        assert_eq!(verified.migrated_items_checked, 2);
         assert!(verified.checksum_matches());
         let serialized = serde_json::to_value(&verified).unwrap();
         assert_eq!(
