@@ -313,17 +313,10 @@ jobs:
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alex" \
             "$RUNNER_TEMP/alex-cli-x86_64/bin/alexandria"
           do
+            codesign --remove-signature "$bin" 2>/dev/null || true
             codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
-
-      - name: Clean up CLI signing keychain
-        if: always() && steps.cli_signing.outputs.available == 'true'
-        uses: ./.github/actions/mac-signing-keychain
-        with:
-          cleanup: "true"
-          keychain: ${{ steps.signing_keychain.outputs.keychain }}
-          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Package CLI binaries
         run: |
@@ -337,8 +330,31 @@ jobs:
 
           tar -C "$RUNNER_TEMP/alex-cli-aarch64/bin" -czf "$artifact_dir/$arm_asset" alex alexandria
           tar -C "$RUNNER_TEMP/alex-cli-x86_64/bin" -czf "$artifact_dir/$intel_asset" alex alexandria
+
+          verify_root="$RUNNER_TEMP/alex-cli-archive-verify"
+          rm -rf "$verify_root"
+          mkdir -p "$verify_root/aarch64" "$verify_root/x86_64"
+          tar -xzf "$artifact_dir/$arm_asset" -C "$verify_root/aarch64"
+          tar -xzf "$artifact_dir/$intel_asset" -C "$verify_root/x86_64"
+          for bin in \
+            "$verify_root/aarch64/alex" \
+            "$verify_root/aarch64/alexandria" \
+            "$verify_root/x86_64/alex" \
+            "$verify_root/x86_64/alexandria"
+          do
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+
           shasum -a 256 "$artifact_dir/$arm_asset" > "$artifact_dir/$arm_asset.sha256"
           shasum -a 256 "$artifact_dir/$intel_asset" > "$artifact_dir/$intel_asset.sha256"
+
+      - name: Clean up CLI signing keychain
+        if: always() && steps.cli_signing.outputs.available == 'true'
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          cleanup: "true"
+          keychain: ${{ steps.signing_keychain.outputs.keychain }}
+          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Upload to GitHub Release
         env:

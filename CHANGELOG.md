@@ -7,6 +7,15 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29-beta.10] - 2026-07-20
+
+### Fixed
+- **macOS CLI archives preserve a valid code signature.** Release jobs now sign
+  fresh staging copies after removing the linker signature, extract the
+  finished archives onto new inodes, and verify every packaged `alex` and
+  `alexandria` binary before upload. The same guard protects beta and stable
+  releases.
+
 ## [0.1.29-beta.9] - 2026-07-20
 
 ### Added

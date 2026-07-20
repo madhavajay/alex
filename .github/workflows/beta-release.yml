@@ -242,6 +242,17 @@ jobs:
           signing_certificate_p12_data: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
           signing_certificate_password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
 
+      - name: Prepare CLI signing payloads
+        run: |
+          set -euo pipefail
+          arm_root="$RUNNER_TEMP/alex-cli-release-aarch64"
+          intel_root="$RUNNER_TEMP/alex-cli-release-x86_64"
+          rm -rf "$arm_root" "$intel_root"
+          mkdir -p "$arm_root" "$intel_root"
+          cp target/release/alex target/release/alexandria "$arm_root/"
+          cp target/x86_64-apple-darwin/release/alex \
+            target/x86_64-apple-darwin/release/alexandria "$intel_root/"
+
       - name: Sign CLI binaries
         if: steps.cli_signing.outputs.available == 'true'
         env:
@@ -249,22 +260,15 @@ jobs:
         run: |
           set -euo pipefail
           for bin in \
-            target/release/alex \
-            target/release/alexandria \
-            target/x86_64-apple-darwin/release/alex \
-            target/x86_64-apple-darwin/release/alexandria
+            "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
+            "$RUNNER_TEMP/alex-cli-release-aarch64/alexandria" \
+            "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
+            "$RUNNER_TEMP/alex-cli-release-x86_64/alexandria"
           do
+            codesign --remove-signature "$bin" 2>/dev/null || true
             codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
-
-      - name: Clean up CLI signing keychain
-        if: always() && steps.cli_signing.outputs.available == 'true'
-        uses: ./.github/actions/mac-signing-keychain
-        with:
-          cleanup: "true"
-          keychain: ${{ steps.signing_keychain.outputs.keychain }}
-          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Package CLI binaries
         run: |
@@ -273,10 +277,33 @@ jobs:
           mkdir -p dist
           arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
           intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
-          tar -C target/release -czf "dist/$arm_asset" alex alexandria
-          tar -C target/x86_64-apple-darwin/release -czf "dist/$intel_asset" alex alexandria
+          tar -C "$RUNNER_TEMP/alex-cli-release-aarch64" -czf "dist/$arm_asset" alex alexandria
+          tar -C "$RUNNER_TEMP/alex-cli-release-x86_64" -czf "dist/$intel_asset" alex alexandria
+
+          verify_root="$RUNNER_TEMP/alex-cli-archive-verify"
+          rm -rf "$verify_root"
+          mkdir -p "$verify_root/aarch64" "$verify_root/x86_64"
+          tar -xzf "dist/$arm_asset" -C "$verify_root/aarch64"
+          tar -xzf "dist/$intel_asset" -C "$verify_root/x86_64"
+          for bin in \
+            "$verify_root/aarch64/alex" \
+            "$verify_root/aarch64/alexandria" \
+            "$verify_root/x86_64/alex" \
+            "$verify_root/x86_64/alexandria"
+          do
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+
           shasum -a 256 "dist/$arm_asset" > "dist/$arm_asset.sha256"
           shasum -a 256 "dist/$intel_asset" > "dist/$intel_asset.sha256"
+
+      - name: Clean up CLI signing keychain
+        if: always() && steps.cli_signing.outputs.available == 'true'
+        uses: ./.github/actions/mac-signing-keychain
+        with:
+          cleanup: "true"
+          keychain: ${{ steps.signing_keychain.outputs.keychain }}
+          original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Upload to prerelease
         env:
