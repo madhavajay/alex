@@ -33,7 +33,8 @@ packageTargets.append(
 packageTargets.append(
     .testTarget(
         name: "AlexandriaBarCoreTests",
-        dependencies: ["AlexandriaBarCore"]
+        dependencies: ["AlexandriaBarCore"],
+        resources: [.copy("Fixtures")]
     ))
 
 let package = Package(

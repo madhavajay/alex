@@ -1003,6 +1003,12 @@ work, even when a narrower prototype exists.
 - [ ] Run an end-to-end macOS long-session Trace Browser benchmark covering
       initial load, paging, rendering, cancellation, navigation, and stable
       loading/daemon indicators.
+      A deterministic 1,277-turn Swift core benchmark and a 1,500-turn
+      production-LAR/public-HTTP backend benchmark now cover paging, bounded
+      filtering/render preparation, search anchors, cancellation pressure,
+      navigation, and health. This item remains open until packaged-window
+      automation proves main-actor responsiveness and visual indicator
+      stability on the agreed Mac.
 
 ### Phase 5 — retention, GC, repair, and archive operations
 
@@ -1029,7 +1035,7 @@ work, even when a narrower prototype exists.
 - [x] Evaluate OTAP/Arrow analytics export after the semantic schema stabilizes.
 - [x] Publish format specification, MIME proposal, examples, and CLI guide.
 - [x] Publish conformance corpus and reader/writer test vectors.
-- [ ] Publish a non-mutating `lar upgrade INPUT --output OUTPUT` rewrite tool
+- [x] Publish a non-mutating `lar upgrade INPUT --output OUTPUT` rewrite tool
       before the first post-v1 archive schema/version ships; it must preserve
       supported optional records and verify the rewritten archive.
 

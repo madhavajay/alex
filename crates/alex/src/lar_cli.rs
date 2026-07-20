@@ -1,13 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use alex_lar::{
-    ArchiveReader, ArchiveWriter, ChunkerConfig, Exchange, ExchangeData, FileHeader, HeaderAtom,
-    HeaderBlock, HeaderFidelity, Limits, ManifestId, RawBodyScanner, RawSearchLimits,
-    RawSearchStats, RecoveryStatus, Stage, StageData, StageId, StageKind, StreamReplaySource,
-    StreamReplayTiming, TokenUsage,
+    upgrade_archive as rewrite_archive, verify_upgraded_archive, ArchiveReader, ArchiveWriter,
+    ChunkerConfig, Exchange, ExchangeData, FileHeader, HeaderAtom, HeaderBlock, HeaderFidelity,
+    Limits, ManifestId, RawBodyScanner, RawSearchLimits, RawSearchStats, RecoveryStatus, Stage,
+    StageData, StageId, StageKind, StreamReplaySource, StreamReplayTiming, TokenUsage,
 };
 use alex_store::{
     LarArtifactLocation, LarBackupArtifactRef, LarBodyStoreConfig, LarBodyStoreMode,
@@ -49,6 +49,8 @@ pub(crate) enum LarCommand {
     Verify(VerifyArgs),
     /// Recover readable records into a new archive; never edits the input
     Repair(RepairArgs),
+    /// Rewrite a clean sealed archive into the latest v1 format
+    Upgrade(UpgradeArgs),
     /// List files, sessions, traces, stages, and artifacts
     Ls(ListArgs),
     /// Search exact raw artifact bytes without scanning duplicate chunks twice
@@ -208,6 +210,18 @@ pub(crate) struct RepairArgs {
     /// Replace an existing output file
     #[arg(long)]
     pub(crate) force: bool,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpgradeArgs {
+    /// Clean, sealed archive to rewrite; it is never modified
+    pub(crate) input: PathBuf,
+    /// New archive path; it must not already exist
+    #[arg(long)]
+    pub(crate) output: PathBuf,
     /// Emit machine-readable JSON
     #[arg(long)]
     pub(crate) json: bool,
@@ -427,6 +441,7 @@ impl LarCommandBackend for LocalLarBackend {
                 }
             }
             LarCommand::Repair(args) => repair_archive(args),
+            LarCommand::Upgrade(args) => upgrade_archive_command(args),
             LarCommand::Ls(args) => {
                 if let Some(archive) = args.archive.as_deref() {
                     list_archive(archive, args)
@@ -473,6 +488,7 @@ impl LarCommand {
             },
             Self::Verify(args) => args.json,
             Self::Repair(args) => args.json,
+            Self::Upgrade(args) => args.json,
             Self::Ls(args) => args.json,
             Self::Grep(args) => args.json,
             Self::Extract(args) => args.json,
@@ -2039,6 +2055,229 @@ fn repair_archive(args: &RepairArgs) -> Result<LarCommandOutput> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpgradeBoundary {
+    VerifiedBeforePublish,
+}
+
+fn upgrade_archive_command(args: &UpgradeArgs) -> Result<LarCommandOutput> {
+    upgrade_archive_with_hook(args, |_| Ok(()))
+}
+
+fn upgrade_archive_with_hook<F>(args: &UpgradeArgs, before_publish: F) -> Result<LarCommandOutput>
+where
+    F: FnOnce(UpgradeBoundary) -> Result<()>,
+{
+    preflight_archive(&args.input)?;
+    let output_parent = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent).with_context(|| {
+        format!(
+            "creating upgrade output directory {}",
+            output_parent.display()
+        )
+    })?;
+    let canonical_input = fs::canonicalize(&args.input)
+        .with_context(|| format!("resolving upgrade input {}", args.input.display()))?;
+    let canonical_parent = fs::canonicalize(output_parent).with_context(|| {
+        format!(
+            "resolving upgrade output directory {}",
+            output_parent.display()
+        )
+    })?;
+    let output_name = args
+        .output
+        .file_name()
+        .context("upgrade output must name a file")?;
+    let resolved_output = if args.output.exists() {
+        fs::canonicalize(&args.output)
+            .with_context(|| format!("resolving upgrade output {}", args.output.display()))?
+    } else {
+        canonical_parent.join(output_name)
+    };
+    if canonical_input == resolved_output {
+        bail!(
+            "upgrade output must differ from the input; {} was not modified",
+            args.input.display()
+        );
+    }
+    if args.output.exists() {
+        bail!(
+            "upgrade output already exists and will not be overwritten: {}",
+            args.output.display()
+        );
+    }
+
+    let mut source = fs::File::open(&canonical_input)
+        .with_context(|| format!("opening upgrade input {}", args.input.display()))?;
+    let source_bytes = source.metadata()?.len();
+    let source_sha256 = sha256_file(&mut source)?;
+    let source_uuid = {
+        let reader = ArchiveReader::open(&mut source, Limits::default())
+            .map_err(|error| anyhow::anyhow!(error))
+            .with_context(|| format!("reading upgrade input {}", args.input.display()))?;
+        reader.header().file_uuid
+    };
+    let mut output_uuid = rand::random::<[u8; 16]>();
+    while output_uuid == source_uuid {
+        output_uuid = rand::random::<[u8; 16]>();
+    }
+    let created_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos()
+        .try_into()
+        .context("current timestamp exceeds the LAR timestamp range")?;
+
+    let output_name_lossy = output_name.to_string_lossy();
+    let mut temporary = None;
+    let mut temporary_file = None;
+    for _ in 0..16 {
+        let candidate = canonical_parent.join(format!(
+            ".{output_name_lossy}.{}-{:016x}.lar-upgrade.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some(candidate);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("creating temporary upgrade archive"),
+        }
+    }
+    let temporary = temporary.context("could not allocate a unique temporary upgrade path")?;
+    let temporary_file = temporary_file.expect("temporary path and file are created together");
+    let mut published = false;
+    let result = (|| -> Result<_> {
+        source.rewind()?;
+        let (mut temporary_file, report) = rewrite_archive(
+            &mut source,
+            temporary_file,
+            output_uuid,
+            created_at_ns,
+            b"alex lar upgrade".to_vec(),
+            Limits::default(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))
+        .with_context(|| format!("upgrading {}", args.input.display()))?;
+        temporary_file.sync_all()?;
+        source.rewind()?;
+        temporary_file.rewind()?;
+        verify_upgraded_archive(&mut source, &mut temporary_file, Limits::default())
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("verifying the complete upgraded archive")?;
+        let source_sha256_after = sha256_file(&mut source)?;
+        if source_sha256_after != source_sha256 {
+            bail!("upgrade input changed while it was being rewritten; output was not published");
+        }
+        let output_sha256 = sha256_file(&mut temporary_file)?;
+        drop(temporary_file);
+        before_publish(UpgradeBoundary::VerifiedBeforePublish)?;
+
+        fs::hard_link(&temporary, &resolved_output).with_context(|| {
+            format!(
+                "publishing upgrade output without overwriting {}",
+                args.output.display()
+            )
+        })?;
+        published = true;
+        sync_parent_directory(&canonical_parent)?;
+        fs::remove_file(&temporary)?;
+        sync_parent_directory(&canonical_parent)?;
+        let output_bytes = fs::metadata(&resolved_output)?.len();
+        Ok((report, output_bytes, output_sha256))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        if published {
+            let _ = fs::remove_file(&resolved_output);
+            let _ = sync_parent_directory(&canonical_parent);
+        }
+    }
+    let (report, output_bytes, output_sha256) = result?;
+    let source_uuid = hex_bytes(&report.source_uuid);
+    let output_uuid = hex_bytes(&report.output_uuid);
+    let human = format!(
+        "upgraded {} into {}: copied {} canonical records, replaced {} derived index records, verified {} manifests and {} chunks; physical UUID {} -> {}; input was not modified",
+        args.input.display(),
+        args.output.display(),
+        report.canonical_records_copied,
+        report.derived_records_replaced,
+        report.manifests_verified,
+        report.chunks_verified,
+        source_uuid,
+        output_uuid,
+    );
+    Ok(LarCommandOutput {
+        human,
+        json: serde_json::json!({
+            "input": args.input,
+            "output": args.output,
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "source_sha256": source_sha256,
+            "output_sha256": output_sha256,
+            "source_uuid": source_uuid,
+            "output_uuid": output_uuid,
+            "source_container_major": report.source_container_major,
+            "source_container_minor": report.source_container_minor,
+            "output_container_major": report.output_container_major,
+            "output_container_minor": report.output_container_minor,
+            "file_role": format!("{:?}", report.file_role),
+            "source_created_at_ns": report.source_created_at_ns,
+            "output_created_at_ns": report.output_created_at_ns,
+            "canonical_records_copied": report.canonical_records_copied,
+            "derived_records_replaced": report.derived_records_replaced,
+            "verified_manifests": report.manifests_verified,
+            "verified_chunks": report.chunks_verified,
+            "input_modified": false,
+            "catalog_modified": false,
+            "published_atomically": true,
+        }),
+        raw_body: None,
+    })
+}
+
+fn sha256_file(file: &mut fs::File) -> Result<String> {
+    file.rewind()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    file.rewind()?;
+    let digest = digest.finalize();
+    Ok(hex_bytes(&digest))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    // Windows does not support opening directories as ordinary File handles.
+    // The archive itself has already been synced before the atomic hard link.
+    Ok(())
+}
+
 fn normalize_artifact_kind(value: &str) -> Result<&'static str> {
     match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "request" | "client-request" => Ok("client_request"),
@@ -3566,6 +3805,10 @@ mod tests {
                 command: LarRepackCommand::Resume { json: true, .. }
             }
         ));
+        assert!(matches!(
+            parse(&["upgrade", "old.lar", "--output", "new.lar", "--json"]),
+            LarCommand::Upgrade(UpgradeArgs { json: true, .. })
+        ));
         assert!(TestCli::try_parse_from([
             "lar-test",
             "import-legacy",
@@ -3596,6 +3839,7 @@ mod tests {
             "repack",
             "verify",
             "repair",
+            "upgrade",
             "ls",
             "grep",
             "extract",
@@ -3896,6 +4140,157 @@ mod tests {
         assert!(fs::metadata(&repaired).unwrap().len() < input_before.len() as u64);
         let repaired_verify = verify_archive(&repaired, false).unwrap();
         assert_eq!(repaired_verify.json["recovery"], "clean");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn upgrade_args(input: &Path, output: &Path) -> UpgradeArgs {
+        UpgradeArgs {
+            input: input.to_path_buf(),
+            output: output.to_path_buf(),
+            json: true,
+        }
+    }
+
+    fn assert_no_upgrade_temps(directory: &Path) {
+        let leftovers = fs::read_dir(directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("lar-upgrade.tmp")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "upgrade temp files remain: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn upgrade_publishes_verified_copy_with_stable_logical_ids() {
+        let dir = tmpdir("archive-upgrade");
+        let input = dir.join("source.lar");
+        let output = dir.join("latest.lar");
+        write_search_archive(&input);
+        let input_before = fs::read(&input).unwrap();
+        let source_ids = {
+            let reader =
+                ArchiveReader::open(fs::File::open(&input).unwrap(), Limits::default()).unwrap();
+            let mut ids = reader.manifest_ids().copied().collect::<Vec<_>>();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+
+        let report = upgrade_archive_command(&upgrade_args(&input, &output)).unwrap();
+        assert_eq!(report.json["input_modified"], false);
+        assert_eq!(report.json["catalog_modified"], false);
+        assert_eq!(report.json["published_atomically"], true);
+        assert!(report.json["source_sha256"].is_string());
+        assert!(report.json["output_sha256"].is_string());
+        assert_ne!(report.json["source_uuid"], report.json["output_uuid"]);
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+
+        let output_ids = {
+            let reader =
+                ArchiveReader::open(fs::File::open(&output).unwrap(), Limits::default()).unwrap();
+            assert!(reader.is_sealed());
+            assert_eq!(reader.recovery_status(), RecoveryStatus::Clean);
+            let mut ids = reader.manifest_ids().copied().collect::<Vec<_>>();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        assert_eq!(source_ids, output_ids);
+        let mut source_file = fs::File::open(&input).unwrap();
+        let mut output_file = fs::File::open(&output).unwrap();
+        verify_upgraded_archive(&mut source_file, &mut output_file, Limits::default()).unwrap();
+        assert_no_upgrade_temps(&dir);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn upgrade_refuses_aliases_existing_outputs_and_publish_races() {
+        let dir = tmpdir("archive-upgrade-path-safety");
+        let input = dir.join("source.lar");
+        write_search_archive(&input);
+        let input_before = fs::read(&input).unwrap();
+
+        let same_error = upgrade_archive_command(&upgrade_args(&input, &input)).unwrap_err();
+        assert!(format!("{same_error:#}").contains("must differ from the input"));
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+
+        let hardlink = dir.join("source-hardlink.lar");
+        fs::hard_link(&input, &hardlink).unwrap();
+        let hardlink_error = upgrade_archive_command(&upgrade_args(&input, &hardlink)).unwrap_err();
+        assert!(
+            format!("{hardlink_error:#}").contains("will not be overwritten"),
+            "{hardlink_error:#}"
+        );
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.join("source-symlink.lar");
+            std::os::unix::fs::symlink(&input, &symlink).unwrap();
+            let symlink_error =
+                upgrade_archive_command(&upgrade_args(&input, &symlink)).unwrap_err();
+            assert!(format!("{symlink_error:#}").contains("must differ from the input"));
+        }
+
+        let existing = dir.join("existing.lar");
+        fs::write(&existing, b"sentinel").unwrap();
+        let existing_error = upgrade_archive_command(&upgrade_args(&input, &existing)).unwrap_err();
+        assert!(format!("{existing_error:#}").contains("will not be overwritten"));
+        assert_eq!(fs::read(&existing).unwrap(), b"sentinel");
+
+        let raced = dir.join("raced.lar");
+        let raced_args = upgrade_args(&input, &raced);
+        let race_error = upgrade_archive_with_hook(&raced_args, |_| {
+            fs::write(&raced, b"concurrent winner")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{race_error:#}").contains("without overwriting"));
+        assert_eq!(fs::read(&raced).unwrap(), b"concurrent winner");
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_no_upgrade_temps(&dir);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn upgrade_failure_and_interruption_leave_no_partial_output() {
+        let dir = tmpdir("archive-upgrade-interruption");
+        let input = dir.join("source.lar");
+        write_search_archive(&input);
+        let input_before = fs::read(&input).unwrap();
+
+        let interrupted_output = dir.join("interrupted.lar");
+        let interruption =
+            upgrade_archive_with_hook(&upgrade_args(&input, &interrupted_output), |_| {
+                bail!("simulated interruption before publish")
+            })
+            .unwrap_err();
+        assert!(format!("{interruption:#}").contains("simulated interruption"));
+        assert!(!interrupted_output.exists());
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_no_upgrade_temps(&dir);
+
+        let truncated = dir.join("truncated.lar");
+        fs::write(&truncated, &input_before[..input_before.len() - 9]).unwrap();
+        let corrupt_output = dir.join("corrupt-output.lar");
+        assert!(upgrade_archive_command(&upgrade_args(&truncated, &corrupt_output)).is_err());
+        assert!(!corrupt_output.exists());
+
+        let corrupt = dir.join("corrupt.lar");
+        let mut corrupt_bytes = input_before.clone();
+        let corrupt_at = corrupt_bytes.len() / 2;
+        corrupt_bytes[corrupt_at] ^= 0x80;
+        fs::write(&corrupt, corrupt_bytes).unwrap();
+        let checksum_output = dir.join("checksum-output.lar");
+        assert!(upgrade_archive_command(&upgrade_args(&corrupt, &checksum_output)).is_err());
+        assert!(!checksum_output.exists());
+        assert_no_upgrade_temps(&dir);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -4,8 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alex_auth::Vault;
+use alex_core::TraceRecord;
 use alex_proxy::{build_state, router, set_exo_config, ExoConfig};
-use alex_store::{LarArtifactLocation, LarBodyStoreConfig, LarBodyStoreMode, Store};
+use alex_store::{
+    LarArtifactLocation, LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, Store,
+};
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 
@@ -119,14 +122,14 @@ fn threshold(
     )
 }
 
-fn emit_report(metrics: Value, gates: Vec<(Value, Option<String>)>) {
+fn emit_report(benchmark: &str, metrics: Value, gates: Vec<(Value, Option<String>)>) {
     let (gates, failures): (Vec<_>, Vec<_>) = gates.into_iter().unzip();
     let failures = failures.into_iter().flatten().collect::<Vec<_>>();
     eprintln!(
         "ALEX_LAR_BENCHMARK {}",
         serde_json::to_string(&json!({
             "schema": "alex-lar-rollout-benchmark-v1",
-            "benchmark": "concurrent_proxy_requests",
+            "benchmark": benchmark,
             "metrics": metrics,
             "gates": gates,
         }))
@@ -360,6 +363,7 @@ async fn concurrent_proxy_throughput_and_added_request_latency() {
         lar.logical_request_bytes as f64 / (1024.0 * 1024.0) / lar.elapsed.as_secs_f64();
 
     emit_report(
+        "concurrent_proxy_requests",
         json!({
             "workload": {
                 "workers": workers,
@@ -409,6 +413,474 @@ async fn concurrent_proxy_throughput_and_added_request_latency() {
             threshold(
                 "ALEX_LAR_BENCH_MAX_PROXY_ADDED_P99_MS",
                 added_p99.max(0.0),
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+        ],
+    );
+}
+
+const BROWSER_PAGE_SIZE: usize = 50;
+const BROWSER_BODY_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
+const BROWSER_SEARCH_MARKER: &str = "tracebrowserbenchmark-7f4a9d3c";
+
+fn browser_request_body(index: usize, prefix: &str, search_index: usize) -> Vec<u8> {
+    let marker = if index == search_index {
+        BROWSER_SEARCH_MARKER
+    } else {
+        "ordinary"
+    };
+    serde_json::to_vec(&json!({
+        "model": "benchmark-model",
+        "messages": [
+            {"role": "system", "content": prefix},
+            {
+                "role": "user",
+                "content": format!(
+                    "long session turn {index:05} {marker} nonce-{index:016x}-{:016x}",
+                    index.wrapping_mul(1_048_583)
+                )
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+fn browser_response_body(index: usize) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": format!("benchmark-completion-{index:05}"),
+        "object": "chat.completion",
+        "model": "benchmark-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": format!(
+                    "synthetic answer {index:05} result-{:016x}",
+                    index.wrapping_mul(7_919)
+                )
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+    .unwrap()
+}
+
+fn seed_lar_only_browser_trace(
+    store: &Store,
+    session_id: &str,
+    trace_id: &str,
+    timestamp_ms: i64,
+    request: &[u8],
+    response: &[u8],
+) -> u64 {
+    let request_write = store
+        .write_body_artifact(
+            &LarBodyArtifact::trace(trace_id, "client_request"),
+            "request.json",
+            request,
+        )
+        .unwrap();
+    let response_write = store
+        .write_body_artifact(
+            &LarBodyArtifact::trace(trace_id, "client_response"),
+            "response.body",
+            response,
+        )
+        .unwrap();
+    assert!(
+        request_write.lar_error.is_none() && request_write.manifest_id.is_some(),
+        "request LAR write failed for {trace_id}: {:?}",
+        request_write.lar_error
+    );
+    assert!(
+        response_write.lar_error.is_none() && response_write.manifest_id.is_some(),
+        "response LAR write failed for {trace_id}: {:?}",
+        response_write.lar_error
+    );
+
+    store
+        .insert_trace(&TraceRecord {
+            id: trace_id.to_string(),
+            ts_request_ms: timestamp_ms,
+            ts_response_ms: Some(timestamp_ms + 800),
+            session_id: Some(session_id.to_string()),
+            harness: Some("benchmark".into()),
+            client_format: Some("openai-chat".into()),
+            upstream_provider: Some("benchmark".into()),
+            upstream_format: Some("openai-chat".into()),
+            requested_model: Some("benchmark-model".into()),
+            routed_model: Some("benchmark-model".into()),
+            status: Some(200),
+            req_body_path: Some(request_write.legacy_path.clone()),
+            resp_body_path: Some(response_write.legacy_path.clone()),
+            ..TraceRecord::default()
+        })
+        .unwrap();
+
+    for path in [&request_write.legacy_path, &response_write.legacy_path] {
+        std::fs::remove_file(path)
+            .unwrap_or_else(|error| panic!("removing benchmark fallback {path}: {error}"));
+    }
+    for artifact_kind in ["client_request", "client_response"] {
+        let location = store
+            .lar_artifact_location("trace", trace_id, artifact_kind, None)
+            .unwrap();
+        assert!(
+            matches!(location, Some(LarArtifactLocation::Lar { .. })),
+            "{trace_id} {artifact_kind} was not published to LAR: {location:?}"
+        );
+    }
+    request.len() as u64 + response.len() as u64
+}
+
+async fn benchmark_json_get(request: reqwest::RequestBuilder, label: &str) -> (Duration, Value) {
+    let started = Instant::now();
+    let response = request
+        .header("x-api-key", "alx-local")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{label} response: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decoding {label} response: {error}"));
+    (started.elapsed(), value)
+}
+
+fn assert_browser_page(value: &Value, session_id: &str, expected_turns: usize, total: usize) {
+    assert_eq!(value["session_id"], session_id);
+    assert_eq!(
+        value["turns"].as_array().map(Vec::len),
+        Some(expected_turns)
+    );
+    assert_eq!(value["total_turns"].as_u64(), Some(total as u64));
+    assert_eq!(
+        value["body_byte_budget"].as_u64(),
+        Some(BROWSER_BODY_BYTE_BUDGET)
+    );
+    assert!(value["body_bytes_loaded"].as_u64().unwrap_or(u64::MAX) <= BROWSER_BODY_BYTE_BUDGET);
+    assert_eq!(value["body_errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(value["body_truncations"].as_array().map(Vec::len), Some(0));
+}
+
+fn sample_p99_ms(samples: &[Duration]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    percentile_ms(&sorted, 99)
+}
+
+/// Manual release-mode backend gate for the production Trace Browser path.
+/// This deliberately stops at decoded HTTP responses; AppKit/SwiftUI rendering
+/// and loading-indicator stability remain part of the separate macOS UI gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual release gate for long-session Trace Browser backend latency"]
+async fn long_session_trace_browser_http_paging_and_cancellation() {
+    let turns = env_usize("ALEX_LAR_BENCH_BROWSER_TURNS", 1_500);
+    let samples = env_usize("ALEX_LAR_BENCH_BROWSER_SAMPLES", 40);
+    let prefix_bytes = env_usize("ALEX_LAR_BENCH_BROWSER_PREFIX_BYTES", 32 * 1024);
+    let cancellation_requests = env_usize("ALEX_LAR_BENCH_BROWSER_CANCEL_REQUESTS", 8);
+    assert!(turns >= BROWSER_PAGE_SIZE * 3);
+    assert!(samples > 0 && prefix_bytes > 0 && cancellation_requests > 0);
+
+    let root = BenchmarkDir::new("trace-browser");
+    let store = Arc::new(
+        Store::open_with_lar_body_store(
+            root.path().join("store"),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                // Keep both active and sealed packs in even the reduced local
+                // smoke profile; production defaults remain exercised by the
+                // writer/index code rather than by a huge benchmark fixture.
+                max_pack_bytes: 16 * 1024,
+                checkpoint_bytes: 8 * 1024,
+                checkpoint_interval: Duration::from_secs(30),
+                writer_lock_timeout: Duration::from_secs(10),
+                ..LarBodyStoreConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let long_session = "benchmark-long-session";
+    let navigation_session = "benchmark-navigation-session";
+    let search_index = turns / 2;
+    let prefix = "stable system prompt and tool schema "
+        .repeat(prefix_bytes.div_ceil("stable system prompt and tool schema ".len()));
+    let prefix = &prefix[..prefix_bytes];
+    let base_timestamp_ms = 1_780_000_000_000i64;
+    let setup_started = Instant::now();
+    let mut logical_body_bytes = 0u64;
+    for index in 0..turns {
+        let trace_id = format!("browser-long-{index:05}");
+        logical_body_bytes = logical_body_bytes.saturating_add(seed_lar_only_browser_trace(
+            &store,
+            long_session,
+            &trace_id,
+            base_timestamp_ms + index as i64 * 1_000,
+            &browser_request_body(index, prefix, search_index),
+            &browser_response_body(index),
+        ));
+    }
+    for index in 0..3 {
+        let trace_id = format!("browser-navigation-{index:02}");
+        logical_body_bytes = logical_body_bytes.saturating_add(seed_lar_only_browser_trace(
+            &store,
+            navigation_session,
+            &trace_id,
+            base_timestamp_ms + turns as i64 * 1_000 + index as i64 * 1_000,
+            &browser_request_body(turns + index, prefix, usize::MAX),
+            &browser_response_body(turns + index),
+        ));
+    }
+    let setup_elapsed = setup_started.elapsed();
+    let archive_statuses = store.lar_archive_file_statuses().unwrap();
+    let sealed_packs = archive_statuses
+        .iter()
+        .filter(|file| file.role == "body-pack" && file.catalog_state == "sealed")
+        .count();
+    let active_packs = archive_statuses
+        .iter()
+        .filter(|file| file.role == "body-pack" && file.catalog_state == "active")
+        .count();
+    assert!(sealed_packs > 0, "fixture did not rotate a sealed LAR pack");
+    assert!(
+        active_packs > 0,
+        "fixture did not retain an active LAR pack"
+    );
+
+    let vault = Arc::new(Vault::open(root.path().join("vault")).unwrap());
+    let state = build_state(
+        "alx-local".into(),
+        vault,
+        store,
+        None,
+        "http://127.0.0.1:0".into(),
+        Duration::from_secs(60),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(cancellation_requests + 4)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let transcript_url = format!("{base_url}/traces/sessions/{long_session}/transcript");
+
+    let (_, tail) = benchmark_json_get(
+        client
+            .get(&transcript_url)
+            .query(&[("limit", BROWSER_PAGE_SIZE), ("tail", 1usize)]),
+        "warm tail transcript",
+    )
+    .await;
+    assert_browser_page(&tail, long_session, BROWSER_PAGE_SIZE, turns);
+    assert_eq!(tail["has_more_before"], true);
+    assert_eq!(tail["has_more_after"], false);
+    let oldest_ts_ms = tail["oldest_ts_ms"].as_i64().unwrap();
+    let oldest_trace_id = tail["oldest_trace_id"].as_str().unwrap().to_string();
+
+    let (_, older) = benchmark_json_get(
+        client.get(&transcript_url).query(&[
+            ("limit", BROWSER_PAGE_SIZE.to_string()),
+            ("before_ms", oldest_ts_ms.to_string()),
+            ("before_id", oldest_trace_id.clone()),
+        ]),
+        "warm older transcript",
+    )
+    .await;
+    assert_browser_page(&older, long_session, BROWSER_PAGE_SIZE, turns);
+    assert_eq!(older["has_more_after"], true);
+
+    let mut tail_samples = Vec::with_capacity(samples);
+    let mut older_samples = Vec::with_capacity(samples);
+    let mut search_anchor_samples = Vec::with_capacity(samples);
+    let mut navigation_samples = Vec::with_capacity(samples);
+    let mut health_samples = Vec::with_capacity(samples);
+    let mut cancelled_tasks = 0usize;
+    let mut completed_before_abort = 0usize;
+    for _ in 0..samples {
+        let (elapsed, page) = benchmark_json_get(
+            client
+                .get(&transcript_url)
+                .query(&[("limit", BROWSER_PAGE_SIZE), ("tail", 1usize)]),
+            "tail transcript",
+        )
+        .await;
+        assert_browser_page(&page, long_session, BROWSER_PAGE_SIZE, turns);
+        tail_samples.push(elapsed);
+
+        let (elapsed, page) = benchmark_json_get(
+            client.get(&transcript_url).query(&[
+                ("limit", BROWSER_PAGE_SIZE.to_string()),
+                ("before_ms", oldest_ts_ms.to_string()),
+                ("before_id", oldest_trace_id.clone()),
+            ]),
+            "older transcript",
+        )
+        .await;
+        assert_browser_page(&page, long_session, BROWSER_PAGE_SIZE, turns);
+        older_samples.push(elapsed);
+
+        let search_started = Instant::now();
+        let (_, search) = benchmark_json_get(
+            client
+                .get(format!("{base_url}/traces/search"))
+                .query(&[("text", BROWSER_SEARCH_MARKER), ("limit", "1")]),
+            "trace search",
+        )
+        .await;
+        let match_row = &search["traces"].as_array().unwrap()[0];
+        assert_eq!(match_row["id"], format!("browser-long-{search_index:05}"));
+        assert_eq!(match_row["session_id"], long_session);
+        let anchor_ts_ms = match_row["ts_request_ms"].as_i64().unwrap();
+        let (_, page) = benchmark_json_get(
+            client.get(&transcript_url).query(&[
+                ("limit", BROWSER_PAGE_SIZE.to_string()),
+                ("after_ms", anchor_ts_ms.saturating_sub(1).to_string()),
+                ("after_id", "\u{10ffff}".to_string()),
+            ]),
+            "search-anchored transcript",
+        )
+        .await;
+        assert_browser_page(&page, long_session, BROWSER_PAGE_SIZE, turns);
+        assert_eq!(
+            page["turns"][0]["trace_id"],
+            format!("browser-long-{search_index:05}")
+        );
+        search_anchor_samples.push(search_started.elapsed());
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(cancellation_requests + 1));
+        let mut requests = Vec::with_capacity(cancellation_requests);
+        for _ in 0..cancellation_requests {
+            let client = client.clone();
+            let transcript_url = transcript_url.clone();
+            let barrier = barrier.clone();
+            requests.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let response = client
+                    .get(transcript_url)
+                    .header("x-api-key", "alx-local")
+                    .query(&[("limit", BROWSER_PAGE_SIZE), ("tail", 1usize)])
+                    .send()
+                    .await?;
+                let status = response.status();
+                response.bytes().await?;
+                Ok::<_, reqwest::Error>(status)
+            }));
+        }
+        barrier.wait().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        for request in &requests {
+            request.abort();
+        }
+        for request in requests {
+            match request.await {
+                Err(error) if error.is_cancelled() => cancelled_tasks += 1,
+                Ok(Ok(status)) => {
+                    assert_eq!(status, reqwest::StatusCode::OK);
+                    completed_before_abort += 1;
+                }
+                Ok(Err(error)) => panic!("cancellation request failed before abort: {error}"),
+                Err(error) => panic!("cancellation request task failed: {error}"),
+            }
+        }
+
+        let navigation_url = format!("{base_url}/traces/sessions/{navigation_session}/transcript");
+        let (elapsed, page) = benchmark_json_get(
+            client
+                .get(navigation_url)
+                .query(&[("limit", BROWSER_PAGE_SIZE), ("tail", 1usize)]),
+            "post-cancellation navigation transcript",
+        )
+        .await;
+        assert_browser_page(&page, navigation_session, 3, 3);
+        navigation_samples.push(elapsed);
+
+        let (elapsed, health) = benchmark_json_get(
+            client.get(format!("{base_url}/health")),
+            "post-cancellation health",
+        )
+        .await;
+        assert_eq!(health["status"], "ok");
+        health_samples.push(elapsed);
+    }
+    server.abort();
+
+    let tail_p99 = sample_p99_ms(&tail_samples);
+    let older_p99 = sample_p99_ms(&older_samples);
+    let search_anchor_p99 = sample_p99_ms(&search_anchor_samples);
+    let navigation_p99 = sample_p99_ms(&navigation_samples);
+    let health_p99 = sample_p99_ms(&health_samples);
+    emit_report(
+        "long_session_trace_browser_backend",
+        json!({
+            "workload": {
+                "turns": turns,
+                "page_size": BROWSER_PAGE_SIZE,
+                "samples": samples,
+                "request_prefix_bytes": prefix_bytes,
+                "logical_body_bytes": logical_body_bytes,
+                "body_byte_budget": BROWSER_BODY_BYTE_BUDGET,
+                "storage": "validated_lar_pointers_with_legacy_files_removed",
+                "sealed_body_packs": sealed_packs,
+                "active_body_packs": active_packs,
+                "cancellation_requests_per_sample": cancellation_requests,
+                "abort_signals_sent": samples.saturating_mul(cancellation_requests),
+                "cancelled_client_tasks": cancelled_tasks,
+                "completed_before_abort": completed_before_abort,
+                "transport": "loopback_http_public_trace_routes",
+            },
+            "setup_elapsed_ms": setup_elapsed.as_secs_f64() * 1_000.0,
+            "tail_page_latency": percentile_report(tail_samples),
+            "older_page_latency": percentile_report(older_samples),
+            "search_then_anchor_page_latency": percentile_report(search_anchor_samples),
+            "post_cancellation_navigation_latency": percentile_report(navigation_samples),
+            "post_cancellation_health_latency": percentile_report(health_samples),
+            "scope": "backend_only_no_macos_rendering",
+        }),
+        vec![
+            threshold(
+                "ALEX_LAR_BENCH_MAX_BROWSER_TAIL_P99_MS",
+                tail_p99,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_BROWSER_OLDER_P99_MS",
+                older_p99,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_BROWSER_SEARCH_ANCHOR_P99_MS",
+                search_anchor_p99,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_BROWSER_POST_CANCEL_NAVIGATION_P99_MS",
+                navigation_p99,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_BROWSER_POST_CANCEL_HEALTH_P99_MS",
+                health_p99,
                 "ms",
                 ThresholdDirection::Maximum,
             ),

@@ -99,6 +99,7 @@ source files.
 | `repack plan` / `apply` / `resume RUN_ID` | Select sealed body packs by `--min-garbage-bytes` and `--min-garbage-ratio`, copy only currently reachable chunks, verify the replacement, atomically switch catalog locations, and move the source to recoverable quarantine. Reports distinguish logical from physical reclamation. |
 | `verify [ARCHIVE]` | Verify the live store when no path is supplied, or frame/checksum/reconstruction integrity for one archive. |
 | `repair INPUT --output OUTPUT` | Copy only the valid prefix into a different file and verify it; never modifies the input. |
+| `upgrade INPUT --output OUTPUT` | Rewrite one clean, sealed, exactly supported v1 archive into a newly sealed latest-v1 file with a new physical UUID. Canonical body/header/stream/exchange/conversation records remain byte-identical and in order; derived indexes/footer are regenerated. The command rejects existing or aliased output paths and unknown extensions instead of dropping data, verifies bodies plus exact canonical equivalence, then publishes atomically without modifying the input or live catalog. `--json` includes UUIDs, SHA-256 identities, byte/count totals, and verification state. |
 | `ls [ARCHIVE]` | Summarize the live catalog or one archive. |
 | `grep LITERAL [ARCHIVE...]` | Search exact raw body bytes in the live catalog plus any supplied sealed archives. Shared chunks are decompressed once per source, matches may span manifest ranges, and results include manifest/stage/trace/session/time anchors where available. `--limit N` fails explicitly instead of returning an incomplete result set. |
 | `extract --trace-id ID --artifact KIND` | Write exact mixed legacy/LAR bytes to stdout or `--output`; kinds are `request`, `upstream-request`, `response`, and `raw-stream`. `--force` is required to replace an output. |
@@ -116,6 +117,7 @@ alex lar migration status
 alex lar migration verify --json
 alex lar gc plan --json
 alex lar repack plan --min-garbage-ratio 0.25 --json
+alex lar upgrade archived-v1.lar --output archived-latest.lar --json
 alex lar grep 'tool_call_id' archived-2026-07-19.lar --limit 500 --json
 alex lar cleanup --dry-run --json
 alex lar extract --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \

@@ -25,6 +25,406 @@ const RECORD_SCHEMA_V1: u16 = 1;
 const COMPRESSION_ZSTD: u8 = 1;
 const METADATA_PAGE_TARGET: usize = 256 * 1024;
 
+/// Result of a preservation-first rewrite to the latest supported v1
+/// container. Canonical records are copied without decoding or re-encoding
+/// their payloads; only derived indexes and the footer are regenerated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveUpgradeReport {
+    pub source_container_major: u16,
+    pub source_container_minor: u16,
+    pub output_container_major: u16,
+    pub output_container_minor: u16,
+    pub file_role: crate::FileRole,
+    pub source_uuid: [u8; 16],
+    pub output_uuid: [u8; 16],
+    pub source_created_at_ns: u64,
+    pub output_created_at_ns: u64,
+    pub canonical_records_copied: u64,
+    pub derived_records_replaced: u64,
+    pub manifests_verified: u64,
+    pub chunks_verified: u64,
+}
+
+/// Rewrite one clean, sealed archive into a newly sealed latest-v1 archive.
+///
+/// The source is never written. Supported canonical frames remain in their
+/// original physical order with identical type, schema, flags, and payload.
+/// Unknown optional records, header extensions, optional feature bits, and
+/// non-v1 canonical schemas are rejected rather than silently discarded.
+pub fn upgrade_archive<R, W>(
+    source: &mut R,
+    mut output: W,
+    output_uuid: [u8; 16],
+    output_created_at_ns: u64,
+    output_writer: Vec<u8>,
+    limits: Limits,
+) -> Result<(W, ArchiveUpgradeReport)>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
+    let mut reader = ArchiveReader::open(&mut *source, limits.clone())?;
+    if !reader.is_sealed() || reader.recovery_status() != RecoveryStatus::Clean {
+        return Err(Error::Invalid(
+            "upgrade source must be a clean, sealed archive",
+        ));
+    }
+    let source_header = reader.header().clone();
+    if source_header.container_major != crate::DEFAULT_CONTAINER_MAJOR
+        || source_header.container_minor != crate::DEFAULT_CONTAINER_MINOR
+    {
+        return Err(Error::Unsupported(format!(
+            "upgrade source container version {}.{}",
+            source_header.container_major, source_header.container_minor
+        )));
+    }
+    if source_header.optional_feature_bits != 0 {
+        return Err(Error::Unsupported(format!(
+            "optional feature bits {:#x} cannot be preserved safely",
+            source_header.optional_feature_bits
+        )));
+    }
+    if output_uuid == source_header.file_uuid {
+        return Err(Error::Invalid(
+            "upgraded archive must use a new physical file UUID",
+        ));
+    }
+
+    // A current-version header must round-trip to exactly the same physical
+    // length. Any extra bounded bytes are extensions this implementation does
+    // not understand and therefore cannot promise to preserve.
+    let mut canonical_source_header = Vec::new();
+    write_file_header(&mut canonical_source_header, &source_header)?;
+    if canonical_source_header.len() as u64 != reader.data_offset() {
+        return Err(Error::Unsupported(
+            "file header extension cannot be preserved safely".into(),
+        ));
+    }
+
+    let manifest_ids: Vec<_> = reader.manifest_ids().copied().collect();
+    for id in &manifest_ids {
+        reader.write_body(id, &mut std::io::sink())?;
+    }
+    let chunk_hashes: Vec<_> = reader.chunk_records().map(|record| record.hash).collect();
+    for hash in &chunk_hashes {
+        reader.read_chunk(hash)?;
+    }
+    drop(reader);
+
+    if file_length(&mut output)? != 0 {
+        return Err(Error::Invalid("upgrade output is not empty"));
+    }
+    let source_end = file_length(source)?;
+    let canonical_end = source_end
+        .checked_sub(FOOTER_TRAILER_LEN)
+        .ok_or(Error::Invalid("sealed archive is shorter than its footer"))?;
+    let mut output_header = source_header.clone();
+    output_header.container_major = crate::DEFAULT_CONTAINER_MAJOR;
+    output_header.container_minor = crate::DEFAULT_CONTAINER_MINOR;
+    output_header.file_uuid = output_uuid;
+    output_header.created_at_ns = output_created_at_ns;
+    output_header.writer = output_writer;
+    output.seek(SeekFrom::Start(0))?;
+    write_file_header(&mut output, &output_header)?;
+
+    source.seek(SeekFrom::Start(canonical_source_header.len() as u64))?;
+    let mut canonical_records_copied = 0u64;
+    let mut derived_records_replaced = 0u64;
+    let mut dictionary_index = 0usize;
+    let mut saw_non_dictionary_record = false;
+    while source.stream_position()? < canonical_end {
+        let before = source.stream_position()?;
+        let frame = {
+            let mut frame_reader = FrameReader::new(&mut *source, &limits);
+            match frame_reader.read_next()? {
+                (FrameRead::Frame, Some(frame)) => frame,
+                (FrameRead::Truncated, _) => {
+                    return Err(Error::Invalid("truncated frame before sealed footer"))
+                }
+                (FrameRead::CleanEof, _) => {
+                    return Err(Error::Invalid("unexpected EOF before sealed footer"))
+                }
+                _ => return Err(Error::Invalid("invalid frame read result")),
+            }
+        };
+        if source.stream_position()? > canonical_end {
+            return Err(Error::InvalidDetail(format!(
+                "record at {before} overlaps the sealed footer"
+            )));
+        }
+        match frame.record_type {
+            RecordType::Chunk
+            | RecordType::BodyManifest
+            | RecordType::HeaderBlock
+            | RecordType::StreamIndex
+            | RecordType::Stage
+            | RecordType::Exchange
+            | RecordType::MetadataPage
+            | RecordType::ConversationEntry
+            | RecordType::Generation
+            | RecordType::TurnView => {
+                if frame.schema_version != RECORD_SCHEMA_V1 || frame.flags != RecordFrame::REQUIRED
+                {
+                    return Err(Error::Unsupported(format!(
+                        "canonical record type {} at {before} uses schema {} or flags {:#x}",
+                        frame.record_type.code(),
+                        frame.schema_version,
+                        frame.flags
+                    )));
+                }
+                saw_non_dictionary_record = true;
+                frame.write(&mut output)?;
+                canonical_records_copied += 1;
+            }
+            RecordType::DictionaryData => {
+                if frame.schema_version != RECORD_SCHEMA_V1
+                    || frame.flags != RecordFrame::REQUIRED
+                    || saw_non_dictionary_record
+                {
+                    return Err(Error::Unsupported(format!(
+                        "dictionary record at {before} is not a contiguous canonical v1 record"
+                    )));
+                }
+                let dictionary = StoredDictionary::decode(&frame.payload, &limits)?;
+                let descriptor =
+                    source_header
+                        .dictionaries
+                        .get(dictionary_index)
+                        .ok_or(Error::Invalid(
+                            "dictionary record lacks a header descriptor",
+                        ))?;
+                if descriptor.id != dictionary.id
+                    || descriptor.uncompressed_length != dictionary.bytes.len() as u64
+                {
+                    return Err(Error::Invalid(
+                        "dictionary record does not match its header descriptor",
+                    ));
+                }
+                dictionary_index += 1;
+                frame.write(&mut output)?;
+                canonical_records_copied += 1;
+            }
+            RecordType::IndexBlock | RecordType::Checkpoint | RecordType::CheckpointLocator => {
+                if frame.schema_version != INDEX_SCHEMA_V1 || frame.flags != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "derived record type {} at {before} uses schema {} or flags {:#x}",
+                        frame.record_type.code(),
+                        frame.schema_version,
+                        frame.flags
+                    )));
+                }
+                saw_non_dictionary_record = true;
+                derived_records_replaced += 1;
+            }
+            RecordType::Unknown(code) => {
+                return Err(Error::Unsupported(format!(
+                    "unknown optional record type {code} at {before} cannot be preserved safely"
+                )))
+            }
+        }
+    }
+    if source.stream_position()? != canonical_end {
+        return Err(Error::Invalid("record stream does not meet sealed footer"));
+    }
+    if dictionary_index != source_header.dictionaries.len() {
+        return Err(Error::Invalid(
+            "file header dictionary descriptors do not map one-to-one to dictionary records",
+        ));
+    }
+
+    // This is intentionally a forward-scan open of the canonical-only output.
+    // It proves the copied graph before any derived indexes are generated.
+    output.flush()?;
+    output.seek(SeekFrom::Start(0))?;
+    let max_chunk = usize::try_from(limits.max_chunk_uncompressed.min(8 * 1024))
+        .map_err(|_| Error::Invalid("chunk limit exceeds address space"))?;
+    if max_chunk == 0 {
+        return Err(Error::Invalid("chunk limit must be non-zero"));
+    }
+    let target_chunk = max_chunk.min(2 * 1024);
+    let rewrite_chunker = ChunkerConfig {
+        min_size: target_chunk.min(512),
+        target_size: target_chunk,
+        max_size: max_chunk,
+    };
+    let mut writer = ArchiveWriter::open_append(output, rewrite_chunker, limits)?;
+    writer.seal()?;
+    let output = writer.into_inner()?;
+    Ok((
+        output,
+        ArchiveUpgradeReport {
+            source_container_major: source_header.container_major,
+            source_container_minor: source_header.container_minor,
+            output_container_major: output_header.container_major,
+            output_container_minor: output_header.container_minor,
+            file_role: source_header.file_role,
+            source_uuid: source_header.file_uuid,
+            output_uuid,
+            source_created_at_ns: source_header.created_at_ns,
+            output_created_at_ns,
+            canonical_records_copied,
+            derived_records_replaced,
+            manifests_verified: manifest_ids.len() as u64,
+            chunks_verified: chunk_hashes.len() as u64,
+        },
+    ))
+}
+
+/// Verify that an upgraded archive is a faithful physical rewrite of its
+/// source. Header provenance fields may change, but every supported canonical
+/// frame must be byte-identical and in the same order. The output footer path
+/// and all local body bytes are verified as well.
+pub fn verify_upgraded_archive<R1, R2>(
+    source: &mut R1,
+    output: &mut R2,
+    limits: Limits,
+) -> Result<()>
+where
+    R1: Read + Seek,
+    R2: Read + Seek,
+{
+    let source_reader = ArchiveReader::open(&mut *source, limits.clone())?;
+    let source_header = source_reader.header().clone();
+    if !source_reader.is_sealed() || source_reader.recovery_status() != RecoveryStatus::Clean {
+        return Err(Error::Invalid(
+            "upgrade verification source is not clean and sealed",
+        ));
+    }
+    let mut output_reader = ArchiveReader::open(&mut *output, limits.clone())?;
+    let output_header = output_reader.header().clone();
+    if !output_reader.is_sealed()
+        || output_reader.recovery_status() != RecoveryStatus::Clean
+        || output_reader.open_path() != OpenPath::Footer
+    {
+        return Err(Error::Invalid(
+            "upgraded archive did not pass the sealed footer path",
+        ));
+    }
+    if output_header.file_uuid == source_header.file_uuid {
+        return Err(Error::Invalid("upgraded archive reused the source UUID"));
+    }
+    if output_header.container_major != crate::DEFAULT_CONTAINER_MAJOR
+        || output_header.container_minor != crate::DEFAULT_CONTAINER_MINOR
+        || output_header.file_role != source_header.file_role
+        || output_header.required_feature_bits != source_header.required_feature_bits
+        || output_header.optional_feature_bits != source_header.optional_feature_bits
+        || output_header.default_hash_algorithm != source_header.default_hash_algorithm
+        || output_header.zstd_level != source_header.zstd_level
+        || output_header.dictionaries != source_header.dictionaries
+    {
+        return Err(Error::Invalid(
+            "upgraded archive changed a preserved header field",
+        ));
+    }
+    let output_manifest_ids: Vec<_> = output_reader.manifest_ids().copied().collect();
+    for id in &output_manifest_ids {
+        output_reader.write_body(id, &mut std::io::sink())?;
+    }
+    let output_chunks: Vec<_> = output_reader
+        .chunk_records()
+        .map(|record| record.hash)
+        .collect();
+    for hash in &output_chunks {
+        output_reader.read_chunk(hash)?;
+    }
+    drop(source_reader);
+    drop(output_reader);
+
+    let source_end = file_length(source)?
+        .checked_sub(FOOTER_TRAILER_LEN)
+        .ok_or(Error::Invalid("source is shorter than its footer"))?;
+    let output_end = file_length(output)?
+        .checked_sub(FOOTER_TRAILER_LEN)
+        .ok_or(Error::Invalid("output is shorter than its footer"))?;
+    let (_, source_data_offset) = {
+        source.seek(SeekFrom::Start(0))?;
+        read_file_header(&mut *source, &limits)?
+    };
+    let (_, output_data_offset) = {
+        output.seek(SeekFrom::Start(0))?;
+        read_file_header(&mut *output, &limits)?
+    };
+    source.seek(SeekFrom::Start(source_data_offset))?;
+    output.seek(SeekFrom::Start(output_data_offset))?;
+    loop {
+        let source_frame = next_canonical_upgrade_frame(source, source_end, &limits)?;
+        let output_frame = next_canonical_upgrade_frame(output, output_end, &limits)?;
+        match (source_frame, output_frame) {
+            (None, None) => break,
+            (Some(left), Some(right))
+                if left.record_type == right.record_type
+                    && left.schema_version == right.schema_version
+                    && left.flags == right.flags
+                    && left.payload == right.payload => {}
+            _ => {
+                return Err(Error::Invalid(
+                    "upgraded archive canonical record sequence differs from source",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn next_canonical_upgrade_frame<R: Read + Seek>(
+    input: &mut R,
+    scan_end: u64,
+    limits: &Limits,
+) -> Result<Option<RecordFrame>> {
+    while input.stream_position()? < scan_end {
+        let before = input.stream_position()?;
+        let frame = {
+            let mut reader = FrameReader::new(&mut *input, limits);
+            match reader.read_next()? {
+                (FrameRead::Frame, Some(frame)) => frame,
+                _ => return Err(Error::Invalid("incomplete frame in sealed archive")),
+            }
+        };
+        if input.stream_position()? > scan_end {
+            return Err(Error::InvalidDetail(format!(
+                "record at {before} overlaps the sealed footer"
+            )));
+        }
+        match frame.record_type {
+            RecordType::Chunk
+            | RecordType::BodyManifest
+            | RecordType::HeaderBlock
+            | RecordType::StreamIndex
+            | RecordType::Stage
+            | RecordType::Exchange
+            | RecordType::DictionaryData
+            | RecordType::MetadataPage
+            | RecordType::ConversationEntry
+            | RecordType::Generation
+            | RecordType::TurnView => {
+                if frame.schema_version != RECORD_SCHEMA_V1 || frame.flags != RecordFrame::REQUIRED
+                {
+                    return Err(Error::Unsupported(format!(
+                        "unsupported canonical record at {before}"
+                    )));
+                }
+                return Ok(Some(frame));
+            }
+            RecordType::IndexBlock | RecordType::Checkpoint | RecordType::CheckpointLocator => {
+                if frame.schema_version != INDEX_SCHEMA_V1 || frame.flags != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "unsupported derived record at {before}"
+                    )));
+                }
+            }
+            RecordType::Unknown(code) => {
+                return Err(Error::Unsupported(format!(
+                    "unknown optional record type {code} at {before}"
+                )))
+            }
+        }
+    }
+    if input.stream_position()? != scan_end {
+        return Err(Error::Invalid("record stream does not meet sealed footer"));
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryStatus {
     Clean,
@@ -3771,7 +4171,11 @@ fn validate_stage_references(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExchangeData, HeaderAtom, HeaderFidelity, StageData, StageKind, StreamRead};
+    use crate::{
+        ArtifactRangeRef, ConversationEntryData, ExchangeData, GenerationData, GenerationReason,
+        HeaderAtom, HeaderFidelity, ParsedFrame, StageData, StageKind, StreamFrameKind,
+        StreamParser, StreamRead, TurnViewData,
+    };
     use proptest::prelude::*;
 
     fn header() -> FileHeader {
@@ -4471,6 +4875,314 @@ mod tests {
         assert!(matches!(
             writer.append_manifest(malformed),
             Err(Error::Invalid("manifest range exceeds chunk"))
+        ));
+    }
+
+    #[test]
+    fn upgrade_preserves_full_canonical_graph_and_rebuilds_footer() {
+        let mut source_header = header();
+        source_header.required_feature_bits |= REQUIRED_FEATURE_CONVERSATION_DAG;
+        let dictionary = br#"{"role":"assistant","content":"tool"}"#.to_vec();
+        let mut writer = ArchiveWriter::create_with_metadata_dictionary(
+            Cursor::new(Vec::new()),
+            source_header,
+            small_config(),
+            limits(),
+            dictionary,
+            b"fixture-json".to_vec(),
+        )
+        .unwrap();
+        let body = b"data: one\n\ndata: two\n\n";
+        let body_id = writer.append_body(body).unwrap();
+        let headers = HeaderBlock::new(
+            HeaderFidelity::Exact,
+            vec![
+                HeaderAtom {
+                    original_name: b"Set-Cookie".to_vec(),
+                    value: b"a=1".to_vec(),
+                    flags: 7,
+                },
+                HeaderAtom {
+                    original_name: b"Set-Cookie".to_vec(),
+                    value: b"b=2".to_vec(),
+                    flags: 9,
+                },
+            ],
+        );
+        let header_id = writer.append_header_block(headers.clone()).unwrap();
+        let stream = StreamIndex::new(
+            body_id,
+            vec![
+                StreamRead {
+                    byte_offset: 0,
+                    byte_length: 11,
+                    delta_from_first_byte_ns: 0,
+                },
+                StreamRead {
+                    byte_offset: 11,
+                    byte_length: 11,
+                    delta_from_first_byte_ns: 500,
+                },
+            ],
+            vec![ParsedFrame {
+                byte_offset: 0,
+                byte_length: 11,
+                delta_from_first_byte_ns: 0,
+                parser: StreamParser::Sse,
+                frame_kind: StreamFrameKind::SseEvent,
+            }],
+        );
+        let stream_id = writer.append_stream_index(stream.clone()).unwrap();
+        let mut stage_data = StageData::new(StageKind::UpstreamResponse, 456);
+        stage_data.attempt_number = Some(1);
+        stage_data.response_headers_ref = Some(header_id);
+        stage_data.response_body_manifest_ref = Some(body_id);
+        stage_data.stream_index_ref = Some(stream_id);
+        let stage = Stage::new(stage_data);
+        let stage_id = writer.append_stage(stage.clone()).unwrap();
+        let mut exchange_data =
+            ExchangeData::new(b"upgrade-trace".to_vec(), 77, 456, vec![stage_id]);
+        exchange_data.session_id = Some(b"upgrade-session".to_vec());
+        let exchange = Exchange::new(exchange_data);
+        let exchange_id = writer.append_exchange(exchange.clone()).unwrap();
+        let entry =
+            ConversationEntry::new(ConversationEntryData::raw_only(vec![ArtifactRangeRef {
+                manifest_id: body_id,
+                byte_offset: 0,
+                byte_length: 11,
+            }]));
+        let entry_id = writer.append_conversation_entry(entry.clone()).unwrap();
+        let generation = Generation::new(GenerationData {
+            parent_generation_id: None,
+            entries: vec![entry_id],
+            reason: GenerationReason::Initial,
+        });
+        let generation_id = writer.append_generation(generation.clone()).unwrap();
+        let turn = TurnView::new(TurnViewData {
+            trace_id: b"upgrade-trace".to_vec(),
+            generation_id,
+            upto_index: 0,
+            response_entry_refs: vec![entry_id],
+        });
+        let turn_id = writer.append_turn_view(turn.clone()).unwrap();
+        writer.seal().unwrap();
+        let source_bytes = writer.into_inner().unwrap().into_inner();
+
+        let mut source = Cursor::new(source_bytes);
+        let (output, report) = upgrade_archive(
+            &mut source,
+            Cursor::new(Vec::new()),
+            [8; 16],
+            999,
+            b"upgrade-test".to_vec(),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(report.source_uuid, [9; 16]);
+        assert_eq!(report.output_uuid, [8; 16]);
+        assert_eq!(report.manifests_verified, 1);
+        assert!(report.canonical_records_copied >= 3);
+        assert!(report.derived_records_replaced >= 2);
+
+        let mut output = Cursor::new(output.into_inner());
+        source.rewind().unwrap();
+        verify_upgraded_archive(&mut source, &mut output, limits()).unwrap();
+        output.rewind().unwrap();
+        let mut reader = ArchiveReader::open(&mut output, limits()).unwrap();
+        assert_eq!(reader.open_path(), OpenPath::Footer);
+        assert_eq!(reader.header().file_role, crate::FileRole::Standalone);
+        assert_eq!(reader.header().file_uuid, [8; 16]);
+        assert_eq!(reader.header().created_at_ns, 999);
+        assert_eq!(reader.header().writer, b"upgrade-test");
+        assert_eq!(reader.header_block(&header_id), Some(&headers));
+        assert_eq!(reader.stream_index(&stream_id), Some(&stream));
+        assert_eq!(reader.stage(&stage_id), Some(&stage));
+        assert_eq!(reader.exchange(&exchange_id), Some(&exchange));
+        assert_eq!(reader.conversation_entry(&entry_id), Some(&entry));
+        assert_eq!(reader.generation(&generation_id), Some(&generation));
+        assert_eq!(reader.turn_view(&turn_id), Some(&turn));
+        assert_eq!(reader.read_body(&body_id).unwrap(), body);
+        assert_eq!(
+            reader.exchanges_for_session(b"upgrade-session"),
+            Some([exchange_id].as_slice())
+        );
+    }
+
+    #[test]
+    fn upgrade_rejects_unsealed_future_and_unpreservable_optional_data() {
+        let mut unsealed =
+            ArchiveWriter::create(Cursor::new(Vec::new()), header(), small_config(), limits())
+                .unwrap();
+        unsealed.append_body(b"body").unwrap();
+        let mut unsealed = unsealed.into_inner().unwrap();
+        assert!(upgrade_archive(
+            &mut unsealed,
+            Cursor::new(Vec::new()),
+            [1; 16],
+            1,
+            b"test".to_vec(),
+            limits(),
+        )
+        .is_err());
+
+        let mut future_header = header();
+        future_header.container_minor = crate::DEFAULT_CONTAINER_MINOR + 1;
+        let mut future = ArchiveWriter::create(
+            Cursor::new(Vec::new()),
+            future_header,
+            small_config(),
+            limits(),
+        )
+        .unwrap();
+        future.seal().unwrap();
+        let mut future = future.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut future,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        let mut optional_header = header();
+        optional_header.optional_feature_bits = 1;
+        let mut optional = ArchiveWriter::create(
+            Cursor::new(Vec::new()),
+            optional_header,
+            small_config(),
+            limits(),
+        )
+        .unwrap();
+        optional.seal().unwrap();
+        let mut optional = optional.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut optional,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn upgrade_rejects_unknown_optional_frames_and_dictionary_mismatch() {
+        let mut writer =
+            ArchiveWriter::create(Cursor::new(Vec::new()), header(), small_config(), limits())
+                .unwrap();
+        RecordFrame {
+            record_type: RecordType::Unknown(900),
+            schema_version: RECORD_SCHEMA_V1,
+            flags: 0,
+            payload: b"future".to_vec(),
+            offset: 0,
+        }
+        .write(writer.get_mut())
+        .unwrap();
+        writer.seal().unwrap();
+        let mut unknown = writer.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut unknown,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        let mut writer =
+            ArchiveWriter::create(Cursor::new(Vec::new()), header(), small_config(), limits())
+                .unwrap();
+        RecordFrame {
+            record_type: RecordType::HeaderBlock,
+            schema_version: RECORD_SCHEMA_V1 + 1,
+            flags: 0,
+            payload: b"future schema".to_vec(),
+            offset: 0,
+        }
+        .write(writer.get_mut())
+        .unwrap();
+        writer.seal().unwrap();
+        let mut future_schema = writer.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut future_schema,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        let bytes = b"dictionary bytes".to_vec();
+        let dictionary = StoredDictionary::new(bytes.clone());
+        let mut mismatched_header = header();
+        mismatched_header
+            .dictionaries
+            .push(crate::DictionaryDescriptor {
+                id: dictionary.id,
+                uncompressed_length: bytes.len() as u64,
+                name: b"missing".to_vec(),
+            });
+        let mut mismatch = ArchiveWriter::create(
+            Cursor::new(Vec::new()),
+            mismatched_header,
+            small_config(),
+            limits(),
+        )
+        .unwrap();
+        mismatch.seal().unwrap();
+        let mut mismatch = mismatch.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut mismatch,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn upgrade_rejects_even_current_minor_header_extensions() {
+        let mut bytes = Vec::new();
+        write_file_header(&mut bytes, &header()).unwrap();
+        let old_payload_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        bytes.truncate(12 + old_payload_len);
+        bytes.push(0xa5);
+        bytes[8..12].copy_from_slice(&((old_payload_len + 1) as u32).to_le_bytes());
+        let checksum = crate::format::checksum_parts(&[&bytes[..12], &bytes[12..]]);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        let mut writer =
+            ArchiveWriter::open_append(Cursor::new(bytes), small_config(), limits()).unwrap();
+        writer.append_body(b"header extension fixture").unwrap();
+        writer.seal().unwrap();
+        let mut extended = writer.into_inner().unwrap();
+        assert!(matches!(
+            upgrade_archive(
+                &mut extended,
+                Cursor::new(Vec::new()),
+                [1; 16],
+                1,
+                b"test".to_vec(),
+                limits(),
+            ),
+            Err(Error::Unsupported(_))
         ));
     }
 

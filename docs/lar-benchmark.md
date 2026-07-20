@@ -241,6 +241,37 @@ emitted only at the 8 MiB/30-second cadence. Newly written chunks are read and
 verified directly from their cataloged frame offsets, so immediate reads do not
 require a checkpoint or a full active-pack scan.
 
+## Long-session Trace Browser backend
+
+The ignored release benchmark can be rerun with:
+
+```sh
+cargo test -p alex-proxy --test lar_rollout_benchmark --release \
+  long_session_trace_browser_http_paging_and_cancellation -- \
+  --ignored --nocapture --test-threads=1
+```
+
+It measures 50-turn tail and older pages, search-to-anchor navigation, and
+navigation/health immediately after cancelled concurrent transcript requests.
+The default 1,500-turn fixture spans active and sealed packs and deletes its
+legacy gzip rollback files before timing, so every body must come from the
+production LAR catalog and reader. The output is an
+`alex-lar-rollout-benchmark-v1` JSON record; workload and optional p99 threshold
+variables are documented in
+[LAR rollout performance gates](lar-rollout-performance-gates.md#long-session-trace-browser-backend).
+
+Linux development-host release result (2026-07-20): the full 1,500-turn,
+40-sample workload completed with 47 sealed body packs plus one active pack and
+320/320 client requests cancelled under pressure. Measured p50/p95/p99 latency
+was 82.98/137.90/138.83 ms for the tail page, 29.23/90.02/95.74 ms for an older
+page, 19.56/54.52/60.53 ms for search plus the anchored page,
+17.82/73.16/97.62 ms for post-cancellation navigation, and
+0.15/0.20/0.22 ms for post-cancellation health. Thresholds were unconfigured.
+This is a development baseline, not an accepted hardware gate. The benchmark
+stops at decoded loopback HTTP responses and therefore cannot replace the
+required macOS rendering, cancellation/navigation, and indicator-stability
+run.
+
 ## Sealed random-access path
 
 Run the ignored release benchmark with:

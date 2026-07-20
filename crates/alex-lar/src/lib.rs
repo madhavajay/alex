@@ -15,8 +15,9 @@ mod replay;
 mod search;
 
 pub use archive::{
-    read_chunk_record_at, ArchiveReader, ArchiveWriter, CheckpointRecordDescriptor,
-    ChunkRecordDescriptor, OpenPath, RecoveryStatus,
+    read_chunk_record_at, upgrade_archive, verify_upgraded_archive, ArchiveReader,
+    ArchiveUpgradeReport, ArchiveWriter, CheckpointRecordDescriptor, ChunkRecordDescriptor,
+    OpenPath, RecoveryStatus,
 };
 pub use chunker::{ChunkerConfig, StreamingChunker};
 pub use conversation::{

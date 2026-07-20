@@ -1,0 +1,14 @@
+{
+  "schema": "alex-trace-browser-long-session-shape-v1",
+  "provenance": "Aggregate-only synthetic shape; contains no captured text, identifiers, paths, headers, or hashes.",
+  "session_id": "synthetic-long-session",
+  "turn_count": 1277,
+  "duration_ms": 54000000,
+  "page_size": 50,
+  "duplicate_timestamp_group": 3,
+  "user_chars": 8192,
+  "assistant_chars": 16384,
+  "tool_every": 7,
+  "search_turn": 638,
+  "search_needle": "synthetic-browser-needle-638"
+}

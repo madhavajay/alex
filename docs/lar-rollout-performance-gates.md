@@ -68,6 +68,64 @@ Optional release gates:
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P95_MS`
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P99_MS`
 
+## Long-session Trace Browser backend
+
+Run the production-route backend measurement with:
+
+```sh
+cargo test -p alex-proxy --test lar_rollout_benchmark --release \
+  long_session_trace_browser_http_paging_and_cancellation -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The default fixture writes 1,500 provider-shaped turns with 32 KiB repeated
+request prefixes through `LarWithFallback`, forces both sealed and active body
+packs, verifies every request and response has a validated LAR pointer, and
+then removes every legacy gzip fallback. Timed reads therefore fail rather
+than silently leaving the production LAR path. Every transcript request uses
+the public authenticated HTTP route and a 50-turn page.
+
+Forty samples measure initial tail paging, an older cursor page, and the full
+search-to-anchored-page navigation. Each sample also starts eight concurrent
+long-session pages, cancels their client tasks, then measures navigation to a
+different session and the public health route. Responses must retain the
+requested session/cursor, stay within the transcript body-byte budget, contain
+no body errors or truncations, and leave the daemon healthy after cancellation.
+The report distinguishes tasks cancelled by the abort from responses that
+completed before the abort, avoiding a timing-dependent failure on fast hosts.
+
+Workload overrides:
+
+- `ALEX_LAR_BENCH_BROWSER_TURNS`
+- `ALEX_LAR_BENCH_BROWSER_SAMPLES`
+- `ALEX_LAR_BENCH_BROWSER_PREFIX_BYTES`
+- `ALEX_LAR_BENCH_BROWSER_CANCEL_REQUESTS`
+
+Optional release gates:
+
+- `ALEX_LAR_BENCH_MAX_BROWSER_TAIL_P99_MS`
+- `ALEX_LAR_BENCH_MAX_BROWSER_OLDER_P99_MS`
+- `ALEX_LAR_BENCH_MAX_BROWSER_SEARCH_ANCHOR_P99_MS`
+- `ALEX_LAR_BENCH_MAX_BROWSER_POST_CANCEL_NAVIGATION_P99_MS`
+- `ALEX_LAR_BENCH_MAX_BROWSER_POST_CANCEL_HEALTH_P99_MS`
+
+This is deliberately a backend gate. It includes loopback HTTP, authentication,
+SQLite cursor/search work, catalog resolution, LAR reads, decompression, JSON
+translation, response transfer, and client JSON decoding. It does not measure
+AppKit/SwiftUI rendering, main-actor scheduling, window navigation, or the
+visual stability of loading and daemon indicators. Client cancellation may
+leave already-started blocking reads to finish; the post-cancellation samples
+measure the resulting service responsiveness. Consequently this benchmark
+does not complete the end-to-end macOS Trace Browser checklist item.
+
+Linux development-host release baseline (2026-07-20), with thresholds
+unconfigured: 1,500 turns, 40 samples, 47 sealed packs plus one active pack,
+and 320/320 cancellation tasks aborted. Tail-page p99 was 138.83 ms, older-page
+p99 95.74 ms, search-plus-anchor p99 60.53 ms, post-cancellation navigation p99
+97.62 ms, and health p99 0.22 ms. Keep the rollout gates unset until the full
+workload has been repeated and accepted on the agreed Mac hardware; this Linux
+measurement is reproducibility evidence only.
+
 ## Concurrent storage-path precursor
 
 Run only this measurement with:

@@ -35,5 +35,6 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | [LAR storage inventory](lar-storage-inventory.md) | Legacy body/header writers and readers that must move through the unified archive seam. |
 | [LAR operator runbook](lar-operations.md) | Safe beta rollout, migration, verification, cleanup, rollback, downgrade, GC/repack, repair, and incident handling. |
 | [LAR benchmark](lar-benchmark.md) | Reproducible synthetic-corpus storage/verification benchmark and recorded design-gate results. |
+| [Trace Browser long-session core benchmark](trace-browser-long-session-core-benchmark.md) | Aggregate-only 1,277-turn Swift paging/filter/render regression coverage and the explicit boundary before packaged-app automation. |
 | [LAR global-dedup ADR](adr/0001-lar-global-dedup.md) | Decision record for global chunk identity and cross-file deduplication. |
 | [OTAP/Arrow analytics ADR](adr/0003-otap-arrow-derived-analytics.md) | Decision to keep OTAP/Arrow derived and defer a native Rust exporter until its official protocol and API stabilize. |
