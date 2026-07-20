@@ -6813,9 +6813,12 @@ async fn admin_middleware_test(
             )
         }
     };
-    let Some(rule) = rule else {
+    let Some(mut rule) = rule else {
         return error_response(StatusCode::NOT_FOUND, "middleware not found");
     };
+    // Dry runs are explicitly scoped to the requested rule. A user must be
+    // able to validate its behavior before enabling it in the live runtime.
+    rule.enabled = true;
     let context = if let Some(context) = request.context {
         context
     } else if let Some(name) = request.fixture_name.as_deref() {
@@ -18841,7 +18844,7 @@ mod tests {
 
         let mut rule = alex_middleware::fable_to_sol_rule();
         rule.id = "custom.fable-to-sol".into();
-        rule.enabled = true;
+        rule.enabled = false;
         let (validation_status, validation) = response_json(
             admin_middleware_validate(
                 State(state.clone()),
