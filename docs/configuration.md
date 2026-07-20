@@ -26,6 +26,7 @@ dario_api_key = "<redacted-dario-key>"
 trace_body_retention_days = 30
 lar_body_store_mode = "legacy"
 lar_durability = "sync"
+lar_startup_migration = false
 lar_migration_batch_size = 32
 trace_row_retention_days = 0
 update_check_hours = 24
@@ -87,6 +88,7 @@ for a stable build.
 | `trace_body_retention_days` | integer | `30` | Gzip body/header retention window. |
 | `lar_body_store_mode` | string | `legacy` | Body-store rollout mode: `legacy`, shadow-only `dual-write-validated`, or `lar-with-fallback`. Experimental modes retain gzip rollback copies. Shadow mode disables automatic startup import so it cannot publish owner pointers; manual import remains explicit. |
 | `lar_durability` | string | `sync` | LAR publication durability: full `sync`, per-capture data-only `batch`, or shadow-only `best-effort`. `best-effort` is rejected with authoritative `lar-with-fallback` mode. |
+| `lar_startup_migration` | boolean | `false` | Opt in to resumable legacy-to-LAR conversion after daemon health is available. This is independent of body-store mode so installing read-only tooling does not mutate existing data. Shadow-only `dual-write-validated` refuses automatic pointer publication even when enabled. |
 | `lar_migration_batch_size` | integer | `32` | Maximum legacy artifacts attempted in one startup migration pass; valid range `1..=4096`. |
 | `trace_row_retention_days` | integer | `0` | SQLite trace-row retention; `0` means unlimited. |
 | `update_check_hours` | integer | `24` | Release check interval; `0` disables. |
@@ -204,6 +206,7 @@ busy machine with live capture and Trace Browser reads:
 
 ```toml
 lar_migration_batch_size = 32
+lar_startup_migration = true
 
 [lar_migration_resources]
 worker_count = 2

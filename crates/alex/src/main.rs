@@ -1049,6 +1049,11 @@ struct Config {
     /// ALEXANDRIA_LAR_DURABILITY can override it for one daemon process.
     #[serde(default)]
     lar_durability: alex_store::LarDurabilityMode,
+    /// Opt in to resumable legacy conversion after the daemon becomes healthy.
+    /// Kept independent from body-store mode so read-only/dry-run rollout does
+    /// not mutate existing installations merely by upgrading the binary.
+    #[serde(default)]
+    lar_startup_migration: bool,
     #[serde(default = "default_lar_migration_batch_size")]
     lar_migration_batch_size: usize,
     #[serde(default)]
@@ -1433,6 +1438,7 @@ impl Config {
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
             lar_durability: alex_store::LarDurabilityMode::Sync,
+            lar_startup_migration: false,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -3359,8 +3365,8 @@ fn default_lar_migration_batch_size() -> usize {
     STARTUP_LAR_MIGRATION_BATCH
 }
 
-fn should_run_startup_lar_migration(mode: alex_store::LarBodyStoreMode) -> bool {
-    mode != alex_store::LarBodyStoreMode::DualWriteValidated
+fn should_run_startup_lar_migration(enabled: bool, mode: alex_store::LarBodyStoreMode) -> bool {
+    enabled && mode != alex_store::LarBodyStoreMode::DualWriteValidated
 }
 
 /// Start the resumable legacy-body conversion only after the daemon has
@@ -3944,18 +3950,21 @@ async fn main() -> Result<()> {
                 .local_addr()
                 .context("reading bound daemon address for LAR migration readiness")?
                 .port();
-            let lar_migration_task =
-                should_run_startup_lar_migration(state.store.lar_body_store_mode()).then(|| {
-                    spawn_startup_lar_migration_after_ready(
-                        state.store.clone(),
-                        format!(
-                            "{}/health",
-                            daemon_connect_base_url(&bound_host, readiness_port)
-                        ),
-                        config.lar_migration_batch_size,
-                        config.lar_migration_resources.clone(),
-                    )
-                });
+            let lar_migration_task = should_run_startup_lar_migration(
+                config.lar_startup_migration,
+                state.store.lar_body_store_mode(),
+            )
+            .then(|| {
+                spawn_startup_lar_migration_after_ready(
+                    state.store.clone(),
+                    format!(
+                        "{}/health",
+                        daemon_connect_base_url(&bound_host, readiness_port)
+                    ),
+                    config.lar_migration_batch_size,
+                    config.lar_migration_resources.clone(),
+                )
+            });
             let (telegram_command_supervisor, telegram_command_count) =
                 telegram::spawn_command_poller_supervisor(
                     daemon_config.clone(),
@@ -11911,6 +11920,7 @@ mod tests {
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
             lar_durability: alex_store::LarDurabilityMode::Sync,
+            lar_startup_migration: false,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -12728,6 +12738,7 @@ mod tests {
             trace_body_retention_days: default_trace_body_retention_days(),
             lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
             lar_durability: alex_store::LarDurabilityMode::Sync,
+            lar_startup_migration: false,
             lar_migration_batch_size: default_lar_migration_batch_size(),
             lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
@@ -12876,15 +12887,22 @@ min_free_disk_bytes = 1073741824
     }
 
     #[test]
-    fn shadow_mode_never_runs_pointer_publishing_startup_migration() {
-        assert!(should_run_startup_lar_migration(
+    fn startup_migration_is_explicit_and_shadow_mode_never_publishes_pointers() {
+        assert!(!should_run_startup_lar_migration(
+            false,
             alex_store::LarBodyStoreMode::Legacy
         ));
         assert!(!should_run_startup_lar_migration(
+            true,
             alex_store::LarBodyStoreMode::DualWriteValidated
         ));
         assert!(should_run_startup_lar_migration(
+            true,
             alex_store::LarBodyStoreMode::LarWithFallback
+        ));
+        assert!(should_run_startup_lar_migration(
+            true,
+            alex_store::LarBodyStoreMode::Legacy
         ));
     }
 

@@ -47,10 +47,15 @@ fn main() -> Result<(), String> {
     let full = golden::v1_0_full_archive();
     let future = golden::v1_future_minor_optional_archive();
     let conversation = golden::v1_conversation_dag_archive();
+    let exchange_metadata = golden::v1_exchange_metadata_archive();
     for (relative, bytes) in [
         ("testdata/v1.0-full.lar", full.as_slice()),
         ("testdata/v1.future-minor-optional.lar", future.as_slice()),
         ("testdata/v1.conversation-dag.lar", conversation.as_slice()),
+        (
+            "testdata/v1.exchange-metadata.lar",
+            exchange_metadata.as_slice(),
+        ),
         ("fuzz/corpus/record_framing/v1.0-full.lar", full.as_slice()),
         (
             "fuzz/corpus/zstd_decompression/v1.0-full.lar",

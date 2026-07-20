@@ -91,7 +91,8 @@ small manifests and exchange metadata.
 ### 3.4 Operations
 
 - Import the existing SQLite plus `bodies/` layout idempotently.
-- Allow migration to run automatically after startup of a new Alex version.
+- Allow migration to run automatically after startup only when an operator has
+  explicitly enabled it; the rollout default remains read-only/dry-run first.
 - Keep the daemon healthy and old traces readable while migration runs.
 - Resume safely after process interruption, power loss, or partial corruption.
 - Verify imported bytes before changing any trace pointer.
@@ -647,13 +648,15 @@ Inventory and import every legacy artifact category, including:
 
 ### 12.3 Startup behavior
 
-On a version introducing LAR:
+On a version introducing LAR, with startup migration explicitly enabled:
 
 1. Apply additive SQLite schema migrations.
 2. Open and recover active LAR files to the last valid record/checkpoint.
 3. Start the daemon and health/admin endpoints.
 4. Route all new writes to the configured LAR write path.
-5. Start or resume the legacy migrator in the background.
+5. Start or resume the legacy migrator in the background. The
+   `lar_startup_migration` setting defaults to `false`, and startup never runs
+   migration in `dual_write_validated` mode.
 6. Serve old and migrated traces through the same body/transcript APIs.
 
 Migration must not delay normal daemon availability beyond the bounded catalog
@@ -768,6 +771,10 @@ deletion.
 - Repack body packs when garbage exceeds a configurable threshold.
 - Repacking writes a new pack, verifies it, atomically switches catalog
   locations, then retires the old pack.
+- Repacking persists and rechecks the source pack's whole-file identity at
+  planning, copy, switch, and retirement boundaries. Selective graph rewrites
+  reject unknown optional records, optional file features, header extensions,
+  and unsupported record schemas rather than silently dropping them.
 - Never rewrite a sealed pack in place.
 - Archive movement uses an archive-set catalog and stable file UUIDs, not paths.
 - Missing/offline packs produce an explicit `archived_offline` state and can be
@@ -995,7 +1002,10 @@ Current feature-branch evidence (2026-07-20): criteria 2–6, 8, and 10–13 pas
 focused synthetic, production-path, migration, search, and conformance tests.
 Criterion 1 passes the deterministic representative corpus at 5.50x
 (tool-heavy: 17.20x) but still requires the anonymized real-corpus run.
-Criteria 7 and 9 remain rollout gates: the sealed filesystem open plus 1 KiB body
+Criteria 7 and 9 remain rollout gates: criterion 9 now has an ignored
+production-path benchmark reporting live proxy error rate and p50/p95/p99 while
+the throttled importer plus GC/repack accounting run concurrently, but its
+target-Mac thresholds remain unset. The sealed filesystem open plus 1 KiB body
 benchmark is now below 10 ms at 6.10 ms warm p99, but cold-cache evidence on the
 agreed Mac hardware profile remains pending. Built-in Linux/macOS cache advice
 now stays on the exact descriptor used by the reader but is explicitly not
@@ -1003,9 +1013,10 @@ called cold; the benchmark has an external cache-drop-and-verification helper
 mode for the controlled hardware run. The documented 500 MiB/s warm
 large-body reconstruction target passes at 724.9 MiB/s p95 on this Linux host
 with the adaptive large-body profile. The
-3.28/3.67/4.48 ms fresh-pack p50/p95/p99 measurement is sequential rather than
-concurrent with migration or GC. Exact measurements live in
-`docs/lar-benchmark.md`.
+3.28/3.67/4.48 ms fresh-pack p50/p95/p99 measurement remains a narrower
+sequential hot-path result. Exact measurements and the coexistence benchmark
+protocol live in `docs/lar-benchmark.md` and
+`docs/lar-rollout-performance-gates.md`.
 
 ## 20. Implementation tasks
 
@@ -1080,7 +1091,8 @@ work, even when a narrower prototype exists.
 - [x] Implement import → reconstruct → hash/length validation.
 - [x] Implement transactional pointer switch only after validation.
 - [x] Implement mixed-mode reads throughout migration.
-- [x] Start the background migrator after daemon health is available.
+- [x] Start the background migrator after daemon health is available when the
+      explicit default-off `lar_startup_migration` setting is enabled.
 - [x] Implement configurable worker, batch, I/O, CPU/yield, and disk-pressure
       controls.
 - [x] Bound total importer memory independently of archive/corpus index size.
@@ -1125,23 +1137,24 @@ work, even when a narrower prototype exists.
       A deterministic 1,277-turn Swift core benchmark and a 1,500-turn
       production-LAR/public-HTTP backend benchmark now cover paging, bounded
       filtering/render preparation, search anchors, cancellation pressure,
-      navigation, and health. This item remains open until packaged-window
-      automation proves main-actor responsiveness and visual indicator
-      stability on the agreed Mac.
+      navigation, and health. Packaged-window automation additionally exercises
+      body-text discovery, its search spinner, trace-anchored navigation, stale
+      page suppression, and stable indicators. This item remains open until
+      that packaged benchmark actually passes on the agreed Mac.
 
 ### Phase 5 — retention, GC, repair, and archive operations
 
 - [x] Implement reference-aware trace deletion.
 - [x] Implement verified mark-and-sweep.
 - [x] Implement pack garbage accounting and repack thresholds.
-- [x] Implement copy-verify-switch-retire compaction for sealed chunk-only
-      packs, including a final catalog-ownership recheck and recoverable source
-      quarantine after the atomic switch.
-- [ ] Implement copy-verify-switch-retire pack compaction for canonical
-      combined packs. Packs containing manifests, headers, stream indexes,
-      stages, exchanges, exchange-metadata companions, or conversation DAG
-      records remain authoritative and are not selected until repack can
-      rewrite and atomically switch the complete canonical graph.
+- [x] Implement copy-verify-switch-retire compaction for sealed chunk-only and
+      canonical combined packs, including manifests, external cross-pack
+      manifest references, ordered headers, stream indexes, repeated/shared
+      Stage occurrences, zero-stage exchanges, exact ExchangeMetadata
+      companion presence, and the transitive conversation DAG. Planning stores
+      the source whole-file identity; copy and switch verify every canonical
+      value, perform a final catalog-ownership recheck, atomically move the
+      complete graph, and quarantine the source recoverably.
 - [x] Implement archive catalog relocation/offline/reattach behavior.
 - [x] Implement `lar verify` and non-mutating `lar repair`.
 - [x] Implement exact standalone archive packing/import for cataloged LAR
@@ -1201,9 +1214,9 @@ work, even when a narrower prototype exists.
       entry bytes across footer, checkpoint, and forward recovery paths.
 - [x] Unknown provider data round-trips as bounded raw-only conversation
       entries without core parsing.
-- [x] Eligible chunk-only repacking preserves chunk IDs and reconstructed body
-      hashes; combined canonical packs remain covered by the unchecked Phase 5
-      gate.
+- [x] Eligible chunk-only and combined canonical repacking preserves chunk and
+      logical record IDs, exact ExchangeMetadata presence/data, global
+      single-copy cross-pack chunks, and reconstructed body hashes.
 
 ### Integration tests
 

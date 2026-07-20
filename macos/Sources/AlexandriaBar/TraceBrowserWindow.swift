@@ -1913,6 +1913,7 @@ struct TraceBrowserView: View {
                         .scaleEffect(0.5)
                         .frame(width: 12, height: 12)
                         .help("Searching message bodies…")
+                        .traceBrowserBenchmarkMarker("search-loading")
                 }
                 if !model.queryText.isEmpty {
                     Button {

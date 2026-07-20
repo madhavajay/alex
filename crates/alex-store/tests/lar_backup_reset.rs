@@ -86,7 +86,12 @@ fn reset_detaches_but_never_deletes_an_external_standalone_archive() {
     let data_dir = tmpdir("external-catalog");
     let external_dir = tmpdir("external-source");
     let archive_path = external_dir.join("attached.lar");
-    let file = std::fs::File::create(&archive_path).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&archive_path)
+        .unwrap();
     let mut writer = ArchiveWriter::create(
         file,
         FileHeader::standalone([9; 16], 1_000_000, b"reset-test".to_vec()),

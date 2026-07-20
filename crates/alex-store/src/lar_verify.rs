@@ -524,13 +524,46 @@ impl Store {
 
         for manifest in &manifests {
             let Some(file_uuid) = manifest.file_uuid.as_deref() else {
-                issue(
-                    &mut report.issues,
-                    "manifest",
-                    &manifest.id,
-                    "missing_file_pointer",
-                    "ready manifest has no file_uuid",
-                );
+                report.manifests_checked += 1;
+                if manifest.record_id.is_some() {
+                    issue(
+                        &mut report.issues,
+                        "manifest",
+                        &manifest.id,
+                        "record_id_without_file",
+                        "catalog-only manifest must not claim a physical record",
+                    );
+                }
+                let mut sink = HashingSink::default();
+                match self.write_lar_manifest_body(&manifest.id, &mut sink) {
+                    Ok(written) => {
+                        let hash = sink.hasher.finalize().as_bytes().to_vec();
+                        report.bytes_reconstructed =
+                            report.bytes_reconstructed.saturating_add(written);
+                        if manifest.total_length < 0
+                            || written != manifest.total_length as u64
+                            || manifest.hash_algorithm != "blake3"
+                            || hash != manifest.whole_body_hash
+                        {
+                            issue(
+                                &mut report.issues,
+                                "manifest",
+                                &manifest.id,
+                                "metadata_mismatch",
+                                "catalog-only reconstruction differs from catalog length/hash",
+                            );
+                        } else {
+                            reconstructed.insert(manifest.id.clone(), (written, hash));
+                        }
+                    }
+                    Err(error) => issue(
+                        &mut report.issues,
+                        "manifest",
+                        &manifest.id,
+                        "reconstruction_failed",
+                        error.to_string(),
+                    ),
+                }
                 continue;
             };
             if !known_files.contains(file_uuid) {

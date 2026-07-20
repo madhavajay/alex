@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Loopback-only delay proxy for the packaged Trace Browser benchmark.
 
-All responses come from the real Alex daemon. Only the first two older-page
-responses for the generated long session are delayed, making loading and stale
-response suppression deterministic without replacing any production endpoint.
+All responses come from the real Alex daemon. Only the first body-search
+response and first two older-page responses for the generated long session are
+delayed, making spinner observation and stale-response suppression
+deterministic without replacing any production endpoint.
 """
 
 from __future__ import annotations
@@ -32,21 +33,38 @@ HOP_BY_HOP = {
 
 
 class DelayState:
-    def __init__(self, long_session_id: str, delays: list[float]) -> None:
+    def __init__(
+        self, long_session_id: str, delays: list[float], search_delay: float
+    ) -> None:
         self.long_session_path = f"/traces/sessions/{long_session_id}/transcript"
         self.delays = delays
+        self.search_delay = search_delay
         self._older_page_count = 0
+        self._search_count = 0
         self._lock = threading.Lock()
 
-    def delay_for(self, raw_path: str) -> tuple[float, int | None]:
+    def delay_for(self, raw_path: str) -> tuple[float, str | None, int | None]:
         parsed = urlsplit(raw_path)
+        if parsed.path == "/traces/search":
+            with self._lock:
+                self._search_count += 1
+                request_number = self._search_count
+            return (
+                self.search_delay if request_number == 1 else 0.0,
+                "search",
+                request_number,
+            )
         if parsed.path != self.long_session_path or "before_ms" not in parse_qs(parsed.query):
-            return 0.0, None
+            return 0.0, None, None
         with self._lock:
             self._older_page_count += 1
             request_number = self._older_page_count
         index = request_number - 1
-        return (self.delays[index] if index < len(self.delays) else 0.0), request_number
+        return (
+            self.delays[index] if index < len(self.delays) else 0.0,
+            "older-page",
+            request_number,
+        )
 
 
 class BenchmarkProxy(ThreadingHTTPServer):
@@ -96,11 +114,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             connection.request(self.command, self.path, body=body, headers=headers)
             upstream = connection.getresponse()
             response_body = upstream.read()
-            delay, older_page_number = self.server.delay_state.delay_for(self.path)
-            if older_page_number is not None:
+            delay, delay_kind, request_number = self.server.delay_state.delay_for(self.path)
+            if delay_kind is not None:
                 self.log_message(
-                    "older-page response %d delayed %.3fs",
-                    older_page_number,
+                    "%s response %d delayed %.3fs",
+                    delay_kind,
+                    request_number,
                     delay,
                 )
             if delay:
@@ -141,6 +160,12 @@ def parse_args() -> argparse.Namespace:
         default="0.25,1.5",
         help="comma-separated delays in seconds (default: 0.25,1.5)",
     )
+    parser.add_argument(
+        "--search-delay",
+        type=float,
+        default=0.25,
+        help="delay for the first trace-search response in seconds (default: 0.25)",
+    )
     args = parser.parse_args()
     try:
         args.delays = [float(value) for value in args.older_page_delays.split(",")]
@@ -152,6 +177,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--listen-port must be between 0 and 65535")
     if any(delay < 0 for delay in args.delays):
         parser.error("--older-page-delays must not contain negative values")
+    if args.search_delay < 0:
+        parser.error("--search-delay must not be negative")
     return args
 
 
@@ -161,7 +188,7 @@ def main() -> None:
         ("127.0.0.1", args.listen_port),
         args.upstream_host,
         args.upstream_port,
-        DelayState(args.long_session_id, args.delays),
+        DelayState(args.long_session_id, args.delays, args.search_delay),
     )
     args.ready_file.parent.mkdir(parents=True, exist_ok=True)
     args.ready_file.write_text(

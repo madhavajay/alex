@@ -1,9 +1,10 @@
 use alex_lar::{
     write_file_header, ArchiveWriter, ArtifactRangeRef, ChunkerConfig, ConversationEntry,
     ConversationEntryData, ConversationEntryKind, ConversationRole, Exchange, ExchangeData,
-    FileHeader, Generation, GenerationData, GenerationReason, HeaderAtom, HeaderBlock,
-    HeaderFidelity, Limits, RecordFrame, RecordType, Stage, StageData, StageKind, StreamIndex,
-    StreamRead, TurnView, TurnViewData, REQUIRED_FEATURE_CONVERSATION_DAG, SEMANTIC_SCHEMA_V1,
+    ExchangeMetadataData, FileHeader, Generation, GenerationData, GenerationReason, HeaderAtom,
+    HeaderBlock, HeaderFidelity, Limits, RecordFrame, RecordType, Stage, StageData, StageKind,
+    StreamIndex, StreamRead, TurnView, TurnViewData, UnknownExchangeMetadataAttribute,
+    REQUIRED_FEATURE_CONVERSATION_DAG, SEMANTIC_SCHEMA_V1,
 };
 use std::io::Cursor;
 
@@ -182,6 +183,82 @@ pub fn v1_conversation_dag_archive() -> Vec<u8> {
             upto_index: 0,
             response_entry_refs: vec![assistant],
         }))
+        .unwrap();
+    writer.seal().unwrap();
+    writer.into_inner().unwrap().into_inner()
+}
+
+pub fn v1_exchange_metadata_data() -> ExchangeMetadataData {
+    ExchangeMetadataData {
+        ts_request_ms: Some(-123),
+        ts_response_ms: Some(456),
+        harness: Some(b"pi".to_vec()),
+        client_format: Some(b"openai-chat".to_vec()),
+        upstream_format: Some(b"anthropic-messages".to_vec()),
+        method: Some(b"POST".to_vec()),
+        path: Some(b"/v1/chat/completions?raw=1".to_vec()),
+        streamed: Some(false),
+        status: Some(70_000),
+        cost_usd_bits: Some((-0.0f64).to_bits()),
+        billing_bucket: Some(b"subscription".to_vec()),
+        error_kind: Some(b"quota".to_vec()),
+        error_code: Some(b"access_terminated_error".to_vec()),
+        substituted: true,
+        original_model: Some(b"model-a".to_vec()),
+        served_model: Some(b"model-b".to_vec()),
+        substitution_reason: Some(b"quota".to_vec()),
+        injected: true,
+        fixture_name: Some(b"onboarding".to_vec()),
+        attempts_json: Some(br#"[{"account":"one"}]"#.to_vec()),
+        original_account_id: Some(b"account-one".to_vec()),
+        served_account_id: Some(b"account-two".to_vec()),
+        subscription_identity: Some(b"sub-identity".to_vec()),
+        via_dario: true,
+        dario_generation: Some(b"generation-7".to_vec()),
+        tags_json: Some(br#"{"run":"bench"}"#.to_vec()),
+        client_ip: Some(b"127.0.0.1".to_vec()),
+        key_fingerprint: Some(b"sha256:abc".to_vec()),
+        reasoning_effort: Some(b"high".to_vec()),
+        thinking_budget: Some(-1),
+        input_tokens: Some(-2),
+        cached_input_tokens: Some(0),
+        cache_creation_tokens: Some(17),
+        output_tokens: Some(18),
+        reasoning_tokens: Some(19),
+        unknown_attributes: vec![UnknownExchangeMetadataAttribute {
+            key: b"x.future.attribute".to_vec(),
+            value: b"preserve me".to_vec(),
+        }],
+    }
+}
+
+pub fn v1_exchange_metadata_archive() -> Vec<u8> {
+    let header = FileHeader::standalone(
+        [0x4d; 16],
+        1_725_000_002_123_456_789,
+        b"alex-lar-golden-exchange-metadata-v1".to_vec(),
+    );
+    let mut writer = ArchiveWriter::create(
+        Cursor::new(Vec::new()),
+        header,
+        ChunkerConfig {
+            min_size: 64,
+            target_size: 128,
+            max_size: 256,
+        },
+        Limits::default(),
+    )
+    .unwrap();
+    writer.enable_metadata_pages();
+    let mut exchange = ExchangeData::new(
+        b"golden-exchange-metadata-v1",
+        1,
+        1_725_000_002_123_456_789,
+        Vec::new(),
+    );
+    exchange.session_id = Some(b"golden-exchange-metadata-session-v1".to_vec());
+    writer
+        .append_exchange_with_metadata(Exchange::new(exchange), v1_exchange_metadata_data())
         .unwrap();
     writer.seal().unwrap();
     writer.into_inner().unwrap().into_inner()

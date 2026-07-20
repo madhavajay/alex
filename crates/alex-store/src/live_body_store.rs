@@ -1427,12 +1427,16 @@ impl Store {
         Ok(manifest.id)
     }
 
-    pub(crate) fn read_catalog_manifest_body(&self, manifest_id: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn write_catalog_manifest_body<W: Write>(
+        &self,
+        manifest_id: &str,
+        output: &mut W,
+    ) -> Result<Option<u64>> {
         let id: ManifestId = manifest_id.parse().map_err(anyhow::Error::new)?;
         let conn = self.conn.lock().unwrap();
         let physical_manifest_file: Option<Option<String>> = conn
             .query_row(
-                "SELECT file_uuid FROM lar_manifests WHERE manifest_id=?1",
+                "SELECT file_uuid FROM lar_manifests WHERE manifest_id=?1 AND state='ready'",
                 [manifest_id],
                 |row| row.get(0),
             )
@@ -1440,11 +1444,19 @@ impl Store {
         if physical_manifest_file.flatten().is_some() {
             return Ok(None);
         }
-        load_catalog_manifest(&conn, id)?
-            .map(|manifest| {
-                reconstruct_manifest(&conn, &self.data_dir, &manifest, &Limits::default())
-            })
-            .transpose()
+        let Some(manifest) = load_catalog_manifest(&conn, id)? else {
+            return Ok(None);
+        };
+        let mut locations = HashMap::new();
+        for reference in &manifest.chunks {
+            if locations.contains_key(&reference.chunk_hash) {
+                continue;
+            }
+            let chunk = catalog_chunk(&conn, &self.data_dir, &reference.chunk_hash)?
+                .with_context(|| format!("missing catalog chunk {:?}", reference.chunk_hash))?;
+            locations.insert(reference.chunk_hash, chunk);
+        }
+        write_manifest_from_locations(&manifest, &locations, &Limits::default(), output).map(Some)
     }
 
     pub(crate) fn read_catalog_manifest_ranges(
@@ -1834,6 +1846,21 @@ fn stage_kind_name(kind: StageKind) -> String {
     }
 }
 
+fn stage_occurrence_id(file_uuid: &str, trace_id: &str, sequence: u64, content_id: &str) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"alex-lar-stage-occurrence-v1\0");
+    for value in [
+        file_uuid.as_bytes(),
+        trace_id.as_bytes(),
+        content_id.as_bytes(),
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
+    hash.update(&sequence.to_le_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
 pub(crate) fn catalog_capture_stages(
     conn: &Connection,
     file_uuid: &str,
@@ -1848,6 +1875,28 @@ pub(crate) fn catalog_capture_stages(
             .stage(stage_id)
             .with_context(|| format!("live LAR writer lost stage {stage_id}"))?;
         let data = &stage.data;
+        let content_id = stage_id.to_string();
+        let capture_sequence = sequence as u64;
+        let existing_occurrence: Option<String> = conn
+            .query_row(
+                "SELECT stage_id FROM lar_stage_records
+                  WHERE trace_id=?1 AND capture_sequence=?2",
+                params![trace_id, capture_sequence],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let content_id_in_use: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lar_stage_records WHERE stage_id=?1)",
+            [&content_id],
+            |row| row.get(0),
+        )?;
+        let occurrence_id = existing_occurrence.unwrap_or_else(|| {
+            if content_id_in_use {
+                stage_occurrence_id(file_uuid, trace_id, capture_sequence, &content_id)
+            } else {
+                content_id.clone()
+            }
+        });
         conn.execute(
             "INSERT INTO lar_stage_records
                (stage_id, trace_id, capture_sequence, kind, attempt_number,
@@ -1856,12 +1905,12 @@ pub(crate) fn catalog_capture_stages(
                 response_body_manifest_ref, trailers_ref, stream_index_ref,
                 file_uuid, record_id, fidelity)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?1, ?15)
+                     ?13, ?14, ?15, ?16)
              ON CONFLICT(stage_id) DO NOTHING",
             params![
-                stage_id.to_string(),
+                occurrence_id,
                 trace_id,
-                sequence as u64,
+                capture_sequence,
                 stage_kind_name(data.kind),
                 data.attempt_number,
                 data.wall_time_ns,
@@ -1873,6 +1922,7 @@ pub(crate) fn catalog_capture_stages(
                 data.trailers_ref.map(|id| id.to_string()),
                 data.stream_index_ref.map(|id| id.to_string()),
                 file_uuid,
+                content_id,
                 fidelity,
             ],
         )?;
@@ -1886,7 +1936,7 @@ pub(crate) fn catalog_capture_stages(
             crate::lar_fts::attach_stage_manifest_refs(
                 conn,
                 trace_id,
-                &stage_id.to_string(),
+                &occurrence_id,
                 &manifest_id.to_string(),
                 created_at_ms,
             )?;
@@ -2423,7 +2473,9 @@ fn reconcile_live_pack_files(store: &Store, conn: &mut Connection) -> Result<()>
              ON CONFLICT(file_uuid) DO UPDATE SET
                path=excluded.path,
                size_bytes=excluded.size_bytes,
-               state=CASE WHEN excluded.state IN ('sealed','repairing')
+               state=CASE WHEN lar_files.state IN ('retired','offline')
+                          THEN lar_files.state
+                          WHEN excluded.state IN ('sealed','repairing')
                           THEN excluded.state ELSE lar_files.state END",
             params![
                 file_uuid,
@@ -2765,15 +2817,6 @@ fn load_catalog_manifest(conn: &Connection, id: ManifestId) -> Result<Option<Bod
     Ok(Some(manifest))
 }
 
-fn reconstruct_manifest(
-    conn: &Connection,
-    data_dir: &Path,
-    manifest: &BodyManifest,
-    limits: &Limits,
-) -> Result<Vec<u8>> {
-    reconstruct_manifest_counted(conn, data_dir, manifest, limits).map(|(body, _)| body)
-}
-
 fn reconstruct_manifest_counted(
     conn: &Connection,
     data_dir: &Path,
@@ -2852,6 +2895,70 @@ fn reconstruct_manifest_from_locations(
         bail!("reconstructed catalog manifest failed length/hash validation");
     }
     Ok((result, readers.len() as u64))
+}
+
+fn write_manifest_from_locations<W: Write>(
+    manifest: &BodyManifest,
+    locations: &HashMap<ChunkHash, CatalogChunk>,
+    limits: &Limits,
+    output: &mut W,
+) -> Result<u64> {
+    manifest.validate().map_err(anyhow::Error::new)?;
+    let mut readers: HashMap<PathBuf, File> = HashMap::new();
+    let mut cached: Option<(ChunkHash, Vec<u8>)> = None;
+    let mut written = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    for reference in &manifest.chunks {
+        let location = locations
+            .get(&reference.chunk_hash)
+            .with_context(|| format!("missing planned chunk {:?}", reference.chunk_hash))?;
+        if location.descriptor.hash != reference.chunk_hash {
+            bail!("planned chunk location has the wrong content hash");
+        }
+        if cached
+            .as_ref()
+            .is_none_or(|(hash, _)| *hash != reference.chunk_hash)
+        {
+            let path = location.path.clone();
+            if !readers.contains_key(&path) {
+                let file = File::open(&path)
+                    .with_context(|| format!("opening LAR pack {}", path.display()))?;
+                readers.insert(path.clone(), file);
+            }
+            let bytes = read_chunk_record_at(
+                readers.get_mut(&path).expect("reader was inserted"),
+                &location.descriptor,
+                limits,
+            )
+            .map_err(anyhow::Error::new)?;
+            cached = Some((reference.chunk_hash, bytes));
+        }
+        let bytes = &cached.as_ref().expect("chunk was cached").1;
+        let start: usize = reference
+            .chunk_offset
+            .try_into()
+            .context("chunk offset exceeds address space")?;
+        let end: usize = reference
+            .chunk_offset
+            .checked_add(reference.length)
+            .context("chunk range overflow")?
+            .try_into()
+            .context("chunk range exceeds address space")?;
+        let range = bytes
+            .get(start..end)
+            .context("manifest range exceeds catalog chunk")?;
+        output.write_all(range)?;
+        hasher.update(range);
+        written = written
+            .checked_add(range.len() as u64)
+            .context("manifest output length overflow")?;
+    }
+    if written != manifest.total_length
+        || hasher.finalize().as_bytes() != &manifest.whole_body_hash.digest
+    {
+        bail!("reconstructed catalog manifest failed length/hash validation");
+    }
+    Ok(written)
 }
 
 fn reconstruct_manifest_ranges(

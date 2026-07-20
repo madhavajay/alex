@@ -16,9 +16,9 @@ session. It never reads a captured trace corpus or the user's normal Alex home.
    so browser reads must come from LAR.
 4. Starts an actual daemon with `ALEXANDRIA_LAR_BODY_STORE=lar-with-fallback`.
 5. Places a loopback reverse proxy between the packaged app and daemon. The
-   proxy forwards every production endpoint and only delays the first two
-   older-page responses (0.25 s and 1.5 s) to make loading and stale-result
-   suppression observable.
+   proxy forwards every production endpoint and only delays the first body
+   search (0.25 s) plus the first two older-page responses (0.25 s and 1.5 s)
+   to make search loading and stale-result suppression observable.
 6. Launches `Alex.app/Contents/MacOS/AlexandriaBar` directly in an explicit
    benchmark mode. Normal status-item startup is unchanged when that mode is
    absent.
@@ -54,11 +54,14 @@ has `passed: true` and covers:
 
 - targeted initial tail load: exactly 50 of 1,277 turns;
 - one older page: exactly 100 of 1,277 turns;
+- body-text search from the three-turn session, including a visible search
+  spinner and navigation to the expected trace-anchored 50-turn page in the
+  long session;
 - navigation to the three-turn session while a delayed older page is in flight,
   followed by a wait beyond the delay to prove stale-result suppression;
 - navigation back, jump to latest, and adjacent inspector trace navigation;
-- ten one-second poll intervals with no reactivation of session, transcript, or
-  page loading and no daemon-down state;
+- ten one-second poll intervals with no reactivation of session, transcript,
+  page, or search loading and no daemon-down state;
 - a visible, key, attached, non-empty window and committed pane markers;
 - per-phase durations, at least 100 main-actor heartbeat samples, and the
   maximum 10 ms heartbeat gap (250 ms budget).

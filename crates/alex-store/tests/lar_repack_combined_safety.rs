@@ -220,7 +220,7 @@ fn write_combined_archive(path: &Path, body_pack: bool) -> CombinedFixture {
 }
 
 #[test]
-fn repack_never_retires_a_combined_canonical_pack() {
+fn repack_preserves_a_complete_combined_canonical_graph() {
     let root = tmpdir("all-records");
     let store = Store::open(root.clone()).unwrap();
     let seed_path = root.join("seed-standalone.lar");
@@ -247,6 +247,17 @@ fn repack_never_retires_a_combined_canonical_pack() {
             REQUIRED_FEATURE_CONVERSATION_DAG,
             fs::metadata(&body_path).unwrap().len(),
         ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE lar_manifests SET state='unreachable'
+          WHERE manifest_id NOT IN (?1, ?2)",
+        params![fixture.request_manifest, fixture.response_manifest],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM lar_file_identities WHERE file_uuid=?1",
+        [&imported.file_uuid],
     )
     .unwrap();
     drop(conn);
@@ -356,8 +367,31 @@ fn repack_never_retires_a_combined_canonical_pack() {
         "fixture must cross the repack garbage threshold"
     );
     drop(conn);
-    assert!(store.plan_lar_repacks(&config).unwrap().is_empty());
-    assert!(store.run_lar_repack(&config, 10).unwrap().is_none());
+    let candidates = store.plan_lar_repacks(&config).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let report = store.run_lar_repack(&config, 10).unwrap().unwrap();
+    assert_eq!(report.state, "complete");
+    assert!(report.destination_path.is_file());
+    assert!(report.quarantine_path.is_file());
+    let mut replacement = ArchiveReader::open(
+        File::open(&report.destination_path).unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(replacement.manifest_count(), 2);
+    assert_eq!(replacement.header_block_count(), 1);
+    assert_eq!(replacement.stream_index_count(), 1);
+    assert_eq!(replacement.stage_count(), 2);
+    assert_eq!(replacement.exchange_count(), 1);
+    assert_eq!(replacement.conversation_entry_count(), 2);
+    assert_eq!(replacement.generation_count(), 1);
+    assert_eq!(replacement.turn_view_count(), 1);
+    assert_eq!(
+        replacement
+            .read_body(&fixture.request_manifest.parse().unwrap())
+            .unwrap(),
+        fixture.request
+    );
 
     assert_eq!(
         store
@@ -414,16 +448,16 @@ fn repack_never_retires_a_combined_canonical_pack() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(source_state, "sealed");
-    assert!(body_path.is_file());
+    assert_eq!(source_state, "retired");
+    assert!(!body_path.exists());
     let refs_to_retired: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM (
                  SELECT c.file_uuid FROM lar_chunks c JOIN lar_files f USING(file_uuid)
-                  WHERE f.state='retired'
+                  WHERE f.state='retired' AND c.state='ready'
                  UNION ALL
                  SELECT m.file_uuid FROM lar_manifests m JOIN lar_files f USING(file_uuid)
-                  WHERE f.state='retired'
+                  WHERE f.state='retired' AND m.state='ready'
                  UNION ALL
                  SELECT h.file_uuid FROM lar_header_blocks h JOIN lar_files f USING(file_uuid)
                   WHERE f.state='retired'

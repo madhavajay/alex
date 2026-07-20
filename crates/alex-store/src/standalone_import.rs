@@ -1186,7 +1186,7 @@ fn attach_stage(
                 &local_content_id,
             )
         } else {
-            local_content_id
+            local_content_id.clone()
         }
     });
     let capture_sequence = to_i64(value.sequence, "stage capture sequence")?;
@@ -1207,7 +1207,7 @@ fn attach_stage(
             response_body_manifest_ref, trailers_ref, stream_index_ref,
             file_uuid, record_id, fidelity)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                 ?13, ?14, ?1, 'captured')
+                 ?13, ?14, ?15, 'captured')
          ON CONFLICT(stage_id) DO NOTHING",
         params![
             stage_id,
@@ -1224,6 +1224,7 @@ fn attach_stage(
             trailers,
             stream_index,
             file_uuid,
+            local_content_id,
         ],
     )?;
     let stored = tx.query_row(
@@ -1265,7 +1266,7 @@ fn attach_stage(
         response_body,
         trailers,
         stream_index,
-        record_id: Some(stage_id.clone()),
+        record_id: Some(local_content_id),
         fidelity: "captured".to_string(),
     };
     if stored != expected {

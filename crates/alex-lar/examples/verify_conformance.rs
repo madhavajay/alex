@@ -106,6 +106,40 @@ fn verify_lar(path: &Path, fixture: &Value, bytes: &[u8]) -> Result<(), String> 
         {
             return Err(format!("{}: turn-view trace index miss", path.display()));
         }
+        if fixture["has_exchange_metadata"].as_bool() == Some(true) {
+            let metadata = reader.exchange_metadata(&exchange.id).ok_or_else(|| {
+                format!("{}: exchange-metadata companion missing", path.display())
+            })?;
+            if metadata.data.harness.as_deref()
+                != fixture["metadata_harness_utf8"].as_str().map(str::as_bytes)
+            {
+                return Err(format!("{}: metadata harness mismatch", path.display()));
+            }
+            if metadata.data.streamed != fixture["metadata_streamed"].as_bool() {
+                return Err(format!("{}: metadata streamed mismatch", path.display()));
+            }
+            if metadata.data.status != fixture["metadata_status"].as_i64() {
+                return Err(format!("{}: metadata status mismatch", path.display()));
+            }
+            if metadata.data.cost_usd_bits != fixture["metadata_cost_usd_bits"].as_u64() {
+                return Err(format!("{}: metadata cost bits mismatch", path.display()));
+            }
+            let expected_key = fixture["metadata_unknown_key_utf8"]
+                .as_str()
+                .map(str::as_bytes);
+            let expected_value = fixture["metadata_unknown_value_utf8"]
+                .as_str()
+                .map(str::as_bytes);
+            if !metadata.data.unknown_attributes.iter().any(|attribute| {
+                Some(attribute.key.as_slice()) == expected_key
+                    && Some(attribute.value.as_slice()) == expected_value
+            }) {
+                return Err(format!(
+                    "{}: metadata unknown optional attribute mismatch",
+                    path.display()
+                ));
+            }
+        }
     }
     if let Some(expected) = fixture["body_utf8"].as_str() {
         let manifest = *reader

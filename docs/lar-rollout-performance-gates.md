@@ -68,6 +68,68 @@ Optional release gates:
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P95_MS`
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P99_MS`
 
+## Live capture during migration and maintenance accounting
+
+Run the production-path coexistence measurement with:
+
+```sh
+cargo test -p alex-proxy --test lar_rollout_benchmark --release \
+  live_capture_during_migration_and_gc_repack_accounting -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The default fixture starts four clients sending 32 requests each through the
+public OpenAI chat route with a 32 KiB prefix. At the same time, the production
+legacy importer converts 128 deterministic, incompressible 64 KiB request
+bodies under a 2 MiB/s I/O throttle, while another thread repeatedly runs the
+production GC reachability query and repack-candidate planner. The fixture
+first creates deleted LAR roots in sealed packs, so both accounting paths have
+real garbage to inspect. It requires the migration to be active when foreground
+capture starts, checks migration and accounting errors, and verifies every
+captured foreground trace found by the benchmark has a published LAR request
+pointer.
+
+The JSON report includes foreground error count/rate, throughput, and request
+latency p50/p95/p99; importer throughput and throttle/yield counters; and
+GC/repack-planning p50/p95/p99 plus their maximum observed garbage counts.
+Only reachability and candidate accounting run here: the benchmark does not
+execute repacks or mutate sealed archive packs.
+
+Workload overrides:
+
+- `ALEX_LAR_BENCH_MAINT_PROXY_WORKERS`
+- `ALEX_LAR_BENCH_MAINT_PROXY_TURNS_PER_WORKER`
+- `ALEX_LAR_BENCH_MAINT_PROXY_PREFIX_BYTES`
+- `ALEX_LAR_BENCH_MAINT_MIGRATION_ARTIFACTS`
+- `ALEX_LAR_BENCH_MAINT_MIGRATION_BODY_BYTES`
+- `ALEX_LAR_BENCH_MAINT_MIGRATION_IO_BYTES_PER_SECOND`
+- `ALEX_LAR_BENCH_MAINT_ACCOUNTING_INTERVAL_MS`
+- `ALEX_LAR_BENCH_MAINT_GARBAGE_ARTIFACTS`
+- `ALEX_LAR_BENCH_MAINT_GARBAGE_BODY_BYTES`
+
+Optional release gates:
+
+- `ALEX_LAR_BENCH_MIN_MAINT_PROXY_OPS_PER_SECOND`
+- `ALEX_LAR_BENCH_MAX_MAINT_PROXY_ERROR_RATE`
+- `ALEX_LAR_BENCH_MAX_MAINT_PROXY_P50_MS`
+- `ALEX_LAR_BENCH_MAX_MAINT_PROXY_P95_MS`
+- `ALEX_LAR_BENCH_MAX_MAINT_PROXY_P99_MS`
+
+Unset values are explicitly reported as `unconfigured`. This local synthetic
+harness is criterion 9 regression evidence, but it does not establish the
+latency/error budget or complete acceptance: the agreed workload, thresholds,
+and Mac hardware run remain required.
+
+A reduced Linux release smoke on 2026-07-20 used 2 clients × 4 turns, 4 KiB
+prefixes, 16 × 16 KiB legacy bodies throttled to 64 KiB/s, and 12 × 64 KiB
+deleted LAR roots. All eight live requests succeeded and published LAR pointers;
+foreground p50/p95/p99 was 43.006/43.916/43.916 ms at 44.76 ops/s. Across 934
+concurrent passes, GC accounting was 0.616/0.857/1.078 ms and repack planning
+was 2.712/3.047/3.323 ms at p50/p95/p99. Migration remained active through the
+foreground workload and completed 16/16 bodies with no failures. Every gate
+was unconfigured. The tiny sample validates overlap and report wiring only; it
+is not a representative latency result or Mac acceptance evidence.
+
 ## Long-session Trace Browser backend
 
 Run the production-route backend measurement with:

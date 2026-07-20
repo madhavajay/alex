@@ -11,6 +11,10 @@ range entries, a generation, and a trace-addressed turn view. It complements
 the frozen pre-DAG `v1.0-full.lar` instead of rewriting that compatibility
 sentinel.
 
+`v1.exchange-metadata.lar` freezes optional Type-15 ExchangeMetadata encoding,
+including every current field, exact floating-point bits, false booleans,
+signed values, and preservation of an unknown optional attribute.
+
 `conformance-v1.json` publishes the exact byte lengths, SHA-256 transport
 digests, and expected semantic reader results. Verify the complete corpus with:
 

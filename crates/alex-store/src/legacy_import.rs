@@ -3403,6 +3403,7 @@ impl Store {
                         &ids.job_id,
                         &item_id,
                         &options.lease_owner,
+                        &plan.trace_id,
                         &exchange_id.to_string(),
                         &file_uuid,
                         plan.session_id.as_deref(),
@@ -3488,8 +3489,19 @@ impl Store {
 
     /// Read a cataloged manifest through the ordinary archive reader.
     pub fn read_lar_manifest_body(&self, manifest_id: &str) -> Result<Vec<u8>> {
-        if let Some(body) = self.read_catalog_manifest_body(manifest_id)? {
-            return Ok(body);
+        let mut body = Vec::new();
+        self.write_lar_manifest_body(manifest_id, &mut body)?;
+        Ok(body)
+    }
+
+    /// Stream a cataloged manifest through the ordinary verified reader.
+    pub fn write_lar_manifest_body<W: Write>(
+        &self,
+        manifest_id: &str,
+        output: &mut W,
+    ) -> Result<u64> {
+        if let Some(written) = self.write_catalog_manifest_body(manifest_id, output)? {
+            return Ok(written);
         }
         let (path, file_uuid, file_state): (String, String, String) = {
             let conn = self.conn.lock().unwrap();
@@ -3522,7 +3534,7 @@ impl Store {
         };
         let id = ManifestId::from_str(manifest_id)?;
         let mut reader = ArchiveReader::open(file, Limits::default())?;
-        reader.read_body(&id).map_err(Into::into)
+        reader.write_body(&id, output).map_err(Into::into)
     }
 
     /// Resolve a batch of mixed legacy/LAR bodies under one reconstructed-byte

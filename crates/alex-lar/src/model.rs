@@ -18,7 +18,7 @@ impl ChunkHash {
 
 macro_rules! logical_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(pub [u8; 32]);
 
         impl std::fmt::Display for $name {

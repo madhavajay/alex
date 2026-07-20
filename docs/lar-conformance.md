@@ -9,6 +9,8 @@ The public v1 vectors live in `crates/alex-lar/testdata/`:
   skips unknown optional records and schemas;
 - `v1.conversation-dag.lar` covers required feature bit `0x2`, normalized raw
   ranges, generation and turn-view indexes, and exact trace lookup;
+- `v1.exchange-metadata.lar` covers optional Type-15 ExchangeMetadata with all
+  current fields and an unknown optional attribute;
 - `conformance-v1.json` publishes byte lengths, SHA-256 transport digests, and
   expected semantic reader results.
 

@@ -723,6 +723,9 @@ reader accepts a newer minor and skips unknown optional record types and schemas
 overwriting fixtures requires the explicit trailing `-- --write` flag.
 `v1.conversation-dag.lar` separately freezes required feature bit `0x2`, raw
 range entries, generation and turn-view records, and their persisted indexes.
+`v1.exchange-metadata.lar` freezes the optional Type-15 ExchangeMetadata
+companion, including its current field encodings and unknown optional attribute
+preservation.
 `conformance-v1.json` publishes byte lengths, SHA-256 transport digests, and
 semantic expectations for all public fixtures; run
 `cargo run -p alex-lar --example verify_conformance` to validate it.

@@ -46,12 +46,128 @@ pub struct ArchiveUpgradeReport {
     pub chunks_verified: u64,
 }
 
+/// Prove that every physical source feature can be represented by Alex's
+/// selective graph rewriter before it omits unreachable records.
+///
+/// This is intentionally stricter than ordinary reading: readers may skip
+/// optional extensions, while a selective rewrite would silently lose them.
+/// Dictionary-compressed metadata is safe because the graph rewriter decodes
+/// canonical values and re-encodes them without depending on the source
+/// dictionary.
+pub fn validate_selective_rewrite_source<R>(source: &mut R, limits: Limits) -> Result<()>
+where
+    R: Read + Seek,
+{
+    let reader = ArchiveReader::open(&mut *source, limits.clone())?;
+    if !reader.is_sealed() || reader.recovery_status() != RecoveryStatus::Clean {
+        return Err(Error::Invalid(
+            "selective rewrite source must be a clean, sealed archive",
+        ));
+    }
+    let header = reader.header().clone();
+    let data_offset = reader.data_offset();
+    if header.container_major != crate::DEFAULT_CONTAINER_MAJOR
+        || header.container_minor != crate::DEFAULT_CONTAINER_MINOR
+    {
+        return Err(Error::Unsupported(format!(
+            "selective rewrite source container version {}.{}",
+            header.container_major, header.container_minor
+        )));
+    }
+    if header.optional_feature_bits != 0 {
+        return Err(Error::Unsupported(format!(
+            "optional feature bits {:#x} cannot be preserved by selective rewrite",
+            header.optional_feature_bits
+        )));
+    }
+    drop(reader);
+
+    let mut canonical_header = Vec::new();
+    write_file_header(&mut canonical_header, &header)?;
+    if canonical_header.len() as u64 != data_offset {
+        return Err(Error::Unsupported(
+            "file header extension cannot be preserved by selective rewrite".into(),
+        ));
+    }
+
+    let scan_end = file_length(source)?
+        .checked_sub(FOOTER_TRAILER_LEN)
+        .ok_or(Error::Invalid("sealed archive is shorter than its footer"))?;
+    source.seek(SeekFrom::Start(data_offset))?;
+    while source.stream_position()? < scan_end {
+        let offset = source.stream_position()?;
+        let frame = {
+            let mut frame_reader = FrameReader::new(&mut *source, &limits);
+            match frame_reader.read_next()? {
+                (FrameRead::Frame, Some(frame)) => frame,
+                _ => return Err(Error::Invalid("incomplete frame in sealed archive")),
+            }
+        };
+        if source.stream_position()? > scan_end {
+            return Err(Error::InvalidDetail(format!(
+                "record at {offset} overlaps the sealed footer"
+            )));
+        }
+        match frame.record_type {
+            RecordType::Chunk
+            | RecordType::BodyManifest
+            | RecordType::HeaderBlock
+            | RecordType::StreamIndex
+            | RecordType::Stage
+            | RecordType::Exchange
+            | RecordType::DictionaryData
+            | RecordType::MetadataPage
+            | RecordType::ConversationEntry
+            | RecordType::Generation
+            | RecordType::TurnView => {
+                if frame.schema_version != RECORD_SCHEMA_V1 || frame.flags != RecordFrame::REQUIRED
+                {
+                    return Err(Error::Unsupported(format!(
+                        "canonical record type {} at {offset} uses schema {} or flags {:#x}",
+                        frame.record_type.code(),
+                        frame.schema_version,
+                        frame.flags
+                    )));
+                }
+            }
+            RecordType::ExchangeMetadata => {
+                if frame.schema_version != RECORD_SCHEMA_V1 || frame.flags != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "exchange metadata at {offset} uses schema {} or flags {:#x}",
+                        frame.schema_version, frame.flags
+                    )));
+                }
+            }
+            RecordType::IndexBlock | RecordType::Checkpoint | RecordType::CheckpointLocator => {
+                if frame.schema_version != INDEX_SCHEMA_V1 || frame.flags != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "derived record type {} at {offset} uses schema {} or flags {:#x}",
+                        frame.record_type.code(),
+                        frame.schema_version,
+                        frame.flags
+                    )));
+                }
+            }
+            RecordType::Unknown(code) => {
+                return Err(Error::Unsupported(format!(
+                    "optional record type {code} cannot be preserved by selective rewrite"
+                )));
+            }
+        }
+    }
+    if source.stream_position()? != scan_end {
+        return Err(Error::Invalid("record stream does not meet sealed footer"));
+    }
+    Ok(())
+}
+
 /// Rewrite one clean, sealed archive into a newly sealed latest-v1 archive.
 ///
 /// The source is never written. Supported canonical frames remain in their
 /// original physical order with identical type, schema, flags, and payload.
-/// Unknown optional records, header extensions, optional feature bits, and
-/// non-v1 canonical schemas are rejected rather than silently discarded.
+/// Unknown optional outer records are copied byte-for-byte in stream order.
+/// Header extensions, optional file-feature bits, and non-v1 canonical schemas
+/// are rejected when they cannot be reproduced without interpretation.
 pub fn upgrade_archive<R, W>(
     source: &mut R,
     mut output: W,
@@ -1955,7 +2071,51 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
         Ok(body)
     }
 
-    fn append_manifest(&mut self, manifest: BodyManifest) -> Result<ManifestId> {
+    fn verify_manifest_body(&mut self, manifest: &BodyManifest) -> Result<()> {
+        manifest.validate()?;
+        let mut written = 0u64;
+        let mut hasher = blake3::Hasher::new();
+        for reference in &manifest.chunks {
+            let location = self
+                .chunks
+                .get(&reference.chunk_hash)
+                .cloned()
+                .ok_or_else(|| Error::Missing(format!("chunk {:?}", reference.chunk_hash)))?;
+            let chunk = self
+                .read_chunk_at(location.frame_offset)?
+                .decompress(&self.limits)?;
+            let start = usize::try_from(reference.chunk_offset)
+                .map_err(|_| Error::Invalid("manifest chunk range overflow"))?;
+            let end = usize::try_from(
+                reference
+                    .chunk_offset
+                    .checked_add(reference.length)
+                    .ok_or(Error::Invalid("manifest chunk range overflow"))?,
+            )
+            .map_err(|_| Error::Invalid("manifest chunk range overflow"))?;
+            let bytes = chunk
+                .get(start..end)
+                .ok_or(Error::Invalid("manifest range exceeds chunk"))?;
+            hasher.update(bytes);
+            written = written
+                .checked_add(bytes.len() as u64)
+                .ok_or(Error::Invalid("manifest body length overflow"))?;
+        }
+        if written != manifest.total_length
+            || hasher.finalize().as_bytes() != &manifest.whole_body_hash.digest
+        {
+            return Err(Error::Invalid("manifest body identity mismatch"));
+        }
+        Ok(())
+    }
+
+    /// Append an already chunked manifest without changing its chunk ranges or
+    /// logical identity. Every referenced chunk must already exist in this
+    /// physical archive and is revalidated before the canonical manifest is
+    /// published. This is used by graph-preserving archive-set operations such
+    /// as repack; ordinary capture callers should prefer [`Self::append_body`]
+    /// or [`Self::append_reader`].
+    pub fn append_manifest_record(&mut self, manifest: BodyManifest) -> Result<ManifestId> {
         manifest.validate()?;
         let expected = BodyManifest::new(
             manifest.total_length,
@@ -1975,6 +2135,32 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             });
         }
         validate_manifest_references(&manifest, &self.chunks)?;
+        if let Some(existing) = self.manifests.get(&manifest.id) {
+            if existing != &manifest {
+                return Err(Error::Invalid("manifest hash collision"));
+            }
+            return Ok(manifest.id);
+        }
+        // Exact-record insertion must not collapse distinct manifests that
+        // reconstruct the same bytes through different chunk ranges. Their
+        // IDs are part of Stage and ConversationEntry identities. Verify the
+        // complete body before publishing the caller-supplied identity.
+        self.verify_manifest_body(&manifest)?;
+        let identity = (
+            manifest.whole_body_hash,
+            manifest.total_length,
+            manifest.media_type.clone(),
+            manifest.content_encoding.clone(),
+        );
+        let payload = manifest.encode();
+        let id = manifest.id;
+        self.append_metadata_record(RecordType::BodyManifest, id.0, payload)?;
+        self.body_identities.entry(identity).or_insert(id);
+        self.manifests.insert(id, manifest);
+        Ok(id)
+    }
+
+    fn append_manifest(&mut self, manifest: BodyManifest) -> Result<ManifestId> {
         let identity = (
             manifest.whole_body_hash,
             manifest.total_length,
@@ -1992,18 +2178,7 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             }
             return Ok(existing_id);
         }
-        if let Some(existing) = self.manifests.get(&manifest.id) {
-            if existing != &manifest {
-                return Err(Error::Invalid("manifest hash collision"));
-            }
-            return Ok(manifest.id);
-        }
-        let payload = manifest.encode();
-        let id = manifest.id;
-        self.append_metadata_record(RecordType::BodyManifest, id.0, payload)?;
-        self.body_identities.insert(identity, id);
-        self.manifests.insert(id, manifest);
-        Ok(id)
+        self.append_manifest_record(manifest)
     }
 
     fn append_metadata_record(
@@ -4561,6 +4736,58 @@ mod tests {
     }
 
     #[test]
+    fn exact_manifest_copy_preserves_distinct_chunk_topologies() {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ArchiveWriter::create(cursor, header(), small_config(), limits()).unwrap();
+        let body = b"abcdefgh";
+        let whole = writer.append_chunk_record(body).unwrap().hash;
+        let left = writer.append_chunk_record(&body[..4]).unwrap().hash;
+        let right = writer.append_chunk_record(&body[4..]).unwrap().hash;
+        let one_range = BodyManifest::new(
+            body.len() as u64,
+            ChunkHash::blake3(body),
+            None,
+            None,
+            vec![ChunkRef {
+                chunk_hash: whole,
+                chunk_offset: 0,
+                logical_offset: 0,
+                length: body.len() as u64,
+            }],
+        );
+        let two_ranges = BodyManifest::new(
+            body.len() as u64,
+            ChunkHash::blake3(body),
+            None,
+            None,
+            vec![
+                ChunkRef {
+                    chunk_hash: left,
+                    chunk_offset: 0,
+                    logical_offset: 0,
+                    length: 4,
+                },
+                ChunkRef {
+                    chunk_hash: right,
+                    chunk_offset: 0,
+                    logical_offset: 4,
+                    length: 4,
+                },
+            ],
+        );
+        assert_ne!(one_range.id, two_ranges.id);
+        let first = writer.append_manifest_record(one_range).unwrap();
+        let second = writer.append_manifest_record(two_ranges).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(writer.manifest_count(), 2);
+        writer.seal().unwrap();
+
+        let mut reader = ArchiveReader::open(writer.into_inner().unwrap(), limits()).unwrap();
+        assert_eq!(reader.read_body(&first).unwrap(), body);
+        assert_eq!(reader.read_body(&second).unwrap(), body);
+    }
+
+    #[test]
     fn chunk_identity_verification_rejects_hash_collision() {
         let cursor = Cursor::new(Vec::new());
         let mut writer = ArchiveWriter::create(cursor, header(), small_config(), limits()).unwrap();
@@ -5157,6 +5384,7 @@ mod tests {
         assert!(matches!(
             writer.append_manifest(malformed),
             Err(Error::Invalid("manifest range exceeds chunk"))
+                | Err(Error::Invalid("predecessor range exceeds chunk"))
         ));
     }
 
@@ -5370,6 +5598,10 @@ mod tests {
         .unwrap();
         writer.seal().unwrap();
         let mut unknown = writer.into_inner().unwrap();
+        assert!(matches!(
+            validate_selective_rewrite_source(&mut unknown, limits()),
+            Err(Error::Unsupported(_))
+        ));
         let (upgraded, _) = upgrade_archive(
             &mut unknown,
             Cursor::new(Vec::new()),
@@ -5439,6 +5671,24 @@ mod tests {
             ),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn selective_rewrite_accepts_supported_dictionary_pages() {
+        let dictionary = b"manifest messages roles tool results headers".repeat(32);
+        let mut writer = ArchiveWriter::create_with_metadata_dictionary(
+            Cursor::new(Vec::new()),
+            header(),
+            small_config(),
+            limits(),
+            dictionary,
+            b"selective-rewrite-test".to_vec(),
+        )
+        .unwrap();
+        writer.append_body(&vec![b'x'; 8_192]).unwrap();
+        writer.seal().unwrap();
+        let mut source = writer.into_inner().unwrap();
+        validate_selective_rewrite_source(&mut source, limits()).unwrap();
     }
 
     #[test]

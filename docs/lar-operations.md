@@ -194,20 +194,23 @@ alex lar repack apply --min-garbage-ratio 0.25 --json
 ```
 
 Interrupted runs are resumed with `gc resume RUN_ID` or
-`repack resume RUN_ID`. Repack currently selects sealed chunk-only packs: it
-copies reachable chunks, verifies the replacement, switches catalog locations
-atomically, and only then moves the source to quarantine. Combined packs that
-also contain manifests, headers, stream indexes, stages, exchanges, exchange
-metadata, or conversation records are deliberately ineligible until repack can
-rewrite and switch their complete canonical graph. It never edits a sealed
-source in place.
+`repack resume RUN_ID`. Repack selects clean sealed body packs, copies the
+reachable chunks and complete canonical graph, verifies the replacement,
+switches every catalog location atomically, and only then moves the source to
+quarantine. Combined packs preserve manifests, cross-pack external manifest
+references, ordered headers, stream indexes, repeated/shared Stage occurrences,
+zero-stage exchanges, exact ExchangeMetadata companion presence, and the
+transitive conversation DAG. It never edits a sealed source in place.
 
 Selection is intentionally conservative: a source must be a clean sealed body
-pack under Alex's managed LAR directory, contain no non-chunk canonical records,
-and have no catalog-owned manifests, header blocks, stages, or migration
-destinations. The apply transaction rechecks those conditions before switching
-chunk locations. Logical GC and physical reclamation are distinct; the old pack
-is quarantined after the switch rather than permanently deleted.
+pack under Alex's managed LAR directory whose schemas and physical extensions
+the selective writer fully understands. Optional file features, header
+extensions, unknown optional records, or unsupported schemas make the pack
+ineligible instead of being discarded. The durable plan stores the source
+whole-file BLAKE3 identity; copy, switch, and retirement recheck it along with
+catalog reachability and canonical values. Logical GC and physical reclamation
+are distinct; the old pack is quarantined after the switch rather than
+permanently deleted.
 
 ## Standalone export and import
 

@@ -53,6 +53,9 @@ private struct TraceBrowserBenchmarkModelObservation: Codable {
     let transcriptLoading: Bool
     let transcriptPageLoading: Bool
     let transcriptUnreachable: Bool
+    let searchMatchCount: Int
+    let searchScanned: Int
+    let searchInFlight: Bool
     let daemonDown: Bool
 }
 
@@ -183,6 +186,58 @@ final class TraceBrowserPackagedBenchmark {
             passed: olderPassed,
             failure: "older-page navigation did not settle at 100/1277 turns")
 
+        // Reproduce the path that exposed the original long-session issue:
+        // find a session by body text, observe the search spinner, then open
+        // the server-provided trace anchor instead of rebuilding from turn 1.
+        // Turn 638 remains in the repeated conversation prefix through request
+        // 765; request 766 is the deterministic compaction boundary.
+        let searchStarted = ContinuousClock.now
+        model.selectFromUser(configuration.shortSessionId)
+        let shortReadyForSearch = await waitUntil(timeoutSeconds: 10) {
+            model.selectedSessionId == self.configuration.shortSessionId
+                && model.transcriptLoadedTurnCount == 3
+                && !model.transcriptLoading
+                && !model.transcriptPageLoading
+        }
+        let searchSpinnerBaseline = probe.markerActivationCounts["search-loading", default: 0]
+        model.queryText = "turn 638 inspect"
+        let searchSpinnerObserved = await waitUntil(timeoutSeconds: 5) {
+            self.probe.markerActivationCounts["search-loading", default: 0]
+                > searchSpinnerBaseline
+        }
+        let searchSettled = await waitUntil(timeoutSeconds: 20) {
+            !model.searchInFlight
+                && model.searchSessionIds == Set([self.configuration.longSessionId])
+                && model.searchMatchCount > 0
+                && model.visibleRows.contains {
+                    $0.id == self.configuration.longSessionId
+                }
+        }
+        if searchSettled {
+            model.selectFromUser(configuration.longSessionId)
+        }
+        let anchoredPageLoaded = await waitUntil(timeoutSeconds: 10) {
+            model.selectedSessionId == self.configuration.longSessionId
+                && model.transcriptLoadedTurnCount == 50
+                && model.turns.first?.traceId == "synthetic-000765"
+                && !model.transcriptLoading
+                && !model.transcriptPageLoading
+                && !model.transcriptUnreachable
+                && !model.daemonDown
+        }
+        let searchPassed = shortReadyForSearch && searchSpinnerObserved
+            && searchSettled && anchoredPageLoaded
+        recordPhase(
+            "body_search_spinner_and_anchored_navigation",
+            startedAt: searchStarted,
+            passed: searchPassed,
+            failure: "body search did not visibly settle or navigate to the expected long-session trace anchor")
+        model.queryText = ""
+        _ = await waitUntil(timeoutSeconds: 3) {
+            model.searchSessionIds == nil && !model.searchInFlight
+                && !self.probe.activeMarkers.contains("search-loading")
+        }
+
         let staleStarted = ContinuousClock.now
         model.loadEarlierTurns()
         let delayedRequestInFlight = await waitUntil(timeoutSeconds: 3) {
@@ -259,7 +314,7 @@ final class TraceBrowserPackagedBenchmark {
         let stabilityStarted = ContinuousClock.now
         let watchedMarkers = [
             "sessions-loading", "transcript-loading", "page-loading",
-            "conversation-loading", "daemon-down",
+            "conversation-loading", "search-loading", "daemon-down",
         ]
         let activationBaseline = probe.markerActivationCounts
         var stable = true
@@ -402,6 +457,9 @@ final class TraceBrowserPackagedBenchmark {
                 transcriptLoading: model?.transcriptLoading ?? false,
                 transcriptPageLoading: model?.transcriptPageLoading ?? false,
                 transcriptUnreachable: model?.transcriptUnreachable ?? true,
+                searchMatchCount: model?.searchMatchCount ?? 0,
+                searchScanned: model?.searchScanned ?? 0,
+                searchInFlight: model?.searchInFlight ?? false,
                 daemonDown: model?.daemonDown ?? true))
         do {
             let encoder = JSONEncoder()

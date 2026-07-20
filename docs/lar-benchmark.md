@@ -241,6 +241,30 @@ emitted only at the 8 MiB/30-second cadence. Newly written chunks are read and
 verified directly from their cataloged frame offsets, so immediate reads do not
 require a checkpoint or a full active-pack scan.
 
+## Live capture with background maintenance
+
+The ignored release benchmark for success criterion 9 can be rerun with:
+
+```sh
+cargo test -p alex-proxy --test lar_rollout_benchmark --release \
+  live_capture_during_migration_and_gc_repack_accounting -- \
+  --ignored --nocapture --test-threads=1
+```
+
+It sends concurrent requests through the real loopback proxy and live
+`LarWithFallback` writer while the production throttled legacy importer and
+repeated production GC/repack-candidate accounting are active. It reports
+foreground errors, throughput, and p50/p95/p99 latency separately from
+maintenance timings. Repack planning is read-only in this harness; no archive
+pack is rewritten. Workload controls and optional operator thresholds are
+listed in
+[LAR rollout performance gates](lar-rollout-performance-gates.md#live-capture-during-migration-and-maintenance-accounting).
+
+The fixture is deterministic and uses production paths, but it remains local
+synthetic evidence. Criterion 9 stays open until its representative workload,
+latency/error budget, and target-Mac run are agreed and recorded. An unset
+threshold is printed as `unconfigured`, never as a passing gate.
+
 ## Long-session Trace Browser backend
 
 The ignored release benchmark can be rerun with:

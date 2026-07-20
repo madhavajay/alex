@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::Store;
 
-const LAR_CATALOG_SCHEMA_VERSION: i64 = 3;
+const LAR_CATALOG_SCHEMA_VERSION: i64 = 4;
 
 const LAR_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS lar_schema_versions (
@@ -170,8 +170,7 @@ CREATE TABLE IF NOT EXISTS lar_stage_records (
   file_uuid                  TEXT,
   record_id                  TEXT,
   fidelity                   TEXT NOT NULL DEFAULT 'captured',
-  UNIQUE (trace_id, capture_sequence),
-  UNIQUE (file_uuid, record_id)
+  UNIQUE (trace_id, capture_sequence)
 );
 CREATE INDEX IF NOT EXISTS lar_stage_records_trace
   ON lar_stage_records(trace_id, capture_sequence);
@@ -387,6 +386,55 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     )?;
     if !has_header_fidelity_detail {
         tx.execute_batch("ALTER TABLE lar_header_blocks ADD COLUMN fidelity_detail TEXT")?;
+    }
+    let stage_schema: String = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='lar_stage_records'",
+        [],
+        |row| row.get(0),
+    )?;
+    if stage_schema.contains("UNIQUE (file_uuid, record_id)") {
+        // A content-addressed Stage may legitimately occur more than once in
+        // one exchange or be shared across exchanges. `stage_id` identifies
+        // the SQLite occurrence while `record_id` identifies the canonical
+        // Stage record, so physical ownership cannot be unique by record ID.
+        tx.execute_batch(
+            "PRAGMA defer_foreign_keys=ON;
+             CREATE TABLE lar_stage_records_v4 (
+               stage_id TEXT PRIMARY KEY,
+               trace_id TEXT NOT NULL,
+               capture_sequence INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               attempt_number INTEGER,
+               wall_time_ns INTEGER,
+               monotonic_delta_ns INTEGER,
+               request_headers_ref TEXT,
+               request_body_manifest_ref TEXT,
+               response_headers_ref TEXT,
+               response_body_manifest_ref TEXT,
+               trailers_ref TEXT,
+               stream_index_ref TEXT,
+               file_uuid TEXT,
+               record_id TEXT,
+               fidelity TEXT NOT NULL DEFAULT 'captured',
+               UNIQUE (trace_id, capture_sequence)
+             );
+             INSERT INTO lar_stage_records_v4
+               (stage_id, trace_id, capture_sequence, kind, attempt_number,
+                wall_time_ns, monotonic_delta_ns, request_headers_ref,
+                request_body_manifest_ref, response_headers_ref,
+                response_body_manifest_ref, trailers_ref, stream_index_ref,
+                file_uuid, record_id, fidelity)
+             SELECT stage_id, trace_id, capture_sequence, kind, attempt_number,
+                    wall_time_ns, monotonic_delta_ns, request_headers_ref,
+                    request_body_manifest_ref, response_headers_ref,
+                    response_body_manifest_ref, trailers_ref, stream_index_ref,
+                    file_uuid, record_id, fidelity
+               FROM lar_stage_records;
+             DROP TABLE lar_stage_records;
+             ALTER TABLE lar_stage_records_v4 RENAME TO lar_stage_records;
+             CREATE INDEX lar_stage_records_trace
+               ON lar_stage_records(trace_id, capture_sequence);",
+        )?;
     }
     tx.execute(
         "INSERT OR IGNORE INTO lar_schema_versions (version, applied_at_ms)
@@ -1180,6 +1228,7 @@ impl Store {
         job_id: &str,
         item_id: &str,
         lease_owner: &str,
+        trace_id: &str,
         exchange_id: &str,
         file_uuid: &str,
         session_id: Option<&str>,
@@ -1192,6 +1241,7 @@ impl Store {
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
     {
+        require_nonempty(trace_id, "trace_id")?;
         require_nonempty(exchange_id, "exchange_id")?;
         require_nonempty(file_uuid, "exchange file UUID")?;
         let stage_count = u64_to_i64(stage_count, "metadata_stage_count")?;
@@ -1221,6 +1271,43 @@ impl Store {
             {
                 bail!("migration metadata item {item_id} is already bound to another exchange");
             }
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        // Live LarWithFallback capture may win the race after legacy metadata
+        // inventory but before this publication transaction. Its existing
+        // trace ownership is authoritative. Keep the just-appended import
+        // records as unreachable GC input and close the migration item as a
+        // durable skip instead of rebinding the trace or failing the job.
+        let existing_owner: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT exchange_id, file_uuid, stage_count
+                   FROM lar_exchange_records WHERE trace_id=?1",
+                [trace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((existing_exchange, existing_file, existing_stage_count)) = existing_owner {
+            tx.execute(
+                "UPDATE lar_migration_items
+                    SET state='skipped', validation_state='validated',
+                        destination_exchange_id=?2, destination_file_uuid=?3,
+                        metadata_stage_count=?4, error_kind=NULL,
+                        validation_error='superseded by authoritative live LAR exchange',
+                        cleanup_eligible=0, updated_at_ms=?5, completed_at_ms=?5
+                  WHERE item_id=?1 AND job_id=?6
+                    AND state IN ('pending','migrating','failed')",
+                params![
+                    item_id,
+                    existing_exchange,
+                    existing_file,
+                    existing_stage_count,
+                    now_ms,
+                    job_id,
+                ],
+            )?;
+            recount_job(&tx, job_id, now_ms)?;
             tx.commit()?;
             return Ok(false);
         }
@@ -1471,6 +1558,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1536,7 +1624,7 @@ mod tests {
             .unwrap();
 
         let store = Store::open(data_dir.clone()).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 3);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
         {
             let conn = store.conn.lock().unwrap();
             let lar_tables: i64 = conn
@@ -1568,7 +1656,7 @@ mod tests {
         drop(store);
 
         let reopened = Store::open(data_dir).unwrap();
-        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 3);
+        assert_eq!(reopened.lar_catalog_schema_version().unwrap(), 4);
         let conn = reopened.conn.lock().unwrap();
         let version_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM lar_schema_versions", [], |row| {
@@ -1614,7 +1702,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(data_dir).unwrap();
-        assert_eq!(store.lar_catalog_schema_version().unwrap(), 3);
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
         let conn = store.conn.lock().unwrap();
         let preserved: String = conn
             .query_row(
@@ -1641,6 +1729,158 @@ mod tests {
             )
             .unwrap();
         assert_eq!(variants, 2);
+    }
+
+    #[test]
+    fn v3_stage_ownership_upgrade_allows_repeated_canonical_records() {
+        let data_dir = tmpdir("stage-v3-upgrade");
+        let db_path = data_dir.join("alexandria.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(crate::SCHEMA).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lar_stage_records (
+               stage_id TEXT PRIMARY KEY,
+               trace_id TEXT NOT NULL,
+               capture_sequence INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               attempt_number INTEGER,
+               wall_time_ns INTEGER,
+               monotonic_delta_ns INTEGER,
+               request_headers_ref TEXT,
+               request_body_manifest_ref TEXT,
+               response_headers_ref TEXT,
+               response_body_manifest_ref TEXT,
+               trailers_ref TEXT,
+               stream_index_ref TEXT,
+               file_uuid TEXT,
+               record_id TEXT,
+               fidelity TEXT NOT NULL DEFAULT 'captured',
+               UNIQUE (trace_id, capture_sequence),
+               UNIQUE (file_uuid, record_id)
+             );
+             CREATE INDEX lar_stage_records_trace
+               ON lar_stage_records(trace_id, capture_sequence);
+             INSERT INTO lar_stage_records
+               (stage_id, trace_id, capture_sequence, kind, file_uuid, record_id)
+             VALUES ('occurrence-1', 'trace-1', 0, 'client_request',
+                     'pack-1', 'canonical-stage');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(data_dir).unwrap();
+        assert_eq!(store.lar_catalog_schema_version().unwrap(), 4);
+        let conn = store.conn.lock().unwrap();
+        let stage_schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='table' AND name='lar_stage_records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stage_schema.contains("UNIQUE (file_uuid, record_id)"));
+        conn.execute(
+            "INSERT INTO lar_stage_records
+               (stage_id, trace_id, capture_sequence, kind, file_uuid, record_id)
+             VALUES ('occurrence-2', 'trace-2', 0, 'client_request',
+                     'pack-1', 'canonical-stage')",
+            [],
+        )
+        .unwrap();
+        let occurrences: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lar_stage_records
+                  WHERE file_uuid='pack-1' AND record_id='canonical-stage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrences, 2);
+    }
+
+    #[test]
+    fn live_exchange_winning_metadata_import_race_is_a_durable_skip() {
+        let store = Store::open(tmpdir("live-metadata-race")).unwrap();
+        store
+            .ensure_lar_migration_job(&migration_job("job-1"), 1)
+            .unwrap();
+        assert!(store
+            .claim_lar_migration_job("job-1", "worker-a", 2, Duration::from_secs(30))
+            .unwrap());
+        let mut metadata = item("metadata-1", "exchange_metadata", "");
+        metadata.source_path = None;
+        store.discover_lar_migration_item(&metadata, 3).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO lar_archive_sets
+                   (archive_set_uuid, created_at_ms, updated_at_ms, state)
+                 VALUES ('live-set', 1, 1, 'active');
+                 INSERT INTO lar_files
+                   (file_uuid, archive_set_uuid, role, path, state,
+                    container_major, container_minor, created_at_ms, size_bytes)
+                 VALUES ('live-file', 'live-set', 'body-pack', 'live.lar',
+                         'active', 1, 0, 1, 0);
+                 INSERT INTO lar_exchange_records
+                   (trace_id, exchange_id, capture_sequence, stage_count,
+                    file_uuid, fidelity)
+                 VALUES ('trace-1', 'live-exchange', 7, 2,
+                         'live-file', 'captured');",
+            )
+            .unwrap();
+        }
+
+        let catalog_called = Cell::new(false);
+        let published = store
+            .publish_lar_migration_exchange(
+                "job-1",
+                "metadata-1",
+                "worker-a",
+                "trace-1",
+                "legacy-exchange",
+                "unused-import-file",
+                None,
+                1,
+                0,
+                0,
+                4,
+                |_| {
+                    catalog_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(!published);
+        assert!(!catalog_called.get());
+        let conn = store.conn.lock().unwrap();
+        let item: (String, String, String, i64, String) = conn
+            .query_row(
+                "SELECT state, destination_exchange_id, destination_file_uuid,
+                        metadata_stage_count, validation_error
+                   FROM lar_migration_items WHERE item_id='metadata-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            item,
+            (
+                "skipped".into(),
+                "live-exchange".into(),
+                "live-file".into(),
+                2,
+                "superseded by authoritative live LAR exchange".into(),
+            )
+        );
     }
 
     #[test]

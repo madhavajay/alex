@@ -1,15 +1,20 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use alex_auth::Vault;
 use alex_core::TraceRecord;
 use alex_proxy::{build_state, router, set_exo_config, ExoConfig};
 use alex_store::{
-    LarArtifactLocation, LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode, Store,
+    LarArtifactLocation, LarBodyArtifact, LarBodyStoreConfig, LarBodyStoreMode,
+    LarLegacyImportBoundary, LarLegacyImportHook, LarLegacyImportOptions,
+    LarLegacyResourceControls, LarRepackConfig, Store,
 };
 use axum::{routing::post, Json, Router};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde_json::{json, Value};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -420,6 +425,510 @@ async fn concurrent_proxy_throughput_and_added_request_latency() {
     );
 }
 
+fn deterministic_maintenance_bytes(mut state: u64, length: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(length);
+    for _ in 0..length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.push(state as u8);
+    }
+    bytes
+}
+
+fn write_legacy_gzip(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap().sync_all().unwrap();
+}
+
+fn seed_legacy_request(store: &Store, root: &Path, index: usize, body_bytes: usize) -> usize {
+    let id = format!("maintenance-migration-{index:05}");
+    let body = deterministic_maintenance_bytes(0x9e37_79b9_7f4a_7c15 ^ index as u64, body_bytes);
+    let path = root
+        .join("legacy-bodies")
+        .join(format!("{id}.request.json.gz"));
+    write_legacy_gzip(&path, &body);
+    store
+        .insert_trace(&TraceRecord {
+            id,
+            ts_request_ms: 1_770_000_000_000 + index as i64,
+            // Sort ahead of live sessions so the bounded startup batch is a
+            // stable snapshot of the legacy fixture even as new traces arrive.
+            session_id: Some("000-maintenance-migration-session".into()),
+            req_body_path: Some(path.to_string_lossy().into_owned()),
+            ..TraceRecord::default()
+        })
+        .unwrap();
+    body.len()
+}
+
+fn seed_repack_accounting(store: &Store, artifacts: usize, body_bytes: usize) -> (u64, u64, usize) {
+    let mut logical_bytes = 0u64;
+    for index in 0..artifacts {
+        let id = format!("maintenance-garbage-{index:05}");
+        let body =
+            deterministic_maintenance_bytes(0xd1b5_4a32_d192_ed03 ^ index as u64, body_bytes);
+        let write = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace(&id, "client_request"),
+                "request.json",
+                &body,
+            )
+            .unwrap();
+        assert!(
+            write.lar_error.is_none() && write.manifest_id.is_some(),
+            "garbage seed LAR write failed for {id}: {:?}",
+            write.lar_error
+        );
+        store
+            .insert_trace(&TraceRecord {
+                id: id.clone(),
+                ts_request_ms: 1_769_000_000_000 + index as i64,
+                session_id: Some("maintenance-garbage-session".into()),
+                req_body_path: Some(write.legacy_path),
+                ..TraceRecord::default()
+            })
+            .unwrap();
+        for path in store.delete_trace(&id).unwrap() {
+            let _ = std::fs::remove_file(path);
+        }
+        logical_bytes = logical_bytes.saturating_add(body.len() as u64);
+    }
+
+    let gc = store.plan_lar_gc().unwrap();
+    let repack_config = LarRepackConfig {
+        min_garbage_bytes: 1,
+        min_garbage_ratio: 0.01,
+    };
+    let candidates = store.plan_lar_repacks(&repack_config).unwrap();
+    assert!(
+        gc.unreachable_chunks > 0,
+        "garbage seed produced no unreachable chunks"
+    );
+    assert!(
+        !candidates.is_empty(),
+        "garbage seed produced no sealed repack candidates"
+    );
+    (logical_bytes, gc.unreachable_chunks, candidates.len())
+}
+
+struct ObservedRequest {
+    latency: Duration,
+    error: Option<String>,
+}
+
+async fn send_observed_request(
+    client: &reqwest::Client,
+    proxy_url: &str,
+    session_id: &str,
+    body: Vec<u8>,
+) -> ObservedRequest {
+    let started = Instant::now();
+    let result = async {
+        let response = client
+            .post(format!("{proxy_url}/v1/chat/completions"))
+            .header("x-api-key", "alx-local")
+            .header("x-alexandria-harness", "benchmark-maintenance")
+            .header("x-session-id", session_id)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| format!("request: {error}"))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("response body: {error}"))?;
+        if status != reqwest::StatusCode::OK {
+            return Err(format!(
+                "HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+        if bytes.is_empty() {
+            return Err("empty response body".into());
+        }
+        Ok(())
+    }
+    .await;
+    ObservedRequest {
+        latency: started.elapsed(),
+        error: result.err(),
+    }
+}
+
+struct AccountingReport {
+    gc_latencies: Vec<Duration>,
+    repack_plan_latencies: Vec<Duration>,
+    errors: Vec<String>,
+    max_unreachable_chunks: u64,
+    max_repack_candidates: usize,
+}
+
+/// Local production-path evidence for the live-capture budget while the
+/// startup importer and read-only GC/repack accounting overlap. This does not
+/// mutate packs or replace the required threshold run on the rollout Mac.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual release gate for live capture during migration and maintenance accounting"]
+async fn live_capture_during_migration_and_gc_repack_accounting() {
+    let workers = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_WORKERS", 4);
+    let turns_per_worker = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_TURNS_PER_WORKER", 32);
+    let prefix_bytes = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_PREFIX_BYTES", 32 * 1024);
+    let migration_artifacts = env_usize("ALEX_LAR_BENCH_MAINT_MIGRATION_ARTIFACTS", 128);
+    let migration_body_bytes = env_usize("ALEX_LAR_BENCH_MAINT_MIGRATION_BODY_BYTES", 64 * 1024);
+    let migration_io_bytes_per_second = env_usize(
+        "ALEX_LAR_BENCH_MAINT_MIGRATION_IO_BYTES_PER_SECOND",
+        2 * 1024 * 1024,
+    );
+    let accounting_interval_ms = env_usize("ALEX_LAR_BENCH_MAINT_ACCOUNTING_INTERVAL_MS", 10);
+    let garbage_artifacts = env_usize("ALEX_LAR_BENCH_MAINT_GARBAGE_ARTIFACTS", 32);
+    let garbage_body_bytes = env_usize("ALEX_LAR_BENCH_MAINT_GARBAGE_BODY_BYTES", 64 * 1024);
+    assert!(
+        workers > 0
+            && turns_per_worker > 0
+            && prefix_bytes > 0
+            && migration_artifacts > 0
+            && migration_body_bytes > 0
+            && migration_io_bytes_per_second > 0
+            && garbage_artifacts > 0
+            && garbage_body_bytes > 0
+    );
+
+    let root = BenchmarkDir::new("maintenance-overlap");
+    let store = Arc::new(
+        Store::open_with_lar_body_store(
+            root.path().join("store"),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                max_pack_bytes: 512 * 1024,
+                checkpoint_bytes: 128 * 1024,
+                checkpoint_interval: Duration::from_secs(30),
+                writer_lock_timeout: Duration::from_secs(10),
+                ..LarBodyStoreConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let (garbage_logical_bytes, initial_unreachable_chunks, initial_repack_candidates) =
+        seed_repack_accounting(&store, garbage_artifacts, garbage_body_bytes);
+    let migration_logical_bytes = (0..migration_artifacts)
+        .map(|index| seed_legacy_request(&store, root.path(), index, migration_body_bytes) as u64)
+        .sum::<u64>();
+
+    let (upstream_url, upstream) = start_upstream().await;
+    let vault = Arc::new(Vault::open(root.path().join("vault")).unwrap());
+    let state = build_state(
+        "alx-local".into(),
+        vault,
+        store.clone(),
+        None,
+        "http://127.0.0.1:0".into(),
+        Duration::from_secs(60),
+    );
+    set_exo_config(
+        &state,
+        ExoConfig {
+            url: upstream_url,
+            enabled_models: vec!["benchmark-model".into()],
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let proxy_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(workers)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    send_request(
+        &client,
+        &proxy_url,
+        "maintenance-warmup",
+        request_body(usize::MAX, 0, prefix_bytes),
+    )
+    .await;
+
+    let migration_finished = Arc::new(AtomicBool::new(false));
+    let (migration_started_tx, migration_started_rx) = mpsc::channel();
+    let migration_hook = LarLegacyImportHook::new(move |boundary| {
+        if boundary == LarLegacyImportBoundary::JobClaimed {
+            let _ = migration_started_tx.send(());
+        }
+        Ok(())
+    });
+    let migration_store = store.clone();
+    let migration_finished_worker = migration_finished.clone();
+    let migration_started_at = Instant::now();
+    let migration_worker = std::thread::spawn(move || {
+        let report = migration_store.run_lar_legacy_import(&LarLegacyImportOptions {
+            limit: Some(migration_artifacts),
+            batch_size: 16,
+            lease_owner: "proxy-maintenance-benchmark-migrator".into(),
+            resources: LarLegacyResourceControls {
+                worker_count: 2,
+                io_bytes_per_second: Some(migration_io_bytes_per_second as u64),
+                cpu_budget_percent: 50,
+                yield_every_artifacts: 1,
+                max_memory_bytes: 16 * 1024 * 1024,
+                max_pack_bytes: 64 * 1024 * 1024,
+                max_pack_index_entries: 65_536,
+                min_free_disk_bytes: None,
+            },
+            suffix_artifacts: Vec::new(),
+            boundary_hook: Some(migration_hook),
+            ..LarLegacyImportOptions::default()
+        });
+        migration_finished_worker.store(true, Ordering::Release);
+        report
+    });
+    migration_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("migration did not reach the claimed boundary");
+
+    let accounting_stop = Arc::new(AtomicBool::new(false));
+    let accounting_store = store.clone();
+    let accounting_stop_worker = accounting_stop.clone();
+    let accounting_worker = std::thread::spawn(move || {
+        let mut report = AccountingReport {
+            gc_latencies: Vec::new(),
+            repack_plan_latencies: Vec::new(),
+            errors: Vec::new(),
+            max_unreachable_chunks: 0,
+            max_repack_candidates: 0,
+        };
+        let repack_config = LarRepackConfig {
+            min_garbage_bytes: 1,
+            min_garbage_ratio: 0.01,
+        };
+        while !accounting_stop_worker.load(Ordering::Acquire) {
+            let began = Instant::now();
+            match accounting_store.plan_lar_gc() {
+                Ok(gc) => {
+                    report.gc_latencies.push(began.elapsed());
+                    report.max_unreachable_chunks =
+                        report.max_unreachable_chunks.max(gc.unreachable_chunks);
+                }
+                Err(error) => report.errors.push(format!("GC accounting: {error:#}")),
+            }
+            let began = Instant::now();
+            match accounting_store.plan_lar_repacks(&repack_config) {
+                Ok(candidates) => {
+                    report.repack_plan_latencies.push(began.elapsed());
+                    report.max_repack_candidates =
+                        report.max_repack_candidates.max(candidates.len());
+                }
+                Err(error) => report
+                    .errors
+                    .push(format!("repack candidate accounting: {error:#}")),
+            }
+            if accounting_interval_ms > 0 {
+                std::thread::sleep(Duration::from_millis(accounting_interval_ms as u64));
+            }
+        }
+        report
+    });
+
+    assert!(
+        !migration_finished.load(Ordering::Acquire),
+        "migration completed before the foreground workload began; lower the configured migration I/O rate or increase its fixture"
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(workers + 1));
+    let foreground_handles = (0..workers)
+        .map(|worker| {
+            let client = client.clone();
+            let proxy_url = proxy_url.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let mut observations = Vec::with_capacity(turns_per_worker);
+                barrier.wait().await;
+                for turn in 0..turns_per_worker {
+                    observations.push(
+                        send_observed_request(
+                            &client,
+                            &proxy_url,
+                            &format!("maintenance-live-{worker:02}"),
+                            request_body(worker, turn, prefix_bytes),
+                        )
+                        .await,
+                    );
+                }
+                observations
+            })
+        })
+        .collect::<Vec<_>>();
+    let foreground_started_at = Instant::now();
+    barrier.wait().await;
+    let mut observations = Vec::with_capacity(workers * turns_per_worker);
+    for handle in foreground_handles {
+        observations.extend(handle.await.unwrap());
+    }
+    let foreground_elapsed = foreground_started_at.elapsed();
+    let migration_overlapped_foreground_end = !migration_finished.load(Ordering::Acquire);
+
+    let migration_report = migration_worker.join().unwrap().unwrap();
+    let migration_elapsed = migration_started_at.elapsed();
+    accounting_stop.store(true, Ordering::Release);
+    let accounting_report = accounting_worker.join().unwrap();
+    server.abort();
+    upstream.abort();
+
+    assert_eq!(migration_report.failed, 0, "{migration_report:#?}");
+    assert_eq!(migration_report.migrated as usize, migration_artifacts);
+    assert!(
+        accounting_report.errors.is_empty(),
+        "{}",
+        accounting_report.errors.join("; ")
+    );
+    assert!(!accounting_report.gc_latencies.is_empty());
+    assert!(!accounting_report.repack_plan_latencies.is_empty());
+    assert!(accounting_report.max_unreachable_chunks >= initial_unreachable_chunks);
+    assert!(accounting_report.max_repack_candidates >= initial_repack_candidates);
+
+    let foreground_operations = workers * turns_per_worker;
+    let errors = observations
+        .iter()
+        .filter_map(|observation| observation.error.clone())
+        .collect::<Vec<_>>();
+    let error_rate = errors.len() as f64 / foreground_operations as f64;
+    let latencies = observations
+        .into_iter()
+        .map(|observation| observation.latency)
+        .collect::<Vec<_>>();
+    let mut sorted_latencies = latencies.clone();
+    sorted_latencies.sort_unstable();
+    let p50_ms = percentile_ms(&sorted_latencies, 50);
+    let p95_ms = percentile_ms(&sorted_latencies, 95);
+    let p99_ms = percentile_ms(&sorted_latencies, 99);
+    let operations_per_second = foreground_operations as f64 / foreground_elapsed.as_secs_f64();
+
+    let traces = store
+        .list_traces(
+            migration_artifacts + foreground_operations + garbage_artifacts + 16,
+            None,
+            None,
+        )
+        .unwrap();
+    let live_trace_ids = traces
+        .iter()
+        .filter(|trace| trace["harness"] == "benchmark-maintenance")
+        .filter_map(|trace| trace["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        live_trace_ids.len() >= foreground_operations.saturating_sub(errors.len())
+            && live_trace_ids.len() <= foreground_operations,
+        "expected every successful foreground request to publish one trace: operations={foreground_operations}, errors={}, traces={}",
+        errors.len(),
+        live_trace_ids.len()
+    );
+    for trace_id in &live_trace_ids {
+        let location = store
+            .lar_artifact_location("trace", trace_id, "client_request", None)
+            .unwrap();
+        assert!(
+            matches!(location, Some(LarArtifactLocation::Lar { .. })),
+            "live trace {trace_id} did not publish its client request to LAR: {location:?}"
+        );
+    }
+
+    emit_report(
+        "live_capture_during_migration_and_gc_repack_accounting",
+        json!({
+            "workload": {
+                "proxy_workers": workers,
+                "turns_per_worker": turns_per_worker,
+                "foreground_operations": foreground_operations,
+                "request_prefix_bytes": prefix_bytes,
+                "migration_artifacts": migration_artifacts,
+                "migration_body_bytes": migration_body_bytes,
+                "migration_logical_bytes": migration_logical_bytes,
+                "migration_io_bytes_per_second": migration_io_bytes_per_second,
+                "garbage_artifacts": garbage_artifacts,
+                "garbage_body_bytes": garbage_body_bytes,
+                "garbage_logical_bytes": garbage_logical_bytes,
+                "accounting_interval_ms": accounting_interval_ms,
+                "maintenance_scope": "legacy_import_plus_read_only_gc_and_repack_candidate_accounting",
+                "transport": "loopback_http_public_openai_chat_route",
+            },
+            "foreground": {
+                "elapsed_ms": foreground_elapsed.as_secs_f64() * 1_000.0,
+                "ops_per_second": operations_per_second,
+                "succeeded": foreground_operations.saturating_sub(errors.len()),
+                "errors": errors.len(),
+                "error_rate": error_rate,
+                "sample_errors": errors.iter().take(8).collect::<Vec<_>>(),
+                "latency": percentile_report(latencies),
+                "lar_client_request_pointers": live_trace_ids.len(),
+            },
+            "migration": {
+                "elapsed_ms": migration_elapsed.as_secs_f64() * 1_000.0,
+                "migrated": migration_report.migrated,
+                "failed": migration_report.failed,
+                "bytes_read": migration_report.bytes_read,
+                "throughput_bytes_per_second": migration_report.throughput_bytes_per_second,
+                "throttled_ms": migration_report.throttled_ms,
+                "yield_count": migration_report.yield_count,
+                "overlapped_foreground_start": true,
+                "still_running_at_foreground_end": migration_overlapped_foreground_end,
+            },
+            "accounting": {
+                "gc_latency": percentile_report(accounting_report.gc_latencies),
+                "repack_plan_latency": percentile_report(accounting_report.repack_plan_latencies),
+                "max_unreachable_chunks": accounting_report.max_unreachable_chunks,
+                "max_repack_candidates": accounting_report.max_repack_candidates,
+                "initial_unreachable_chunks": initial_unreachable_chunks,
+                "initial_repack_candidates": initial_repack_candidates,
+            },
+            "scope": "local_synthetic_production_paths_not_macos_acceptance",
+        }),
+        vec![
+            threshold(
+                "ALEX_LAR_BENCH_MIN_MAINT_PROXY_OPS_PER_SECOND",
+                operations_per_second,
+                "ops/s",
+                ThresholdDirection::Minimum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_MAINT_PROXY_ERROR_RATE",
+                error_rate,
+                "ratio",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_MAINT_PROXY_P50_MS",
+                p50_ms,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_MAINT_PROXY_P95_MS",
+                p95_ms,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+            threshold(
+                "ALEX_LAR_BENCH_MAX_MAINT_PROXY_P99_MS",
+                p99_ms,
+                "ms",
+                ThresholdDirection::Maximum,
+            ),
+        ],
+    );
+}
+
 const BROWSER_PAGE_SIZE: usize = 50;
 const BROWSER_BODY_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
 const BROWSER_SEARCH_MARKER: &str = "tracebrowserbenchmark-7f4a9d3c";
@@ -744,6 +1253,9 @@ async fn long_session_trace_browser_http_paging_and_cancellation() {
             "trace search",
         )
         .await;
+        assert_eq!(search["coverage_complete"], true);
+        assert_eq!(search["scanned"].as_u64(), Some((turns + 3) as u64));
+        assert_eq!(search["body_errors"].as_array().map(Vec::len), Some(0));
         let match_row = &search["traces"].as_array().unwrap()[0];
         assert_eq!(match_row["id"], format!("browser-long-{search_index:05}"));
         assert_eq!(match_row["session_id"], long_session);
