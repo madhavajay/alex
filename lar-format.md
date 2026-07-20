@@ -996,13 +996,17 @@ work, even when a narrower prototype exists.
 
 - [x] Read paged transcript bodies through LAR manifests.
 - [ ] Display stage/attempt timelines and body/header differences.
-- [ ] Display compaction/generation/branch events.
-- [ ] Add raw stream replay with speed controls.
+      Stage and attempt ordering, fidelity, and content-reference change markers
+      are visible, but this remains open until the browser can inspect and diff
+      each stage's actual ordered duplicate headers and body bytes rather than
+      only comparing content-addressed reference IDs.
+- [x] Display compaction/generation/branch events.
+- [x] Add raw stream replay with speed controls.
 - [x] Build normalized-entry FTS indexing and reverse references.
 - [x] Preserve search trace/timestamp anchors.
 - [x] Implement raw `lar grep` with unique-chunk scanning.
 - [x] Prototype page Bloom/trigram filters and measure value/size/privacy cost.
-- [ ] Add offline/archive-missing states without showing daemon down.
+- [x] Add offline/archive-missing states without showing daemon down.
 - [ ] Run an end-to-end macOS long-session Trace Browser benchmark covering
       initial load, paging, rendering, cancellation, navigation, and stable
       loading/daemon indicators.
