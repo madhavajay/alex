@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/alex-middleware",
   "crates/alex-core",
   "crates/alex-auth",
   "crates/alex-store",
@@ -16,6 +17,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/madhavajay/alex"
 
 [workspace.dependencies]
+alex-middleware = { path = "crates/alex-middleware", version = "0.1.25" }
 alex-core = { path = "crates/alex-core", version = "0.1.25" }
 alex-auth = { path = "crates/alex-auth", version = "0.1.25" }
 alex-store = { path = "crates/alex-store", version = "0.1.25" }

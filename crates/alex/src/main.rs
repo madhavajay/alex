@@ -153,6 +153,11 @@ enum Command {
         #[command(subcommand)]
         command: ProtectionCommand,
     },
+    /// Inspect, validate, install, and test request middleware
+    Middleware {
+        #[command(subcommand)]
+        command: MiddlewareCommand,
+    },
     /// Show subscription plans, limit-window utilization, and reset times
     Limits {
         #[arg(long)]
@@ -502,6 +507,54 @@ enum SimulateCommand {
 #[derive(Subcommand)]
 enum ProtectionCommand {
     Preset { name: String },
+}
+
+#[derive(Subcommand)]
+enum MiddlewareCommand {
+    /// Show middleware runtime settings, generation, and reload errors
+    Status,
+    /// List installed declarative middleware rules
+    List,
+    /// Show one installed declarative middleware rule
+    Show { id: String },
+    /// Validate one JSON or TOML rule file without installing it
+    Validate { file: PathBuf },
+    /// Validate and install one JSON or TOML rule file
+    Install { file: PathBuf },
+    /// Enable an installed middleware rule
+    Enable { id: String },
+    /// Disable an installed middleware rule
+    Disable { id: String },
+    /// Remove an installed middleware rule
+    Rm { id: String },
+    /// Atomically reload middleware from disk
+    Reload,
+    /// Dry-run a rule against a fixture, trace, or explicit context
+    Test {
+        id: String,
+        #[arg(
+            long,
+            conflicts_with_all = ["trace", "context"],
+            required_unless_present_any = ["trace", "context"]
+        )]
+        fixture: Option<String>,
+        #[arg(long, conflicts_with_all = ["fixture", "context"])]
+        trace: Option<String>,
+        /// JSON or TOML AttemptResultContext file
+        #[arg(long, conflicts_with_all = ["fixture", "trace"])]
+        context: Option<PathBuf>,
+    },
+    /// List or clear active session route leases
+    Leases {
+        #[command(subcommand)]
+        command: Option<MiddlewareLeasesCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MiddlewareLeasesCommand {
+    /// Clear one active session route lease
+    Clear { id: String },
 }
 
 #[derive(Subcommand)]
@@ -5039,6 +5092,9 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Command::Middleware { command } => {
+            run_middleware_command(&config, command).await?;
+        }
         Command::Keys { command } => match command {
             KeysCommand::Mint {
                 kind,
@@ -7449,6 +7505,252 @@ async fn daemon_get(
         anyhow::bail!("daemon returned {status}: {}", ui::truncate(&body, 300));
     }
     Ok(resp)
+}
+
+fn middleware_path_id<'a>(id: &'a str, kind: &str) -> Result<&'a str> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        anyhow::bail!("invalid {kind} ID '{id}' (use letters, digits, '.', '-', or '_' only)");
+    }
+    Ok(id)
+}
+
+fn middleware_load_value(path: &Path) -> Result<serde_json::Value> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading middleware file {}", path.display()))?;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("json") => serde_json::from_str(&raw)
+            .with_context(|| format!("parsing middleware JSON {}", path.display())),
+        Some(extension) if extension.eq_ignore_ascii_case("toml") => {
+            let value: toml::Value = toml::from_str(&raw)
+                .with_context(|| format!("parsing middleware TOML {}", path.display()))?;
+            serde_json::to_value(value)
+                .with_context(|| format!("converting middleware TOML {}", path.display()))
+        }
+        _ => match serde_json::from_str(&raw) {
+            Ok(value) => Ok(value),
+            Err(json_error) => {
+                let value: toml::Value = toml::from_str(&raw).with_context(|| {
+                    format!(
+                        "parsing middleware file {} as JSON ({json_error}) or TOML",
+                        path.display()
+                    )
+                })?;
+                serde_json::to_value(value)
+                    .with_context(|| format!("converting middleware TOML {}", path.display()))
+            }
+        },
+    }
+}
+
+/// Rule files may contain a bare RuleSpecV1, `{ rule = ... }`, or the
+/// single-entry RuleSetV1 shape used by `middleware/rules.toml`.
+fn middleware_rule_from_file(path: &Path) -> Result<serde_json::Value> {
+    let value = middleware_load_value(path)?;
+    let rule = if let Some(rule) = value.get("rule") {
+        rule.clone()
+    } else if let Some(rules) = value.get("rules") {
+        let rules = rules
+            .as_array()
+            .context("middleware 'rules' field must be an array")?;
+        match rules.as_slice() {
+            [rule] => rule.clone(),
+            [] => anyhow::bail!("middleware rule set contains no rules"),
+            _ => anyhow::bail!(
+                "middleware install/validate accepts one rule at a time; file contains {}",
+                rules.len()
+            ),
+        }
+    } else {
+        value
+    };
+    if !rule.is_object() {
+        anyhow::bail!("middleware rule must be a JSON/TOML object");
+    }
+    Ok(rule)
+}
+
+async fn middleware_status(config: &Config) -> Result<serde_json::Value> {
+    let response = daemon_get(config, "/admin/middleware", &[]).await?;
+    response
+        .json()
+        .await
+        .context("decoding middleware status from daemon")
+}
+
+fn middleware_rule<'a>(status: &'a serde_json::Value, id: &str) -> Result<&'a serde_json::Value> {
+    status["rules"]
+        .as_array()
+        .context("daemon middleware status omitted the rules array")?
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some(id))
+        .with_context(|| format!("unknown middleware rule '{id}'"))
+}
+
+async fn middleware_write(
+    config: &Config,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let (status, response) = daemon_send(config, method, path, body).await?;
+    if !status.is_success() {
+        anyhow::bail!("middleware request failed ({status}): {response}");
+    }
+    Ok(response)
+}
+
+async fn middleware_set_rule_enabled(
+    config: &Config,
+    id: &str,
+    enabled: bool,
+) -> Result<serde_json::Value> {
+    let id = middleware_path_id(id, "middleware rule")?;
+    let status = middleware_status(config).await?;
+    let mut rule = middleware_rule(&status, id)?.clone();
+    rule["enabled"] = json!(enabled);
+    middleware_write(
+        config,
+        reqwest::Method::PUT,
+        &format!("/admin/middleware/rules/{id}"),
+        Some(rule),
+    )
+    .await
+}
+
+async fn run_middleware_command(config: &Config, command: MiddlewareCommand) -> Result<()> {
+    match command {
+        MiddlewareCommand::Status => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&middleware_status(config).await?)?
+            );
+        }
+        MiddlewareCommand::List => {
+            let status = middleware_status(config).await?;
+            let rules = status["rules"]
+                .as_array()
+                .context("daemon middleware status omitted the rules array")?;
+            println!("{}", serde_json::to_string_pretty(rules)?);
+        }
+        MiddlewareCommand::Show { id } => {
+            let id = middleware_path_id(&id, "middleware rule")?;
+            let status = middleware_status(config).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(middleware_rule(&status, id)?)?
+            );
+        }
+        MiddlewareCommand::Validate { file } => {
+            let rule = middleware_rule_from_file(&file)?;
+            let response = middleware_write(
+                config,
+                reqwest::Method::POST,
+                "/admin/middleware/validate",
+                Some(json!({"rule": rule})),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            if response["valid"].as_bool() == Some(false) {
+                anyhow::bail!("middleware validation failed");
+            }
+        }
+        MiddlewareCommand::Install { file } => {
+            let rule = middleware_rule_from_file(&file)?;
+            let response = middleware_write(
+                config,
+                reqwest::Method::POST,
+                "/admin/middleware/rules",
+                Some(rule),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Enable { id } => {
+            let response = middleware_set_rule_enabled(config, &id, true).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Disable { id } => {
+            let response = middleware_set_rule_enabled(config, &id, false).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Rm { id } => {
+            let id = middleware_path_id(&id, "middleware rule")?;
+            let response = middleware_write(
+                config,
+                reqwest::Method::DELETE,
+                &format!("/admin/middleware/rules/{id}"),
+                None,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Reload => {
+            let response = middleware_write(
+                config,
+                reqwest::Method::POST,
+                "/admin/middleware/reload",
+                Some(json!({})),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Test {
+            id,
+            fixture,
+            trace,
+            context,
+        } => {
+            let id = middleware_path_id(&id, "middleware rule")?;
+            if fixture.is_none() && trace.is_none() && context.is_none() {
+                anyhow::bail!("middleware test requires --fixture, --trace, or --context");
+            }
+            let mut payload = json!({"middleware_id": id});
+            if let Some(fixture) = fixture {
+                payload["fixture_name"] = json!(fixture);
+            }
+            if let Some(trace) = trace {
+                payload["trace_id"] = json!(trace);
+            }
+            if let Some(context) = context {
+                payload["context"] = middleware_load_value(&context)?;
+            }
+            let response = middleware_write(
+                config,
+                reqwest::Method::POST,
+                "/admin/middleware/test",
+                Some(payload),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        MiddlewareCommand::Leases { command: None } => {
+            let response = daemon_get(config, "/admin/middleware/leases", &[]).await?;
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .context("decoding middleware leases from daemon")?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        MiddlewareCommand::Leases {
+            command: Some(MiddlewareLeasesCommand::Clear { id }),
+        } => {
+            let id = middleware_path_id(&id, "route lease")?;
+            let response = middleware_write(
+                config,
+                reqwest::Method::DELETE,
+                &format!("/admin/middleware/leases/{id}"),
+                None,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+    }
+    Ok(())
 }
 
 async fn resolve_notification_channel(config: &Config, requested: Option<&str>) -> Result<String> {
@@ -10476,6 +10778,191 @@ mod tests {
             } => assert_eq!(provider.as_deref(), Some("anthropic")),
             _ => panic!("unexpected reauth status parse"),
         }
+    }
+
+    #[test]
+    fn middleware_cli_parses_rule_lifecycle_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "middleware", "status"])
+                .unwrap()
+                .command,
+            Some(Command::Middleware {
+                command: MiddlewareCommand::Status
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "middleware", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Middleware {
+                command: MiddlewareCommand::List
+            })
+        ));
+        match Cli::try_parse_from(["alex", "middleware", "show", "fable-to-sol"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Middleware {
+                command: MiddlewareCommand::Show { id },
+            } => assert_eq!(id, "fable-to-sol"),
+            _ => panic!("unexpected middleware show parse"),
+        }
+        match Cli::try_parse_from(["alex", "middleware", "validate", "rule.toml"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Middleware {
+                command: MiddlewareCommand::Validate { file },
+            } => assert_eq!(file, PathBuf::from("rule.toml")),
+            _ => panic!("unexpected middleware validate parse"),
+        }
+        match Cli::try_parse_from(["alex", "middleware", "install", "rule.json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Middleware {
+                command: MiddlewareCommand::Install { file },
+            } => assert_eq!(file, PathBuf::from("rule.json")),
+            _ => panic!("unexpected middleware install parse"),
+        }
+        for verb in ["enable", "disable", "rm"] {
+            assert!(Cli::try_parse_from(["alex", "middleware", verb, "fable-to-sol"]).is_ok());
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "middleware", "reload"])
+                .unwrap()
+                .command,
+            Some(Command::Middleware {
+                command: MiddlewareCommand::Reload
+            })
+        ));
+    }
+
+    #[test]
+    fn middleware_cli_parses_dry_run_sources_and_lease_commands() {
+        match Cli::try_parse_from([
+            "alex",
+            "middleware",
+            "test",
+            "fable-to-sol",
+            "--fixture",
+            "fable-error",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Middleware {
+                command:
+                    MiddlewareCommand::Test {
+                        id,
+                        fixture: Some(fixture),
+                        trace: None,
+                        context: None,
+                    },
+            } => {
+                assert_eq!(id, "fable-to-sol");
+                assert_eq!(fixture, "fable-error");
+            }
+            _ => panic!("unexpected middleware test parse"),
+        }
+        assert!(Cli::try_parse_from([
+            "alex",
+            "middleware",
+            "test",
+            "fable-to-sol",
+            "--fixture",
+            "fable-error",
+            "--trace",
+            "trace-id",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "alex",
+            "middleware",
+            "test",
+            "fable-to-sol",
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "middleware", "leases"])
+                .unwrap()
+                .command,
+            Some(Command::Middleware {
+                command: MiddlewareCommand::Leases { command: None }
+            })
+        ));
+        match Cli::try_parse_from(["alex", "middleware", "leases", "clear", "lease-123"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Middleware {
+                command:
+                    MiddlewareCommand::Leases {
+                        command: Some(MiddlewareLeasesCommand::Clear { id }),
+                    },
+            } => assert_eq!(id, "lease-123"),
+            _ => panic!("unexpected middleware lease clear parse"),
+        }
+    }
+
+    #[test]
+    fn middleware_rule_files_accept_bare_json_and_single_rule_toml() {
+        let dir = tmpdir("middleware-rule-files");
+        let json_path = dir.join("bare.json");
+        std::fs::write(
+            &json_path,
+            r#"{"id":"bare","name":"Bare","hook":"attempt_result","when":{"models":["fable-*"]},"then":{"continue":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(middleware_rule_from_file(&json_path).unwrap()["id"], "bare");
+
+        let toml_path = dir.join("wrapped.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+api_version = 1
+
+[[rules]]
+id = "wrapped"
+name = "Wrapped"
+hook = "attempt_result"
+
+[rules.when]
+models = ["fable-*"]
+
+[rules.then]
+continue = true
+"#,
+        )
+        .unwrap();
+        let rule = middleware_rule_from_file(&toml_path).unwrap();
+        assert_eq!(rule["id"], "wrapped");
+        assert_eq!(rule["then"]["continue"], true);
+    }
+
+    #[test]
+    fn middleware_rule_files_reject_multi_rule_install_and_unsafe_path_ids() {
+        let dir = tmpdir("middleware-multi-rule-file");
+        let path = dir.join("rules.json");
+        std::fs::write(
+            &path,
+            r#"{"api_version":1,"rules":[{"id":"a"},{"id":"b"}]}"#,
+        )
+        .unwrap();
+        assert!(middleware_rule_from_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("one rule at a time"));
+        assert_eq!(
+            middleware_path_id("alex.rule-1", "middleware rule").unwrap(),
+            "alex.rule-1"
+        );
+        assert!(middleware_path_id("../rules/a", "middleware rule").is_err());
     }
 
     #[test]

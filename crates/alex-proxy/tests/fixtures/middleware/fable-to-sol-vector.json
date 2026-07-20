@@ -1,0 +1,44 @@
+{
+  "description": "A failed Anthropic Fable attempt is replaced by an OpenAI Sol attempt before client commitment.",
+  "request": {
+    "harness": "claude",
+    "session_id": "fixture-session-fable-sol",
+    "client_format": "anthropic_messages",
+    "model": "claude-fable-5"
+  },
+  "failure_fixture": "anthropic-fable-unavailable-529",
+  "expected_decision": {
+    "decision": "reroute",
+    "target": {
+      "kind": "exact",
+      "model": "gpt-5.6-sol",
+      "providers": {
+        "only": [
+          "openai"
+        ]
+      }
+    },
+    "scope": {
+      "scope": "session",
+      "ttl_seconds": 86400
+    }
+  },
+  "expected_attempts": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "status": 529
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "status": 200
+    }
+  ],
+  "next_turn": {
+    "model": "claude-fable-5",
+    "expected_provider": "openai",
+    "expected_model": "gpt-5.6-sol",
+    "anthropic_attempts": 0
+  }
+}

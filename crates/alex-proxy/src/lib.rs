@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod plugins;
+mod middleware;
 pub use plugins::{PluginManager, PluginManifest};
 pub mod notify;
 
@@ -626,6 +627,10 @@ pub struct AppState {
     pub vault: Arc<Vault>,
     pub store: Arc<Store>,
     pub http: reqwest::Client,
+    /// Optional per-provider base URL overrides. Production starts empty; the
+    /// seam exists so local integrations can exercise the complete dispatch,
+    /// retry, and translation path without contacting a live provider.
+    upstream_base_overrides: std::sync::RwLock<HashMap<Provider, String>>,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
     /// Set before graceful shutdown begins. Background provider probes use it
@@ -677,9 +682,10 @@ pub struct AppState {
     codex_affinity: std::sync::Mutex<CodexAffinityCache>,
     codex_affinity_locks:
         std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    substitution: SubstitutionConfig,
     protection: std::sync::RwLock<ProtectionPolicy>,
     protection_persister: std::sync::RwLock<Option<Arc<dyn ProtectionPolicyPersister>>>,
+    middleware: std::sync::RwLock<middleware::MiddlewareRuntime>,
+    middleware_leases: std::sync::Mutex<HashMap<String, middleware::MiddlewareRouteLease>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
     /// Deliberately transient provider-wide fault injection for exercising
@@ -1006,11 +1012,21 @@ pub fn build_state_with_substitution(
         .build()
         .expect("reqwest client");
     let (reset_abort, _) = tokio::sync::watch::channel(0u64);
+    let middleware_root = store.data_dir.join("middleware");
+    let middleware = middleware::MiddlewareRuntime::load(
+        middleware_root.clone(),
+        substitution.clone(),
+    );
+    let middleware_leases = middleware::load_leases(&middleware_root)
+        .into_iter()
+        .map(|lease| (lease.id.clone(), lease))
+        .collect();
     Arc::new(AppState {
         local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
         store: store.clone(),
         http,
+        upstream_base_overrides: std::sync::RwLock::new(HashMap::new()),
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1055,18 +1071,46 @@ pub fn build_state_with_substitution(
         telegram_base: std::sync::RwLock::new("https://api.telegram.org".into()),
         codex_affinity: std::sync::Mutex::new(CodexAffinityCache::default()),
         codex_affinity_locks: std::sync::Mutex::new(HashMap::new()),
-        substitution,
         protection: std::sync::RwLock::new(ProtectionPolicy::default()),
         protection_persister: std::sync::RwLock::new(None),
+        middleware: std::sync::RwLock::new(middleware),
+        middleware_leases: std::sync::Mutex::new(middleware_leases),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
+fn upstream_base(state: &AppState, provider: Provider, default: &str) -> String {
+    state
+        .upstream_base_overrides
+        .read()
+        .ok()
+        .and_then(|overrides| overrides.get(&provider).cloned())
+        .unwrap_or_else(|| default.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Overrides one provider's dispatch base. This deliberately changes only
+/// model traffic; usage/auth endpoints retain their provider-owned URLs.
+/// Primarily used by deterministic middleware and wire integration tests.
+pub fn set_upstream_base_override(
+    state: &Arc<AppState>,
+    provider: Provider,
+    base_url: impl Into<String>,
+) {
+    if let Ok(mut overrides) = state.upstream_base_overrides.write() {
+        overrides.insert(provider, base_url.into());
+    }
+}
+
 pub fn set_protection_policy(state: &Arc<AppState>, policy: ProtectionPolicy) {
     if let Ok(mut slot) = state.protection.write() {
-        *slot = policy;
+        *slot = policy.clone();
+    }
+    if let Ok(mut runtime) = state.middleware.write() {
+        runtime.set_legacy_protection(policy);
     }
 }
 
@@ -1620,6 +1664,31 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/protection",
             get(admin_protection).put(admin_protection_update),
+        )
+        .route("/admin/middleware", get(admin_middleware))
+        .route(
+            "/admin/middleware/settings",
+            axum::routing::put(admin_middleware_settings),
+        )
+        .route(
+            "/admin/middleware/validate",
+            post(admin_middleware_validate),
+        )
+        .route("/admin/middleware/reload", post(admin_middleware_reload))
+        .route(
+            "/admin/middleware/rules",
+            post(admin_middleware_rule_create),
+        )
+        .route(
+            "/admin/middleware/rules/{id}",
+            axum::routing::put(admin_middleware_rule_replace)
+                .delete(admin_middleware_rule_delete),
+        )
+        .route("/admin/middleware/test", post(admin_middleware_test))
+        .route("/admin/middleware/leases", get(admin_middleware_leases))
+        .route(
+            "/admin/middleware/leases/{id}",
+            axum::routing::delete(admin_middleware_lease_delete),
         )
         // Compatibility aliases for released macOS clients.
         .route(
@@ -4532,6 +4601,16 @@ fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
             "rate_limit_error",
             r#"{"type":"error","error":{"type":"rate_limit_error","message":"Overloaded"}}"#,
         ),
+        // Sanitized design vector for the first middleware vertical slice.
+        // A real captured Fable failure can replace the wording later without
+        // changing the rule, coordinator, or fixture-injection contract.
+        (
+            "anthropic-fable-unavailable-529",
+            "anthropic",
+            529,
+            "overloaded_error",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Fable subscription is unavailable; please retry shortly"}}"#,
+        ),
         (
             "kimi-quota-exhausted-403",
             "kimi",
@@ -6355,6 +6434,470 @@ async fn update_routing(state: Arc<AppState>, provider: Provider, body: Value) -
     }
 }
 
+fn persist_middleware_leases_state(state: &AppState) -> std::result::Result<(), String> {
+    let root = state
+        .middleware
+        .read()
+        .map_err(|_| "middleware runtime unavailable".to_string())?
+        .root()
+        .to_path_buf();
+    let leases = state
+        .middleware_leases
+        .lock()
+        .map_err(|_| "middleware leases unavailable".to_string())?
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    middleware::persist_leases(&root, &leases)
+}
+
+fn middleware_leases_snapshot(state: &AppState) -> Vec<middleware::MiddlewareRouteLease> {
+    let now = now_ms();
+    let mut expired = false;
+    let mut leases = match state.middleware_leases.lock() {
+        Ok(mut leases) => {
+            let before = leases.len();
+            leases.retain(|_, lease| lease.expires_ms > now);
+            expired = leases.len() != before;
+            leases.values().cloned().collect::<Vec<_>>()
+        }
+        Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
+    };
+    leases.sort_by_key(|lease| lease.expires_ms);
+    if expired {
+        if let Err(error) = persist_middleware_leases_state(state) {
+            tracing::warn!(%error, "could not persist expired middleware leases");
+        }
+    }
+    leases
+}
+
+async fn admin_middleware(State(state): State<Arc<AppState>>) -> Response {
+    let leases = middleware_leases_snapshot(&state);
+    match state.middleware.read() {
+        Ok(runtime) => axum::Json(runtime.status_json(leases)).into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "middleware runtime unavailable",
+        ),
+    }
+}
+
+async fn admin_middleware_settings(
+    State(state): State<Arc<AppState>>,
+    axum::Json(settings): axum::Json<middleware::MiddlewareSettings>,
+) -> Response {
+    let mut runtime = match state.middleware.write() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    match runtime.update_settings(settings.clone()) {
+        Ok(()) => axum::Json(json!({
+            "generation": runtime.generation.to_string(),
+            "settings": settings,
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MiddlewareValidationRequest {
+    rule: alex_middleware::RuleSpecV1,
+}
+
+async fn admin_middleware_validate(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<MiddlewareValidationRequest>,
+) -> Response {
+    let errors = match state.middleware.read() {
+        Ok(runtime) => runtime.validate_rule(request.rule.clone()),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    let body_inspection_required = request.rule.when.needs_body()
+        || request
+            .rule
+            .expression
+            .as_ref()
+            .is_some_and(alex_middleware::MatchExpressionV1::needs_body);
+    axum::Json(json!({
+        "valid": errors.is_empty(),
+        "errors": errors,
+        "warnings": [],
+        "canonical_rule": request.rule,
+        "body_inspection_required": body_inspection_required,
+    }))
+    .into_response()
+}
+
+async fn admin_middleware_reload(State(state): State<Arc<AppState>>) -> Response {
+    let mut runtime = match state.middleware.write() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    match runtime.reload() {
+        Ok(()) => axum::Json(json!({
+            "generation": runtime.generation.to_string(),
+            "reloaded": true,
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_middleware_rule_create(
+    State(state): State<Arc<AppState>>,
+    axum::Json(rule): axum::Json<alex_middleware::RuleSpecV1>,
+) -> Response {
+    let mut runtime = match state.middleware.write() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    match runtime.create_rule(rule) {
+        Ok(rule) => (
+            StatusCode::CREATED,
+            axum::Json(json!({
+                "generation": runtime.generation.to_string(),
+                "rule": rule,
+            })),
+        )
+            .into_response(),
+        Err(error) if error.contains("already exists") => {
+            error_response(StatusCode::CONFLICT, &error)
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_middleware_rule_replace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::Json(rule): axum::Json<alex_middleware::RuleSpecV1>,
+) -> Response {
+    let mut runtime = match state.middleware.write() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    match runtime.replace_rule(&id, rule) {
+        Ok(rule) => axum::Json(json!({
+            "generation": runtime.generation.to_string(),
+            "rule": rule,
+        }))
+        .into_response(),
+        Err(error) if error.contains("not found") => error_response(StatusCode::NOT_FOUND, &error),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_middleware_rule_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut runtime = match state.middleware.write() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    match runtime.delete_rule(&id) {
+        Ok(true) => axum::Json(json!({
+            "generation": runtime.generation.to_string(),
+            "deleted": true,
+        }))
+        .into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "middleware not found"),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn admin_middleware_leases(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(json!({"leases": middleware_leases_snapshot(&state)})).into_response()
+}
+
+async fn admin_middleware_lease_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let deleted = state
+        .middleware_leases
+        .lock()
+        .map(|mut leases| leases.remove(&id).is_some())
+        .unwrap_or(false);
+    if !deleted {
+        return error_response(StatusCode::NOT_FOUND, "middleware lease not found");
+    }
+    if let Err(error) = persist_middleware_leases_state(&state) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
+    let generation = state
+        .middleware
+        .read()
+        .map(|runtime| runtime.generation.to_string())
+        .unwrap_or_default();
+    axum::Json(json!({"generation": generation, "deleted": true})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct MiddlewareTestRequest {
+    middleware_id: String,
+    #[serde(default)]
+    fixture_name: Option<String>,
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    context: Option<alex_middleware::AttemptResultContext>,
+}
+
+fn middleware_error_class(class: ErrorClass) -> alex_middleware::ErrorClass {
+    match class {
+        ErrorClass::Auth => alex_middleware::ErrorClass::Auth,
+        ErrorClass::Capacity => alex_middleware::ErrorClass::Capacity,
+        ErrorClass::BadRequest => alex_middleware::ErrorClass::BadRequest,
+        ErrorClass::Server => alex_middleware::ErrorClass::Server,
+        ErrorClass::ClientDisconnect => alex_middleware::ErrorClass::ClientDisconnect,
+        ErrorClass::Network => alex_middleware::ErrorClass::Network,
+        ErrorClass::Other => alex_middleware::ErrorClass::Other,
+    }
+}
+
+fn fixture_middleware_context(
+    rule: &alex_middleware::RuleSpecV1,
+    fixture: &ErrorFixture,
+) -> alex_middleware::AttemptResultContext {
+    let model = rule
+        .when
+        .models
+        .first()
+        .or_else(|| rule.when.original_models.first())
+        .map(|model| {
+            if model.contains('*') {
+                "claude-fable-5".to_string()
+            } else {
+                model.clone()
+            }
+        })
+        .unwrap_or_else(|| "claude-fable-5".into());
+    let provider = rule
+        .when
+        .providers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fixture.provider.clone());
+    let harness = rule
+        .when
+        .harness_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "claude".into());
+    let parsed = parse_upstream_error(&provider, fixture.status, fixture.body.as_bytes());
+    let kind = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.kind.clone())
+        .or_else(|| Some(fixture.error_kind.clone()));
+    let class = classify_error(&provider, Some(fixture.status), kind.as_deref());
+    let model_ref = alex_middleware::ModelRef {
+        provider: provider.clone(),
+        id: model.clone(),
+        aliases: Vec::new(),
+        equivalence_classes: Vec::new(),
+        capabilities: alex_middleware::ModelCapabilities {
+            tools: true,
+            vision: true,
+            reasoning: true,
+            portable_history: true,
+        },
+    };
+    alex_middleware::AttemptResultContext {
+        request: alex_middleware::ClientRequestView {
+            trace_id: "middleware-dry-run".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            client_format: alex_middleware::ClientFormat::AnthropicMessages,
+            original_model: model.clone(),
+            current_model: model.clone(),
+            streaming: false,
+            headers: Default::default(),
+            body: Default::default(),
+        },
+        harness: alex_middleware::HarnessView {
+            name: Some(harness),
+            version: None,
+        },
+        session: alex_middleware::SessionView {
+            id: Some("middleware-dry-run-session".into()),
+            run_id: None,
+            source: alex_middleware::SessionIdSource::NativeHeader,
+            active_route_lease: None,
+        },
+        route: alex_middleware::RouteView {
+            requested: model_ref.clone(),
+            selected: model_ref,
+            provider: alex_middleware::ProviderView {
+                id: provider.clone(),
+                enabled: true,
+                paused: false,
+                healthy: true,
+                supported_formats: vec![provider.clone()],
+            },
+            upstream_format: provider,
+            attempt_number: 1,
+            same_route_accounts_remaining: false,
+        },
+        outcome: alex_middleware::AttemptOutcome {
+            status: fixture.status,
+            headers: Default::default(),
+            body: alex_middleware::BodyView {
+                content_type: Some("application/json".into()),
+                size_bytes: Some(fixture.body.len() as u64),
+                text: Some(fixture.body.clone()),
+                json: serde_json::from_str(&fixture.body).ok(),
+                truncated: false,
+                inspected_bytes: fixture.body.len(),
+            },
+            error: Some(alex_middleware::ErrorInfo {
+                class: middleware_error_class(class),
+                kind,
+                code: parsed.as_ref().and_then(|parsed| parsed.code.clone()),
+                message: parsed.and_then(|parsed| parsed.message),
+            }),
+            timing: Default::default(),
+        },
+    }
+}
+
+async fn admin_middleware_test(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<MiddlewareTestRequest>,
+) -> Response {
+    let (rule, max_attempts) = match state.middleware.read() {
+        Ok(runtime) => (
+            runtime
+                .rules()
+                .iter()
+                .find(|rule| rule.id == request.middleware_id)
+                .cloned(),
+            runtime.settings.max_attempts,
+        ),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "middleware runtime unavailable",
+            )
+        }
+    };
+    let Some(rule) = rule else {
+        return error_response(StatusCode::NOT_FOUND, "middleware not found");
+    };
+    let context = if let Some(context) = request.context {
+        context
+    } else if let Some(name) = request.fixture_name.as_deref() {
+        match load_fixture(&state, name) {
+            Ok(fixture) => fixture_middleware_context(&rule, &fixture),
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+        }
+    } else if let Some(trace_id) = request.trace_id.as_deref() {
+        let trace = match state.store.get_trace(trace_id) {
+            Ok(Some(trace)) => trace,
+            Ok(None) => return error_response(StatusCode::NOT_FOUND, "trace not found"),
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let body = trace["resp_body_path"]
+            .as_str()
+            .and_then(read_gz_file)
+            .map(|body| String::from_utf8_lossy(&body).into_owned())
+            .unwrap_or_default();
+        let fixture = ErrorFixture {
+            name: "trace-dry-run".into(),
+            provider: trace["upstream_provider"]
+                .as_str()
+                .unwrap_or("unknown")
+                .into(),
+            status: trace["status"].as_u64().unwrap_or(500) as u16,
+            error_kind: trace["error_kind"]
+                .as_str()
+                .unwrap_or("http_status")
+                .into(),
+            body,
+            direction: Direction::UpstreamToClient,
+            created_ms: now_ms(),
+            source_trace_id: Some(trace_id.into()),
+        };
+        fixture_middleware_context(&rule, &fixture)
+    } else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "provide fixture_name, trace_id, or context",
+        );
+    };
+    let engine = match alex_middleware::CompiledRuleSetV1::compile_with(
+        alex_middleware::RuleSetV1 {
+            api_version: alex_middleware::API_VERSION_V1,
+            rules: vec![rule.clone()],
+        },
+        &alex_middleware::ValidationOptions {
+            max_attempts,
+            ..Default::default()
+        },
+        None,
+    ) {
+        Ok(engine) => engine,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"valid": false, "errors": error.errors})),
+            )
+                .into_response()
+        }
+    };
+    let inspection = engine.inspection_plan(&context);
+    let evaluation = engine.evaluate_attempt(&context);
+    let body_inspection_required = rule.when.needs_body()
+        || rule
+            .expression
+            .as_ref()
+            .is_some_and(alex_middleware::MatchExpressionV1::needs_body);
+    axum::Json(json!({
+        "valid": true,
+        "middleware_id": rule.id,
+        "body_inspection_required": body_inspection_required,
+        "inspection": inspection,
+        "decision": evaluation.decision,
+        "records": evaluation.records,
+        "response_patches": evaluation.response_patches,
+    }))
+    .into_response()
+}
+
 fn validate_protection_policy(policy: &ProtectionPolicy) -> std::result::Result<(), String> {
     if policy.retries > 10 {
         return Err("retries must be between 0 and 10".into());
@@ -7477,7 +8020,16 @@ async fn plan_upstream(
                     .account_for_excluding(provider, true, excluded_accounts)
                     .await
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                (ANTHROPIC_BASE.to_string(), account, None, None, false, None, false, None)
+                (
+                    upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
+                    account,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                )
             } else {
                 // Harness identity is irrelevant here: every non-genuine-
                 // Claude-Code Anthropic request uses Dario. The daemon always
@@ -7490,7 +8042,16 @@ async fn plan_upstream(
                         .account_for_excluding(provider, true, excluded_accounts)
                         .await
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    (ANTHROPIC_BASE.to_string(), account, None, None, false, None, false, None)
+                    (
+                        upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
+                        account,
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                        None,
+                    )
                 } else {
                     let dario_active = match state.dario.as_ref() {
                         Some(dario) => match dario.active() {
@@ -7615,6 +8176,11 @@ async fn plan_upstream(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
+            let openai_base = upstream_base(
+                state,
+                Provider::Openai,
+                if oauth { CODEX_BASE } else { OPENAI_BASE },
+            );
             bind_codex_account(state, affinity_session, &account);
             match format {
                 ClientFormat::OpenaiChat if !oauth => {
@@ -7622,7 +8188,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{OPENAI_BASE}/v1/chat/completions"),
+                        url: format!("{openai_base}/v1/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -7645,7 +8211,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{CODEX_BASE}/responses"),
+                        url: format!("{openai_base}/responses"),
                         account,
                         connection_account: None,
                         body,
@@ -7668,9 +8234,9 @@ async fn plan_upstream(
                             destream = true;
                         }
                         translate::normalize_codex_request(body_json);
-                        format!("{CODEX_BASE}/responses")
+                        format!("{openai_base}/responses")
                     } else {
-                        format!("{OPENAI_BASE}/v1/responses")
+                        format!("{openai_base}/v1/responses")
                     };
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
@@ -7695,10 +8261,10 @@ async fn plan_upstream(
                     converted["model"] = json!(routed_model);
                     let url = if oauth {
                         translate::normalize_codex_request(&mut converted);
-                        format!("{CODEX_BASE}/responses")
+                        format!("{openai_base}/responses")
                     } else {
                         converted["stream"] = json!(false);
-                        format!("{OPENAI_BASE}/v1/responses")
+                        format!("{openai_base}/v1/responses")
                     };
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
@@ -7724,10 +8290,10 @@ async fn plan_upstream(
                     converted["model"] = json!(routed_model);
                     let url = if oauth {
                         translate::normalize_codex_request(&mut converted);
-                        format!("{CODEX_BASE}/responses")
+                        format!("{openai_base}/responses")
                     } else {
                         converted["stream"] = json!(false);
-                        format!("{OPENAI_BASE}/v1/responses")
+                        format!("{openai_base}/v1/responses")
                     };
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
@@ -9845,26 +10411,6 @@ fn no_substitute(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.trim() == "1")
 }
 
-fn configured_fallback(
-    config: &SubstitutionConfig,
-    requested_model: &str,
-    current_model: &str,
-    attempted_models: &HashSet<String>,
-) -> Option<(Provider, String)> {
-    if !config.enabled {
-        return None;
-    }
-    config
-        .fallbacks
-        .get(requested_model)
-        .or_else(|| config.fallbacks.get(current_model))?
-        .iter()
-        .find_map(|candidate| {
-            (!attempted_models.contains(candidate)).then(|| route_model(candidate))
-        })
-        .and_then(|(provider, model)| provider.map(|provider| (provider, model)))
-}
-
 fn policy_covers(class: ErrorClass, policy: &ProtectionPolicy) -> bool {
     policy.enabled
         && (reroutable_error_class(class) || (class == ErrorClass::Auth && policy.reroute_on_auth))
@@ -9889,39 +10435,6 @@ fn canonical_model_alias(model: &str) -> &str {
         "terra" | "gpt-5.6-terra" => "gpt-5.6-terra",
         _ => model,
     }
-}
-
-fn protection_equivalent(
-    policy: &ProtectionPolicy,
-    requested_model: &str,
-    current_provider: Provider,
-    attempted_models: &HashSet<String>,
-) -> Option<(Provider, String)> {
-    if !policy.enabled {
-        return None;
-    }
-    let equivalents = policy.equivalencies.get(requested_model).or_else(|| {
-        let requested_alias = canonical_model_alias(requested_model);
-        policy
-            .equivalencies
-            .iter()
-            .find(|(model, _)| canonical_model_alias(model) == requested_alias)
-            .map(|(_, equivalents)| equivalents)
-    })?;
-    equivalents.iter().find_map(|(provider, model)| {
-        let candidate_provider = match provider.as_str() {
-            "anthropic" => Provider::Anthropic,
-            "openai" => Provider::Openai,
-            "xai" => Provider::Xai,
-            "gemini" => Provider::Gemini,
-            "openrouter" => Provider::Openrouter,
-            "exo" => Provider::Exo,
-            "kimi" => Provider::Kimi,
-            _ => return None,
-        };
-        (candidate_provider != current_provider && !attempted_models.contains(model))
-            .then(|| (candidate_provider, model.clone()))
-    })
 }
 
 fn take_pending_injection(
@@ -9953,6 +10466,9 @@ fn take_pending_injection(
 /// A retry must not use that escape hatch: failover only moves to a genuinely
 /// ready, non-reserve-blocked account.
 fn retry_account_eligible(state: &AppState, account: &Account) -> bool {
+    if account.status != "active" || account.paused {
+        return false;
+    }
     let now = now_ms();
     if account.cooldown_until_ms.is_some_and(|until| until > now) {
         return false;
@@ -10069,6 +10585,392 @@ fn rejected_client_trace(
         client_ip: peer.map(|address| address.ip().to_string()),
         key_fingerprint: fingerprint,
         ..Default::default()
+    }
+}
+
+fn safe_middleware_headers(headers: &HeaderMap) -> alex_middleware::SafeHeaders {
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            values
+                .entry(name.as_str().to_string())
+                .or_default()
+                .push(value.to_string());
+        }
+    }
+    alex_middleware::SafeHeaders::from_untrusted(values).headers
+}
+
+fn middleware_client_format(format: ClientFormat) -> alex_middleware::ClientFormat {
+    match format {
+        ClientFormat::AnthropicMessages => alex_middleware::ClientFormat::AnthropicMessages,
+        ClientFormat::OpenaiChat => alex_middleware::ClientFormat::OpenaiChat,
+        ClientFormat::OpenaiResponses => alex_middleware::ClientFormat::OpenaiResponses,
+        ClientFormat::GeminiGenerate => alex_middleware::ClientFormat::GeminiGenerate,
+    }
+}
+
+fn middleware_session_source(
+    headers: &HeaderMap,
+    body_json: &Value,
+) -> alex_middleware::SessionIdSource {
+    if [
+        "x-claude-code-session-id",
+        "x-claude-code-agent-id",
+        "x-session-id",
+        "session_id",
+    ]
+    .iter()
+    .any(|name| headers.get(*name).is_some())
+    {
+        alex_middleware::SessionIdSource::NativeHeader
+    } else if session_from_metadata(body_json).is_some() {
+        alex_middleware::SessionIdSource::RequestBody
+    } else if body_json
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        alex_middleware::SessionIdSource::PromptCacheKey
+    } else {
+        alex_middleware::SessionIdSource::DerivedConversationRoot
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn middleware_attempt_context(
+    state: &AppState,
+    format: ClientFormat,
+    path: &str,
+    headers: &HeaderMap,
+    original_body_json: &Value,
+    trace: &TraceRecord,
+    requested_model: &str,
+    current_model: &str,
+    current_provider: Provider,
+    upstream_format: &str,
+    attempt_number: u32,
+    same_route_accounts_remaining: bool,
+    status: u16,
+    response_headers: &HeaderMap,
+    body: alex_middleware::BodyView,
+) -> alex_middleware::AttemptResultContext {
+    let original_provider = route_model(requested_model)
+        .0
+        .unwrap_or_else(|| format.default_provider());
+    let source_capabilities = alex_middleware::ModelCapabilities {
+        tools: original_body_json
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        vision: original_body_json.to_string().contains("image"),
+        reasoning: original_body_json.get("reasoning").is_some()
+            || original_body_json.get("thinking").is_some(),
+        portable_history: original_body_json.get("previous_response_id").is_none(),
+    };
+    let (requested_equivalence_classes, selected_equivalence_classes) = state
+        .middleware
+        .read()
+        .map(|runtime| {
+            (
+                runtime.equivalence_classes_for_model(requested_model),
+                runtime.equivalence_classes_for_model(current_model),
+            )
+        })
+        .unwrap_or_default();
+    let requested = alex_middleware::ModelRef {
+        provider: original_provider.as_str().into(),
+        id: requested_model.into(),
+        aliases: vec![canonical_model_alias(requested_model).into()],
+        equivalence_classes: requested_equivalence_classes,
+        capabilities: source_capabilities.clone(),
+    };
+    let selected = alex_middleware::ModelRef {
+        provider: current_provider.as_str().into(),
+        id: current_model.into(),
+        aliases: vec![canonical_model_alias(current_model).into()],
+        equivalence_classes: selected_equivalence_classes,
+        capabilities: source_capabilities,
+    };
+    let parsed = body
+        .text
+        .as_deref()
+        .and_then(|text| parse_upstream_error(upstream_format, status, text.as_bytes()));
+    let fallback_kind = format!("http_status_{status}");
+    let kind = parsed
+        .as_ref()
+        .and_then(|error| error.kind.clone())
+        .unwrap_or(fallback_kind);
+    let error = alex_middleware::ErrorInfo {
+        class: middleware_error_class(classify_error(
+            current_provider.as_str(),
+            Some(status),
+            Some(&kind),
+        )),
+        kind: Some(kind),
+        code: parsed
+            .as_ref()
+            .and_then(|error| error.code.clone())
+            .or_else(|| Some(status.to_string())),
+        message: parsed.and_then(|error| error.message),
+    };
+    alex_middleware::AttemptResultContext {
+        request: alex_middleware::ClientRequestView {
+            trace_id: trace.id.clone(),
+            method: "POST".into(),
+            path: path.into(),
+            client_format: middleware_client_format(format),
+            original_model: requested_model.into(),
+            current_model: current_model.into(),
+            streaming: original_body_json["stream"].as_bool().unwrap_or(false),
+            headers: safe_middleware_headers(headers),
+            body: alex_middleware::JsonBodyView {
+                json: Some(original_body_json.clone()),
+                size_bytes: serde_json::to_vec(original_body_json)
+                    .ok()
+                    .map(|body| body.len() as u64),
+                truncated: false,
+            },
+        },
+        harness: alex_middleware::HarnessView {
+            name: trace.harness.clone(),
+            version: headers
+                .get("x-alexandria-harness-version")
+                .and_then(|value| value.to_str().ok())
+                .map(String::from),
+        },
+        session: alex_middleware::SessionView {
+            id: trace.session_id.clone(),
+            run_id: trace.run_id.clone(),
+            source: middleware_session_source(headers, original_body_json),
+            active_route_lease: None,
+        },
+        route: alex_middleware::RouteView {
+            requested,
+            selected,
+            provider: alex_middleware::ProviderView {
+                id: current_provider.as_str().into(),
+                enabled: true,
+                paused: false,
+                healthy: true,
+                supported_formats: vec![upstream_format.into()],
+            },
+            upstream_format: upstream_format.into(),
+            attempt_number,
+            same_route_accounts_remaining,
+        },
+        outcome: alex_middleware::AttemptOutcome {
+            status,
+            headers: safe_middleware_headers(response_headers),
+            body,
+            error: Some(error),
+            timing: Default::default(),
+        },
+    }
+}
+
+fn middleware_target_route(
+    state: &AppState,
+    target: &alex_middleware::RouteTarget,
+    current_provider: Provider,
+    current_model: &str,
+) -> Option<(Provider, String)> {
+    match target {
+        alex_middleware::RouteTarget::Exact { model, providers } => {
+            let routed = route_model(model);
+            let constrained_provider = match providers {
+                alex_middleware::ProviderConstraint::Only(providers)
+                | alex_middleware::ProviderConstraint::Prefer(providers) => providers
+                    .iter()
+                    .find_map(|provider| Provider::from_str_loose(provider)),
+                alex_middleware::ProviderConstraint::Exclude(excluded) => (!excluded
+                    .iter()
+                    .any(|provider| provider.eq_ignore_ascii_case(current_provider.as_str())))
+                .then_some(current_provider),
+                alex_middleware::ProviderConstraint::Any => None,
+            };
+            let provider = constrained_provider
+                .or(routed.0)
+                .unwrap_or(current_provider);
+            Some((provider, routed.1))
+        }
+        alex_middleware::RouteTarget::Equivalent { class, providers } => {
+            let targets = state
+                .middleware
+                .read()
+                .ok()?
+                .equivalent_targets(class);
+            let find_named = |names: &[String]| {
+                names.iter().find_map(|preferred| {
+                    targets.iter().find(|(provider, _)| {
+                        provider.eq_ignore_ascii_case(preferred)
+                    })
+                })
+            };
+            let selected = match providers {
+                alex_middleware::ProviderConstraint::Any => targets.first(),
+                alex_middleware::ProviderConstraint::Only(only) => find_named(only),
+                alex_middleware::ProviderConstraint::Prefer(preferred) => {
+                    find_named(preferred).or_else(|| targets.first())
+                }
+                alex_middleware::ProviderConstraint::Exclude(excluded) => targets.iter().find(
+                    |(provider, _)| {
+                        !excluded
+                            .iter()
+                            .any(|value| value.eq_ignore_ascii_case(provider))
+                    },
+                ),
+            }?;
+            let provider = Provider::from_str_loose(&selected.0)?;
+            (crate::canonical_model_alias(&selected.1) != crate::canonical_model_alias(current_model)
+                || provider != current_provider)
+                .then(|| (provider, selected.1.clone()))
+        }
+    }
+}
+
+fn matched_terminal_rule(evaluation: &alex_middleware::EvaluationResult) -> Option<String> {
+    evaluation
+        .records
+        .iter()
+        .find(|record| {
+            record.state == alex_middleware::MatchState::Matched
+                && record.action.is_some()
+                && !record.suppressed
+        })
+        .map(|record| record.rule_id.clone())
+}
+
+fn active_middleware_route_lease(
+    state: &AppState,
+    harness: Option<&str>,
+    session_id: Option<&str>,
+    requested_model: &str,
+) -> Option<middleware::MiddlewareRouteLease> {
+    let session_id = session_id?;
+    let harness = harness.unwrap_or("unknown");
+    let now = now_ms();
+    let mut changed = false;
+    let matched = {
+        let mut leases = state
+            .middleware_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = leases.len();
+        leases.retain(|_, lease| lease.expires_ms > now);
+        changed |= before != leases.len();
+        let lease = leases.values_mut().find(|lease| {
+            lease.harness == harness
+                && lease.session_id == session_id
+                && canonical_model_alias(&lease.original_model)
+                    == canonical_model_alias(requested_model)
+        });
+        lease.map(|lease| {
+            lease.last_used_ms = now;
+            changed = true;
+            lease.clone()
+        })
+    };
+    if changed {
+        if let Err(error) = persist_middleware_leases_state(state) {
+            tracing::warn!(%error, "could not persist middleware lease use");
+        }
+    }
+    matched
+}
+
+fn commit_middleware_route_lease(
+    state: &AppState,
+    trace: &mut TraceRecord,
+    original_model: &str,
+    pending: Option<(alex_middleware::RouteTarget, u64, String, String)>,
+) {
+    let Some((target, ttl_seconds, source_middleware_id, reason)) = pending else {
+        return;
+    };
+    let (Some(session_id), Some(harness)) = (trace.session_id.clone(), trace.harness.clone()) else {
+        return;
+    };
+    let now = now_ms();
+    let ttl_ms = i64::try_from(ttl_seconds)
+        .unwrap_or(i64::MAX / 1_000)
+        .saturating_mul(1_000);
+    let lease = middleware::MiddlewareRouteLease {
+        id: uuid::Uuid::new_v4().to_string(),
+        harness: harness.clone(),
+        session_id: session_id.clone(),
+        original_model: original_model.into(),
+        target,
+        source_middleware_id,
+        reason,
+        created_ms: now,
+        last_used_ms: now,
+        expires_ms: now.saturating_add(ttl_ms),
+    };
+    {
+        let mut leases = state
+            .middleware_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        leases.retain(|_, existing| {
+            !(existing.harness == harness
+                && existing.session_id == session_id
+                && canonical_model_alias(&existing.original_model)
+                    == canonical_model_alias(original_model))
+        });
+        leases.insert(lease.id.clone(), lease.clone());
+    }
+    trace.tags = merge_trace_note(trace.tags.take(), "middleware_lease", &lease.id);
+    if let Err(error) = persist_middleware_leases_state(state) {
+        tracing::warn!(%error, lease = %lease.id, "could not persist middleware lease");
+    }
+}
+
+fn client_respond_as(format: ClientFormat) -> RespondAs {
+    match format {
+        ClientFormat::AnthropicMessages => RespondAs::Anthropic,
+        ClientFormat::OpenaiChat => RespondAs::OpenaiChat,
+        ClientFormat::OpenaiResponses => RespondAs::OpenaiResponses,
+        ClientFormat::GeminiGenerate => RespondAs::Gemini,
+    }
+}
+
+fn prepend_response_notice(response: &mut Value, target: RespondAs, notice: &str) {
+    let text = format!("{notice}\n\n");
+    match target {
+        RespondAs::Anthropic => {
+            if let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) {
+                content.insert(0, json!({"type": "text", "text": text}));
+            }
+        }
+        RespondAs::OpenaiChat => {
+            if let Some(message) = response.pointer_mut("/choices/0/message") {
+                let existing = message["content"].as_str().unwrap_or_default();
+                message["content"] = Value::String(format!("{text}{existing}"));
+            }
+        }
+        RespondAs::OpenaiResponses => {
+            if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+                if let Some(message) = output
+                    .iter_mut()
+                    .find(|item| item["type"] == "message")
+                {
+                    if let Some(content) =
+                        message.get_mut("content").and_then(Value::as_array_mut)
+                    {
+                        content.insert(0, json!({"type": "output_text", "text": text}));
+                    }
+                }
+            }
+        }
+        RespondAs::Gemini => {
+            if let Some(parts) = response
+                .pointer_mut("/candidates/0/content/parts")
+                .and_then(Value::as_array_mut)
+            {
+                parts.insert(0, json!({"text": text}));
+            }
+        }
     }
 }
 
@@ -10308,7 +11210,31 @@ async fn proxy(
             "unavailable",
         );
     }
-    let (routed_provider, routed_model) = route_model(&requested_model);
+    let substitution_disabled = no_substitute(&headers);
+    let requested_route = route_model(&requested_model);
+    let requested_provider = requested_route.0.unwrap_or_else(|| format.default_provider());
+    let active_route_lease = (!substitution_disabled)
+        .then(|| {
+            active_middleware_route_lease(
+                &state,
+                trace.harness.as_deref(),
+                trace.session_id.as_deref(),
+                &requested_model,
+            )
+        })
+        .flatten();
+    let (routed_provider, routed_model) = active_route_lease
+        .as_ref()
+        .and_then(|lease| {
+            middleware_target_route(
+                &state,
+                &lease.target,
+                requested_provider,
+                &requested_model,
+            )
+        })
+        .map(|(provider, model)| (Some(provider), model))
+        .unwrap_or(requested_route);
     // `alex/<model>` is the local alias published for an enabled Exo model.
     // An explicit `exo/<model>` must also be enabled; this prevents an
     // arbitrary caller from using Alexandria as an unintended LAN proxy.
@@ -10334,7 +11260,12 @@ async fn proxy(
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
-    let substitution_disabled = no_substitute(&headers);
+    if let Some(lease) = &active_route_lease {
+        trace.substituted = true;
+        trace.original_model = Some(requested_model.clone());
+        trace.substitution_reason = Some(format!("session route lease {}", lease.id));
+        trace.tags = merge_trace_note(trace.tags.take(), "middleware_lease_applied", &lease.id);
+    }
     let paused_mode = paused_provider_mode(&state, provider);
     // A provider pause has precedence over a one-shot fixture: it represents
     // the operator taking the provider out of service, while fixtures remain
@@ -10364,6 +11295,7 @@ async fn proxy(
             },
         )
     };
+    let mut injected_attempt: Option<(u16, Vec<u8>)> = None;
     if let Some(simulation) = simulation {
         if headers.get("x-alexandria-simulate-error").is_some()
             && !local_key_request
@@ -10405,7 +11337,7 @@ async fn proxy(
         );
         if fixture_name.is_some() {
             trace.injected = true;
-            trace.fixture_name = fixture_name;
+            trace.fixture_name = fixture_name.clone();
             trace.tags = merge_trace_note(trace.tags.take(), "injected", "true");
         }
         // Simulation deliberately never dispatches upstream traffic, but it
@@ -10427,107 +11359,166 @@ async fn proxy(
                 emit_reauth_notification_for_account(&state, &account);
             }
         }
-        let protection = state
-            .protection
-            .read()
-            .map(|policy| policy.clone())
-            .unwrap_or_default();
-        if (reroutable_error_class(class) || policy_covers(class, &protection))
-            && !substitution_disabled
-        {
+        let response_body = injected_body
+            .unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
+        let dispatch_injected = fixture_name.is_some()
+            && state.vault.list_cached().into_iter().any(|account| {
+                account.provider == provider
+                    && account.status == "active"
+                    && !account.paused
+            });
+        if dispatch_injected {
+            injected_attempt = Some((status, response_body));
+        } else {
             let mut attempted_accounts = HashSet::new();
-            let mut attempted_models = HashSet::from([routed_model.clone()]);
             let mut attempts = Vec::<Value>::new();
-            let mut current_provider = provider;
-            let mut current_model = routed_model.clone();
-            // A forced simulation never opens an upstream socket, but retain
-            // the policy's retry rung in the trace so the lab can prove the
-            // exact escalation plan deterministically.
-            if protection.enabled {
-                for retry in 0..protection.retries {
-                    attempts.push(
-                        json!({"rung": "retry_same", "retry": retry + 1, "model": current_model}),
-                    );
-                }
-            }
             let prefer_oauth = format != ClientFormat::OpenaiChat;
-            let mut account = state
+            let account = state
                 .vault
-                .account_for_excluding(current_provider, prefer_oauth, &attempted_accounts)
+                .account_for_excluding(provider, prefer_oauth, &attempted_accounts)
                 .await
-                .ok();
-            while let Some(current_account) = account {
-                attempted_accounts.insert(current_account.id.clone());
-                attempts.push(json!({"account_id": current_account.id, "model": current_model}));
-                // Cross-provider auth protection must not hide the fact that
-                // the original managed subscription needs a fresh login.
-                if class == ErrorClass::Auth {
-                    emit_reauth_notification_for_account(&state, &current_account);
-                }
-                let _ = state
-                    .vault
-                    .mark_cooldown(&current_account.id, now_ms() + 60_000)
-                    .await;
-                let next = state
-                    .vault
-                    .account_for_excluding(current_provider, prefer_oauth, &attempted_accounts)
-                    .await
-                    .ok()
-                    .filter(|candidate| {
-                        !attempted_accounts.contains(&candidate.id)
-                            && retry_account_eligible(&state, candidate)
-                    });
-                if let Some(next) = next {
-                    trace.substituted = true;
-                    trace
-                        .original_model
-                        .get_or_insert_with(|| requested_model.clone());
-                    trace
-                        .original_account_id
-                        .get_or_insert_with(|| current_account.id.clone());
-                    trace.substitution_reason = Some(class.as_str().into());
-                    trace.served_model = Some(current_model.clone());
-                    trace.served_account_id = Some(next.id.clone());
-                    bind_trace_account(&state.store, &mut trace, &next);
-                    account = Some(next);
-                    continue;
-                }
-                let fallback = if reroutable_error_class(class) {
-                    configured_fallback(
-                        &state.substitution,
+                .ok()
+                .or_else(|| {
+                    state.vault.list_cached().into_iter().find(|account| {
+                        account.provider == provider
+                            && account.status == "active"
+                            && !account.paused
+                            && !attempted_accounts.contains(&account.id)
+                    })
+                });
+            if let Some(mut current_account) = account {
+                let mut current_provider = provider;
+                let mut current_model = routed_model.clone();
+                let response_headers = HeaderMap::from_iter([(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )]);
+                let max_attempts = state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.settings.max_attempts)
+                    .unwrap_or(3);
+                for attempt_number in 1..=max_attempts {
+                    attempted_accounts.insert(current_account.id.clone());
+                    if class == ErrorClass::Auth {
+                        emit_reauth_notification_for_account(&state, &current_account);
+                    }
+                    let _ = state
+                        .vault
+                        .mark_cooldown(&current_account.id, now_ms() + 60_000)
+                        .await;
+                    let next = state
+                        .vault
+                        .account_for_excluding(
+                            current_provider,
+                            prefer_oauth,
+                            &attempted_accounts,
+                        )
+                        .await
+                        .ok()
+                        .or_else(|| {
+                            state.vault.list_cached().into_iter().find(|account| {
+                                account.provider == current_provider
+                                    && !attempted_accounts.contains(&account.id)
+                                    && retry_account_eligible(&state, account)
+                            })
+                        })
+                        .filter(|candidate| {
+                            !attempted_accounts.contains(&candidate.id)
+                                && retry_account_eligible(&state, candidate)
+                        });
+                    let upstream_format = match current_provider {
+                        Provider::Anthropic => "anthropic",
+                        Provider::Openai if format == ClientFormat::OpenaiChat => "openai-chat",
+                        Provider::Openai => "openai-responses",
+                        Provider::Gemini => "gemini",
+                        _ => "openai-chat",
+                    };
+                    let context = middleware_attempt_context(
+                        &state,
+                        format,
+                        path,
+                        &headers,
+                        &body_json,
+                        &trace,
                         &requested_model,
                         &current_model,
-                        &attempted_models,
-                    )
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    protection_equivalent(
-                        &protection,
-                        &requested_model,
                         current_provider,
-                        &attempted_models,
-                    )
-                });
-                let Some((fallback_provider, fallback_model)) = fallback else {
-                    bind_trace_account(&state.store, &mut trace, &current_account);
-                    break;
-                };
-                current_provider = fallback_provider;
-                current_model = fallback_model;
-                attempted_models.insert(current_model.clone());
-                account = state
-                    .vault
-                    .account_for_excluding(
-                        current_provider,
-                        format != ClientFormat::OpenaiChat,
-                        &attempted_accounts,
-                    )
-                    .await
-                    .ok()
-                    .filter(|account| retry_account_eligible(&state, account));
-                if let Some(next) = account.as_ref() {
+                        upstream_format,
+                        attempt_number,
+                        next.is_some(),
+                        status,
+                        &response_headers,
+                        alex_middleware::BodyView {
+                            content_type: Some("application/json".into()),
+                            size_bytes: Some(response_body.len() as u64),
+                            text: Some(String::from_utf8_lossy(&response_body).into_owned()),
+                            json: serde_json::from_slice(&response_body).ok(),
+                            truncated: false,
+                            inspected_bytes: response_body.len(),
+                        },
+                    );
+                    let evaluation = state
+                        .middleware
+                        .read()
+                        .map(|runtime| runtime.evaluate(&context, substitution_disabled))
+                        .unwrap_or_default();
+                    if let Ok(mut runtime) = state.middleware.write() {
+                        runtime.note_evaluation(&evaluation);
+                    }
+                    attempts.push(json!({
+                        "account_id": current_account.id,
+                        "provider": current_provider.as_str(),
+                        "model": current_model,
+                        "status": status,
+                        "middleware_decisions": evaluation.records,
+                    }));
+                    let (selected, retry_same_route) = match &evaluation.decision {
+                        alex_middleware::AttemptDecision::RetrySameRoute { .. } => (
+                            next.map(|account| {
+                                (current_provider, current_model.clone(), account)
+                            }),
+                            true,
+                        ),
+                        alex_middleware::AttemptDecision::Reroute { target, .. } => {
+                            let selected = if let Some((target_provider, target_model)) =
+                                middleware_target_route(
+                                    &state,
+                                    target,
+                                    current_provider,
+                                    &current_model,
+                                )
+                            {
+                                state
+                                    .vault
+                                    .account_for_excluding(
+                                        target_provider,
+                                        prefer_oauth,
+                                        &attempted_accounts,
+                                    )
+                                    .await
+                                    .ok()
+                                    .or_else(|| {
+                                        state.vault.list_cached().into_iter().find(|account| {
+                                            account.provider == target_provider
+                                                && !attempted_accounts.contains(&account.id)
+                                                && retry_account_eligible(&state, account)
+                                        })
+                                    })
+                                    .filter(|account| retry_account_eligible(&state, account))
+                                    .map(|account| (target_provider, target_model, account))
+                            } else {
+                                None
+                            };
+                            (selected, false)
+                        }
+                        alex_middleware::AttemptDecision::Continue
+                        | alex_middleware::AttemptDecision::ReturnOriginal { .. } => (None, false),
+                    };
+                    let Some((selected_provider, selected_model, selected_account)) = selected
+                    else {
+                        break;
+                    };
                     trace.substituted = true;
                     trace
                         .original_model
@@ -10536,34 +11527,44 @@ async fn proxy(
                         .original_account_id
                         .get_or_insert_with(|| current_account.id.clone());
                     trace.substitution_reason = Some(class.as_str().into());
-                    trace.served_model = Some(current_model.clone());
-                    trace.served_account_id = Some(next.id.clone());
-                    trace.routed_model = Some(current_model.clone());
-                    trace.upstream_provider = Some(current_provider.as_str().into());
-                    bind_trace_account(&state.store, &mut trace, next);
+                    trace.served_model = Some(selected_model.clone());
+                    trace.served_account_id = Some(selected_account.id.clone());
+                    trace.routed_model = Some(selected_model.clone());
+                    trace.upstream_provider = Some(selected_provider.as_str().into());
+                    bind_trace_account(&state.store, &mut trace, &selected_account);
+                    if retry_same_route && attempt_number < max_attempts {
+                        current_provider = selected_provider;
+                        current_model = selected_model;
+                        current_account = selected_account;
+                        continue;
+                    }
+                    attempts.push(json!({
+                        "account_id": selected_account.id,
+                        "provider": selected_provider.as_str(),
+                        "model": selected_model,
+                    }));
+                    break;
+                }
+                if trace.substituted {
+                    trace.attempts = serde_json::to_string(&attempts).ok();
                 }
             }
-            if trace.substituted {
-                trace.attempts = serde_json::to_string(&attempts).ok();
+            trace.ts_response_ms = Some(now_ms());
+            finalize_trace(&state, trace, &body, None, Some(&response_body));
+            let mut response = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                .header("content-type", "application/json")
+                .header("x-alexandria-trace-id", &trace_id);
+            if let Some(mode) = pause_mode {
+                response = response.header(
+                    "x-alexandria-paused",
+                    format!("{}:{}", provider.as_str(), mode.as_str()),
+                );
             }
+            return response.body(Body::from(response_body)).unwrap_or_else(|e| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            });
         }
-        trace.ts_response_ms = Some(now_ms());
-        let response_body =
-            injected_body.unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
-        finalize_trace(&state, trace, &body, None, Some(&response_body));
-        let mut response = Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-            .header("content-type", "application/json")
-            .header("x-alexandria-trace-id", &trace_id);
-        if let Some(mode) = pause_mode {
-            response = response.header(
-                "x-alexandria-paused",
-                format!("{}:{}", provider.as_str(), mode.as_str()),
-            );
-        }
-        return response
-            .body(Body::from(response_body))
-            .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
     let Some(in_flight) = InFlight::new(
         &state,
@@ -10610,10 +11611,16 @@ async fn proxy(
 
     let original_body_json = body_json.clone();
     let mut attempted_accounts = HashSet::new();
-    let mut attempted_models = HashSet::from([routed_model.clone()]);
     let mut attempt_records = Vec::<Value>::new();
     let mut current_provider = provider;
     let mut current_model = routed_model.clone();
+    let mut pending_notice: Option<String> = None;
+    let mut pending_route_lease: Option<(
+        alex_middleware::RouteTarget,
+        u64,
+        String,
+        String,
+    )> = None;
     let mut plan = match plan_upstream(
         &state,
         format,
@@ -10679,7 +11686,13 @@ async fn proxy(
             tracing::error!(account = %account.id, "refusing to retry an already-attempted account");
             break;
         }
-        attempt_records.push(json!({"account_id": plan.account.id, "model": current_model}));
+        attempt_records.push(json!({
+            "account_id": plan.account.id,
+            "provider": current_provider.as_str(),
+            "model": current_model,
+            "injected": injected_attempt.is_some(),
+            "fixture_name": trace.fixture_name,
+        }));
 
         let mut forced_oauth_refresh = false;
         loop {
@@ -10700,23 +11713,34 @@ async fn proxy(
                     up_headers.insert(name, value);
                 }
             }
-            let resp = tokio::time::timeout(
-                UPSTREAM_RESPONSE_HEAD_TIMEOUT,
-                state
-                    .http
-                    .post(&plan.url)
-                    .headers(up_headers)
-                    .body(plan.body.clone())
-                    .send(),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "upstream response headers timed out after {}s",
-                    UPSTREAM_RESPONSE_HEAD_TIMEOUT.as_secs()
-                )
-            })
-            .and_then(|result| result.map_err(|error| error.to_string()));
+            let resp: Result<reqwest::Response, String> =
+                if let Some((status, body)) = injected_attempt.take() {
+                    axum::http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .header("x-alexandria-injected", "true")
+                        .body(body)
+                        .map(reqwest::Response::from)
+                        .map_err(|error| format!("could not construct injected response: {error}"))
+                } else {
+                    tokio::time::timeout(
+                        UPSTREAM_RESPONSE_HEAD_TIMEOUT,
+                        state
+                            .http
+                            .post(&plan.url)
+                            .headers(up_headers)
+                            .body(plan.body.clone())
+                            .send(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "upstream response headers timed out after {}s",
+                            UPSTREAM_RESPONSE_HEAD_TIMEOUT.as_secs()
+                        )
+                    })
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                };
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
@@ -10735,7 +11759,7 @@ async fn proxy(
             // quota exhaustion as HTTP 401/403. Inspect those small error
             // bodies before the auth refresh and failover decisions; the
             // helper rebuilds the response for normal forwarding/finalization.
-            let (resp, error_class) = match classify_upstream_response(
+            let (mut resp, error_class) = match classify_upstream_response(
                 current_provider.as_str(),
                 plan.upstream_format,
                 resp,
@@ -10790,136 +11814,46 @@ async fn proxy(
                 }
             }
 
-            let protection = state
-                .protection
-                .read()
-                .map(|policy| policy.clone())
-                .unwrap_or_default();
-            if (reroutable_error_class(error_class) || policy_covers(error_class, &protection))
-                && !substitution_disabled
-                && account.kind != "dario"
-            {
-                let retry_after_s = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(60)
-                    .clamp(1, 3600);
-                tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
-                if let Err(e) = state
-                    .vault
-                    .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
-                    .await
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() && account.kind != "dario" {
+                let protection = state
+                    .protection
+                    .read()
+                    .map(|policy| policy.clone())
+                    .unwrap_or_default();
+                if (reroutable_error_class(error_class)
+                    || policy_covers(error_class, &protection))
+                    && !substitution_disabled
                 {
-                    tracing::warn!("failed to mark cooldown: {e}");
+                    let retry_after_s = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .unwrap_or(60)
+                        .clamp(1, 3600);
+                    tracing::warn!(account = %account.id, retry_after_s, status = %resp.status(), "upstream failed; cooling account down");
+                    if let Err(error) = state
+                        .vault
+                        .mark_cooldown(&account.id, now_ms() + retry_after_s * 1000)
+                        .await
+                    {
+                        tracing::warn!("failed to mark cooldown: {error}");
+                    }
                 }
 
-                if !retry_failover_allowed(
+                let retry_allowed = retry_failover_allowed(
                     current_provider,
                     codex_thread_was_affined,
                     allow_mid_thread_failover,
-                ) {
-                    tracing::warn!(
-                        account = %account.id,
-                        status = %resp.status(),
-                        "returning retryable Codex error without switching an affined thread"
-                    );
-                    upstream_resp = Some(resp);
-                    break 'accounts;
-                }
-
+                );
                 let mut retry_body_json = original_body_json.clone();
-                match plan_upstream(
-                    &state,
-                    format,
-                    current_provider,
-                    &current_model,
-                    &mut retry_body_json,
-                    &body,
-                    &trace_id,
-                    &attempted_accounts,
-                    affinity_session_id.as_deref(),
-                    &headers,
-                )
-                .await
-                {
-                    Ok(next_plan)
-                        if !attempted_accounts.contains(&next_plan.account.id)
-                            && retry_account_eligible(&state, &next_plan.account) =>
-                    {
-                        trace.substituted = true;
-                        trace
-                            .original_model
-                            .get_or_insert_with(|| requested_model.clone());
-                        trace
-                            .original_account_id
-                            .get_or_insert_with(|| plan.account.id.clone());
-                        trace.substitution_reason = Some(error_class.as_str().into());
-                        plan = next_plan;
-                        account = plan
-                            .connection_account
-                            .clone()
-                            .unwrap_or_else(|| plan.account.clone());
-                        bind_trace_account(&state.store, &mut trace, &plan.account);
-                        trace.upstream_format = Some(plan.upstream_format.into());
-                        trace.via_dario = plan.via_dario;
-                        trace.dario_generation = plan.dario_generation.clone();
-                        trace.served_model = Some(current_model.clone());
-                        trace.served_account_id = Some(plan.account.id.clone());
-                        trace.billing_bucket = Some(
-                            if account.kind == "oauth" || account.kind == "dario" {
-                                "subscription"
-                            } else {
-                                "api"
-                            }
-                            .into(),
-                        );
-                        tracing::warn!(
-                            account = %account.id,
-                            attempted = attempted_accounts.len(),
-                            "retrying with failover account"
-                        );
-                        continue 'accounts;
-                    }
-                    Ok(next_plan) => {
-                        tracing::error!(
-                            account = %next_plan.account.id,
-                            "account selector returned an already-attempted failover account"
-                        );
-                    }
-                    Err((status, msg)) => tracing::warn!(
-                        status = %status,
-                        error = %msg,
-                        attempted = attempted_accounts.len(),
-                        "no untried failover account available"
-                    ),
-                }
-                let fallback = if reroutable_error_class(error_class) {
-                    configured_fallback(
-                        &state.substitution,
-                        &requested_model,
-                        &current_model,
-                        &attempted_models,
-                    )
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    protection_equivalent(
-                        &protection,
-                        &requested_model,
-                        current_provider,
-                        &attempted_models,
-                    )
-                });
-                if let Some((fallback_provider, fallback_model)) = fallback {
-                    let mut retry_body_json = original_body_json.clone();
-                    match plan_upstream(
+                let same_route_plan = if retry_allowed && !substitution_disabled {
+                    plan_upstream(
                         &state,
                         format,
-                        fallback_provider,
-                        &fallback_model,
+                        current_provider,
+                        &current_model,
                         &mut retry_body_json,
                         &body,
                         &trace_id,
@@ -10928,53 +11862,235 @@ async fn proxy(
                         &headers,
                     )
                     .await
-                    {
-                        Ok(next_plan)
-                            if !attempted_accounts.contains(&next_plan.account.id)
-                                && retry_account_eligible(&state, &next_plan.account) =>
-                        {
-                            trace.substituted = true;
-                            trace
-                                .original_model
-                                .get_or_insert_with(|| requested_model.clone());
-                            trace
-                                .original_account_id
-                                .get_or_insert_with(|| plan.account.id.clone());
-                            trace.substitution_reason = Some(error_class.as_str().into());
-                            current_provider = fallback_provider;
-                            current_model = fallback_model;
-                            attempted_models.insert(current_model.clone());
-                            plan = next_plan;
-                            account = plan
-                                .connection_account
-                                .clone()
-                                .unwrap_or_else(|| plan.account.clone());
-                            bind_trace_account(&state.store, &mut trace, &plan.account);
-                            trace.upstream_provider = Some(current_provider.as_str().into());
-                            trace.routed_model = Some(current_model.clone());
-                            trace.upstream_format = Some(plan.upstream_format.into());
-                            trace.via_dario = plan.via_dario;
-                            trace.dario_generation = plan.dario_generation.clone();
-                            trace.served_model = Some(current_model.clone());
-                            trace.served_account_id = Some(plan.account.id.clone());
-                            trace.billing_bucket = Some(
-                                if account.kind == "oauth" || account.kind == "dario" {
-                                    "subscription"
-                                } else {
-                                    "api"
-                                }
-                                .into(),
+                    .ok()
+                    .filter(|candidate| {
+                        !attempted_accounts.contains(&candidate.account.id)
+                            && retry_account_eligible(&state, &candidate.account)
+                    })
+                } else {
+                    None
+                };
+                let same_route_accounts_remaining = same_route_plan.is_some();
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from);
+                let empty_body = alex_middleware::BodyView {
+                    content_type: content_type.clone(),
+                    ..Default::default()
+                };
+                let mut context = middleware_attempt_context(
+                    &state,
+                    format,
+                    path,
+                    &headers,
+                    &original_body_json,
+                    &trace,
+                    &requested_model,
+                    &current_model,
+                    current_provider,
+                    plan.upstream_format,
+                    attempt_records.len() as u32,
+                    same_route_accounts_remaining,
+                    status,
+                    resp.headers(),
+                    empty_body,
+                );
+                let (inspection, body_limit) = state
+                    .middleware
+                    .read()
+                    .map(|runtime| {
+                        (
+                            runtime.inspection_plan(&context),
+                            runtime.settings.error_body_limit_bytes,
+                        )
+                    })
+                    .unwrap_or_default();
+                if inspection.needs_body {
+                    match inspect_response_prefix(resp, body_limit).await {
+                        Ok((rebuilt, prefix, truncated)) => {
+                            resp = rebuilt;
+                            let text = String::from_utf8_lossy(&prefix).into_owned();
+                            context = middleware_attempt_context(
+                                &state,
+                                format,
+                                path,
+                                &headers,
+                                &original_body_json,
+                                &trace,
+                                &requested_model,
+                                &current_model,
+                                current_provider,
+                                plan.upstream_format,
+                                attempt_records.len() as u32,
+                                same_route_accounts_remaining,
+                                status,
+                                resp.headers(),
+                                alex_middleware::BodyView {
+                                    content_type,
+                                    size_bytes: (!truncated).then_some(prefix.len() as u64),
+                                    text: Some(text),
+                                    json: (!truncated)
+                                        .then(|| serde_json::from_slice(&prefix).ok())
+                                        .flatten(),
+                                    truncated,
+                                    inspected_bytes: prefix.len(),
+                                },
                             );
-                            tracing::warn!(account = %account.id, model = %current_model, "retrying with configured model fallback");
-                            continue 'accounts;
                         }
-                        Ok(next_plan) => {
-                            tracing::warn!(account = %next_plan.account.id, "configured fallback selected an attempted account")
-                        }
-                        Err((status, msg)) => {
-                            tracing::warn!(status = %status, error = %msg, model = %fallback_model, "configured fallback has no eligible account")
+                        Err(error) => {
+                            trace.status = Some(502);
+                            trace.error = Some(error.clone());
+                            trace.error_kind = Some("upstream_unreachable".into());
+                            trace.error_class = Some(ErrorClass::Network.as_str().into());
+                            finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                            return error_response(StatusCode::BAD_GATEWAY, &error);
                         }
                     }
+                }
+                let evaluation = state
+                    .middleware
+                    .read()
+                    .map(|runtime| {
+                        runtime.evaluate(
+                            &context,
+                            substitution_disabled || !retry_allowed,
+                        )
+                    })
+                    .unwrap_or_default();
+                if let Ok(mut runtime) = state.middleware.write() {
+                    runtime.note_evaluation(&evaluation);
+                }
+                if let Some(record) = attempt_records.last_mut().and_then(Value::as_object_mut) {
+                    record.insert("provider".into(), json!(current_provider.as_str()));
+                    record.insert("status".into(), json!(status));
+                    record.insert("error".into(), json!(context.outcome.error));
+                    record.insert(
+                        "body_truncated".into(),
+                        json!(context.outcome.body.truncated),
+                    );
+                    record.insert(
+                        "middleware_decisions".into(),
+                        json!(evaluation.records),
+                    );
+                }
+                let source_rule = matched_terminal_rule(&evaluation);
+                let max_attempts = state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.settings.max_attempts as usize)
+                    .unwrap_or(3);
+                if attempt_records.len() >= max_attempts
+                    && evaluation.decision.is_terminal()
+                {
+                    tracing::warn!(max_attempts, "middleware attempt budget exhausted");
+                    upstream_resp = Some(resp);
+                    break 'accounts;
+                }
+
+                let next_route = match &evaluation.decision {
+                    alex_middleware::AttemptDecision::RetrySameRoute { reason, .. } => {
+                        same_route_plan.map(|next_plan| {
+                            (current_provider, current_model.clone(), next_plan, reason.clone())
+                        })
+                    }
+                    alex_middleware::AttemptDecision::Reroute {
+                        target,
+                        scope,
+                        notice,
+                        reason,
+                    } => {
+                        if let Some((provider, model)) =
+                            middleware_target_route(
+                                &state,
+                                target,
+                                current_provider,
+                                &current_model,
+                            )
+                        {
+                            let mut retry_body_json = original_body_json.clone();
+                            let next_plan = plan_upstream(
+                                &state,
+                                format,
+                                provider,
+                                &model,
+                                &mut retry_body_json,
+                                &body,
+                                &trace_id,
+                                &attempted_accounts,
+                                affinity_session_id.as_deref(),
+                                &headers,
+                            )
+                            .await
+                            .ok()
+                            .filter(|candidate| {
+                                !attempted_accounts.contains(&candidate.account.id)
+                                    && retry_account_eligible(&state, &candidate.account)
+                            });
+                            next_plan.map(|next_plan| {
+                                pending_notice = notice.as_ref().map(|notice| notice.text.clone());
+                                if let alex_middleware::RouteScope::Session { ttl_seconds } = scope {
+                                    if context.session.has_stable_id()
+                                        && context.route.requested.capabilities.portable_history
+                                    {
+                                        pending_route_lease = Some((
+                                            target.clone(),
+                                            *ttl_seconds,
+                                            source_rule.clone().unwrap_or_else(|| "unknown".into()),
+                                            reason.clone(),
+                                        ));
+                                    }
+                                }
+                                (provider, model, next_plan, reason.clone())
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    alex_middleware::AttemptDecision::Continue
+                    | alex_middleware::AttemptDecision::ReturnOriginal { .. } => None,
+                };
+
+                if let Some((next_provider, next_model, next_plan, reason)) = next_route {
+                    trace.substituted = true;
+                    trace
+                        .original_model
+                        .get_or_insert_with(|| requested_model.clone());
+                    trace
+                        .original_account_id
+                        .get_or_insert_with(|| plan.account.id.clone());
+                    trace.substitution_reason = Some(reason);
+                    current_provider = next_provider;
+                    current_model = next_model;
+                    plan = next_plan;
+                    account = plan
+                        .connection_account
+                        .clone()
+                        .unwrap_or_else(|| plan.account.clone());
+                    bind_trace_account(&state.store, &mut trace, &plan.account);
+                    trace.upstream_provider = Some(current_provider.as_str().into());
+                    trace.routed_model = Some(current_model.clone());
+                    trace.upstream_format = Some(plan.upstream_format.into());
+                    trace.via_dario = plan.via_dario;
+                    trace.dario_generation = plan.dario_generation.clone();
+                    trace.served_model = Some(current_model.clone());
+                    trace.served_account_id = Some(plan.account.id.clone());
+                    trace.billing_bucket = Some(
+                        if account.kind == "oauth" || account.kind == "dario" {
+                            "subscription"
+                        } else {
+                            "api"
+                        }
+                        .into(),
+                    );
+                    tracing::warn!(
+                        middleware = source_rule.as_deref().unwrap_or("unknown"),
+                        account = %account.id,
+                        model = %current_model,
+                        "executing middleware retry decision"
+                    );
+                    continue 'accounts;
                 }
             }
 
@@ -10983,14 +12099,20 @@ async fn proxy(
         }
     }
     let upstream_resp = upstream_resp.expect("upstream response after retry loop");
+    let status = upstream_resp.status();
+    if let Some(record) = attempt_records.last_mut().and_then(Value::as_object_mut) {
+        record.insert("status".into(), json!(status.as_u16()));
+        record
+            .entry("middleware_decisions")
+            .or_insert_with(|| json!([]));
+    }
     if trace.substituted {
         trace.served_model = Some(current_model.clone());
         trace.served_account_id = Some(plan.account.id.clone());
-        trace.attempts = serde_json::to_string(&attempt_records).ok();
     }
+    trace.attempts = serde_json::to_string(&attempt_records).ok();
     bind_trace_account(&state.store, &mut trace, &plan.account);
 
-    let status = upstream_resp.status();
     trace.status = Some(status.as_u16() as i64);
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -11001,7 +12123,10 @@ async fn proxy(
     trace.resp_headers_json = Some(redacted_headers(&resp_headers));
     let is_sse = content_type.starts_with("text/event-stream");
 
-    if let Some(target) = plan.respond_as {
+    let response_target = plan
+        .respond_as
+        .or_else(|| pending_notice.as_ref().map(|_| client_respond_as(format)));
+    if let Some(target) = response_target {
         use alex_core::translate;
         let buf = match upstream_resp.bytes().await {
             Ok(b) => b.to_vec(),
@@ -11072,7 +12197,7 @@ async fn proxy(
         // clear, non-empty completion (and mark the trace) before translating to
         // the client format; normal completions are left untouched.
         surface_upstream_refusal(&mut trace, &mut upstream_final, plan.upstream_format);
-        let out = match (target, plan.upstream_format) {
+        let mut out = match (target, plan.upstream_format) {
             (RespondAs::Gemini, "gemini") => upstream_final.clone(),
             (RespondAs::Anthropic, "gemini") => {
                 translate::gemini_response_to_anthropic(&upstream_final, &requested_model)
@@ -11127,6 +12252,9 @@ async fn proxy(
                 translate::responses_final_to_openai_chat(&upstream_final, &requested_model)
             }
         };
+        if let Some(notice) = pending_notice.as_deref() {
+            prepend_response_notice(&mut out, target, notice);
+        }
         let (out_ct, out_body) = if plan.client_stream {
             let sse = match target {
                 RespondAs::Anthropic => translate::synth_anthropic_sse(&out),
@@ -11149,6 +12277,12 @@ async fn proxy(
             trace.error.as_deref(),
         )
         .await;
+        commit_middleware_route_lease(
+            &state,
+            &mut trace,
+            &requested_model,
+            pending_route_lease.take(),
+        );
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(StatusCode::OK)
@@ -11211,6 +12345,14 @@ async fn proxy(
             trace.error.as_deref(),
         )
         .await;
+        if out_status.is_success() {
+            commit_middleware_route_lease(
+                &state,
+                &mut trace,
+                &requested_model,
+                pending_route_lease.take(),
+            );
+        }
         finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
         return Response::builder()
             .status(out_status)
@@ -11226,6 +12368,8 @@ async fn proxy(
     let client_body = body.clone();
     let upstream_body = plan.body.clone();
     let dario_guard = plan.dario_guard.take();
+    let pending_stream_lease = pending_route_lease.take();
+    let original_stream_model = requested_model.clone();
     tokio::spawn(async move {
         let _dario_guard = dario_guard;
         let mut in_flight = in_flight;
@@ -11306,6 +12450,14 @@ async fn proxy(
         .await;
 
         fill_usage_and_cost(&state2, &mut trace, &buf, is_sse);
+        if trace.error.is_none() && status.is_success() {
+            commit_middleware_route_lease(
+                &state2,
+                &mut trace,
+                &original_stream_model,
+                pending_stream_lease,
+            );
+        }
         finalize_trace(
             &state2,
             trace,
@@ -11707,6 +12859,60 @@ fn parse_upstream_error(format: &str, _status: u16, body: &[u8]) -> Option<Parse
         code: json_string(&error["code"]),
         message: json_string(&error["message"]),
     })
+}
+
+/// Inspect a bounded response prefix without making a no-match response
+/// lossy. The returned response replays every consumed chunk before resuming
+/// the original reqwest stream, preserving the upstream bytes exactly.
+///
+/// The read target is `limit + 1`: the extra byte distinguishes a complete
+/// body exactly at the limit from a truncated one. Successful responses never
+/// call this helper in the default middleware mode.
+async fn inspect_response_prefix(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(reqwest::Response, Vec<u8>, bool), String> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let mut stream = response.bytes_stream();
+    let mut replay_chunks = Vec::<Bytes>::new();
+    let mut inspected = Vec::with_capacity(limit.min(64 * 1024));
+    let target = limit.saturating_add(1);
+    let mut ended = false;
+
+    while inspected.len() < target {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = target - inspected.len();
+                inspected.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                replay_chunks.push(chunk);
+            }
+            Some(Err(error)) => {
+                return Err(format!("upstream body read failed during inspection: {error}"));
+            }
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+
+    let truncated = inspected.len() > limit || (!ended && inspected.len() == target);
+    inspected.truncate(limit);
+    let replay = futures_util::stream::iter(
+        replay_chunks
+            .into_iter()
+            .map(Ok::<Bytes, reqwest::Error>),
+    )
+    .chain(stream);
+    let mut rebuilt = axum::http::Response::builder()
+        .status(status)
+        .version(version)
+        .body(reqwest::Body::wrap_stream(replay))
+        .map_err(|error| format!("could not rebuild inspected response: {error}"))?;
+    *rebuilt.headers_mut() = headers;
+    Ok((reqwest::Response::from(rebuilt), inspected, truncated))
 }
 
 fn capture_response_error(trace: &mut TraceRecord, body: &[u8]) {
@@ -13050,11 +14256,26 @@ mod tests {
         assert!(needs_reauth_flag(&state, account_id).await);
         reauth_watch_once(&state).await;
 
-        let payload = first_event(
-            &received,
-            "watchdog did not send the Anthropic paste-mode Telegram alert",
-        )
-        .await;
+        let payload = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(payload) = received
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|payload| {
+                        payload["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("work@example.test"))
+                    })
+                    .cloned()
+                {
+                    return payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watchdog did not send the Anthropic paste-mode Telegram alert");
         let text = payload["text"].as_str().unwrap();
         assert!(text.contains("work@example.test"));
         assert!(text.contains("https://claude.ai/oauth/authorize"));
@@ -13072,7 +14293,14 @@ mod tests {
         reauth_watch_once(&state).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            received.lock().unwrap().len(),
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|payload| payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("work@example.test")))
+                .count(),
             1,
             "an active watchdog login must be reused, not duplicated"
         );
@@ -14833,6 +16061,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_base_override_reaches_cross_format_openai_plan() {
+        let state = test_state("middleware-upstream-override");
+        state
+            .vault
+            .upsert(test_api_account("openai-test", Provider::Openai))
+            .await
+            .unwrap();
+        set_upstream_base_override(&state, Provider::Openai, "http://127.0.0.1:9876/");
+        let mut request = json!({
+            "model": "claude-fable-5",
+            "max_tokens": 64,
+            "messages": []
+        });
+        let original = serde_json::to_vec(&request).unwrap();
+        let plan = plan_upstream(
+            &state,
+            ClientFormat::AnthropicMessages,
+            Provider::Openai,
+            "gpt-5.6-sol",
+            &mut request,
+            &original,
+            "trace-middleware-override",
+            &HashSet::new(),
+            Some("session-middleware"),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.url, "http://127.0.0.1:9876/v1/responses");
+        assert_eq!(plan.upstream_format, "openai-responses");
+        assert!(matches!(plan.respond_as, Some(RespondAs::Anthropic)));
+    }
+
+    #[tokio::test]
     async fn configured_dario_fails_closed_when_repair_is_unavailable() {
         let state = test_state_with_dario(
             "dario-unhealthy",
@@ -15916,6 +17178,14 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
+        let cached_accounts = state.vault.list_cached();
+        assert!(
+            cached_accounts.iter().any(|account| account.provider == Provider::Anthropic
+                && account.status == "active"
+                && !account.paused),
+            "test Anthropic account disappeared before simulated policy check: {cached_accounts:?}"
+        );
+
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
@@ -15937,7 +17207,7 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true);
+        assert_eq!(trace["substituted"], true, "trace={trace}");
         assert_eq!(trace["served_model"], "gpt-5.6-sol");
         server.abort();
     }
@@ -17317,6 +18587,314 @@ mod tests {
             .unwrap();
         assert_eq!(row["injected"], true);
         assert_eq!(row["fixture_name"], "captured-auth");
+    }
+
+    #[tokio::test]
+    async fn fable_fixture_reroutes_to_sol_then_session_lease_skips_anthropic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let anthropic_requests = Arc::new(AtomicUsize::new(0));
+        let openai_requests = Arc::new(AtomicUsize::new(0));
+        let anthropic_seen = anthropic_requests.clone();
+        let openai_seen = openai_requests.clone();
+        let upstream = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let seen = anthropic_seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({
+                                "type": "error",
+                                "error": {"type": "overloaded_error", "message": "unexpected Anthropic request"}
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move |axum::Json(request): axum::Json<Value>| {
+                    let seen = openai_seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(request["model"], "gpt-5.6-sol");
+                        axum::Json(json!({
+                            "id": "resp_sol_middleware",
+                            "object": "response",
+                            "status": "completed",
+                            "model": "gpt-5.6-sol",
+                            "output": [{
+                                "id": "msg_sol_middleware",
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "Sol handled the turn", "annotations": []}]
+                            }],
+                            "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state("middleware-fable-sol-lease");
+        state
+            .vault
+            .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-sol", Provider::Openai))
+            .await
+            .unwrap();
+        set_upstream_base_override(
+            &state,
+            Provider::Anthropic,
+            format!("http://{address}"),
+        );
+        set_upstream_base_override(&state, Provider::Openai, format!("http://{address}"));
+        let fixture_root = tmpdir("middleware-fable-sol-fixtures");
+        set_fixture_dir(&state, fixture_root.join("fixtures"));
+        {
+            let mut runtime = state.middleware.write().unwrap();
+            let mut rule = runtime
+                .rules()
+                .iter()
+                .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+                .unwrap()
+                .clone();
+            rule.enabled = true;
+            let id = rule.id.clone();
+            runtime.replace_rule(&id, rule).unwrap();
+        }
+        let injected = admin_session_inject(
+            State(state.clone()),
+            Path("session-fable-sol".into()),
+            axum::Json(json!({"fixture": "anthropic-fable-unavailable-529"})),
+        )
+        .await;
+        assert_eq!(injected.status(), StatusCode::CREATED);
+
+        let request = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+            headers.insert("x-session-id", HeaderValue::from_static("session-fable-sol"));
+            headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"hello"}]}"#,
+                ),
+                None,
+            )
+        };
+
+        let (first_status, first) = response_json(request().await).await;
+        assert_eq!(first_status, StatusCode::OK, "{first}");
+        let first_text = first["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_text.contains("We moved this chat from Fable 5"));
+        assert!(first_text.contains("Sol handled the turn"));
+        assert_eq!(first["model"], "claude-fable-5");
+        assert_eq!(openai_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(anthropic_requests.load(Ordering::SeqCst), 0);
+
+        let leases = middleware_leases_snapshot(&state);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].session_id, "session-fable-sol");
+        assert_eq!(leases[0].original_model, "claude-fable-5");
+
+        let (second_status, second) = response_json(request().await).await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert_eq!(openai_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            anthropic_requests.load(Ordering::SeqCst),
+            0,
+            "the active session lease must bypass Anthropic"
+        );
+
+        let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
+        let first_trace = traces
+            .iter()
+            .find(|trace| trace["injected"] == true)
+            .expect("injected trace");
+        let attempts = first_trace["attempts"].as_array().expect("attempt records");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["status"], 529);
+        assert_eq!(attempts[1]["provider"], "openai");
+        assert_eq!(attempts[1]["status"], 200);
+        assert_eq!(attempts[1]["middleware_decisions"], json!([]));
+        assert!(attempts[0]["middleware_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID));
+        server.abort();
+    }
+
+    #[test]
+    fn configured_equivalent_target_honors_provider_constraints() {
+        let state = test_state("middleware-equivalent-target");
+        set_protection_policy(
+            &state,
+            ProtectionPolicy {
+                enabled: true,
+                equivalencies: BTreeMap::from([(
+                    "claude-fable-5".into(),
+                    BTreeMap::from([("openai".into(), "gpt-5.6-sol".into())]),
+                )]),
+                ..Default::default()
+            },
+        );
+        let target = alex_middleware::RouteTarget::Equivalent {
+            class: "fable-5".into(),
+            providers: alex_middleware::ProviderConstraint::Only(vec!["openai".into()]),
+        };
+        assert_eq!(
+            middleware_target_route(
+                &state,
+                &target,
+                Provider::Anthropic,
+                "claude-fable-5",
+            ),
+            Some((Provider::Openai, "gpt-5.6-sol".into()))
+        );
+
+        let excluded = alex_middleware::RouteTarget::Equivalent {
+            class: "claude-fable-5".into(),
+            providers: alex_middleware::ProviderConstraint::Exclude(vec!["openai".into()]),
+        };
+        assert_eq!(
+            middleware_target_route(
+                &state,
+                &excluded,
+                Provider::Anthropic,
+                "claude-fable-5",
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_middleware_inspection_replays_original_chunks_exactly() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"defgh")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ijkl")),
+        ];
+        let response = axum::http::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "application/json")
+            .header("x-upstream-marker", "preserved")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .map(reqwest::Response::from)
+            .unwrap();
+        let (rebuilt, prefix, truncated) = inspect_response_prefix(response, 5).await.unwrap();
+        assert_eq!(rebuilt.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rebuilt.headers()["x-upstream-marker"], "preserved");
+        assert_eq!(prefix, b"abcde");
+        assert!(truncated);
+        assert_eq!(rebuilt.bytes().await.unwrap().as_ref(), b"abcdefghijkl");
+
+        let exact = axum::http::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Bytes::from_static(b"12345"))
+            .map(reqwest::Response::from)
+            .unwrap();
+        let (rebuilt, prefix, truncated) = inspect_response_prefix(exact, 5).await.unwrap();
+        assert_eq!(prefix, b"12345");
+        assert!(!truncated);
+        assert_eq!(rebuilt.bytes().await.unwrap().as_ref(), b"12345");
+    }
+
+    #[tokio::test]
+    async fn middleware_admin_status_validate_crud_and_fixture_dry_run_round_trip() {
+        let state = test_state("middleware-admin-round-trip");
+        let fixture_root = tmpdir("middleware-admin-fixtures");
+        set_fixture_dir(&state, fixture_root.join("fixtures"));
+
+        let (status, initial) = response_json(admin_middleware(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(initial["settings"]["error_body_limit_bytes"], 65_536);
+        assert!(initial["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == alex_middleware::ACCOUNT_FAILOVER_ID));
+
+        let mut rule = alex_middleware::fable_to_sol_rule();
+        rule.id = "custom.fable-to-sol".into();
+        rule.enabled = true;
+        let (validation_status, validation) = response_json(
+            admin_middleware_validate(
+                State(state.clone()),
+                axum::Json(MiddlewareValidationRequest { rule: rule.clone() }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(validation_status, StatusCode::OK);
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["body_inspection_required"], true);
+
+        let (created_status, created) = response_json(
+            admin_middleware_rule_create(State(state.clone()), axum::Json(rule.clone())).await,
+        )
+        .await;
+        assert_eq!(created_status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["rule"]["id"], rule.id);
+        assert!(created["generation"].as_str().is_some());
+
+        let (dry_status, dry) = response_json(
+            admin_middleware_test(
+                State(state.clone()),
+                axum::Json(MiddlewareTestRequest {
+                    middleware_id: rule.id.clone(),
+                    fixture_name: Some("anthropic-fable-unavailable-529".into()),
+                    trace_id: None,
+                    context: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(dry_status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["decision"]["decision"], "reroute");
+        assert!(dry["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["rule_id"] == rule.id));
+
+        let deleted = admin_middleware_rule_delete(
+            State(state.clone()),
+            Path("custom.fable-to-sol".into()),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let (_, final_status) = response_json(admin_middleware(State(state)).await).await;
+        assert!(!final_status["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["id"] == "custom.fable-to-sol"));
     }
 
     #[tokio::test]
