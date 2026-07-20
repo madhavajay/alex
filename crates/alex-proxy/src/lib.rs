@@ -5195,6 +5195,162 @@ fn transcript_turn(row: &Value) -> Value {
     })
 }
 
+fn transcript_request_format(format: &str) -> Option<alex_core::ClientFormat> {
+    match format {
+        "anthropic" => Some(alex_core::ClientFormat::AnthropicMessages),
+        "openai-chat" => Some(alex_core::ClientFormat::OpenaiChat),
+        "openai-responses" => Some(alex_core::ClientFormat::OpenaiResponses),
+        "gemini" => Some(alex_core::ClientFormat::GeminiGenerate),
+        _ => None,
+    }
+}
+
+fn transcript_content_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(transcript_content_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
+fn inherited_entry_turn(row: &Value, index: usize, entry: &alex_core::ResumeEntry) -> Value {
+    let mut text = Vec::new();
+    let mut assistant_blocks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in &entry.content {
+        match block["type"].as_str() {
+            Some("text") => {
+                let Some(value) = block["text"].as_str().filter(|text| !text.is_empty()) else {
+                    continue;
+                };
+                text.push(value.to_string());
+                if entry.role == "assistant" {
+                    assistant_blocks.push(json!({
+                        "type": "text",
+                        "text": truncate_chars(value.to_string(), 8000),
+                    }));
+                }
+            }
+            Some("tool_call") => {
+                let arguments = match &block["arguments"] {
+                    Value::String(value) => value.clone(),
+                    Value::Null => String::new(),
+                    value => value.to_string(),
+                };
+                let mut call = json!({
+                    "name": block["name"].as_str().unwrap_or("tool"),
+                    "arguments": truncate_chars(arguments, 600),
+                });
+                if let Some(id) = block["id"].as_str().filter(|id| !id.is_empty()) {
+                    call["id"] = json!(id);
+                }
+                tool_calls.push(call.clone());
+                let mut assistant_block = call;
+                assistant_block["type"] = json!("tool_call");
+                assistant_blocks.push(assistant_block);
+            }
+            Some("tool_result") => {
+                let result = transcript_content_text(&block["content"]);
+                if !result.is_empty() {
+                    text.push(format!("[tool result] {result}"));
+                }
+            }
+            Some("content") => {
+                let value = transcript_content_text(&block["value"]);
+                if !value.is_empty() {
+                    text.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = (!text.is_empty()).then(|| truncate_chars(text.join("\n\n"), 8000));
+    let trace_id = format!(
+        "{}:inherited:{index}",
+        row["id"].as_str().unwrap_or("trace")
+    );
+    json!({
+        "trace_id": trace_id,
+        "ts_request_ms": row["ts_request_ms"],
+        "ts_response_ms": Value::Null,
+        "model": Value::Null,
+        "provider": Value::Null,
+        "status": Value::Null,
+        "input_tokens": Value::Null,
+        "output_tokens": Value::Null,
+        "reasoning_effort": Value::Null,
+        "thinking_budget": Value::Null,
+        "cost_usd": Value::Null,
+        "billing_bucket": Value::Null,
+        "account_id": Value::Null,
+        "error": Value::Null,
+        "error_kind": Value::Null,
+        "error_code": Value::Null,
+        "error_class": Value::Null,
+        "user": if matches!(entry.role, "user" | "tool") { text.clone() } else { None },
+        "assistant": if entry.role == "assistant" { text } else { None },
+        "tool_calls": tool_calls,
+        "assistant_blocks": assistant_blocks,
+        "executed_tools": [],
+        "role": entry.role,
+        "inherited": true,
+    })
+}
+
+/// Return the history prefix embedded in a fork's first provider request.
+/// The final user/tool entry remains on the real trace turn, where it is
+/// paired with that trace's response. A plain first request (system + one
+/// user message) therefore produces no synthetic entries.
+fn transcript_inherited_turns(row: &Value) -> Vec<Value> {
+    let Some(format) = row["client_format"]
+        .as_str()
+        .and_then(transcript_request_format)
+    else {
+        return Vec::new();
+    };
+    let Some(request) = read_gz_json(row["req_body_path"].as_str()) else {
+        return Vec::new();
+    };
+    let entries = alex_core::request_entries(format, &request);
+    let Some(current_index) = entries
+        .iter()
+        .rposition(|entry| matches!(entry.role, "user" | "tool"))
+    else {
+        return Vec::new();
+    };
+    // `last_user_text` renders the trailing request entry on the real turn.
+    // Do not guess at requests that end in an assistant message.
+    if current_index + 1 != entries.len() {
+        return Vec::new();
+    }
+    let history = &entries[..current_index];
+    let genuine_prior_history = history.iter().any(|entry| {
+        matches!(entry.role, "assistant" | "tool")
+            || entry.content.iter().any(|block| {
+                matches!(block["type"].as_str(), Some("tool_call" | "tool_result"))
+            })
+    });
+    if !genuine_prior_history {
+        return Vec::new();
+    }
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| inherited_entry_turn(row, index, entry))
+        .collect()
+}
+
 /// Counts are sent with the transcript so tab labels never need to rescan a
 /// large response while the user is typing a filter. They intentionally count
 /// displayable message halves, matching the client filter's All/User/Model
@@ -5268,6 +5424,48 @@ fn codex_user_history_signature(row: &Value) -> Option<String> {
     openai_responses_user_history_signature(&read_gz_json(row["req_body_path"].as_str())?)
 }
 
+fn build_session_transcript(rows: &[Value], tools: &[Value], limit: usize) -> Vec<Value> {
+    let mut previous_codex_user_history: Option<String> = None;
+    let mut turns = Vec::new();
+    for (index, row) in rows.iter().take(limit).enumerate() {
+        if index == 0 {
+            turns.extend(transcript_inherited_turns(row));
+        }
+        let signature = codex_user_history_signature(row);
+        let replayed_user = signature.is_some() && signature == previous_codex_user_history;
+        if signature.is_some() {
+            previous_codex_user_history = signature;
+        }
+        let mut turn = transcript_turn(row);
+        // Pi emits a tool start after the model response that requested it
+        // and before the next provider request. Associate by explicit
+        // trace_id when available, otherwise by that session-local time
+        // interval. `turn_id` remains on each tool row for Pi-level joins.
+        let next_request = rows
+            .get(index + 1)
+            .and_then(|next| next["ts_request_ms"].as_i64());
+        let trace_id = row["id"].as_str();
+        let started = row["ts_request_ms"].as_i64().unwrap_or_default();
+        let executed: Vec<Value> = tools
+            .iter()
+            .filter(|tool| {
+                tool["trace_id"].as_str() == trace_id
+                    || (tool["trace_id"].is_null()
+                        && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
+                            ts >= started && next_request.is_none_or(|next| ts < next)
+                        }))
+            })
+            .cloned()
+            .collect();
+        turn["executed_tools"] = json!(executed);
+        if replayed_user {
+            turn["user"] = Value::Null;
+        }
+        turns.push(turn);
+    }
+    turns
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5286,45 +5484,7 @@ async fn traces_session_transcript(
         Ok(rows) => rows,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let mut previous_codex_user_history: Option<String> = None;
-    let turns: Vec<Value> = rows
-        .iter()
-        .take(limit)
-        .enumerate()
-        .map(|(index, row)| {
-            let signature = codex_user_history_signature(row);
-            let replayed_user = signature.is_some() && signature == previous_codex_user_history;
-            if signature.is_some() {
-                previous_codex_user_history = signature;
-            }
-            let mut turn = transcript_turn(row);
-            // Pi emits a tool start after the model response that requested it
-            // and before the next provider request. Associate by explicit
-            // trace_id when available, otherwise by that session-local time
-            // interval. `turn_id` remains on each tool row for Pi-level joins.
-            let next_request = rows
-                .get(index + 1)
-                .and_then(|next| next["ts_request_ms"].as_i64());
-            let trace_id = row["id"].as_str();
-            let started = row["ts_request_ms"].as_i64().unwrap_or_default();
-            let executed: Vec<Value> = tools
-                .iter()
-                .filter(|tool| {
-                    tool["trace_id"].as_str() == trace_id
-                        || (tool["trace_id"].is_null()
-                            && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
-                                ts >= started && next_request.is_none_or(|next| ts < next)
-                            }))
-                })
-                .cloned()
-                .collect();
-            turn["executed_tools"] = json!(executed);
-            if replayed_user {
-                turn["user"] = Value::Null;
-            }
-            turn
-        })
-        .collect();
+    let turns = build_session_transcript(&rows, &tools, limit);
     let tab_counts = transcript_tab_counts(&turns);
     axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
         .into_response()
@@ -7689,9 +7849,9 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        account_plot_series, openai_responses_user_history_signature, session_from_metadata,
-        trace_extras, trace_harness, trace_reasoning_fields, transcript_assistant_blocks,
-        transcript_tab_counts, transcript_turn, truncate_chars, Store,
+        account_plot_series, build_session_transcript, openai_responses_user_history_signature,
+        session_from_metadata, trace_extras, trace_harness, trace_reasoning_fields,
+        transcript_assistant_blocks, transcript_tab_counts, transcript_turn, truncate_chars, Store,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::{json, Value};
@@ -7846,6 +8006,79 @@ mod trace_api_tests {
         assert_eq!(turn["reasoning_effort"], "minimal");
         assert_eq!(turn["billing_bucket"], "subscription");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
+    }
+
+    fn first_request_row(store: &Store, id: &str, request: &str) -> Value {
+        let request_path = store
+            .write_body(id, "request.json", request.as_bytes())
+            .expect("gzip-write first request body");
+        json!({
+            "id": id,
+            "ts_request_ms": 1_783_564_098_000_i64,
+            "ts_response_ms": null,
+            "routed_model": "claude-sonnet-4-5",
+            "upstream_provider": "anthropic",
+            "status": 200,
+            "input_tokens": null,
+            "output_tokens": null,
+            "cost_usd": null,
+            "error": null,
+            "client_format": "anthropic",
+            "upstream_format": "anthropic",
+            "req_body_path": request_path,
+            "resp_body_path": null,
+        })
+    }
+
+    #[test]
+    fn transcript_first_fork_request_renders_inherited_history_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-inherited-transcript-{}",
+            std::process::id()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).unwrap();
+        let row = first_request_row(
+            &store,
+            "fork-first",
+            include_str!("../tests/fixtures/transcript/fork_first_request.json"),
+        );
+
+        let turns = build_session_transcript(&[row], &[], 500);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0]["user"], "Inspect the failing test.");
+        assert_eq!(turns[0]["inherited"], true);
+        assert_eq!(turns[1]["assistant"], "I will inspect it.");
+        assert_eq!(turns[1]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(turns[1]["inherited"], true);
+        assert!(turns[2]["user"]
+            .as_str()
+            .is_some_and(|text| text.contains("fn broken() {}")));
+        assert_eq!(turns[2]["inherited"], true);
+        assert_eq!(turns[3]["assistant"], "The failure is in broken().");
+        assert_eq!(turns[3]["inherited"], true);
+        assert_eq!(turns[4]["user"], "Fix it and run the tests.");
+        assert!(turns[4].get("inherited").is_none());
+    }
+
+    #[test]
+    fn transcript_normal_first_request_does_not_duplicate_its_user() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-normal-transcript-{}",
+            std::process::id()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).unwrap();
+        let row = first_request_row(
+            &store,
+            "normal-first",
+            include_str!("../tests/fixtures/transcript/normal_first_request.json"),
+        );
+
+        let turns = build_session_transcript(&[row], &[], 500);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["user"], "Start a new task.");
+        assert!(turns[0].get("inherited").is_none());
     }
 
     struct RemoveTestDir(PathBuf);

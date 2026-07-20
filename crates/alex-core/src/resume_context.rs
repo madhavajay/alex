@@ -182,7 +182,13 @@ fn build_resume_context_from_entries(
     }
 }
 
-fn request_entries(format: ClientFormat, request: &Value) -> Vec<ResumeEntry> {
+/// Normalize the visible messages carried in one request body.
+///
+/// Transcript presentation uses the same normalization as session forking so
+/// Anthropic, OpenAI, Responses, and Gemini history are interpreted
+/// consistently. System/developer instructions and hidden reasoning are
+/// intentionally omitted.
+pub fn request_entries(format: ClientFormat, request: &Value) -> Vec<ResumeEntry> {
     let mut entries = Vec::new();
     match format {
         ClientFormat::AnthropicMessages => {

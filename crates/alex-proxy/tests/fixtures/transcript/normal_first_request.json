@@ -1,0 +1,7 @@
+{
+  "model": "claude-sonnet-4-5",
+  "system": "You are a coding assistant.",
+  "messages": [
+    {"role": "user", "content": "Start a new task."}
+  ]
+}

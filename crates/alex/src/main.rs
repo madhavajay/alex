@@ -222,7 +222,7 @@ enum Command {
         /// Alex model to use; defaults to the source model when the target supports it
         #[arg(long)]
         model: Option<String>,
-        /// Force legacy prompt-paste mode instead of native Pi session injection
+        /// Force legacy prompt-paste mode instead of native session injection
         #[arg(long)]
         paste: bool,
         /// Reconstruct and validate the fork without launching a harness

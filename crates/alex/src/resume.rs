@@ -12,7 +12,7 @@ use alex_core::{
 };
 use alex_store::{SessionForkRecord, Store, TraceFilter};
 use anyhow::{bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Local, SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
@@ -80,6 +80,8 @@ struct ModelSelection {
 enum ResumeMode {
     PromptPaste { reason: String },
     NativePi(PiSessionDraft),
+    NativeClaude(ClaudeSessionDraft),
+    NativeCodex(CodexSessionDraft),
 }
 
 #[derive(Debug)]
@@ -87,6 +89,31 @@ struct PiSessionDraft {
     id: String,
     path: PathBuf,
     jsonl: String,
+}
+
+#[derive(Debug)]
+struct ClaudeSessionDraft {
+    id: String,
+    path: PathBuf,
+    jsonl: String,
+}
+
+#[derive(Debug)]
+struct CodexSessionDraft {
+    id: String,
+    path: PathBuf,
+    jsonl: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeSessionFormat {
+    version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexSessionFormat {
+    cli_version: String,
+    history_mode: String,
 }
 
 pub(crate) async fn resume_cmd(
@@ -497,28 +524,47 @@ fn build_launch_plan(
         ],
         _ => unreachable!("target validation restricts resume harnesses"),
     };
-    let mode = if target != "pi" {
-        args.push(OsString::from(prompt.replace('\0', "�")));
-        ResumeMode::PromptPaste {
-            reason: "native session injection is Pi-only".into(),
-        }
-    } else if paste {
+    let mode = if paste {
         args.push(OsString::from(prompt.replace('\0', "�")));
         ResumeMode::PromptPaste {
             reason: "forced by --paste".into(),
         }
     } else {
-        match sniff_pi_session_format(&config_dir.join("sessions")) {
-            Ok(()) => {
-                let draft = build_pi_session_draft(&config_dir, cwd, &model.model, context)?;
-                args.push(OsString::from("--session"));
-                args.push(OsString::from(&draft.id));
-                ResumeMode::NativePi(draft)
-            }
-            Err(reason) => {
-                args.push(OsString::from(prompt.replace('\0', "�")));
-                ResumeMode::PromptPaste { reason }
-            }
+        match target {
+            "pi" => match sniff_pi_session_format(&config_dir.join("sessions")) {
+                Ok(()) => {
+                    let draft = build_pi_session_draft(&config_dir, cwd, &model.model, context)?;
+                    args.push(OsString::from("--session"));
+                    args.push(OsString::from(&draft.id));
+                    ResumeMode::NativePi(draft)
+                }
+                Err(reason) => prompt_paste_mode(&mut args, prompt, reason),
+            },
+            "claude" => match sniff_claude_session_format(&config_dir.join("projects")) {
+                Ok(format) => {
+                    let draft = build_claude_session_draft(
+                        &config_dir,
+                        cwd,
+                        &model.model,
+                        context,
+                        &format,
+                    )?;
+                    args.push(OsString::from("--resume"));
+                    args.push(OsString::from(&draft.id));
+                    ResumeMode::NativeClaude(draft)
+                }
+                Err(reason) => prompt_paste_mode(&mut args, prompt, reason),
+            },
+            "codex" => match sniff_codex_session_format(&config_dir.join("sessions")) {
+                Ok(format) => {
+                    let draft = build_codex_session_draft(&config_dir, cwd, context, &format)?;
+                    args.push(OsString::from("resume"));
+                    args.push(OsString::from(&draft.id));
+                    ResumeMode::NativeCodex(draft)
+                }
+                Err(reason) => prompt_paste_mode(&mut args, prompt, reason),
+            },
+            _ => unreachable!("target validation restricts resume harnesses"),
         }
     };
     Ok(LaunchPlan {
@@ -530,6 +576,11 @@ fn build_launch_plan(
         model,
         mode,
     })
+}
+
+fn prompt_paste_mode(args: &mut Vec<OsString>, prompt: &str, reason: String) -> ResumeMode {
+    args.push(OsString::from(prompt.replace('\0', "�")));
+    ResumeMode::PromptPaste { reason }
 }
 
 fn select_resume_model(
@@ -629,7 +680,7 @@ fn target_default_model(target: &str, config_dir: &Path, models: &[String]) -> O
 }
 
 fn sniff_pi_session_format(session_root: &Path) -> std::result::Result<(), String> {
-    let recent = most_recent_pi_session(session_root).ok_or_else(|| {
+    let recent = most_recent_jsonl(session_root).ok_or_else(|| {
         format!(
             "no existing Pi session under {} was available for the format safety check",
             session_root.display()
@@ -645,7 +696,7 @@ fn sniff_pi_session_format(session_root: &Path) -> std::result::Result<(), Strin
         .map_err(|reason| format!("recent Pi session format was not recognized: {reason}"))
 }
 
-fn most_recent_pi_session(root: &Path) -> Option<PathBuf> {
+fn most_recent_jsonl(root: &Path) -> Option<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut newest = None;
     while let Some(directory) = pending.pop() {
@@ -675,6 +726,223 @@ fn most_recent_pi_session(root: &Path) -> Option<PathBuf> {
         }
     }
     newest.map(|(_, path)| path)
+}
+
+fn sniff_claude_session_format(
+    project_root: &Path,
+) -> std::result::Result<ClaudeSessionFormat, String> {
+    let recent = most_recent_jsonl(project_root).ok_or_else(|| {
+        format!(
+            "no existing Claude session under {} was available for the format safety check",
+            project_root.display()
+        )
+    })?;
+    let raw = std::fs::read_to_string(&recent).map_err(|error| {
+        format!(
+            "could not read recent Claude session {}: {error}",
+            recent.display()
+        )
+    })?;
+    validate_claude_session_jsonl(&raw)
+        .map_err(|reason| format!("recent Claude session format was not recognized: {reason}"))
+}
+
+fn validate_claude_session_jsonl(raw: &str) -> std::result::Result<ClaudeSessionFormat, String> {
+    let mut version = None;
+    let mut conversation_entries = 0usize;
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(line)
+            .map_err(|error| format!("line {} is not JSON: {error}", index + 1))?;
+        if !matches!(value["type"].as_str(), Some("user" | "assistant")) {
+            continue;
+        }
+        let line_number = index + 1;
+        let kind = value["type"].as_str().unwrap_or_default();
+        if value["uuid"].as_str().is_none()
+            || !(value["parentUuid"].is_null() || value["parentUuid"].as_str().is_some())
+            || value["sessionId"].as_str().is_none()
+            || value["timestamp"].as_str().is_none()
+            || value["cwd"].as_str().is_none()
+            || value["isSidechain"].as_bool().is_none()
+        {
+            return Err(format!(
+                "line {line_number} has an invalid Claude {kind} envelope"
+            ));
+        }
+        let entry_version = value["version"]
+            .as_str()
+            .filter(|candidate| !candidate.is_empty())
+            .ok_or_else(|| format!("line {line_number} has no Claude Code version"))?;
+        if version
+            .as_deref()
+            .is_some_and(|known| known != entry_version)
+        {
+            return Err(format!(
+                "line {line_number} changes Claude Code version within one session"
+            ));
+        }
+        version = Some(entry_version.to_string());
+        let message = &value["message"];
+        if message["role"].as_str() != Some(kind) {
+            return Err(format!(
+                "line {line_number} Claude envelope and message roles differ"
+            ));
+        }
+        validate_claude_message_content(message, line_number)?;
+        conversation_entries += 1;
+    }
+    if conversation_entries == 0 {
+        return Err("session contains no Claude user or assistant conversation entries".into());
+    }
+    Ok(ClaudeSessionFormat {
+        version: version.unwrap_or_default(),
+    })
+}
+
+fn validate_claude_message_content(
+    message: &Value,
+    line: usize,
+) -> std::result::Result<(), String> {
+    match &message["content"] {
+        Value::String(_) => Ok(()),
+        Value::Array(blocks) => {
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("text") if block["text"].as_str().is_some() => {}
+                    Some("thinking" | "redacted_thinking") => {}
+                    Some("image" | "document") => {}
+                    Some("tool_use")
+                        if block["id"].as_str().is_some()
+                            && block["name"].as_str().is_some()
+                            && block["input"].is_object() => {}
+                    Some("tool_result")
+                        if block["tool_use_id"].as_str().is_some()
+                            && (block["content"].is_string() || block["content"].is_array()) => {}
+                    kind => {
+                        return Err(format!(
+                            "line {line} has an unknown Claude {kind:?} content block shape"
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "line {line} Claude message content is not text or an array"
+        )),
+    }
+}
+
+fn sniff_codex_session_format(
+    session_root: &Path,
+) -> std::result::Result<CodexSessionFormat, String> {
+    let recent = most_recent_jsonl(session_root).ok_or_else(|| {
+        format!(
+            "no existing Codex session under {} was available for the format safety check",
+            session_root.display()
+        )
+    })?;
+    let raw = std::fs::read_to_string(&recent).map_err(|error| {
+        format!(
+            "could not read recent Codex session {}: {error}",
+            recent.display()
+        )
+    })?;
+    validate_codex_session_jsonl(&raw)
+        .map_err(|reason| format!("recent Codex session format was not recognized: {reason}"))
+}
+
+fn validate_codex_session_jsonl(raw: &str) -> std::result::Result<CodexSessionFormat, String> {
+    let mut lines = raw.lines().filter(|line| !line.trim().is_empty());
+    let first = lines.next().ok_or_else(|| "session is empty".to_string())?;
+    let meta = serde_json::from_str::<Value>(first)
+        .map_err(|error| format!("line 1 is not JSON: {error}"))?;
+    let payload = &meta["payload"];
+    if meta["type"].as_str() != Some("session_meta")
+        || meta["timestamp"].as_str().is_none()
+        || payload["id"].as_str().is_none()
+        || payload["session_id"].as_str() != payload["id"].as_str()
+        || payload["timestamp"].as_str().is_none()
+        || payload["cwd"].as_str().is_none()
+        || payload["originator"].as_str().is_none()
+        || payload["source"].as_str().is_none()
+        || payload["model_provider"].as_str().is_none()
+    {
+        return Err("expected a Codex session_meta envelope on the first line".into());
+    }
+    let cli_version = payload["cli_version"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex session_meta has no cli_version".to_string())?;
+    let history_mode = payload["history_mode"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex session_meta has no history_mode".to_string())?;
+    if history_mode != "legacy" {
+        return Err(format!("unsupported Codex history_mode {history_mode:?}"));
+    }
+
+    for (offset, line) in lines.enumerate() {
+        let line_number = offset + 2;
+        let value = serde_json::from_str::<Value>(line)
+            .map_err(|error| format!("line {line_number} is not JSON: {error}"))?;
+        if value["type"].as_str() != Some("response_item") {
+            continue;
+        }
+        validate_codex_response_item(&value["payload"], line_number)?;
+    }
+    Ok(CodexSessionFormat {
+        cli_version: cli_version.to_string(),
+        history_mode: history_mode.to_string(),
+    })
+}
+
+fn validate_codex_response_item(payload: &Value, line: usize) -> std::result::Result<(), String> {
+    match payload["type"].as_str() {
+        Some("message") => {
+            if payload["role"].as_str().is_none() || payload["content"].as_array().is_none() {
+                return Err(format!("line {line} has an invalid Codex message item"));
+            }
+            for block in payload["content"].as_array().into_iter().flatten() {
+                match block["type"].as_str() {
+                    Some("input_text" | "output_text") if block["text"].as_str().is_some() => {}
+                    kind => {
+                        return Err(format!(
+                            "line {line} has an unknown Codex {kind:?} message content shape"
+                        ))
+                    }
+                }
+            }
+        }
+        Some("function_call")
+            if payload["id"].as_str().is_some()
+                && payload["call_id"].as_str().is_some()
+                && payload["name"].as_str().is_some()
+                && payload["arguments"].as_str().is_some() => {}
+        Some("function_call_output")
+            if payload["call_id"].as_str().is_some() && payload["output"].as_str().is_some() => {}
+        Some(
+            "reasoning"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "web_search_call"
+            | "computer_call"
+            | "computer_call_output"
+            | "local_shell_call"
+            | "local_shell_call_output"
+            | "mcp_tool_call"
+            | "mcp_tool_call_output",
+        ) => {}
+        kind => {
+            return Err(format!(
+                "line {line} has an unknown Codex response item {kind:?}"
+            ))
+        }
+    }
+    Ok(())
 }
 
 fn validate_pi_session_jsonl(raw: &str) -> std::result::Result<(), String> {
@@ -1122,6 +1390,522 @@ fn pi_zero_usage() -> Value {
     })
 }
 
+fn build_claude_session_draft(
+    config_dir: &Path,
+    cwd: &Path,
+    model: &str,
+    context: &ResumeContext,
+    format: &ClaudeSessionFormat,
+) -> Result<ClaudeSessionDraft> {
+    let id = Uuid::new_v4().to_string();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let path = config_dir
+        .join("projects")
+        .join(claude_cwd_slug(cwd))
+        .join(format!("{id}.jsonl"));
+    let jsonl = render_claude_session(context, cwd, model, &id, &format.version, &timestamp)?;
+    Ok(ClaudeSessionDraft { id, path, jsonl })
+}
+
+fn claude_cwd_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct NativeIds {
+    session_hex: String,
+    entry_index: u32,
+    tool_index: u32,
+}
+
+impl NativeIds {
+    fn new(session_id: &str) -> Self {
+        Self {
+            session_hex: session_id.chars().filter(|ch| *ch != '-').collect(),
+            entry_index: 0,
+            tool_index: 0,
+        }
+    }
+
+    fn uuid(&mut self) -> String {
+        self.entry_index += 1;
+        let prefix = self
+            .session_hex
+            .get(..24)
+            .unwrap_or("000000000000400080000000");
+        let compact = format!("{prefix}{:08x}", self.entry_index);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &compact[0..8],
+            &compact[8..12],
+            &compact[12..16],
+            &compact[16..20],
+            &compact[20..32]
+        )
+    }
+
+    fn tool(&mut self, prefix: &str) -> String {
+        self.tool_index += 1;
+        format!("{prefix}_alex_{}_{:04x}", self.session_hex, self.tool_index)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeToolLink {
+    tool_use_id: String,
+    assistant_uuid: String,
+}
+
+fn render_claude_session(
+    context: &ResumeContext,
+    cwd: &Path,
+    model: &str,
+    session_id: &str,
+    version: &str,
+    timestamp: &str,
+) -> Result<String> {
+    let mut ids = NativeIds::new(session_id);
+    let mut lines = Vec::new();
+    let mut parent_uuid: Option<String> = None;
+    let mut tool_calls = HashMap::<String, ClaudeToolLink>::new();
+
+    for entry in &context.entries {
+        if entry.role == "assistant" {
+            let uuid = ids.uuid();
+            let mut content = Vec::new();
+            for block in &entry.content {
+                match block["type"].as_str() {
+                    Some("text") if block["text"].as_str().is_some() => {
+                        content.push(json!({"type":"text", "text":block["text"]}));
+                    }
+                    Some("tool_call") => {
+                        let Some(name) = block["name"].as_str().filter(|name| !name.is_empty())
+                        else {
+                            content.push(native_degraded_block("tool call without a name", block));
+                            continue;
+                        };
+                        let Some(input) = block["arguments"].as_object() else {
+                            content.push(native_degraded_block(
+                                "tool call arguments were not a JSON object",
+                                block,
+                            ));
+                            continue;
+                        };
+                        let fresh_id = ids.tool("toolu");
+                        if let Some(source_id) = block["id"].as_str().filter(|id| !id.is_empty()) {
+                            tool_calls.insert(
+                                source_id.to_string(),
+                                ClaudeToolLink {
+                                    tool_use_id: fresh_id.clone(),
+                                    assistant_uuid: uuid.clone(),
+                                },
+                            );
+                        }
+                        content.push(json!({
+                            "type":"tool_use", "id":fresh_id, "name":name, "input":input
+                        }));
+                    }
+                    Some("tool_result") => content.push(native_degraded_block(
+                        "tool result on an assistant entry has no native Claude representation",
+                        block,
+                    )),
+                    Some("content") => content.push(native_degraded_block(
+                        "source content has no native Claude representation",
+                        &block["value"],
+                    )),
+                    Some(kind) => content.push(native_degraded_block(
+                        &format!("unsupported source content block {kind}"),
+                        block,
+                    )),
+                    None => content.push(native_degraded_block(
+                        "source content block had no type",
+                        block,
+                    )),
+                }
+            }
+            if !content.is_empty() {
+                let tool_use = content.iter().any(|block| block["type"] == "tool_use");
+                let message = json!({
+                    "id":format!("msg_alex_{}_{}", ids.session_hex, ids.entry_index),
+                    "type":"message",
+                    "role":"assistant",
+                    "model":model,
+                    "content":content,
+                    "stop_reason":if tool_use { "tool_use" } else { "end_turn" },
+                    "stop_sequence":Value::Null,
+                    "usage":{
+                        "input_tokens":0,
+                        "output_tokens":0,
+                        "cache_creation_input_tokens":0,
+                        "cache_read_input_tokens":0
+                    }
+                });
+                let mut line = claude_envelope(
+                    "assistant",
+                    &uuid,
+                    parent_uuid.as_deref(),
+                    session_id,
+                    version,
+                    timestamp,
+                    cwd,
+                    message,
+                );
+                line["requestId"] =
+                    json!(format!("req_alex_{}_{}", ids.session_hex, ids.entry_index));
+                lines.push(line);
+                parent_uuid = Some(uuid);
+            }
+            continue;
+        }
+
+        let mut buffered = Vec::new();
+        for block in &entry.content {
+            match block["type"].as_str() {
+                Some("text") if block["text"].as_str().is_some() => {
+                    buffered.push(json!({"type":"text", "text":block["text"]}));
+                }
+                Some("tool_result") => {
+                    flush_claude_user_content(
+                        &mut lines,
+                        &mut buffered,
+                        entry.role,
+                        &mut ids,
+                        &mut parent_uuid,
+                        session_id,
+                        version,
+                        timestamp,
+                        cwd,
+                    );
+                    let source_id = block["tool_call_id"].as_str().filter(|id| !id.is_empty());
+                    if let Some(link) = source_id.and_then(|id| tool_calls.get(id)) {
+                        let uuid = ids.uuid();
+                        let result = pi_result_text(&block["content"]);
+                        let message = json!({
+                            "role":"user",
+                            "content":[{
+                                "type":"tool_result",
+                                "tool_use_id":link.tool_use_id,
+                                "content":result,
+                                "is_error":block["is_error"].as_bool().unwrap_or(false)
+                            }]
+                        });
+                        let mut line = claude_envelope(
+                            "user",
+                            &uuid,
+                            parent_uuid.as_deref(),
+                            session_id,
+                            version,
+                            timestamp,
+                            cwd,
+                            message,
+                        );
+                        line["sourceToolAssistantUUID"] = json!(link.assistant_uuid);
+                        line["toolUseResult"] = if block["content"].is_null() {
+                            json!("")
+                        } else {
+                            block["content"].clone()
+                        };
+                        line["session_id"] = json!(session_id);
+                        lines.push(line);
+                        parent_uuid = Some(uuid);
+                    } else {
+                        buffered.push(native_degraded_block(
+                            "tool result could not be linked to a representable tool call",
+                            block,
+                        ));
+                    }
+                }
+                Some("content") => buffered.push(native_degraded_block(
+                    "source content has no native Claude representation",
+                    &block["value"],
+                )),
+                Some("tool_call") => buffered.push(native_degraded_block(
+                    "tool call on a non-assistant entry has no native Claude representation",
+                    block,
+                )),
+                Some(kind) => buffered.push(native_degraded_block(
+                    &format!("unsupported source content block {kind}"),
+                    block,
+                )),
+                None => buffered.push(native_degraded_block(
+                    "source content block had no type",
+                    block,
+                )),
+            }
+        }
+        flush_claude_user_content(
+            &mut lines,
+            &mut buffered,
+            entry.role,
+            &mut ids,
+            &mut parent_uuid,
+            session_id,
+            version,
+            timestamp,
+            cwd,
+        );
+    }
+    jsonl_string(lines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_claude_user_content(
+    lines: &mut Vec<Value>,
+    content: &mut Vec<Value>,
+    source_role: &str,
+    ids: &mut NativeIds,
+    parent_uuid: &mut Option<String>,
+    session_id: &str,
+    version: &str,
+    timestamp: &str,
+    cwd: &Path,
+) {
+    if content.is_empty() {
+        return;
+    }
+    if source_role != "user" {
+        content.insert(
+            0,
+            json!({
+                "type":"text",
+                "text":format!(
+                    "[Alex resume: source role {source_role:?} was represented as a Claude user message]"
+                )
+            }),
+        );
+    }
+    let uuid = ids.uuid();
+    let line = claude_envelope(
+        "user",
+        &uuid,
+        parent_uuid.as_deref(),
+        session_id,
+        version,
+        timestamp,
+        cwd,
+        json!({"role":"user", "content":std::mem::take(content)}),
+    );
+    lines.push(line);
+    *parent_uuid = Some(uuid);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claude_envelope(
+    kind: &str,
+    uuid: &str,
+    parent_uuid: Option<&str>,
+    session_id: &str,
+    version: &str,
+    timestamp: &str,
+    cwd: &Path,
+    message: Value,
+) -> Value {
+    json!({
+        "type":kind,
+        "uuid":uuid,
+        "parentUuid":parent_uuid,
+        "sessionId":session_id,
+        "version":version,
+        "timestamp":timestamp,
+        "cwd":cwd,
+        "gitBranch":"",
+        "isSidechain":false,
+        "userType":"external",
+        "entrypoint":"cli",
+        "message":message,
+    })
+}
+
+fn build_codex_session_draft(
+    config_dir: &Path,
+    cwd: &Path,
+    context: &ResumeContext,
+    format: &CodexSessionFormat,
+) -> Result<CodexSessionDraft> {
+    let id = Uuid::new_v4().to_string();
+    let utc = Utc::now();
+    let timestamp = utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let local = Local::now();
+    let path = config_dir
+        .join("sessions")
+        .join(local.format("%Y/%m/%d").to_string())
+        .join(format!(
+            "rollout-{}-{id}.jsonl",
+            local.format("%Y-%m-%dT%H-%M-%S")
+        ));
+    let jsonl = render_codex_session(context, cwd, &id, format, &timestamp)?;
+    Ok(CodexSessionDraft { id, path, jsonl })
+}
+
+fn render_codex_session(
+    context: &ResumeContext,
+    cwd: &Path,
+    session_id: &str,
+    format: &CodexSessionFormat,
+    timestamp: &str,
+) -> Result<String> {
+    let mut ids = NativeIds::new(session_id);
+    let mut tool_calls = HashMap::<String, String>::new();
+    let mut lines = vec![json!({
+        "timestamp":timestamp,
+        "type":"session_meta",
+        "payload":{
+            "session_id":session_id,
+            "id":session_id,
+            "timestamp":timestamp,
+            "cwd":cwd,
+            "originator":"codex-tui",
+            "cli_version":format.cli_version,
+            "source":"cli",
+            "thread_source":"user",
+            "model_provider":"alexandria",
+            "history_mode":format.history_mode,
+        }
+    })];
+
+    for entry in &context.entries {
+        let mut text = Vec::new();
+        for block in &entry.content {
+            match block["type"].as_str() {
+                Some("text") if block["text"].as_str().is_some() => {
+                    text.push(block["text"].as_str().unwrap_or_default().to_string());
+                }
+                Some("tool_call") if entry.role == "assistant" => {
+                    flush_codex_text(&mut lines, &mut text, entry.role, &mut ids, timestamp);
+                    let Some(name) = block["name"].as_str().filter(|name| !name.is_empty()) else {
+                        text.push(native_degraded_text("tool call without a name", block));
+                        continue;
+                    };
+                    let call_id = ids.tool("call");
+                    if let Some(source_id) = block["id"].as_str().filter(|id| !id.is_empty()) {
+                        tool_calls.insert(source_id.to_string(), call_id.clone());
+                    }
+                    let arguments = serde_json::to_string(&block["arguments"])?;
+                    let item_id = format!("fc_alex_{}_{}", ids.session_hex, ids.tool_index);
+                    lines.push(codex_response_item(
+                        timestamp,
+                        json!({
+                            "type":"function_call",
+                            "id":item_id,
+                            "name":name,
+                            "arguments":arguments,
+                            "call_id":call_id,
+                        }),
+                    ));
+                }
+                Some("tool_result") => {
+                    flush_codex_text(&mut lines, &mut text, entry.role, &mut ids, timestamp);
+                    let source_id = block["tool_call_id"].as_str().filter(|id| !id.is_empty());
+                    if let Some(call_id) = source_id.and_then(|id| tool_calls.get(id)) {
+                        lines.push(codex_response_item(
+                            timestamp,
+                            json!({
+                                "type":"function_call_output",
+                                "call_id":call_id,
+                                "output":pi_result_text(&block["content"]),
+                            }),
+                        ));
+                    } else {
+                        text.push(native_degraded_text(
+                            "tool result could not be linked to a representable tool call",
+                            block,
+                        ));
+                    }
+                }
+                Some("content") => text.push(native_degraded_text(
+                    "source content has no native Codex representation",
+                    &block["value"],
+                )),
+                Some("tool_call") => text.push(native_degraded_text(
+                    "tool call on a non-assistant entry has no native Codex representation",
+                    block,
+                )),
+                Some(kind) => text.push(native_degraded_text(
+                    &format!("unsupported source content block {kind}"),
+                    block,
+                )),
+                None => text.push(native_degraded_text(
+                    "source content block had no type",
+                    block,
+                )),
+            }
+        }
+        flush_codex_text(&mut lines, &mut text, entry.role, &mut ids, timestamp);
+    }
+    jsonl_string(lines)
+}
+
+fn flush_codex_text(
+    lines: &mut Vec<Value>,
+    text: &mut Vec<String>,
+    source_role: &str,
+    ids: &mut NativeIds,
+    timestamp: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let (role, content_type) = if source_role == "assistant" {
+        ("assistant", "output_text")
+    } else {
+        if source_role != "user" {
+            text.insert(
+                0,
+                format!(
+                    "[Alex resume: source role {source_role:?} was represented as a Codex user message]"
+                ),
+            );
+        }
+        ("user", "input_text")
+    };
+    let mut payload = json!({
+        "type":"message",
+        "role":role,
+        "content":[{"type":content_type, "text":text.join("\n")}],
+    });
+    if role == "assistant" {
+        payload["id"] = json!(format!(
+            "msg_alex_{}_{}",
+            ids.session_hex,
+            ids.entry_index + 1
+        ));
+        payload["phase"] = json!("final_answer");
+    }
+    ids.entry_index += 1;
+    lines.push(codex_response_item(timestamp, payload));
+    text.clear();
+}
+
+fn codex_response_item(timestamp: &str, payload: Value) -> Value {
+    json!({"timestamp":timestamp, "type":"response_item", "payload":payload})
+}
+
+fn native_degraded_block(reason: &str, original: &Value) -> Value {
+    json!({"type":"text", "text":native_degraded_text(reason, original)})
+}
+
+fn native_degraded_text(reason: &str, original: &Value) -> String {
+    format!("[Alex resume: {reason}]\n{original}")
+}
+
+fn jsonl_string(lines: Vec<Value>) -> Result<String> {
+    let mut output = String::new();
+    for line in lines {
+        output.push_str(&serde_json::to_string(&line)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 fn print_resume_summary(
     source: &ResumeSource,
     context: &ResumeContext,
@@ -1174,6 +1958,12 @@ fn print_resume_summary(
     }
     match &plan.mode {
         ResumeMode::NativePi(draft) => println!("mode: native pi session {}", draft.id),
+        ResumeMode::NativeClaude(draft) => {
+            println!("mode: native claude session {}", draft.id)
+        }
+        ResumeMode::NativeCodex(draft) => {
+            println!("mode: native codex session {}", draft.id)
+        }
         ResumeMode::PromptPaste { reason } => println!("mode: prompt-paste ({reason})"),
     }
     println!("config: {}", plan.config_dir.display());
@@ -1191,7 +1981,15 @@ async fn launch_and_record_fork(
 ) -> Result<()> {
     let native_target_session = match &plan.mode {
         ResumeMode::NativePi(draft) => {
-            materialize_pi_session(draft)?;
+            materialize_native_session(&draft.path, &draft.jsonl, "Pi")?;
+            Some(draft.id.clone())
+        }
+        ResumeMode::NativeClaude(draft) => {
+            materialize_native_session(&draft.path, &draft.jsonl, "Claude")?;
+            Some(draft.id.clone())
+        }
+        ResumeMode::NativeCodex(draft) => {
+            materialize_native_session(&draft.path, &draft.jsonl, "Codex")?;
             Some(draft.id.clone())
         }
         ResumeMode::PromptPaste { .. } => None,
@@ -1255,27 +2053,26 @@ async fn launch_and_record_fork(
     exit_status(status)
 }
 
-fn materialize_pi_session(draft: &PiSessionDraft) -> Result<()> {
-    let parent = draft
-        .path
+fn materialize_native_session(path: &Path, jsonl: &str, harness: &str) -> Result<()> {
+    let parent = path
         .parent()
-        .context("native Pi session path has no parent directory")?;
+        .with_context(|| format!("native {harness} session path has no parent directory"))?;
     std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating Pi session directory {}", parent.display()))?;
+        .with_context(|| format!("creating {harness} session directory {}", parent.display()))?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(&draft.path).with_context(|| {
+    let mut file = options.open(path).with_context(|| {
         format!(
-            "creating fresh native Pi session {} without overwriting existing files",
-            draft.path.display()
+            "creating fresh native {harness} session {} without overwriting existing files",
+            path.display()
         )
     })?;
-    file.write_all(draft.jsonl.as_bytes())
-        .with_context(|| format!("writing native Pi session {}", draft.path.display()))?;
+    file.write_all(jsonl.as_bytes())
+        .with_context(|| format!("writing native {harness} session {}", path.display()))?;
     file.flush()
-        .with_context(|| format!("flushing native Pi session {}", draft.path.display()))?;
+        .with_context(|| format!("flushing native {harness} session {}", path.display()))?;
     Ok(())
 }
 

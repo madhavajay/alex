@@ -16,8 +16,8 @@ pub use grok_billing::{
 pub use openrouter_catalog::parse_models_response as parse_openrouter_models_response;
 pub use quota::quota_state;
 pub use resume_context::{
-    build_resume_context, build_resume_context_from_captures, ResumeCapture, ResumeContext,
-    ResumeEntry,
+    build_resume_context, build_resume_context_from_captures, request_entries, ResumeCapture,
+    ResumeContext, ResumeEntry,
 };
 
 use serde::{Deserialize, Serialize};
