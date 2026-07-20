@@ -11,7 +11,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alex_lar::{
@@ -45,6 +46,88 @@ const ESTIMATED_PENDING_ARTIFACT_BYTES: u64 = 4 * 1024;
 /// Conservative planning charge for one chunk or manifest entry retained by
 /// both the active writer and the validation reader during a batch.
 const ESTIMATED_INDEX_ENTRY_BYTES: u64 = 256;
+
+/// Renews a claimed migration lease independently of artifact size, codec
+/// speed, configured I/O throttling, and batch duration. A batch may legally
+/// take longer than the lease (for example, one very large tool result), so
+/// renewing only between batches would allow another worker to steal a live
+/// import.
+struct MigrationLeaseHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<JoinHandle<Result<()>>>,
+}
+
+impl MigrationLeaseHeartbeat {
+    fn start(
+        data_dir: &Path,
+        job_id: &str,
+        lease_owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Self> {
+        let lease_ms = i64::try_from(lease_duration.as_millis())
+            .context("migration lease duration exceeds SQLite's integer range")?;
+        if lease_ms <= 0 {
+            bail!("migration lease duration must be positive");
+        }
+        let interval = lease_duration
+            .checked_div(3)
+            .unwrap_or(lease_duration)
+            .max(Duration::from_millis(1));
+        let connection = rusqlite::Connection::open(data_dir.join("alexandria.sqlite3"))
+            .context("opening migration lease heartbeat connection")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let job_id = job_id.to_string();
+        let lease_owner = lease_owner.to_string();
+        let (stop, stopped) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("alex-lar-migration-lease".into())
+            .spawn(move || loop {
+                match stopped.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let renewed_at_ms = now_ms();
+                let expires_at_ms = renewed_at_ms
+                    .checked_add(lease_ms)
+                    .context("migration lease heartbeat expiry overflows i64")?;
+                let changed = connection.execute(
+                    "UPDATE lar_migration_jobs
+                        SET lease_expires_at_ms=?3, updated_at_ms=?4
+                      WHERE job_id=?1 AND lease_owner=?2 AND state='running'
+                        AND lease_expires_at_ms>?4",
+                    params![job_id, lease_owner, expires_at_ms, renewed_at_ms],
+                )?;
+                if changed != 1 {
+                    bail!("migration job {job_id} lost its live lease for {lease_owner}");
+                }
+            })
+            .context("starting migration lease heartbeat")?;
+        Ok(Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        })
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("migration lease heartbeat panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MigrationLeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            tracing::warn!("migration lease heartbeat stopped with an error: {error:#}");
+        }
+    }
+}
 
 #[cfg(test)]
 static LEGACY_METADATA_PLAN_QUERY_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2955,8 +3038,22 @@ impl Store {
             return Ok(report);
         }
         report.claimed = true;
+        let mut lease_heartbeat = match MigrationLeaseHeartbeat::start(
+            &self.data_dir,
+            &job.job_id,
+            &options.lease_owner,
+            options.lease_duration,
+        ) {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                let _ =
+                    self.release_import_lease(&job.job_id, &options.lease_owner, true, now_ms());
+                return Err(error);
+            }
+        };
         visit_import_boundary(options, LarLegacyImportBoundary::JobClaimed)?;
         if check_disk_pressure(&self.data_dir, options, &mut report)? {
+            lease_heartbeat.stop()?;
             self.release_import_lease(&job.job_id, &options.lease_owner, false, now_ms())?;
             report.job_state = "pending".into();
             self.finalize_import_report(&mut report, &resources, run_started.elapsed())?;
@@ -3206,6 +3303,7 @@ impl Store {
         }
         writer.get_ref().sync_all()?;
         self.update_import_file_size(&ids)?;
+        lease_heartbeat.stop()?;
 
         let current = self
             .lar_migration_job(&ids.job_id)?

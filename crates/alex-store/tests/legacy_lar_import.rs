@@ -1,13 +1,14 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alex_core::TraceRecord;
 use alex_lar::{ArchiveReader, HeaderFidelity, Limits, OpenPath, StageKind};
 use alex_store::{
     LarArtifactLocation, LarArtifactReadRequest, LarBodyArtifact, LarBodyStoreConfig,
-    LarBodyStoreMode, LarLegacyImportOptions, LarLegacyResourceControls, Store, ToolCallRecord,
-    LAR_HEADER_FLAG_REDACTED,
+    LarBodyStoreMode, LarLegacyImportBoundary, LarLegacyImportHook, LarLegacyImportOptions,
+    LarLegacyResourceControls, Store, ToolCallRecord, LAR_HEADER_FLAG_REDACTED,
 };
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -136,6 +137,41 @@ fn worker_pool_and_progress_controls_are_observable() {
     assert_eq!(report.eta_seconds, None);
     assert_eq!(report.yield_count, 8);
     assert_eq!(report.last_error, None);
+}
+
+#[test]
+fn migration_renews_its_lease_during_a_long_batch_boundary() {
+    let store = Store::open(tmpdir("lease-heartbeat")).unwrap();
+    let mut row = trace("trace-lease-heartbeat", "lease-heartbeat-session");
+    row.req_body_path = Some(
+        store
+            .write_body(
+                "trace-lease-heartbeat",
+                "request.json",
+                b"body whose migration remains exclusively leased",
+            )
+            .unwrap(),
+    );
+    store.insert_trace(&row).unwrap();
+    let hook = LarLegacyImportHook::new(|boundary| {
+        if boundary == LarLegacyImportBoundary::BodyAppended {
+            std::thread::sleep(Duration::from_millis(180));
+        }
+        Ok(())
+    });
+
+    let report = store
+        .run_lar_legacy_import(&LarLegacyImportOptions {
+            batch_size: 1,
+            lease_owner: "lease-heartbeat-worker".into(),
+            lease_duration: Duration::from_millis(60),
+            boundary_hook: Some(hook),
+            ..LarLegacyImportOptions::default()
+        })
+        .unwrap();
+
+    assert_eq!((report.migrated, report.failed), (1, 0));
+    assert_eq!(report.job_state, "complete");
 }
 
 #[test]

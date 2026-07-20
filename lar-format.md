@@ -1145,6 +1145,10 @@ work, even when a narrower prototype exists.
 - [x] Surface migration progress, throughput, dedup ratio, ETA, and last error.
 - [x] Implement pause/resume/status/verify admin and CLI commands.
 - [x] Implement crash, restart, stale lease, and duplicate work recovery.
+      A dedicated heartbeat renews an owned job independently of batch size,
+      artifact size, codec speed, and I/O throttling, so a valid long-running
+      import cannot lose its lease merely because one batch exceeds the lease
+      duration.
 - [x] Implement missing/corrupt file reporting without data loss.
 - [x] Import legacy headers, routing attempts, exchange/stage ordering, linked
       tool stages, and explicitly represented unlinked tools into the same
