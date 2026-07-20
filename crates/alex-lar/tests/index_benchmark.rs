@@ -1,12 +1,16 @@
 use alex_lar::{ArchiveReader, ArchiveWriter, ChunkerConfig, FileHeader, Limits, OpenPath};
 use std::fs::File;
-use std::io::{Cursor, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+const CACHE_MODE_ENV: &str = "ALEX_LAR_RANDOM_ACCESS_CACHE_MODE";
+const CACHE_HELPER_ENV: &str = "ALEX_LAR_COLD_CACHE_HELPER";
+const EXTERNAL_READY_MARKER: &str = "alex-lar-cold-cache-ready-v1";
 
 struct TempArchive(PathBuf);
 
@@ -69,35 +73,152 @@ impl Write for FirstByteSink {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CacheMode {
+    Warm,
+    Advisory,
+    ExternalAttested { helper: PathBuf },
+}
+
+impl CacheMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Advisory => {
+                #[cfg(target_os = "linux")]
+                {
+                    "linux-posix-fadvise-dontneed"
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    "macos-f-nocache-descriptor"
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    "advisory-unavailable"
+                }
+            }
+            Self::ExternalAttested { .. } => "external-helper-attested",
+        }
+    }
+}
+
+fn parse_cache_mode(mode: Option<&str>, helper: Option<PathBuf>) -> Result<CacheMode, String> {
+    match mode.unwrap_or("advisory") {
+        "warm" if helper.is_none() => Ok(CacheMode::Warm),
+        "advisory" if helper.is_none() => Ok(CacheMode::Advisory),
+        "external" => helper
+            .map(|helper| CacheMode::ExternalAttested { helper })
+            .ok_or_else(|| {
+                format!("{CACHE_HELPER_ENV} is required when {CACHE_MODE_ENV}=external")
+            }),
+        "warm" | "advisory" => Err(format!(
+            "{CACHE_HELPER_ENV} is only valid when {CACHE_MODE_ENV}=external"
+        )),
+        other => Err(format!(
+            "unsupported {CACHE_MODE_ENV}={other:?}; expected warm, advisory, or external"
+        )),
+    }
+}
+
+fn cache_mode_from_env() -> Result<CacheMode, String> {
+    let mode = std::env::var(CACHE_MODE_ENV).ok();
+    let helper = std::env::var_os(CACHE_HELPER_ENV).map(PathBuf::from);
+    parse_cache_mode(mode.as_deref(), helper)
+}
+
+fn timed_file_open(path: &Path) -> io::Result<(File, Duration)> {
+    let started = Instant::now();
+    let file = File::open(path)?;
+    Ok((file, started.elapsed()))
+}
+
+fn timed_open_with_configuration<F>(path: &Path, configure: F) -> io::Result<(File, Duration)>
+where
+    F: FnOnce(&File) -> io::Result<()>,
+{
+    let (file, open_elapsed) = timed_file_open(path)?;
+    configure(&file)?;
+    Ok((file, open_elapsed))
+}
+
 #[cfg(target_os = "linux")]
-fn evict_file_cache(path: &Path) {
+fn configure_advisory_cache(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let file = File::open(path).unwrap();
     let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-    assert_eq!(result, 0, "posix_fadvise(DONTNEED) failed: {result}");
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn evict_file_cache(path: &Path) {
+fn configure_advisory_cache(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let file = File::open(path).unwrap();
     let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-    assert_ne!(result, -1, "fcntl(F_NOCACHE) failed");
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn evict_file_cache(_path: &Path) {}
+fn configure_advisory_cache(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no advisory cache control is implemented for this platform",
+    ))
+}
+
+fn run_external_cache_helper(helper: &Path, archive: &Path) -> Result<(), String> {
+    let output = Command::new(helper)
+        .arg(archive)
+        .env("ALEX_LAR_COLD_CACHE_PROTOCOL", "1")
+        .output()
+        .map_err(|error| format!("running cold-cache helper {}: {error}", helper.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cold-cache helper {} failed with {}: {}",
+            helper.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let marker = String::from_utf8_lossy(&output.stdout);
+    if marker.trim() != EXTERNAL_READY_MARKER {
+        return Err(format!(
+            "cold-cache helper {} did not emit the required {EXTERNAL_READY_MARKER:?} marker",
+            helper.display()
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_file(path: &Path, mode: &CacheMode) -> (File, Duration) {
+    match mode {
+        CacheMode::Warm => timed_file_open(path).unwrap(),
+        CacheMode::Advisory => timed_open_with_configuration(path, configure_advisory_cache)
+            .unwrap_or_else(|error| panic!("applying advisory cache control: {error}")),
+        CacheMode::ExternalAttested { helper } => {
+            run_external_cache_helper(helper, path).unwrap_or_else(|error| panic!("{error}"));
+            timed_file_open(path).unwrap()
+        }
+    }
+}
 
 fn open_and_read(
     path: &Path,
     manifest: &alex_lar::ManifestId,
-    cold: bool,
+    cache_mode: &CacheMode,
 ) -> (Duration, Duration, OpenPath) {
-    if cold {
-        evict_file_cache(path);
-    }
+    // Cache control and ArchiveReader intentionally share this exact File.
+    // This is required for descriptor-scoped F_NOCACHE on macOS and removes
+    // descriptor-lifetime ambiguity from the Linux advisory path as well.
+    let (file, open_elapsed) = prepare_file(path, cache_mode);
     let started = Instant::now();
-    let mut reader = ArchiveReader::open(File::open(path).unwrap(), Limits::default()).unwrap();
+    let mut reader = ArchiveReader::open(file, Limits::default()).unwrap();
     let open_path = reader.open_path();
     let mut sink = FirstByteSink {
         started,
@@ -106,7 +227,11 @@ fn open_and_read(
     };
     assert_eq!(reader.write_body(manifest, &mut sink).unwrap(), 1_024);
     assert_eq!(sink.bytes, 1_024);
-    (sink.first_byte.unwrap(), started.elapsed(), open_path)
+    (
+        open_elapsed + sink.first_byte.unwrap(),
+        open_elapsed + started.elapsed(),
+        open_path,
+    )
 }
 
 fn percentile(samples: &mut [Duration], percentile: usize) -> Duration {
@@ -129,16 +254,19 @@ fn persisted_footer_avoids_the_forward_scan() {
     // body lookup, chunk decompression, and the first output byte becoming
     // available. It is not a controlled cold-cache measurement because a
     // portable test cannot evict the host page cache.
-    let (first_scan, _, scan_path) = open_and_read(&scan_file.0, scan_ids.last().unwrap(), false);
+    let warm_mode = CacheMode::Warm;
+    let advised_or_external_mode = cache_mode_from_env().unwrap_or_else(|error| panic!("{error}"));
+    let (first_scan, _, scan_path) =
+        open_and_read(&scan_file.0, scan_ids.last().unwrap(), &warm_mode);
     let (first_footer, _, footer_path) =
-        open_and_read(&indexed_file.0, indexed_ids.last().unwrap(), false);
+        open_and_read(&indexed_file.0, indexed_ids.last().unwrap(), &warm_mode);
     assert_eq!(scan_path, OpenPath::ForwardScan);
     assert_eq!(footer_path, OpenPath::Footer);
 
     let mut warm = (0..100)
         .map(|sample| {
             let index = sample * 7919 % indexed_ids.len();
-            open_and_read(&indexed_file.0, &indexed_ids[index], false).0
+            open_and_read(&indexed_file.0, &indexed_ids[index], &warm_mode).0
         })
         .collect::<Vec<_>>();
     let p50 = percentile(&mut warm.clone(), 50);
@@ -148,16 +276,55 @@ fn persisted_footer_avoids_the_forward_scan() {
         p99 < Duration::from_millis(10),
         "sealed archive filesystem open+small-body p99 exceeded 10 ms: {p99:?}"
     );
-    let mut cold = (0..20)
+    let mut cache_controlled = (0..20)
         .map(|sample| {
             let index = sample * 3571 % indexed_ids.len();
-            open_and_read(&indexed_file.0, &indexed_ids[index], true).0
+            open_and_read(
+                &indexed_file.0,
+                &indexed_ids[index],
+                &advised_or_external_mode,
+            )
+            .0
         })
         .collect::<Vec<_>>();
-    let cold_p50 = percentile(&mut cold.clone(), 50);
-    let cold_p95 = percentile(&mut cold.clone(), 95);
-    let cold_p99 = percentile(&mut cold, 99);
+    let cache_p50 = percentile(&mut cache_controlled.clone(), 50);
+    let cache_p95 = percentile(&mut cache_controlled.clone(), 95);
+    let cache_p99 = percentile(&mut cache_controlled, 99);
     eprintln!(
-        "2,000-manifest random filesystem open+1KiB body TTFT: first-forward={first_scan:?}, first-footer={first_footer:?}, footer-warm p50={p50:?} p95={p95:?} p99={p99:?}, advised-cold p50={cold_p50:?} p95={cold_p95:?} p99={cold_p99:?}"
+        "2,000-manifest random filesystem open+1KiB body TTFT: first-forward={first_scan:?}, first-footer={first_footer:?}, footer-warm p50={p50:?} p95={p95:?} p99={p99:?}, cache-mode={} p50={cache_p50:?} p95={cache_p95:?} p99={cache_p99:?}",
+        advised_or_external_mode.label(),
     );
+}
+
+#[test]
+fn cache_mode_requires_an_explicit_verified_external_helper() {
+    assert_eq!(parse_cache_mode(None, None).unwrap(), CacheMode::Advisory);
+    assert_eq!(
+        parse_cache_mode(Some("warm"), None).unwrap(),
+        CacheMode::Warm
+    );
+    assert!(parse_cache_mode(Some("external"), None).is_err());
+    assert!(parse_cache_mode(Some("advisory"), Some(PathBuf::from("helper"))).is_err());
+    assert_eq!(
+        parse_cache_mode(Some("external"), Some(PathBuf::from("helper"))).unwrap(),
+        CacheMode::ExternalAttested {
+            helper: PathBuf::from("helper")
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_configuration_is_applied_to_the_descriptor_returned_to_reader() {
+    use std::cell::Cell;
+    use std::os::fd::AsRawFd;
+
+    let archive = TempArchive::write("descriptor-identity", b"descriptor identity");
+    let configured = Cell::new(None);
+    let (file, _) = timed_open_with_configuration(&archive.0, |file| {
+        configured.set(Some(file.as_raw_fd()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(configured.get(), Some(file.as_raw_fd()));
 }

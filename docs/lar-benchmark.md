@@ -280,21 +280,56 @@ Run the ignored release benchmark with:
 cargo test -p alex-lar --test index_benchmark --release -- --ignored --nocapture
 ```
 
-On this Linux workspace, a sealed archive containing 2,000 manifests opened a
-fresh file descriptor through its footer and produced the first byte of a
-selected 1 KiB body in 6.53 ms. Across 100 deterministic random-manifest
-filesystem opens, open+lookup+first decompressed byte measured 6.42 ms p50,
-6.65 ms p95, and 7.78 ms p99. Twenty random samples after Linux
-`posix_fadvise(POSIX_FADV_DONTNEED)` measured 6.16 ms p50 and 8.42 ms p95/p99.
-The equivalent first forward-scan TTFT took 12.03 ms. The ignored benchmark
-asserts the sealed warm p99 remains below 10 ms.
+The default second sample series uses OS-specific advisory cache control on
+the exact `File` descriptor subsequently moved into `ArchiveReader`: Linux uses
+`posix_fadvise(POSIX_FADV_DONTNEED)`, while macOS uses descriptor-scoped
+`fcntl(F_NOCACHE)`. The descriptor is not closed and reopened between cache
+configuration and the measured read. Output identifies the mode as
+`linux-posix-fadvise-dontneed` or `macos-f-nocache-descriptor`; neither label
+means controlled cold cache. Linux may retain referenced pages, and macOS
+`F_NOCACHE` controls caching behavior for that descriptor without proving that
+the unified buffer cache or device caches were empty.
+
+A site that can perform and verify a real cache drop can opt into the explicit
+external mode:
+
+```sh
+ALEX_LAR_RANDOM_ACCESS_CACHE_MODE=external \
+ALEX_LAR_COLD_CACHE_HELPER=/absolute/path/to/cache-drop-and-verify \
+cargo test -p alex-lar --test index_benchmark --release -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The helper is invoked before every measured random-access sample with the
+archive path as its only argument and `ALEX_LAR_COLD_CACHE_PROTOCOL=1` in its
+environment. It must perform the platform-specific eviction, verify whatever
+cold-cache condition the test site requires, exit successfully, and emit only
+`alex-lar-cold-cache-ready-v1` on stdout. Helper time is outside the TTFT
+measurement. The `external-helper-attested` output label records only the
+helper's successful attestation; it does not independently prove physical
+page-cache or storage-controller state. The Rust benchmark cannot inspect that
+state portably. On macOS, a wrapper around a privileged `purge` plus
+site-specific verification is one possible implementation; no macOS result is
+recorded here.
+
+On this Linux workspace, the corrected exact-descriptor benchmark over a
+sealed archive containing 2,000 manifests opened through its footer and
+produced the first byte of a selected 1 KiB body in 6.19 ms. Across 100
+deterministic random-manifest filesystem opens, open+lookup+first decompressed
+byte measured 5.96 ms p50, 6.03 ms p95, and 6.10 ms p99. Twenty random samples
+using Linux `posix_fadvise(POSIX_FADV_DONTNEED)` on the reader's descriptor
+measured 6.00 ms p50 and 7.11 ms p95/p99. The equivalent first forward-scan
+TTFT took 11.80 ms. This is a 2026-07-20 development-host result, not an
+accepted hardware gate. The ignored benchmark asserts the sealed warm p99
+remains below 10 ms.
 
 The custom sink timestamps the first non-empty write, so the numbers include
 opening and validating the footer/index, random manifest lookup, locating the
 chunk, and decompression to first output rather than only index parsing. The
-"cold" samples are an OS cache-drop advisory, not proof that hardware caches
-were empty; the agreed Mac hardware profile therefore remains rollout
-evidence.
+Linux `posix_fadvise` samples above are advisory-eviction evidence, not a
+controlled cold-cache result. A controlled run still requires the external
+helper protocol on the agreed hardware profile; the agreed Mac run remains a
+rollout gate.
 
 ## Native framing versus an MCAP profile
 

@@ -899,8 +899,11 @@ focused synthetic, production-path, migration, search, and conformance tests.
 Criterion 1 passes the deterministic representative corpus at 5.50x
 (tool-heavy: 17.20x) but still requires the anonymized real-corpus run.
 Criteria 7 and 9 remain rollout gates: the sealed filesystem open plus 1 KiB body
-benchmark is now below 10 ms at 7.28 ms warm p99, but cold-cache evidence on the
-agreed Mac hardware profile remains pending. The documented 500 MiB/s warm
+benchmark is now below 10 ms at 6.10 ms warm p99, but cold-cache evidence on the
+agreed Mac hardware profile remains pending. Built-in Linux/macOS cache advice
+now stays on the exact descriptor used by the reader but is explicitly not
+called cold; the benchmark has an external cache-drop-and-verification helper
+mode for the controlled hardware run. The documented 500 MiB/s warm
 large-body reconstruction target passes at 724.9 MiB/s p95 on this Linux host
 with the adaptive large-body profile. The
 3.28/3.67/4.48 ms fresh-pack p50/p95/p99 measurement is sequential rather than
