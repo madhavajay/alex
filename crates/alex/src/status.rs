@@ -25,6 +25,7 @@ pub(crate) struct StatusAccount {
     pub name: String,
     pub kind: String,
     pub label: Option<String>,
+    pub email: Option<String>,
     pub status: String,
     pub health: String,
     pub needs_reauth: bool,
@@ -97,12 +98,14 @@ pub(crate) async fn status_summary(config: &Config) -> Result<StatusSummary> {
             let last_heartbeat = heartbeat_for(admin_health.as_ref(), &account.id);
             let needs_reauth = account.needs_reauth();
             let usage_pct = usage_for(limits.as_ref(), account.provider.as_str());
+            let email = account.email();
             StatusAccount {
                 id: account.id,
                 provider: account.provider.as_str().to_string(),
                 name: account.name,
                 kind: account.kind,
                 label: account.label,
+                email,
                 status: account.status,
                 health: heartbeat_health(&last_heartbeat),
                 needs_reauth,
@@ -247,115 +250,158 @@ impl StatusSummary {
     }
 
     fn telegram_text_at(&self, now: i64) -> String {
-        let update = if self.update_available {
-            format!(
-                "update available → v{}",
-                self.update_target.as_deref().unwrap_or("unknown")
-            )
-        } else {
-            "up to date".to_string()
-        };
         let daemon = if self.daemon_up {
-            format!(
-                "up{}",
-                self.uptime_s
-                    .map(|seconds| format!(" · uptime {}", compact_duration(seconds * 1000)))
-                    .unwrap_or_default()
-            )
+            self.uptime_s
+                .map(|seconds| format!("up {}", compact_duration(seconds * 1000)))
+                .unwrap_or_else(|| "up".to_string())
         } else {
             "down".to_string()
         };
-        let lines = vec![
-            format!("Alex v{} · {update}", self.version),
-            format!("Daemon: {daemon} · service {}", self.service),
-            format!("Dario: {}", if self.dario_ready { "ready" } else { "down" }),
-            String::new(),
-            "Accounts:".to_string(),
-        ];
-        let account_lines = if self.accounts.is_empty() {
-            vec!["• none configured".to_string()]
-        } else {
-            self.accounts
-                .iter()
-                .map(|account| {
-                    let mut details = vec![account.status.clone(), account.health.clone()];
-                    if account.needs_reauth {
-                        details.push("reauth needed".to_string());
-                    }
-                    if let Some(usage) = account.usage_pct {
-                        details.push(format!("{usage:.0}% used"));
-                    }
-                    details.push(expiry_text(account.expires_at_ms, now));
-                    format!(
-                        "• {}/{} — {}",
-                        account.provider,
-                        account.name,
-                        details.join(" · ")
-                    )
-                })
-                .collect()
-        };
-        telegram_status_text(
-            lines,
-            account_lines,
-            limit_blocks(self.limits.as_ref(), now),
-            heartbeat_lines(self.admin_health.as_ref(), now),
-        )
+        let header = format!(
+            "Alex v{} · Daemon {daemon} · Dario {}",
+            self.version,
+            if self.dario_ready { "ready" } else { "down" }
+        );
+        let account_blocks = self
+            .accounts
+            .iter()
+            .map(|account| account_block(self, account, now))
+            .collect();
+        telegram_status_text(header, account_blocks)
     }
 }
 
-#[derive(Debug)]
-struct HeartbeatLine {
-    text: String,
-    ok: bool,
+#[derive(Debug, Clone)]
+struct LimitWindow {
+    name: String,
+    remaining_pct: f64,
+    reset: String,
 }
 
-fn limit_blocks(limits: Option<&Value>, now: i64) -> Vec<Vec<String>> {
-    limits
-        .and_then(|value| value["providers"].as_array())
+fn account_block(summary: &StatusSummary, account: &StatusAccount, now: i64) -> Vec<String> {
+    let same_provider = summary
+        .accounts
+        .iter()
+        .filter(|other| other.provider == account.provider)
+        .count();
+    let local_name = (same_provider > 1).then(|| {
+        let name = strip_urls(&compact_whitespace(&account.name));
+        format!(" ({})", if name.is_empty() { "account" } else { &name })
+    });
+    let display_name = format!(
+        "{}{}",
+        account.provider,
+        local_name.as_deref().unwrap_or_default()
+    );
+    let ping_failed = account.last_heartbeat["ok"].as_bool() == Some(false);
+    let failed = account.needs_reauth || ping_failed;
+    let mut first = format!("{} {display_name}", if failed { "❌" } else { "✅" });
+
+    let limit_entry = limit_entry(summary.limits.as_ref(), account);
+    if failed {
+        let reason = if account.needs_reauth {
+            "needs reauth".to_string()
+        } else {
+            let message = account.last_heartbeat["message"]
+                .as_str()
+                .map(compact_whitespace)
+                .map(|message| strip_urls(&message))
+                .filter(|message| !message.is_empty())
+                .map(|message| truncate_chars(&message, HEARTBEAT_ERROR_LIMIT));
+            format!(
+                "ping failed{}",
+                message
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            )
+        };
+        first.push_str(&format!(" — {reason}"));
+    } else {
+        let plan = limit_entry
+            .and_then(|entry| plain_plan(entry["plan"].as_str()))
+            .or_else(|| plain_plan(account.label.as_deref()));
+        let email = account
+            .email
+            .as_deref()
+            .map(compact_whitespace)
+            .filter(|email| !email.is_empty() && !contains_url(email));
+        let details = plan.into_iter().chain(email).collect::<Vec<_>>();
+        if !details.is_empty() {
+            first.push_str(&format!(" — {}", details.join(" · ")));
+        }
+    }
+
+    let mut lines = vec![first];
+    if let Some(entry) = limit_entry {
+        let windows = limit_windows(entry, now);
+        if let Some((tightest_index, tightest)) = windows
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| left.remaining_pct.total_cmp(&right.remaining_pct))
+        {
+            lines.push(format!(
+                "{} {:.0}% left · {} resets {}",
+                remaining_bar(tightest.remaining_pct),
+                tightest.remaining_pct,
+                tightest.name,
+                tightest.reset
+            ));
+            for (index, window) in windows.iter().enumerate() {
+                if index != tightest_index && window.remaining_pct < 50.0 {
+                    lines.push(format!(
+                        "↓ {:.0}% left · {} resets {}",
+                        window.remaining_pct, window.name, window.reset
+                    ));
+                }
+            }
+        }
+    }
+    if account.needs_reauth {
+        lines.push(format!("→ /reauth {}", account.provider));
+    }
+    lines
+}
+
+fn limit_entry<'a>(limits: Option<&'a Value>, account: &StatusAccount) -> Option<&'a Value> {
+    let entries = limits?["providers"].as_array()?;
+    entries
+        .iter()
+        .find(|entry| {
+            entry["provider"].as_str() == Some(account.provider.as_str())
+                && entry["account_id"].as_str() == Some(account.id.as_str())
+        })
+        .or_else(|| {
+            entries.iter().find(|entry| {
+                entry["provider"].as_str() == Some(account.provider.as_str())
+                    && entry["account_id"].as_str().is_none()
+            })
+        })
+}
+
+fn limit_windows(entry: &Value, now: i64) -> Vec<LimitWindow> {
+    entry["windows"]
+        .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|entry| {
-            let provider = entry["provider"].as_str()?.trim();
-            if provider.is_empty() {
+        .filter_map(|window| {
+            let used = window["used_pct"].as_f64()?;
+            if !used.is_finite() {
                 return None;
             }
-            let windows = entry["windows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|window| {
-                    let usage = window["used_pct"].as_f64()?;
-                    if !usage.is_finite() {
-                        return None;
-                    }
-                    let name = window["window"]
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("window");
-                    let reset = reset_at_ms(window)
-                        .map(|reset| reset_relative_text(reset, now))
-                        .unwrap_or_else(|| "reset unknown".to_string());
-                    Some(format!(
-                        "  {name} — {:.0}% used · {reset}",
-                        usage.clamp(0.0, 100.0)
-                    ))
-                })
-                .collect::<Vec<_>>();
-            if windows.is_empty() {
-                return None;
-            }
-            let plan = entry["plan"]
+            let name = window["window"]
                 .as_str()
-                .map(str::trim)
-                .filter(|plan| !plan.is_empty());
-            let mut block = vec![match plan {
-                Some(plan) => format!("• {provider} — plan {plan}"),
-                None => format!("• {provider}"),
-            }];
-            block.extend(windows);
-            Some(block)
+                .map(compact_whitespace)
+                .map(|name| strip_urls(&name))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "window".to_string());
+            let reset = reset_at_ms(window)
+                .map(|reset| reset_relative_value(reset, now))
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(LimitWindow {
+                name,
+                remaining_pct: (100.0 - used).clamp(0.0, 100.0),
+                reset,
+            })
         })
         .collect()
 }
@@ -372,135 +418,84 @@ fn reset_at_ms(window: &Value) -> Option<i64> {
         })
 }
 
-fn reset_relative_text(reset: i64, now: i64) -> String {
+fn reset_relative_value(reset: i64, now: i64) -> String {
     if reset >= now {
-        format!("resets in {}", compact_duration(reset.saturating_sub(now)))
+        compact_duration(reset.saturating_sub(now))
     } else {
-        format!("reset {} ago", compact_duration(now.saturating_sub(reset)))
+        format!("{} ago", compact_duration(now.saturating_sub(reset)))
     }
 }
 
-fn heartbeat_lines(admin_health: Option<&Value>, now: i64) -> Vec<HeartbeatLine> {
-    let mut latest: Vec<(String, &Value)> = Vec::new();
-    for account in admin_health
-        .and_then(|value| value["accounts"].as_array())
-        .into_iter()
-        .flatten()
-    {
-        let heartbeat = &account["last_heartbeat"];
-        if heartbeat["ok"].as_bool().is_none() {
-            continue;
-        }
-        let Some(provider) = account["provider"]
-            .as_str()
-            .or_else(|| heartbeat["provider"].as_str())
-            .map(str::trim)
-            .filter(|provider| !provider.is_empty())
-        else {
-            continue;
-        };
-        if let Some((_, current)) = latest.iter_mut().find(|(name, _)| name == provider) {
-            if heartbeat["ts_ms"].as_i64().unwrap_or(i64::MIN)
-                > current["ts_ms"].as_i64().unwrap_or(i64::MIN)
-            {
-                *current = heartbeat;
-            }
-        } else {
-            latest.push((provider.to_string(), heartbeat));
-        }
+fn remaining_bar(remaining_pct: f64) -> String {
+    let percent = remaining_pct.round().clamp(0.0, 100.0) as usize;
+    let full = percent / 10;
+    let partial = percent % 10;
+    let mut blocks = vec!["🟩"; full];
+    if partial > 0 && blocks.len() < 10 {
+        blocks.push(if percent < 20 { "🟥" } else { "🟨" });
     }
-
-    latest
-        .into_iter()
-        .map(|(provider, heartbeat)| {
-            let ok = heartbeat["ok"].as_bool().unwrap_or(false);
-            let age = heartbeat["ts_ms"]
-                .as_i64()
-                .map(|timestamp| {
-                    format!(
-                        "{} ago",
-                        compact_duration(now.saturating_sub(timestamp).max(0))
-                    )
-                })
-                .unwrap_or_else(|| "time unknown".to_string());
-            let result = if ok { "✓ ok" } else { "✗ fail" };
-            let error = (!ok)
-                .then(|| heartbeat["message"].as_str())
-                .flatten()
-                .map(compact_whitespace)
-                .filter(|message| !message.is_empty())
-                .map(|message| truncate_chars(&message, HEARTBEAT_ERROR_LIMIT));
-            HeartbeatLine {
-                text: format!(
-                    "• {provider} — {result} · {age}{}",
-                    error
-                        .map(|message| format!(" · {message}"))
-                        .unwrap_or_default()
-                ),
-                ok,
-            }
-        })
-        .collect()
+    blocks.resize(10, "⬜");
+    blocks.join("")
 }
 
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn telegram_status_text(
-    base_lines: Vec<String>,
-    mut account_lines: Vec<String>,
-    mut limit_blocks: Vec<Vec<String>>,
-    mut heartbeat_lines: Vec<HeartbeatLine>,
-) -> String {
+fn contains_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("://") || lower.contains("www.")
+}
+
+fn strip_urls(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|word| !contains_url(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn plain_plan(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || contains_url(value) {
+        return None;
+    }
+    value
+        .split_whitespace()
+        .next()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_alphanumeric() && !matches!(character, '+' | '-' | '_')
+            })
+        })
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+}
+
+fn telegram_status_text(header: String, mut account_blocks: Vec<Vec<String>>) -> String {
     let mut truncated = false;
     loop {
-        let text = assemble_telegram_text(
-            &base_lines,
-            &account_lines,
-            &limit_blocks,
-            &heartbeat_lines,
-            truncated,
-        );
+        let text = assemble_telegram_text(&header, &account_blocks, truncated);
         if telegram_len(&text) <= TELEGRAM_MESSAGE_LIMIT {
             return text;
         }
         truncated = true;
-        if limit_blocks.pop().is_some() {
-            continue;
-        }
-        if let Some(index) = heartbeat_lines.iter().rposition(|line| line.ok) {
-            heartbeat_lines.remove(index);
-            continue;
-        }
-        if heartbeat_lines.pop().is_some() {
-            continue;
-        }
-        if account_lines.pop().is_some() {
+        if account_blocks.pop().is_some() {
             continue;
         }
         return truncate_chars(&text, TELEGRAM_MESSAGE_LIMIT);
     }
 }
 
-fn assemble_telegram_text(
-    base_lines: &[String],
-    account_lines: &[String],
-    limit_blocks: &[Vec<String>],
-    heartbeat_lines: &[HeartbeatLine],
-    truncated: bool,
-) -> String {
-    let mut lines = base_lines.to_vec();
-    lines.extend(account_lines.iter().cloned());
-    if !limit_blocks.is_empty() {
+fn assemble_telegram_text(header: &str, account_blocks: &[Vec<String>], truncated: bool) -> String {
+    let mut lines = vec![header.to_string()];
+    for block in account_blocks {
         lines.push(String::new());
-        lines.push("Subscriptions & limits:".to_string());
-        lines.extend(limit_blocks.iter().flatten().cloned());
+        lines.extend(block.iter().cloned());
     }
-    if !heartbeat_lines.is_empty() {
+    if account_blocks.is_empty() && !truncated {
         lines.push(String::new());
-        lines.push("Ping / health:".to_string());
-        lines.extend(heartbeat_lines.iter().map(|line| line.text.clone()));
+        lines.push("No accounts configured.".to_string());
     }
     if truncated {
         lines.push("… additional status lines omitted".to_string());
@@ -528,14 +523,6 @@ fn truncate_chars(value: &str, max: usize) -> String {
     }
     output.push('…');
     output
-}
-
-fn expiry_text(expires_at_ms: Option<i64>, now: i64) -> String {
-    match expires_at_ms.map(|expiry| expiry - now) {
-        Some(remaining) if remaining >= 0 => format!("{} left", compact_duration(remaining)),
-        Some(remaining) => format!("expired {} ago", compact_duration(-remaining)),
-        None => "no expiry".to_string(),
-    }
 }
 
 fn compact_duration(ms: i64) -> String {
@@ -570,7 +557,8 @@ mod tests {
                 provider: "openai".into(),
                 name: "work".into(),
                 kind: "oauth".into(),
-                label: None,
+                label: Some("codex (oauth)".into()),
+                email: Some("work@example.com".into()),
                 status: "active".into(),
                 health: "healthy".into(),
                 needs_reauth: false,
@@ -590,97 +578,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn formats_synthetic_status_for_telegram() {
-        let now = 1_000_000;
-        let summary = synthetic_summary(now);
-
-        let text = summary.telegram_text_at(now);
-        assert!(text.contains("Alex v9.8.7 · update available → v10.0.0"));
-        assert!(text.contains("Daemon: up · uptime 2h · service active"));
-        assert!(text.contains("Dario: ready"));
-        assert!(text.contains("openai/work — active · healthy · 42% used · 6h left"));
+    fn set_openai_limits(summary: &mut StatusSummary, now: i64) {
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "openai",
+                "plan": "plus",
+                "windows": [{
+                    "window": "7d",
+                    "used_pct": 61.0,
+                    "resets_at_s": (now + 12 * 3_600_000) / 1000
+                }]
+            }]
+        }));
     }
 
     #[test]
-    fn formats_limits_and_healthy_and_failing_pings() {
+    fn formats_healthy_account_as_one_entry() {
         let now = 1_000_000;
         let mut summary = synthetic_summary(now);
-        summary.limits = Some(serde_json::json!({
-            "providers": [
-                {
-                    "provider": "openai",
-                    "plan": "plus",
-                    "windows": [
-                        {
-                            "window": "5h",
-                            "used_pct": 42.4,
-                            "resets_at_s": (now + 6 * 3_600_000) / 1000
-                        },
-                        {
-                            "window": "7d",
-                            "used_pct": 75.0
-                        }
-                    ]
-                },
-                {
-                    "provider": "anthropic",
-                    "plan": "max",
-                    "windows": []
-                }
-            ]
-        }));
-        summary.admin_health = Some(serde_json::json!({
-            "accounts": [
-                {
-                    "provider": "openai",
-                    "last_heartbeat": {
-                        "provider": "openai",
-                        "ok": true,
-                        "ts_ms": now - 2 * 60_000,
-                        "message": "creds ok"
-                    }
-                },
-                {
-                    "provider": "anthropic",
-                    "last_heartbeat": {
-                        "provider": "anthropic",
-                        "ok": false,
-                        "ts_ms": now - 5 * 60_000,
-                        "message": "invalid token\n".to_string() + &"refused ".repeat(30)
-                    }
-                }
-            ]
-        }));
+        set_openai_limits(&mut summary, now);
 
         let text = summary.telegram_text_at(now);
-        assert!(text.contains("Subscriptions & limits:"));
-        assert!(text.contains("• openai — plan plus"));
-        assert!(text.contains("  5h — 42% used · resets in 6h"));
-        assert!(text.contains("  7d — 75% used · reset unknown"));
-        assert!(!text.contains("• anthropic — plan max"));
-        assert!(text.contains("Ping / health:"));
-        assert!(text.contains("• openai — ✓ ok · 2m ago"));
-        assert!(text.contains("• anthropic — ✗ fail · 5m ago · invalid token refused"));
-        assert!(text.contains('…'));
-        assert!(!text.contains("invalid token\n"));
-    }
-
-    #[test]
-    fn omits_sections_without_limit_or_heartbeat_data() {
-        let now = 1_000_000;
-        let mut summary = synthetic_summary(now);
-        summary.limits = Some(serde_json::json!({
-            "providers": [{"provider": "openai", "plan": "plus", "windows": []}]
-        }));
-        summary.admin_health = Some(serde_json::json!({
-            "accounts": [{"provider": "openai", "last_heartbeat": null}]
-        }));
-
-        let text = summary.telegram_text_at(now);
+        assert!(text.starts_with("Alex v9.8.7 · Daemon up 2h · Dario ready"));
+        assert!(text.contains("✅ openai — plus · work@example.com"));
+        assert!(text.contains("🟩🟩🟩🟨⬜⬜⬜⬜⬜⬜ 39% left · 7d resets 12h"));
+        assert!(!text.contains("Accounts:"));
         assert!(!text.contains("Subscriptions & limits:"));
         assert!(!text.contains("Ping / health:"));
-        assert!(text.contains("Accounts:"));
+    }
+
+    #[test]
+    fn failing_ping_keeps_usage_and_shows_inline_reason() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        set_openai_limits(&mut summary, now);
+        summary.accounts[0].last_heartbeat = serde_json::json!({
+            "ok": false,
+            "message": "connection   timeout"
+        });
+
+        let text = summary.telegram_text_at(now);
+        assert!(text.contains("❌ openai — ping failed: connection timeout"));
+        assert!(text.contains("39% left · 7d resets 12h"));
+        assert!(!text.contains("/reauth openai"));
+    }
+
+    #[test]
+    fn needs_reauth_has_hint_and_usage() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        set_openai_limits(&mut summary, now);
+        summary.accounts[0].needs_reauth = true;
+
+        let text = summary.telegram_text_at(now);
+        assert!(text.contains("❌ openai — needs reauth"));
+        assert!(text.contains("→ /reauth openai"));
+        assert!(text.contains("39% left"));
+    }
+
+    #[test]
+    fn tightest_window_drives_bar_and_only_other_low_windows_are_listed() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "openai",
+                "plan": "plus",
+                "windows": [
+                    {"window": "5h", "used_pct": 30.0},
+                    {"window": "7d", "used_pct": 61.0},
+                    {"window": "30d", "used_pct": 55.0}
+                ]
+            }]
+        }));
+
+        let text = summary.telegram_text_at(now);
+        assert!(text.contains("🟩🟩🟩🟨⬜⬜⬜⬜⬜⬜ 39% left · 7d resets unknown"));
+        assert!(text.contains("↓ 45% left · 30d resets unknown"));
+        assert!(!text.contains("70% left · 5h"));
+    }
+
+    #[test]
+    fn output_never_contains_urls_and_multi_account_names_are_local() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        let mut personal = summary.accounts[0].clone();
+        personal.id = "openai-oauth-personal".into();
+        personal.name = "personal".into();
+        personal.email = Some("personal@example.com".into());
+        summary.accounts.push(personal);
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "openai",
+                "plan": "https://plans.example/plus",
+                "windows": [{"window": "https://limits.example/7d", "used_pct": 10.0}]
+            }]
+        }));
+
+        let text = summary.telegram_text_at(now);
+        assert!(text.contains("✅ openai (work) — codex · work@example.com"));
+        assert!(text.contains("✅ openai (personal) — codex · personal@example.com"));
+        assert!(!text.contains("http://"));
+        assert!(!text.contains("https://"));
+        assert!(!text.contains("plans.example"));
+        assert!(!text.contains("limits.example"));
     }
 
     #[test]

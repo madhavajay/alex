@@ -591,6 +591,10 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
+    /// Set before graceful shutdown begins. Background provider probes use it
+    /// to discard lifecycle-induced transport failures instead of persisting
+    /// them as provider health history.
+    shutting_down: std::sync::atomic::AtomicBool,
     in_flight_requests: std::sync::Mutex<HashMap<String, InFlightRequest>>,
     upstream_stream_idle_timeout: Duration,
     pub started_ms: i64,
@@ -637,6 +641,17 @@ pub struct AppState {
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
+}
+
+impl AppState {
+    pub fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,6 +929,7 @@ pub fn build_state_with_substitution(
         http,
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
         in_flight_requests: std::sync::Mutex::new(HashMap::new()),
         upstream_stream_idle_timeout,
         started_ms: now_ms(),
@@ -5653,12 +5669,14 @@ async fn admin_provider_resume(
 }
 
 async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let heartbeats = state.store.last_heartbeats().unwrap_or_default();
     let accounts: Vec<Value> = state
         .vault
         .list()
         .await
         .into_iter()
         .map(|a| {
+            let last_heartbeat = heartbeat_for_account(&heartbeats, &a);
             let email = a.email();
             let policy = state.vault.policy(a.provider);
             let reserve_pct = routing_reserve_pct(&a, &policy);
@@ -5693,7 +5711,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 // Reachability derived from the last heartbeat/ping, distinct
                 // from `status` (credential presence). The UI dot must follow
                 // this, not `status`, so a failing-ping provider reads red.
-                "health": account_health(&a),
+                "health": account_health(&a, last_heartbeat),
                 "last_probe": a.account_meta.get("last_probe").cloned().unwrap_or(Value::Null),
                 "needs_reauth": a.needs_reauth(),
                 "expires_at_ms": a.expires_at_ms,
@@ -6032,10 +6050,7 @@ async fn admin_health(State(state): State<Arc<AppState>>) -> Response {
         .await
         .into_iter()
         .map(|a| {
-            let last = heartbeats
-                .iter()
-                .find(|h| h["provider"].as_str() == Some(a.provider.as_str()))
-                .cloned();
+            let last = heartbeat_for_account(&heartbeats, &a).cloned();
             json!({
                 "id": a.id,
                 "provider": a.provider.as_str(),
@@ -6370,41 +6385,70 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
     };
     let mut results = Vec::new();
     for provider in providers {
+        if state.is_shutting_down() {
+            break;
+        }
         let r = ping_provider(state, provider, models).await;
-        if r.ok {
-            if let Some(account_id) = r.account_id.as_deref() {
-                if let Err(error) = state.vault.clear_cooldown(account_id).await {
-                    tracing::warn!(%error, %account_id, "could not clear recovered account cooldown");
-                }
-            }
-        }
-        if let Err(e) = state.store.insert_heartbeat(
-            now_ms(),
-            r.provider,
-            r.account_id.as_deref(),
-            r.ok,
-            r.status.map(|s| s as i64),
-            r.latency_ms,
-            &r.message,
-        ) {
-            tracing::warn!("failed to record heartbeat: {e}");
-        }
-        tracing::info!(
-            provider = r.provider,
-            ok = r.ok,
-            status = r.status,
-            latency_ms = r.latency_ms,
-            reply = %r.message,
-            "heartbeat"
-        );
-        // Reachability, not credential-presence, is what the status dot must
-        // reflect: persist the probe outcome and — for an auth-class failure —
-        // reuse the proactive re-auth dispatcher (same cooldown as the request
-        // path and the idle-expiry watchdog).
-        record_probe_outcome(state, &r).await;
+        record_heartbeat_result(state, &r).await;
         results.push(r);
     }
     results
+}
+
+/// Persist one completed heartbeat unless daemon shutdown has begun. In-flight
+/// requests commonly lose their transport while axum drains; those failures
+/// describe daemon lifecycle, not provider reachability.
+async fn record_heartbeat_result(state: &Arc<AppState>, r: &PingResult) {
+    if state.is_shutting_down() {
+        tracing::debug!(
+            provider = r.provider,
+            status = r.status,
+            detail = %r.message,
+            "discarding heartbeat result during daemon shutdown"
+        );
+        return;
+    }
+
+    if r.ok {
+        if let Some(account_id) = r.account_id.as_deref() {
+            if let Err(error) = state.vault.clear_cooldown(account_id).await {
+                tracing::warn!(%error, %account_id, "could not clear recovered account cooldown");
+            }
+        }
+    }
+    // Re-check after the async vault operation: shutdown may have started
+    // while it yielded, in which case this probe must not enter health history.
+    if state.is_shutting_down() {
+        tracing::debug!(
+            provider = r.provider,
+            "discarding heartbeat result after daemon shutdown began"
+        );
+        return;
+    }
+    if let Err(e) = state.store.insert_heartbeat(
+        now_ms(),
+        r.provider,
+        r.account_id.as_deref(),
+        r.ok,
+        r.status.map(|s| s as i64),
+        r.latency_ms,
+        &r.message,
+    ) {
+        tracing::warn!("failed to record heartbeat: {e}");
+    }
+    tracing::info!(
+        provider = r.provider,
+        ok = r.ok,
+        status = r.status,
+        latency_ms = r.latency_ms,
+        reply = %r.message,
+        "heartbeat"
+    );
+    // Reachability, not credential-presence, is what the status dot must
+    // reflect: persist the probe outcome and — for an auth-class failure —
+    // reuse the proactive re-auth dispatcher (same cooldown as the request
+    // path and the idle-expiry watchdog).
+    record_probe_outcome(state, r).await;
 }
 
 /// Health an account's last probe implies. This is reachability, distinct from
@@ -6554,17 +6598,36 @@ async fn record_dario_response_probe(
 /// watchdog) always wins so the dot is red regardless of the last ping; failing
 /// that it echoes the last probe's health, defaulting to `unknown` when the
 /// account has never been probed (never claim green without evidence).
-fn account_health(account: &Account) -> String {
+fn heartbeat_for_account<'a>(heartbeats: &'a [Value], account: &Account) -> Option<&'a Value> {
+    heartbeats
+        .iter()
+        .find(|heartbeat| heartbeat["account_id"].as_str() == Some(account.id.as_str()))
+        .or_else(|| {
+            heartbeats.iter().find(|heartbeat| {
+                heartbeat["account_id"].is_null()
+                    && heartbeat["provider"].as_str() == Some(account.provider.as_str())
+            })
+        })
+}
+
+fn account_health(account: &Account, last_heartbeat: Option<&Value>) -> String {
     if account.needs_reauth() {
         return "auth_failed".to_string();
     }
-    account
+    if let Some(health) = account
         .account_meta
         .get("last_probe")
         .and_then(|probe| probe.get("health"))
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string()
+    {
+        return health.to_string();
+    }
+    match last_heartbeat.and_then(|heartbeat| heartbeat["ok"].as_bool()) {
+        Some(true) => "healthy",
+        Some(false) => "unreachable",
+        None => "unknown",
+    }
+    .to_string()
 }
 
 async fn anthropic_messages(
@@ -8579,11 +8642,22 @@ async fn admin_run_keys_revoke(
     }
 }
 
-async fn admin_run_keys_revoke_all(State(state): State<Arc<AppState>>) -> Response {
-    match state.store.revoke_all_run_keys() {
-        Ok(revoked) => {
+async fn admin_run_keys_revoke_all(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let include_harness = query
+        .get("include_harness")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    match state.store.revoke_all_run_keys(include_harness) {
+        Ok(counts) => {
             state.run_keys.write().unwrap().clear();
-            axum::Json(json!({"revoked": revoked})).into_response()
+            axum::Json(json!({
+                "revoked": counts.revoked,
+                "harness_revoked": counts.harness_revoked,
+                "harness_skipped": counts.harness_skipped,
+            }))
+            .into_response()
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -15412,14 +15486,15 @@ mod tests {
         use tower::ServiceExt;
 
         let state = test_state("run-key-bulk-routes");
-        for (id, hash) in [
-            ("rk-active-1", "active1111bbbb2222cccc"),
-            ("rk-active-2", "active2222bbbb2222cccc"),
-            ("rk-revoked", "revoked111bbbb2222cccc"),
+        for (id, hash, kind) in [
+            ("rk-active-run", "active1111bbbb2222cccc", "run"),
+            ("rk-active-wrap", "active2222bbbb2222cccc", "wrap"),
+            ("rk-harness", "harness111bbbb2222cccc", "harness"),
+            ("rk-revoked", "revoked111bbbb2222cccc", "run"),
         ] {
             state
                 .store
-                .insert_run_key(id, hash, "run", None, None, None, 1_000, None)
+                .insert_run_key(id, hash, kind, None, None, None, 1_000, None)
                 .unwrap();
         }
         assert!(state.store.revoke_run_key("rk-revoked").unwrap());
@@ -15452,13 +15527,37 @@ mod tests {
             response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["revoked"], 2);
+        assert_eq!(body["harness_revoked"], 0);
+        assert_eq!(body["harness_skipped"], 1);
         assert!(state.run_keys.read().unwrap().is_empty());
+        assert!(state
+            .store
+            .lookup_run_key("harness111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_some());
         assert!(state
             .store
             .list_run_keys(true)
             .unwrap()
             .iter()
+            .filter(|row| row["kind"] != "harness")
             .all(|row| row["revoked"] == true));
+
+        let request = axum::http::Request::post("/admin/run-keys/revoke-all?include_harness=1")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revoked"], 1);
+        assert_eq!(body["harness_revoked"], 1);
+        assert_eq!(body["harness_skipped"], 0);
+        assert!(state
+            .store
+            .lookup_run_key("harness111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_none());
 
         state
             .store
@@ -15481,7 +15580,7 @@ mod tests {
         let (status, body) =
             response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["removed"], 3);
+        assert_eq!(body["removed"], 4);
         assert!(state.run_keys.read().unwrap().is_empty());
         let rows = state.store.list_run_keys(true).unwrap();
         assert_eq!(rows.len(), 1);
@@ -18275,6 +18374,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn heartbeat_result_is_not_recorded_after_shutdown_begins() {
+        let state = test_state("heartbeat-shutdown-discard");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "shutdown"))
+            .await
+            .unwrap();
+        state.begin_shutdown();
+
+        record_heartbeat_result(
+            &state,
+            &PingResult {
+                provider: "xai",
+                account_id: Some("xai-oauth-shutdown".into()),
+                ok: false,
+                status: None,
+                latency_ms: 12,
+                message: "error sending request".into(),
+            },
+        )
+        .await;
+
+        assert!(state.store.last_heartbeats().unwrap().is_empty());
+        let account = state
+            .vault
+            .list()
+            .await
+            .into_iter()
+            .find(|account| account.id == "xai-oauth-shutdown")
+            .unwrap();
+        assert!(account.account_meta.get("last_probe").is_none());
+        assert!(!account.needs_reauth());
+    }
+
     async fn account_health_of(state: &Arc<AppState>, id: &str) -> String {
         let account = state
             .vault
@@ -18283,7 +18417,8 @@ mod tests {
             .into_iter()
             .find(|a| a.id == id)
             .expect("account present");
-        account_health(&account)
+        let heartbeats = state.store.last_heartbeats().unwrap_or_default();
+        account_health(&account, heartbeat_for_account(&heartbeats, &account))
     }
 
     async fn admin_accounts_health(state: &Arc<AppState>, id: &str) -> String {
@@ -18556,6 +18691,69 @@ mod tests {
             "unknown"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_only_account_reports_healthy_or_unreachable() {
+        for (ok, expected) in [(true, "healthy"), (false, "unreachable")] {
+            let state = test_state(if ok {
+                "heartbeat-only-healthy"
+            } else {
+                "heartbeat-only-unreachable"
+            });
+            state
+                .vault
+                .upsert(active_oauth_account(Provider::Xai, "grok"))
+                .await
+                .unwrap();
+            state
+                .store
+                .insert_heartbeat(
+                    now_ms(),
+                    "xai",
+                    Some("xai-oauth-grok"),
+                    ok,
+                    ok.then_some(200),
+                    12,
+                    "heartbeat evidence",
+                )
+                .unwrap();
+
+            assert_eq!(account_health_of(&state, "xai-oauth-grok").await, expected);
+            assert_eq!(
+                admin_accounts_health(&state, "xai-oauth-grok").await,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_evidence_wins_over_newer_heartbeat() {
+        let state = test_state("probe-wins-over-heartbeat");
+        state
+            .vault
+            .upsert(active_oauth_account(Provider::Xai, "grok"))
+            .await
+            .unwrap();
+        record_probe_outcome(&state, &probe_result("xai-oauth-grok", true, Some(200))).await;
+        state
+            .store
+            .insert_heartbeat(
+                now_ms(),
+                "xai",
+                Some("xai-oauth-grok"),
+                false,
+                Some(503),
+                12,
+                "later heartbeat failed",
+            )
+            .unwrap();
+
+        assert_eq!(account_health_of(&state, "xai-oauth-grok").await, "healthy");
+        assert_eq!(
+            admin_accounts_health(&state, "xai-oauth-grok").await,
+            "healthy"
+        );
     }
 
     #[tokio::test]

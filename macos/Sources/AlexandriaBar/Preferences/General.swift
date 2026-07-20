@@ -3,8 +3,8 @@ import SwiftUI
 import AlexandriaBarCore
 
 /// The Preferences → General tab: launch at login, refresh cadence, alerts,
-/// updates, terminal, daemon, network exposure, reset, proxy credentials,
-/// feedback, and about. Restyled per ui/Create Settings Page (§2.3 of the
+/// updates, terminal, daemon, network exposure, reset, feedback, and about.
+/// Restyled per ui/Create Settings Page (§2.3 of the
 /// design spec): section labels + hairline-divided setting rows.
 struct GeneralPreferencesPane: View {
     let store: SnapshotStore
@@ -32,8 +32,6 @@ struct GeneralPreferencesPane: View {
     @State private var daemonUpdateTarget: String?
     @State private var daemonUpdateStatus: String?
     @State private var launchAtLogin = false
-    @State private var copyingCredentials = false
-    @State private var credentialCopyStatus: String?
     @State private var showingResetSheet = false
     @State private var networkExposure = "loopback"
     @State private var selectedInterfaceAddress = ""
@@ -266,36 +264,6 @@ struct GeneralPreferencesPane: View {
             ) {
                 showingResetSheet = true
             }
-        }
-
-        SectionLabel(text: "Proxy credentials")
-            .settingsSectionSpacing()
-        SettingCaption(
-            "Copy credentials for generic API clients, or a ready-to-edit command that mints a tagged run key. Both use the currently loaded local daemon settings.")
-        HStack(spacing: AlexTheme.Spacing.md) {
-            PillButton(
-                title: "Copy environment block", variant: .standard,
-                systemImage: "doc.on.doc",
-                horizontalPadding: 12, verticalPadding: 5, cornerRadius: 7,
-                isEnabled: !copyingCredentials && store.config != nil
-            ) {
-                copyGenericCredentials()
-            }
-            .help("Copy the same shell exports printed by alex credentials")
-            PillButton(
-                title: "Copy run-key curl", variant: .standard,
-                systemImage: "terminal",
-                horizontalPadding: 12, verticalPadding: 5, cornerRadius: 7,
-                isEnabled: store.config != nil
-            ) {
-                copyRunKeyCurl()
-            }
-            .help("Copy an editable POST /admin/run-keys example using this daemon")
-            if copyingCredentials { ProgressView().controlSize(.small) }
-        }
-        .padding(.vertical, 8)
-        if let credentialCopyStatus {
-            SettingCaption(credentialCopyStatus)
         }
 
         SectionLabel(text: "Feedback")
@@ -585,45 +553,20 @@ struct GeneralPreferencesPane: View {
             == rhs.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
     }
 
-    private func copyGenericCredentials() {
-        guard let config = store.config else { return }
-        copyingCredentials = true
-        credentialCopyStatus = nil
-        Task {
-            do {
-                let environment = try await AlexandriaClient(config: config)
-                    .credentialsEnvironment()
-                CredentialClipboard.copy(environment)
-                credentialCopyStatus = "Environment credential block copied."
-            } catch {
-                NSSound.beep()
-                credentialCopyStatus = "Could not load credentials from the local daemon."
-            }
-            copyingCredentials = false
-        }
-    }
-
-    private func copyRunKeyCurl() {
-        guard let config = store.config else { return }
-        let endpoint = config.baseURL.appendingPathComponent("admin/run-keys").absoluteString
-        let body = #"{"run_id":"demo-run-001","tags":{"harness":"pi","project":"my-project"},"ttl_seconds":86400,"label":"example tagged run"}"#
-        let command = """
-        curl -sS -X POST \\
-          -H \(shellQuote("x-api-key: \(config.localKey)")) \\
-          -H 'content-type: application/json' \\
-          --data \(shellQuote(body)) \\
-          \(shellQuote(endpoint))
-        """
-        CredentialClipboard.copy(command)
-        credentialCopyStatus = "Editable run-key curl command copied."
-    }
-
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
-    }
 }
 
 // MARK: - Row vocabulary (Create Settings App.tsx:595-609)
+
+private struct SettingHintColorKey: EnvironmentKey {
+    static let defaultValue = AlexTheme.Colors.textFaint
+}
+
+extension EnvironmentValues {
+    var settingHintColor: Color {
+        get { self[SettingHintColorKey.self] }
+        set { self[SettingHintColorKey.self] = newValue }
+    }
+}
 
 /// Setting row: 13px label + optional 11px hint, trailing control,
 /// 11px vertical padding.
@@ -631,6 +574,7 @@ struct SettingRow<Control: View>: View {
     let label: String
     var hint: String?
     @ViewBuilder let control: Control
+    @Environment(\.settingHintColor) private var hintColor
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -641,7 +585,7 @@ struct SettingRow<Control: View>: View {
                 if let hint {
                     Text(hint)
                         .font(.system(size: 11))
-                        .foregroundStyle(AlexTheme.Colors.textFaint)
+                        .foregroundStyle(hintColor)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

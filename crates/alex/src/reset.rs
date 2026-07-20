@@ -144,7 +144,9 @@ pub(crate) async fn execute(
                 store.tombstone_known_account(&known, alex_auth::now_ms())?;
             }
         }
-        store.revoke_all_run_keys()?;
+        // Credential reset owns provider/run credentials. Harness connection
+        // credentials remain under the separate `harnesses` reset selection.
+        store.revoke_all_run_keys(false)?;
     }
     if selection.traces {
         store.clear_traces_and_bodies()?;

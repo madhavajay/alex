@@ -692,6 +692,17 @@ pub struct ResetCounts {
     pub dario_prompt_cache_bytes: u64,
 }
 
+/// Counts returned by a bulk run-key revocation. `revoked` is the total number
+/// changed in this operation; `harness_revoked` is the harness-key subset, and
+/// `harness_skipped` is the number of active harness keys deliberately left
+/// alone because harness revocation was not requested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunKeyRevocationCounts {
+    pub revoked: u64,
+    pub harness_revoked: u64,
+    pub harness_skipped: u64,
+}
+
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
@@ -795,10 +806,36 @@ impl Store {
         })
     }
 
-    /// Revokes every still-active key without deleting the audit rows.
-    pub fn revoke_all_run_keys(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("UPDATE run_keys SET revoked = 1 WHERE revoked = 0", [])? as u64)
+    /// Revokes active run and wrap keys without deleting their audit rows.
+    /// Harness keys are a separate, long-lived connection credential and are
+    /// included only when `include_harness` is explicit.
+    pub fn revoke_all_run_keys(&self, include_harness: bool) -> Result<RunKeyRevocationCounts> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let ordinary_revoked = tx.execute(
+            "UPDATE run_keys SET revoked = 1
+             WHERE revoked = 0 AND kind IN ('run', 'wrap')",
+            [],
+        )? as u64;
+        let active_harness: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_keys WHERE revoked = 0 AND kind = 'harness'",
+            [],
+            |row| row.get(0),
+        )?;
+        let harness_revoked = if include_harness {
+            tx.execute(
+                "UPDATE run_keys SET revoked = 1 WHERE revoked = 0 AND kind = 'harness'",
+                [],
+            )? as u64
+        } else {
+            0
+        };
+        tx.commit()?;
+        Ok(RunKeyRevocationCounts {
+            revoked: ordinary_revoked + harness_revoked,
+            harness_revoked,
+            harness_skipped: if include_harness { 0 } else { active_harness },
+        })
     }
 
     /// Permanently removes revoked run-key audit rows, leaving active keys intact.
@@ -3039,6 +3076,54 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0]["id"], "rk-active");
         assert_eq!(store.delete_revoked_run_keys().unwrap(), 0);
+    }
+
+    #[test]
+    fn bulk_revoke_skips_harness_keys_unless_explicitly_included() {
+        let store = Store::open(tmpdir("bulk-revoke-key-scope")).unwrap();
+        for (id, hash, kind) in [
+            ("rk-run", "run11111bbbb2222cccc", "run"),
+            ("rk-wrap", "wrap1111bbbb2222cccc", "wrap"),
+            ("rk-harness", "harness1bbbb2222cccc", "harness"),
+        ] {
+            store
+                .insert_run_key(id, hash, kind, None, None, None, 1_000, None)
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.revoke_all_run_keys(false).unwrap(),
+            RunKeyRevocationCounts {
+                revoked: 2,
+                harness_revoked: 0,
+                harness_skipped: 1,
+            }
+        );
+        assert!(store
+            .lookup_run_key("harness1bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .lookup_run_key("run11111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .lookup_run_key("wrap1111bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            store.revoke_all_run_keys(true).unwrap(),
+            RunKeyRevocationCounts {
+                revoked: 1,
+                harness_revoked: 1,
+                harness_skipped: 0,
+            }
+        );
+        assert!(store
+            .lookup_run_key("harness1bbbb2222cccc", i64::MAX)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
