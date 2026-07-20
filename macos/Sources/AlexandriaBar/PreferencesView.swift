@@ -15,6 +15,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
     case credentials = "Credentials"
     case dario = "Dario"
     case protection = "Failover"
+    case middleware = "Middleware"
     case notifications = "Notifications"
 
     var icon: String {
@@ -25,6 +26,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
         case .credentials: "key"
         case .dario: "server.rack"
         case .protection: "shield"
+        case .middleware: "arrow.triangle.branch"
         case .notifications: "paperplane"
         }
     }
@@ -69,7 +71,9 @@ struct PreferencesView: View {
                 .padding(.bottom, 12)
 
             VStack(spacing: 2) {
-                ForEach(PreferencesSection.allCases, id: \.self) { section in
+                // Failover is retained as a compatibility deep-link for one
+                // release. New navigation goes directly to Middleware.
+                ForEach(PreferencesSection.allCases.filter { $0 != .protection }, id: \.self) { section in
                     SettingsNavItem(
                         label: section.rawValue,
                         icon: section.icon,
@@ -126,7 +130,9 @@ struct PreferencesView: View {
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .protection:
-                    ProtectionPreferencesSection(store: store)
+                    MiddlewarePreferencesSection(store: store, migratedFromFailover: true)
+                case .middleware:
+                    MiddlewarePreferencesSection(store: store)
                 case .notifications:
                     NotificationsPreferencesSection(store: store)
                 }

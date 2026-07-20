@@ -702,6 +702,61 @@ import Testing
         _ = try await client.searchTraces(
             text: "", filters: OmniQuery.parse("key:5effb978eb304b0b"))
     }
+
+    @Test func middlewareValidationWrapsCanonicalRule() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/middleware/validate")
+            #expect(request.httpMethod == "POST")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            let rule = try #require(json["rule"] as? [String: Any])
+            #expect(rule["id"] as? String == "fable-overload-to-sol")
+            let match = try #require(rule["when"] as? [String: Any])
+            #expect(match["harness_names"] as? [String] == ["claude", "codex", "pi"])
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"valid":true,"errors":[],"warnings":[]}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
+            id: "fable-overload-to-sol")
+
+        let result = try await client.validateMiddlewareRule(rule)
+        #expect(result.valid)
+    }
+
+    @Test func middlewareDryRunUsesCanonicalIdentifierFields() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/middleware/test")
+            #expect(request.httpMethod == "POST")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["middleware_id"] as? String == "fable-overload-to-sol")
+            #expect(json["fixture_name"] as? String == "fable-real-error")
+            #expect(json["trace_id"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"matched":true,"proposed_action":"reroute"}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let result = try await client.testMiddleware(.init(
+            middlewareId: "fable-overload-to-sol", fixtureName: "fable-real-error"))
+        #expect(result.matched)
+        #expect(result.proposedAction == "reroute")
+    }
 }
 
 private func requestBody(_ request: URLRequest) throws -> Data {

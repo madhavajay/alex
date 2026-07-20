@@ -614,6 +614,87 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/protection", method: "PUT", body: body(policy))
     }
 
+    // MARK: Middleware
+
+    /// Returns the active middleware generation and its rules. The response
+    /// models use defensive defaults so an app can remain usable while a beta
+    /// daemon adds new status fields.
+    public func middlewareStatus() async throws -> MiddlewareRuntimeStatus {
+        try await get("admin/middleware", as: MiddlewareRuntimeStatus.self)
+    }
+
+    @discardableResult
+    public func updateMiddlewareSettings(
+        _ settings: MiddlewareSettings
+    ) async throws -> MiddlewareRuntimeStatus {
+        let data = try await request(
+            "admin/middleware/settings", method: "PUT", body: body(settings))
+        return try JSONDecoder().decode(MiddlewareRuntimeStatus.self, from: data)
+    }
+
+    public func validateMiddlewareRule(
+        _ rule: MiddlewareRuleSpecV1
+    ) async throws -> MiddlewareValidationResponse {
+        let data = try await request(
+            "admin/middleware/validate", method: "POST",
+            body: body(MiddlewareValidationRequest(rule: rule)))
+        return try JSONDecoder().decode(MiddlewareValidationResponse.self, from: data)
+    }
+
+    @discardableResult
+    public func reloadMiddleware() async throws -> MiddlewareRuntimeStatus {
+        let data = try await request(
+            "admin/middleware/reload", method: "POST", body: body([String: String]()))
+        return try JSONDecoder().decode(MiddlewareRuntimeStatus.self, from: data)
+    }
+
+    @discardableResult
+    public func createMiddlewareRule(
+        _ rule: MiddlewareRuleSpecV1
+    ) async throws -> MiddlewareMutationResponse {
+        let data = try await request(
+            "admin/middleware/rules", method: "POST", body: body(rule))
+        return try JSONDecoder().decode(MiddlewareMutationResponse.self, from: data)
+    }
+
+    @discardableResult
+    public func updateMiddlewareRule(
+        _ rule: MiddlewareRuleSpecV1
+    ) async throws -> MiddlewareMutationResponse {
+        let data = try await request(
+            "admin/middleware/rules/\(encodedPathComponent(rule.id))",
+            method: "PUT", body: body(rule))
+        return try JSONDecoder().decode(MiddlewareMutationResponse.self, from: data)
+    }
+
+    public func deleteMiddlewareRule(id: String) async throws {
+        _ = try await request(
+            "admin/middleware/rules/\(encodedPathComponent(id))", method: "DELETE")
+    }
+
+    public func testMiddleware(
+        _ test: MiddlewareTestRequest
+    ) async throws -> MiddlewareTestResponse {
+        let data = try await request(
+            "admin/middleware/test", method: "POST", body: body(test))
+        return try JSONDecoder().decode(MiddlewareTestResponse.self, from: data)
+    }
+
+    public func middlewareLeases() async throws -> [MiddlewareRouteLease] {
+        // During beta the status response carries leases as well. Keeping the
+        // dedicated endpoint makes refresh/clear operations cheap later.
+        let data = try await request("admin/middleware/leases")
+        if let direct = try? JSONDecoder().decode([MiddlewareRouteLease].self, from: data) {
+            return direct
+        }
+        return try JSONDecoder().decode(MiddlewareLeasesResponse.self, from: data).leases
+    }
+
+    public func clearMiddlewareLease(id: String) async throws {
+        _ = try await request(
+            "admin/middleware/leases/\(encodedPathComponent(id))", method: "DELETE")
+    }
+
     public func notificationSettings() async throws -> NotificationSettingsResponse {
         try await get("admin/notifications", as: NotificationSettingsResponse.self)
     }
