@@ -1444,24 +1444,22 @@ impl Config {
         }
     }
 
-    fn dario_route_should_enable(&self, has_active_anthropic_oauth: bool) -> bool {
-        match self.anthropic_upstream.as_str() {
-            "dario" => true,
-            "direct" => false,
-            "auto" => has_active_anthropic_oauth,
-            _ => false,
-        }
+    fn dario_route_should_enable(&self, _has_active_anthropic_oauth: bool) -> bool {
+        // Non-Claude-Code Anthropic traffic must never leak onto the direct
+        // third-party-app billing path. Genuine Claude Code is identified per
+        // request in the proxy and remains the sole direct Anthropic path.
+        true
     }
 
     fn dario_routing_reason(&self, has_active_anthropic_oauth: bool) -> String {
         match self.anthropic_upstream.as_str() {
-            "dario" => "forced on".into(),
-            "direct" => "forced off".into(),
+            "dario" => "eligible Anthropic traffic always uses Dario".into(),
+            "direct" => "direct is reserved for genuine Claude Code".into(),
             "auto" if has_active_anthropic_oauth => {
-                "auto: active Claude subscription detected".into()
+                "eligible Anthropic traffic uses Dario; Claude subscription detected".into()
             }
-            "auto" => "auto: no Claude subscription".into(),
-            other => format!("unrecognized mode {other:?}; routing direct"),
+            "auto" => "eligible Anthropic traffic uses Dario".into(),
+            other => format!("unrecognized mode {other:?}; enforcing Dario routing"),
         }
     }
 
@@ -4718,7 +4716,10 @@ async fn main() -> Result<()> {
                     let mut config = config;
                     let (mode, message) = match command {
                         DarioCommand::Enable => ("dario", "forced on"),
-                        DarioCommand::Disable => ("direct", "forced off"),
+                        DarioCommand::Disable => (
+                            "direct",
+                            "direct only for genuine Claude Code; other Anthropic traffic remains on Dario",
+                        ),
                         DarioCommand::Auto => ("auto", "automatic"),
                         _ => unreachable!(),
                     };
@@ -11761,18 +11762,15 @@ mod tests {
 
         config.anthropic_upstream = "auto".into();
         assert!(config.dario_route_should_enable(true));
-        assert!(
-            !config.dario_route_should_enable(false),
-            "no OAuth subscription (including API-key-only) must stay direct"
-        );
+        assert!(config.dario_route_should_enable(false));
 
         config.anthropic_upstream = "dario".into();
         assert!(config.dario_route_should_enable(true));
         assert!(config.dario_route_should_enable(false));
 
         config.anthropic_upstream = "direct".into();
-        assert!(!config.dario_route_should_enable(true));
-        assert!(!config.dario_route_should_enable(false));
+        assert!(config.dario_route_should_enable(true));
+        assert!(config.dario_route_should_enable(false));
     }
 
     #[test]
@@ -11835,31 +11833,31 @@ mod tests {
         let auto_with_subscription = serde_json::json!({
             "routing_mode": "auto",
             "route_enabled": true,
-            "routing_reason": "auto: active Claude subscription detected",
+            "routing_reason": "eligible Anthropic traffic uses Dario; Claude subscription detected",
         });
         assert_eq!(
             dario_status_routing_text(&auto_with_subscription),
-            "mode: auto\nrouting: dario (auto: active Claude subscription detected)"
+            "mode: auto\nrouting: dario (eligible Anthropic traffic uses Dario; Claude subscription detected)"
         );
 
         let auto_without_subscription = serde_json::json!({
             "routing_mode": "auto",
-            "route_enabled": false,
-            "routing_reason": "auto: no Claude subscription",
+            "route_enabled": true,
+            "routing_reason": "eligible Anthropic traffic uses Dario",
         });
         assert_eq!(
             dario_status_routing_text(&auto_without_subscription),
-            "mode: auto\nrouting: direct (auto: no Claude subscription)"
+            "mode: auto\nrouting: dario (eligible Anthropic traffic uses Dario)"
         );
 
         let forced_disabled = serde_json::json!({
             "routing_mode": "direct",
-            "route_enabled": false,
-            "routing_reason": "forced off",
+            "route_enabled": true,
+            "routing_reason": "direct is reserved for genuine Claude Code",
         });
         assert_eq!(
             dario_status_routing_text(&forced_disabled),
-            "mode: direct\nrouting: direct (forced off)"
+            "mode: direct\nrouting: dario (direct is reserved for genuine Claude Code)"
         );
     }
 

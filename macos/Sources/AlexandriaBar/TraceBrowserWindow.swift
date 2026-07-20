@@ -478,7 +478,10 @@ final class TraceBrowserModel {
             if let parent = row.parentSessionId, keptIds.contains(parent) {
                 kept.append(row)
                 keptIds.insert(row.id)
-            } else if pill.matches(SessionDisplayStatus.status(for: row, now: now)) {
+            } else if pill == .alexError
+                ? row.isAlexError
+                : pill.matches(SessionDisplayStatus.status(for: row, now: now))
+            {
                 kept.append(row)
                 keptIds.insert(row.id)
             }
@@ -1127,6 +1130,30 @@ final class TraceBrowserModel {
         }
     }
 
+    func approveRejectedClient(_ session: TraceSession) {
+        guard let fingerprint = session.approvableCredentialFingerprint else {
+            showSimulationNotice("This rejected credential cannot be safely approved")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let client = self.client() else {
+                self.showSimulationNotice("Approval failed: daemon unavailable")
+                return
+            }
+            do {
+                try await client.approveAlexErrorCredential(fingerprint: fingerprint)
+                self.sessionsFingerprint = ""
+                await self.pollSessions()
+                self.showSimulationNotice("Client approved — retry its request")
+            } catch is CancellationError {
+                return
+            } catch {
+                self.showSimulationNotice("Approval failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func copyLastReply(_ session: TraceSession) {
         Task {
             guard let client = client() else { return }
@@ -1361,6 +1388,7 @@ private struct BuiltDocument: @unchecked Sendable {
 /// Quick session status filter (mock TB App.tsx:259-260).
 enum SessionStatusPill: Int, CaseIterable {
     case all
+    case alexError
     case running
     case error
     case done
@@ -1368,6 +1396,7 @@ enum SessionStatusPill: Int, CaseIterable {
     var title: String {
         switch self {
         case .all: "All"
+        case .alexError: "Alex Error"
         case .running: "Running"
         case .error: "Error"
         case .done: "Done"
@@ -1377,6 +1406,7 @@ enum SessionStatusPill: Int, CaseIterable {
     func matches(_ status: DisplayStatus) -> Bool {
         switch self {
         case .all: true
+        case .alexError: false
         case .running: status == .running
         case .error: status == .error
         case .done: status == .success
@@ -1983,6 +2013,15 @@ private struct SessionListView: View {
     @ViewBuilder
     private func contextMenu(_ session: TraceSession) -> some View {
         let hasSessionId = !session.sessionId.isEmpty
+        if session.isAlexError {
+            if session.approvableCredentialFingerprint != nil {
+                Button("Approve") { model.approveRejectedClient(session) }
+                    .help("Re-enable this exact previously known client credential")
+            } else {
+                Text("Approval unavailable for unknown credentials")
+            }
+            Divider()
+        }
         Menu("Simulate") {
             if model.fixturesLoading {
                 Text("Loading fixtures…")

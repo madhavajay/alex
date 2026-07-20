@@ -63,7 +63,7 @@ for a stable build.
 | `exo_enabled_models` | string array | `[]` | Models exposed/routed through Exo. |
 | `openrouter_exposed_models` | string array | seven-model starter list below | Bare OpenRouter IDs advertised to `/v1/models` and harnesses. Explicit `[]` exposes none. |
 | `gemini_project` | string | `""` | Optional Code Assist project override/cache. `GOOGLE_CLOUD_PROJECT` takes precedence when set. |
-| `anthropic_upstream` | string | `auto` | `auto`, `dario`, or `direct`; set through `alex dario auto|enable|disable`. |
+| `anthropic_upstream` | string | `auto` | Compatibility value set through `alex dario auto|enable|disable`; non-Claude-Code Anthropic requests always use Dario. |
 | `dario_mode_migrated` | boolean | `true` | Internal one-time legacy `direct` to `auto` migration marker. Do not use as a routing control. |
 | `dario_api_key` | string | empty, generated/saved at daemon start | Credential used only between Alex and its local Dario child. |
 | `dario_claude_bin` | path or absent | absent | Explicit real Claude Code binary for model prompt capture. An invalid explicit path does not fall through. |

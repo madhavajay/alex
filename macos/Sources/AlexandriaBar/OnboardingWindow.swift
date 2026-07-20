@@ -54,6 +54,7 @@ final class OnboardingModel {
     var troubleshootExpanded = false
     var checks: [Check] = []
     var checksRunning = false
+    var traceCheckRunning = false
     private var traceEnteredMs: Int64?
     private var pollTask: Task<Void, Never>?
     private var lastRejectedSessionId: String?
@@ -93,8 +94,16 @@ final class OnboardingModel {
 
     func chooseProvider(_ provider: String) {
         authModel?.cancel()
+        resetProviderDependentState()
         selectedProvider = provider
         exampleModel = OnboardingSupport.exampleModel(for: provider)
+        if let account = store.accounts.last(where: { $0.provider == provider }) {
+            authModel = nil
+            providerState = .working(
+                provider == "anthropic" ? "Preparing Claude routing…" : "Using connected account…")
+            Task { await completeProviderSelection(provider, account: account) }
+            return
+        }
         if provider == "openrouter" || provider == "exo" {
             authModel = nil
             let name = ProviderInfo.displayName(provider)
@@ -109,16 +118,66 @@ final class OnboardingModel {
         auth.onAuthenticated = { [weak self] authenticatedProvider in
             guard let self, self.selectedProvider == authenticatedProvider else { return }
             Task {
-                await self.store.refresh()
+                await self.refreshStore()
                 let account = self.store.accounts.last { $0.provider == authenticatedProvider }
-                let identity = account?.email ?? account?.label ?? account?.name
-                    ?? ProviderInfo.displayName(authenticatedProvider)
-                self.providerState = .success(identity)
+                await self.completeProviderSelection(authenticatedProvider, account: account)
             }
         }
         auth.onFailed = { [weak self] message in self?.providerState = .failure(message) }
         authModel = auth
         auth.begin()
+    }
+
+    private func resetProviderDependentState() {
+        pollTask?.cancel()
+        traceState = .idle
+        traceCheckRunning = false
+        discoveredTrace = nil
+        traceEnteredMs = nil
+        lastRejectedSessionId = nil
+        troubleshootExpanded = false
+        checks = []
+        mintedOnboardingKey = nil
+        onboardingKeyFingerprint = nil
+        credentialMintState = .idle
+        credentialRunState = .idle
+        credentialResponseText = nil
+    }
+
+    private func accountIdentity(_ account: Account?, provider: String) -> String {
+        account?.email ?? account?.label ?? account?.name
+            ?? ProviderInfo.displayName(provider)
+    }
+
+    private func refreshStore() async {
+        await store.refresh()
+        while store.refreshing {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// Auto-Dario routing is chosen when the daemon starts. If Claude was the
+    /// first account added after a fresh/reset launch, restart once so the
+    /// daemon sees that subscription before onboarding asks Pi to test it.
+    private func completeProviderSelection(_ provider: String, account: Account?) async {
+        guard selectedProvider == provider else { return }
+        if provider == "anthropic", store.dario?.routeEnabled != true {
+            providerState = .working("Starting Claude subscription routing through Dario…")
+            let result = await DaemonController.restartDaemon()
+            DaemonDiscovery.invalidateCache()
+            await refreshStore()
+            guard selectedProvider == provider else { return }
+            guard result.ok, store.dario?.routeEnabled == true else {
+                let detail = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                providerState = .failure(
+                    detail.isEmpty
+                        ? "Claude connected, but Dario routing did not start."
+                        : "Claude connected, but Dario routing did not start: \(detail)")
+                return
+            }
+        }
+        let refreshedAccount = store.accounts.last { $0.provider == provider } ?? account
+        providerState = .success(accountIdentity(refreshedAccount, provider: provider))
     }
 
     func selectHarness(_ harness: Harness) {
@@ -210,6 +269,9 @@ final class OnboardingModel {
     func go(to next: Int) {
         pollTask?.cancel()
         step = min(max(next, 0), Self.stepTitles.count - 1)
+        if step == 2, harnessState.isSuccess, !traceState.isSuccess {
+            beginTracePolling()
+        }
     }
 
     private func loadExampleModel(using client: AlexandriaClient) async {
@@ -304,17 +366,34 @@ final class OnboardingModel {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.pollForTrace()
-                if case .success = self?.traceState { return }
+                let found = await self?.pollForTrace() ?? false
+                if found, self?.traceState.isTerminal == true { return }
                 try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
-    private func pollForTrace() async {
-        guard let config = store.config, let since = traceEnteredMs else { return }
+    func checkForTrace() {
+        guard harnessState.isSuccess, !traceCheckRunning else { return }
+        if traceEnteredMs == nil {
+            traceEnteredMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        }
+        traceCheckRunning = true
+        Task {
+            let found = await pollForTrace()
+            if !found, !traceState.isTerminal {
+                traceState = .working(
+                    "No new matching request yet — run the command, then check again.")
+            }
+            traceCheckRunning = false
+        }
+    }
+
+    @discardableResult
+    private func pollForTrace() async -> Bool {
+        guard let config = store.config, let since = traceEnteredMs else { return false }
         guard let sessions = try? await AlexandriaClient(config: config)
-            .traceSessions(since: "1h", limit: 100) else { return }
+            .traceSessions(since: "1h", limit: 100) else { return false }
         let harness = selectedHarness?.lowercased()
         if let match = sessions
             .filter({ $0.lastTsMs >= since })
@@ -329,8 +408,9 @@ final class OnboardingModel {
                 let model = match.models?.first ?? "alex model"
                 let tokens = (match.totalInputTokens ?? 0) + (match.totalOutputTokens ?? 0)
                 traceState = .success("\(model) · \(tokens) tokens")
+                return true
             case .rejected:
-                guard lastRejectedSessionId != match.sessionId else { return }
+                guard lastRejectedSessionId != match.sessionId else { return true }
                 lastRejectedSessionId = match.sessionId
                 let transcript = try? await AlexandriaClient(config: config)
                     .traceTranscript(sessionId: match.sessionId)
@@ -346,8 +426,10 @@ final class OnboardingModel {
                     traceState = .failure(
                         "Your request reached Alex but the provider rejected it: \(message)")
                 }
+                return true
             }
         }
+        return false
     }
 
     func runTroubleshooting() {
@@ -586,6 +668,15 @@ struct OnboardingView: View {
                 operationText(model.traceState)
             }
             .padding(12).cardStyle()
+            PillButton(
+                title: "Check for Request",
+                variant: .bordered,
+                systemImage: "arrow.clockwise",
+                isEnabled: !model.traceState.isSuccess,
+                isBusy: model.traceCheckRunning
+            ) {
+                model.checkForTrace()
+            }
             if model.traceState.isFailure {
                 PillButton(title: "Troubleshoot", variant: .bordered,
                            systemImage: "wrench.and.screwdriver", isBusy: model.checksRunning) {

@@ -9,6 +9,7 @@ import AlexandriaBarCore
 struct GeneralPreferencesPane: View {
     let store: SnapshotStore
     let onRunOnboarding: () -> Void
+    let onResetCompleted: () -> Void
     @AppStorage("refreshSeconds") private var refreshSeconds: Double = 60
     @AppStorage("limitWarnPct") private var limitWarnPct: Double = 90
     @AppStorage("notifyEnabled") private var notifyEnabled = true
@@ -52,7 +53,7 @@ struct GeneralPreferencesPane: View {
             }
         }
         .sheet(isPresented: $showingResetSheet) {
-            ResetSettingsSheet(store: store)
+            ResetSettingsSheet(store: store, onResetCompleted: onResetCompleted)
         }
         .onAppear {
             launchAtLogin = LaunchAtLogin.isEnabled
@@ -661,6 +662,7 @@ extension View {
 
 private struct ResetSettingsSheet: View {
     let store: SnapshotStore
+    let onResetCompleted: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var selection = ResetSelection()
     @State private var plan: ResetResponse?
@@ -923,6 +925,12 @@ private struct ResetSettingsSheet: View {
                 }
                 applied = true
                 await store.refresh()
+                // Any deliberate reset returns the app to the guided setup.
+                // Clear completion as well as opening it now, so closing the
+                // window cannot suppress onboarding on the next launch.
+                UserDefaults.standard.removeObject(
+                    forKey: OnboardingModel.completedDefaultsKey)
+                onResetCompleted()
             } catch {
                 guard operationID == id else { return }
                 self.error = "Could not apply reset: \(error.localizedDescription)"

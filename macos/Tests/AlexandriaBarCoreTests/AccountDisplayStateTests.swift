@@ -40,6 +40,17 @@ import Testing
         #expect(state == .active)
     }
 
+    @Test func newlyAuthenticatedAccountIsActiveBeforeFirstProbe() {
+        let state = AccountDisplayState.derive(
+            status: "active",
+            kind: "oauth",
+            needsReauth: false,
+            expiresInS: 3_600,
+            health: .unknown)
+
+        #expect(state == .active)
+    }
+
     @Test func non2xxLastPingNeedsReauth() {
         let state = AccountDisplayState.derive(
             status: "active",

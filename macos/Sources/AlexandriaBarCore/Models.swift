@@ -341,8 +341,10 @@ public enum AccountDisplayState: String, Sendable, Equatable {
         switch health {
         case .degraded: return .degraded
         case .unreachable: return .unreachable
-        case .unknown: return .unknown
-        case .healthy, .none: return .active
+        // A newly-added credential has no probe evidence yet. Authentication
+        // succeeded and no failure signal exists, so label the account Active
+        // instead of presenting the probe's initial `unknown` as an auth state.
+        case .unknown, .healthy, .none: return .active
         case .authFailed, .unknownAfterError: return .needsReauth
         }
     }

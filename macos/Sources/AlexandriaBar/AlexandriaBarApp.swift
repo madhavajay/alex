@@ -37,6 +37,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.startPolling()
         statusController.showOnboardingIfNeeded()
+        // Accounts aren't loaded at launch, so the zero-accounts (fresh/reset)
+        // case can only be judged after the first refresh completes.
+        Task { [weak statusController] in
+            await store.refresh()
+            // startPolling() may already own the coalesced refresh, in which
+            // case refresh() above returns immediately. Wait for that work so
+            // daemonUp/accounts reflect the first real snapshot before gating
+            // onboarding.
+            while store.refreshing {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if store.config == nil, DaemonController.findBinary() != nil {
+                _ = await DaemonController.bootstrapDaemon()
+                DaemonDiscovery.invalidateCache()
+                await store.refresh()
+                while store.refreshing {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+            }
+            statusController?.showOnboardingIfNeeded()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

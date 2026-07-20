@@ -11,6 +11,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var traceBrowser: TraceBrowserWindowController?
     private var darioWindow: DarioWindowController?
     private var onboardingWindow: OnboardingWindowController?
+    private var onboardingShownThisLaunch = false
     private let reauthWizard: ReauthWizardWindowController
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
@@ -57,8 +58,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     func showOnboardingIfNeeded() {
-        guard UserDefaults.standard.object(
-            forKey: OnboardingModel.completedDefaultsKey) == nil else { return }
+        // Never onboarded on this Mac → show it.
+        if UserDefaults.standard.object(
+            forKey: OnboardingModel.completedDefaultsKey) == nil {
+            showOnboarding()
+            return
+        }
+        // Otherwise, a live daemon with zero provider accounts means a fresh or
+        // just-reset install (the completed flag lives in macOS UserDefaults,
+        // not in ~/.alexandria, so it survives a data-dir wipe). Re-onboard —
+        // but only once per launch, so closing the wizard doesn't re-pop it.
+        guard !onboardingShownThisLaunch,
+            store.daemonUp,
+            ProviderPresentation.hasNoAccounts(store.accounts)
+        else { return }
         showOnboarding()
     }
 
@@ -101,6 +114,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
         buildHeader()
+        buildStartOnboarding()
         buildIssues()
         buildReauthentication()
         // The app (Sparkle) update is independent of daemon health, so this
@@ -120,6 +134,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         buildTraces()
         buildActions()
+    }
+
+    /// Keep recovery discoverable even when the user dismissed the automatic
+    /// wizard. This sits immediately under the header on a zero-account daemon.
+    private func buildStartOnboarding() {
+        guard store.daemonUp,
+            ProviderPresentation.hasNoAccounts(store.accounts)
+        else { return }
+        addAction("Start Onboarding", symbol: "sparkles") { [weak self] in
+            self?.showOnboarding()
+        }
+        menu.addItem(.separator())
     }
 
     /// Adds a hosted SwiftUI view as a (non-highlighting) menu item.
@@ -962,7 +988,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 onOpenTraceBrowser: { [weak self] query in
                     self?.openTraceBrowser(query: query)
                 },
-                onRunOnboarding: { [weak self] in self?.showOnboarding() })
+                onRunOnboarding: { [weak self] in self?.showOnboarding() },
+                // The reset sheet only invokes this after provider credentials
+                // were removed, so reopen even if onboarding already appeared
+                // earlier in this app launch.
+                onResetCompleted: { [weak self] in self?.showOnboarding() })
         }
         prefsController?.show(section: section)
     }
@@ -978,6 +1008,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     self?.openTraceBrowser(query: query)
                 })
         }
+        onboardingShownThisLaunch = true
         onboardingWindow?.show()
     }
 }

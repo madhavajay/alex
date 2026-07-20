@@ -300,6 +300,14 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(RunKeysRemovedResponse.self, from: data).removed
     }
 
+    /// Re-authorizes an exact, previously known client credential represented
+    /// by the redacted fingerprint on an Alex Error trace.
+    public func approveAlexErrorCredential(fingerprint: String) async throws {
+        _ = try await request(
+            "admin/alex-errors/\(encodedPathComponent(fingerprint))/approve",
+            method: "POST")
+    }
+
     public func accounts() async throws -> [Account] {
         try await get("admin/accounts", as: AccountsResponse.self).accounts
     }

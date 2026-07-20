@@ -2210,6 +2210,98 @@ impl Store {
         Ok(row)
     }
 
+    /// Returns a run-key catalogue row even when it is revoked or expired.
+    ///
+    /// The proxy uses this only to decide whether an authentication rejection
+    /// can safely offer a local recovery action. The raw key and its complete
+    /// hash never leave the store.
+    pub fn lookup_known_run_key(&self, key_hash: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                &format!("SELECT {RUN_KEY_COLS} FROM run_keys WHERE key_hash = ?1"),
+                params![key_hash],
+                run_key_row_json,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Reactivates one previously known key selected by its redacted
+    /// fingerprint and marks its recorded Alex Error sessions as approved.
+    /// The fingerprint must resolve unambiguously and wrap/ingest keys are not
+    /// eligible for model-proxy access.
+    pub fn approve_run_key_fingerprint(&self, fingerprint: &str) -> Result<Option<Value>> {
+        if fingerprint.len() != 16 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid key fingerprint");
+        }
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {RUN_KEY_COLS} FROM run_keys WHERE lower(substr(key_hash, 1, 16)) = ?1"
+            ))?;
+            let collected = stmt
+                .query_map(params![fingerprint], run_key_row_json)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            collected
+        };
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        if rows.len() != 1 {
+            anyhow::bail!("ambiguous key fingerprint");
+        }
+        let mut row = rows.into_iter().next().unwrap_or_else(|| json!({}));
+        if row["kind"] == "wrap" {
+            anyhow::bail!("wrap keys cannot be approved for model requests");
+        }
+        let id = row["id"].as_str().unwrap_or_default().to_string();
+        tx.execute(
+            "UPDATE run_keys SET revoked = 0, expires_ms = NULL WHERE id = ?1",
+            params![id],
+        )?;
+
+        let trace_tags = {
+            let mut stmt = tx.prepare(
+                "SELECT id, tags_json FROM traces
+                 WHERE key_fingerprint = ?1 AND tags_json IS NOT NULL",
+            )?;
+            let collected = stmt
+                .query_map(params![fingerprint], |result| {
+                    Ok((
+                        result.get::<_, String>(0)?,
+                        result.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            collected
+        };
+        let mut traces_updated = 0_u64;
+        for (trace_id, raw_tags) in trace_tags {
+            let Some(mut tags) = serde_json::from_str::<Value>(&raw_tags)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+            else {
+                continue;
+            };
+            if tags.get("alex_error").and_then(Value::as_str) != Some("true") {
+                continue;
+            }
+            tags.insert("approval_state".into(), json!("approved"));
+            traces_updated += tx.execute(
+                "UPDATE traces SET tags_json = ?2 WHERE id = ?1",
+                params![trace_id, Value::Object(tags).to_string()],
+            )? as u64;
+        }
+        tx.commit()?;
+        row["revoked"] = json!(false);
+        row["expires_ms"] = Value::Null;
+        row["traces_updated"] = json!(traces_updated);
+        Ok(Some(row))
+    }
+
     pub fn touch_run_key(&self, key_hash: &str, now_ms: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -3446,6 +3538,58 @@ mod tests {
                 None
             )
             .is_err());
+    }
+
+    #[test]
+    fn revoked_run_key_can_be_safely_approved_by_fingerprint() {
+        let store = Store::open(tmpdir("approve-run-key")).unwrap();
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        store
+            .insert_run_key(
+                "rk-old-codex",
+                hash,
+                "harness",
+                None,
+                Some(r#"{"harness":"codex"}"#),
+                Some("codex"),
+                1_000,
+                None,
+            )
+            .unwrap();
+        assert!(store.revoke_run_key("rk-old-codex").unwrap());
+        assert!(store.lookup_run_key(hash, 2_000).unwrap().is_none());
+        assert_eq!(
+            store.lookup_known_run_key(hash).unwrap().unwrap()["revoked"],
+            true
+        );
+
+        let mut rejected = trace("alex-error-auth-0123456789abcdef", 2_000, None);
+        rejected.id = "alex-error-trace".into();
+        rejected.session_id = Some("alex-error-auth-0123456789abcdef".into());
+        rejected.key_fingerprint = Some("0123456789abcdef".into());
+        rejected.tags = Some(
+            r#"{"alex_error":"true","alex_error_kind":"auth","approval_state":"pending"}"#
+                .into(),
+        );
+        store.insert_trace(&rejected).unwrap();
+
+        let approved = store
+            .approve_run_key_fingerprint("0123456789ABCDEF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved["id"], "rk-old-codex");
+        assert_eq!(approved["revoked"], false);
+        assert_eq!(approved["expires_ms"], Value::Null);
+        assert_eq!(approved["traces_updated"], 1);
+        assert!(store.lookup_run_key(hash, i64::MAX).unwrap().is_some());
+        let session = store.sessions(None, 10).unwrap().remove(0);
+        assert_eq!(session["tags"]["approval_state"], "approved");
+
+        assert!(store
+            .approve_run_key_fingerprint("ffffffffffffffff")
+            .unwrap()
+            .is_none());
+        assert!(store.approve_run_key_fingerprint("not-a-fingerprint").is_err());
     }
 
     #[test]

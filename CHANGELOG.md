@@ -7,6 +7,29 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29-beta.6] - 2026-07-20
+
+### Fixed
+- **Anthropic requests no longer escape Dario after a reset.** Every eligible
+  non-Claude-Code Anthropic request is routed through Dario and fails closed if
+  its generation or prompt cache is unavailable; genuine Claude Code remains
+  the only direct Anthropic path.
+- **Fresh and reset installs reliably enter onboarding.** A missing daemon
+  config is bootstrapped automatically, resetting Alex reopens onboarding, and
+  a zero-provider menu now exposes **Start Onboarding** at the top.
+- **Onboarding is resumable and testable.** Connected provider accounts can be
+  selected without repeating OAuth, changing provider clears stale test state,
+  and **Check for Request** manually checks for the copied harness command.
+- **Fresh provider state is no longer misleading.** Newly authenticated
+  accounts show Active before their first health probe, while Dario/Claude stay
+  hidden until an Anthropic account exists.
+- **Old clients can be recovered without accepting unknown secrets.** Requests
+  rejected by Alex now appear in an **Alex Error** Trace Browser section. A
+  known revoked or expired client can be right-clicked and **Approve**d; unknown
+  credentials remain visible but cannot be authorized.
+- **OpenAI-compatible model discovery uses the public namespace.** `/v1/models`
+  now advertises proxy aliases as `alex/*`, not the legacy `alexandria/*` form.
+
 ## [0.1.28] - 2026-07-19
 
 First stable release of the 0.1.28 line — everything from the 0.1.28 betas plus

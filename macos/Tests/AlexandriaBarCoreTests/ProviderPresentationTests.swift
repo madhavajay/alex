@@ -35,12 +35,21 @@ import Testing
         #expect(ProviderPresentation.paneState(for: "anthropic", accounts: []) == .connectAccount)
     }
 
-    @Test func enabledDownDarioKeepsAnthropicProviderVisibleWithoutAccounts() {
+    @Test func darioStaysHiddenUntilAnthropicAccountExists() throws {
         #expect(DarioHealth.evaluate(nil as DarioStatus?).tint == .red)
+        #expect(!ProviderPresentation.shouldPresentDario(for: []))
         #expect(ProviderPresentation.menuProviders(
-            limits: [], accounts: [], includeAnthropicDario: true) == ["anthropic"])
-        #expect(ProviderPresentation.shouldShowLimitsCard(
+            limits: [], accounts: [], includeAnthropicDario: true).isEmpty)
+        #expect(!ProviderPresentation.shouldShowLimitsCard(
             limits: [], accounts: [], includeAnthropicDario: true))
+
+        let claudeAccount = try account(provider: "anthropic")
+        #expect(ProviderPresentation.shouldPresentDario(for: [claudeAccount]))
+        #expect(ProviderPresentation.menuProviders(
+            limits: [], accounts: [claudeAccount],
+            includeAnthropicDario: true) == ["anthropic"])
+        #expect(ProviderPresentation.shouldShowLimitsCard(
+            limits: [], accounts: [claudeAccount], includeAnthropicDario: true))
     }
 
     @Test func providerWithoutConnectedAccountShowsOnlyConnectState() throws {

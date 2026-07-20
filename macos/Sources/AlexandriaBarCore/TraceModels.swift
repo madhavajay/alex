@@ -58,6 +58,17 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         SessionKind.isPingOrTest(sessionId: sessionId, harness: harness, tags: tags)
     }
 
+    /// Requests rejected by Alex itself before an upstream accepted them.
+    public var isAlexError: Bool { tags?["alex_error"] == "true" }
+
+    /// Only a fingerprint Alex linked to an existing revoked/expired key can
+    /// be approved. Unknown credentials remain visible but never actionable.
+    public var approvableCredentialFingerprint: String? {
+        guard isAlexError, tags?["approval_state"] == "pending" else { return nil }
+        return tags?["credential_fingerprint"]?.isEmpty == false
+            ? tags?["credential_fingerprint"] : nil
+    }
+
     enum CodingKeys: String, CodingKey {
         case models, providers, harness, errors, tags, efforts
         case sessionId = "session_id"
@@ -1218,6 +1229,7 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public var childCount: Int
 
     public var isPingOrTest: Bool { kindBadge != nil }
+    public var isAlexError: Bool { tags?["alex_error"] == "true" }
 
     public init(session: TraceSession) {
         id = session.sessionId

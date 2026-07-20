@@ -47,38 +47,61 @@ final class AuthFlowModel {
 
     var authorizeUrl: String? { session?.authorizeUrl }
 
+    private var currentConfig: DaemonConfig? {
+        store.config ?? DaemonDiscovery.load()
+    }
+
     func begin(force: Bool = false) {
         stage = .starting
         session = nil
         pasteInput = ""
         pollTask?.cancel()
-        guard let config = store.config else {
-            let message = "Daemon config not found — is Alex installed?"
-            stage = .failed(message)
-            onFailed?(message)
-            return
-        }
-        let client = AlexandriaClient(config: config)
         Task { [weak self] in
+            guard let self, let config = await self.configStartingDaemonIfNeeded() else { return }
+            let client = AlexandriaClient(config: config)
             do {
                 let session = try await client.authLoginStart(
-                    provider: ProviderInfo.loginArg(self?.provider ?? ""),
-                    name: self?.accountName,
-                    autoIdentity: self?.autoIdentity ?? false,
+                    provider: ProviderInfo.loginArg(self.provider),
+                    name: self.accountName,
+                    autoIdentity: self.autoIdentity,
                     force: force)
-                self?.sessionUpdated(session)
+                self.sessionUpdated(session)
             } catch {
                 let message = error.localizedDescription
                 if message.localizedCaseInsensitiveContains("session")
                     && message.localizedCaseInsensitiveContains("pending")
                 {
-                    self?.stage = .pendingConflict
+                    self.stage = .pendingConflict
                 } else {
-                    self?.stage = .failed(message)
-                    self?.onFailed?(message)
+                    self.fail(message)
                 }
             }
         }
+    }
+
+    /// The app can be launched after `~/.alexandria` was removed while the CLI
+    /// and launchd service remain installed. Treat that as recoverable setup:
+    /// ask the CLI to recreate config, restart so the daemon loads its new key,
+    /// then refresh the shared snapshot before starting OAuth.
+    private func configStartingDaemonIfNeeded() async -> DaemonConfig? {
+        if let config = currentConfig { return config }
+
+        let result = await DaemonController.bootstrapDaemon()
+        DaemonDiscovery.invalidateCache()
+        await store.refresh()
+        if let config = currentConfig { return config }
+
+        let detail = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = detail.isEmpty
+            ? "Alex could not create its daemon configuration."
+            : "Alex could not create its daemon configuration: \(detail)"
+        fail(message)
+        return nil
+    }
+
+    private func fail(_ message: String) {
+        stage = .failed(message)
+        onFailed?(message)
     }
 
     private func sessionUpdated(_ session: LoginSession) {
@@ -111,7 +134,7 @@ final class AuthFlowModel {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
-                guard let self, let config = self.store.config else { return }
+                guard let self, let config = self.currentConfig else { return }
                 if case .awaiting = self.stage {} else { return }
                 let client = AlexandriaClient(config: config)
                 if let session = try? await client.authLoginStatus(id: id) {
@@ -123,7 +146,7 @@ final class AuthFlowModel {
 
     func submitPaste() {
         guard let session, !pasteInput.trimmingCharacters(in: .whitespaces).isEmpty,
-              let config = store.config else { return }
+              let config = currentConfig else { return }
         let client = AlexandriaClient(config: config)
         let input = pasteInput.trimmingCharacters(in: .whitespacesAndNewlines)
         Task { [weak self] in
@@ -143,7 +166,7 @@ final class AuthFlowModel {
     /// fast path for a user who already logged into `kimi`. Tokens stay in the
     /// daemon vault; nothing secret is surfaced here.
     func useExistingKimiLogin() {
-        guard supportsExistingImport, !importing, let config = store.config else { return }
+        guard supportsExistingImport, !importing, let config = currentConfig else { return }
         importing = true
         pollTask?.cancel()
         let client = AlexandriaClient(config: config)

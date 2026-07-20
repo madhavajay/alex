@@ -17,6 +17,13 @@ public enum ProviderPresentation {
         accounts.contains { $0.provider == provider }
     }
 
+    /// Dario is an Anthropic-subscription transport, not an independent token
+    /// provider. Keep it out of fresh-install UI until an Anthropic account is
+    /// actually present in the daemon vault.
+    public static func shouldPresentDario(for accounts: [Account]) -> Bool {
+        hasAccount(for: "anthropic", in: accounts)
+    }
+
     public static func visibleLimits(
         _ limits: [ProviderLimits], for accounts: [Account]
     ) -> [ProviderLimits] {
@@ -31,7 +38,7 @@ public enum ProviderPresentation {
         if accounts.contains(where: { $0.provider == "openai" && $0.kind == "oauth" }) {
             providers.insert("openai")
         }
-        if includeAnthropicDario {
+        if includeAnthropicDario, shouldPresentDario(for: accounts) {
             providers.insert("anthropic")
         }
         return providers.sorted()
@@ -39,7 +46,8 @@ public enum ProviderPresentation {
 
     /// Codex supplies limits per account, so a connected Codex OAuth account
     /// still has a useful loading card before a provider-wide snapshot exists.
-    /// Dario similarly keeps its Anthropic parent visible while enabled.
+    /// Dario similarly keeps its Anthropic parent visible while enabled, but
+    /// only after an Anthropic subscription has been connected.
     public static func shouldShowLimitsCard(
         limits: [ProviderLimits], accounts: [Account], includeAnthropicDario: Bool = false
     ) -> Bool {

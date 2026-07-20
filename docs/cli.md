@@ -191,8 +191,8 @@ Install and operate the generational Claude-subscription broker.
 | --- | --- | --- |
 | `bootstrap` | Install with npm/pnpm/Bun; `--json`. | `alex dario bootstrap --json` |
 | `enable` | Persist `anthropic_upstream="dario"`; restart required. | `alex dario enable` |
-| `disable` | Persist `anthropic_upstream="direct"`; restart required. | `alex dario disable` |
-| `auto` | Persist automatic subscription-based routing; restart required. | `alex dario auto` |
+| `disable` | Persist the legacy `direct` value; genuine Claude Code is still the only direct Anthropic path. | `alex dario disable` |
+| `auto` | Persist the default always-Dario route for eligible Anthropic traffic; restart required. | `alex dario auto` |
 | `status` | Query daemon generation/routing/prompt-cache state. | `alex dario status` |
 | `restart` | Roll a fresh generation of the current version. | `alex dario restart` |
 | `update` | Check npm and roll when newer. | `alex dario update` |

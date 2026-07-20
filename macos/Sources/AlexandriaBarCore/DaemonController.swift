@@ -162,6 +162,32 @@ public enum DaemonController {
         await run(args: ["daemon", "--background"], timeout: 30)
     }
 
+    /// Recover a first-run or wiped-data-dir install. Every CLI invocation
+    /// creates config.toml when it is missing, but an already-running launchd
+    /// daemon still has the old local key in memory. Restart the managed daemon
+    /// so it loads the newly-created key; if no service is installed, start an
+    /// ordinary background daemon instead.
+    public static func bootstrapDaemon() async -> CommandResult {
+        await restartDaemon()
+    }
+
+    /// Restart the managed daemon, falling back to an ordinary background
+    /// process on development/app-only installs without a registered service.
+    public static func restartDaemon() async -> CommandResult {
+        let restarted = await run(args: ["service", "restart", "--force"], timeout: 30)
+        if restarted.ok { return restarted }
+
+        let started = await startDaemon()
+        if started.ok { return started }
+
+        return CommandResult(
+            exitCode: started.exitCode,
+            stdout: [restarted.stdout, started.stdout]
+                .filter { !$0.isEmpty }.joined(separator: "\n"),
+            stderr: [restarted.stderr, started.stderr]
+                .filter { !$0.isEmpty }.joined(separator: "\n"))
+    }
+
     public static func setDaemonHost(_ host: String) async -> CommandResult {
         await run(args: ["config", "host", host], timeout: 30)
     }

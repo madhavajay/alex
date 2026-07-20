@@ -393,7 +393,8 @@ public final class SnapshotStore {
                 body: "No config found at ~/.alexandria/config.toml"))
             return out
         }
-        if config?.darioEnabled == true, nodePath == nil {
+        let hasAnthropicAccount = ProviderPresentation.shouldPresentDario(for: accounts)
+        if hasAnthropicAccount, config?.darioEnabled == true, nodePath == nil {
             out.append(StoreAlert(
                 id: "node-missing", severity: .critical,
                 title: "Node.js not found — dario needs it",
@@ -441,7 +442,7 @@ public final class SnapshotStore {
             }
         }
 
-        if config?.darioEnabled == true || dario != nil {
+        if hasAnthropicAccount && (config?.darioEnabled == true || dario != nil) {
             let evaluation = DarioHealth.evaluate(dario)
             if evaluation.state != .ready {
                 let active = dario.flatMap { status in

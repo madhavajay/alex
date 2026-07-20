@@ -1573,6 +1573,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(admin_run_keys_clear_revoked),
         )
         .route(
+            "/admin/alex-errors/{fingerprint}/approve",
+            post(admin_alex_error_approve),
+        )
+        .route(
             "/admin/run-keys/{id}",
             axum::routing::delete(admin_run_keys_revoke),
         )
@@ -3409,7 +3413,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         ids.push((*alias).to_string());
     }
     // Advertise every provider's models alphabetically (case-insensitive) so the
-    // picker is scrollable. Sort before deriving the `alexandria/*` duplicates
+    // picker is scrollable. Sort before deriving the `alex/*` aliases
     // and de-duplicating so both blocks share one order.
     sort_model_ids(&mut ids);
     let claude_gateway = headers
@@ -3424,7 +3428,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         });
     if !claude_gateway {
         for id in ids.clone() {
-            ids.push(format!("alexandria/{id}"));
+            ids.push(format!("alex/{id}"));
         }
     }
     let mut seen = HashSet::new();
@@ -6498,9 +6502,8 @@ pub async fn ping_provider(
         Provider::Anthropic => (
             // Sonnet costs roughly 10x Haiku per ping, but it verifies that a
             // subscription can actually use premium models. Immediately after
-            // Dario is enabled its first Sonnet ping may warm the prompt cache
-            // (or briefly use the direct fallback and receive one 429) before
-            // subsequent routed checks become green.
+            // Dario is enabled its first Sonnet ping may warm the prompt cache;
+            // it is never allowed to leak onto direct third-party-app billing.
             ClientFormat::AnthropicMessages,
             "/v1/messages",
             json!({
@@ -6665,7 +6668,7 @@ fn annotate_anthropic_ping_message(
     message: String,
 ) -> String {
     if provider == Provider::Anthropic && dario_down {
-        "degraded — serving via direct fallback, Dario down".into()
+        "Dario unavailable — Anthropic routing is fail-closed".into()
     } else {
         message
     }
@@ -7296,49 +7299,6 @@ fn exo_account() -> Account {
     }
 }
 
-fn direct_anthropic_plan(
-    account: Account,
-    body_json: &mut Value,
-    original_body: &[u8],
-    routed_model: &str,
-    converted: Option<(Value, RespondAs)>,
-    client_stream: bool,
-    dario_fallback_reason: String,
-) -> UpstreamPlan {
-    let (body, respond_as) = match converted {
-        None => {
-            body_json["model"] = json!(routed_model);
-            (
-                serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec()),
-                None,
-            )
-        }
-        Some((mut converted, respond_as)) => {
-            converted["model"] = json!(routed_model);
-            converted["stream"] = json!(false);
-            (
-                serde_json::to_vec(&converted).unwrap_or_else(|_| original_body.to_vec()),
-                Some(respond_as),
-            )
-        }
-    };
-    UpstreamPlan {
-        url: format!("{ANTHROPIC_BASE}/v1/messages"),
-        account,
-        connection_account: None,
-        body,
-        upstream_format: "anthropic",
-        destream: false,
-        respond_as,
-        client_stream,
-        extra_headers: vec![],
-        dario_guard: None,
-        dario_fallback_reason: Some(dario_fallback_reason),
-        via_dario: false,
-        dario_generation: None,
-    }
-}
-
 async fn ensure_gemini_project(
     state: &AppState,
     account: &Account,
@@ -7504,11 +7464,11 @@ async fn plan_upstream(
                     .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                 (ANTHROPIC_BASE.to_string(), account, None, None, false, None, false, None)
             } else {
-                let route_via_dario = state
-                    .dario
-                    .as_ref()
-                    .map(|dario| dario.routes_requests())
-                    .unwrap_or(false);
+                // Harness identity is irrelevant here: every non-genuine-
+                // Claude-Code Anthropic request uses Dario. The daemon always
+                // supplies this router; its absence is retained only for
+                // embedded/test AppState users that intentionally omit Dario.
+                let route_via_dario = state.dario.is_some();
                 if !route_via_dario {
                     let account = state
                         .vault
@@ -7522,18 +7482,10 @@ async fn plan_upstream(
                             Some(active) => Some(active),
                             None => match dario.ensure_active().await {
                                 Ok(active) => Some(active),
-                                Err(reason) => {
-                                    let account = state
-                                        .vault
-                                        .account_for_excluding(provider, true, excluded_accounts)
-                                        .await
-                                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                                    tracing::warn!(%reason, "Dario unavailable after on-demand repair; using direct Anthropic fallback");
-                                    return Ok(direct_anthropic_plan(
-                                        account, body_json, original_body, routed_model, converted,
-                                        client_stream, format!("dario repair failed: {reason}"),
-                                    ));
-                                }
+                                Err(reason) => return Err((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!("Dario repair failed: {reason}"),
+                                )),
                             },
                         },
                         None => None,
@@ -7542,32 +7494,17 @@ async fn plan_upstream(
                         (Some(dario), Some(active)) => {
                             match dario.prepare_model(routed_model).await {
                                 DarioPrepare::ServeThroughDario => {}
-                                DarioPrepare::DirectFallback { reason } => {
-                                    let account = state
-                                        .vault
-                                        .account_for_excluding(provider, true, excluded_accounts)
-                                        .await
-                                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-                                    return Ok(direct_anthropic_plan(
-                                        account,
-                                        body_json,
-                                        original_body,
-                                        routed_model,
-                                        converted,
-                                        client_stream,
-                                        reason,
-                                    ));
-                                }
+                                DarioPrepare::DirectFallback { reason } => return Err((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!("Dario prompt cache unavailable: {reason}"),
+                                )),
                                 DarioPrepare::Unavailable { reason } => {
                                     return Err((StatusCode::SERVICE_UNAVAILABLE, reason));
                                 }
                             }
                             let Some(guard) = dario.begin(&active.generation_id) else {
-                                let account = state.vault.account_for_excluding(provider, true, excluded_accounts).await
-                                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                                 let reason = "Dario became unavailable while routing the Anthropic request".to_string();
-                                tracing::warn!(%reason, "using direct Anthropic fallback");
-                                return Ok(direct_anthropic_plan(account, body_json, original_body, routed_model, converted, client_stream, reason));
+                                return Err((StatusCode::SERVICE_UNAVAILABLE, reason));
                             };
                             let attribution_account = state
                                 .vault
@@ -7586,11 +7523,8 @@ async fn plan_upstream(
                             )
                         }
                         (Some(_), None) => {
-                            let account = state.vault.account_for_excluding(provider, true, excluded_accounts).await
-                                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
                             let reason = "Dario has no healthy generation after on-demand repair".to_string();
-                            tracing::warn!(%reason, "using direct Anthropic fallback");
-                            return Ok(direct_anthropic_plan(account, body_json, original_body, routed_model, converted, client_stream, reason));
+                            return Err((StatusCode::SERVICE_UNAVAILABLE, reason));
                         }
                         (None, None) => unreachable!("Dario routing requires a Dario router"),
                         (None, Some(_)) => {
@@ -9149,6 +9083,35 @@ async fn admin_run_keys_clear_revoked(State(state): State<Arc<AppState>>) -> Res
     }
 }
 
+async fn admin_alex_error_approve(
+    State(state): State<Arc<AppState>>,
+    Path(fingerprint): Path<String>,
+) -> Response {
+    match state.store.approve_run_key_fingerprint(&fingerprint) {
+        Ok(Some(row)) => {
+            state.run_keys.write().unwrap().clear();
+            tracing::info!(
+                key_fingerprint = %fingerprint,
+                key_id = row["id"].as_str().unwrap_or_default(),
+                "previously known client key approved"
+            );
+            axum::Json(json!({
+                "approved": true,
+                "key_id": row["id"],
+                "kind": row["kind"],
+                "label": row["label"],
+                "traces_updated": row["traces_updated"],
+            }))
+            .into_response()
+        }
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            "this credential is not a previously known Alex key",
+        ),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
 const MAX_INGEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 fn valid_ingest_trace_id(id: &str) -> bool {
@@ -9991,6 +9954,109 @@ fn retry_failover_allowed(
     provider != Provider::Openai || !thread_was_affined || allow_mid_thread_failover
 }
 
+fn alex_error_trace_response(
+    state: &Arc<AppState>,
+    mut trace: TraceRecord,
+    body: &[u8],
+    status: StatusCode,
+    message: &str,
+    kind: &str,
+    approval_state: &str,
+) -> Response {
+    let trace_id = if trace.id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        trace.id.clone()
+    };
+    trace.id = trace_id.clone();
+    trace.ts_request_ms = if trace.ts_request_ms == 0 {
+        now_ms()
+    } else {
+        trace.ts_request_ms
+    };
+    trace.ts_response_ms = Some(now_ms());
+    trace.status = Some(status.as_u16() as i64);
+    trace.error = Some(message.to_string());
+    trace.error_kind = Some(format!("alex_{kind}"));
+    trace.error_code = Some(status.as_u16().to_string());
+    trace.error_class = Some(
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            "auth"
+        } else if status.is_client_error() {
+            "bad_request"
+        } else {
+            "server"
+        }
+        .into(),
+    );
+    trace.upstream_provider.get_or_insert_with(|| "alex".into());
+    if trace.requested_model.is_none() {
+        trace.requested_model = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value["model"].as_str().map(String::from));
+    }
+    if trace.routed_model.is_none() {
+        trace.routed_model = trace.requested_model.clone();
+    }
+    if trace.session_id.is_none() {
+        let group = trace
+            .key_fingerprint
+            .clone()
+            .unwrap_or_else(|| trace_id.chars().take(16).collect());
+        trace.session_id = Some(format!("alex-error-{kind}-{group}"));
+    }
+    for (key, value) in [
+        ("alex_error", "true"),
+        ("alex_error_kind", kind),
+        ("approval_state", approval_state),
+    ] {
+        trace.tags = merge_trace_note(trace.tags.take(), key, value);
+    }
+    if let Some(fingerprint) = trace.key_fingerprint.clone() {
+        trace.tags = merge_trace_note(
+            trace.tags.take(),
+            "credential_fingerprint",
+            &fingerprint,
+        );
+    }
+
+    let response_body = serde_json::to_vec(&json!({
+        "error": {"type": "alexandria", "message": message}
+    }))
+    .unwrap_or_default();
+    finalize_trace(state, trace, body, None, Some(&response_body));
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("x-alexandria-trace-id", trace_id)
+        .body(Body::from(response_body))
+        .unwrap_or_else(|error| {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        })
+}
+
+fn rejected_client_trace(
+    headers: &HeaderMap,
+    format: ClientFormat,
+    path: &'static str,
+    peer: Option<std::net::SocketAddr>,
+    fingerprint: Option<String>,
+) -> TraceRecord {
+    TraceRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        ts_request_ms: now_ms(),
+        method: Some("POST".into()),
+        path: Some(path.into()),
+        client_format: Some(format.as_str().into()),
+        harness: trace_harness(headers),
+        req_headers_json: Some(redacted_headers(headers)),
+        tags: trace_tags_json(headers),
+        client_ip: peer.map(|address| address.ip().to_string()),
+        key_fingerprint: fingerprint,
+        ..Default::default()
+    }
+}
+
 async fn proxy(
     state: Arc<AppState>,
     format: ClientFormat,
@@ -10017,11 +10083,24 @@ async fn proxy(
         }
         Some(k) => {
             let key_hash = key_hash_hex(&k);
+            let fingerprint: String = key_hash.chars().take(16).collect();
             match run_key_entry(&state, &key_hash) {
                 Some(entry) if entry.kind == "wrap" => {
-                    return error_response(
+                    let trace = rejected_client_trace(
+                        &headers,
+                        format,
+                        path,
+                        peer,
+                        Some(fingerprint),
+                    );
+                    return alex_error_trace_response(
+                        &state,
+                        trace,
+                        &body,
                         StatusCode::FORBIDDEN,
                         "wrap keys may only post to /traces/ingest",
+                        "key_scope",
+                        "unavailable",
                     )
                 }
                 Some(entry) => {
@@ -10029,23 +10108,49 @@ async fn proxy(
                         tracing::warn!("failed to touch run key: {e}");
                     }
                     run_key = Some(entry);
-                    key_hash.chars().take(16).collect()
-                }
-                None if k.starts_with(RUN_KEY_PREFIX) => {
-                    return error_response(StatusCode::UNAUTHORIZED, "run key expired or revoked")
+                    fingerprint
                 }
                 None => {
-                    return error_response(
+                    let known = state
+                        .store
+                        .lookup_known_run_key(&key_hash)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|row| row["kind"] != "wrap");
+                    let message = if k.starts_with(RUN_KEY_PREFIX) {
+                        "run key expired or revoked"
+                    } else {
+                        "bad or missing local key (x-api-key / Authorization: Bearer)"
+                    };
+                    let trace = rejected_client_trace(
+                        &headers,
+                        format,
+                        path,
+                        peer,
+                        Some(fingerprint),
+                    );
+                    return alex_error_trace_response(
+                        &state,
+                        trace,
+                        &body,
                         StatusCode::UNAUTHORIZED,
-                        "bad or missing local key (x-api-key / Authorization: Bearer)",
+                        message,
+                        "auth",
+                        if known { "pending" } else { "unavailable" },
                     )
                 }
             }
         }
         None => {
-            return error_response(
+            let trace = rejected_client_trace(&headers, format, path, peer, None);
+            return alex_error_trace_response(
+                &state,
+                trace,
+                &body,
                 StatusCode::UNAUTHORIZED,
                 "bad or missing local key (x-api-key / Authorization: Bearer)",
+                "auth",
+                "unavailable",
             )
         }
     };
@@ -10076,7 +10181,15 @@ async fn proxy(
     let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &format!("body is not JSON: {e}"))
+            return alex_error_trace_response(
+                &state,
+                trace,
+                &body,
+                StatusCode::BAD_REQUEST,
+                &format!("body is not JSON: {e}"),
+                "invalid_request",
+                "unavailable",
+            )
         }
     };
     let plugin_headers: serde_json::Map<String, Value> = headers
@@ -10170,7 +10283,15 @@ async fn proxy(
 
     let requested_model = body_json["model"].as_str().unwrap_or("").to_string();
     if requested_model.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "missing 'model' in request body");
+        return alex_error_trace_response(
+            &state,
+            trace,
+            &body,
+            StatusCode::BAD_REQUEST,
+            "missing 'model' in request body",
+            "invalid_request",
+            "unavailable",
+        );
     }
     let (routed_provider, routed_model) = route_model(&requested_model);
     // `alex/<model>` is the local alias published for an enabled Exo model.
@@ -10178,7 +10299,17 @@ async fn proxy(
     // arbitrary caller from using Alexandria as an unintended LAN proxy.
     let provider = match routed_provider {
         Some(Provider::Exo) if !exo_model_enabled(&state, &routed_model) => {
-            return error_response(StatusCode::NOT_FOUND, "Exo model is not enabled")
+            trace.requested_model = Some(requested_model);
+            trace.routed_model = Some(routed_model);
+            return alex_error_trace_response(
+                &state,
+                trace,
+                &body,
+                StatusCode::NOT_FOUND,
+                "Exo model is not enabled",
+                "routing",
+                "unavailable",
+            );
         }
         Some(provider) => provider,
         None if exo_model_enabled(&state, &routed_model) => Provider::Exo,
@@ -10484,10 +10615,15 @@ async fn proxy(
     {
         Ok(p) => p,
         Err((status, msg)) => {
-            trace.status = Some(status.as_u16() as i64);
-            trace.error = Some(msg.clone());
-            finalize_trace(&state, trace, &body, None, None);
-            return error_response(status, &msg);
+            return alex_error_trace_response(
+                &state,
+                trace,
+                &body,
+                status,
+                &msg,
+                "routing",
+                "unavailable",
+            );
         }
     };
     trace.upstream_format = Some(plan.upstream_format.into());
@@ -13682,7 +13818,7 @@ mod tests {
             &state,
             vec!["z-ai/glm-5.2".into(), "anthropic/claude-sonnet-5".into()],
         );
-        // The Claude gateway path advertises one flat block (no alexandria/*
+        // The Claude gateway path advertises one flat block (no alex/*
         // duplicates), so the whole list must be alphabetical end to end.
         let mut headers = HeaderMap::new();
         headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
@@ -13691,6 +13827,17 @@ mod tests {
         assert!(
             is_case_insensitively_sorted(&ids),
             "advertised model list is not alphabetical: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_model_catalog_uses_alex_not_alexandria_namespace() {
+        let state = test_state("models-alex-namespace");
+        let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
+        assert!(ids.iter().any(|id| id.starts_with("alex/")));
+        assert!(
+            ids.iter().all(|id| !id.starts_with("alexandria/")),
+            "legacy alexandria/* ids leaked into /v1/models: {ids:?}"
         );
     }
 
@@ -14631,7 +14778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_dario_can_remain_passive_while_direct_routing_is_selected() {
+    async fn non_claude_code_anthropic_uses_dario_even_with_legacy_direct_flag() {
         let state = test_state_with_dario(
             "dario-passive",
             Some(Arc::new(FakeDario {
@@ -14662,13 +14809,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(plan.url, "http://127.0.0.1:9191/v1/messages");
         assert_eq!(plan.account.id, "anthropic-test");
-        assert!(plan.dario_guard.is_none());
+        assert!(plan.via_dario);
+        assert!(plan.dario_guard.is_some());
     }
 
     #[tokio::test]
-    async fn configured_dario_falls_back_direct_when_repair_is_unavailable() {
+    async fn configured_dario_fails_closed_when_repair_is_unavailable() {
         let state = test_state_with_dario(
             "dario-unhealthy",
             Some(Arc::new(FakeDario {
@@ -14697,13 +14845,12 @@ mod tests {
             &client_headers,
         )
         .await;
-        let plan = result.unwrap();
-        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
-        assert!(!plan.via_dario);
-        assert!(plan
-            .dario_fallback_reason
-            .unwrap()
-            .contains("repair failed"));
+        let (status, message) = match result {
+            Err(error) => error,
+            Ok(_) => panic!("Dario repair failure must not fall back direct"),
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.contains("Dario repair failed"));
     }
 
     #[tokio::test]
@@ -14747,10 +14894,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_ping_is_annotated_when_dario_falls_back_direct() {
+    fn anthropic_ping_is_annotated_when_dario_is_unavailable() {
         assert_eq!(
             annotate_anthropic_ping_message(Provider::Anthropic, true, "creds ok".into()),
-            "degraded — serving via direct fallback, Dario down"
+            "Dario unavailable — Anthropic routing is fail-closed"
         );
         assert_eq!(
             annotate_anthropic_ping_message(Provider::Openai, true, "creds ok".into()),
@@ -14792,13 +14939,12 @@ mod tests {
             &client_headers,
         )
         .await;
-        let plan = result.unwrap();
-        assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
-        assert!(!plan.via_dario);
-        assert!(plan
-            .dario_fallback_reason
-            .unwrap()
-            .contains("became unavailable"));
+        let (status, message) = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a vanished Dario generation must fail closed"),
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.contains("became unavailable"));
     }
 
     #[test]
@@ -16171,6 +16317,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_client_is_recorded_as_an_approvable_alex_error() {
+        let state = test_state("alex-error-approval");
+        let key = "alxk-previously-connected-codex";
+        let hash = key_hash_hex(key);
+        let fingerprint: String = hash.chars().take(16).collect();
+        state
+            .store
+            .insert_run_key(
+                "rk-old-codex",
+                &hash,
+                "harness",
+                None,
+                Some(r#"{"harness":"codex"}"#),
+                Some("codex"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        assert!(state.store.revoke_run_key("rk-old-codex").unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+        headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("codex"),
+        );
+        let body = Bytes::from_static(
+            br#"{"model":"alex/gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("x-alexandria-trace-id"));
+
+        let sessions = state.store.sessions(None, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["tags"]["alex_error"], "true");
+        assert_eq!(sessions[0]["tags"]["alex_error_kind"], "auth");
+        assert_eq!(sessions[0]["tags"]["approval_state"], "pending");
+        assert_eq!(
+            sessions[0]["tags"]["credential_fingerprint"],
+            fingerprint
+        );
+
+        let (status, approved) = response_json(
+            admin_alex_error_approve(State(state.clone()), Path(fingerprint.clone())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(approved["approved"], true);
+        assert_eq!(approved["key_id"], "rk-old-codex");
+        assert!(run_key_entry(&state, &hash).is_some());
+        assert_eq!(
+            state.store.sessions(None, 10).unwrap()[0]["tags"]["approval_state"],
+            "approved"
+        );
+    }
+
+    #[tokio::test]
     async fn run_key_bulk_routes_are_gated_and_static_routes_beat_id_capture() {
         use tower::ServiceExt;
 
@@ -16191,6 +16403,10 @@ mod tests {
 
         for (method, path) in [
             ("POST", "/admin/run-keys/revoke-all"),
+            (
+                "POST",
+                "/admin/alex-errors/0123456789abcdef/approve",
+            ),
             ("DELETE", "/admin/run-keys/revoked"),
         ] {
             let request = axum::http::Request::builder()

@@ -43,6 +43,7 @@ struct PreferencesView: View {
     let onOpenDario: () -> Void
     let onOpenTraceBrowser: (String) -> Void
     let onRunOnboarding: () -> Void
+    let onResetCompleted: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -113,7 +114,9 @@ struct PreferencesView: View {
             Group {
                 switch state.section {
                 case .general:
-                    GeneralPreferencesPane(store: store, onRunOnboarding: onRunOnboarding)
+                    GeneralPreferencesPane(
+                        store: store, onRunOnboarding: onRunOnboarding,
+                        onResetCompleted: onResetCompleted)
                 case .providers:
                     ProvidersPreferencesSection(
                         store: store,
@@ -210,17 +213,20 @@ final class PreferencesWindowController {
     private let onOpenDario: () -> Void
     private let onOpenTraceBrowser: (String) -> Void
     private let onRunOnboarding: () -> Void
+    private let onResetCompleted: () -> Void
 
     init(
         store: SnapshotStore,
         onOpenDario: @escaping () -> Void = {},
         onOpenTraceBrowser: @escaping (String) -> Void = { _ in },
-        onRunOnboarding: @escaping () -> Void = {}
+        onRunOnboarding: @escaping () -> Void = {},
+        onResetCompleted: @escaping () -> Void = {}
     ) {
         self.store = store
         self.onOpenDario = onOpenDario
         self.onOpenTraceBrowser = onOpenTraceBrowser
         self.onRunOnboarding = onRunOnboarding
+        self.onResetCompleted = onResetCompleted
     }
 
     func show(section: PreferencesSection = .general) {
@@ -238,7 +244,8 @@ final class PreferencesWindowController {
                 },
                 onOpenDario: onOpenDario,
                 onOpenTraceBrowser: onOpenTraceBrowser,
-                onRunOnboarding: onRunOnboarding))
+                onRunOnboarding: onRunOnboarding,
+                onResetCompleted: onResetCompleted))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock
