@@ -273,8 +273,13 @@ public struct AlexandriaClient: Sendable {
     }
 
     @discardableResult
-    public func revokeAllRunKeys() async throws -> Int {
-        let data = try await request("admin/run-keys/revoke-all", method: "POST")
+    public func revokeAllRunKeys(includeHarness: Bool = true) async throws -> Int {
+        // Current daemons revoke every kind and safely ignore this query item.
+        // A scope-aware daemon can use it without requiring a UI/client update.
+        let data = try await request(
+            "admin/run-keys/revoke-all",
+            query: [URLQueryItem(name: "include_harness", value: includeHarness ? "true" : "false")],
+            method: "POST")
         return try JSONDecoder().decode(RunKeysRevokedResponse.self, from: data).revoked
     }
 

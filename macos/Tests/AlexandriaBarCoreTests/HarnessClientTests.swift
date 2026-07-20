@@ -659,6 +659,7 @@ import Testing
             defer { requests += 1 }
             if requests == 0 {
                 #expect(request.url?.path == "/admin/run-keys/revoke-all")
+                #expect(request.url?.query == "include_harness=true")
                 #expect(request.httpMethod == "POST")
                 return (response, Data(#"{"revoked":3}"#.utf8))
             }

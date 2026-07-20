@@ -43,6 +43,7 @@ public final class SnapshotStore {
     public private(set) var dario: DarioStatus?
     public private(set) var daemonUpdate: DaemonUpdateStatus?
     public private(set) var harnesses: [Harness] = []
+    public private(set) var credentials: CredentialsResponse?
     public private(set) var harnessesSupported: Bool?
     public private(set) var harnessesCheckedMs: Int64?
     public private(set) var harnessesChecking = false
@@ -128,6 +129,7 @@ public final class SnapshotStore {
             config = nil
             daemonUp = false
             harnesses = []
+            credentials = nil
             harnessesSupported = nil
             recentSessions = []
             daemonUpdate = nil
@@ -152,6 +154,7 @@ public final class SnapshotStore {
             daemonUp = false
             health = nil
             harnesses = []
+            credentials = nil
             harnessesSupported = nil
             recentSessions = []
             daemonUpdate = nil
@@ -180,6 +183,7 @@ public final class SnapshotStore {
         async let darioR = Self.fetchDario(using: client)
         async let daemonUpdateR = try? client.daemonUpdateStatus()
         async let harnessesR = client.harnessSnapshot()
+        async let credentialsR = try? client.credentials()
         async let recentSessionsR = try? client.traceSessions(since: "24h", limit: 12)
         async let exoConfigR = try? client.exoConfig()
         async let exoStatusR = try? client.exoStatus()
@@ -215,6 +219,9 @@ public final class SnapshotStore {
         exoConfig = await exoConfigR
         exoStatus = await exoStatusR
         exoModels = await exoModelsR ?? []
+        if let fetchedCredentials = await credentialsR {
+            credentials = fetchedCredentials
+        }
         switch await darioR {
         case .fetched(let fetched):
             // A successful nil is the endpoint's explicit 404/disabled signal.
@@ -248,6 +255,13 @@ public final class SnapshotStore {
         }
         detectWindowResets(old: oldLimits, new: limits)
         scheduleBoundaryRefresh()
+    }
+
+    /// Makes a focused credentials-pane refresh available to the Harnesses
+    /// pane immediately, without waiting for the next full polling interval.
+    public func rememberCredentials(_ credentials: CredentialsResponse) {
+        self.credentials = credentials
+        onRefresh?()
     }
 
     /// Reload just the harness snapshot after a harness mutation. Wait for an

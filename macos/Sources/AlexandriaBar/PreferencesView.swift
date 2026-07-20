@@ -53,7 +53,7 @@ struct PreferencesView: View {
             content
         }
         .background(AlexTheme.Colors.background)
-        .frame(width: 960, height: 680)
+        .frame(minWidth: 960, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity)
     }
 
     // MARK: Sidebar (mock: 180px, bg rgba(0,0,0,0.25), traffic-light zone on top)
@@ -119,10 +119,13 @@ struct PreferencesView: View {
                         store: store,
                         onAuthenticate: onAuthenticate)
                 case .harnesses:
-                    HarnessesPreferencesSection(store: store)
+                    HarnessesPreferencesSection(
+                        store: store, onOpenTraceBrowser: onOpenTraceBrowser)
                 case .credentials:
                     CredentialsPreferencesSection(
-                        store: store, onOpenTraceBrowser: onOpenTraceBrowser)
+                        store: store,
+                        onOpenTraceBrowser: onOpenTraceBrowser,
+                        onOpenHarnesses: { state.section = .harnesses })
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .protection:
@@ -240,11 +243,14 @@ final class PreferencesWindowController {
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock
             // (§1.30): content extends under a transparent titlebar.
-            win.styleMask = [.titled, .closable, .fullSizeContentView]
+            win.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
             win.titlebarAppearsTransparent = true
             win.titleVisibility = .hidden
             win.isReleasedWhenClosed = false
+            win.setContentSize(NSSize(width: 960, height: 680))
+            win.minSize = win.frame.size
             win.center()
+            win.setFrameAutosaveName("AlexandriaPreferences")
             window = win
         }
         if let window {

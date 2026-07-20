@@ -17,6 +17,7 @@ import AlexandriaBarCore
 /// multi-refresh flow.
 struct HarnessesPreferencesSection: View {
     let store: SnapshotStore
+    let onOpenTraceBrowser: (String) -> Void
     @State private var updateAllModel: MultiHarnessRefreshSheetModel?
 
     private var rows: [Harness] {
@@ -48,6 +49,10 @@ struct HarnessesPreferencesSection: View {
         }
         .task(id: store.harnessesCheckedMs) {
             await store.refreshHarnessesIfStale()
+            guard let config = store.config,
+                  let fetched = try? await AlexandriaClient(config: config).credentials()
+            else { return }
+            store.rememberCredentials(fetched)
         }
     }
 
@@ -116,7 +121,10 @@ struct HarnessesPreferencesSection: View {
             ScrollView {
                 VStack(spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { index, harness in
-                        HarnessRowView(harness: harness, store: store)
+                        HarnessRowView(
+                            harness: harness,
+                            store: store,
+                            onOpenTraceBrowser: onOpenTraceBrowser)
                         if index < rows.count - 1 {
                             Rectangle()
                                 .fill(AlexTheme.Colors.divider)
@@ -180,6 +188,7 @@ private struct MultiHarnessRefreshRootProxy: View {
 private struct HarnessRowView: View {
     let harness: Harness
     let store: SnapshotStore
+    let onOpenTraceBrowser: (String) -> Void
     @State private var error: String?
     @State private var actionModel: HarnessActionSheetModel?
     @State private var hovered = false
@@ -225,7 +234,7 @@ private struct HarnessRowView: View {
         }
     }
 
-    // MARK: Name + path column (App.tsx:491-502, fixed 160px)
+    // MARK: Name + path/key column (widened for the key fingerprint)
 
     private var nameAndPath: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -252,8 +261,28 @@ private struct HarnessRowView: View {
                 .foregroundStyle(AlexTheme.Colors.textFaintest)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if harness.connected, let key = harnessKey {
+                HStack(spacing: 6) {
+                    Text("key \(key.shortFingerprint)")
+                        .font(AlexTheme.Fonts.metaMono)
+                        .foregroundStyle(AlexTheme.Colors.textFaint)
+                        .lineLimit(1)
+                    PillButton(
+                        title: "Traces", variant: .bordered,
+                        systemImage: "magnifyingglass",
+                        fontSize: 9, horizontalPadding: 6,
+                        verticalPadding: 2, cornerRadius: 5
+                    ) {
+                        onOpenTraceBrowser("key:\(key.keyFingerprint)")
+                    }
+                }
+            }
         }
-        .frame(width: 160, alignment: .leading)
+        .frame(width: 220, alignment: .leading)
+    }
+
+    private var harnessKey: CredentialRunKey? {
+        store.credentials?.inbound.runKeys.activeHarnessKey(named: harness.name)
     }
 
     // MARK: Col 2 — Install/Update + hover-revealed Delete (App.tsx:523-538)
