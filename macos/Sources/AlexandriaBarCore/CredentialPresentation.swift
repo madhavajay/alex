@@ -19,17 +19,32 @@ public enum ConnectClientAPI: String, CaseIterable, Sendable, Identifiable {
     }
 }
 
+public enum ConnectOutputFormat: String, CaseIterable, Sendable, Identifiable {
+    case env
+    case curl
+
+    public var id: String { rawValue }
+}
+
 /// Pure shell-snippet generation kept out of SwiftUI so every protocol's
 /// endpoint and environment names are covered by unit tests.
 public enum ConnectSnippetBuilder {
     public static func build(
+        format: ConnectOutputFormat = .env,
         api: ConnectClientAPI,
         baseURL: String,
         key: String,
+        label: String? = nil,
         model: String? = nil
     ) -> String {
         let base = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let label = normalized(label)
         let model = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if format == .curl {
+            return curl(api: api, base: base, key: key, label: label, model: model)
+        }
+
         var lines: [String]
 
         switch api {
@@ -59,10 +74,97 @@ public enum ConnectSnippetBuilder {
             ]
         }
 
+        if let label {
+            lines.append("# next key label: \(label)")
+        }
         if let model, !model.isEmpty {
             lines.append("export MODEL=\(model)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static func curl(
+        api: ConnectClientAPI,
+        base: String,
+        key: String,
+        label: String?,
+        model inputModel: String?
+    ) -> String {
+        let explicitModel = normalized(inputModel)
+        let model = explicitModel ?? OnboardingSupport.defaultExampleModel
+        let prompt = OnboardingSupport.credentialsDemoPrompt
+        let endpoint: String
+        let body: String
+        var headers: [(String, String)]
+
+        switch api {
+        case .anthropicMessages:
+            endpoint = "\(base)/v1/messages"
+            headers = [
+                ("x-api-key", key),
+                ("anthropic-version", "2023-06-01"),
+                ("content-type", "application/json"),
+            ]
+            body = "{\"model\":\(jsonQuoted(model)),\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":\(jsonQuoted(prompt))}]}"
+        case .openAIChat:
+            endpoint = "\(base)/v1/chat/completions"
+            headers = [
+                ("Authorization", "Bearer \(key)"),
+                ("content-type", "application/json"),
+            ]
+            body = "{\"model\":\(jsonQuoted(model)),\"messages\":[{\"role\":\"user\",\"content\":\(jsonQuoted(prompt))}]}"
+        case .openAIResponses:
+            endpoint = "\(base)/v1/responses"
+            headers = [
+                ("Authorization", "Bearer \(key)"),
+                ("content-type", "application/json"),
+            ]
+            body = "{\"model\":\(jsonQuoted(model)),\"input\":\(jsonQuoted(prompt))}"
+        case .geminiGenerateContent:
+            let pathModel = model.addingPercentEncoding(
+                withAllowedCharacters: CharacterSet.urlPathAllowed
+                    .subtracting(CharacterSet(charactersIn: "/"))) ?? model
+            endpoint = "\(base)/v1beta/models/\(pathModel):generateContent"
+            headers = [
+                ("x-goog-api-key", key),
+                ("content-type", "application/json"),
+            ]
+            body = "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\(jsonQuoted(prompt))}]}]}"
+        }
+
+        if let label {
+            headers.append(("x-session-id", label))
+        }
+        if let explicitModel {
+            headers.append(("x-alexandria-task", explicitModel))
+        }
+
+        var lines = [
+            "curl -sS -X POST \\",
+            "  \(shellQuote(endpoint)) \\",
+        ]
+        lines.append(contentsOf: headers.map {
+            "  -H \(shellQuote("\($0.0): \($0.1)")) \\"
+        })
+        lines.append("  --data \(shellQuote(body))")
+        return lines.joined(separator: "\n")
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func jsonQuoted(_ value: String) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let data = try? encoder.encode(value)
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 

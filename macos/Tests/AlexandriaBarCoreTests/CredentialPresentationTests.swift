@@ -31,13 +31,55 @@ import Testing
             api: .openAIResponses,
             baseURL: "http://localhost:9999",
             key: "alxk-fresh",
+            label: "  desktop-session  ",
             model: "  gpt-5.2  ")
         #expect(snippet == """
             # OpenAI Responses — POST $OPENAI_BASE_URL/responses
             export OPENAI_BASE_URL=http://localhost:9999/v1
             export OPENAI_API_KEY=alxk-fresh
+            # next key label: desktop-session
             export MODEL=gpt-5.2
             """)
+    }
+
+    @Test(arguments: [
+        (ConnectClientAPI.anthropicMessages, "/v1/messages", "x-api-key: alxk-real", "\"max_tokens\":256"),
+        (.openAIChat, "/v1/chat/completions", "Authorization: Bearer alxk-real", "\"messages\":"),
+        (.openAIResponses, "/v1/responses", "Authorization: Bearer alxk-real", "\"input\":"),
+        (.geminiGenerateContent, "/v1beta/models/demo-model:generateContent", "x-goog-api-key: alxk-real", "\"contents\":"),
+    ])
+    func curlUsesProtocolEndpointAuthBodyAndOptionalTags(
+        api: ConnectClientAPI,
+        endpoint: String,
+        authHeader: String,
+        bodyMarker: String
+    ) {
+        let curl = ConnectSnippetBuilder.build(
+            format: .curl,
+            api: api,
+            baseURL: "http://127.0.0.1:4100/",
+            key: "alxk-real",
+            label: "desktop-session",
+            model: "demo-model")
+
+        #expect(curl.hasPrefix("curl -sS -X POST"))
+        #expect(curl.contains("http://127.0.0.1:4100\(endpoint)"))
+        #expect(curl.contains(authHeader))
+        #expect(curl.contains(bodyMarker))
+        #expect(curl.contains("x-session-id: desktop-session"))
+        #expect(curl.contains("x-alexandria-task: demo-model"))
+        #expect(curl.contains("--data"))
+    }
+
+    @Test func curlWithoutInputsUsesRunnableDefaultAndOmitsOptionalTags() {
+        let curl = ConnectSnippetBuilder.build(
+            format: .curl,
+            api: .openAIChat,
+            baseURL: "http://localhost:4100",
+            key: "alxk-real")
+        #expect(curl.contains("\"model\":\"alex/claude-haiku-4-5\""))
+        #expect(!curl.contains("x-session-id"))
+        #expect(!curl.contains("x-alexandria-task"))
     }
 
     @Test func harnessJoinSelectsNewestActiveMatchingKey() throws {

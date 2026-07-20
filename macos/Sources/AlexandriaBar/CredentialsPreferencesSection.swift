@@ -28,6 +28,7 @@ struct CredentialsPreferencesSection: View {
     @State private var actionStatus: String?
     @State private var mintedKey: MintedRunKey?
     @State private var connectAPI = ConnectClientAPI.anthropicMessages
+    @State private var connectOutputFormat = ConnectOutputFormat.env
     @State private var connectLabel = ""
     @State private var connectModel = ""
     @State private var connectKey: MintedRunKey?
@@ -141,7 +142,7 @@ struct CredentialsPreferencesSection: View {
         Group {
             SectionLabel(text: "Connect another app")
                 .settingsSectionSpacing()
-            SettingCaption("Choose a client API and copy a ready-to-use local environment. The key is model-only and cannot administer Alex.")
+            SettingCaption("Choose a client API and copy ready-to-use environment variables or a runnable request. The key is model-only and cannot administer Alex.")
             SettingRow(label: "Client API") {
                 Picker("", selection: $connectAPI) {
                     ForEach(ConnectClientAPI.allCases) { api in
@@ -151,23 +152,40 @@ struct CredentialsPreferencesSection: View {
                 .settingsPicker()
             }
             RowDivider()
+            SettingRow(label: "Output format") {
+                Picker("", selection: $connectOutputFormat) {
+                    ForEach(ConnectOutputFormat.allCases) { format in
+                        Text(format.rawValue).tag(format)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .labelsHidden()
+                .frame(width: 140)
+            }
+            RowDivider()
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
+                ScrollView([.horizontal, .vertical]) {
                     Text(connectKey == nil
                          ? (isMintingConnectKey ? "Minting a scoped key…" : "Scoped key unavailable")
                          : connectSnippet)
                         .font(AlexTheme.Fonts.metaMono)
                         .foregroundStyle(AlexTheme.Colors.foreground)
                         .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 12)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(maxWidth: .infinity, minHeight: 54, maxHeight: 220, alignment: .leading)
                 HStack(spacing: 8) {
                     PillButton(
                         title: "Copy", variant: .primary, systemImage: "doc.on.doc",
                         isEnabled: connectKey != nil && !isMintingConnectKey
                     ) {
-                        copy(connectSnippet, status: "Connection snippet copied.")
+                        copy(
+                            connectSnippet,
+                            status: connectOutputFormat == .env
+                                ? "Environment snippet copied."
+                                : "Curl command copied.")
                     }
                     PillButton(
                         title: isMintingConnectKey ? "Generating…" : "Regenerate",
@@ -199,7 +217,7 @@ struct CredentialsPreferencesSection: View {
                     .settingsField()
             }
             RowDivider()
-            SettingRow(label: "Model", hint: "Optional MODEL line in the copied snippet") {
+            SettingRow(label: "Model", hint: "Optional MODEL export and request model/task tag") {
                 TextField("Any model", text: $connectModel)
                     .settingsField()
             }
@@ -282,16 +300,16 @@ struct CredentialsPreferencesSection: View {
             SectionLabel(text: "Active keys")
                 .settingsSectionSpacing()
             SettingCaption("Secret values are never included in this inventory.")
-            SettingRow(label: "Admin key", hint: presenceText(credentials?.inbound.adminKey.present)) {
-                statusBadge(credentials?.inbound.adminKey.present == true)
-            }
-            RowDivider()
-            SettingRow(label: "Local key", hint: presenceText(credentials?.inbound.localKey.present)) {
+            SettingRow(
+                label: "Local key",
+                hint: "Full access — administers Alex and calls models. Treat it like a password."
+            ) {
                 PillButton(title: "Copy key", variant: .bordered, systemImage: "doc.on.doc", isEnabled: config != nil) {
                     guard let config else { return }
                     copy(config.localKey, status: "Local key copied.")
                 }
             }
+            .environment(\.settingHintColor, AlexTheme.Colors.warningOrange)
 
             if let keys = credentials?.inbound.runKeys, !keys.isEmpty {
                 runKeyBulkActions(keys)
@@ -407,20 +425,14 @@ struct CredentialsPreferencesSection: View {
     private var connectSnippet: String {
         guard let connectKey else { return "" }
         return ConnectSnippetBuilder.build(
-            api: connectAPI, baseURL: baseURL, key: connectKey.key, model: connectModel)
+            format: connectOutputFormat,
+            api: connectAPI,
+            baseURL: baseURL,
+            key: connectKey.key,
+            label: connectLabel,
+            model: connectModel)
     }
     private var isBulkBusy: Bool { isRevokingAll || isClearingRevoked }
-
-    private func statusBadge(_ active: Bool, label: String? = nil) -> some View {
-        HStack(spacing: 5) {
-            StatusDot(
-                tint: active ? AlexTheme.Colors.success : AlexTheme.Colors.textFaint,
-                size: 6, glow: active)
-            Text(label ?? (active ? "Present" : "Missing"))
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(active ? AlexTheme.Colors.success : AlexTheme.Colors.textTertiary)
-        }
-    }
 
     private func tableHeader(_ value: String) -> some View {
         Text(value)
@@ -493,10 +505,6 @@ struct CredentialsPreferencesSection: View {
             }
         }
         .padding(.top, 8)
-    }
-
-    private func presenceText(_ present: Bool?) -> String {
-        present == true ? "Present" : "Missing"
     }
 
     private func shortFingerprint(_ value: String) -> String {
