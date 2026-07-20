@@ -335,10 +335,47 @@ pub struct ResetRequest {
     pub cache: bool,
     #[serde(default = "reset_dry_run_default")]
     pub dry_run: bool,
+    /// Applies immediately unless the caller explicitly requests a drain.
+    #[serde(default)]
+    pub mode: ResetMode,
 }
 
 fn reset_dry_run_default() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetMode {
+    #[default]
+    Immediate,
+    Graceful,
+}
+
+#[derive(Debug, Clone)]
+enum ResetActivity {
+    Idle,
+    Draining(u64),
+    Applying(u64),
+}
+
+#[derive(Debug, Clone)]
+struct ResetControl {
+    next_id: u64,
+    activity: ResetActivity,
+    phase: String,
+    detail: String,
+}
+
+impl Default for ResetControl {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            activity: ResetActivity::Idle,
+            phase: "idle".into(),
+            detail: String::new(),
+        }
+    }
 }
 
 pub type ResetFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
@@ -595,7 +632,14 @@ pub struct AppState {
     /// to discard lifecycle-induced transport failures instead of persisting
     /// them as provider health history.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Immediate reset uses the shutdown suppression path without claiming the
+    /// daemon itself is permanently shutting down.
+    reset_suppresses_health: std::sync::atomic::AtomicBool,
     in_flight_requests: std::sync::Mutex<HashMap<String, InFlightRequest>>,
+    reset_control: std::sync::Mutex<ResetControl>,
+    reset_changed: tokio::sync::Notify,
+    reset_abort: tokio::sync::watch::Sender<u64>,
+    reset_apply_lock: tokio::sync::Mutex<()>,
     upstream_stream_idle_timeout: Duration,
     pub started_ms: i64,
     pub base_url: String,
@@ -651,6 +695,31 @@ impl AppState {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .reset_suppresses_health
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Update the coarse reset phase exposed to polling clients.
+    pub fn set_reset_progress(&self, phase: impl Into<String>, detail: impl Into<String>) {
+        let mut control = self
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.phase = phase.into();
+        control.detail = detail.into();
+        drop(control);
+        self.reset_changed.notify_waiters();
+    }
+
+    fn reset_active(&self) -> bool {
+        !matches!(
+            self.reset_control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .activity,
+            ResetActivity::Idle
+        )
     }
 }
 
@@ -810,6 +879,7 @@ struct InFlightRequest {
 struct InFlight {
     state: Arc<AppState>,
     id: String,
+    reset_abort: tokio::sync::watch::Receiver<u64>,
 }
 
 impl InFlight {
@@ -818,7 +888,17 @@ impl InFlight {
         model: String,
         session_id: Option<String>,
         harness: Option<String>,
-    ) -> Self {
+    ) -> Option<Self> {
+        // Registration and reset activation share one mutex, closing the race
+        // where a request passed the early route gate just as a drain began.
+        let control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(control.activity, ResetActivity::Idle) {
+            return None;
+        }
+        let reset_abort = state.reset_abort.subscribe();
         let id = uuid::Uuid::new_v4().to_string();
         state
             .in_flight_requests
@@ -836,10 +916,12 @@ impl InFlight {
         state
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self {
+        drop(control);
+        Some(Self {
             state: state.clone(),
             id,
-        }
+            reset_abort,
+        })
     }
 }
 
@@ -853,6 +935,7 @@ impl Drop for InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.id);
+        self.state.reset_changed.notify_waiters();
     }
 }
 
@@ -922,6 +1005,7 @@ pub fn build_state_with_substitution(
         .connect_timeout(Duration::from_secs(15))
         .build()
         .expect("reqwest client");
+    let (reset_abort, _) = tokio::sync::watch::channel(0u64);
     Arc::new(AppState {
         local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
@@ -930,7 +1014,12 @@ pub fn build_state_with_substitution(
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        reset_suppresses_health: std::sync::atomic::AtomicBool::new(false),
         in_flight_requests: std::sync::Mutex::new(HashMap::new()),
+        reset_control: std::sync::Mutex::new(ResetControl::default()),
+        reset_changed: tokio::sync::Notify::new(),
+        reset_abort,
+        reset_apply_lock: tokio::sync::Mutex::new(()),
         upstream_stream_idle_timeout,
         started_ms: now_ms(),
         base_url,
@@ -1489,7 +1578,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/storage", get(admin_storage))
         .route("/admin/storage/prune", post(admin_storage_prune))
-        .route("/admin/reset", post(admin_reset))
+        .route("/admin/reset", post(admin_reset).delete(admin_reset_cancel))
+        .route("/admin/reset/progress", get(admin_reset_progress))
         .route("/admin/traces", get(admin_traces))
         .route(
             "/admin/fixtures",
@@ -2197,13 +2287,6 @@ async fn admin_reset(
     body: Option<axum::Json<ResetRequest>>,
 ) -> Response {
     let request = body.map(|body| body.0).unwrap_or_default();
-    let in_flight = state.in_flight.load(std::sync::atomic::Ordering::SeqCst);
-    if !request.dry_run && in_flight > 0 {
-        return error_response(
-            StatusCode::CONFLICT,
-            "cannot reset while routed requests are in flight; retry after they complete",
-        );
-    }
     let handler = state
         .reset_handler
         .read()
@@ -2215,10 +2298,163 @@ async fn admin_reset(
             "reset is not configured by this daemon",
         );
     };
-    match handler.reset(state, request).await {
+
+    if request.dry_run {
+        state.set_reset_progress("counting_bodies", "Counting captured bodies");
+        return match handler.reset(state.clone(), request).await {
+            Ok(plan) => {
+                state.set_reset_progress("complete", "Dry run complete");
+                axum::Json(plan).into_response()
+            }
+            Err(e) => {
+                state.set_reset_progress("failed", e.to_string());
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            }
+        };
+    }
+
+    let operation_id = {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.next_id = control.next_id.wrapping_add(1);
+        let id = control.next_id;
+        match request.mode {
+            ResetMode::Immediate => {
+                control.activity = ResetActivity::Applying(id);
+                control.phase = "aborting_requests".into();
+                control.detail = "Closing routed requests".into();
+                state
+                    .reset_suppresses_health
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .reset_abort
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            ResetMode::Graceful => {
+                control.activity = ResetActivity::Draining(id);
+                control.phase = "draining".into();
+                control.detail = "Waiting for routed requests to finish".into();
+            }
+        }
+        id
+    };
+    state.reset_changed.notify_waiters();
+
+    loop {
+        let notified = state.reset_changed.notified();
+        let activity = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activity
+            .clone();
+        let still_owned = matches!(
+            activity,
+            ResetActivity::Draining(id) | ResetActivity::Applying(id) if id == operation_id
+        );
+        if !still_owned {
+            return error_response(
+                StatusCode::CONFLICT,
+                "reset drain was cancelled or overridden",
+            );
+        }
+        if state.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            break;
+        }
+        notified.await;
+    }
+
+    let _apply = state.reset_apply_lock.lock().await;
+    {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let still_owned = matches!(
+            control.activity,
+            ResetActivity::Draining(id) | ResetActivity::Applying(id) if id == operation_id
+        );
+        if !still_owned {
+            return error_response(
+                StatusCode::CONFLICT,
+                "reset drain was cancelled or overridden",
+            );
+        }
+        control.activity = ResetActivity::Applying(operation_id);
+        control.phase = "counting_bodies".into();
+        control.detail = "Counting captured bodies".into();
+    }
+    state.reset_changed.notify_waiters();
+
+    let result = handler.reset(state.clone(), request).await;
+    let finished_owned = {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owns_operation =
+            matches!(control.activity, ResetActivity::Applying(id) if id == operation_id);
+        if owns_operation {
+            control.activity = ResetActivity::Idle;
+            match &result {
+                Ok(_) => {
+                    control.phase = "complete".into();
+                    control.detail = "Reset complete".into();
+                }
+                Err(error) => {
+                    control.phase = "failed".into();
+                    control.detail = error.to_string();
+                }
+            }
+        }
+        owns_operation
+    };
+    if finished_owned {
+        state
+            .reset_suppresses_health
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    state.reset_changed.notify_waiters();
+    match result {
         Ok(plan) => axum::Json(plan).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+async fn admin_reset_progress(State(state): State<Arc<AppState>>) -> axum::Json<Value> {
+    let control = state
+        .reset_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let status = match control.activity {
+        ResetActivity::Idle => "idle",
+        ResetActivity::Draining(_) => "draining",
+        ResetActivity::Applying(_) => "applying",
+    };
+    axum::Json(json!({
+        "status": status,
+        "phase": control.phase,
+        "detail": control.detail,
+        "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+    }))
+}
+
+async fn admin_reset_cancel(State(state): State<Arc<AppState>>) -> Response {
+    let mut control = state
+        .reset_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !matches!(control.activity, ResetActivity::Draining(_)) {
+        return error_response(StatusCode::CONFLICT, "no graceful reset drain is active");
+    }
+    control.activity = ResetActivity::Idle;
+    control.phase = "cancelled".into();
+    control.detail = "Graceful reset cancelled".into();
+    drop(control);
+    state.reset_changed.notify_waiters();
+    axum::Json(json!({"cancelled": true})).into_response()
 }
 
 async fn admin_auth_import(
@@ -6745,6 +6981,9 @@ async fn record_dario_response_probe(
     status: Option<u16>,
     error: Option<&str>,
 ) {
+    if state.is_shutting_down() {
+        return;
+    }
     let Some((account_id, status)) = account_id.zip(status) else {
         return;
     };
@@ -9756,6 +9995,9 @@ async fn proxy(
     body: Bytes,
     peer: Option<std::net::SocketAddr>,
 ) -> Response {
+    if state.reset_active() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "resetting");
+    }
     let mut run_key: Option<CachedRunKey> = None;
     let mut local_key_request = false;
     let client_fingerprint = match client_key(&headers) {
@@ -10173,12 +10415,14 @@ async fn proxy(
             .body(Body::from(response_body))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
-    let in_flight = InFlight::new(
+    let Some(in_flight) = InFlight::new(
         &state,
         routed_model.clone(),
         trace.session_id.clone(),
         trace.harness.clone(),
-    );
+    ) else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "resetting");
+    };
 
     // Resolve verified Codex/Claude children to the lineage root so every
     // descendant prefers the same upstream account while retaining its own
@@ -10829,13 +11073,14 @@ async fn proxy(
     let dario_guard = plan.dario_guard.take();
     tokio::spawn(async move {
         let _dario_guard = dario_guard;
-        let _in_flight = in_flight;
+        let mut in_flight = in_flight;
         let mut buf: Vec<u8> = Vec::new();
         let mut sse_error_observer = is_sse.then(|| SseErrorObserver::new(plan.upstream_format));
         let stream_error = forward_upstream_stream(
             &mut upstream_stream,
             &tx,
             state2.upstream_stream_idle_timeout,
+            Some(&mut in_flight.reset_abort),
             |chunk| {
                 buf.extend_from_slice(chunk);
                 if let Some(observer) = sse_error_observer.as_mut() {
@@ -10884,7 +11129,7 @@ async fn proxy(
                 .into(),
             );
         }
-        if trace.error.is_some() {
+        if trace.error.is_some() && !state2.is_shutting_down() {
             if let (Some(dario), Some(gen)) = (
                 &state2.dario,
                 trace
@@ -10944,6 +11189,7 @@ async fn forward_upstream_stream<S, E, F>(
     upstream_stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     idle_timeout: Duration,
+    mut reset_abort: Option<&mut tokio::sync::watch::Receiver<u64>>,
     mut observe: F,
 ) -> Option<String>
 where
@@ -10952,7 +11198,17 @@ where
     F: FnMut(&Bytes),
 {
     loop {
-        match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
+        let next = if let Some(reset_abort) = reset_abort.as_deref_mut() {
+            tokio::select! {
+                _ = reset_abort.changed() => {
+                    return Some("stream aborted by immediate reset".into());
+                }
+                result = tokio::time::timeout(idle_timeout, upstream_stream.next()) => result,
+            }
+        } else {
+            tokio::time::timeout(idle_timeout, upstream_stream.next()).await
+        };
+        match next {
             Ok(Some(Ok(chunk))) => {
                 observe(&chunk);
                 if tx.send(Ok(chunk)).await.is_err() {
@@ -13878,12 +14134,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_upstream_releases_the_in_flight_guard_after_idle_timeout() {
         let state = test_state("in-flight-idle-timeout");
-        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             let _in_flight = guard;
             let mut stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), None, |_| {}).await
         });
 
         tokio::task::yield_now().await;
@@ -13900,7 +14156,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_guard_is_released_when_the_stream_task_panics() {
         let state = test_state("in-flight-panic");
-        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
         let task = tokio::spawn(async move {
             let _in_flight = guard;
             panic!("fake streaming task panic");
@@ -13909,6 +14165,202 @@ mod tests {
         assert!(task.await.is_err());
         assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(in_flight_requests(&state).is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingResetHandler {
+        calls: AtomicUsize,
+    }
+
+    impl ResetHandler for RecordingResetHandler {
+        fn reset(&self, _state: Arc<AppState>, request: ResetRequest) -> ResetFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(json!({
+                    "dry_run": request.dry_run,
+                    "applied": !request.dry_run,
+                }))
+            })
+        }
+    }
+
+    fn reset_request(method: &str, path: &str, body: Value) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-api-key", "alx-local")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn wait_for_reset_status(state: &Arc<AppState>, wanted: &str) {
+        for _ in 0..100 {
+            let status = {
+                let control = state
+                    .reset_control
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match control.activity {
+                    ResetActivity::Idle => "idle",
+                    ResetActivity::Draining(_) => "draining",
+                    ResetActivity::Applying(_) => "applying",
+                }
+            };
+            if status == wanted {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("reset did not enter {wanted}");
+    }
+
+    #[tokio::test]
+    async fn immediate_reset_aborts_a_fake_in_flight_stream_and_succeeds() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-immediate-aborts-stream");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let mut guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let stream = tokio::spawn(async move {
+            let mut upstream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+            forward_upstream_stream(
+                &mut upstream,
+                &tx,
+                Duration::from_secs(300),
+                Some(&mut guard.reset_abort),
+                |_| {},
+            )
+            .await
+        });
+
+        let response = router(state.clone())
+            .oneshot(reset_request(
+                "POST",
+                "/admin/reset",
+                json!({"dry_run": false, "mode": "immediate", "traces": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            stream.await.unwrap().as_deref(),
+            Some("stream aborted by immediate reset")
+        );
+        assert_eq!(state.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        assert!(!state.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn graceful_reset_rejects_new_routes_and_applies_at_zero_in_flight() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-graceful");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let reset_state = state.clone();
+        let pending = tokio::spawn(async move {
+            router(reset_state)
+                .oneshot(reset_request(
+                    "POST",
+                    "/admin/reset",
+                    json!({"dry_run": false, "mode": "graceful", "traces": true}),
+                ))
+                .await
+                .unwrap()
+        });
+        wait_for_reset_status(&state, "draining").await;
+
+        assert_eq!(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                HeaderMap::new(),
+                Bytes::new(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+
+        drop(guard);
+        assert_eq!(pending.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_cancel_graceful_drain_restores_routed_service() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-graceful-cancel");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let reset_state = state.clone();
+        let pending = tokio::spawn(async move {
+            router(reset_state)
+                .oneshot(reset_request(
+                    "POST",
+                    "/admin/reset",
+                    json!({"dry_run": false, "mode": "graceful", "traces": true}),
+                ))
+                .await
+                .unwrap()
+        });
+        wait_for_reset_status(&state, "draining").await;
+
+        let cancel = router(state.clone())
+            .oneshot(reset_request("DELETE", "/admin/reset", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::OK);
+        assert_ne!(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                HeaderMap::new(),
+                Bytes::new(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(pending.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn reset_progress_endpoint_reports_current_phases_and_in_flight() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-progress");
+        let _guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        for (phase, detail) in [
+            ("counting_bodies", "Counting captured bodies"),
+            ("disconnecting_harnesses", "Disconnecting harnesses (3/6)"),
+            ("clearing_caches", "Clearing derived caches"),
+        ] {
+            state.set_reset_progress(phase, detail);
+            let response = router(state.clone())
+                .oneshot(reset_request("GET", "/admin/reset/progress", json!({})))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["phase"], phase);
+            assert_eq!(body["detail"], detail);
+            assert_eq!(body["in_flight"], 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -13927,7 +14379,7 @@ mod tests {
         })
         .boxed();
         let task = tokio::spawn(async move {
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), None, |_| {}).await
         });
 
         tokio::task::yield_now().await;

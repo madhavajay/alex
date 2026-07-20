@@ -81,9 +81,19 @@ async fn plan(
     store: &Store,
     selection: Selection,
     dry_run: bool,
+    progress: Option<&alex_proxy::AppState>,
 ) -> Result<Value> {
+    if let Some(state) = progress {
+        state.set_reset_progress("counting_bodies", "Counting captured bodies");
+    }
     let counts = store.reset_counts()?;
+    if let Some(state) = progress {
+        state.set_reset_progress("counting_traces", "Counting traces and accounts");
+    }
     let accounts = vault.list().await;
+    if let Some(state) = progress {
+        state.set_reset_progress("counting_harnesses", "Checking connected harnesses");
+    }
     let harnesses = connected_harnesses(config).await?;
     let selected = selection.selected();
     Ok(json!({
@@ -124,7 +134,19 @@ pub(crate) async fn execute(
     selection: Selection,
     dry_run: bool,
 ) -> Result<Value> {
-    let mut result = plan(config, vault, store, selection, dry_run).await?;
+    execute_with_progress(config, config_path, vault, store, selection, dry_run, None).await
+}
+
+async fn execute_with_progress(
+    config: &Config,
+    config_path: &Path,
+    vault: &Vault,
+    store: &Store,
+    selection: Selection,
+    dry_run: bool,
+    progress: Option<&alex_proxy::AppState>,
+) -> Result<Value> {
+    let mut result = plan(config, vault, store, selection, dry_run, progress).await?;
     if dry_run || !selection.any() {
         return Ok(result);
     }
@@ -132,12 +154,23 @@ pub(crate) async fn execute(
     // Disconnect before rotating local_key. The shared disconnect command is
     // the single owner of harness-local file cleanup and harness-key revocation.
     if selection.harnesses {
-        for harness in connected_harnesses(config).await? {
+        let harnesses = connected_harnesses(config).await?;
+        let total = harnesses.len();
+        for (index, harness) in harnesses.into_iter().enumerate() {
+            if let Some(state) = progress {
+                state.set_reset_progress(
+                    "disconnecting_harnesses",
+                    format!("Disconnecting harnesses ({}/{total})", index + 1),
+                );
+            }
             harness_connect::disconnect_cmd(config, harness, None).await?;
         }
     }
 
     if selection.credentials {
+        if let Some(state) = progress {
+            state.set_reset_progress("removing_accounts", "Removing provider accounts");
+        }
         for account in vault.list().await {
             let known = account_known(&account);
             if vault.remove(&account.id).await? {
@@ -149,12 +182,21 @@ pub(crate) async fn execute(
         store.revoke_all_run_keys(false)?;
     }
     if selection.traces {
+        if let Some(state) = progress {
+            state.set_reset_progress("clearing_traces", "Removing traces and captured bodies");
+        }
         store.clear_traces_and_bodies()?;
     }
     if selection.cache {
+        if let Some(state) = progress {
+            state.set_reset_progress("clearing_caches", "Clearing derived caches");
+        }
         store.clear_derived_cache()?;
     }
     if selection.settings {
+        if let Some(state) = progress {
+            state.set_reset_progress("restoring_settings", "Restoring default settings");
+        }
         // data_dir is the location of the data being reset, not a preference;
         // retaining it avoids silently moving a configured installation to a
         // second, empty data directory.
@@ -182,13 +224,14 @@ impl alex_proxy::ResetHandler for DaemonResetHandler {
     ) -> alex_proxy::ResetFuture {
         Box::pin(async move {
             let (config, _) = crate::load_or_create_config()?;
-            let result = execute(
+            let result = execute_with_progress(
                 &config,
                 &crate::alexandria_home().join("config.toml"),
                 state.vault.as_ref(),
                 state.store.as_ref(),
                 request.clone().into(),
                 request.dry_run,
+                Some(state.as_ref()),
             )
             .await?;
             if !request.dry_run && request.credentials {

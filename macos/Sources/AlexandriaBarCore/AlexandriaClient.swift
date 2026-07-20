@@ -348,18 +348,30 @@ public struct AlexandriaClient: Sendable {
 
     /// Gets a real-count dry-run plan before a user can commit a reset.
     public func resetPlan(_ selection: ResetSelection) async throws -> ResetResponse {
-        try await reset(selection, dryRun: true)
+        try await reset(selection, mode: .immediate, dryRun: true)
     }
 
     /// Applies the selected reset categories. Call `resetPlan` first to show its counts to the user.
-    public func reset(_ selection: ResetSelection, dryRun: Bool = false) async throws -> ResetResponse {
+    public func reset(
+        _ selection: ResetSelection, mode: ResetMode = .immediate, dryRun: Bool = false
+    ) async throws -> ResetResponse {
         // Counting 100k+ captured body files on a cold filesystem cache can
         // take well past the 5s default — this endpoint gets its own budget.
         let data = try await request(
             "admin/reset", method: "POST",
-            body: body(ResetRequest(selection: selection, dryRun: dryRun)),
+            body: body(ResetRequest(selection: selection, dryRun: dryRun, mode: mode)),
             timeout: 120)
         return try JSONDecoder().decode(ResetResponse.self, from: data)
+    }
+
+    public func resetProgress() async throws -> ResetProgress {
+        try await get("admin/reset/progress", as: ResetProgress.self)
+    }
+
+    @discardableResult
+    public func cancelResetDrain() async throws -> ResetCancelResponse {
+        let data = try await request("admin/reset", method: "DELETE")
+        return try JSONDecoder().decode(ResetCancelResponse.self, from: data)
     }
 
     public func routing(provider: String) async throws -> ProviderRoutingResponse {

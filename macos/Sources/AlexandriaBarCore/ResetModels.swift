@@ -23,6 +23,11 @@ public struct ResetSelection: Codable, Sendable, Equatable {
     }
 }
 
+public enum ResetMode: String, Codable, Sendable, Equatable {
+    case immediate
+    case graceful
+}
+
 public struct ResetRequest: Codable, Sendable, Equatable {
     public let credentials: Bool
     public let settings: Bool
@@ -30,20 +35,47 @@ public struct ResetRequest: Codable, Sendable, Equatable {
     public let harnesses: Bool
     public let cache: Bool
     public let dryRun: Bool
+    public let mode: ResetMode
 
     enum CodingKeys: String, CodingKey {
-        case credentials, settings, traces, harnesses, cache
+        case credentials, settings, traces, harnesses, cache, mode
         case dryRun = "dry_run"
     }
 
-    public init(selection: ResetSelection, dryRun: Bool) {
+    public init(
+        selection: ResetSelection, dryRun: Bool, mode: ResetMode = .immediate
+    ) {
         credentials = selection.credentials
         settings = selection.settings
         traces = selection.traces
         harnesses = selection.harnesses
         cache = selection.cache
         self.dryRun = dryRun
+        self.mode = mode
     }
+}
+
+public struct ResetProgress: Codable, Sendable, Equatable {
+    public let status: String
+    public let phase: String
+    public let detail: String
+    public let inFlight: Int
+
+    enum CodingKeys: String, CodingKey {
+        case status, phase, detail
+        case inFlight = "in_flight"
+    }
+
+    public init(status: String, phase: String, detail: String, inFlight: Int) {
+        self.status = status
+        self.phase = phase
+        self.detail = detail
+        self.inFlight = inFlight
+    }
+}
+
+public struct ResetCancelResponse: Codable, Sendable, Equatable {
+    public let cancelled: Bool
 }
 
 public struct ResetFileCount: Codable, Sendable, Equatable {

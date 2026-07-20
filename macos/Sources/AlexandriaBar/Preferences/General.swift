@@ -668,6 +668,11 @@ private struct ResetSettingsSheet: View {
     @State private var error: String?
     @State private var confirmed = false
     @State private var applied = false
+    @State private var progress: ResetProgress?
+    @State private var activeMode: ResetMode?
+    @State private var drainStartedAt: Date?
+    @State private var operationTask: Task<Void, Never>?
+    @State private var operationID = UUID()
 
     private var hasSelection: Bool {
         selection.credentials || selection.settings || selection.traces
@@ -725,6 +730,43 @@ private struct ResetSettingsSheet: View {
                     .foregroundStyle(AlexTheme.Colors.success)
             }
 
+            if busy {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(progressCaption)
+                            .font(.system(size: 11))
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    if activeMode == .graceful {
+                        HStack(spacing: 8) {
+                            PillButton(
+                                title: "Cancel drain", variant: .bordered,
+                                fontSize: 11, isEnabled: true
+                            ) {
+                                cancelGracefulDrain()
+                            }
+                            if let drainStartedAt {
+                                TimelineView(.periodic(from: drainStartedAt, by: 1)) { context in
+                                    if context.date.timeIntervalSince(drainStartedAt) >= 60 {
+                                        PillButton(
+                                            title: "Still draining — reset immediately instead?",
+                                            variant: .danger, fontSize: 11,
+                                            horizontalPadding: 10, verticalPadding: 5,
+                                            cornerRadius: 6, showsBorder: true,
+                                            isEnabled: true
+                                        ) {
+                                            overrideWithImmediateReset()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             HStack {
                 // Once the reset has been applied there is nothing left to cancel, and
                 // labelling the only way out "Cancel" reads as "undo" -- so nobody dares
@@ -745,14 +787,21 @@ private struct ResetSettingsSheet: View {
                     ) {
                         runDryRun()
                     }
-                    if plan != nil {
+                    if plan != nil && confirmed {
                         PillButton(
-                            title: "Reset now", variant: .danger, fontSize: 12,
+                            title: "Reset Immediately", variant: .danger, fontSize: 12,
                             horizontalPadding: 12, verticalPadding: 6,
                             cornerRadius: 6, showsBorder: true,
-                            isEnabled: confirmed && !busy
+                            isEnabled: !busy
                         ) {
-                            applyReset()
+                            applyReset(mode: .immediate)
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        PillButton(
+                            title: "Reset Gracefully", variant: .bordered, fontSize: 12,
+                            isEnabled: !busy
+                        ) {
+                            applyReset(mode: .graceful)
                         }
                     }
                 }
@@ -765,6 +814,15 @@ private struct ResetSettingsSheet: View {
             plan = nil
             confirmed = false
             error = nil
+        }
+        .onDisappear {
+            if activeMode == .graceful, let config = store.config {
+                Task {
+                    _ = try? await AlexandriaClient(config: config).cancelResetDrain()
+                }
+            }
+            operationID = UUID()
+            operationTask?.cancel()
         }
     }
 
@@ -812,35 +870,127 @@ private struct ResetSettingsSheet: View {
 
     private func runDryRun() {
         guard let config = store.config else { return }
+        operationTask?.cancel()
+        let id = UUID()
+        operationID = id
         busy = true
         error = nil
         confirmed = false
-        Task {
+        progress = ResetProgress(
+            status: "idle", phase: "counting_bodies",
+            detail: "Counting captured bodies", inFlight: 0)
+        activeMode = nil
+        operationTask = Task {
+            let polling = pollResetProgress(config: config, operationID: id)
+            defer { polling.cancel() }
             do {
-                plan = try await AlexandriaClient(config: config).resetPlan(selection)
+                let result = try await AlexandriaClient(config: config).resetPlan(selection)
+                guard operationID == id else { return }
+                plan = result
             } catch {
+                guard operationID == id else { return }
                 self.error = "Could not get reset counts: \(error.localizedDescription)"
             }
-            busy = false
+            if operationID == id {
+                busy = false
+            }
         }
     }
 
-    private func applyReset() {
+    private func applyReset(mode: ResetMode) {
         guard let config = store.config, plan != nil, confirmed else { return }
+        operationTask?.cancel()
+        let id = UUID()
+        operationID = id
         busy = true
         error = nil
-        Task {
+        activeMode = mode
+        drainStartedAt = mode == .graceful ? Date() : nil
+        progress = ResetProgress(
+            status: mode == .graceful ? "draining" : "applying",
+            phase: mode == .graceful ? "draining" : "aborting_requests",
+            detail: mode == .graceful
+                ? "Waiting for routed requests to finish" : "Closing routed requests",
+            inFlight: progress?.inFlight ?? 0)
+        operationTask = Task {
+            let polling = pollResetProgress(config: config, operationID: id)
+            defer { polling.cancel() }
             do {
-                _ = try await AlexandriaClient(config: config).reset(selection)
+                _ = try await AlexandriaClient(config: config).reset(selection, mode: mode)
+                guard operationID == id else { return }
                 if selection.settings {
                     AppSettingsReset.clear()
                 }
                 applied = true
                 await store.refresh()
             } catch {
+                guard operationID == id else { return }
                 self.error = "Could not apply reset: \(error.localizedDescription)"
             }
-            busy = false
+            if operationID == id {
+                busy = false
+                activeMode = nil
+                drainStartedAt = nil
+            }
         }
+    }
+
+    private var progressCaption: String {
+        guard let progress else {
+            return activeMode == .graceful ? "Draining…" : "Preparing reset…"
+        }
+        switch progress.phase {
+        case "draining":
+            return "Draining — \(progress.inFlight) request\(progress.inFlight == 1 ? "" : "s") in flight…"
+        case "aborting_requests": return "Closing routed requests…"
+        case "counting_bodies": return "Counting captured bodies…"
+        case "counting_traces": return "Counting traces and accounts…"
+        case "counting_harnesses": return "Checking connected harnesses…"
+        case "disconnecting_harnesses": return progress.detail + "…"
+        case "removing_accounts": return "Removing provider accounts…"
+        case "clearing_traces": return "Removing traces and captured bodies…"
+        case "clearing_caches": return "Clearing derived caches…"
+        case "restoring_settings": return "Restoring default settings…"
+        case "complete": return "Reset complete."
+        default: return progress.detail.isEmpty ? "Working…" : progress.detail
+        }
+    }
+
+    private func pollResetProgress(
+        config: DaemonConfig, operationID id: UUID
+    ) -> Task<Void, Never> {
+        Task {
+            let client = AlexandriaClient(config: config)
+            while !Task.isCancelled && operationID == id {
+                if let latest = try? await client.resetProgress(), operationID == id {
+                    progress = latest
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
+    private func cancelGracefulDrain() {
+        guard let config = store.config, activeMode == .graceful else { return }
+        Task {
+            do {
+                _ = try await AlexandriaClient(config: config).cancelResetDrain()
+                operationID = UUID()
+                operationTask?.cancel()
+                busy = false
+                activeMode = nil
+                drainStartedAt = nil
+                progress = nil
+                error = nil
+            } catch {
+                self.error = "Could not cancel graceful reset: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func overrideWithImmediateReset() {
+        operationID = UUID()
+        operationTask?.cancel()
+        applyReset(mode: .immediate)
     }
 }
