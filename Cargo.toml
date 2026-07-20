@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/alex-lar",
   "crates/alex-middleware",
   "crates/alex-core",
   "crates/alex-auth",
@@ -18,6 +19,7 @@ repository = "https://github.com/madhavajay/alex"
 
 [workspace.dependencies]
 alex-middleware = { path = "crates/alex-middleware", version = "0.1.25" }
+alex-lar = { path = "crates/alex-lar", version = "0.1.25" }
 alex-core = { path = "crates/alex-core", version = "0.1.25" }
 alex-auth = { path = "crates/alex-auth", version = "0.1.25" }
 alex-store = { path = "crates/alex-store", version = "0.1.25" }
@@ -52,3 +54,5 @@ regex = "1"
 argon2 = "0.5"
 aes-gcm = "0.10"
 async-trait = "0.1"
+crc32fast = "1"
+thiserror = "2"
