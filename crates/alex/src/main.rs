@@ -3769,6 +3769,7 @@ async fn main() -> Result<()> {
                 );
             }
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let shutdown_state = state.clone();
             let shutdown_task = tokio::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -3785,6 +3786,10 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                 }
                 eprintln!("\ndraining in-flight connections, then shutting down");
+                // Mark daemon lifecycle before waking axum's graceful drain.
+                // Any in-flight provider heartbeat that aborts from here on is
+                // discarded rather than poisoning persisted provider health.
+                shutdown_state.begin_shutdown();
                 let _ = shutdown_tx.send(true);
             });
             let shutdown = || {
@@ -8898,6 +8903,130 @@ fn current_uid() -> String {
         .unwrap_or_default()
 }
 
+/// Decide which discovered daemon PIDs are stale. Kept pure so service install
+/// can prove it never signals either its own CLI process or the newly-managed
+/// service process.
+#[cfg(unix)]
+fn daemon_pids_to_evict(discovered: &[u32], own_pid: u32, service_pid: u32) -> Vec<u32> {
+    let mut pids: Vec<u32> = discovered
+        .iter()
+        .copied()
+        .filter(|pid| *pid != own_pid && *pid != service_pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(unix)]
+fn daemon_process_pids() -> Vec<u32> {
+    // Match any installed/dev path whose executable basename is `alex` or
+    // `alexandria` and whose first argument is the daemon subcommand.
+    let pattern = r"(^|.*/)(alex|alexandria)[[:space:]]+daemon([[:space:]]|$)";
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", pattern])
+        .output()
+    else {
+        eprintln!("warning: pgrep unavailable; could not check for co-bound daemons");
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(target_os = "macos")]
+fn managed_service_pid() -> Option<u32> {
+    match detect_service_state() {
+        ServiceState::LaunchdLoaded { pid: Some(pid) } => u32::try_from(pid).ok(),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn managed_service_pid() -> Option<u32> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property",
+            "MainPID",
+            "--value",
+            "alexandria",
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .flatten()
+        .filter(|pid| *pid != 0)
+}
+
+#[cfg(unix)]
+fn wait_for_managed_service_pid() -> Option<u32> {
+    for _ in 0..20 {
+        if let Some(pid) = managed_service_pid() {
+            return Some(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
+/// TERM stale manually-started daemons after the service is loaded. They may
+/// otherwise remain co-bound through SO_REUSEPORT and serve old code forever.
+#[cfg(unix)]
+fn evict_co_bound_daemons_after_install() {
+    let Some(service_pid) = wait_for_managed_service_pid() else {
+        eprintln!(
+            "warning: managed daemon PID was not available; skipped co-bound daemon eviction"
+        );
+        return;
+    };
+    let own_pid = std::process::id();
+    let stale = daemon_pids_to_evict(&daemon_process_pids(), own_pid, service_pid);
+    if stale.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "evicting co-bound daemon pid(s): {} (keeping service pid {service_pid})",
+        stale
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut signalled = Vec::new();
+    for pid in stale {
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == 0 {
+            signalled.push(pid);
+        } else {
+            eprintln!(
+                "warning: could not SIGTERM co-bound daemon pid {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    for pid in signalled {
+        if process_running(i64::from(pid)).unwrap_or(false) {
+            eprintln!("co-bound daemon pid {pid} was signalled and is still draining");
+        } else {
+            eprintln!("evicted co-bound daemon pid {pid}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn evict_co_bound_daemons_after_install() {}
+
 fn service_install(config: &Config) -> Result<()> {
     let exe = std::env::current_exe()?
         .canonicalize()
@@ -8980,6 +9109,7 @@ fn service_install(config: &Config) -> Result<()> {
     } else {
         anyhow::bail!("service install supports macOS (launchd) and Linux (systemd) only");
     }
+    evict_co_bound_daemons_after_install();
     println!("  {}", service_state_label(&detect_service_state()));
     Ok(())
 }
@@ -11747,6 +11877,16 @@ mod tests {
         assert_eq!(parse_launchctl_pid(out), Some(96513));
         assert_eq!(parse_launchctl_pid("state = running"), None);
         assert_eq!(parse_launchctl_pid(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_install_kill_list_never_contains_own_or_service_pid() {
+        assert_eq!(
+            daemon_pids_to_evict(&[41, 99, 7, 41, 1234], 99, 1234),
+            vec![7, 41]
+        );
+        assert!(daemon_pids_to_evict(&[99, 1234], 99, 1234).is_empty());
     }
 
     #[test]
