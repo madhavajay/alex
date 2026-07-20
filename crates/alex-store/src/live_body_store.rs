@@ -7,7 +7,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::MutexGuard;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alex_lar::{
     read_chunk_record_at, read_file_header, ArchiveReader, ArchiveWriter, BodyManifest,
@@ -974,6 +974,8 @@ impl Store {
         let mut state = match self.lock_live_lar_writer("body", &artifact.owner_id) {
             Ok(state) => state,
             Err(error) => {
+                self.lar_runtime_metrics
+                    .record_write(bytes.len() as u64, true);
                 if let Some(path_column) = replacement {
                     self.publish_legacy_trace_replacement(artifact, path_column, &legacy_path)?;
                 }
@@ -991,7 +993,11 @@ impl Store {
             }
         };
 
-        match self.write_lar_body_locked(&mut state, artifact, &legacy_path, bytes, replacement) {
+        let result =
+            self.write_lar_body_locked(&mut state, artifact, &legacy_path, bytes, replacement);
+        self.lar_runtime_metrics
+            .record_write(bytes.len() as u64, result.is_err());
+        match result {
             Ok(manifest_id) => Ok(LarBodyWriteResult {
                 legacy_path,
                 manifest_id: Some(manifest_id.to_string()),
@@ -1431,10 +1437,16 @@ impl Store {
                 .map(str::as_bytes)
                 .map(Vec::from);
             exchange_data.run_id = capture.run_id.as_deref().map(str::as_bytes).map(Vec::from);
+            let append_started = Instant::now();
             let exchange_id = writer
                 .append_exchange_with_metadata(Exchange::new(exchange_data), metadata.clone())?;
+            self.lar_runtime_metrics
+                .record_append(append_started.elapsed());
             let file_uuid = active.file_uuid.clone();
+            let flush_started = Instant::now();
             let flush = flush_active_pack(active, &checkpoint_config)?;
+            self.lar_runtime_metrics
+                .record_flush(flush_started.elapsed());
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             catalog_capture_headers(&tx, &file_uuid, capture, now_ms())?;
             catalog_capture_exchange(
@@ -1472,7 +1484,10 @@ impl Store {
             if let Some(checkpoint) = flush.checkpoint {
                 publish_checkpoint(&tx, &file_uuid, checkpoint)?;
             }
+            let commit_started = Instant::now();
             tx.commit()?;
+            self.lar_runtime_metrics
+                .record_sqlite_commit(commit_started.elapsed());
             Ok(Some(exchange_id.to_string()))
         })();
         if let Err(error) = &result {
@@ -1684,11 +1699,17 @@ impl Store {
             harness: Some(tool.harness.as_bytes().to_vec()),
             ..ExchangeMetadataData::default()
         };
+        let append_started = Instant::now();
         let exchange_id = active
             .writer
             .append_exchange_with_metadata(exchange, metadata)?;
+        self.lar_runtime_metrics
+            .record_append(append_started.elapsed());
         let file_uuid = active.file_uuid.clone();
+        let flush_started = Instant::now();
         let flush = flush_active_pack(active, &checkpoint_config)?;
+        self.lar_runtime_metrics
+            .record_flush(flush_started.elapsed());
 
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         catalog_capture_exchange(
@@ -1748,7 +1769,10 @@ impl Store {
                updated_at_ms=excluded.updated_at_ms",
             params![tool.session_id, now_ms()],
         )?;
+        let commit_started = Instant::now();
         tx.commit()?;
+        self.lar_runtime_metrics
+            .record_sqlite_commit(commit_started.elapsed());
         Ok(())
     }
 
@@ -1778,9 +1802,16 @@ impl Store {
         if bytes.len() as u64 > state.config.limits.max_body_length {
             bail!("body exceeds configured LAR limit");
         }
+        let chunker_started = Instant::now();
         let chunks = split_body(bytes, state.config.chunker)?;
+        self.lar_runtime_metrics
+            .record_chunker(chunker_started.elapsed());
+        self.lar_runtime_metrics
+            .record_chunk_candidates(chunks.len() as u64, bytes.len() as u64);
         let mut conn = self.conn.lock().unwrap();
+        let hash_started = Instant::now();
         let whole_hash = ChunkHash::blake3(bytes);
+        self.lar_runtime_metrics.record_hash(hash_started.elapsed());
         let existing_manifest: Option<String> = conn
             .query_row(
                 "SELECT manifest_id FROM lar_manifests
@@ -1804,6 +1835,8 @@ impl Store {
             if reconstructed != bytes {
                 bail!("catalog body identity reconstructed to different bytes");
             }
+            self.lar_runtime_metrics
+                .record_whole_body_dedup_hit(bytes.len() as u64);
             if state.config.mode == LarBodyStoreMode::LarWithFallback || replacement.is_some() {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let published_at_ms = now_ms();
@@ -1822,7 +1855,10 @@ impl Store {
                 } else if replacement.is_some() {
                     clear_artifact_publication(&tx, artifact)?;
                 }
+                let commit_started = Instant::now();
                 tx.commit()?;
+                self.lar_runtime_metrics
+                    .record_sqlite_commit(commit_started.elapsed());
             }
             return Ok(id);
         }
@@ -1831,7 +1867,9 @@ impl Store {
         let mut missing = Vec::<(ChunkHash, usize)>::new();
         let mut missing_hashes = HashSet::new();
         for (index, chunk) in chunks.iter().enumerate() {
+            let hash_started = Instant::now();
             let hash = ChunkHash::blake3(chunk);
+            self.lar_runtime_metrics.record_hash(hash_started.elapsed());
             if locations.contains_key(&hash) || !missing_hashes.insert(hash) {
                 continue;
             }
@@ -1841,6 +1879,8 @@ impl Store {
                 missing.push((hash, index));
             }
         }
+        self.lar_runtime_metrics
+            .record_new_chunk_plan(missing.len() as u64);
 
         let mut appended = Vec::new();
         let mut active_size = None;
@@ -1874,10 +1914,27 @@ impl Store {
             )?;
             let path = PathBuf::from(path);
             for (hash, index) in missing {
-                let descriptor = active
+                let observed = active
                     .writer
-                    .append_chunk_record(&chunks[index])
+                    .append_chunk_record_observed(&chunks[index])
                     .map_err(anyhow::Error::new)?;
+                let descriptor = observed.descriptor;
+                self.lar_runtime_metrics
+                    .record_hash(Duration::from_nanos(observed.hash_ns));
+                if observed.compression_ns > 0 {
+                    self.lar_runtime_metrics
+                        .record_compression(Duration::from_nanos(observed.compression_ns));
+                }
+                if observed.append_ns > 0 {
+                    self.lar_runtime_metrics
+                        .record_append(Duration::from_nanos(observed.append_ns));
+                }
+                if !observed.deduplicated {
+                    self.lar_runtime_metrics.record_new_chunk_bytes(
+                        descriptor.uncompressed_length,
+                        descriptor.compressed_length,
+                    );
+                }
                 if descriptor.hash != hash {
                     bail!("live LAR writer returned a mismatched chunk hash");
                 }
@@ -1890,13 +1947,19 @@ impl Store {
                 );
                 appended.push((file_uuid.clone(), descriptor));
             }
-            active_size = Some((file_uuid, flush_active_pack(active, &checkpoint_config)?));
+            let flush_started = Instant::now();
+            let flush = flush_active_pack(active, &checkpoint_config)?;
+            self.lar_runtime_metrics
+                .record_flush(flush_started.elapsed());
+            active_size = Some((file_uuid, flush));
         }
 
         let mut references = Vec::with_capacity(chunks.len());
         let mut logical_offset = 0u64;
         for chunk in &chunks {
+            let hash_started = Instant::now();
             let hash = ChunkHash::blake3(chunk);
+            self.lar_runtime_metrics.record_hash(hash_started.elapsed());
             let descriptor = locations
                 .get(&hash)
                 .context("planned LAR chunk location disappeared")?
@@ -1955,7 +2018,10 @@ impl Store {
         if let Some(path_column) = replacement {
             publish_trace_body_path(&tx, &artifact.owner_id, path_column, legacy_path)?;
         }
+        let commit_started = Instant::now();
         tx.commit()?;
+        self.lar_runtime_metrics
+            .record_sqlite_commit(commit_started.elapsed());
         Ok(manifest.id)
     }
 
@@ -4998,6 +5064,10 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(published, 0);
+            let health = store.lar_health_metrics();
+            assert_eq!(health.state, "degraded");
+            assert_eq!(health.write_failures, 1);
+            assert!(health.last_write_failure_ms.is_some());
 
             let recovered = store
                 .write_body_artifact(

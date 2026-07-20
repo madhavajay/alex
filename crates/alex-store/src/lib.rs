@@ -23,6 +23,7 @@ mod lar_fts;
 mod lar_gc;
 mod lar_grep;
 mod lar_jsonl_import;
+mod lar_observability;
 mod lar_repack;
 mod lar_stage_content;
 mod lar_stream_replay;
@@ -56,6 +57,10 @@ pub use lar_grep::{
     LarRecordGrepMatch, LarRecordGrepReport,
 };
 pub use lar_jsonl_import::{LarJsonlImportOptions, LarJsonlImportReport};
+pub use lar_observability::{
+    LarHealthMetricsSnapshot, LarHistogramBucket, LarLatencySnapshot, LarReadMetricsSnapshot,
+    LarRuntimeMetricsSnapshot, LarWriteMetricsSnapshot,
+};
 pub use lar_repack::{LarRepackCandidate, LarRepackConfig, LarRepackReport};
 pub use lar_stage_content::{
     LarStageArtifactContent, LarStageContentCursor, LarStageContentError,
@@ -866,6 +871,7 @@ pub struct Store {
     live_lar: Mutex<live_body_store::LiveLarCoordinator>,
     live_lar_mode: LarBodyStoreMode,
     live_lar_contention_warning_after: std::time::Duration,
+    lar_runtime_metrics: lar_observability::LarRuntimeMetrics,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -913,6 +919,7 @@ impl Store {
             live_lar: Mutex::new(live_body_store::LiveLarCoordinator::new(lar_config)?),
             live_lar_mode,
             live_lar_contention_warning_after,
+            lar_runtime_metrics: lar_observability::LarRuntimeMetrics::default(),
         };
         if live_lar_mode != LarBodyStoreMode::Legacy {
             if let Err(error) = store.recover_lar_body_store_orphans() {
@@ -2647,6 +2654,14 @@ impl Store {
         Ok(report)
     }
 
+    pub fn lar_runtime_metrics(&self) -> LarRuntimeMetricsSnapshot {
+        self.lar_runtime_metrics.snapshot()
+    }
+
+    pub fn lar_health_metrics(&self) -> LarHealthMetricsSnapshot {
+        self.lar_runtime_metrics.health_snapshot()
+    }
+
     pub fn disk_usage(&self) -> Result<Value> {
         let mut sqlite_bytes = 0u64;
         for suffix in ["", "-wal", "-shm"] {
@@ -2695,6 +2710,9 @@ impl Store {
         let mut lar_catalog_bytes = 0_u64;
         let mut lar_physical_bytes = 0_u64;
         let mut lar_missing_files = 0_u64;
+        let mut lar_offline_files = 0_u64;
+        let mut lar_repairing_files = 0_u64;
+        let mut lar_unavailable_files = 0_u64;
         {
             let mut statement = conn.prepare(
                 "SELECT role, state, COUNT(*), COALESCE(SUM(size_bytes), 0)
@@ -2720,34 +2738,59 @@ impl Store {
             }
         }
         {
-            let mut statement = conn.prepare("SELECT path FROM lar_files")?;
+            let mut statement = conn.prepare("SELECT path, state FROM lar_files")?;
             let paths = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            for path in paths {
+            for (path, state) in paths {
+                let offline = state == "offline";
+                let repairing = state == "repairing";
+                lar_offline_files = lar_offline_files.saturating_add(u64::from(offline));
+                lar_repairing_files = lar_repairing_files.saturating_add(u64::from(repairing));
                 let path = std::path::PathBuf::from(path);
                 let path = if path.is_absolute() {
                     path
                 } else {
                     self.data_dir.join(path)
                 };
-                match std::fs::metadata(path) {
+                let missing = match std::fs::metadata(path) {
                     Ok(metadata) if metadata.is_file() => {
                         lar_physical_bytes = lar_physical_bytes.saturating_add(metadata.len());
+                        false
                     }
-                    _ => lar_missing_files = lar_missing_files.saturating_add(1),
+                    _ => {
+                        lar_missing_files = lar_missing_files.saturating_add(1);
+                        true
+                    }
+                };
+                if missing || offline {
+                    lar_unavailable_files = lar_unavailable_files.saturating_add(1);
                 }
             }
         }
+        let (lar_active_files, lar_active_bytes, lar_oldest_active_created_at_ms): (
+            u64,
+            u64,
+            Option<i64>,
+        ) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0), MIN(created_at_ms)
+               FROM lar_files WHERE state='active'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         let (
             lar_chunks,
             lar_unique_uncompressed_bytes,
             lar_chunk_compressed_bytes,
             lar_unreachable_chunks,
+            lar_quarantined_chunks,
         ) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(uncompressed_length), 0),
                     COALESCE(SUM(compressed_length), 0),
-                    COALESCE(SUM(CASE WHEN state='unreachable' THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN state='unreachable' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END), 0)
                FROM lar_chunks",
             [],
             |row| {
@@ -2756,14 +2799,23 @@ impl Store {
                     row.get::<_, u64>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
                 ))
             },
         )?;
-        let (lar_manifests, lar_unique_manifest_bytes): (u64, u64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(total_length), 0)
-               FROM lar_manifests WHERE state='ready'",
+        let (
+            lar_manifests,
+            lar_unique_manifest_bytes,
+            lar_unreachable_manifests,
+            lar_quarantined_manifests,
+        ): (u64, u64, u64, u64) = conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN state='ready' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state='ready' THEN total_length ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state='unreachable' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END), 0)
+               FROM lar_manifests",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let (lar_artifact_refs, lar_referenced_body_bytes): (u64, u64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(m.total_length), 0)
@@ -2784,6 +2836,201 @@ impl Store {
             "SELECT COUNT(*), MAX(created_at_ms) FROM lar_checkpoints",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let current_ms = Utc::now().timestamp_millis();
+        let lar_active_file_max_age_ms = lar_oldest_active_created_at_ms
+            .map(|created| current_ms.saturating_sub(created).max(0) as u64);
+        let lar_latest_checkpoint_age_ms = lar_latest_checkpoint_ms
+            .map(|created| current_ms.saturating_sub(created).max(0) as u64);
+        let mut lar_active_file_status = Vec::new();
+        {
+            let mut statement = conn.prepare(
+                "SELECT f.file_uuid, f.path, COALESCE(f.size_bytes, 0), f.created_at_ms,
+                        MAX(c.created_at_ms), MAX(c.append_offset)
+                   FROM lar_files f LEFT JOIN lar_checkpoints c ON c.file_uuid=f.file_uuid
+                  WHERE f.state='active'
+                  GROUP BY f.file_uuid, f.path, f.size_bytes, f.created_at_ms
+                  ORDER BY f.created_at_ms, f.file_uuid",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    file_uuid,
+                    path,
+                    catalog_size_bytes,
+                    created_at_ms,
+                    checkpoint_at_ms,
+                    checkpoint_append_offset,
+                ) = row?;
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.data_dir.join(path)
+                };
+                let actual_size_bytes = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .map(|metadata| metadata.len());
+                lar_active_file_status.push(json!({
+                    "file_uuid": file_uuid,
+                    "catalog_size_bytes": catalog_size_bytes,
+                    "actual_size_bytes": actual_size_bytes,
+                    "created_at_ms": created_at_ms,
+                    "age_ms": current_ms.saturating_sub(created_at_ms).max(0) as u64,
+                    "checkpoint_at_ms": checkpoint_at_ms,
+                    "checkpoint_age_ms": checkpoint_at_ms
+                        .map(|created| current_ms.saturating_sub(created).max(0) as u64),
+                    "checkpoint_append_offset": checkpoint_append_offset,
+                    "bytes_since_checkpoint": checkpoint_append_offset
+                        .map(|offset| catalog_size_bytes.saturating_sub(offset)),
+                }));
+            }
+        }
+        let (gc_runs, gc_active_runs, gc_failed_runs, gc_bytes_reclaimed): (u64, u64, u64, u64) =
+            conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN state IN ('marking','sweeping','repacking') THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(bytes_reclaimed), 0)
+                   FROM lar_gc_runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let (
+            repack_runs,
+            repack_active_runs,
+            repack_failed_runs,
+            repack_logical_bytes_reclaimed,
+            repack_physical_bytes_reclaimed,
+        ): (u64, u64, u64, u64, u64) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN state IN ('copying','copied','switched') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(logical_bytes_reclaimed), 0),
+                    COALESCE(SUM(physical_bytes_reclaimed), 0)
+               FROM lar_repack_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        let (search_index_state, search_index_updated_at_ms): (String, i64) = conn.query_row(
+            "SELECT state, updated_at_ms FROM lar_normalized_index_meta WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let search_artifacts: u64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM lar_trace_artifacts
+                  WHERE validation_state='validated' AND manifest_id IS NOT NULL)
+                + (SELECT COALESCE(SUM(
+                       CASE WHEN req_headers_json IS NOT NULL THEN 1 ELSE 0 END
+                       + CASE WHEN resp_headers_json IS NOT NULL THEN 1 ELSE 0 END
+                     ), 0) FROM traces)",
+            [],
+            |row| row.get(0),
+        )?;
+        let search_covered_body_artifacts: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM lar_trace_artifacts a
+              JOIN lar_normalized_artifact_state s
+                ON s.owner_kind=a.owner_kind AND s.owner_id=a.owner_id
+               AND s.artifact_kind=a.artifact_kind AND s.stage_id=a.stage_id
+               AND s.manifest_id=a.manifest_id
+             WHERE a.validation_state='validated' AND a.manifest_id IS NOT NULL
+               AND s.schema_version=?1",
+            [LAR_NORMALIZED_INDEX_SCHEMA_VERSION],
+            |row| row.get(0),
+        )?;
+        let search_covered_header_artifacts: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM lar_normalized_artifact_state s JOIN traces t
+                ON s.owner_kind='trace' AND s.owner_id=t.id
+             WHERE s.schema_version=?1 AND s.stage_id='' AND s.manifest_id=''
+               AND ((s.artifact_kind='request_headers' AND t.req_headers_json IS NOT NULL)
+                 OR (s.artifact_kind='response_headers' AND t.resp_headers_json IS NOT NULL))",
+            [LAR_NORMALIZED_INDEX_SCHEMA_VERSION],
+            |row| row.get(0),
+        )?;
+        let search_covered_artifacts =
+            search_covered_body_artifacts.saturating_add(search_covered_header_artifacts);
+        let search_pending_artifacts = search_artifacts.saturating_sub(search_covered_artifacts);
+        let search_oldest_pending_body_at_ms: Option<i64> = conn.query_row(
+            "SELECT MIN(a.validated_at_ms) FROM lar_trace_artifacts a
+             WHERE a.validation_state='validated' AND a.manifest_id IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM lar_normalized_artifact_state s
+                  WHERE s.owner_kind=a.owner_kind AND s.owner_id=a.owner_id
+                    AND s.artifact_kind=a.artifact_kind AND s.stage_id=a.stage_id
+                    AND s.manifest_id=a.manifest_id AND s.schema_version=?1
+               )",
+            [LAR_NORMALIZED_INDEX_SCHEMA_VERSION],
+            |row| row.get(0),
+        )?;
+        let search_oldest_pending_header_at_ms: Option<i64> = conn.query_row(
+            "SELECT MIN(ts_request_ms) FROM (
+               SELECT t.ts_request_ms FROM traces t
+                WHERE t.req_headers_json IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM lar_normalized_artifact_state s
+                   WHERE s.owner_kind='trace' AND s.owner_id=t.id
+                     AND s.artifact_kind='request_headers' AND s.stage_id=''
+                     AND s.manifest_id='' AND s.schema_version=?1)
+               UNION ALL
+               SELECT t.ts_request_ms FROM traces t
+                WHERE t.resp_headers_json IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM lar_normalized_artifact_state s
+                   WHERE s.owner_kind='trace' AND s.owner_id=t.id
+                     AND s.artifact_kind='response_headers' AND s.stage_id=''
+                     AND s.manifest_id='' AND s.schema_version=?1)
+             )",
+            [LAR_NORMALIZED_INDEX_SCHEMA_VERSION],
+            |row| row.get(0),
+        )?;
+        let search_oldest_pending_at_ms = [
+            search_oldest_pending_body_at_ms,
+            search_oldest_pending_header_at_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let search_index_lag_ms = search_oldest_pending_at_ms
+            .map(|created| current_ms.saturating_sub(created).max(0) as u64)
+            .unwrap_or(0);
+        let corrupt_migration_items: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM lar_migration_items
+              WHERE validation_state='failed' AND error_kind='corrupt'",
+            [],
+            |row| row.get(0),
+        )?;
+        let lar_orphan_chunks: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM lar_chunks c
+              WHERE c.state='ready' AND NOT EXISTS (
+                SELECT 1 FROM lar_manifest_chunks mc
+                 WHERE mc.hash_algorithm=c.hash_algorithm AND mc.chunk_hash=c.chunk_hash
+              )",
+            [],
+            |row| row.get(0),
+        )?;
+        let lar_orphan_manifests: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM lar_manifests m
+              WHERE m.state='ready'
+                AND NOT EXISTS (SELECT 1 FROM lar_trace_artifacts a
+                                 WHERE a.manifest_id=m.manifest_id)
+                AND NOT EXISTS (SELECT 1 FROM lar_stage_records s
+                                 WHERE s.request_body_manifest_ref=m.manifest_id
+                                    OR s.response_body_manifest_ref=m.manifest_id)
+                AND NOT EXISTS (SELECT 1 FROM lar_conversation_entry_ranges r
+                                 WHERE r.manifest_id=m.manifest_id)
+                AND NOT EXISTS (SELECT 1 FROM lar_migration_items i
+                                 WHERE i.destination_manifest_id=m.manifest_id)",
+            [],
+            |row| row.get(0),
         )?;
         let referenced_to_unique_ratio = if lar_unique_uncompressed_bytes == 0 {
             1.0
@@ -2806,12 +3053,25 @@ impl Store {
                 "files": lar_files,
                 "catalog_bytes": lar_catalog_bytes,
                 "physical_bytes": lar_physical_bytes,
-                "missing_or_offline_files": lar_missing_files,
+                "missing_files": lar_missing_files,
+                "offline_files": lar_offline_files,
+                "repairing_files": lar_repairing_files,
+                "missing_or_offline_files": lar_unavailable_files,
+                "active_files": lar_active_files,
+                "active_bytes": lar_active_bytes,
+                "active_file_max_age_ms": lar_active_file_max_age_ms,
+                "active_file_status": lar_active_file_status,
                 "chunks": lar_chunks,
                 "unreachable_chunks": lar_unreachable_chunks,
+                "orphan_chunks": lar_orphan_chunks,
+                "quarantined_chunks": lar_quarantined_chunks,
                 "unique_uncompressed_bytes": lar_unique_uncompressed_bytes,
                 "compressed_chunk_bytes": lar_chunk_compressed_bytes,
                 "manifests": lar_manifests,
+                "unreachable_manifests": lar_unreachable_manifests,
+                "orphan_manifests": lar_orphan_manifests,
+                "quarantined_manifests": lar_quarantined_manifests,
+                "corrupt_migration_items": corrupt_migration_items,
                 "unique_manifest_bytes": lar_unique_manifest_bytes,
                 "artifact_references": lar_artifact_refs,
                 "referenced_body_bytes": lar_referenced_body_bytes,
@@ -2822,6 +3082,32 @@ impl Store {
                 "stages": lar_stages,
                 "checkpoints": lar_checkpoints,
                 "latest_checkpoint_ms": lar_latest_checkpoint_ms,
+                "latest_checkpoint_age_ms": lar_latest_checkpoint_age_ms,
+                "runtime": self.lar_runtime_metrics.snapshot(),
+                "maintenance": {
+                    "gc": {
+                        "runs": gc_runs,
+                        "active_runs": gc_active_runs,
+                        "failed_runs": gc_failed_runs,
+                        "bytes_reclaimed": gc_bytes_reclaimed,
+                    },
+                    "repack": {
+                        "runs": repack_runs,
+                        "active_runs": repack_active_runs,
+                        "failed_runs": repack_failed_runs,
+                        "logical_bytes_reclaimed": repack_logical_bytes_reclaimed,
+                        "physical_bytes_reclaimed": repack_physical_bytes_reclaimed,
+                    },
+                },
+                "search_index": {
+                    "state": search_index_state,
+                    "updated_at_ms": search_index_updated_at_ms,
+                    "artifacts": search_artifacts,
+                    "covered_artifacts": search_covered_artifacts,
+                    "pending_artifacts": search_pending_artifacts,
+                    "oldest_pending_at_ms": search_oldest_pending_at_ms,
+                    "lag_ms": search_index_lag_ms,
+                },
             },
         }))
     }
@@ -3599,18 +3885,26 @@ mod tests {
         )
         .unwrap();
         let body = br#"{"messages":[{"role":"user","content":"repeated body"}]}"#;
+        let mut manifest_id = None;
         for trace_id in ["lar-du-a", "lar-du-b"] {
-            store
+            let result = store
                 .write_body_artifact(
                     &LarBodyArtifact::trace(trace_id, "client_request"),
                     "request.json",
                     body,
                 )
                 .unwrap();
+            manifest_id = result.manifest_id.or(manifest_id);
             store
                 .insert_trace(&trace(trace_id, 1000, Some("lar-du-session")))
                 .unwrap();
         }
+        assert_eq!(
+            store
+                .read_lar_manifest_body(manifest_id.as_deref().unwrap())
+                .unwrap(),
+            body
+        );
 
         let usage = store.disk_usage().unwrap();
         assert_eq!(usage["lar"]["manifests"], 1);
@@ -3620,6 +3914,107 @@ mod tests {
         assert!(usage["lar"]["physical_bytes"].as_u64().unwrap() > 0);
         assert_eq!(usage["lar"]["missing_or_offline_files"], 0);
         assert!(usage["lar"]["referenced_to_unique_ratio"].as_f64().unwrap() > 1.0);
+        assert_eq!(usage["lar"]["missing_files"], 0);
+        assert_eq!(usage["lar"]["offline_files"], 0);
+        assert_eq!(usage["lar"]["repairing_files"], 0);
+        assert_eq!(usage["lar"]["active_files"], 1);
+        assert_eq!(
+            usage["lar"]["active_file_status"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(usage["lar"]["runtime"]["writes"]["operations"], 2);
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["successful_operations"],
+            2
+        );
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["attempted_body_bytes"],
+            body.len() * 2
+        );
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["committed_body_bytes"],
+            body.len() * 2
+        );
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["whole_body_dedup_hits"],
+            1
+        );
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["whole_body_dedup_ratio"],
+            0.5
+        );
+        assert_eq!(usage["lar"]["runtime"]["writes"]["chunk_dedup_ratio"], 0.5);
+        assert_eq!(usage["lar"]["runtime"]["reads"]["operations"], 1);
+        assert_eq!(
+            usage["lar"]["runtime"]["reads"]["reconstructed_bytes"],
+            body.len()
+        );
+        assert_eq!(
+            usage["lar"]["runtime"]["writes"]["chunker_latency"]["histogram"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(usage["lar"]["maintenance"]["gc"]["runs"], 0);
+        assert_eq!(usage["lar"]["maintenance"]["repack"]["runs"], 0);
+        assert_eq!(usage["lar"]["search_index"]["pending_artifacts"], 0);
+        assert_eq!(usage["lar"]["orphan_chunks"], 0);
+        assert_eq!(usage["lar"]["orphan_manifests"], 0);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE lar_files SET state='offline'", [])
+            .unwrap();
+        let offline = store.disk_usage().unwrap();
+        assert_eq!(offline["lar"]["missing_files"], 0);
+        assert_eq!(offline["lar"]["offline_files"], 1);
+        assert_eq!(offline["lar"]["missing_or_offline_files"], 1);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE lar_files SET state='repairing'", [])
+            .unwrap();
+        let repairing = store.disk_usage().unwrap();
+        assert_eq!(repairing["lar"]["offline_files"], 0);
+        assert_eq!(repairing["lar"]["repairing_files"], 1);
+        assert_eq!(repairing["lar"]["missing_files"], 0);
+    }
+
+    #[test]
+    fn disk_usage_reports_search_index_coverage_and_lag() {
+        let store = Store::open(tmpdir("lar-search-index-lag")).unwrap();
+        let mut record = trace("search-lag", 1_000, None);
+        record.req_headers_json = Some(r#"{"content-type":"application/json"}"#.into());
+        store.insert_trace(&record).unwrap();
+
+        let covered = store.disk_usage().unwrap();
+        assert_eq!(covered["lar"]["search_index"]["artifacts"], 1);
+        assert_eq!(covered["lar"]["search_index"]["covered_artifacts"], 1);
+        assert_eq!(covered["lar"]["search_index"]["pending_artifacts"], 0);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM lar_normalized_artifact_state
+                  WHERE owner_kind='trace' AND owner_id='search-lag'",
+                [],
+            )
+            .unwrap();
+        let pending = store.disk_usage().unwrap();
+        assert_eq!(pending["lar"]["search_index"]["covered_artifacts"], 0);
+        assert_eq!(pending["lar"]["search_index"]["pending_artifacts"], 1);
+        assert_eq!(
+            pending["lar"]["search_index"]["oldest_pending_at_ms"],
+            1_000
+        );
+        assert!(pending["lar"]["search_index"]["lag_ms"].as_u64().unwrap() > 0);
     }
 
     #[test]

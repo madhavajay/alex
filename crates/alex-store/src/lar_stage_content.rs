@@ -883,7 +883,23 @@ impl Store {
                 output.push((id.clone(), LarArtifactBatchRead::Missing));
                 continue;
             };
+            let started = std::time::Instant::now();
             let read = reconstruct_plan(plan, &locations, &mut files, &mut chunks, &limits);
+            let elapsed = started.elapsed();
+            let (bytes, failed) = match &read {
+                LarArtifactBatchRead::Read(bytes) => (bytes.len() as u64, false),
+                LarArtifactBatchRead::Error { .. }
+                | LarArtifactBatchRead::ArchiveUnavailable(_) => (0, true),
+                LarArtifactBatchRead::Missing | LarArtifactBatchRead::Truncated { .. } => {
+                    (0, false)
+                }
+            };
+            self.lar_runtime_metrics.record_read(
+                bytes,
+                (bytes > 0).then_some(elapsed),
+                elapsed,
+                failed,
+            );
             output.push((id.clone(), read));
         }
         Ok(output)

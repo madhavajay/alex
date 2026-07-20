@@ -973,6 +973,32 @@ Expose metrics and status for:
 LAR failures must not be reported as generic daemon-down state when metadata and
 health endpoints remain available.
 
+Implemented status contract:
+
+- `/admin/storage` returns persistent catalog/file totals plus process-local
+  runtime metrics under `lar.runtime`. Runtime measurements carry a `since_ms`
+  boundary and use 32 fixed exponential buckets (count/total/max and bounded
+  p50/p95/p99 estimates), so telemetry memory is constant.
+- Write counters distinguish attempted/committed body bytes and newly appended
+  unique/compressed chunk bytes. Whole-body reuse and byte-weighted chunk reuse
+  are separate ratios; failed publication never masquerades as committed data.
+- Live body and exchange metadata paths observe chunking, hashing, compression,
+  append, metadata-page flush/checkpoint/sync, and SQLite publication commits.
+  Ordinary streaming reads, batched Trace Browser reads, stage-content reads,
+  and stream-replay range reads feed the same TTFT/throughput family.
+- Active files report catalog/actual size, age, checkpoint age/offset, and bytes
+  since checkpoint. Missing, offline, and repairing files remain distinct.
+  Quarantined/unreachable objects and corrupt legacy migration inputs are
+  reported separately.
+- Persistent status aggregates GC and repack run/failure/reclaimed-byte totals
+  (logical and physical reclamation are distinct), normalized-index coverage
+  and oldest-pending lag, and migration counters. `/admin/lar/migration` also
+  derives progress, elapsed time, wall-clock throughput, and ETA from durable
+  job timestamps.
+- `/health` remains cheap and returns top-level `status: ok` while exposing an
+  independent process-local `lar.state` and safe read/write failure counters.
+  A recoverable LAR failure therefore does not present as daemon unavailability.
+
 ## 18. Benchmark and conformance corpus
 
 Build an anonymized corpus derived from real shapes, including:
@@ -1118,14 +1144,13 @@ work, even when a narrower prototype exists.
 - [x] Reuse one manifest for identical stages.
 - [x] Move hashing/compression/parsing to bounded blocking workers.
 - [x] Add pack rotation and periodic checkpoints.
-- [ ] Add the complete live health and storage metric set from section 17.
-      The health surface currently reports bounded-worker queue wait/work and
-      failure counters. Storage status reports logical/unique bytes, dedup
-      ratios, checkpoint/file state, corruption/unreachable counts, migration
-      progress, and offline archives. Runtime histograms for
-      chunker/hash/compression, append/flush/SQLite commit, read TTFT and
-      reconstruction, GC/repack reclamation, and search-index lag remain to be
-      instrumented before this item is complete.
+- [x] Add the complete live health and storage metric set from section 17.
+      Fixed-size process-local histograms cover live write phases and the
+      interactive read paths without retaining per-trace samples. Persistent
+      storage status covers byte-weighted dedup, active file/checkpoint ages,
+      object/file health, migration progress/rate/ETA, GC/repack reclamation,
+      and normalized-index lag. Daemon health remains independent from the
+      separately reported LAR degradation state.
 - [x] Add feature flags for read, write, dual-write, and fallback modes.
 
 ### Phase 3 — legacy importer and startup migration

@@ -174,6 +174,10 @@ CREATE TABLE IF NOT EXISTS lar_stage_records (
 );
 CREATE INDEX IF NOT EXISTS lar_stage_records_trace
   ON lar_stage_records(trace_id, capture_sequence);
+CREATE INDEX IF NOT EXISTS lar_stage_records_request_manifest
+  ON lar_stage_records(request_body_manifest_ref);
+CREATE INDEX IF NOT EXISTS lar_stage_records_response_manifest
+  ON lar_stage_records(response_body_manifest_ref);
 
 -- Trace-to-exchange ownership is explicit rather than inferred from stages:
 -- an exchange may contain zero stages, and content-addressed stages may be
@@ -330,6 +334,8 @@ CREATE INDEX IF NOT EXISTS lar_migration_items_job_state
   ON lar_migration_items(job_id, state, updated_at_ms);
 CREATE INDEX IF NOT EXISTS lar_migration_items_owner
   ON lar_migration_items(owner_kind, owner_id, artifact_kind);
+CREATE INDEX IF NOT EXISTS lar_migration_items_destination_manifest
+  ON lar_migration_items(destination_manifest_id);
 
 CREATE TABLE IF NOT EXISTS lar_gc_runs (
   run_id                   TEXT PRIMARY KEY,
@@ -498,6 +504,10 @@ pub struct LarMigrationJob {
     pub state: String,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
+    pub started_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
     pub discovered_count: u64,
     pub pending_count: u64,
     pub migrated_count: u64,
@@ -625,16 +635,20 @@ fn migration_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LarMigrationJo
         state: row.get(1)?,
         lease_owner: row.get(2)?,
         lease_expires_at_ms: row.get(3)?,
-        discovered_count: nonnegative_u64(row.get(4)?, "discovered_count")?,
-        pending_count: nonnegative_u64(row.get(5)?, "pending_count")?,
-        migrated_count: nonnegative_u64(row.get(6)?, "migrated_count")?,
-        skipped_count: nonnegative_u64(row.get(7)?, "skipped_count")?,
-        failed_count: nonnegative_u64(row.get(8)?, "failed_count")?,
-        bytes_read: nonnegative_u64(row.get(9)?, "bytes_read")?,
-        unique_bytes_written: nonnegative_u64(row.get(10)?, "unique_bytes_written")?,
-        bytes_deduplicated: nonnegative_u64(row.get(11)?, "bytes_deduplicated")?,
-        last_committed_cursor: row.get(12)?,
-        last_error: row.get(13)?,
+        started_at_ms: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+        completed_at_ms: row.get(7)?,
+        discovered_count: nonnegative_u64(row.get(8)?, "discovered_count")?,
+        pending_count: nonnegative_u64(row.get(9)?, "pending_count")?,
+        migrated_count: nonnegative_u64(row.get(10)?, "migrated_count")?,
+        skipped_count: nonnegative_u64(row.get(11)?, "skipped_count")?,
+        failed_count: nonnegative_u64(row.get(12)?, "failed_count")?,
+        bytes_read: nonnegative_u64(row.get(13)?, "bytes_read")?,
+        unique_bytes_written: nonnegative_u64(row.get(14)?, "unique_bytes_written")?,
+        bytes_deduplicated: nonnegative_u64(row.get(15)?, "bytes_deduplicated")?,
+        last_committed_cursor: row.get(16)?,
+        last_error: row.get(17)?,
     })
 }
 
@@ -715,6 +729,7 @@ impl Store {
         )?;
         conn.query_row(
             "SELECT job_id, state, lease_owner, lease_expires_at_ms,
+                    started_at_ms, created_at_ms, updated_at_ms, completed_at_ms,
                     discovered_count, pending_count, migrated_count, skipped_count, failed_count,
                     bytes_read, unique_bytes_written, bytes_deduplicated,
                     last_committed_cursor, last_error
@@ -783,6 +798,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT job_id, state, lease_owner, lease_expires_at_ms,
+                    started_at_ms, created_at_ms, updated_at_ms, completed_at_ms,
                     discovered_count, pending_count, migrated_count, skipped_count, failed_count,
                     bytes_read, unique_bytes_written, bytes_deduplicated,
                     last_committed_cursor, last_error
@@ -798,6 +814,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT job_id, state, lease_owner, lease_expires_at_ms,
+                    started_at_ms, created_at_ms, updated_at_ms, completed_at_ms,
                     discovered_count, pending_count, migrated_count, skipped_count, failed_count,
                     bytes_read, unique_bytes_written, bytes_deduplicated,
                     last_committed_cursor, last_error

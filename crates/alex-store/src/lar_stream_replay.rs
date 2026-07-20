@@ -240,6 +240,7 @@ impl Store {
             .iter()
             .map(|range| (range.byte_offset, range.byte_length))
             .collect::<Vec<_>>();
+        let read_started = std::time::Instant::now();
         let payloads = if byte_ranges.is_empty() {
             Vec::new()
         } else if reader.manifest(&manifest_id).is_some() {
@@ -254,6 +255,18 @@ impl Store {
         } else {
             self.read_lar_manifest_ranges(&stage.manifest_id, &byte_ranges)?
         };
+        if !byte_ranges.is_empty() {
+            let elapsed = read_started.elapsed();
+            let bytes = payloads.iter().fold(0_u64, |total, payload| {
+                total.saturating_add(payload.len() as u64)
+            });
+            self.lar_runtime_metrics.record_read(
+                bytes,
+                (bytes > 0).then_some(elapsed),
+                elapsed,
+                false,
+            );
+        }
         let events = selected
             .into_iter()
             .zip(payloads)

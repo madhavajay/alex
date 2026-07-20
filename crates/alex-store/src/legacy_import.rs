@@ -3602,41 +3602,50 @@ impl Store {
         manifest_id: &str,
         output: &mut W,
     ) -> Result<u64> {
-        if let Some(written) = self.write_catalog_manifest_body(manifest_id, output)? {
-            return Ok(written);
-        }
-        let (path, file_uuid, file_state): (String, String, String) = {
-            let conn = self.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT f.path, f.file_uuid, f.state FROM lar_manifests m
-                 JOIN lar_files f ON f.file_uuid=m.file_uuid
-                 WHERE m.manifest_id=?1 AND m.state='ready'",
-                [manifest_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .with_context(|| format!("locating LAR manifest {manifest_id}"))?
-        };
-        let path = resolve_source_path(&self.data_dir, &path);
-        if !matches!(file_state.as_str(), "active" | "sealed") {
-            return Err(
-                LarArchiveUnavailableError::offline(file_uuid, path.to_string_lossy()).into(),
-            );
-        }
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(
-                    LarArchiveUnavailableError::missing(file_uuid, path.to_string_lossy()).into(),
+        let mut observed = crate::lar_observability::ObservedWriter::new(output);
+        let result: Result<u64> = (|| {
+            if let Some(written) = self.write_catalog_manifest_body(manifest_id, &mut observed)? {
+                return Ok(written);
+            }
+            let (path, file_uuid, file_state): (String, String, String) = {
+                let conn = self.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT f.path, f.file_uuid, f.state FROM lar_manifests m
+                     JOIN lar_files f ON f.file_uuid=m.file_uuid
+                     WHERE m.manifest_id=?1 AND m.state='ready'",
+                    [manifest_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
+                .with_context(|| format!("locating LAR manifest {manifest_id}"))?
+            };
+            let path = resolve_source_path(&self.data_dir, &path);
+            if !matches!(file_state.as_str(), "active" | "sealed") {
+                return Err(
+                    LarArchiveUnavailableError::offline(file_uuid, path.to_string_lossy()).into(),
+                );
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("opening LAR archive at {}", path.display()))
-            }
-        };
-        let id = ManifestId::from_str(manifest_id)?;
-        let mut reader = ArchiveReader::open(file, Limits::default())?;
-        reader.write_body(&id, output).map_err(Into::into)
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(LarArchiveUnavailableError::missing(
+                        file_uuid,
+                        path.to_string_lossy(),
+                    )
+                    .into())
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("opening LAR archive at {}", path.display()))
+                }
+            };
+            let id = ManifestId::from_str(manifest_id)?;
+            let mut reader = ArchiveReader::open(file, Limits::default())?;
+            reader.write_body(&id, &mut observed).map_err(Into::into)
+        })();
+        let (bytes, ttft, elapsed) = observed.observation();
+        self.lar_runtime_metrics
+            .record_read(bytes, ttft, elapsed, result.is_err());
+        result
     }
 
     /// Resolve a batch of mixed legacy/LAR bodies under one reconstructed-byte
@@ -3960,6 +3969,7 @@ impl Store {
             }
         }
         for ((path, file_uuid), manifests) in archives {
+            let open_started = Instant::now();
             let opened = File::open(&path)
                 .with_context(|| format!("opening LAR archive at {}", path.display()))
                 .and_then(|file| {
@@ -3968,8 +3978,15 @@ impl Store {
             match opened {
                 Ok(mut reader) => {
                     for (index, manifest_id) in manifests {
-                        output[index] = match reader.read_body(&manifest_id) {
-                            Ok(bytes) => LarArtifactBatchRead::Read(bytes),
+                        let mut bytes = Vec::new();
+                        let mut observed =
+                            crate::lar_observability::ObservedWriter::new(&mut bytes);
+                        let read = reader.write_body(&manifest_id, &mut observed);
+                        let (written, ttft, elapsed) = observed.observation();
+                        self.lar_runtime_metrics
+                            .record_read(written, ttft, elapsed, read.is_err());
+                        output[index] = match read {
+                            Ok(_) => LarArtifactBatchRead::Read(bytes),
                             Err(error) => LarArtifactBatchRead::Error {
                                 kind: "archive_read".into(),
                                 detail: error.to_string(),
@@ -3980,6 +3997,8 @@ impl Store {
                 Err(error) => {
                     let missing = !path.exists();
                     for (index, _) in manifests {
+                        self.lar_runtime_metrics
+                            .record_read(0, None, open_started.elapsed(), true);
                         output[index] = if missing {
                             LarArtifactBatchRead::ArchiveUnavailable(
                                 LarArchiveUnavailableError::missing(

@@ -2884,6 +2884,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "lar_storage_workers": state.lar_storage_metrics.snapshot(
             state.lar_storage_permits.available_permits()
         ),
+        "lar": state.store.lar_health_metrics(),
         "launchd_socket_activation": std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION")
             .as_deref() == Some(std::ffi::OsStr::new("1")),
     }))
@@ -4242,6 +4243,34 @@ async fn admin_storage(State(state): State<Arc<AppState>>) -> Response {
 }
 
 fn lar_migration_job_json(job: &alex_store::LarMigrationJob) -> Value {
+    let completed = job
+        .migrated_count
+        .saturating_add(job.skipped_count)
+        .saturating_add(job.failed_count);
+    let total = job.discovered_count;
+    let progress_percent = if total == 0 {
+        100.0
+    } else {
+        completed.min(total) as f64 * 100.0 / total as f64
+    };
+    let started_at_ms = job.started_at_ms.unwrap_or(job.created_at_ms);
+    let ended_at_ms = job
+        .completed_at_ms
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let elapsed_ms = ended_at_ms.saturating_sub(started_at_ms).max(0) as u64;
+    let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+    let throughput_bytes_per_second = if elapsed_seconds > 0.0 {
+        (job.bytes_read as f64 / elapsed_seconds) as u64
+    } else {
+        0
+    };
+    let throughput_artifacts_per_second = if elapsed_seconds > 0.0 {
+        completed as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+    let eta_seconds = (throughput_artifacts_per_second > 0.0 && job.pending_count > 0)
+        .then(|| (job.pending_count as f64 / throughput_artifacts_per_second).ceil() as u64);
     json!({
         "job_id": job.job_id,
         "state": job.state,
@@ -4253,6 +4282,17 @@ fn lar_migration_job_json(job: &alex_store::LarMigrationJob) -> Value {
         "bytes_read": job.bytes_read,
         "unique_bytes": job.unique_bytes_written,
         "deduplicated_bytes": job.bytes_deduplicated,
+        "started_at_ms": job.started_at_ms,
+        "created_at_ms": job.created_at_ms,
+        "updated_at_ms": job.updated_at_ms,
+        "completed_at_ms": job.completed_at_ms,
+        "completed_items": completed,
+        "total_items": total,
+        "progress_percent": progress_percent,
+        "elapsed_ms": elapsed_ms,
+        "throughput_bytes_per_second": throughput_bytes_per_second,
+        "throughput_artifacts_per_second": throughput_artifacts_per_second,
+        "eta_seconds": eta_seconds,
         "last_committed_cursor": job.last_committed_cursor,
         "last_error": job.last_error,
         "lease_owner": job.lease_owner,
@@ -16394,6 +16434,31 @@ mod tests {
             LAR_STORAGE_WORKERS
         );
         assert_eq!(body["lar_storage_workers"]["join_failures"], 0);
+        assert_eq!(body["lar"]["state"], "ok");
+        assert_eq!(body["lar"]["write_failures"], 0);
+        assert_eq!(body["lar"]["read_failures"], 0);
+    }
+
+    #[tokio::test]
+    async fn admin_storage_exposes_bounded_lar_observability() {
+        let state = test_state("lar-storage-observability");
+        let (status, body) = response_json(admin_storage(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["lar"]["runtime"]["writes"]["operations"], 0);
+        assert_eq!(
+            body["lar"]["runtime"]["writes"]["chunker_latency"]["histogram"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(body["lar"]["maintenance"]["gc"]["runs"], 0);
+        assert_eq!(body["lar"]["maintenance"]["repack"]["runs"], 0);
+        assert_eq!(body["lar"]["search_index"]["pending_artifacts"], 0);
+        assert_eq!(body["lar"]["missing_files"], 0);
+        assert_eq!(body["lar"]["offline_files"], 0);
+        assert_eq!(body["lar"]["repairing_files"], 0);
+        assert_eq!(body["lar_storage_workers"]["capacity"], LAR_STORAGE_WORKERS);
     }
 
     #[tokio::test]
@@ -17397,6 +17462,13 @@ mod tests {
         assert_eq!(paused["job_id"], "migration-1");
         assert_eq!(paused["state"], "paused");
         assert_eq!(paused["paused"], true);
+        assert_eq!(paused["progress_percent"], 100.0);
+        assert_eq!(paused["total_items"], 0);
+        assert_eq!(paused["completed_items"], 0);
+        assert!(paused["elapsed_ms"].is_number());
+        assert!(paused["throughput_bytes_per_second"].is_number());
+        assert!(paused["throughput_artifacts_per_second"].is_number());
+        assert!(paused.get("eta_seconds").is_some());
 
         let (status, resumed) =
             response_json(admin_lar_migration_resume(State(state.clone())).await).await;

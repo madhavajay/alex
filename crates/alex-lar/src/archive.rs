@@ -610,6 +610,17 @@ pub struct ChunkRecordDescriptor {
     pub compressed_length: u64,
 }
 
+/// Phase measurements for one direct chunk append. Durations are nanoseconds
+/// so callers can aggregate them without retaining per-chunk observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkRecordAppendResult {
+    pub descriptor: ChunkRecordDescriptor,
+    pub deduplicated: bool,
+    pub hash_ns: u64,
+    pub compression_ns: u64,
+    pub append_ns: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointRecordDescriptor {
     pub frame_offset: u64,
@@ -649,6 +660,10 @@ pub fn read_chunk_record_at<R: Read + Seek>(
     stored.decompress(limits)
 }
 
+fn elapsed_ns(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_nanos().try_into().unwrap_or(u64::MAX)
+}
+
 #[derive(Clone, Debug)]
 struct StoredChunk {
     hash: ChunkHash,
@@ -657,10 +672,10 @@ struct StoredChunk {
 }
 
 impl StoredChunk {
-    fn from_bytes(bytes: &[u8], level: i32) -> Result<Self> {
+    fn from_bytes_with_hash(bytes: &[u8], hash: ChunkHash, level: i32) -> Result<Self> {
         let compressed = zstd::stream::encode_all(Cursor::new(bytes), level).map_err(Error::Io)?;
         Ok(Self {
-            hash: ChunkHash::blake3(bytes),
+            hash,
             uncompressed_length: bytes.len() as u64,
             compressed,
         })
@@ -1626,6 +1641,16 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
     /// when this pack already contains it. Cross-pack deduplication is a
     /// catalog concern; this method intentionally never copies external data.
     pub fn append_chunk_record(&mut self, bytes: &[u8]) -> Result<ChunkRecordDescriptor> {
+        Ok(self.append_chunk_record_observed(bytes)?.descriptor)
+    }
+
+    /// Append one pre-chunked range and return bounded phase measurements for
+    /// live storage observability. This preserves the same collision checks
+    /// and byte-for-byte duplicate verification as `append_chunk_record`.
+    pub fn append_chunk_record_observed(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<ChunkRecordAppendResult> {
         if bytes.len() as u64 > self.limits.max_chunk_uncompressed {
             return Err(Error::Limit {
                 what: "uncompressed chunk",
@@ -1633,7 +1658,9 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
                 limit: self.limits.max_chunk_uncompressed,
             });
         }
+        let hash_started = std::time::Instant::now();
         let hash = ChunkHash::blake3(bytes);
+        let hash_ns = elapsed_ns(hash_started.elapsed());
         if let Some(location) = self.chunks.get(&hash).cloned() {
             let existing = self
                 .read_chunk_at(location.frame_offset)?
@@ -1641,25 +1668,41 @@ impl<W: Read + Write + Seek> ArchiveWriter<W> {
             if existing != bytes {
                 return Err(Error::Invalid("BLAKE3 chunk collision"));
             }
-            return Ok(ChunkRecordDescriptor {
-                hash,
-                frame_offset: location.frame_offset,
-                uncompressed_length: location.uncompressed_length,
-                compressed_length: location.compressed_length,
+            return Ok(ChunkRecordAppendResult {
+                descriptor: ChunkRecordDescriptor {
+                    hash,
+                    frame_offset: location.frame_offset,
+                    uncompressed_length: location.uncompressed_length,
+                    compressed_length: location.compressed_length,
+                },
+                deduplicated: true,
+                hash_ns,
+                compression_ns: 0,
+                append_ns: 0,
             });
         }
-        let chunk = StoredChunk::from_bytes(bytes, self.header.zstd_level as i32)?;
+        let compression_started = std::time::Instant::now();
+        let chunk = StoredChunk::from_bytes_with_hash(bytes, hash, self.header.zstd_level as i32)?;
+        let compression_ns = elapsed_ns(compression_started.elapsed());
+        let append_started = std::time::Instant::now();
         let location = ChunkLocation {
             frame_offset: self.append_frame(RecordType::Chunk, chunk.encode())?,
             uncompressed_length: chunk.uncompressed_length,
             compressed_length: chunk.compressed.len() as u64,
         };
+        let append_ns = elapsed_ns(append_started.elapsed());
         self.chunks.insert(hash, location.clone());
-        Ok(ChunkRecordDescriptor {
-            hash,
-            frame_offset: location.frame_offset,
-            uncompressed_length: location.uncompressed_length,
-            compressed_length: location.compressed_length,
+        Ok(ChunkRecordAppendResult {
+            descriptor: ChunkRecordDescriptor {
+                hash,
+                frame_offset: location.frame_offset,
+                uncompressed_length: location.uncompressed_length,
+                compressed_length: location.compressed_length,
+            },
+            deduplicated: false,
+            hash_ns,
+            compression_ns,
+            append_ns,
         })
     }
     pub fn header(&self) -> &FileHeader {
