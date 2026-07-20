@@ -485,7 +485,7 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
     };
     let mut spans = vec![
         Span::styled(
-            " ◆ ALEXANDRIA ",
+            " ◆ ALEX ",
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("v{version} "), Style::default().fg(PURPLE)),

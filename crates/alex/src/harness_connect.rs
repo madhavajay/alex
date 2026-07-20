@@ -608,7 +608,7 @@ pub(crate) async fn tool_capture_cmd(
             .json(&json!({"enabled": enabled}))
             .send()
             .await
-            .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+            .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or_default();
         if !status.is_success() {
@@ -634,7 +634,7 @@ pub(crate) async fn tool_capture_cmd(
         .header("x-api-key", &config.local_key)
         .send()
         .await
-        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+        .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or_default();
     if !status.is_success() {
@@ -846,7 +846,7 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
 
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -972,7 +972,7 @@ async fn connect_claude(
     }
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1050,7 +1050,7 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
     }
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1133,7 +1133,7 @@ async fn connect_grok(config: &Config, config_dir: Option<PathBuf>, json_out: bo
     }
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1206,7 +1206,7 @@ async fn connect_kimi(config: &Config, config_dir: Option<PathBuf>, json_out: bo
     }
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1279,7 +1279,7 @@ async fn connect_amp(config: &Config, config_dir: Option<PathBuf>, json_out: boo
     }
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -4621,7 +4621,7 @@ async fn fetch_models_with_harness_key(
         .header("x-api-key", api_key)
         .send()
         .await
-        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+        .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
     let status = response.status();
     let value: Value = response.json().await.unwrap_or_default();
     if !status.is_success() {
@@ -4657,7 +4657,7 @@ async fn admin_get(
         .await
         .with_context(|| {
             format!(
-                "could not reach the alexandria daemon at {}",
+                "could not reach the Alex daemon at {}",
                 normalized_base_url(config)
             )
         })?;
@@ -4687,7 +4687,7 @@ async fn admin_send(
     }
     let resp = req.send().await.with_context(|| {
         format!(
-            "could not reach the alexandria daemon at {}",
+            "could not reach the Alex daemon at {}",
             normalized_base_url(config)
         )
     })?;

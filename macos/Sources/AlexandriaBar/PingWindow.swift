@@ -34,7 +34,7 @@ final class PingModel {
         startedAt = Date()
         finishedAt = nil
         task?.cancel()
-        lines.append("$ alexandria ping \(target)")
+        lines.append("$ alex ping \(target)")
         task = Task { [weak self] in
             guard let self else { return }
             let result = await DaemonController.runStreaming(
@@ -177,7 +177,7 @@ struct PingView: View {
         }
     }
 
-    /// Client-side classification of streamed `alexandria ping` lines
+    /// Client-side classification of streamed `alex ping` lines
     /// (✓/✗ marks survive; ANSI is stripped upstream).
     private enum LineKind {
         case command

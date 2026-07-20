@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 Usage: ./install-macos.sh [--bar-only] [--no-bar] [...install.sh flags]
 
-Installs the full Alexandria macOS experience:
-  1. the alexandria binary + daemon      (delegates to ./install.sh)
-  2. AlexandriaBar menu-bar app          (macos/, builds + installs to ~/Applications)
+Installs the full Alex macOS experience:
+  1. the alex binary + daemon             (delegates to ./install.sh)
+  2. Alex menu-bar app                    (macos/, builds + installs to ~/Applications)
 
   --bar-only   only build/install the menu bar app
   --no-bar     only run install.sh (skip the menu bar app)

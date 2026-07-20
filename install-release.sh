@@ -65,7 +65,7 @@ install_macos() {
     exit 1
   fi
 
-  say "Installing the Alexandria CLI/daemon and menu-bar app with Homebrew…"
+  say "Installing the Alex CLI, daemon, and menu-bar app with Homebrew…"
   quit_alex_apps
   brew install madhavajay/alex/alex
   # Recover from a broken/renamed cask record before installing. Casks from
@@ -94,7 +94,7 @@ install_macos() {
   fi
   open_app
 
-  say "Alexandria is installed. The daemon is registered to run at login."
+  say "Alex is installed. The daemon is registered to run at login."
   say "Next: alex auth import"
 }
 
@@ -103,7 +103,7 @@ install_linux() {
   case "$machine" in
     x86_64|amd64) platform="linux-x86_64" ;;
     *)
-      say "No precompiled Alexandria Linux binary is published for $machine yet." >&2
+      say "No precompiled Alex Linux binary is published for $machine yet." >&2
       exit 1
       ;;
   esac
@@ -112,7 +112,7 @@ install_linux() {
   tag="${latest_url##*/}"
   version="${tag#v}"
   if [ -z "$version" ] || [ "$version" = "$latest_url" ]; then
-    say "Could not determine the latest Alexandria release." >&2
+    say "Could not determine the latest Alex release." >&2
     exit 1
   fi
 
@@ -121,7 +121,7 @@ install_linux() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alex-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
-  say "Downloading Alexandria $version for Linux x86_64…"
+  say "Downloading Alex $version for Linux x86_64…"
   curl -fsSL "$base/$asset" -o "$tmp/$asset"
   curl -fsSL "$base/$asset.sha256" -o "$tmp/$asset.sha256"
 
@@ -138,9 +138,9 @@ install_linux() {
   install -m 0755 "$tmp/alexandria" "$INSTALL_DIR/alexandria"
 
   if "$INSTALL_DIR/alex" service install; then
-    say "Alexandria is installed and its user service is running."
+    say "Alex is installed and its user service is running."
   else
-    say "Alexandria is installed, but the user service could not be registered."
+    say "Alex is installed, but the user service could not be registered."
     say "Start it manually with: $INSTALL_DIR/alex daemon --background"
   fi
   say "Next: $INSTALL_DIR/alex auth import"

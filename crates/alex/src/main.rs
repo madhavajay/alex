@@ -108,7 +108,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a harness's alexandria config and revoke its keys
+    /// Remove a harness's Alex-managed config and revoke its keys
     Disconnect {
         harness: String,
         #[arg(long)]
@@ -8473,7 +8473,7 @@ async fn keys_list_cmd(config: &Config, all: bool, json: bool) -> Result<()> {
     }
     if rows.is_empty() {
         println!(
-            "no run keys{} — mint one with `alexandria keys mint`",
+            "no run keys{} — mint one with `alex keys mint`",
             if all { "" } else { " (try --all)" }
         );
         return Ok(());
@@ -8864,7 +8864,7 @@ fn dario_status_routing_text(body: &serde_json::Value) -> String {
 
 fn print_banner(host: &str, port: u16, local_key: &str) {
     let base = daemon_connect_base_url(host, port);
-    eprintln!("{}", ui::divider("alexandria"));
+    eprintln!("{}", ui::divider("alex"));
     eprintln!(
         "daemon listening on {}",
         ui::bold(&ui::lapis(&format!("http://{host}:{port}")))
@@ -10568,7 +10568,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         println!(
             "  {} {}",
             ui::pad_right(&ui::purple("binary"), 10),
-            ui::dim("alexandria not found on PATH")
+            ui::dim("alex not found on PATH")
         );
     } else {
         let mut first = true;

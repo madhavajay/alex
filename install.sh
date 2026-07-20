@@ -126,7 +126,7 @@ if [ "$UPGRADE" = "1" ]; then
   OLD_PIDS=""
   for pid in $LISTENER_PIDS; do
     if ! is_alex_daemon_pid "$pid"; then
-      echo "refusing to replace non-Alexandria listener pid $pid on port $PORT" >&2
+      echo "refusing to replace non-Alex listener pid $pid on port $PORT" >&2
       exit 1
     fi
     OLD_PIDS="${OLD_PIDS}${OLD_PIDS:+ }$pid"
@@ -175,7 +175,7 @@ if [ "$UPGRADE" = "1" ]; then
     for pid in $OLD_PIDS; do
       [ "$pid" = "$NEW_PID" ] && continue
       if ! is_alex_daemon_pid "$pid"; then
-        echo "not TERMing pid $pid: it is no longer an Alexandria daemon" >&2
+        echo "not TERMing pid $pid: it is no longer an Alex daemon" >&2
         continue
       fi
       kill -TERM "$pid" 2>/dev/null || true
