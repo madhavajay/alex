@@ -81,6 +81,34 @@ Remote trace flags are `--trace-url` (alias `--alex-url`), `--run-id`,
 `--trace-key-file`, and `--allow-insecure-http`. Environment alternatives are
 documented in [Configuration](configuration.md).
 
+## `resume`
+
+Start a new interactive Pi, Claude, or Codex session from a captured session's
+conversation history:
+
+```bash
+alex resume 5d56cba0-b43b-464a-99fb-5bbca2bcc46d
+alex resume 5d56cba0-b43b-464a-99fb-5bbca2bcc46d codex
+alex resume shared-id pi --source-harness claude --dry-run
+```
+
+Omitting the target harness opens a picker containing installed, connected
+harnesses. `--source-harness` disambiguates an ID captured from more than one
+harness. `--dry-run` validates and summarizes the fork without launching or
+printing the conversation.
+
+The fork keeps ordered user/assistant messages and tool calls/results while
+excluding captured system instructions and hidden reasoning. If the prompt is
+too large for safe process launch, the oldest complete entries are omitted and
+the summary reports that truncation.
+
+Alex traces do not currently store a canonical working directory. The launcher
+therefore accepts a directory only from exact local harness metadata: Pi's
+session header, Claude's latest matching transcript record, or Codex's latest
+state database (with rollout files as a fallback). The directory must still
+exist. Otherwise the command visibly falls back to the directory from which
+`alex resume` was invoked.
+
 ## `env`
 
 Print model-client exports using the configured host, port, and local key.

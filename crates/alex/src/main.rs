@@ -20,6 +20,7 @@ mod dario;
 mod harness_connect;
 mod harness_e2e;
 mod reset;
+mod resume;
 mod selfupdate;
 mod status;
 mod telegram;
@@ -208,6 +209,19 @@ enum Command {
         /// Arguments passed to the harness after `--`
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Fork a captured session into a new interactive harness session
+    Resume {
+        /// Captured Alex session ID to use as the starting context
+        session: String,
+        /// Connected harness to launch; omit to choose interactively
+        harness: Option<String>,
+        /// Disambiguate a source session ID shared by more than one harness
+        #[arg(long)]
+        source_harness: Option<String>,
+        /// Reconstruct and validate the fork without launching a harness
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Check for and install a newer alex release
     Update {
@@ -4277,6 +4291,21 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Command::Resume {
+            session,
+            harness,
+            source_harness,
+            dry_run,
+        } => {
+            resume::resume_cmd(
+                &config,
+                &session,
+                harness.as_deref(),
+                source_harness.as_deref(),
+                dry_run,
+            )
+            .await?;
+        }
         Command::Connect {
             harness,
             config_dir,
@@ -7533,7 +7562,7 @@ async fn traces_reattach_cmd(
 }
 
 const TRACE_BACKUP_FORMAT: &str = "alex-trace-backup";
-const TRACE_BACKUP_VERSION: u32 = 1;
+const TRACE_BACKUP_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7617,9 +7646,11 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         let traces_jsonl = staging.join("traces.jsonl");
         let tool_calls_jsonl = staging.join("tool_calls.jsonl");
         let heartbeats_jsonl = staging.join("heartbeats.jsonl");
+        let session_forks_jsonl = staging.join("session_forks.jsonl");
         write_trace_jsonl(&traces_jsonl, &rows.traces)?;
         write_trace_jsonl(&tool_calls_jsonl, &rows.tool_calls)?;
         write_trace_jsonl(&heartbeats_jsonl, &rows.heartbeats)?;
+        write_trace_jsonl(&session_forks_jsonl, &rows.session_forks)?;
 
         let mut body_files = Vec::new();
         collect_trace_body_files(
@@ -7647,6 +7678,7 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         archive.append_path_with_name(&traces_jsonl, "traces.jsonl")?;
         archive.append_path_with_name(&tool_calls_jsonl, "tool_calls.jsonl")?;
         archive.append_path_with_name(&heartbeats_jsonl, "heartbeats.jsonl")?;
+        archive.append_path_with_name(&session_forks_jsonl, "session_forks.jsonl")?;
         for (source, archive_path) in &body_files {
             archive.append_path_with_name(source, archive_path)?;
         }
@@ -7669,10 +7701,11 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         format!("moving completed archive to {}", destination.display())
     })?;
     println!(
-        "exported {} traces, {} tool calls, {} heartbeats, {} body files to {} ({})",
+        "exported {} traces, {} tool calls, {} heartbeats, {} session forks, {} body files to {} ({})",
         rows.traces.len(),
         rows.tool_calls.len(),
         rows.heartbeats.len(),
+        rows.session_forks.len(),
         body_files,
         destination.display(),
         ui::human_bytes(archive_bytes)
@@ -7729,7 +7762,13 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             });
             let known_root_file = matches!(
                 path.to_str(),
-                Some("manifest.json" | "traces.jsonl" | "tool_calls.jsonl" | "heartbeats.jsonl")
+                Some(
+                    "manifest.json"
+                        | "traces.jsonl"
+                        | "tool_calls.jsonl"
+                        | "heartbeats.jsonl"
+                        | "session_forks.jsonl"
+                )
             );
             let is_body = root == Some("bodies") && path.components().count() > 1;
             let entry_type = entry.header().entry_type();
@@ -7751,7 +7790,12 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             std::io::copy(&mut entry, &mut output)?;
         }
 
-        for required in ["manifest.json", "traces.jsonl", "tool_calls.jsonl", "heartbeats.jsonl"] {
+        for required in [
+            "manifest.json",
+            "traces.jsonl",
+            "tool_calls.jsonl",
+            "heartbeats.jsonl",
+        ] {
             if !seen.contains(Path::new(required)) {
                 bail!("trace backup is missing {required}");
             }
@@ -7760,17 +7804,30 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             staging.join("manifest.json"),
         )?)
         .context("invalid trace backup manifest")?;
-        if manifest.format != TRACE_BACKUP_FORMAT || manifest.version != TRACE_BACKUP_VERSION {
+        if manifest.format != TRACE_BACKUP_FORMAT
+            || !(1..=TRACE_BACKUP_VERSION).contains(&manifest.version)
+        {
             bail!(
                 "unsupported trace backup format/version: {}/{}",
                 manifest.format,
                 manifest.version
             );
         }
+        if manifest.version >= 2 && !seen.contains(Path::new("session_forks.jsonl")) {
+            bail!("trace backup is missing session_forks.jsonl");
+        }
         let rows = alex_store::TraceBackupRows {
             traces: read_trace_jsonl(&staging.join("traces.jsonl"), "traces.jsonl")?,
             tool_calls: read_trace_jsonl(&staging.join("tool_calls.jsonl"), "tool_calls.jsonl")?,
             heartbeats: read_trace_jsonl(&staging.join("heartbeats.jsonl"), "heartbeats.jsonl")?,
+            session_forks: if manifest.version >= 2 {
+                read_trace_jsonl(
+                    &staging.join("session_forks.jsonl"),
+                    "session_forks.jsonl",
+                )?
+            } else {
+                Vec::new()
+            },
         };
         let counts = store.import_trace_backup_rows(&rows)?;
 
@@ -7798,14 +7855,16 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(&staging);
     let (counts, bodies_imported, bodies_skipped) = result?;
     println!(
-        "imported {} traces, {} tool calls, {} heartbeats, {} body files; skipped {} traces, {} tool calls, {} heartbeats, {} body files",
+        "imported {} traces, {} tool calls, {} heartbeats, {} session forks, {} body files; skipped {} traces, {} tool calls, {} heartbeats, {} session forks, {} body files",
         counts.traces_imported,
         counts.tool_calls_imported,
         counts.heartbeats_imported,
+        counts.session_forks_imported,
         bodies_imported,
         counts.traces_skipped,
         counts.tool_calls_skipped,
         counts.heartbeats_skipped,
+        counts.session_forks_skipped,
         bodies_skipped,
     );
     Ok(())
@@ -11283,13 +11342,27 @@ mod tests {
         let _ = std::fs::remove_file(&archive);
         let config = test_config(data_dir.clone());
         let store = Store::open(data_dir.clone()).unwrap();
-        for (id, ts, body) in [
-            ("archive-trace-1", 1_000, b"request one".as_slice()),
-            ("archive-trace-2", 2_000, b"request two".as_slice()),
+        for (id, ts, body, session_id, harness) in [
+            (
+                "archive-trace-1",
+                1_000,
+                b"request one".as_slice(),
+                "archive-source",
+                "pi",
+            ),
+            (
+                "archive-trace-2",
+                2_000,
+                b"request two".as_slice(),
+                "archive-target",
+                "codex",
+            ),
         ] {
             let mut trace = alex_core::TraceRecord {
                 id: id.into(),
                 ts_request_ms: ts,
+                session_id: Some(session_id.into()),
+                harness: Some(harness.into()),
                 ..Default::default()
             };
             trace.req_body_path = Some(store.write_body(id, "request.json", body).unwrap());
@@ -11318,6 +11391,16 @@ mod tests {
         store
             .insert_heartbeat(900, "anthropic", None, true, Some(200), 10, "ok")
             .unwrap();
+        store
+            .record_session_fork(&alex_store::SessionForkRecord {
+                target_harness: "codex".into(),
+                target_session_id: "archive-target".into(),
+                source_harness: "pi".into(),
+                source_session_id: "archive-source".into(),
+                created_ms: 1_500,
+                recovered_cwd: Some("/work/archive-source".into()),
+            })
+            .unwrap();
 
         traces_backup_export_cmd(&config, &archive, false).unwrap();
         assert!(traces_backup_export_cmd(&config, &archive, false).is_err());
@@ -11329,6 +11412,18 @@ mod tests {
         let counts = store.reset_counts().unwrap();
         assert_eq!((counts.traces, counts.heartbeats, counts.body_files), (2, 1, 3));
         assert_eq!(store.session_tool_calls("archive-session").unwrap().len(), 1);
+        let sessions = store.sessions(None, 0).unwrap();
+        let source = sessions
+            .iter()
+            .find(|row| row["session_id"] == "archive-source")
+            .unwrap();
+        let target = sessions
+            .iter()
+            .find(|row| row["session_id"] == "archive-target")
+            .unwrap();
+        assert_eq!(source["fork_count"], 1);
+        assert_eq!(target["forked_from_session_id"], "archive-source");
+        assert_eq!(target["recovered_cwd"], "/work/archive-source");
         for id in ["archive-trace-1", "archive-trace-2"] {
             let path = store.get_trace(id).unwrap().unwrap()["req_body_path"]
                 .as_str()

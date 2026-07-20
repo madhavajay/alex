@@ -211,6 +211,22 @@ CREATE TABLE IF NOT EXISTS session_lineage (
 CREATE INDEX IF NOT EXISTS session_lineage_parent
   ON session_lineage(harness, parent_session_id);
 
+-- Explicit user-initiated session forks are separate from subagent lineage:
+-- they may cross harnesses and are created by `alex resume`, not lifecycle
+-- hooks. A target session can have one source, while a source can be forked
+-- any number of times.
+CREATE TABLE IF NOT EXISTS session_forks (
+  target_harness    TEXT NOT NULL,
+  target_session_id TEXT NOT NULL,
+  source_harness    TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  created_ms        INTEGER NOT NULL,
+  recovered_cwd     TEXT,
+  PRIMARY KEY (target_harness, target_session_id)
+);
+CREATE INDEX IF NOT EXISTS session_forks_source
+  ON session_forks(source_harness, source_session_id);
+
 -- Tool activity is deliberately separate from model traces: Pi reports it
 -- asynchronously, and a model turn can have zero or many tool calls.
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -289,12 +305,21 @@ const BACKUP_TOOL_CALL_COLS: &[&str] = &[
 const BACKUP_HEARTBEAT_COLS: &[&str] = &[
     "ts_ms", "provider", "account_id", "ok", "status", "latency_ms", "message",
 ];
+const BACKUP_SESSION_FORK_COLS: &[&str] = &[
+    "target_harness",
+    "target_session_id",
+    "source_harness",
+    "source_session_id",
+    "created_ms",
+    "recovered_cwd",
+];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TraceBackupRows {
     pub traces: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub heartbeats: Vec<Value>,
+    pub session_forks: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -305,6 +330,8 @@ pub struct TraceImportCounts {
     pub tool_calls_skipped: u64,
     pub heartbeats_imported: u64,
     pub heartbeats_skipped: u64,
+    pub session_forks_imported: u64,
+    pub session_forks_skipped: u64,
 }
 
 fn sqlite_row_json(row: &rusqlite::Row<'_>, columns: &[&str]) -> rusqlite::Result<Value> {
@@ -623,6 +650,20 @@ pub struct ToolCallRecord {
     pub result_body_path: Option<String>,
 }
 
+/// Durable provenance for a user-initiated session fork. Unlike
+/// `session_lineage`, the source and target may belong to different harnesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionForkRecord {
+    pub target_harness: String,
+    pub target_session_id: String,
+    pub source_harness: String,
+    pub source_session_id: String,
+    pub created_ms: i64,
+    /// Native session directory recovered and validated by the resume launcher,
+    /// when exact harness metadata is still available locally.
+    pub recovered_cwd: Option<String>,
+}
+
 impl Default for TraceFilter {
     fn default() -> Self {
         Self {
@@ -816,11 +857,17 @@ impl Store {
             std::fs::remove_dir_all(&bodies)
                 .with_context(|| format!("removing captured bodies at {}", bodies.display()))?;
         }
-        conn.execute_batch("DELETE FROM tool_calls; DELETE FROM traces; DELETE FROM heartbeats;")?;
+        conn.execute_batch(
+            "DELETE FROM session_forks;
+             DELETE FROM tool_calls;
+             DELETE FROM traces;
+             DELETE FROM heartbeats;",
+        )?;
         Ok(())
     }
 
-    /// Export the three trace-history tables as lossless JSON values. Body
+    /// Export trace history and session-fork provenance as lossless JSON
+    /// values. Body
     /// paths owned by this store are made portable relative to `data_dir`.
     pub fn export_trace_backup_rows(&self) -> Result<TraceBackupRows> {
         let mut conn = self.conn.lock().unwrap();
@@ -844,6 +891,12 @@ impl Store {
                 BACKUP_HEARTBEAT_COLS,
                 "ts_ms, provider",
             )?,
+            session_forks: export_table_rows(
+                &transaction,
+                "session_forks",
+                BACKUP_SESSION_FORK_COLS,
+                "created_ms, target_harness, target_session_id",
+            )?,
         };
         transaction.commit()?;
         for row in &mut rows.traces {
@@ -859,7 +912,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// Restore trace-history rows without modifying rows already present.
+    /// Restore trace-history and session-fork rows without modifying rows
+    /// already present.
     /// Trace and tool-call uniqueness is enforced by SQLite; heartbeats use
     /// equality across their complete row because that table has no key.
     pub fn import_trace_backup_rows(&self, rows: &TraceBackupRows) -> Result<TraceImportCounts> {
@@ -919,6 +973,13 @@ impl Store {
             &rows.tool_calls,
             &mut counts.tool_calls_imported,
             &mut counts.tool_calls_skipped,
+        )?;
+        insert_rows(
+            "session_forks",
+            BACKUP_SESSION_FORK_COLS,
+            &rows.session_forks,
+            &mut counts.session_forks_imported,
+            &mut counts.session_forks_skipped,
         )?;
 
         let heartbeat_match = format!(
@@ -1338,6 +1399,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Create or replace the source provenance for a target session. Replaying
+    /// the same record is idempotent, while a corrected record for the same
+    /// target updates all source metadata atomically.
+    pub fn record_session_fork(&self, record: &SessionForkRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_forks
+                (target_harness, target_session_id, source_harness,
+                 source_session_id, created_ms, recovered_cwd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(target_harness, target_session_id) DO UPDATE SET
+                source_harness = excluded.source_harness,
+                source_session_id = excluded.source_session_id,
+                created_ms = excluded.created_ms,
+                recovered_cwd = excluded.recovered_cwd",
+            params![
+                record.target_harness,
+                record.target_session_id,
+                record.source_harness,
+                record.source_session_id,
+                record.created_ms,
+                record.recovered_cwd,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn sessions(&self, since_ms: Option<i64>, limit: usize) -> Result<Vec<Value>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
@@ -1466,6 +1554,29 @@ impl Store {
                 row["subagent_started_ms"] = json!(started_ms);
                 row["subagent_stopped_ms"] = json!(stopped_ms);
             }
+            let fork = conn
+                .query_row(
+                    "SELECT source_session_id, source_harness, created_ms, recovered_cwd
+                     FROM session_forks
+                     WHERE target_session_id = ?1 AND (?2 IS NULL OR target_harness = ?2)
+                     ORDER BY created_ms DESC LIMIT 1",
+                    params![session_id, harness],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((source_session_id, source_harness, created_ms, recovered_cwd)) = fork {
+                row["forked_from_session_id"] = json!(source_session_id);
+                row["forked_from_harness"] = json!(source_harness);
+                row["forked_at_ms"] = json!(created_ms);
+                row["recovered_cwd"] = json!(recovered_cwd);
+            }
             let child_count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM session_lineage
                  WHERE parent_session_id = ?1 AND (?2 IS NULL OR harness = ?2)",
@@ -1473,6 +1584,13 @@ impl Store {
                 |r| r.get(0),
             )?;
             row["child_count"] = json!(child_count);
+            let fork_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_forks
+                 WHERE source_session_id = ?1 AND (?2 IS NULL OR source_harness = ?2)",
+                params![session_id, harness],
+                |r| r.get(0),
+            )?;
+            row["fork_count"] = json!(fork_count);
             if let Some(display) = session_display_fields(row).as_object() {
                 for (key, value) in display {
                     row[key] = value.clone();
@@ -2546,6 +2664,185 @@ mod tests {
         assert_eq!(child["subagent_started_ms"], 1500);
         assert_eq!(child["subagent_stopped_ms"], 3500);
         assert_eq!(child["child_count"], 1);
+    }
+
+    #[test]
+    fn session_forks_annotate_cross_harness_sources_and_targets() {
+        let store = Store::open(tmpdir("session-forks-cross-harness")).unwrap();
+        for (id, session_id, harness, ts) in [
+            ("root-trace", "root-session", "claude", 1_000),
+            ("source-trace", "source-session", "claude", 2_000),
+            ("target-trace", "target-session", "codex", 3_000),
+        ] {
+            let mut row = trace(id, ts, None);
+            row.session_id = Some(session_id.into());
+            row.harness = Some(harness.into());
+            store.insert_trace(&row).unwrap();
+        }
+        store
+            .record_harness_event(
+                "claude",
+                &json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": "root-session",
+                    "agent_id": "source-session",
+                }),
+                1_500,
+            )
+            .unwrap();
+        store
+            .record_session_fork(&SessionForkRecord {
+                target_harness: "codex".into(),
+                target_session_id: "target-session".into(),
+                source_harness: "claude".into(),
+                source_session_id: "source-session".into(),
+                created_ms: 2_500,
+                recovered_cwd: Some("/work/original".into()),
+            })
+            .unwrap();
+
+        let sessions = store.sessions(None, 0).unwrap();
+        let source = sessions
+            .iter()
+            .find(|row| row["session_id"] == "source-session")
+            .unwrap();
+        assert_eq!(source["parent_session_id"], "root-session");
+        assert_eq!(source["subagent_started_ms"], 1_500);
+        assert_eq!(source["fork_count"], 1);
+
+        let target = sessions
+            .iter()
+            .find(|row| row["session_id"] == "target-session")
+            .unwrap();
+        assert_eq!(target["forked_from_session_id"], "source-session");
+        assert_eq!(target["forked_from_harness"], "claude");
+        assert_eq!(target["forked_at_ms"], 2_500);
+        assert_eq!(target["recovered_cwd"], "/work/original");
+        assert_eq!(target["child_count"], 0);
+        assert_eq!(target["fork_count"], 0);
+    }
+
+    #[test]
+    fn session_fork_upsert_replaces_target_provenance() {
+        let store = Store::open(tmpdir("session-fork-upsert")).unwrap();
+        for (id, session_id, harness, ts) in [
+            ("first-source-trace", "first-source", "claude", 1_000),
+            ("second-source-trace", "second-source", "pi", 2_000),
+            ("target-trace", "target", "codex", 3_000),
+        ] {
+            let mut row = trace(id, ts, None);
+            row.session_id = Some(session_id.into());
+            row.harness = Some(harness.into());
+            store.insert_trace(&row).unwrap();
+        }
+        let first = SessionForkRecord {
+            target_harness: "codex".into(),
+            target_session_id: "target".into(),
+            source_harness: "claude".into(),
+            source_session_id: "first-source".into(),
+            created_ms: 2_500,
+            recovered_cwd: Some("/work/first".into()),
+        };
+        let corrected = SessionForkRecord {
+            source_harness: "pi".into(),
+            source_session_id: "second-source".into(),
+            created_ms: 2_750,
+            recovered_cwd: None,
+            ..first.clone()
+        };
+        store.record_session_fork(&first).unwrap();
+        store.record_session_fork(&corrected).unwrap();
+        store.record_session_fork(&corrected).unwrap();
+
+        let backup = store.export_trace_backup_rows().unwrap();
+        assert_eq!(backup.session_forks.len(), 1);
+        assert_eq!(backup.session_forks[0]["source_harness"], "pi");
+        assert_eq!(
+            backup.session_forks[0]["source_session_id"],
+            "second-source"
+        );
+        assert_eq!(backup.session_forks[0]["created_ms"], 2_750);
+        assert_eq!(backup.session_forks[0]["recovered_cwd"], Value::Null);
+
+        let sessions = store.sessions(None, 0).unwrap();
+        let first_source = sessions
+            .iter()
+            .find(|row| row["session_id"] == "first-source")
+            .unwrap();
+        let second_source = sessions
+            .iter()
+            .find(|row| row["session_id"] == "second-source")
+            .unwrap();
+        let target = sessions
+            .iter()
+            .find(|row| row["session_id"] == "target")
+            .unwrap();
+        assert_eq!(first_source["fork_count"], 0);
+        assert_eq!(second_source["fork_count"], 1);
+        assert_eq!(target["forked_from_session_id"], "second-source");
+        assert_eq!(target["forked_at_ms"], 2_750);
+        assert_eq!(target["recovered_cwd"], Value::Null);
+    }
+
+    #[test]
+    fn session_forks_reset_and_backup_round_trip() {
+        let store = Store::open(tmpdir("session-fork-backup")).unwrap();
+        let mut source = trace("source-trace", 1_000, None);
+        source.session_id = Some("source".into());
+        source.harness = Some("claude".into());
+        let mut target = trace("target-trace", 2_000, None);
+        target.session_id = Some("target".into());
+        target.harness = Some("codex".into());
+        store.insert_trace(&source).unwrap();
+        store.insert_trace(&target).unwrap();
+        store
+            .record_session_fork(&SessionForkRecord {
+                target_harness: "codex".into(),
+                target_session_id: "target".into(),
+                source_harness: "claude".into(),
+                source_session_id: "source".into(),
+                created_ms: 1_500,
+                recovered_cwd: Some("/work/source".into()),
+            })
+            .unwrap();
+
+        let backup = store.export_trace_backup_rows().unwrap();
+        assert_eq!(backup.session_forks.len(), 1);
+        store.clear_traces_and_bodies().unwrap();
+
+        // Reusing the same session ids after reset must not inherit stale fork
+        // provenance.
+        store.insert_trace(&source).unwrap();
+        store.insert_trace(&target).unwrap();
+        let reset_sessions = store.sessions(None, 0).unwrap();
+        let reset_source = reset_sessions
+            .iter()
+            .find(|row| row["session_id"] == "source")
+            .unwrap();
+        let reset_target = reset_sessions
+            .iter()
+            .find(|row| row["session_id"] == "target")
+            .unwrap();
+        assert_eq!(reset_source["fork_count"], 0);
+        assert!(reset_target.get("forked_from_session_id").is_none());
+
+        let imported = store.import_trace_backup_rows(&backup).unwrap();
+        assert_eq!(imported.session_forks_imported, 1);
+        let restored = store.sessions(None, 0).unwrap();
+        let restored_source = restored
+            .iter()
+            .find(|row| row["session_id"] == "source")
+            .unwrap();
+        let restored_target = restored
+            .iter()
+            .find(|row| row["session_id"] == "target")
+            .unwrap();
+        assert_eq!(restored_source["fork_count"], 1);
+        assert_eq!(restored_target["forked_from_session_id"], "source");
+        assert_eq!(restored_target["recovered_cwd"], "/work/source");
+
+        let repeated = store.import_trace_backup_rows(&backup).unwrap();
+        assert_eq!(repeated.session_forks_skipped, 1);
     }
 
     #[test]
