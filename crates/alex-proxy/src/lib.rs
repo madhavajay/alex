@@ -2301,9 +2301,13 @@ async fn admin_reset(
 
     if request.dry_run {
         state.set_reset_progress("counting_bodies", "Counting captured bodies");
-        return match handler.reset(state.clone(), request).await {
+        let result = handler.reset(state.clone(), request).await;
+        // A dry run must not leave the progress surface reading "applying" —
+        // it reports via phase/detail only and returns the activity to idle so
+        // the app never shows a spinner for a completed dry run.
+        return match result {
             Ok(plan) => {
-                state.set_reset_progress("complete", "Dry run complete");
+                state.set_reset_progress("dry_run_complete", "Dry run complete");
                 axum::Json(plan).into_response()
             }
             Err(e) => {
