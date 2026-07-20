@@ -129,7 +129,10 @@ public struct AlexandriaClient: Sendable {
         self.config = config
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 5
-        cfg.timeoutIntervalForResource = 10
+        // Resource timeout bounds the WHOLE transfer and overrides any
+        // per-request budget — keep it high enough for slow endpoints
+        // (reset dry-run walks 100k+ body files; large trace bodies).
+        cfg.timeoutIntervalForResource = 300
         self.session = URLSession(configuration: cfg)
     }
 
@@ -159,9 +162,10 @@ public struct AlexandriaClient: Sendable {
 
     private func request(
         _ path: String, query: [URLQueryItem] = [], method: String = "GET",
-        body: Data? = nil
+        body: Data? = nil, timeout: TimeInterval? = nil
     ) async throws -> Data {
         var req = URLRequest(url: url(path, query: query))
+        if let timeout { req.timeoutInterval = timeout }
         req.httpMethod = method
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
         if let body {
@@ -342,9 +346,12 @@ public struct AlexandriaClient: Sendable {
 
     /// Applies the selected reset categories. Call `resetPlan` first to show its counts to the user.
     public func reset(_ selection: ResetSelection, dryRun: Bool = false) async throws -> ResetResponse {
+        // Counting 100k+ captured body files on a cold filesystem cache can
+        // take well past the 5s default — this endpoint gets its own budget.
         let data = try await request(
             "admin/reset", method: "POST",
-            body: body(ResetRequest(selection: selection, dryRun: dryRun)))
+            body: body(ResetRequest(selection: selection, dryRun: dryRun)),
+            timeout: 120)
         return try JSONDecoder().decode(ResetResponse.self, from: data)
     }
 
