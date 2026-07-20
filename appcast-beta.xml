@@ -3,13 +3,13 @@
     <channel>
         <title>Alex</title>
         <item>
-            <title>0.1.29-beta.8</title>
-            <pubDate>Mon, 20 Jul 2026 11:46:11 +0000</pubDate>
-            <sparkle:version>0.1.29-beta.8</sparkle:version>
-            <sparkle:shortVersionString>0.1.29-beta.8</sparkle:shortVersionString>
+            <title>0.1.29-beta.9</title>
+            <pubDate>Mon, 20 Jul 2026 12:54:57 +0000</pubDate>
+            <sparkle:version>0.1.29-beta.9</sparkle:version>
+            <sparkle:shortVersionString>0.1.29-beta.9</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.29-beta.8/Alex-0.1.29-beta.8.dmg" length="10844760" type="application/octet-stream" sparkle:edSignature="3fqk9mNZMwPkFek3Miws7b+Wgwewz3KaxAGra0haIcf38X2bm4w+pMWYEB1vRfJZF3h7BEJEh2RaS6EVmBnDDQ=="/>
+            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.29-beta.9/Alex-0.1.29-beta.9.dmg" length="11358748" type="application/octet-stream" sparkle:edSignature="L/tJffLURyf+QXr1PL9dwEDDJ4UeOiAv99xUMxz5UNXsLIq52sDgokFLtsq6Y+giegzPhoe9EMYU01Clh18kCw=="/>
         </item>
     </channel>
 </rss>
