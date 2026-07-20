@@ -957,10 +957,7 @@ async fn refresh_codex_usage_for_account(vault: &Vault, account: Account) -> Res
 /// pinned to the credential's exact ChatGPT workspace and never sends a model
 /// prompt. Failures are returned per account so one stale credential cannot
 /// prevent the remaining subscriptions from updating.
-pub async fn refresh_due_codex_usage(
-    vault: &Vault,
-    max_age_ms: i64,
-) -> Vec<(String, Result<()>)> {
+pub async fn refresh_due_codex_usage(vault: &Vault, max_age_ms: i64) -> Vec<(String, Result<()>)> {
     let now = now_ms();
     let accounts: Vec<Account> = vault
         .list()
@@ -1864,12 +1861,10 @@ mod tests {
         });
         assert!(!codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 - 1);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 - 1);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 + 60);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 + 60);
         account.account_meta["codex_limits"]["observed_at_ms"] = json!(now - 300_000);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 

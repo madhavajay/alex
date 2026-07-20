@@ -274,7 +274,9 @@ pub trait NotificationChannel: Send + Sync {
     }
     async fn send(&self, ev: &NotificationEvent) -> Result<()>;
     async fn send_text(&self, _text: &str) -> Result<()> {
-        Err(anyhow!("notification channel does not support text replies"))
+        Err(anyhow!(
+            "notification channel does not support text replies"
+        ))
     }
 }
 
@@ -546,7 +548,11 @@ impl NotificationDispatcher {
             matches!(entry.config.format, WebhookFormat::Telegram)
                 && NotificationLevel::Warn >= entry.config.min_level
                 && (entry.config.categories.is_empty()
-                    || entry.config.categories.iter().any(|category| category == "reauth"))
+                    || entry
+                        .config
+                        .categories
+                        .iter()
+                        .any(|category| category == "reauth"))
         }) {
             let channel_id = entry.config.id.as_deref();
             if let Some(channel_id) = channel_id {
@@ -565,9 +571,11 @@ impl NotificationDispatcher {
     }
 
     fn set_channel_error(&self, channel_id: &str, error: &str) {
-        let Some(index) = self.channels.iter().position(|entry| {
-            entry.config.id.as_deref() == Some(channel_id)
-        }) else {
+        let Some(index) = self
+            .channels
+            .iter()
+            .position(|entry| entry.config.id.as_deref() == Some(channel_id))
+        else {
             return;
         };
         let mut statuses = self
@@ -642,8 +650,7 @@ impl NotificationDispatcher {
         let mut delivery = CustomDelivery::default();
         for (index, entry) in self.channels.iter().enumerate() {
             if !matches!(entry.config.format, WebhookFormat::Telegram)
-                || only_channel_id
-                    .is_some_and(|wanted| entry.config.id.as_deref() != Some(wanted))
+                || only_channel_id.is_some_and(|wanted| entry.config.id.as_deref() != Some(wanted))
                 || !accepts(&entry.config, &event)
             {
                 continue;
@@ -1124,8 +1131,7 @@ mod tests {
             provider: "xai".into(),
             label: Some("work".into()),
         };
-        let first_verification_uri_complete =
-            "https://auth.example.test/device?code=first";
+        let first_verification_uri_complete = "https://auth.example.test/device?code=first";
         assert!(dispatcher.send_custom(
             "Grok needs re-authentication",
             format!("Tap {first_verification_uri_complete}"),
@@ -1210,7 +1216,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*channel.0.lock().unwrap(), ["pong"]);
-        assert!(dispatcher.send_telegram_reply("foreign", "nope").await.is_err());
+        assert!(dispatcher
+            .send_telegram_reply("foreign", "nope")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1254,7 +1263,10 @@ mod tests {
         assert_eq!(messages[0].direction, "in");
         assert_eq!(messages[2].direction, "out");
         assert_eq!(messages[2].kind, "reply");
-        assert_eq!(dispatcher.admin_view()["channels"][0]["last_error"], Value::Null);
+        assert_eq!(
+            dispatcher.admin_view()["channels"][0]["last_error"],
+            Value::Null
+        );
     }
 
     #[test]

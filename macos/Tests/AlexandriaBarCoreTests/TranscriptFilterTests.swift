@@ -10,7 +10,8 @@ import Testing
             thinkingBudget: nil, costUsd: nil, billingBucket: nil, accountId: nil, viaDario: nil,
             darioGeneration: nil, error: nil, errorKind: nil, errorCode: nil, errorClass: nil,
             user: user, assistant: assistant, toolCalls: nil,
-            assistantBlocks: nil, executedTools: nil)
+            assistantBlocks: nil, executedTools: nil, bodyErrors: nil, bodyTruncations: nil,
+            stages: nil, stageError: nil)
     }
 
     /// Regression for the "typing in the transcript filter freezes the

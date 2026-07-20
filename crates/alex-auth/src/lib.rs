@@ -237,7 +237,10 @@ fn credential_rank(account: &Account) -> (bool, i64) {
     let unexpired =
         account.kind != "oauth" || account.expires_at_ms.map(|e| e > now).unwrap_or(true);
     let valid = has_secret && unexpired;
-    let freshness = account.last_refresh_ms.or(account.expires_at_ms).unwrap_or(i64::MIN);
+    let freshness = account
+        .last_refresh_ms
+        .or(account.expires_at_ms)
+        .unwrap_or(i64::MIN);
     (valid, freshness)
 }
 
@@ -888,7 +891,9 @@ impl Vault {
         into_id: &str,
         allow_mismatch: bool,
     ) -> Result<MergeOutcome> {
-        let (from, into) = self.validate_merge(from_id, into_id, allow_mismatch).await?;
+        let (from, into) = self
+            .validate_merge(from_id, into_id, allow_mismatch)
+            .await?;
         let mut survivor = into.clone();
         let adopted = if credential_rank(&from) > credential_rank(&into) {
             survivor.kind = from.kind.clone();
@@ -1807,7 +1812,13 @@ struct KimiCredentialFile {
 
 /// Build a Kimi account from an already-parsed credential file. Kept pure so it
 /// can be unit-tested without touching disk or the network. Never logs tokens.
-pub fn kimi_account_from_credentials(access_token: String, refresh_token: Option<String>, expires_at_s: Option<i64>, expires_in_s: Option<i64>, scope: Option<String>) -> Account {
+pub fn kimi_account_from_credentials(
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_s: Option<i64>,
+    expires_in_s: Option<i64>,
+    scope: Option<String>,
+) -> Account {
     let expires_at_ms = expires_at_s
         .map(|s| s * 1000)
         .or_else(|| expires_in_s.map(|s| now_ms() + s * 1000))
@@ -2220,7 +2231,10 @@ mod tests {
         assert_eq!(account.kind, "oauth");
         assert_eq!(account.id, "kimi-oauth");
         assert_eq!(account.expires_at_ms, Some(expires_at_s * 1000));
-        assert_eq!(account.refresh_token.as_deref(), Some("refresh-token-shape"));
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("refresh-token-shape")
+        );
         assert_eq!(account.account_meta["scope"], json!("kimi-code"));
     }
 
@@ -3374,11 +3388,7 @@ mod tests {
             .await
             .is_err());
         vault
-            .record_routing_limits_for_workspace(
-                "openai-api_key-work",
-                "workspace-a",
-                snapshot,
-            )
+            .record_routing_limits_for_workspace("openai-api_key-work", "workspace-a", snapshot)
             .await
             .unwrap();
 

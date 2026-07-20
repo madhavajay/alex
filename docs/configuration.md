@@ -24,6 +24,8 @@ anthropic_upstream = "auto"
 dario_mode_migrated = true
 dario_api_key = "<redacted-dario-key>"
 trace_body_retention_days = 30
+lar_body_store_mode = "legacy"
+lar_migration_batch_size = 32
 trace_row_retention_days = 0
 update_check_hours = 24
 update_channel = "stable"
@@ -37,6 +39,14 @@ enabled = false
 reroute_on_auth = false
 retries = 1
 auto_return = true
+
+[lar_migration_resources]
+worker_count = 1
+cpu_budget_percent = 100
+yield_every_artifacts = 0
+max_memory_bytes = 134217728
+max_pack_bytes = 536870912
+max_pack_index_entries = 262144
 ```
 
 The actual serializer also writes the other non-`None` fields and empty
@@ -74,6 +84,8 @@ for a stable build.
 | `dario_probe_failures` | integer | `2` | Consecutive failures before a generation is marked unhealthy. |
 | `dario_probe_model` | string | `claude-haiku-4-5` | Tiny through-Dario readiness model. |
 | `trace_body_retention_days` | integer | `30` | Gzip body/header retention window. |
+| `lar_body_store_mode` | string | `legacy` | Body-store rollout mode: `legacy`, shadow-only `dual-write-validated`, or `lar-with-fallback`. Experimental modes retain gzip rollback copies. Shadow mode disables automatic startup import so it cannot publish owner pointers; manual import remains explicit. |
+| `lar_migration_batch_size` | integer | `32` | Maximum legacy artifacts attempted in one startup migration pass; valid range `1..=4096`. |
 | `trace_row_retention_days` | integer | `0` | SQLite trace-row retention; `0` means unlimited. |
 | `update_check_hours` | integer | `24` | Release check interval; `0` disables. |
 | `update_channel` | string | build-dependent `stable`/`beta` | Persistent release channel. Only `stable` and `beta` are accepted by update controls. |
@@ -181,6 +193,45 @@ openai = "gpt-5.6-sol"
 `alex protection preset anthropic-openai` writes the current Fable/Sol
 equivalencies but intentionally does not turn `protection.enabled` on.
 
+## Legacy LAR migration resources
+
+The startup importer begins only after the daemon health endpoint responds. Its
+defaults preserve the previous single-worker, unthrottled behavior. Configure
+resource limits under `lar_migration_resources` when conversion must share a
+busy machine with live capture and Trace Browser reads:
+
+```toml
+lar_migration_batch_size = 32
+
+[lar_migration_resources]
+worker_count = 2
+io_bytes_per_second = 52428800
+cpu_budget_percent = 50
+yield_every_artifacts = 8
+max_memory_bytes = 134217728
+max_pack_bytes = 536870912
+max_pack_index_entries = 262144
+min_free_disk_bytes = 10737418240
+```
+
+| Field | Default | Valid values and behavior |
+| --- | --- | --- |
+| `worker_count` | `1` | `1..=16`. Bounds the parallel source-provenance workers; archive appends remain serialized. |
+| `io_bytes_per_second` | absent | Positive bytes/second. When absent, importer reads are not rate-limited. The limit is shared by all workers. |
+| `cpu_budget_percent` | `100` | `1..=100`. Adds cooperative rest between completed artifacts to approximate this duty-cycle budget. |
+| `yield_every_artifacts` | `0` | Explicitly yield after this many completed artifacts; `0` disables explicit yields. |
+| `max_memory_bytes` | `134217728` | At least 1 MiB. Bounds predecessor buffers and caches and derives caps for pending inventory (`memory / 4096`) and retained pack-index entries (`memory / 256`). Individual bodies are streamed; one artifact may temporarily exceed these planning estimates according to its own bounded size. |
+| `max_pack_bytes` | `536870912` | Positive soft size cap for one importer pack. After a validated artifact crosses the cap, the pack is sealed and the next artifact continues in a deterministic successor pack. |
+| `max_pack_index_entries` | `262144` | Positive cap on retained chunk/manifest index entries. The effective cap is the smaller of this value and `max_memory_bytes / 256`. Rotation occurs between artifacts, so one unusually large artifact is the maximum overshoot. |
+| `min_free_disk_bytes` | absent | Pause before writes or between batches when available bytes fall below this threshold. Legacy files stay readable and the durable job can resume later. |
+
+Each migration pass reports durable item totals and completion percentage,
+bytes/artifacts per second, deduplication ratio, ETA, last error, worker usage,
+throttled time, yields, free disk, configured/effective batch and pack caps,
+pack sequence/rotations, any disk-pressure pause reason, and whether detailed
+errors were truncated after 256 entries. Invalid limits fail that migration
+pass without deleting or switching legacy sources.
+
 ## Notifications
 
 Notifications use top-level array-of-table entries:
@@ -221,6 +272,7 @@ launchd, and Dario-child variables are omitted.
 | Variable | Used by |
 | --- | --- |
 | `ALEXANDRIA_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
+| `ALEXANDRIA_LAR_BODY_STORE` | Daemon-only override for `lar_body_store_mode`; invalid values fail startup instead of silently changing storage behavior. |
 | `ALEXANDRIA_URL` | Remote `alex connect`/`alex up` base URL. |
 | `ALEXANDRIA_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
 | `ALEXANDRIA_RUN_ID` | Caller-selected wrap run ID. |

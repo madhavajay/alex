@@ -279,7 +279,10 @@ impl UpdateDecision {
     /// unconfirmable difference are offered — the alternative (staying silent)
     /// is the exact false "up to date" the user rejected.
     pub(crate) fn update_available(self) -> bool {
-        matches!(self, UpdateDecision::Available | UpdateDecision::Unconfirmed)
+        matches!(
+            self,
+            UpdateDecision::Available | UpdateDecision::Unconfirmed
+        )
     }
 }
 
@@ -1366,20 +1369,14 @@ mod tests {
     fn decide_update_backstop_never_false_latest() {
         // Identical tag (incl. v-prefix / build metadata) → confirmed latest.
         assert_eq!(decide_update("0.1.28", "0.1.28"), UpdateDecision::UpToDate);
-        assert_eq!(
-            decide_update("v0.1.28", "0.1.28"),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("v0.1.28", "0.1.28"), UpdateDecision::UpToDate);
         assert_eq!(
             decide_update("0.1.28", "0.1.28+build.5"),
             UpdateDecision::UpToDate
         );
 
         // A strictly newer latest → available.
-        assert_eq!(
-            decide_update("0.1.28", "0.1.29"),
-            UpdateDecision::Available
-        );
+        assert_eq!(decide_update("0.1.28", "0.1.29"), UpdateDecision::Available);
         // Row-8 shape: an rc tag is the newest → offered, not a false latest.
         assert_eq!(
             decide_update("0.1.28", "0.1.29-rc.1"),
@@ -1388,10 +1385,7 @@ mod tests {
 
         // Running build strictly newer than the channel head (dev/ahead) →
         // up to date (no newer tag exists), which does not violate the rule.
-        assert_eq!(
-            decide_update("0.1.29", "0.1.28"),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("0.1.29", "0.1.28"), UpdateDecision::UpToDate);
 
         // THE user-trust cases: tags differ but one side is unparseable. Must
         // NOT be UpToDate — offered/flagged instead.
@@ -1442,23 +1436,76 @@ mod tests {
         // Row 4's channel is DERIVED from the (beta) build version per B2 — a
         // beta build must not default to the stable channel.
         let row4_channel = UpdateChannel::default_for_version("0.1.28-beta.2");
-        assert_eq!(row4_channel, UpdateChannel::Beta, "B2: beta build → beta channel");
+        assert_eq!(
+            row4_channel,
+            UpdateChannel::Beta,
+            "B2: beta build → beta channel"
+        );
 
         let rows = [
             // 1: stable build, stable channel → stable update, NOT the beta.
-            Row { current: "0.1.27", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.27",
+                channel: UpdateChannel::Stable,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.29-beta.1",
+                expect_available: true,
+                expect_latest: "0.1.28",
+            },
             // 2: stable build, beta channel → the newer beta.
-            Row { current: "0.1.27", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.29-beta.1" },
+            Row {
+                current: "0.1.27",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.29-beta.1",
+                expect_available: true,
+                expect_latest: "0.1.29-beta.1",
+            },
             // 3: beta build, beta channel → newer beta.
-            Row { current: "0.1.28-beta.2", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.2",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28-beta.3",
+            },
             // 4: beta build, channel defaulted (→ beta per B2) → newer beta, NOT "up to date".
-            Row { current: "0.1.28-beta.2", channel: row4_channel, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.2",
+                channel: row4_channel,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28-beta.3",
+            },
             // 5: beta build, beta channel, final shipped → roll onto the final (final > its betas).
-            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.28-beta.3",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28",
+            },
             // 6: stable build, stable channel, same version → up to date.
-            Row { current: "0.1.28", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.28",
+                channel: UpdateChannel::Stable,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: false,
+                expect_latest: "0.1.28",
+            },
             // 7: beta build, beta channel, same beta → up to date.
-            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.3",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: false,
+                expect_latest: "0.1.28-beta.3",
+            },
         ];
 
         for (i, row) in rows.iter().enumerate() {
@@ -1494,10 +1541,7 @@ mod tests {
         // returns the stable head, so the decision is "up to date".
         let latest = resolve_latest(UpdateChannel::Stable, "0.1.28", "0.1.29-beta.5");
         assert_eq!(latest, "0.1.28");
-        assert_eq!(
-            decide_update("0.1.28", &latest),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("0.1.28", &latest), UpdateDecision::UpToDate);
 
         // select_release_for_channel filters the same way: stable skips every
         // pre-release even when it is the newest tag present.
@@ -1510,8 +1554,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let (stable_tag, _) =
-            select_release_for_channel(&releases, UpdateChannel::Stable).unwrap();
+        let (stable_tag, _) = select_release_for_channel(&releases, UpdateChannel::Stable).unwrap();
         assert_eq!(stable_tag, "v0.1.28");
         // Beta channel, in contrast, sees the newer beta.
         let (beta_tag, _) = select_release_for_channel(&releases, UpdateChannel::Beta).unwrap();
@@ -1570,11 +1613,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pids_to_reclaim_keeps_only_the_new_daemon() {
-        let listeners = vec![
-            "1001".to_string(),
-            "1002".to_string(),
-            "2000".to_string(),
-        ];
+        let listeners = vec!["1001".to_string(), "1002".to_string(), "2000".to_string()];
         // The new daemon (2000) is spared; the two strays are reclaimed.
         assert_eq!(
             pids_to_reclaim(&listeners, "2000"),

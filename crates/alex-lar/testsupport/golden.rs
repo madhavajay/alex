@@ -1,0 +1,188 @@
+use alex_lar::{
+    write_file_header, ArchiveWriter, ArtifactRangeRef, ChunkerConfig, ConversationEntry,
+    ConversationEntryData, ConversationEntryKind, ConversationRole, Exchange, ExchangeData,
+    FileHeader, Generation, GenerationData, GenerationReason, HeaderAtom, HeaderBlock,
+    HeaderFidelity, Limits, RecordFrame, RecordType, Stage, StageData, StageKind, StreamIndex,
+    StreamRead, TurnView, TurnViewData, REQUIRED_FEATURE_CONVERSATION_DAG, SEMANTIC_SCHEMA_V1,
+};
+use std::io::Cursor;
+
+pub const FULL_BODY: &[u8] =
+    b"event: message\ndata: {\"type\":\"message\",\"text\":\"golden body\"}\n\n";
+
+pub fn v1_0_full_archive() -> Vec<u8> {
+    let header = FileHeader::standalone(
+        [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ],
+        1_725_000_000_123_456_789,
+        b"alex-lar-golden-v1.0".to_vec(),
+    );
+    let chunker = ChunkerConfig {
+        min_size: 64,
+        target_size: 128,
+        max_size: 256,
+    };
+    let mut writer =
+        ArchiveWriter::create(Cursor::new(Vec::new()), header, chunker, Limits::default()).unwrap();
+    writer.enable_metadata_pages();
+    let manifest = writer.append_body(FULL_BODY).unwrap();
+    let headers = HeaderBlock::new(
+        HeaderFidelity::Exact,
+        vec![
+            HeaderAtom {
+                original_name: b"Content-Type".to_vec(),
+                value: b"text/event-stream".to_vec(),
+                flags: 0,
+            },
+            HeaderAtom {
+                original_name: b"X-Golden-Version".to_vec(),
+                value: b"1.0".to_vec(),
+                flags: 0,
+            },
+        ],
+    );
+    let header_id = writer.append_header_block(headers).unwrap();
+    let stream = StreamIndex::new(
+        manifest,
+        vec![StreamRead {
+            byte_offset: 0,
+            byte_length: FULL_BODY.len() as u64,
+            delta_from_first_byte_ns: 0,
+        }],
+        Vec::new(),
+    );
+    let stream_id = writer.append_stream_index(stream).unwrap();
+    let mut stage = StageData::new(StageKind::UpstreamResponse, 1_725_000_000_123_456_789);
+    stage.attempt_number = Some(1);
+    stage.response_headers_ref = Some(header_id);
+    stage.response_body_manifest_ref = Some(manifest);
+    stage.stream_index_ref = Some(stream_id);
+    stage.provider = Some(b"golden-provider".to_vec());
+    stage.routed_model = Some(b"golden-model-v1".to_vec());
+    stage.status_code = Some(200);
+    let stage_id = writer.append_stage(Stage::new(stage)).unwrap();
+    let mut exchange = ExchangeData::new(
+        b"golden-trace-v1.0",
+        7,
+        1_725_000_000_123_456_789,
+        vec![stage_id],
+    );
+    exchange.session_id = Some(b"golden-session-v1.0".to_vec());
+    exchange.run_id = Some(b"golden-run-v1.0".to_vec());
+    writer.append_exchange(Exchange::new(exchange)).unwrap();
+    writer.seal().unwrap();
+    writer.into_inner().unwrap().into_inner()
+}
+
+pub fn v1_future_minor_optional_archive() -> Vec<u8> {
+    let mut header = FileHeader::standalone(
+        [0x23; 16],
+        1_725_000_000_987_654_321,
+        b"synthetic-future-minor".to_vec(),
+    );
+    header.container_minor = 23;
+    header.optional_feature_bits = 0x8000_0000_0000_0042;
+    let mut bytes = Vec::new();
+    write_file_header(&mut bytes, &header).unwrap();
+    for (record_type, schema_version, payload) in [
+        (RecordType::Unknown(900), 1, b"optional-type".to_vec()),
+        (
+            RecordType::HeaderBlock,
+            99,
+            b"optional-future-header-schema".to_vec(),
+        ),
+    ] {
+        RecordFrame {
+            record_type,
+            schema_version,
+            flags: 0,
+            payload,
+            offset: bytes.len() as u64,
+        }
+        .write(&mut bytes)
+        .unwrap();
+    }
+    bytes
+}
+
+pub fn v1_conversation_dag_archive() -> Vec<u8> {
+    let mut header = FileHeader::standalone(
+        [0x31; 16],
+        1_725_000_001_123_456_789,
+        b"alex-lar-golden-conversation-v1".to_vec(),
+    );
+    header.required_feature_bits |= REQUIRED_FEATURE_CONVERSATION_DAG;
+    let mut writer = ArchiveWriter::create(
+        Cursor::new(Vec::new()),
+        header,
+        ChunkerConfig {
+            min_size: 64,
+            target_size: 128,
+            max_size: 256,
+        },
+        Limits::default(),
+    )
+    .unwrap();
+    writer.enable_metadata_pages();
+
+    let user_body = b"{\"role\":\"user\",\"content\":\"golden DAG request\"}";
+    let assistant_body = b"{\"role\":\"assistant\",\"content\":\"golden DAG response\"}";
+    let user_manifest = writer.append_body(user_body).unwrap();
+    let assistant_manifest = writer.append_body(assistant_body).unwrap();
+    let user = writer
+        .append_conversation_entry(ConversationEntry::new(ConversationEntryData {
+            semantic_schema: SEMANTIC_SCHEMA_V1,
+            role: ConversationRole::User,
+            kind: ConversationEntryKind::Message,
+            raw_ranges: vec![ArtifactRangeRef {
+                manifest_id: user_manifest,
+                byte_offset: 0,
+                byte_length: user_body.len() as u64,
+            }],
+            name: None,
+            tool_call_id: None,
+        }))
+        .unwrap();
+    let assistant = writer
+        .append_conversation_entry(ConversationEntry::new(ConversationEntryData {
+            semantic_schema: SEMANTIC_SCHEMA_V1,
+            role: ConversationRole::Assistant,
+            kind: ConversationEntryKind::Message,
+            raw_ranges: vec![ArtifactRangeRef {
+                manifest_id: assistant_manifest,
+                byte_offset: 0,
+                byte_length: assistant_body.len() as u64,
+            }],
+            name: None,
+            tool_call_id: None,
+        }))
+        .unwrap();
+    let generation = writer
+        .append_generation(Generation::new(GenerationData {
+            parent_generation_id: None,
+            entries: vec![user],
+            reason: GenerationReason::Initial,
+        }))
+        .unwrap();
+    let trace_id = b"golden-dag-trace-v1";
+    writer
+        .append_exchange(Exchange::new(ExchangeData::new(
+            trace_id,
+            1,
+            1_725_000_001_123_456_789,
+            Vec::new(),
+        )))
+        .unwrap();
+    writer
+        .append_turn_view(TurnView::new(TurnViewData {
+            trace_id: trace_id.to_vec(),
+            generation_id: generation,
+            upto_index: 0,
+            response_entry_refs: vec![assistant],
+        }))
+        .unwrap();
+    writer.seal().unwrap();
+    writer.into_inner().unwrap().into_inner()
+}

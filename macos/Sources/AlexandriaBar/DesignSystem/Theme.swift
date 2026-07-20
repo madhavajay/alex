@@ -173,7 +173,14 @@ enum AlexTheme {
             case "amp":
                 tinted(0xFF9F0A)
             case "xai", "grok":
-                tinted(0xFF453A)
+                // xAI's mark is monochrome. A red X reads like an error state
+                // beside health/status UI, so keep the provider identity
+                // black and white and reserve red for actual failures.
+                ProviderBrand(
+                    accent: Colors.dynamic(light: 0x000000, dark: 0xFFFFFF),
+                    chipText: Color.white,
+                    chipBackground: Color.black,
+                    authAccent: Colors.dynamic(light: 0x000000, dark: 0xFFFFFF))
             case "kimi", "kimi-code":
                 // Kimi (Moonshot AI) ink-violet brand accent.
                 tinted(0x6C5CE7)

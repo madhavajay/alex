@@ -6,7 +6,10 @@ import AlexandriaBarCore
 @MainActor
 @Observable
 final class TraceBrowserModel {
+    private static let transcriptPageSize = 50
     private let store: SnapshotStore
+    private var cachedClientConfig: DaemonConfig?
+    private var cachedClient: AlexandriaClient?
 
     private(set) var sessions: [TraceSession] = [] {
         didSet { recomputeSessionSummary(); recomputeTranscriptSummary() }
@@ -26,7 +29,33 @@ final class TraceBrowserModel {
     private(set) var transcriptLoading = false
     private(set) var transcriptUnreachable = false
     private var transcriptLoadedSessionId: String?
+    private var transcriptOldestCursor: TranscriptCursor?
+    private var transcriptNewestCursor: TranscriptCursor?
+    private var transcriptLoadedSessionRevision = ""
+    private var transcriptLoadedTraceCount = 0
+    private var transcriptGeneration = 0
+    private var transcriptRequestToken: Int?
+    private(set) var transcriptPageLoading = false
+    private(set) var transcriptAvailableTurnCount = 0
+    private(set) var transcriptHasMoreBefore = false
+    private(set) var transcriptHasMoreAfter = false
+    private(set) var transcriptBodyTruncationCount = 0
+    private(set) var transcriptBodyErrorCount = 0
+    private(set) var transcriptArchiveSummary = TranscriptArchiveSummary()
+    private var transcriptFollowingTail = false
+    private(set) var conversationEvents: [TraceConversationEvent] = []
+    private(set) var conversationTotalEvents = 0
+    private(set) var conversationHasMore = false
+    private(set) var conversationLoading = false
+    private(set) var conversationInitialLoadComplete = false
+    private(set) var conversationError: String?
+    private var conversationLoadedSessionId: String?
+    private var conversationLoadedSessionRevision = ""
+    private var conversationCursor: TranscriptCursor?
+    private var conversationGeneration = 0
+    private var conversationUnsupported = false
     private(set) var searchSessionIds: Set<String>?
+    private var searchAnchorBySession: [String: TranscriptCursor] = [:]
     private(set) var searchMatchCount = 0
     private(set) var searchScanned = 0
     /// True while a body-text search request is in flight (debounce elapsed,
@@ -195,6 +224,7 @@ final class TraceBrowserModel {
 
     private var sessionsTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
+    private var conversationTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var sessionFilterTask: Task<Void, Never>?
     private var fixtureLoadTask: Task<Void, Never>?
@@ -386,7 +416,9 @@ final class TraceBrowserModel {
         Task {
             guard let client = client() else { return }
             var bodyPath: String?
-            if let last = try? await client.traceTranscript(sessionId: session.sessionId).turns.last,
+            if let last = try? await client.traceTranscript(
+                sessionId: session.sessionId, limit: 1, tail: true
+            ).turns.last,
                 let detail = try? await client.traceDetail(id: last.traceId) {
                 bodyPath = detail.trace.reqBodyPath
                     ?? detail.trace.respBodyPath ?? detail.trace.upstreamReqBodyPath
@@ -632,6 +664,12 @@ final class TraceBrowserModel {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
+        conversationTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollConversationEvents()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
         // `stop()` cancels any in-flight search when an existing window is
         // reopened. Re-apply the current query so initial/preset key filters
         // always populate their server-backed session id set.
@@ -643,6 +681,8 @@ final class TraceBrowserModel {
         sessionsTask = nil
         transcriptTask?.cancel()
         transcriptTask = nil
+        conversationTask?.cancel()
+        conversationTask = nil
         searchTask?.cancel()
         searchTask = nil
         renderChain?.cancel()
@@ -678,12 +718,40 @@ final class TraceBrowserModel {
         resetTurns()
         setUserAtBottom(true)
         Task { await pollTranscript() }
+        Task { await pollConversationEvents() }
     }
 
-    private func resetTurns() {
+    private func resetTurns(resetConversation: Bool = true) {
         allTurns = []
         turns = []
         transcriptLoadedSessionId = nil
+        transcriptOldestCursor = nil
+        transcriptNewestCursor = nil
+        transcriptLoadedSessionRevision = ""
+        transcriptLoadedTraceCount = 0
+        transcriptGeneration &+= 1
+        transcriptRequestToken = nil
+        transcriptPageLoading = false
+        transcriptAvailableTurnCount = 0
+        transcriptHasMoreBefore = false
+        transcriptHasMoreAfter = false
+        transcriptBodyTruncationCount = 0
+        transcriptBodyErrorCount = 0
+        transcriptArchiveSummary = TranscriptArchiveSummary()
+        transcriptFollowingTail = false
+        if resetConversation {
+            conversationEvents = []
+            conversationTotalEvents = 0
+            conversationHasMore = false
+            conversationLoading = false
+            conversationInitialLoadComplete = false
+            conversationError = nil
+            conversationLoadedSessionId = nil
+            conversationLoadedSessionRevision = ""
+            conversationCursor = nil
+            conversationGeneration &+= 1
+            conversationUnsupported = false
+        }
         transcriptLoading = selectedSessionId != nil
         transcriptUnreachable = false
         inspectorToolBody = nil
@@ -710,10 +778,28 @@ final class TraceBrowserModel {
         renderOp = (renderVersion, .set(NSAttributedString()))
     }
 
+    var transcriptLoadedTurnCount: Int { allTurns.count }
+
     func loadEarlierTurns() {
-        windowMaxTurns += TranscriptWindow.defaultMaxTurns
-        renderState = nil
-        scheduleRender()
+        if transcriptHasMoreBefore, transcriptOldestCursor != nil {
+            windowMaxTurns += Self.transcriptPageSize
+            Task { await loadTranscriptPage(.older) }
+        } else {
+            windowMaxTurns += TranscriptWindow.defaultMaxTurns
+            renderState = nil
+            scheduleRender()
+        }
+    }
+
+    func loadNewerTurns() {
+        guard transcriptHasMoreAfter, transcriptNewestCursor != nil else { return }
+        windowMaxTurns += Self.transcriptPageSize
+        Task { await loadTranscriptPage(.newer) }
+    }
+
+    func jumpToLatestTurns() {
+        resetTurns(resetConversation: false)
+        Task { await pollTranscript(ignoreSearchAnchor: true) }
     }
 
     func requestScrollToBottom() {
@@ -825,7 +911,11 @@ final class TraceBrowserModel {
         // config.toml here used to synchronously hit disk on every 1s/500ms
         // poll, directly on the main actor.
         guard let cfg = store.config else { return nil }
-        return AlexandriaClient(config: cfg)
+        if cachedClientConfig != cfg {
+            cachedClientConfig = cfg
+            cachedClient = AlexandriaClient(config: cfg)
+        }
+        return cachedClient
     }
 
     private func pollSessions() async {
@@ -888,52 +978,297 @@ final class TraceBrowserModel {
         return newest
     }
 
-    private func pollTranscript() async {
+    private enum TranscriptPageDirection {
+        case older
+        case newer
+    }
+
+    private func sessionRevision(_ session: TraceSession?) -> String {
+        guard let session else { return "" }
+        return [
+            String(session.traceCount),
+            String(session.lastTsMs),
+            String(session.lastStatus ?? -1),
+            String(session.totalInputTokens ?? -1),
+            String(session.totalOutputTokens ?? -1),
+            String(session.errors ?? -1),
+        ].joined(separator: "|")
+    }
+
+    private func applyTranscriptPage(
+        _ response: TranscriptResponse,
+        direction: TranscriptPageDirection?,
+        followsTail: Bool? = nil
+    ) {
+        let merged = TranscriptPaging.merge(existing: allTurns, incoming: response.turns)
+        allTurns = merged
+        transcriptLoadedSessionId = response.sessionId
+        transcriptAvailableTurnCount = response.totalTurns
+            ?? max(selectedSession?.traceCount ?? 0, merged.count)
+        transcriptOldestCursor = merged.first.map {
+            TranscriptCursor(tsMs: $0.tsRequestMs, traceId: $0.traceId)
+        }
+        transcriptNewestCursor = merged.last.map {
+            TranscriptCursor(tsMs: $0.tsRequestMs, traceId: $0.traceId)
+        }
+        switch direction {
+        case nil:
+            transcriptHasMoreBefore = response.hasMoreBefore ?? false
+            transcriptHasMoreAfter = response.hasMoreAfter ?? false
+        case .older:
+            transcriptHasMoreBefore = response.hasMoreBefore ?? false
+        case .newer:
+            transcriptHasMoreAfter = response.hasMoreAfter ?? false
+        }
+        if let followsTail {
+            transcriptFollowingTail = followsTail
+        } else if direction == .newer, !transcriptHasMoreAfter {
+            transcriptFollowingTail = true
+        }
+        transcriptLoadedTraceCount = response.totalTurns ?? selectedSession?.traceCount ?? merged.count
+        transcriptLoadedSessionRevision = sessionRevision(selectedSession)
+        transcriptLoading = false
+        transcriptUnreachable = false
+        transcriptBodyTruncationCount = merged.reduce(0) {
+            $0 + ($1.bodyTruncations?.count ?? 0)
+        }
+        let bodyIssues = merged.flatMap { $0.bodyErrors ?? [] }
+        transcriptArchiveSummary = TranscriptArchiveSummary(issues: bodyIssues)
+        transcriptBodyErrorCount = bodyIssues.reduce(0) {
+            $0 + (matchesArchivedUnavailable($1.resolvedArchiveAvailability) ? 0 : 1)
+        }
+        transcriptTabCounts = .counting(merged)
+        let fingerprint = TraceFingerprint.turns(merged)
+        if fingerprint != turnsFingerprint {
+            turnsFingerprint = fingerprint
+            BarLog.measure(
+                .browser,
+                label: "transcript apply \(response.sessionId) loaded=\(merged.count)/\(transcriptAvailableTurnCount)"
+            ) {
+                applyTurnFilter()
+            }
+            ensureFirstTraceDetail()
+        }
+    }
+
+    private func loadTranscriptPage(_ direction: TranscriptPageDirection) async {
+        let generation = transcriptGeneration
+        guard transcriptRequestToken != generation, let sid = selectedSessionId,
+            let client = client()
+        else { return }
+        let before = direction == .older ? transcriptOldestCursor : nil
+        let after = direction == .newer ? transcriptNewestCursor : nil
+        guard before != nil || after != nil else { return }
+        transcriptRequestToken = generation
+        transcriptPageLoading = true
+        defer {
+            if transcriptRequestToken == generation {
+                transcriptRequestToken = nil
+                transcriptPageLoading = false
+            }
+        }
+        do {
+            let response = try await client.traceTranscript(
+                sessionId: sid,
+                limit: Self.transcriptPageSize,
+                after: after,
+                before: before)
+            guard generation == transcriptGeneration,
+                response.sessionId == selectedSessionId
+            else { return }
+            applyTranscriptPage(response, direction: direction)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard generation == transcriptGeneration else { return }
+            transcriptUnreachable = allTurns.isEmpty
+            BarLog.warn(.browser, "transcript page \(direction) failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func pollTranscript(ignoreSearchAnchor: Bool = false) async {
+        let generation = transcriptGeneration
         guard let sid = selectedSessionId else { return }
+        let needsInitialLoad = transcriptLoadedSessionId != sid
+        let revision = sessionRevision(selectedSession)
+        if !needsInitialLoad {
+            if !transcriptFollowingTail, transcriptHasMoreAfter { return }
+            if revision == transcriptLoadedSessionRevision, !transcriptHasMoreAfter { return }
+        }
+        guard transcriptRequestToken != generation else { return }
         guard let client = client() else {
-            daemonDown = true
             transcriptLoading = false
             transcriptUnreachable = true
             return
         }
-        let needsInitialLoad = transcriptLoadedSessionId != sid
         if needsInitialLoad { transcriptLoading = true }
         if needsInitialLoad {
             Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(1500))
                 guard !Task.isCancelled, let self, self.selectedSessionId == sid,
-                    self.transcriptLoading
+                    self.transcriptGeneration == generation, self.transcriptLoading
                 else { return }
                 self.transcriptUnreachable = true
             }
         }
+        transcriptRequestToken = generation
+        defer {
+            if transcriptRequestToken == generation { transcriptRequestToken = nil }
+        }
         do {
-            let resp = try await client.traceTranscript(sessionId: sid, limit: 500)
-            daemonDown = false
-            guard resp.sessionId == selectedSessionId else { return }
-            transcriptLoadedSessionId = sid
-            transcriptLoading = false
-            transcriptUnreachable = false
-            transcriptTabCounts = resp.tabCounts
-            let fingerprint = TraceFingerprint.turns(resp.turns)
-            if fingerprint != turnsFingerprint {
-                turnsFingerprint = fingerprint
-                BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
-                    allTurns = resp.turns
+            let response: TranscriptResponse
+            var followsTail: Bool? = nil
+            if needsInitialLoad {
+                if !ignoreSearchAnchor, let anchor = searchAnchorBySession[sid] {
+                    // Start at the matching trace instead of rebuilding from
+                    // the beginning of a long session. The one-millisecond
+                    // predecessor keeps the cursor exclusive while including
+                    // the searched trace in normal timestamp distributions.
+                    let justBefore = TranscriptCursor(
+                        tsMs: anchor.tsMs == Int64.min ? Int64.min : anchor.tsMs - 1,
+                        traceId: "\u{10ffff}")
+                    response = try await client.traceTranscript(
+                        sessionId: sid, limit: Self.transcriptPageSize, after: justBefore)
+                    followsTail = false
+                } else {
+                    response = try await client.traceTranscript(
+                        sessionId: sid, limit: Self.transcriptPageSize, tail: true)
+                    followsTail = true
                 }
-                applyTurnFilter()
-                ensureFirstTraceDetail()
+            } else if transcriptFollowingTail, transcriptHasMoreAfter,
+                let after = transcriptNewestCursor
+            {
+                // A burst can add more than one page between polls. Walk the
+                // remaining indexed pages before switching back to tail refreshes.
+                response = try await client.traceTranscript(
+                    sessionId: sid, limit: Self.transcriptPageSize, after: after)
+            } else if (selectedSession?.traceCount ?? 0) > transcriptLoadedTraceCount,
+                let after = transcriptNewestCursor
+            {
+                response = try await client.traceTranscript(
+                    sessionId: sid, limit: Self.transcriptPageSize, after: after)
+            } else {
+                // The final trace can gain status/body/token fields without a
+                // new request timestamp. Refresh only the small tail page and
+                // replace matching trace ids in place.
+                response = try await client.traceTranscript(
+                    sessionId: sid, limit: Self.transcriptPageSize, tail: true)
             }
+            guard generation == transcriptGeneration,
+                response.sessionId == selectedSessionId
+            else { return }
+            applyTranscriptPage(response, direction: nil, followsTail: followsTail)
+        } catch is CancellationError {
+            return
         } catch {
-            guard !(error is CancellationError) else { return }
-            daemonDown = true
+            guard generation == transcriptGeneration else { return }
             transcriptLoading = false
             transcriptUnreachable = true
+            BarLog.warn(.browser, "transcript refresh failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func pollConversationEvents(loadNextPage: Bool = false, force: Bool = false) async {
+        let generation = conversationGeneration
+        guard !conversationUnsupported, !conversationLoading,
+            let sid = selectedSessionId, let client = client()
+        else { return }
+        let revision = sessionRevision(selectedSession)
+        if !force, !loadNextPage {
+            // A partial page is advanced only by the explicit UI action. Do
+            // not turn the two-second live refresh into an unbounded archive
+            // scan for a long-running session.
+            if conversationHasMore { return }
+            // Conversation events change with the selected session's trace
+            // summary. Avoid polling an unchanged empty/complete timeline and
+            // flashing its loading state on every refresh tick.
+            if conversationLoadedSessionId == sid,
+                conversationLoadedSessionRevision == revision
+            {
+                return
+            }
+        }
+        conversationLoading = true
+        defer {
+            if generation == conversationGeneration { conversationLoading = false }
+        }
+        do {
+            var page = try await client.traceConversationEvents(
+                sessionId: sid, limit: 100, after: conversationCursor,
+                includeEntries: false)
+            guard generation == conversationGeneration,
+                page.sessionId == selectedSessionId
+            else { return }
+            let timelineShrank = conversationLoadedSessionId == sid
+                && page.totalEvents < conversationTotalEvents
+            if timelineShrank {
+                // The cursor belonged to a longer pre-delete timeline. Its
+                // response is only a stale tail; reload the bounded first page
+                // before recording the new revision or it would remain empty.
+                page = try await client.traceConversationEvents(
+                    sessionId: sid, limit: 100, includeEntries: false)
+                guard generation == conversationGeneration,
+                    page.sessionId == selectedSessionId
+                else { return }
+            }
+            if conversationLoadedSessionId != sid || timelineShrank {
+                conversationEvents = []
+                conversationCursor = nil
+            }
+            conversationEvents = TraceConversationPaging.merge(
+                existing: conversationEvents, incoming: page.events)
+            conversationLoadedSessionId = sid
+            conversationLoadedSessionRevision = revision
+            conversationTotalEvents = page.totalEvents
+            conversationHasMore = page.hasMoreAfter
+            if let next = page.nextCursor { conversationCursor = next }
+            conversationInitialLoadComplete = true
+            conversationError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard generation == conversationGeneration else { return }
+            if let clientError = error as? AlexandriaClient.ClientError,
+                case let .http(status, _) = clientError, status == 404
+            {
+                // Additive endpoint: mixed-version clients silently omit the
+                // generation lane when connected to an older daemon.
+                conversationUnsupported = true
+                conversationInitialLoadComplete = true
+                conversationError = nil
+                return
+            }
+            conversationError = error.localizedDescription
+            BarLog.warn(.browser, "conversation event refresh failed: \(error.localizedDescription)")
+        }
+    }
+
+    func loadMoreConversationEvents() {
+        Task { await pollConversationEvents(loadNextPage: true) }
+    }
+
+    func retryConversationEvents() {
+        conversationError = nil
+        conversationUnsupported = false
+        Task {
+            await pollConversationEvents(
+                loadNextPage: conversationHasMore, force: true)
         }
     }
 
     func retrySessions() { Task { await pollSessions() } }
     func retryTranscript() { Task { await pollTranscript() } }
+    func retryArchivedBodies() {
+        guard selectedSessionId != nil else { return }
+        resetTurns(resetConversation: false)
+        Task { await pollTranscript() }
+    }
+
+    private func matchesArchivedUnavailable(
+        _ availability: TranscriptArchiveAvailability?
+    ) -> Bool {
+        availability == .archivedOffline || availability == .archivedMissing
+    }
 
     private func queryChanged() {
         searchTask?.cancel()
@@ -942,6 +1277,7 @@ final class TraceBrowserModel {
         applyTurnFilter()
         guard !query.freeText.isEmpty || query.key != nil else {
             searchSessionIds = nil
+            searchAnchorBySession = [:]
             searchInFlight = false
             recomputeVisible(debounce: true)
             return
@@ -976,16 +1312,25 @@ final class TraceBrowserModel {
             let resp = try await client.searchTraces(text: query.freeText, filters: query)
             guard parsedQuery == query else { return }
             searchSessionIds = Set(resp.traces.compactMap(\.sessionId))
+            searchAnchorBySession = resp.traces.reduce(into: [:]) { anchors, row in
+                guard let sessionId = row.sessionId, let timestamp = row.tsRequestMs,
+                    anchors[sessionId] == nil
+                else { return }
+                anchors[sessionId] = TranscriptCursor(tsMs: timestamp, traceId: row.id)
+            }
             searchMatchCount = resp.traces.count
             searchScanned = resp.scanned ?? 0
             let elapsed = start.duration(to: .now)
             BarLog.info(.browser, "search \"\(query.freeText)\" matches=\(resp.traces.count) scanned=\(resp.scanned ?? 0) in \(elapsed.components.seconds * 1000 + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000))ms")
+        } catch is CancellationError {
+            return
         } catch {
             guard parsedQuery == query else { return }
             // Degrade silently to metadata-only matching (tag matches still
             // apply via `OmniQuery.isVisible`; server-side body matches just
             // don't contribute) rather than surfacing an error UI.
             searchSessionIds = []
+            searchAnchorBySession = [:]
             searchMatchCount = 0
             searchScanned = 0
             BarLog.warn(.browser, "search \"\(query.freeText)\" failed: \(error.localizedDescription)")
@@ -1092,8 +1437,9 @@ final class TraceBrowserModel {
                 return
             }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                guard let errorTrace = transcript.turns.reversed().first(where: {
+                let turns = try await self.completeTranscript(
+                    sessionId: session.sessionId, client: client)
+                guard let errorTrace = turns.reversed().first(where: {
                     TraceClassification.isError(
                         status: $0.status, errorKind: $0.errorKind, error: $0.error)
                 }) else {
@@ -1125,7 +1471,8 @@ final class TraceBrowserModel {
         Task {
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                let transcript = try await client.traceTranscript(
+                    sessionId: session.sessionId, limit: 1, tail: true)
                 guard let last = transcript.turns.last else { return }
                 let markdown = try await client.traceReplyMarkdown(traceId: last.traceId)
                 NSPasteboard.general.clearContents()
@@ -1145,9 +1492,10 @@ final class TraceBrowserModel {
         Task {
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                let turns = try await completeTranscript(
+                    sessionId: session.sessionId, client: client)
                 let markdown = Self.exportMarkdown(
-                    sessionId: session.sessionId, turns: transcript.turns)
+                    sessionId: session.sessionId, turns: turns)
                 try markdown.write(to: dest, atomically: true, encoding: .utf8)
             } catch {
                 NSSound.beep()
@@ -1178,6 +1526,30 @@ final class TraceBrowserModel {
             }
         }
         return out
+    }
+
+    private func completeTranscript(
+        sessionId: String, client: AlexandriaClient
+    ) async throws -> [TranscriptTurn] {
+        var turns: [TranscriptTurn] = []
+        var after: TranscriptCursor?
+        while true {
+            let response = try await client.traceTranscript(
+                sessionId: sessionId, limit: Self.transcriptPageSize, after: after)
+            turns = TranscriptPaging.merge(existing: turns, incoming: response.turns)
+            guard response.hasMoreAfter == true, let next = response.newestCursor,
+                next != after
+            else {
+                // An older daemon omits pagination metadata. Preserve its
+                // historical 500-turn behavior instead of looping the first page.
+                if response.hasMoreAfter == nil {
+                    return try await client.traceTranscript(
+                        sessionId: sessionId, limit: 500).turns
+                }
+                return turns
+            }
+            after = next
+        }
     }
 
     /// Single-session delete, e.g. from the row context menu. Routes through
@@ -1235,7 +1607,7 @@ final class TraceBrowserModel {
                     let ids: Set<String>
                     do {
                         let transcript = try await client.traceTranscript(
-                            sessionId: session.sessionId)
+                            sessionId: session.sessionId, limit: Self.transcriptPageSize)
                         ids = Set(transcript.turns.map(\.traceId))
                     } catch {
                         transcriptFailures += 1
@@ -2188,6 +2560,14 @@ private struct TranscriptView: View {
     private var singleSelectionBody: some View {
         VStack(spacing: 0) {
             header
+            if model.selectedSession != nil,
+                (!model.conversationEvents.isEmpty
+                    || (model.conversationLoading && !model.conversationInitialLoadComplete)
+                    || model.conversationError != nil)
+            {
+                ConversationGenerationTimeline(model: model)
+                Divider()
+            }
             if infoExpanded, model.selectedSession != nil {
                 SessionInfoCard(model: model)
                 Divider()
@@ -2198,14 +2578,65 @@ private struct TranscriptView: View {
             if let followed = model.followedSubagentId {
                 followBanner(followed)
             }
-            if model.hiddenTurnCount > 0 {
-                Button("Load earlier turns (\(model.hiddenTurnCount) more)") {
-                    model.loadEarlierTurns()
+            if model.transcriptArchiveSummary.isUnavailable {
+                HStack(spacing: 8) {
+                    Image(systemName: "externaldrive.badge.exclamationmark")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.transcriptArchiveSummary.title)
+                            .fontWeight(.semibold)
+                        Text(model.transcriptArchiveSummary.guidance)
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Retry") { model.retryArchivedBodies() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
-                .buttonStyle(.link)
                 .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(.orange.opacity(0.08))
+                .help("The Alex daemon is connected. Reattach the archived LAR file to restore these bodies.")
+                Divider()
+            }
+            if model.transcriptBodyTruncationCount > 0 || model.transcriptBodyErrorCount > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(
+                        "\(model.transcriptBodyTruncationCount) oversized and \(model.transcriptBodyErrorCount) unreadable transcript bodies were omitted"
+                    )
+                    Spacer()
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                Divider()
+            }
+            if model.transcriptHasMoreBefore || model.transcriptHasMoreAfter
+                || model.hiddenTurnCount > 0
+            {
+                HStack(spacing: 12) {
+                    if model.transcriptHasMoreBefore || model.hiddenTurnCount > 0 {
+                        Button("Load earlier turns") { model.loadEarlierTurns() }
+                            .buttonStyle(.link)
+                    }
+                    if model.transcriptPageLoading {
+                        ProgressView().controlSize(.small)
+                    }
+                    Spacer()
+                    if model.transcriptHasMoreAfter {
+                        Button("Load newer turns") { model.loadNewerTurns() }
+                            .buttonStyle(.link)
+                        Button("Jump to latest") { model.jumpToLatestTurns() }
+                            .buttonStyle(.link)
+                    }
+                }
+                .disabled(model.transcriptPageLoading)
+                .font(.system(size: 11))
+                .padding(.horizontal, 12)
                 .padding(.vertical, 4)
-                .frame(maxWidth: .infinity)
                 Divider()
             }
             ZStack(alignment: .bottom) {
@@ -2340,7 +2771,7 @@ private struct TranscriptView: View {
         SessionListFooter(
             text: "\(model.transcriptEntries.count) of \(model.transcriptTotalCount) messages",
             showsDot: true,
-            trailingText: "\(TraceFormat.tokens(model.transcriptTokensTotal)) tokens total")
+            trailingText: "\(model.transcriptLoadedTurnCount)/\(model.transcriptAvailableTurnCount) turns loaded · \(TraceFormat.tokens(model.transcriptTokensTotal)) tokens shown")
     }
 
     private var header: some View {
@@ -2455,6 +2886,165 @@ private struct TranscriptView: View {
             parts.append("run \(runId)")
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+private struct ConversationGenerationTimeline: View {
+    @Bindable var model: TraceBrowserModel
+    @State private var expanded = false
+
+    private var notable: [TraceConversationEvent] {
+        model.conversationEvents.filter(\.isNotable)
+    }
+
+    private var displayed: [TraceConversationEvent] {
+        let recent = Array(model.conversationEvents.suffix(20))
+        let merged = TraceConversationPaging.merge(existing: notable, incoming: recent)
+        return Array(merged.suffix(500))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 7) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.primary)
+                Text("\(model.conversationTotalEvents) conversation generation\(model.conversationTotalEvents == 1 ? "" : "s")")
+                    .font(.system(size: 10.5, weight: .semibold))
+                if !notable.isEmpty {
+                    Text("\(notable.count) structural event\(notable.count == 1 ? "" : "s") loaded")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                if model.conversationLoading,
+                    model.conversationEvents.isEmpty || model.conversationHasMore
+                {
+                    ProgressView().controlSize(.small)
+                }
+                Button(expanded ? "Hide" : "Timeline") { expanded.toggle() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10))
+            }
+            if let error = model.conversationError {
+                HStack(spacing: 6) {
+                    Text(error)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                    Button("Retry") { model.retryConversationEvents() }
+                        .buttonStyle(.link)
+                }
+            } else if !expanded {
+                HStack(spacing: 5) {
+                    ForEach(notable.suffix(4)) { event in
+                        generationChip(event)
+                    }
+                    if notable.count > 4 {
+                        Text("+\(notable.count - 4)")
+                            .font(AlexTheme.Fonts.mono(8.5))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                if displayed.count < model.conversationEvents.count {
+                    Text("Showing structural events and the latest 20 routine appends (maximum 500 rows).")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 5) {
+                        ForEach(displayed) { event in
+                            generationRow(event)
+                        }
+                    }
+                }
+                .frame(maxHeight: 180)
+                if model.conversationHasMore {
+                    Button("Load next event page") { model.loadMoreConversationEvents() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 9.5))
+                        .disabled(model.conversationLoading)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(AlexTheme.Colors.primary.opacity(0.035))
+    }
+
+    private func generationChip(_ event: TraceConversationEvent) -> some View {
+        Label(event.reason, systemImage: icon(event.reason))
+            .font(.system(size: 8.5, weight: .medium))
+            .foregroundStyle(color(event.reason))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(color(event.reason).opacity(0.11)))
+            .help(generationHelp(event))
+    }
+
+    private func generationRow(_ event: TraceConversationEvent) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: icon(event.reason))
+                .font(.system(size: 9))
+                .foregroundStyle(color(event.reason))
+                .frame(width: 12)
+            Text(TraceFormat.time(event.tsRequestMs))
+                .font(AlexTheme.Fonts.mono(8.5))
+                .foregroundStyle(.secondary)
+            Text(event.reason)
+                .font(.system(size: 9.5, weight: event.isNotable ? .semibold : .regular))
+                .foregroundStyle(event.isNotable ? color(event.reason) : .secondary)
+            Text("\(event.uptoIndex + 1) entries")
+                .font(AlexTheme.Fonts.mono(8.5))
+                .foregroundStyle(.secondary)
+            if let evidence = event.evidence {
+                Text("\(evidence.source):\(evidence.kind):\(evidence.id)")
+                    .font(AlexTheme.Fonts.mono(8.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 3)
+            Text(String(event.generationId.prefix(8)))
+                .font(AlexTheme.Fonts.mono(8))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .help(generationHelp(event))
+        }
+    }
+
+    private func generationHelp(_ event: TraceConversationEvent) -> String {
+        var lines = [
+            "generation \(event.generationId)",
+            "turn view \(event.turnViewId)",
+            "trace \(event.traceId)",
+        ]
+        if let parent = event.parentGenerationId { lines.append("parent \(parent)") }
+        if let evidence = event.evidence {
+            lines.append("evidence \(evidence.source):\(evidence.kind):\(evidence.id)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func icon(_ reason: String) -> String {
+        switch reason {
+        case "compaction": "arrow.down.right.and.arrow.up.left"
+        case "branch": "arrow.triangle.branch"
+        case "mutation": "wand.and.stars"
+        case "import": "square.and.arrow.down"
+        case "initial": "record.circle"
+        default: "plus.circle"
+        }
+    }
+
+    private func color(_ reason: String) -> Color {
+        switch reason {
+        case "compaction": .orange
+        case "branch": .purple
+        case "mutation": .pink
+        case "import": .blue
+        default: AlexTheme.Colors.textSecondary
+        }
     }
 }
 

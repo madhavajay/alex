@@ -428,6 +428,44 @@ public struct AlexandriaClient: Sendable {
         }
     }
 
+    /// Returns nil when connected to an older daemon which does not expose LAR
+    /// migration administration yet. Transport and server failures still throw.
+    public func larMigrationStatus() async throws -> LARMigrationStatus? {
+        do {
+            return try await get("admin/lar/migration", as: LARMigrationStatus.self)
+        } catch ClientError.http(404, _) {
+            return nil
+        }
+    }
+
+    /// Pauses background legacy-body conversion at the next safe record
+    /// boundary. A false result means the connected daemon predates LAR.
+    @discardableResult
+    public func larMigrationPause() async throws -> Bool {
+        try await larMigrationAction("pause")
+    }
+
+    /// Resumes (or starts) the durable background migration job.
+    @discardableResult
+    public func larMigrationResume() async throws -> Bool {
+        try await larMigrationAction("resume")
+    }
+
+    /// Starts a non-destructive validation pass over migrated artifacts.
+    @discardableResult
+    public func larMigrationVerify() async throws -> Bool {
+        try await larMigrationAction("verify")
+    }
+
+    private func larMigrationAction(_ action: String) async throws -> Bool {
+        do {
+            _ = try await request("admin/lar/migration/\(action)", method: "POST")
+            return true
+        } catch ClientError.http(404, _) {
+            return false
+        }
+    }
+
     private static func updateRejectionReason(from body: String) -> String {
         let data = Data(body.utf8)
         if let decoded = try? JSONDecoder().decode(DaemonUpdateApplyResponse.self, from: data),
@@ -731,11 +769,51 @@ public struct AlexandriaClient: Sendable {
         ).sessions
     }
 
-    public func traceTranscript(sessionId: String, limit: Int = 500) async throws -> TranscriptResponse {
-        try await get(
+    public func traceTranscript(
+        sessionId: String,
+        limit: Int = 500,
+        tail: Bool = false,
+        after: TranscriptCursor? = nil,
+        before: TranscriptCursor? = nil,
+        bodyByteBudget: Int? = nil
+    ) async throws -> TranscriptResponse {
+        var query = [URLQueryItem(name: "limit", value: "\(limit)")]
+        if tail { query.append(URLQueryItem(name: "tail", value: "true")) }
+        if let after {
+            query.append(URLQueryItem(name: "after_ms", value: "\(after.tsMs)"))
+            query.append(URLQueryItem(name: "after_id", value: after.traceId))
+        }
+        if let before {
+            query.append(URLQueryItem(name: "before_ms", value: "\(before.tsMs)"))
+            query.append(URLQueryItem(name: "before_id", value: before.traceId))
+        }
+        if let bodyByteBudget {
+            query.append(URLQueryItem(name: "body_byte_budget", value: "\(bodyByteBudget)"))
+        }
+        return try await get(
             "traces/sessions/\(sessionId)/transcript",
-            query: [URLQueryItem(name: "limit", value: "\(limit)")],
+            query: query,
             as: TranscriptResponse.self)
+    }
+
+    public func traceConversationEvents(
+        sessionId: String,
+        limit: Int = 100,
+        after: TranscriptCursor? = nil,
+        includeEntries: Bool = false
+    ) async throws -> TraceConversationEventPage {
+        var query = [
+            URLQueryItem(name: "limit", value: "\(limit)"),
+            URLQueryItem(name: "include_entries", value: includeEntries ? "true" : "false"),
+        ]
+        if let after {
+            query.append(URLQueryItem(name: "after_ms", value: "\(after.tsMs)"))
+            query.append(URLQueryItem(name: "after_id", value: after.traceId))
+        }
+        return try await get(
+            "traces/sessions/\(encodedPathComponent(sessionId))/conversation-events",
+            query: query,
+            as: TraceConversationEventPage.self)
     }
 
     public func searchTraces(text: String, since: String = "24h", filters: OmniQuery = OmniQuery()) async throws -> TraceSearchResponse {
@@ -785,6 +863,27 @@ public struct AlexandriaClient: Sendable {
         return TraceBodyContent(
             text: String(data: data, encoding: .utf8) ?? "",
             diskPath: http?.value(forHTTPHeaderField: "x-alexandria-body-path"))
+    }
+
+    public func traceStreamReplay(
+        traceId: String,
+        stageId: String,
+        source: TraceStreamReplaySource = .observedReads,
+        cursor: UInt64 = 0,
+        limit: Int = 100,
+        maxPageBytes: Int = 4 * 1024 * 1024
+    ) async throws -> TraceStreamReplayPage {
+        let trace = encodedPathComponent(traceId)
+        let stage = encodedPathComponent(stageId)
+        return try await get(
+            "traces/\(trace)/stages/\(stage)/replay",
+            query: [
+                URLQueryItem(name: "source", value: source.rawValue),
+                URLQueryItem(name: "cursor", value: "\(cursor)"),
+                URLQueryItem(name: "limit", value: "\(limit)"),
+                URLQueryItem(name: "max_page_bytes", value: "\(maxPageBytes)"),
+            ],
+            as: TraceStreamReplayPage.self)
     }
 
     public func toolBody(id: String, kind: String) async throws -> TraceBodyContent {

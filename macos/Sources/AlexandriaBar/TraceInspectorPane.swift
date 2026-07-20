@@ -223,6 +223,304 @@ struct ToolBodyInspectorView: View {
     }
 }
 
+/// Incremental client-side playback for one captured response stream. Pages
+/// remain bounded by the daemon API; playback fetches the next page only when
+/// the current one has been consumed, so an hours-long trace never becomes one
+/// giant allocation or timer queue.
+private struct TraceStreamReplayView: View {
+    let traceId: String
+    let stage: TranscriptStage
+    let client: AlexandriaClient?
+
+    @State private var expanded = false
+    @State private var source = TraceStreamReplaySource.observedReads
+    @State private var speed = TraceStreamReplaySpeed.one
+    @State private var page: TraceStreamReplayPage?
+    @State private var pageEventIndex = 0
+    @State private var nextCursor: UInt64?
+    @State private var previousDeltaNs: UInt64?
+    @State private var latestEvent: TraceStreamReplayEvent?
+    @State private var output = ""
+    @State private var outputBytes = 0
+    @State private var omittedBytes = 0
+    @State private var loading = false
+    @State private var playing = false
+    @State private var completed = false
+    @State private var errorMessage: String?
+    @State private var playbackTask: Task<Void, Never>?
+
+    private let displayByteLimit = TraceStreamReplayBuffer.displayByteLimit
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 7) {
+                controls
+                status
+                if let errorMessage {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(errorMessage)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                        Button("Retry") { restart(autoplay: false) }
+                            .controlSize(.small)
+                    }
+                } else if page?.totalEvents == 0 {
+                    Text("No captured stream events")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                if !output.isEmpty {
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(output)
+                            .font(AlexTheme.Fonts.mono(9.5))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    .frame(height: 190)
+                    .padding(6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(AlexTheme.Colors.muted.opacity(0.18)))
+                }
+                if omittedBytes > 0 {
+                    Text("Display capped at 1 MiB; \(omittedBytes) rendered bytes omitted. Replay timing and paging continue.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "waveform.path")
+                    .foregroundStyle(AlexTheme.Colors.primary)
+                Text("Stream replay · \(TranscriptStageTimeline.label(stage))")
+                    .font(.system(size: 11, weight: .medium))
+            }
+        }
+        .onChange(of: expanded) { _, isExpanded in
+            if isExpanded, page == nil, !loading {
+                restart(autoplay: false)
+            } else if !isExpanded {
+                pause()
+            }
+        }
+        .onChange(of: source) { _, _ in
+            restart(autoplay: false)
+        }
+        .onDisappear { pause() }
+    }
+
+    private var controls: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Picker("Stream", selection: $source) {
+                Text("Raw reads").tag(TraceStreamReplaySource.observedReads)
+                Text("Parsed frames").tag(TraceStreamReplaySource.parsedFrames)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            HStack(spacing: 7) {
+                Picker("Speed", selection: $speed) {
+                    ForEach(TraceStreamReplaySpeed.allCases) { value in
+                        Text(value.rawValue).tag(value)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 88)
+                Button {
+                    playing ? pause() : start()
+                } label: {
+                    Label(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill")
+                }
+                Button {
+                    restart(autoplay: true)
+                } label: {
+                    Label("Restart", systemImage: "backward.end.fill")
+                }
+                Spacer(minLength: 4)
+                if loading {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    private var status: some View {
+        if let replayStatus {
+            Text(replayStatus)
+                .font(AlexTheme.Fonts.mono(9))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .textSelection(.enabled)
+        } else if loading {
+            Text("Loading first replay page…")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var replayStatus: String? {
+        guard let page else { return nil }
+        let consumed = latestEvent.map { $0.index + 1 } ?? page.cursor
+        var parts = ["\(consumed)/\(page.totalEvents) events", page.archiveState]
+        if let event = latestEvent {
+            parts.append(String(format: "%.3fs", Double(event.observedDeltaNs) / 1_000_000_000))
+            if let parser = event.parser { parts.append(parser) }
+            if let kind = event.frameKind { parts.append(kind) }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    @MainActor
+    private func start() {
+        guard !playing else { return }
+        if completed {
+            restart(autoplay: true)
+            return
+        }
+        errorMessage = nil
+        playing = true
+        playbackTask?.cancel()
+        playbackTask = Task { @MainActor in
+            await playbackLoop()
+        }
+    }
+
+    @MainActor
+    private func pause() {
+        playbackTask?.cancel()
+        playbackTask = nil
+        playing = false
+    }
+
+    @MainActor
+    private func restart(autoplay: Bool) {
+        pause()
+        page = nil
+        pageEventIndex = 0
+        nextCursor = nil
+        previousDeltaNs = nil
+        latestEvent = nil
+        output = ""
+        outputBytes = 0
+        omittedBytes = 0
+        completed = false
+        errorMessage = nil
+        playbackTask = Task { @MainActor in
+            let loaded = await loadPage(cursor: 0)
+            guard loaded, autoplay, !Task.isCancelled else { return }
+            playing = true
+            await playbackLoop()
+        }
+    }
+
+    @MainActor
+    private func playbackLoop() async {
+        if page == nil, !(await loadPage(cursor: 0)) {
+            playing = false
+            return
+        }
+        while !Task.isCancelled {
+            guard let currentPage = page else { break }
+            if pageEventIndex >= currentPage.events.count {
+                guard let cursor = nextCursor else {
+                    completed = true
+                    playing = false
+                    playbackTask = nil
+                    return
+                }
+                guard await loadPage(cursor: cursor) else {
+                    playing = false
+                    return
+                }
+                continue
+            }
+
+            let event = currentPage.events[pageEventIndex]
+            let delay = TraceStreamReplayTiming.delayNanoseconds(
+                previousDeltaNs: previousDeltaNs,
+                currentDeltaNs: event.observedDeltaNs,
+                speed: speed)
+            if delay > 0 {
+                do {
+                    try await Task<Never, Never>.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled else { return }
+            append(event)
+            latestEvent = event
+            previousDeltaNs = event.observedDeltaNs
+            pageEventIndex += 1
+            // Instant mode still yields between events so pause/trace changes
+            // are responsive even when replaying a very large capture.
+            if speed == .instant { await Task.yield() }
+        }
+    }
+
+    @MainActor
+    private func loadPage(cursor: UInt64) async -> Bool {
+        guard let client else {
+            errorMessage = "Daemon unavailable"
+            return false
+        }
+        loading = true
+        defer { loading = false }
+        do {
+            let fetched = try await client.traceStreamReplay(
+                traceId: traceId, stageId: stage.stageId,
+                source: source, cursor: cursor)
+            guard !Task.isCancelled else { return false }
+            page = fetched
+            pageEventIndex = 0
+            nextCursor = fetched.nextCursor
+            errorMessage = nil
+            return true
+        } catch {
+            guard !(error is CancellationError) else { return false }
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @MainActor
+    private func append(_ event: TraceStreamReplayEvent) {
+        guard let bytes = event.bytes else {
+            let marker = "\n<invalid base64 for event \(event.index)>\n"
+            appendDisplay(marker)
+            return
+        }
+        let fragment: String
+        if !bytes.contains(0), let text = String(data: bytes, encoding: .utf8) {
+            fragment = text
+        } else {
+            fragment = "\n\(TraceStreamReplayBuffer.display(bytes))\n"
+        }
+        appendDisplay(fragment)
+    }
+
+    @MainActor
+    private func appendDisplay(_ fragment: String) {
+        let encoded = Data(fragment.utf8)
+        let remaining = max(0, displayByteLimit - outputBytes)
+        guard remaining > 0 else {
+            omittedBytes += encoded.count
+            return
+        }
+        if encoded.count <= remaining {
+            output.append(contentsOf: fragment)
+            outputBytes += encoded.count
+            return
+        }
+        let accepted = encoded.prefix(remaining)
+        output.append(contentsOf: String(decoding: accepted, as: UTF8.self))
+        outputBytes += accepted.count
+        omittedBytes += encoded.count - accepted.count
+    }
+}
+
 struct TraceInspectorView: View {
     let traceId: String
     @Bindable var model: TraceBrowserModel
@@ -496,6 +794,7 @@ struct TraceInspectorView: View {
         let trace = response.trace
         endpointBlock(trace)
         overview(trace)
+        transportTimeline
         if let extras = response.extras, extras.hasAny {
             section(
                 "Extras",
@@ -534,6 +833,14 @@ struct TraceInspectorView: View {
         requestBodyGroup()
         bodyGroup(
             title: "Response body", kind: .response, load: $respBody, isExpanded: $respBodyOpen)
+        ForEach(transportStages.filter { $0.streamIndexRef != nil }) { stage in
+            TraceStreamReplayView(
+                traceId: traceId, stage: stage, client: model.detailClient())
+                // Stage ids are content-addressed and can legitimately recur
+                // on another trace. Include the trace in SwiftUI identity so
+                // replay output/tasks cannot survive inspector navigation.
+                .id("\(traceId)|\(stage.stageId)")
+        }
         if let capture = response.extras?.darioCapture {
             if capture.requestAvailable {
                 bodyGroup(
@@ -544,6 +851,70 @@ struct TraceInspectorView: View {
                 bodyGroup(
                     title: "Anthropic → Dario", kind: .darioUpstreamResponse,
                     load: $darioRespBody, isExpanded: $darioRespBodyOpen)
+            }
+        }
+    }
+
+    private var transportStages: [TranscriptStage] {
+        guard let stages = model.turns.first(where: { $0.traceId == traceId })?.stages else {
+            return []
+        }
+        return TranscriptStageTimeline.ordered(stages)
+    }
+
+    @ViewBuilder
+    private var transportTimeline: some View {
+        if !transportStages.isEmpty {
+            section(
+                "Transport timeline",
+                copyText: TranscriptStageTimeline.summary(transportStages)
+            ) {
+                if let summary = TranscriptStageTimeline.summary(transportStages) {
+                    Text(summary)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .textSelection(.enabled)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(transportStages) { stage in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("\(stage.captureSequence + 1)")
+                                .font(AlexTheme.Fonts.mono(9))
+                                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                                .frame(width: 18, alignment: .trailing)
+                            Text(TranscriptStageTimeline.label(stage))
+                                .font(.system(size: 10, weight: .medium))
+                            if stage.streamIndexRef != nil {
+                                Image(systemName: "waveform.path")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(AlexTheme.Colors.primary)
+                                    .help("Captured stream timing is replayable")
+                            }
+                            Spacer(minLength: 4)
+                            Text(stage.fidelity)
+                                .font(AlexTheme.Fonts.mono(8.5))
+                                .foregroundStyle(
+                                    stage.fidelity == "captured"
+                                        ? AlexTheme.Colors.textTertiary : .orange)
+                        }
+                        let refs = [
+                            stage.requestHeadersRef.map { "req headers \($0)" },
+                            stage.requestBodyManifestRef.map { "req body \($0)" },
+                            stage.responseHeadersRef.map { "resp headers \($0)" },
+                            stage.responseBodyManifestRef.map { "resp body \($0)" },
+                            stage.trailersRef.map { "trailers \($0)" },
+                        ].compactMap(\.self)
+                        if !refs.isEmpty {
+                            Text(refs.joined(separator: " · "))
+                                .font(AlexTheme.Fonts.mono(8.5))
+                                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                                .padding(.leading, 24)
+                        }
+                    }
+                }
             }
         }
     }

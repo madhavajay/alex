@@ -86,6 +86,65 @@ and produces one normalized turn per request:
 }
 ```
 
+Long sessions can be read without rebuilding the full transcript. `limit`
+accepts 1–500 turns, `tail=true` returns the newest page, and stable cursor
+pairs walk in either direction:
+
+- `after_ms` + `after_id` returns the next chronological page;
+- `before_ms` + `before_id` returns the preceding page;
+- `since`/`since_ms` remain supported for older clients.
+
+Paged responses add `total_turns`, `has_more_before`, `has_more_after`, and
+oldest/newest timestamp-and-trace-ID cursor fields. Trace rows and the required
+tool metadata are selected with session/timestamp indexes; compressed bodies
+are opened only for the bounded page. Body parsing runs on a blocking worker so
+a large transcript cannot starve daemon health and admin requests.
+
+When a turn has LAR exchange metadata, the same page includes its ordered
+`stages` (client request, router decision, every upstream attempt/failure,
+client response, and optional stream-index reference). All stages for the page
+come from one SQLite query; the Trace Browser does not open body packs merely
+to draw the route. Its compact transport line compares content-addressed
+header/body references, so it can accurately label client/upstream artifacts
+as shared or changed and identify timed streams without loading their bytes.
+Legacy turns omit the additive field and remain decodable by older clients.
+
+Explicit conversation-generation metadata is separately paged at
+`/traces/sessions/{session_id}/conversation-events`. Stable `after_ms` +
+`after_id` cursors and a `limit` of 1–500 walk canonical turn/generation IDs,
+parent/reason/evidence, `upto_index`, and (by default) the ordered semantic
+entry refs with exact manifest byte ranges. Branch, compaction, mutation, and
+import reasons are accepted only with capture/import evidence; the catalog
+does not infer them from similar JSON bodies. Use `include_entries=false` for
+the Trace Browser summary projection: it avoids expanding every entry in every
+growing prefix while retaining the authoritative generation timeline. The
+macOS timeline renders structural events plus a bounded recent append window.
+
+Transcript pages also have a reconstructed-body budget. The default is 16 MiB;
+local clients may request a smaller or larger cap with `body_byte_budget` (up
+to 256 MiB). Responses report `body_byte_budget`, `body_bytes_loaded`,
+`body_truncations`, and `body_errors`. Oversized or unreadable artifacts are
+omitted explicitly on both the page and affected turn instead of silently
+blanking the entire transcript page.
+
+An offline or missing LAR file is a body-level condition, not a daemon health
+failure. The transcript endpoint still returns `200` with all available turn
+metadata. Its affected `body_errors` entry has `kind` and
+`archive_availability` set to `archived_offline` or `archived_missing`, plus
+the stable `archive_file_uuid` and last cataloged `archive_path`. The macOS
+Trace Browser presents reattach guidance and a body reload action while
+leaving daemon connectivity healthy. For compatibility with an older daemon,
+the client also recognizes the archive state when only `kind` is present.
+
+Live LAR trace persistence is also kept off Tokio executor threads. A bounded
+worker gate is acquired asynchronously before large request/response buffers
+are cloned; hashing, zstd, archive sync, and SQLite publication then run on a
+blocking worker. `/health` and `/admin/storage` expose worker capacity,
+availability, queue wait, work latency, completions, and join failures, while
+storage status reports archive states, physical/catalog bytes, unique and
+referenced bytes, compression/dedup ratios, checkpoints, and unreachable
+chunks.
+
 The user side comes from `last_user_text(client_format, request)`. The assistant
 side and requested tool calls come from the upstream response format, including
 SSE reassembly. The transcript preserves text/tool/text ordering in
@@ -132,8 +191,18 @@ alex traces search --session ses_123 --json
 Search filters include time bounds, run/session/model/provider, historical
 account, path, harness, status/errors, key fingerprint, and limit. The HTTP
 search API additionally accepts text (`text` or `q`), error class, multiple
-account IDs, and reasoning effort. Text search scans request/response bodies and
-caps the candidate set at 300 rows.
+account IDs, and reasoning effort. For LAR-backed traces, text search uses a
+versioned SQLite FTS5 index of bounded provider-neutral user, assistant,
+reasoning, and tool text. Repeated entries are stored once and reverse
+references retain the trace, session, timestamp, stage, and manifest anchors.
+The index is derived from authoritative LAR bytes and can be cleared and
+rebuilt with explicit artifact/body/text limits.
+
+Mixed stores remain searchable during migration. The HTTP path searches FTS
+first, then checks only request/response gzip slots not already covered by the
+normalized index. That compatibility pass is capped at 300 trace rows and 4
+MiB of decompressed bytes per body, so a malformed or very large legacy body
+cannot turn one search into an unbounded scan.
 
 The TUI has Sessions, Limits, Accounts, and Dario tabs. Session rows include
 stable display fields (short ID, duration, provider summary, tag summary, and
@@ -152,11 +221,30 @@ traces but cannot read them.
 | `GET /traces/sessions/{session_id}/transcript` | Both conversation sides, assistant tool calls/blocks, and executed tools. |
 | `GET /traces/{id}` | One complete metadata row. |
 | `GET /traces/{id}/body/{kind}` | Decompressed `request`, `upstream-request`, `response`, `dario-upstream-request`, or `dario-upstream-response`. |
+| `GET /traces/{id}/stages/{stage_id}/replay` | Cursor-paged stream reads or parsed frames with bytes and observed timing. |
 | `GET /traces/{id}/reply.md` | Assistant reply rendered as Markdown text. |
 | `DELETE /traces/{id}` | Delete one trace and its referenced body artifacts. |
 | `GET /tools/{id}/body/{args|result}` | Decompressed redacted tool payload. |
 | `GET /traces/export.ndjson` | Filtered NDJSON; `bodies=1` adds base64-decoded artifact bytes as base64 fields. |
 | `GET /traces/runs/{run_id}` | Run summary, plus `/events`, `/artifacts`, and `/export.ndjson` child resources. |
+
+### Paged stream replay
+
+Replay is stage-specific because retries can produce multiple upstream response
+streams for one trace. Request
+`/traces/{id}/stages/{stage_id}/replay?source=observed_reads&cursor=0&limit=100`.
+Use `source=parsed_frames` to navigate stored SSE/NDJSON frame annotations;
+malformed or unparsed streams return an empty parsed page while their observed
+raw reads remain available.
+
+Each event includes `bytes_b64`, its raw manifest offset/length, and the
+absolute `observed_delta_ns` from first byte. `next_cursor` is null at the end.
+The daemon never sleeps: UI speed controls schedule events from those absolute
+deltas. Limits are 500 events and 16 MiB per request, with defaults of 100
+events and 4 MiB. One event larger than the requested byte cap returns a typed
+`replay_event_too_large` error rather than allocating it. Offline and missing
+archives return `archived_offline`/`archived_missing` with file UUID and path so
+clients can offer reattach and retry.
 
 Example:
 

@@ -3272,24 +3272,24 @@ pub(crate) fn set_codex_default_route(config_dir: &Path, route: &str) -> Result<
         bail!("Codex is not connected to Alex");
     }
     let state = read_codex_state(&state_path)?;
-    let (provider, model, catalog_path) = if route == "alex" {
-        (
-            PROVIDER_NAME,
-            state.alex_model.as_deref().context(
-                "Alex profile is missing its selected model; update the Codex config",
-            )?,
-            config_dir.join(CODEX_CATALOG_FILE),
-        )
-    } else {
-        (
-            "openai",
-            state
-                .native_model
-                .as_deref()
-                .context("OpenAI profile is missing its selected model; update the Codex config")?,
-            config_dir.join(CODEX_NATIVE_CATALOG_FILE),
-        )
-    };
+    let (provider, model, catalog_path) =
+        if route == "alex" {
+            (
+                PROVIDER_NAME,
+                state.alex_model.as_deref().context(
+                    "Alex profile is missing its selected model; update the Codex config",
+                )?,
+                config_dir.join(CODEX_CATALOG_FILE),
+            )
+        } else {
+            (
+                "openai",
+                state.native_model.as_deref().context(
+                    "OpenAI profile is missing its selected model; update the Codex config",
+                )?,
+                config_dir.join(CODEX_NATIVE_CATALOG_FILE),
+            )
+        };
     let config_path = config_dir.join(CODEX_CONFIG_FILE);
     let mut doc = read_codex_config(&config_path)?;
     apply_codex_route(&mut doc, provider, model, &catalog_path);
@@ -5477,7 +5477,10 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let timed_out = command_version(&bin, &[], Duration::from_millis(30)).await;
-        assert_eq!(timed_out.warning.as_deref(), Some("version check timed out"));
+        assert_eq!(
+            timed_out.warning.as_deref(),
+            Some("version check timed out")
+        );
         // The failure must not be memoized: a retry with a workable timeout
         // succeeds instead of replaying the cached timeout.
         let retried = command_version(&bin, &[], Duration::from_secs(10)).await;
@@ -5667,6 +5670,9 @@ mod tests {
             dario_probe_failures: crate::default_dario_probe_failures(),
             dario_probe_model: crate::default_dario_probe_model(),
             trace_body_retention_days: crate::default_trace_body_retention_days(),
+            lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_migration_batch_size: crate::default_lar_migration_batch_size(),
+            lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
             update_check_hours: crate::default_update_check_hours(),
             update_channel: crate::default_update_channel(),

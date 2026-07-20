@@ -596,10 +596,7 @@ mod tests {
         assert_eq!(route_model("o3-mini").0, Some(Provider::Openai));
         assert_eq!(
             route_model("kimi-for-coding"),
-            (
-                Some(Provider::Kimi),
-                "kimi/kimi-for-coding".to_string()
-            )
+            (Some(Provider::Kimi), "kimi/kimi-for-coding".to_string())
         );
         assert_eq!(route_model("mystery-model").0, None);
     }
@@ -697,7 +694,10 @@ mod tests {
             "x-ratelimit-remaining-tokens": "5000000",
         });
         let parsed = parse_limit_headers(Provider::Xai, &headers);
-        assert!(parsed.get("requests").is_none(), "must not emit request counts");
+        assert!(
+            parsed.get("requests").is_none(),
+            "must not emit request counts"
+        );
         assert!(parsed.get("tokens").is_none(), "must not emit token counts");
         assert_eq!(
             parsed["windows"].as_array().map(Vec::len),

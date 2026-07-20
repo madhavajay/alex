@@ -366,7 +366,7 @@ import Testing
 
     @Test func transcriptDecoding() throws {
         let json = #"""
-        {"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"reasoning_effort":"high","status":200,"thinking_budget":null,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"thinking_budget":16000,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
+        {"body_byte_budget":16777216,"body_bytes_loaded":2048,"body_errors":[{"artifact_kind":"client_request","kind":"legacy_read","message":"bad gzip","trace_id":"deadbeef"}],"body_truncations":[{"artifact_kind":"client_response","budget_remaining_bytes":0,"reason":"page_body_byte_budget","total_bytes":4096,"trace_id":"deadbeef"}],"session_id":"auto-1","turns":[{"assistant":"creds ok","cost_usd":0.0000214,"error":null,"input_tokens":142,"model":"grok-code-fast-1","output_tokens":3,"reasoning_effort":"high","status":200,"thinking_budget":null,"trace_id":"3290c574","ts_request_ms":1783484392318,"ts_response_ms":1783484394631,"user":"hello"},{"assistant":null,"body_errors":[{"artifact_kind":"client_request","kind":"legacy_read","message":"bad gzip","trace_id":"deadbeef"}],"body_truncations":[{"artifact_kind":"client_response","budget_remaining_bytes":0,"reason":"page_body_byte_budget","total_bytes":4096,"trace_id":"deadbeef"}],"cost_usd":null,"error":"upstream 429","input_tokens":null,"model":null,"output_tokens":null,"status":429,"thinking_budget":16000,"trace_id":"deadbeef","ts_request_ms":1783484392400,"ts_response_ms":null,"user":null}]}
         """#
         let transcript = try decode(json, as: TranscriptResponse.self)
         #expect(transcript.sessionId == "auto-1")
@@ -377,6 +377,43 @@ import Testing
         #expect(transcript.turns[1].error == "upstream 429")
         #expect(transcript.turns[1].model == nil)
         #expect(transcript.turns[1].thinkingBudget == 16_000)
+        #expect(transcript.bodyByteBudget == 16_777_216)
+        #expect(transcript.bodyBytesLoaded == 2_048)
+        #expect(transcript.bodyErrors?.first?.kind == "legacy_read")
+        #expect(transcript.bodyTruncations?.first?.totalBytes == 4_096)
+        #expect(transcript.turns[1].bodyErrors?.count == 1)
+        #expect(transcript.turns[1].bodyTruncations?.count == 1)
+    }
+
+    @Test func transcriptArchiveAvailabilityIsTypedAndLegacyCompatible() throws {
+        let current = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"a","ts_request_ms":1,"body_errors":[{"trace_id":"a","artifact_kind":"client_request","kind":"archived_offline","message":"reattach","archive_availability":"archived_offline","archive_file_uuid":"abcd","archive_path":"cold/a.lar"},{"trace_id":"a","artifact_kind":"client_response","kind":"archived_missing","message":"locate","archive_availability":"archived_missing","archive_file_uuid":"ef01","archive_path":"cold/b.lar"}]}]}"#,
+            as: TranscriptResponse.self)
+        let issues = try #require(current.turns[0].bodyErrors)
+        #expect(issues[0].resolvedArchiveAvailability == .archivedOffline)
+        #expect(issues[0].archiveFileUuid == "abcd")
+        #expect(issues[0].archivePath == "cold/a.lar")
+        #expect(issues[1].resolvedArchiveAvailability == .archivedMissing)
+        let summary = TranscriptArchiveSummary(issues: issues)
+        #expect(summary.offlineBodyCount == 1)
+        #expect(summary.missingBodyCount == 1)
+        #expect(summary.unavailableBodyCount == 2)
+        #expect(summary.isUnavailable)
+        #expect(summary.title.contains("unavailable"))
+
+        let legacy = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"old","ts_request_ms":1,"body_errors":[{"trace_id":"old","artifact_kind":"client_request","kind":"archived_missing","message":"missing"}]}]}"#,
+            as: TranscriptResponse.self)
+        let legacyIssue = try #require(legacy.turns[0].bodyErrors?.first)
+        #expect(legacyIssue.archiveAvailability == nil)
+        #expect(legacyIssue.resolvedArchiveAvailability == .archivedMissing)
+
+        let future = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"new","ts_request_ms":1,"body_errors":[{"trace_id":"new","artifact_kind":"client_request","kind":"archive_future","archive_availability":"archive_future"}]}]}"#,
+            as: TranscriptResponse.self)
+        #expect(
+            future.turns[0].bodyErrors?.first?.archiveAvailability
+                == .unknown("archive_future"))
     }
 
     @Test func searchDecoding() throws {
@@ -503,6 +540,137 @@ import Testing
         """#
         let changedTools = try decode(changedToolsJson, as: TranscriptResponse.self).turns
         #expect(TraceFingerprint.turns(turns) != TraceFingerprint.turns(changedTools))
+    }
+
+    @Test func transcriptPagingIsAdditiveAndBackwardsCompatible() throws {
+        let legacy = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"b","ts_request_ms":20,"assistant":"draft"}]}"#,
+            as: TranscriptResponse.self)
+        #expect(legacy.totalTurns == nil)
+        #expect(legacy.oldestCursor == nil)
+
+        let page = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"b","ts_request_ms":20,"assistant":"final","status":200},{"trace_id":"c","ts_request_ms":20,"user":"next"}],"total_turns":3,"has_more_before":true,"has_more_after":false,"oldest_ts_ms":20,"oldest_trace_id":"b","newest_ts_ms":20,"newest_trace_id":"c"}"#,
+            as: TranscriptResponse.self)
+        let earlier = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"a","ts_request_ms":10,"user":"hello","tool_calls":[{"name":"read","arguments":"{}"}]}]}"#,
+            as: TranscriptResponse.self)
+        let merged = TranscriptPaging.merge(
+            existing: legacy.turns,
+            incoming: page.turns + earlier.turns)
+        #expect(merged.map(\.traceId) == ["a", "b", "c"])
+        #expect(merged[1].assistant == "final")
+        #expect(page.totalTurns == 3)
+        #expect(page.oldestCursor == TranscriptCursor(tsMs: 20, traceId: "b"))
+        #expect(page.newestCursor == TranscriptCursor(tsMs: 20, traceId: "c"))
+
+        let counts = TranscriptTabCounts.counting(merged)
+        #expect(counts.user == 2)
+        #expect(counts.model == 2)
+        #expect(counts.tools == 1)
+        #expect(counts.all == 4)
+    }
+
+    @Test func transcriptStageTimelineShowsAttemptsAndTransportDifferences() throws {
+        let response = try decode(
+            #"""
+            {"session_id":"s","turns":[{"trace_id":"trace-stage","ts_request_ms":20,"stages":[
+              {"stage_id":"client-req","capture_sequence":0,"kind":"client_request","request_headers_ref":"h1","request_body_manifest_ref":"m1","fidelity":"captured"},
+              {"stage_id":"router","capture_sequence":1,"kind":"router_decision","fidelity":"captured"},
+              {"stage_id":"up-req","capture_sequence":2,"kind":"upstream_request","attempt_number":1,"request_headers_ref":"h2","request_body_manifest_ref":"m1","fidelity":"captured"},
+              {"stage_id":"up-resp","capture_sequence":3,"kind":"upstream_response","attempt_number":1,"response_headers_ref":"h3","response_body_manifest_ref":"m2","stream_index_ref":"stream-1","fidelity":"captured"},
+              {"stage_id":"client-resp","capture_sequence":4,"kind":"client_response","response_headers_ref":"h4","response_body_manifest_ref":"m3","fidelity":"captured"}
+            ]}]}
+            """#,
+            as: TranscriptResponse.self)
+        let stages = try #require(response.turns[0].stages)
+        let summary = try #require(TranscriptStageTimeline.summary(stages))
+        #expect(summary.contains("client request → router → upstream request #1"))
+        #expect(summary.contains("shared request body"))
+        #expect(summary.contains("changed request headers"))
+        #expect(summary.contains("changed response body"))
+        #expect(summary.contains("changed response headers"))
+        #expect(summary.contains("timed stream"))
+
+        let legacy = try decode(
+            #"{"session_id":"s","turns":[{"trace_id":"legacy","ts_request_ms":1}]}"#,
+            as: TranscriptResponse.self)
+        #expect(legacy.turns[0].stages == nil)
+        #expect(legacy.turns[0].stageError == nil)
+    }
+
+    @Test func streamReplayPageDecodesRawBytesAndFutureSources() throws {
+        let page = try decode(
+            #"{"trace_id":"trace","stage_id":"upstream","stage_kind":"upstream_response","source":"observed_reads","cursor":4,"next_cursor":5,"total_events":8,"page_bytes":6,"stream_index_id":"stream","raw_body_manifest_id":"body","archive_file_uuid":"archive","archive_state":"active","timing":"observed_delta_ns","server_sleep":false,"events":[{"index":4,"byte_offset":12,"byte_length":6,"observed_delta_ns":1500000000,"parser":null,"frame_kind":null,"bytes_b64":"ZGF0YTog"}]}"#,
+            as: TraceStreamReplayPage.self)
+        #expect(page.source == .observedReads)
+        #expect(page.nextCursor == 5)
+        #expect(page.serverSleep == false)
+        #expect(String(data: try #require(page.events[0].bytes), encoding: .utf8) == "data: ")
+
+        let future = try decode(
+            #"{"trace_id":"trace","stage_id":"upstream","stage_kind":"upstream_response","source":"provider_frames_v2","cursor":0,"next_cursor":null,"total_events":0,"page_bytes":0,"stream_index_id":"stream","raw_body_manifest_id":"body","archive_file_uuid":"archive","archive_state":"sealed","timing":"observed_delta_ns","server_sleep":false,"events":[]}"#,
+            as: TraceStreamReplayPage.self)
+        #expect(future.source == .unknown("provider_frames_v2"))
+    }
+
+    @Test func streamReplayTimingScalesAbsoluteObservedDeltas() {
+        #expect(TraceStreamReplayTiming.delayNanoseconds(
+            previousDeltaNs: nil, currentDeltaNs: 1_000, speed: .instant) == 0)
+        #expect(TraceStreamReplayTiming.delayNanoseconds(
+            previousDeltaNs: 1_000, currentDeltaNs: 3_000, speed: .one) == 2_000)
+        #expect(TraceStreamReplayTiming.delayNanoseconds(
+            previousDeltaNs: 1_000, currentDeltaNs: 3_000, speed: .two) == 1_000)
+        #expect(TraceStreamReplayTiming.delayNanoseconds(
+            previousDeltaNs: 1_000, currentDeltaNs: 3_000, speed: .quarter) == 8_000)
+        #expect(TraceStreamReplayTiming.delayNanoseconds(
+            previousDeltaNs: 3_000, currentDeltaNs: 1_000, speed: .one) == 0)
+    }
+
+    @Test func streamReplayDisplayBufferIsBoundedAndBinarySafe() {
+        let first = TraceStreamReplayBuffer.appending(
+            Data("hello".utf8), to: Data(), limit: 7)
+        let second = TraceStreamReplayBuffer.appending(
+            Data(" world".utf8), to: first.data, limit: 7)
+        #expect(String(data: second.data, encoding: .utf8) == "hello w")
+        #expect(second.omittedBytes == 5)
+        #expect(TraceStreamReplayBuffer.display(Data([0, 1, 255])).contains("binary stream"))
+    }
+
+    @Test func conversationGenerationSummaryDecodesAndPagesWithoutBodyBytes() throws {
+        let page = try decode(
+            #"{"session_id":"session","events":[{"trace_id":"trace-2","session_id":"session","ts_request_ms":20,"turn_view_id":"turn-2","generation_id":"gen-2","parent_generation_id":"gen-1","reason":"compaction","evidence":{"source":"capture","kind":"provider_event","id":"compact-7"},"upto_index":4,"entries":[],"response_entries":[]}],"total_events":77,"has_more_after":true,"next_after_ms":20,"next_after_id":"trace-2","entries_included":false}"#,
+            as: TraceConversationEventPage.self)
+        #expect(page.sessionId == "session")
+        #expect(page.totalEvents == 77)
+        #expect(page.entriesIncluded == false)
+        #expect(page.nextCursor == TranscriptCursor(tsMs: 20, traceId: "trace-2"))
+        #expect(page.events[0].reason == "compaction")
+        #expect(page.events[0].isNotable)
+        #expect(page.events[0].evidence?.id == "compact-7")
+        #expect(page.events[0].entries.isEmpty)
+    }
+
+    @Test func conversationGenerationPagingReplacesStableTurnViews() throws {
+        let first = try decode(
+            #"{"session_id":"s","events":[{"trace_id":"a","session_id":"s","ts_request_ms":10,"turn_view_id":"turn-a","generation_id":"gen-a","parent_generation_id":null,"reason":"initial","evidence":null,"upto_index":0,"entries":[],"response_entries":[]}],"total_events":2,"has_more_after":true,"next_after_ms":10,"next_after_id":"a"}"#,
+            as: TraceConversationEventPage.self)
+        let second = try decode(
+            #"{"session_id":"s","events":[{"trace_id":"b","session_id":"s","ts_request_ms":10,"turn_view_id":"turn-b","generation_id":"gen-b","parent_generation_id":"gen-a","reason":"branch","evidence":{"source":"capture","kind":"subagent","id":"child-1"},"upto_index":1,"entries":[],"response_entries":[]},{"trace_id":"a","session_id":"s","ts_request_ms":10,"turn_view_id":"turn-a","generation_id":"gen-a","parent_generation_id":null,"reason":"initial","evidence":null,"upto_index":0,"entries":[],"response_entries":[]}],"total_events":2,"has_more_after":false,"next_after_ms":10,"next_after_id":"b"}"#,
+            as: TraceConversationEventPage.self)
+        let merged = TraceConversationPaging.merge(
+            existing: first.events, incoming: second.events)
+        #expect(merged.map(\.traceId) == ["a", "b"])
+        #expect(merged[1].reason == "branch")
+        #expect(merged[1].isNotable)
+    }
+
+    @Test func traceSearchRowsCarryTranscriptAnchors() throws {
+        let response = try decode(
+            #"{"traces":[{"id":"match","session_id":"long-session","ts_request_ms":1784521342831}],"scanned":300}"#,
+            as: TraceSearchResponse.self)
+        #expect(response.traces[0].sessionId == "long-session")
+        #expect(response.traces[0].tsRequestMs == 1_784_521_342_831)
     }
 
     private func makeSession(

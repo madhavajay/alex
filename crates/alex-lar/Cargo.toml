@@ -1,0 +1,21 @@
+[package]
+name = "alex-lar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Seekable, deduplicated archive primitives for Alex LLM traffic"
+
+[dependencies]
+blake3 = "1"
+crc32fast = "1"
+zstd = "0.13"
+
+[dev-dependencies]
+enumset = "1"
+flate2.workspace = true
+libc = "0.2"
+mcap = { version = "0.25", default-features = false, features = ["zstd"] }
+proptest = "1"
+serde_json.workspace = true
+sha2.workspace = true

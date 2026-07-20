@@ -253,6 +253,8 @@ struct GeneralPreferencesPane: View {
 
         networkExposureSection
 
+        LARMigrationPreferencesSection(store: store)
+
         SectionLabel(text: "Reset")
             .settingsSectionSpacing()
         SettingRow(

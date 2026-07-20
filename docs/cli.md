@@ -81,6 +81,60 @@ Remote trace flags are `--trace-url` (alias `--alex-url`), `--run-id`,
 `--trace-key-file`, and `--allow-insecure-http`. Environment alternatives are
 documented in [Configuration](configuration.md).
 
+## `lar`
+
+Inspect, migrate, verify, and extract bodies from the LLM Archive store. LAR
+migration is additive: validated archive pointers are preferred, legacy gzip
+paths remain available for fallback, and startup migration never deletes the
+source files.
+
+| Subcommand | Behavior |
+| --- | --- |
+| `import SOURCE [--format auto\|lar\|jsonl]` | Auto-detect a sealed LAR archive or Alex JSONL v1 export, or require the selected format explicitly. Sealed LAR remains a validate-then-attach operation. JSONL is read one bounded line at a time; schema/types, duplicate trace IDs, base64 lengths, and BLAKE3 body hashes are validated before writes. Each completed JSONL trace publishes its SQLite row last and exact re-imports are skipped. |
+| `import-legacy` | Run the shared resumable importer. `--dry-run` inventories only; `--verify` also verifies dry-run gzip sources; `--limit N` bounds one invocation; `--json` reports counters and failures. Published pointers always pass normal-reader length and BLAKE3 validation. |
+| `migration status` | Show all durable jobs, leases, counters, deduplicated bytes, and the last error. |
+| `migration pause` / `resume` | Control the one incomplete migration job without changing converted artifacts. |
+| `migration verify` | Read every active/sealed archive and reconstruct every cataloged manifest, then compare migrated source identities. Read-only; JSON reports carry a canonical BLAKE3 checksum so saved verification evidence is tamper-detectable. |
+| `gc plan` / `apply` / `resume RUN_ID` | Compute reachability from trace and stage roots, then persist, recheck, and logically sweep unreachable manifest/chunk catalog objects. Planning is non-mutating and interrupted runs resume from durable state. Immutable pack bytes are reclaimed separately by repacking. |
+| `repack plan` / `apply` / `resume RUN_ID` | Select sealed body packs by `--min-garbage-bytes` and `--min-garbage-ratio`, copy only currently reachable chunks, verify the replacement, atomically switch catalog locations, and move the source to recoverable quarantine. Reports distinguish logical from physical reclamation. |
+| `verify [ARCHIVE]` | Verify the live store when no path is supplied, or frame/checksum/reconstruction integrity for one archive. |
+| `repair INPUT --output OUTPUT` | Copy only the valid prefix into a different file and verify it; never modifies the input. |
+| `ls [ARCHIVE]` | Summarize the live catalog or one archive. |
+| `grep LITERAL [ARCHIVE...]` | Search exact raw body bytes in the live catalog plus any supplied sealed archives. Shared chunks are decompressed once per source, matches may span manifest ranges, and results include manifest/stage/trace/session/time anchors where available. `--limit N` fails explicitly instead of returning an incomplete result set. |
+| `extract --trace-id ID --artifact KIND` | Write exact mixed legacy/LAR bytes to stdout or `--output`; kinds are `request`, `upstream-request`, `response`, and `raw-stream`. `--force` is required to replace an output. |
+| `replay ARCHIVE --trace-id ID` | Replay a captured stream from a standalone or sealed archive. Raw mode preserves observed HTTP-client read boundaries; `--parsed` independently emits recorded SSE/NDJSON ranges. `--speed instant\|0.25x\|0.5x\|1x\|2x\|4x` controls timing and defaults to instant so a long capture cannot accidentally block for hours. Use `--stage-id` when a trace has multiple streams and `--output` for a file. |
+| `export OUTPUT --format lar\|har\|warc\|jsonl\|otel\|openinference` | Export one `--trace-id`, one `--session`, or the complete live trace catalog. Body bytes are read through the mixed LAR/legacy reader. Standalone LAR output is sealed and reconstructed after writing; interchange outputs embed an explicit fidelity-loss report. `otel` uses current `gen_ai.*` names and `openinference` is a distinct OpenInference-on-OpenTelemetry attribute vocabulary. `--force` is required to replace output. |
+| `cleanup --dry-run` | Run a full verification pass and report the legacy files/bytes eligible for cleanup. No file is moved. |
+| `cleanup --apply` | Only after every migration job is complete with no pending/failed items and full verification passes, move legacy body files into a recoverable, audited quarantine below `lar/quarantine/`. LAR data is never removed. |
+
+```bash
+alex lar import-legacy --dry-run --verify --json
+alex lar import cold-archive.lar --json
+alex lar import traces.jsonl --format jsonl --json
+alex lar export traces.openinference.jsonl --format openinference --session SESSION_ID
+alex lar migration status
+alex lar migration verify --json
+alex lar gc plan --json
+alex lar repack plan --min-garbage-ratio 0.25 --json
+alex lar grep 'tool_call_id' archived-2026-07-19.lar --limit 500 --json
+alex lar cleanup --dry-run --json
+alex lar extract --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
+  --artifact response --output response.sse
+alex lar replay session.lar --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
+  --speed 2x
+alex lar replay session.lar --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
+  --parsed --speed instant --output parsed-events.sse
+```
+
+JSONL import defaults cap a physical line at 768 MiB, each decoded body at
+256 MiB, metadata at 2 MiB, headers at 65,536 fields/8 MiB, the stream at one
+million trace records, and total input at 4 TiB. These are rejection limits,
+not buffering targets: only one line and its at-most-three decoded bodies are
+resident. The source manifest's fidelity-loss list and per-record header
+fidelity are returned in the import report. Header arrays must agree with the
+raw header JSON retained in trace metadata, which makes export/import/export
+stable for current Alex JSONL files.
+
 ## `env`
 
 Print model-client exports using the configured host, port, and local key.

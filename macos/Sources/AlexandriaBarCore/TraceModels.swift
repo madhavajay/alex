@@ -81,11 +81,535 @@ public struct TranscriptResponse: Codable, Sendable {
     public let sessionId: String
     public let turns: [TranscriptTurn]
     public let tabCounts: TranscriptTabCounts?
+    public let totalTurns: Int?
+    public let hasMoreBefore: Bool?
+    public let hasMoreAfter: Bool?
+    public let oldestTsMs: Int64?
+    public let oldestTraceId: String?
+    public let newestTsMs: Int64?
+    public let newestTraceId: String?
+    public let bodyByteBudget: Int64?
+    public let bodyBytesLoaded: Int64?
+    public let bodyTruncations: [TranscriptBodyIssue]?
+    public let bodyErrors: [TranscriptBodyIssue]?
+
+    public var oldestCursor: TranscriptCursor? {
+        guard let tsMs = oldestTsMs, let traceId = oldestTraceId else { return nil }
+        return TranscriptCursor(tsMs: tsMs, traceId: traceId)
+    }
+
+    public var newestCursor: TranscriptCursor? {
+        guard let tsMs = newestTsMs, let traceId = newestTraceId else { return nil }
+        return TranscriptCursor(tsMs: tsMs, traceId: traceId)
+    }
 
     enum CodingKeys: String, CodingKey {
         case turns
         case sessionId = "session_id"
         case tabCounts = "tab_counts"
+        case totalTurns = "total_turns"
+        case hasMoreBefore = "has_more_before"
+        case hasMoreAfter = "has_more_after"
+        case oldestTsMs = "oldest_ts_ms"
+        case oldestTraceId = "oldest_trace_id"
+        case newestTsMs = "newest_ts_ms"
+        case newestTraceId = "newest_trace_id"
+        case bodyByteBudget = "body_byte_budget"
+        case bodyBytesLoaded = "body_bytes_loaded"
+        case bodyTruncations = "body_truncations"
+        case bodyErrors = "body_errors"
+    }
+}
+
+public struct TranscriptBodyIssue: Codable, Sendable, Equatable {
+    public let traceId: String
+    public let artifactKind: String
+    public let kind: String?
+    public let message: String?
+    public let reason: String?
+    public let totalBytes: Int64?
+    public let budgetRemainingBytes: Int64?
+    public let archiveAvailability: TranscriptArchiveAvailability?
+    public let archiveFileUuid: String?
+    public let archivePath: String?
+
+    /// New daemons send `archive_availability`; older LAR-aware daemons sent
+    /// only the same value in `kind`. Supporting both keeps mixed-version
+    /// Trace Browsers from turning a readable 200 response into a decode error.
+    public var resolvedArchiveAvailability: TranscriptArchiveAvailability? {
+        archiveAvailability ?? TranscriptArchiveAvailability(legacyKind: kind)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case traceId = "trace_id"
+        case artifactKind = "artifact_kind"
+        case kind, message, reason
+        case totalBytes = "total_bytes"
+        case budgetRemainingBytes = "budget_remaining_bytes"
+        case archiveAvailability = "archive_availability"
+        case archiveFileUuid = "archive_file_uuid"
+        case archivePath = "archive_path"
+    }
+}
+
+public enum TranscriptArchiveAvailability: Sendable, Equatable, Codable {
+    case archivedOffline
+    case archivedMissing
+    case unknown(String)
+
+    public var rawValue: String {
+        switch self {
+        case .archivedOffline: "archived_offline"
+        case .archivedMissing: "archived_missing"
+        case let .unknown(value): value
+        }
+    }
+
+    public init?(legacyKind: String?) {
+        switch legacyKind {
+        case "archived_offline": self = .archivedOffline
+        case "archived_missing": self = .archivedMissing
+        default: return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = Self(legacyKind: value) ?? .unknown(value)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+public struct TranscriptArchiveSummary: Sendable, Equatable {
+    public let offlineBodyCount: Int
+    public let missingBodyCount: Int
+
+    public init(issues: [TranscriptBodyIssue] = []) {
+        offlineBodyCount = issues.reduce(0) {
+            $0 + ($1.resolvedArchiveAvailability == .archivedOffline ? 1 : 0)
+        }
+        missingBodyCount = issues.reduce(0) {
+            $0 + ($1.resolvedArchiveAvailability == .archivedMissing ? 1 : 0)
+        }
+    }
+
+    public var unavailableBodyCount: Int { offlineBodyCount + missingBodyCount }
+    public var isUnavailable: Bool { unavailableBodyCount > 0 }
+
+    public var title: String {
+        if offlineBodyCount > 0, missingBodyCount > 0 {
+            return "Some archived transcript bodies are unavailable"
+        }
+        if missingBodyCount > 0 {
+            return "Archived transcript bodies are missing"
+        }
+        return "Archived transcript bodies are offline"
+    }
+
+    public var guidance: String {
+        let noun = unavailableBodyCount == 1 ? "body is" : "bodies are"
+        if missingBodyCount > 0 {
+            return "\(unavailableBodyCount) \(noun) unavailable. Locate and reattach the .lar archive, then retry."
+        }
+        return "\(unavailableBodyCount) \(noun) unavailable. Reattach the .lar archive, then retry."
+    }
+}
+
+public struct TranscriptStage: Codable, Sendable, Equatable, Identifiable {
+    public let stageId: String
+    public let captureSequence: Int
+    public let kind: String
+    public let attemptNumber: Int?
+    public let wallTimeNs: UInt64?
+    public let monotonicDeltaNs: UInt64?
+    public let requestHeadersRef: String?
+    public let requestBodyManifestRef: String?
+    public let responseHeadersRef: String?
+    public let responseBodyManifestRef: String?
+    public let trailersRef: String?
+    public let streamIndexRef: String?
+    public let fidelity: String
+
+    public var id: String { stageId }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, fidelity
+        case stageId = "stage_id"
+        case captureSequence = "capture_sequence"
+        case attemptNumber = "attempt_number"
+        case wallTimeNs = "wall_time_ns"
+        case monotonicDeltaNs = "monotonic_delta_ns"
+        case requestHeadersRef = "request_headers_ref"
+        case requestBodyManifestRef = "request_body_manifest_ref"
+        case responseHeadersRef = "response_headers_ref"
+        case responseBodyManifestRef = "response_body_manifest_ref"
+        case trailersRef = "trailers_ref"
+        case streamIndexRef = "stream_index_ref"
+    }
+}
+
+public enum TraceStreamReplaySource: Sendable, Equatable, Codable, Hashable {
+    case observedReads
+    case parsedFrames
+    case unknown(String)
+
+    public var rawValue: String {
+        switch self {
+        case .observedReads: "observed_reads"
+        case .parsedFrames: "parsed_frames"
+        case let .unknown(value): value
+        }
+    }
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "observed_reads": self = .observedReads
+        case "parsed_frames": self = .parsedFrames
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+public struct TraceStreamReplayEvent: Codable, Sendable, Equatable, Identifiable {
+    public let index: UInt64
+    public let byteOffset: UInt64
+    public let byteLength: UInt64
+    public let observedDeltaNs: UInt64
+    public let parser: String?
+    public let frameKind: String?
+    public let bytesB64: String
+
+    public var id: UInt64 { index }
+    public var bytes: Data? { Data(base64Encoded: bytesB64) }
+
+    enum CodingKeys: String, CodingKey {
+        case index, parser
+        case byteOffset = "byte_offset"
+        case byteLength = "byte_length"
+        case observedDeltaNs = "observed_delta_ns"
+        case frameKind = "frame_kind"
+        case bytesB64 = "bytes_b64"
+    }
+}
+
+public struct TraceStreamReplayPage: Codable, Sendable, Equatable {
+    public let traceId: String
+    public let stageId: String
+    public let stageKind: String
+    public let source: TraceStreamReplaySource
+    public let cursor: UInt64
+    public let nextCursor: UInt64?
+    public let totalEvents: UInt64
+    public let pageBytes: UInt64
+    public let streamIndexId: String
+    public let rawBodyManifestId: String
+    public let archiveFileUuid: String
+    public let archiveState: String
+    public let timing: String
+    public let serverSleep: Bool
+    public let events: [TraceStreamReplayEvent]
+
+    enum CodingKeys: String, CodingKey {
+        case source, cursor, timing, events
+        case traceId = "trace_id"
+        case stageId = "stage_id"
+        case stageKind = "stage_kind"
+        case nextCursor = "next_cursor"
+        case totalEvents = "total_events"
+        case pageBytes = "page_bytes"
+        case streamIndexId = "stream_index_id"
+        case rawBodyManifestId = "raw_body_manifest_id"
+        case archiveFileUuid = "archive_file_uuid"
+        case archiveState = "archive_state"
+        case serverSleep = "server_sleep"
+    }
+}
+
+public enum TraceStreamReplaySpeed: String, CaseIterable, Sendable, Identifiable {
+    case instant
+    case quarter = "0.25x"
+    case half = "0.5x"
+    case one = "1x"
+    case two = "2x"
+    case four = "4x"
+
+    public var id: String { rawValue }
+
+    public var multiplier: Double? {
+        switch self {
+        case .instant: nil
+        case .quarter: 0.25
+        case .half: 0.5
+        case .one: 1
+        case .two: 2
+        case .four: 4
+        }
+    }
+}
+
+public enum TraceStreamReplayTiming {
+    /// Returns the client-side wait between two absolute capture deltas. The
+    /// daemon deliberately never sleeps, so a cancelled UI task immediately
+    /// pauses even when the original stream contains an hours-long gap.
+    public static func delayNanoseconds(
+        previousDeltaNs: UInt64?, currentDeltaNs: UInt64,
+        speed: TraceStreamReplaySpeed
+    ) -> UInt64 {
+        guard let multiplier = speed.multiplier else { return 0 }
+        let previous = previousDeltaNs ?? 0
+        let delta = currentDeltaNs >= previous ? currentDeltaNs - previous : 0
+        let scaled = Double(delta) / multiplier
+        if !scaled.isFinite || scaled >= Double(UInt64.max) { return UInt64.max }
+        return UInt64(scaled.rounded(.down))
+    }
+}
+
+public enum TraceStreamReplayBuffer {
+    public static let displayByteLimit = 1 * 1024 * 1024
+
+    public static func appending(
+        _ event: Data, to current: Data, limit: Int = displayByteLimit
+    ) -> (data: Data, omittedBytes: Int) {
+        let boundedLimit = max(0, limit)
+        guard current.count < boundedLimit else {
+            return (current, event.count)
+        }
+        let accepted = min(event.count, boundedLimit - current.count)
+        var result = current
+        result.append(event.prefix(accepted))
+        return (result, event.count - accepted)
+    }
+
+    public static func display(_ data: Data) -> String {
+        if !data.contains(0), let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        let preview = data.prefix(256).map { String(format: "%02x", $0) }
+            .joined(separator: " ")
+        let suffix = data.count > 256 ? " …" : ""
+        return "<binary stream: \(data.count) bytes>\n\(preview)\(suffix)"
+    }
+}
+
+public struct TraceConversationRawRange: Codable, Sendable, Equatable {
+    public let manifestId: String
+    public let byteOffset: UInt64
+    public let byteLength: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case manifestId = "manifest_id"
+        case byteOffset = "byte_offset"
+        case byteLength = "byte_length"
+    }
+}
+
+public struct TraceConversationEntry: Codable, Sendable, Equatable, Identifiable {
+    public let entryId: String
+    public let semanticSchema: UInt16
+    public let role: String
+    public let kind: String
+    public let name: String?
+    public let toolCallId: String?
+    public let sourceFormats: [String]
+    public let rawRanges: [TraceConversationRawRange]
+
+    public var id: String { entryId }
+
+    enum CodingKeys: String, CodingKey {
+        case role, kind, name
+        case entryId = "entry_id"
+        case semanticSchema = "semantic_schema"
+        case toolCallId = "tool_call_id"
+        case sourceFormats = "source_formats"
+        case rawRanges = "raw_ranges"
+    }
+}
+
+public struct TraceConversationEvidence: Codable, Sendable, Equatable {
+    public let source: String
+    public let kind: String
+    public let id: String
+}
+
+public struct TraceConversationEvent: Codable, Sendable, Equatable, Identifiable {
+    public let traceId: String
+    public let sessionId: String
+    public let tsRequestMs: Int64
+    public let turnViewId: String
+    public let generationId: String
+    public let parentGenerationId: String?
+    public let reason: String
+    public let evidence: TraceConversationEvidence?
+    public let uptoIndex: UInt64
+    public let entries: [TraceConversationEntry]
+    public let responseEntries: [TraceConversationEntry]
+
+    public var id: String { turnViewId }
+    public var isNotable: Bool { reason != "initial" && reason != "append" }
+
+    enum CodingKeys: String, CodingKey {
+        case reason, evidence, entries
+        case traceId = "trace_id"
+        case sessionId = "session_id"
+        case tsRequestMs = "ts_request_ms"
+        case turnViewId = "turn_view_id"
+        case generationId = "generation_id"
+        case parentGenerationId = "parent_generation_id"
+        case uptoIndex = "upto_index"
+        case responseEntries = "response_entries"
+    }
+}
+
+public struct TraceConversationEventPage: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let events: [TraceConversationEvent]
+    public let totalEvents: Int
+    public let hasMoreAfter: Bool
+    public let nextAfterMs: Int64?
+    public let nextAfterId: String?
+    public let entriesIncluded: Bool?
+
+    public var nextCursor: TranscriptCursor? {
+        guard let nextAfterMs, let nextAfterId else { return nil }
+        return TranscriptCursor(tsMs: nextAfterMs, traceId: nextAfterId)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case events
+        case sessionId = "session_id"
+        case totalEvents = "total_events"
+        case hasMoreAfter = "has_more_after"
+        case nextAfterMs = "next_after_ms"
+        case nextAfterId = "next_after_id"
+        case entriesIncluded = "entries_included"
+    }
+}
+
+public enum TraceConversationPaging {
+    public static func merge(
+        existing: [TraceConversationEvent], incoming: [TraceConversationEvent]
+    ) -> [TraceConversationEvent] {
+        var byId = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        for event in incoming { byId[event.id] = event }
+        return byId.values.sorted {
+            if $0.tsRequestMs != $1.tsRequestMs { return $0.tsRequestMs < $1.tsRequestMs }
+            return $0.traceId < $1.traceId
+        }
+    }
+}
+
+public enum TranscriptStageTimeline {
+    public static func ordered(_ stages: [TranscriptStage]) -> [TranscriptStage] {
+        stages.sorted {
+            if $0.captureSequence != $1.captureSequence {
+                return $0.captureSequence < $1.captureSequence
+            }
+            return $0.stageId < $1.stageId
+        }
+    }
+
+    public static func summary(_ stages: [TranscriptStage]) -> String? {
+        guard !stages.isEmpty else { return nil }
+        let ordered = ordered(stages)
+        var details = [String]()
+        let route = ordered.map(label).joined(separator: " → ")
+        compare(
+            "request body", first: first(ordered, "client_request")?.requestBodyManifestRef,
+            second: first(ordered, "upstream_request")?.requestBodyManifestRef, into: &details)
+        compare(
+            "request headers", first: first(ordered, "client_request")?.requestHeadersRef,
+            second: first(ordered, "upstream_request")?.requestHeadersRef, into: &details)
+        compare(
+            "response body", first: last(ordered, "upstream_response")?.responseBodyManifestRef,
+            second: last(ordered, "client_response")?.responseBodyManifestRef, into: &details)
+        compare(
+            "response headers", first: last(ordered, "upstream_response")?.responseHeadersRef,
+            second: last(ordered, "client_response")?.responseHeadersRef, into: &details)
+        if ordered.contains(where: { $0.streamIndexRef != nil }) { details.append("timed stream") }
+        if ordered.contains(where: { $0.fidelity != "captured" }) {
+            details.append("mixed fidelity")
+        }
+        return ([route] + details).joined(separator: " · ")
+    }
+
+    private static func first(_ stages: [TranscriptStage], _ kind: String) -> TranscriptStage? {
+        stages.first { $0.kind == kind }
+    }
+
+    private static func last(_ stages: [TranscriptStage], _ kind: String) -> TranscriptStage? {
+        stages.last { $0.kind == kind }
+    }
+
+    private static func compare(
+        _ name: String, first: String?, second: String?, into details: inout [String]
+    ) {
+        guard let first, let second else { return }
+        details.append(first == second ? "shared \(name)" : "changed \(name)")
+    }
+
+    public static func label(_ stage: TranscriptStage) -> String {
+        let base: String
+        switch stage.kind {
+        case "client_request": base = "client request"
+        case "normalized_request": base = "normalized"
+        case "router_decision": base = "router"
+        case "retry_decision": base = "retry"
+        case "failover_decision": base = "failover"
+        case "upstream_request": base = "upstream request"
+        case "upstream_response": base = "upstream response"
+        case "upstream_failure": base = "upstream failure"
+        case "client_response": base = "client response"
+        case "client_trailers": base = "trailers"
+        case "tool_call": base = "tool call"
+        case "tool_result": base = "tool result"
+        case "auth_refresh": base = "auth refresh"
+        case "account_routing": base = "account route"
+        case "dario_request": base = "Dario request"
+        case "dario_response": base = "Dario response"
+        case "injected_response": base = "injected response"
+        case "cancellation": base = "cancelled"
+        default: base = stage.kind.replacingOccurrences(of: "_", with: " ")
+        }
+        guard let attempt = stage.attemptNumber else { return base }
+        return "\(base) #\(attempt)"
+    }
+}
+
+public struct TranscriptCursor: Sendable, Equatable {
+    public let tsMs: Int64
+    public let traceId: String
+
+    public init(tsMs: Int64, traceId: String) {
+        self.tsMs = tsMs
+        self.traceId = traceId
+    }
+}
+
+public enum TranscriptPaging {
+    /// Merge prepended, appended, or refreshed pages by durable trace id. A
+    /// repeated tail page replaces finalized rows without duplicating them.
+    public static func merge(
+        existing: [TranscriptTurn], incoming: [TranscriptTurn]
+    ) -> [TranscriptTurn] {
+        var byId = Dictionary(uniqueKeysWithValues: existing.map { ($0.traceId, $0) })
+        for turn in incoming { byId[turn.traceId] = turn }
+        return byId.values.sorted {
+            if $0.tsRequestMs != $1.tsRequestMs { return $0.tsRequestMs < $1.tsRequestMs }
+            return $0.traceId < $1.traceId
+        }
     }
 }
 
@@ -95,6 +619,36 @@ public struct TranscriptTabCounts: Codable, Sendable, Equatable {
     public let model: Int
     public let tools: Int
     public let agents: Int
+
+    public static func counting(_ turns: [TranscriptTurn]) -> TranscriptTabCounts {
+        var all = 0
+        var user = 0
+        var model = 0
+        var tools = 0
+        for turn in turns {
+            let hasUser = turn.user?.isEmpty == false
+            let hasTools = turn.toolCalls?.isEmpty == false
+                || turn.executedTools?.isEmpty == false
+                || turn.assistantBlocks?.contains(where: { $0.type == "tool_call" }) == true
+            let hasModel = turn.assistant?.isEmpty == false
+                || turn.assistantBlocks?.contains(where: {
+                    $0.type == "text" && $0.text?.isEmpty == false
+                }) == true
+                || hasTools
+                || turn.error?.isEmpty == false
+            if hasUser {
+                user += 1
+                all += 1
+            }
+            if hasModel {
+                model += 1
+                all += 1
+                if hasTools { tools += 1 }
+            }
+        }
+        return TranscriptTabCounts(
+            all: all, user: user, model: model, tools: tools, agents: 0)
+    }
 }
 
 public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
@@ -122,6 +676,10 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let toolCalls: [ToolCall]?
     public let assistantBlocks: [AssistantBlock]?
     public let executedTools: [ExecutedTool]?
+    public let bodyErrors: [TranscriptBodyIssue]?
+    public let bodyTruncations: [TranscriptBodyIssue]?
+    public let stages: [TranscriptStage]?
+    public let stageError: String?
 
     public var id: String { traceId }
 
@@ -145,6 +703,10 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case toolCalls = "tool_calls"
         case assistantBlocks = "assistant_blocks"
         case executedTools = "executed_tools"
+        case bodyErrors = "body_errors"
+        case bodyTruncations = "body_truncations"
+        case stages
+        case stageError = "stage_error"
     }
 }
 
@@ -1128,12 +1690,14 @@ public struct TraceSearchResponse: Codable, Sendable {
 public struct TraceSearchRow: Codable, Sendable {
     public let id: String
     public let sessionId: String?
+    public let tsRequestMs: Int64?
     public let reasoningEffort: String?
     public let thinkingBudget: Int64?
 
     enum CodingKeys: String, CodingKey {
         case id
         case sessionId = "session_id"
+        case tsRequestMs = "ts_request_ms"
         case reasoningEffort = "reasoning_effort"
         case thinkingBudget = "thinking_budget"
     }
@@ -2373,6 +2937,20 @@ public enum TranscriptRender {
             hasher.combine(execution.argsBodyPath)
             hasher.combine(execution.resultBodyPath)
         }
+        for stage in turn.stages ?? [] {
+            hasher.combine(stage.stageId)
+            hasher.combine(stage.captureSequence)
+            hasher.combine(stage.kind)
+            hasher.combine(stage.attemptNumber)
+            hasher.combine(stage.requestHeadersRef)
+            hasher.combine(stage.requestBodyManifestRef)
+            hasher.combine(stage.responseHeadersRef)
+            hasher.combine(stage.responseBodyManifestRef)
+            hasher.combine(stage.trailersRef)
+            hasher.combine(stage.streamIndexRef)
+            hasher.combine(stage.fidelity)
+        }
+        hasher.combine(turn.stageError)
         return String(hasher.finalize())
     }
 
@@ -2482,6 +3060,11 @@ public enum TranscriptRender {
             .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.12),
             .paragraphStyle: rightCardPara,
         ]
+        let transport: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+            .paragraphStyle: leftBodyPara,
+        ]
         var toolResultKey = toolResult
         toolResultKey[.foregroundColor] = NSColor.secondaryLabelColor
         var toolKey = tool
@@ -2568,6 +3151,17 @@ public enum TranscriptRender {
                 status: turn.status, errorKind: turn.errorKind, error: turn.error)
             let sepAttrs = linked(isError ? badSeparator : separator, turn.traceId)
             out.append(NSAttributedString(string: "· \(facts) ·\n", attributes: sepAttrs))
+            if let stages = turn.stages,
+                let summary = TranscriptStageTimeline.summary(stages)
+            {
+                out.append(NSAttributedString(
+                    string: "transport  \(summary)\n", attributes: transport))
+            }
+            if let stageError = turn.stageError, !stageError.isEmpty {
+                out.append(NSAttributedString(
+                    string: "transport metadata unavailable: \(cap(stageError))\n",
+                    attributes: error))
+            }
             if let text = turn.user, !text.isEmpty {
                 let toolBody = TurnHeader.toolResultBody(text)
                 let label = TurnHeader.requestLabel(

@@ -10,11 +10,11 @@ use tokio::sync::Mutex;
 use crate::login::{
     anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
     codex_device_exchange_named, codex_device_poll_once, codex_device_start, codex_exchange_named,
-    generate_pkce, kimi_device_poll_once_at,
-    kimi_device_start_at, kimi_oauth_host, kimi_upsert_from_tokens, kimi_verification_url,
-    openai_authorize_url, poll_device_flow, validate_account_name, wait_for_openai_callback,
-    xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, DeviceFlowError,
-    OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
+    generate_pkce, kimi_device_poll_once_at, kimi_device_start_at, kimi_oauth_host,
+    kimi_upsert_from_tokens, kimi_verification_url, openai_authorize_url, poll_device_flow,
+    validate_account_name, wait_for_openai_callback, xai_device_poll_once, xai_device_start,
+    xai_upsert_from_tokens, DeviceFlowError, OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL,
+    OPENAI_REDIRECT_URI,
 };
 use crate::{now_ms, Vault};
 
@@ -564,10 +564,9 @@ impl LoginManager {
             user_code: Some(start.user_code.clone()),
             verification_uri: Some(start.verification_uri.clone()),
             verification_uri_complete: Some(
-                start
-                    .verification_uri_complete
-                    .clone()
-                    .unwrap_or_else(|| format!("{}?user_code={}", start.verification_uri, start.user_code)),
+                start.verification_uri_complete.clone().unwrap_or_else(|| {
+                    format!("{}?user_code={}", start.verification_uri, start.user_code)
+                }),
             ),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
@@ -745,8 +744,7 @@ mod tests {
             .unwrap();
         assert_eq!(snap["state"], "pending");
         assert_eq!(
-            snap["verification_uri_complete"],
-            snap["authorize_url"],
+            snap["verification_uri_complete"], snap["authorize_url"],
             "notification callers always receive one actionable URL field"
         );
         std::fs::remove_dir_all(&dir).ok();

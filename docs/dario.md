@@ -118,7 +118,9 @@ header branch: `x-api-key` is the Dario key, a client `anthropic-beta` is passed
 when present, and `anthropic-version` is preserved or defaults to `2023-06-01`.
 The checked-in Rust does not define Dario npm's exact final CLI beta list; the
 capture preload records the resulting Dario-to-Anthropic headers with secrets
-redacted. Do not document additional beta flags as an Alex guarantee.
+redacted. It first writes a private crash-recoverable spool file; Alex then
+ingests the completed record through the typed trace body store. Do not
+document additional beta flags as an Alex guarantee.
 
 ## Generational supervisor
 
@@ -181,7 +183,9 @@ unhealthy status is represented as down rather than by dropping the Dario row.
 ```text
 <data_dir>/dario/                 installed package generations and logs
 <data_dir>/dario-prompt-cache/    captured system prompts and cache metadata
-<data_dir>/bodies/YYYY-MM-DD/     gzip Dario upstream request/response captures
+<data_dir>/dario-capture-spool/   transient preload captures awaiting ingestion
+<data_dir>/bodies/YYYY-MM-DD/     legacy/rollback copies of ingested captures
+<data_dir>/lar/live/              LAR body packs when an experimental mode is enabled
 ```
 
 Captured fetch headers redact authorization, API keys, cookies, and set-cookie.

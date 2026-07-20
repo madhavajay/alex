@@ -13,6 +13,61 @@ use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+mod lar_archive_ops;
+mod lar_catalog;
+mod lar_conversation;
+mod lar_conversation_adapter;
+mod lar_fts;
+mod lar_gc;
+mod lar_grep;
+mod lar_jsonl_import;
+mod lar_repack;
+mod lar_stream_replay;
+mod lar_verify;
+mod legacy_import;
+mod live_body_store;
+mod standalone_import;
+
+pub use lar_archive_ops::{
+    LarArchiveAvailability, LarArchiveDetachReport, LarArchiveFileStatus,
+    LarArchiveReattachOptions, LarArchiveReattachReport, LarArchiveUnavailableError,
+};
+pub use lar_catalog::{
+    LarArtifactError, LarArtifactLocation, LarManifestRegistration, LarMigrationItem,
+    LarMigrationJob, LarMigrationJobSpec, LarPointerSwitch, LarValidation,
+};
+pub use lar_conversation::{
+    LarConversationBackfillReport, LarConversationEntryCapture, LarConversationEntryKind,
+    LarConversationEntryView, LarConversationEventPage, LarConversationEventView,
+    LarConversationEvidence, LarConversationEvidenceSource, LarConversationGenerationEvent,
+    LarConversationRawRange, LarConversationRole, LarConversationSemantics,
+    LarConversationTurnCapture, LarConversationTurnIds,
+};
+pub use lar_fts::{LarFtsRebuildOptions, LarFtsRebuildReport, LAR_NORMALIZED_INDEX_SCHEMA_VERSION};
+pub use lar_gc::LarGcReport;
+pub use lar_grep::{LarCatalogGrepMatch, LarCatalogGrepReport};
+pub use lar_jsonl_import::{LarJsonlImportOptions, LarJsonlImportReport};
+pub use lar_repack::{LarRepackCandidate, LarRepackConfig, LarRepackReport};
+pub use lar_stream_replay::{
+    LarStreamReplayError, LarStreamReplayPage, LarStreamReplayPageEvent,
+    LarStreamReplayPageOptions, LarStreamReplaySource, DEFAULT_STREAM_REPLAY_PAGE_BYTES,
+    DEFAULT_STREAM_REPLAY_PAGE_LIMIT, MAX_STREAM_REPLAY_PAGE_BYTES, MAX_STREAM_REPLAY_PAGE_LIMIT,
+};
+pub use lar_verify::{LarMigrationVerificationIssue, LarMigrationVerificationReport};
+pub use legacy_import::{
+    LarArtifactBatchRead, LarArtifactReadRequest, LarLegacyArtifact, LarLegacyImportBoundary,
+    LarLegacyImportError, LarLegacyImportHook, LarLegacyImportOptions, LarLegacyImportReport,
+    LarLegacyResourceControls, LarLegacySuffixArtifact,
+};
+pub use live_body_store::{
+    LarBodyArtifact, LarBodyOwnerKind, LarBodyStoreConfig, LarBodyStoreMode, LarBodyWriteResult,
+    LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture, LarStreamReadCapture,
+    LarUpstreamAttemptCapture, LAR_HEADER_FLAG_REDACTED,
+};
+pub use standalone_import::{
+    LarBackupArtifactRef, LarStandaloneImportOptions, LarStandaloneImportReport,
+};
+
 static BODY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Display-only fields shared by the trace browser clients. Keeping this
@@ -146,6 +201,7 @@ CREATE TABLE IF NOT EXISTS traces (
   dario_generation  TEXT
 );
 CREATE INDEX IF NOT EXISTS traces_session ON traces(session_id);
+CREATE INDEX IF NOT EXISTS traces_session_ts ON traces(session_id, ts_request_ms, id);
 CREATE INDEX IF NOT EXISTS traces_ts ON traces(ts_request_ms);
 CREATE INDEX IF NOT EXISTS traces_model ON traces(routed_model);
 
@@ -229,6 +285,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   result_body_path   TEXT,
   UNIQUE(harness, session_id, tool_call_id)
 );
+CREATE INDEX IF NOT EXISTS tool_calls_session_ts ON tool_calls(session_id, ts_start_ms);
 CREATE INDEX IF NOT EXISTS tool_calls_session_turn
   ON tool_calls(session_id, turn_id, ts_start_ms);
 CREATE INDEX IF NOT EXISTS tool_calls_trace ON tool_calls(trace_id);
@@ -272,22 +329,79 @@ const TRACE_COLS: &str =
      method, path, subscription_identity, via_dario, dario_generation";
 
 const BACKUP_TRACE_COLS: &[&str] = &[
-    "id", "ts_request_ms", "ts_response_ms", "session_id", "harness", "client_format",
-    "upstream_provider", "upstream_format", "requested_model", "routed_model", "method", "path",
-    "status", "streamed", "input_tokens", "cached_input_tokens", "cache_creation_tokens",
-    "output_tokens", "reasoning_tokens", "cost_usd", "billing_bucket", "req_body_path",
-    "upstream_req_body_path", "resp_body_path", "req_headers_json", "resp_headers_json", "error",
-    "error_kind", "error_code", "error_class", "substituted", "original_model", "served_model",
-    "substitution_reason", "attempts", "injected", "fixture_name", "original_account_id",
-    "served_account_id", "account_id", "run_id", "tags_json", "client_ip", "key_fingerprint",
-    "reasoning_effort", "thinking_budget", "subscription_identity", "via_dario", "dario_generation",
+    "id",
+    "ts_request_ms",
+    "ts_response_ms",
+    "session_id",
+    "harness",
+    "client_format",
+    "upstream_provider",
+    "upstream_format",
+    "requested_model",
+    "routed_model",
+    "method",
+    "path",
+    "status",
+    "streamed",
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cost_usd",
+    "billing_bucket",
+    "req_body_path",
+    "upstream_req_body_path",
+    "resp_body_path",
+    "req_headers_json",
+    "resp_headers_json",
+    "error",
+    "error_kind",
+    "error_code",
+    "error_class",
+    "substituted",
+    "original_model",
+    "served_model",
+    "substitution_reason",
+    "attempts",
+    "injected",
+    "fixture_name",
+    "original_account_id",
+    "served_account_id",
+    "account_id",
+    "run_id",
+    "tags_json",
+    "client_ip",
+    "key_fingerprint",
+    "reasoning_effort",
+    "thinking_budget",
+    "subscription_identity",
+    "via_dario",
+    "dario_generation",
 ];
 const BACKUP_TOOL_CALL_COLS: &[&str] = &[
-    "id", "harness", "session_id", "turn_id", "tool_call_id", "trace_id", "tool_name",
-    "ts_start_ms", "ts_end_ms", "is_error", "exit_status", "args_body_path", "result_body_path",
+    "id",
+    "harness",
+    "session_id",
+    "turn_id",
+    "tool_call_id",
+    "trace_id",
+    "tool_name",
+    "ts_start_ms",
+    "ts_end_ms",
+    "is_error",
+    "exit_status",
+    "args_body_path",
+    "result_body_path",
 ];
 const BACKUP_HEARTBEAT_COLS: &[&str] = &[
-    "ts_ms", "provider", "account_id", "ok", "status", "latency_ms", "message",
+    "ts_ms",
+    "provider",
+    "account_id",
+    "ok",
+    "status",
+    "latency_ms",
+    "message",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -330,8 +444,16 @@ fn sqlite_row_json(row: &rusqlite::Row<'_>, columns: &[&str]) -> rusqlite::Resul
     Ok(Value::Object(object))
 }
 
-fn export_table_rows(conn: &Connection, table: &str, columns: &[&str], order: &str) -> Result<Vec<Value>> {
-    let sql = format!("SELECT {} FROM {table} ORDER BY {order}", columns.join(", "));
+fn export_table_rows(
+    conn: &Connection,
+    table: &str,
+    columns: &[&str],
+    order: &str,
+) -> Result<Vec<Value>> {
+    let sql = format!(
+        "SELECT {} FROM {table} ORDER BY {order}",
+        columns.join(", ")
+    );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([], |row| sqlite_row_json(row, columns))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -364,7 +486,11 @@ fn restored_body_path(data_dir: &Path, value: &mut Value) {
     *value = Value::String(data_dir.join(path).to_string_lossy().into_owned());
 }
 
-fn checked_sql_values(row: &Value, table: &str, columns: &[&str]) -> Result<Vec<rusqlite::types::Value>> {
+fn checked_sql_values(
+    row: &Value,
+    table: &str,
+    columns: &[&str],
+) -> Result<Vec<rusqlite::types::Value>> {
     use rusqlite::types::Value as SqlValue;
 
     let object = row
@@ -386,12 +512,13 @@ fn checked_sql_values(row: &Value, table: &str, columns: &[&str]) -> Result<Vec<
                     } else if let Some(value) = value.as_u64() {
                         i64::try_from(value)
                             .map(SqlValue::Integer)
-                            .with_context(|| format!("{table}.{column} is outside SQLite's integer range"))
+                            .with_context(|| {
+                                format!("{table}.{column} is outside SQLite's integer range")
+                            })
                     } else {
-                        value
-                            .as_f64()
-                            .map(SqlValue::Real)
-                            .with_context(|| format!("{table}.{column} is not a finite JSON number"))
+                        value.as_f64().map(SqlValue::Real).with_context(|| {
+                            format!("{table}.{column} is not a finite JSON number")
+                        })
                     }
                 }
                 Value::String(value) => Ok(SqlValue::Text(value.clone())),
@@ -600,7 +727,24 @@ pub struct TraceFilter {
     pub error_class: Option<String>,
     pub key_fingerprint: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Provider-neutral body text, resolved through the disposable LAR FTS
+    /// index. Raw archive bytes remain authoritative.
+    pub text: Option<String>,
     pub limit: usize,
+}
+
+/// A stable cursor page from one session. Rows are always returned in
+/// chronological order, even when the query reads the newest tail or walks
+/// backward from an older cursor.
+#[derive(Debug, Clone)]
+pub struct SessionTracePage {
+    pub rows: Vec<Value>,
+    pub total_count: usize,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    /// Timestamp of the first trace after this page. This is the exclusive
+    /// time boundary for unlinked harness tool activity.
+    pub next_ts_ms: Option<i64>,
 }
 
 /// Normalized harness tool activity. Payload bytes live in `bodies/`, just as
@@ -641,6 +785,7 @@ impl Default for TraceFilter {
             error_class: None,
             key_fingerprint: None,
             reasoning_effort: None,
+            text: None,
             limit: DEFAULT_SEARCH_LIMIT,
         }
     }
@@ -678,6 +823,9 @@ fn date_dir_name(name: &str) -> bool {
 pub struct Store {
     conn: Mutex<Connection>,
     pub data_dir: PathBuf,
+    live_lar: Mutex<live_body_store::LiveLarCoordinator>,
+    live_lar_mode: LarBodyStoreMode,
+    live_lar_lock_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -694,9 +842,15 @@ pub struct ResetCounts {
 
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self> {
+        Self::open_inner(data_dir, LarBodyStoreConfig::default())
+    }
+
+    fn open_inner(data_dir: PathBuf, lar_config: LarBodyStoreConfig) -> Result<Self> {
+        let live_lar_mode = lar_config.mode;
+        let live_lar_lock_timeout = lar_config.writer_lock_timeout;
         std::fs::create_dir_all(&data_dir)?;
         let db_path = data_dir.join("alexandria.sqlite3");
-        let conn =
+        let mut conn =
             Connection::open(&db_path).with_context(|| format!("opening sqlite at {db_path:?}"))?;
         // Migrations and account tombstones share the daemon's WAL database;
         // wait for an in-flight writer instead of assuming exclusive startup.
@@ -705,11 +859,28 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrate_traces(&conn)?;
         migrate_run_keys(&conn)?;
+        lar_catalog::migrate(&mut conn)?;
+        lar_archive_ops::migrate(&conn)?;
+        lar_conversation::migrate(&conn)?;
+        lar_fts::migrate(&conn)?;
+        lar_gc::migrate(&mut conn)?;
+        lar_repack::migrate(&mut conn)?;
         seed_pricing(&conn)?;
-        Ok(Self {
+        let store = Self {
             conn: Mutex::new(conn),
             data_dir,
-        })
+            live_lar: Mutex::new(live_body_store::LiveLarCoordinator::new(lar_config)?),
+            live_lar_mode,
+            live_lar_lock_timeout,
+        };
+        if live_lar_mode != LarBodyStoreMode::Legacy {
+            if let Err(error) = store.recover_lar_body_store_orphans() {
+                tracing::warn!(
+                    "live LAR startup recovery failed; legacy fallbacks remain available: {error:#}"
+                );
+            }
+        }
+        Ok(store)
     }
 
     pub fn pricing_for(&self, model: &str) -> Option<Pricing> {
@@ -807,16 +978,58 @@ impl Store {
         Ok(conn.execute("DELETE FROM run_keys WHERE revoked = 1", [])? as u64)
     }
 
-    /// Deletes trace rows and heartbeats and removes every captured body file.
-    /// `known_accounts` is intentionally not touched.
+    /// Deletes trace rows and heartbeats and removes every Alex-owned captured
+    /// body/archive file. External standalone archives are detached from the
+    /// local catalog but are never removed. `known_accounts` is intentionally
+    /// not touched.
     pub fn clear_traces_and_bodies(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let bodies = self.data_dir.join("bodies");
-        if bodies.exists() {
-            std::fs::remove_dir_all(&bodies)
-                .with_context(|| format!("removing captured bodies at {}", bodies.display()))?;
+        // Writer -> SQLite is the normal capture lock order. Holding the
+        // coordinator across reset prevents a new pack publication racing the
+        // catalog clear or directory removal.
+        let mut live_lar = self.live_lar.lock().unwrap();
+        live_lar.reset()?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        lar_gc::clear_all_trace_references(&transaction)?;
+        transaction.execute_batch(
+            "DELETE FROM lar_normalized_entry_refs;
+             DELETE FROM lar_normalized_entries_fts;
+             DELETE FROM lar_normalized_entries;
+             DELETE FROM lar_normalized_index_meta;
+             DELETE FROM lar_repack_chunks;
+             DELETE FROM lar_repack_runs;
+             DELETE FROM lar_gc_candidates;
+             DELETE FROM lar_gc_runs;
+             DELETE FROM lar_migration_items;
+             DELETE FROM lar_migration_jobs;
+             DELETE FROM lar_session_revisions;
+             DELETE FROM lar_manifest_chunks;
+             DELETE FROM lar_file_identities;
+             DELETE FROM lar_checkpoints;
+             DELETE FROM lar_manifests;
+             DELETE FROM lar_chunks;
+             DELETE FROM lar_header_block_atoms;
+             DELETE FROM lar_header_blocks;
+             DELETE FROM lar_header_atoms;
+             DELETE FROM lar_files;
+             DELETE FROM lar_archive_sets;",
+        )?;
+        transaction
+            .execute_batch("DELETE FROM tool_calls; DELETE FROM traces; DELETE FROM heartbeats;")?;
+        transaction.commit()?;
+        drop(conn);
+
+        // Files are removed only after every SQLite owner/reference is gone.
+        // A failed filesystem cleanup therefore leaves harmless unreferenced
+        // bytes which a repeated reset can reclaim; it never leaves a catalog
+        // pointer to missing shared content.
+        for directory in [self.data_dir.join("bodies"), self.data_dir.join("lar")] {
+            if directory.exists() {
+                std::fs::remove_dir_all(&directory).with_context(|| {
+                    format!("removing captured trace storage at {}", directory.display())
+                })?;
+            }
         }
-        conn.execute_batch("DELETE FROM tool_calls; DELETE FROM traces; DELETE FROM heartbeats;")?;
         Ok(())
     }
 
@@ -951,10 +1164,8 @@ impl Store {
             if exists {
                 counts.heartbeats_skipped += 1;
             } else {
-                transaction.execute(
-                    &heartbeat_insert,
-                    rusqlite::params_from_iter(values.iter()),
-                )?;
+                transaction
+                    .execute(&heartbeat_insert, rusqlite::params_from_iter(values.iter()))?;
                 counts.heartbeats_imported += 1;
             }
         }
@@ -1071,6 +1282,7 @@ impl Store {
                 t.dario_generation,
             ],
         )?;
+        lar_fts::refresh_trace_anchor(&conn, &t.id, t.session_id.as_deref(), t.ts_request_ms)?;
         Ok(())
     }
 
@@ -1329,6 +1541,22 @@ impl Store {
             sql.push_str(" AND reasoning_effort = ?");
             args.push(e.clone());
         }
+        if let Some(text) = f.text.as_deref() {
+            let Some(match_query) = lar_fts::fts_match_query(text) else {
+                return Ok(Vec::new());
+            };
+            sql.push_str(
+                " AND id IN (
+                    SELECT DISTINCT refs.trace_id
+                    FROM lar_normalized_entries_fts
+                    JOIN lar_normalized_entry_refs refs
+                      ON refs.entry_id=lar_normalized_entries_fts.entry_id
+                    WHERE lar_normalized_entries_fts MATCH ?
+                      AND refs.trace_id IS NOT NULL
+                  )",
+            );
+            args.push(match_query);
+        }
         sql.push_str(" ORDER BY ts_request_ms DESC LIMIT ?");
         args.push(effective_limit(f.limit).to_string());
         let mut stmt = conn.prepare(&sql)?;
@@ -1567,6 +1795,89 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Read a bounded chronological page without materializing and sorting an
+    /// entire long-running session. Cursors are `(ts_request_ms, trace_id)` so
+    /// simultaneous traces cannot be skipped or duplicated at page boundaries.
+    pub fn session_traces_page(
+        &self,
+        session_id: &str,
+        after: Option<(i64, String)>,
+        before: Option<(i64, String)>,
+        limit: usize,
+        tail: bool,
+    ) -> Result<SessionTracePage> {
+        if after.is_some() && before.is_some() {
+            anyhow::bail!("session trace page cannot use both after and before cursors");
+        }
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.lock().unwrap();
+        let mut sql = format!("SELECT {TRACE_COLS} FROM traces WHERE session_id = ?");
+        let mut args = vec![session_id.to_string()];
+        let descending = before.is_some() || (after.is_none() && tail);
+        if let Some((ts, id)) = &after {
+            sql.push_str(" AND (ts_request_ms > ? OR (ts_request_ms = ? AND id > ?))");
+            args.extend([ts.to_string(), ts.to_string(), id.clone()]);
+        } else if let Some((ts, id)) = &before {
+            sql.push_str(" AND (ts_request_ms < ? OR (ts_request_ms = ? AND id < ?))");
+            args.extend([ts.to_string(), ts.to_string(), id.clone()]);
+        }
+        sql.push_str(if descending {
+            " ORDER BY ts_request_ms DESC, id DESC LIMIT ?"
+        } else {
+            " ORDER BY ts_request_ms ASC, id ASC LIMIT ?"
+        });
+        args.push(limit.to_string());
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
+        let mut rows: Vec<Value> = mapped.filter_map(|row| row.ok()).collect();
+        if descending {
+            rows.reverse();
+        }
+
+        let total_count = conn.query_row(
+            "SELECT COUNT(*) FROM traces WHERE session_id=?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let cursor = |row: &Value| {
+            (
+                row["ts_request_ms"].as_i64().unwrap_or_default(),
+                row["id"].as_str().unwrap_or_default().to_string(),
+            )
+        };
+        let has_more_before = if let Some(first) = rows.first() {
+            let (ts, id) = cursor(first);
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM traces WHERE session_id=?1
+                 AND (ts_request_ms < ?2 OR (ts_request_ms = ?2 AND id < ?3)))",
+                params![session_id, ts, id],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        } else {
+            false
+        };
+        let next_ts_ms = if let Some(last) = rows.last() {
+            let (ts, id) = cursor(last);
+            conn.query_row(
+                "SELECT ts_request_ms FROM traces WHERE session_id=?1
+                 AND (ts_request_ms > ?2 OR (ts_request_ms = ?2 AND id > ?3))
+                 ORDER BY ts_request_ms ASC, id ASC LIMIT 1",
+                params![session_id, ts, id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        Ok(SessionTracePage {
+            rows,
+            total_count,
+            has_more_before,
+            has_more_after: next_ts_ms.is_some(),
+            next_ts_ms,
+        })
+    }
+
     pub fn get_trace(&self, id: &str) -> Result<Option<Value>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -1580,8 +1891,9 @@ impl Store {
     }
 
     pub fn delete_trace(&self, id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let paths: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let paths: Option<(Option<String>, Option<String>, Option<String>)> = transaction
             .query_row(
                 "SELECT req_body_path, upstream_req_body_path, resp_body_path
                  FROM traces WHERE id = ?1",
@@ -1592,7 +1904,9 @@ impl Store {
         let Some((req, upstream, resp)) = paths else {
             anyhow::bail!("trace not found: {id}");
         };
-        conn.execute("DELETE FROM traces WHERE id = ?1", params![id])?;
+        lar_gc::delete_trace_references(&transaction, id)?;
+        transaction.execute("DELETE FROM traces WHERE id = ?1", params![id])?;
+        transaction.commit()?;
         Ok([req, upstream, resp].into_iter().flatten().collect())
     }
 
@@ -1616,6 +1930,7 @@ impl Store {
                 tool.is_error.map(|v| v as i64), tool.exit_status, tool.args_body_path,
                 tool.result_body_path],
         )?;
+        lar_fts::refresh_tool_anchor(&conn, &tool.id)?;
         Ok(())
     }
 
@@ -1627,6 +1942,57 @@ impl Store {
              FROM tool_calls WHERE session_id=?1 ORDER BY ts_start_ms ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
+                "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
+                "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
+                "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
+                "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+                "exit_status": r.get::<_, Option<i64>>(9)?,
+                "args_body_path": r.get::<_, Option<String>>(10)?,
+                "result_body_path": r.get::<_, Option<String>>(11)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Load the tool activity needed to render one trace page. Explicit
+    /// trace links always win even if the tool starts after the following
+    /// request; unlinked activity is restricted to this page's time window.
+    pub fn session_tool_calls_page(
+        &self,
+        session_id: &str,
+        trace_ids: &[String],
+        start_ms: i64,
+        end_before_ms: Option<i64>,
+    ) -> Result<Vec<Value>> {
+        use rusqlite::types::Value as SqlValue;
+
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT id, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms,
+                    ts_end_ms, is_error, exit_status, args_body_path, result_body_path
+             FROM tool_calls WHERE session_id=? AND
+             ((trace_id IS NULL AND ts_start_ms>=?",
+        );
+        let mut args = vec![
+            SqlValue::Text(session_id.to_string()),
+            SqlValue::Integer(start_ms),
+        ];
+        if let Some(end) = end_before_ms {
+            sql.push_str(" AND ts_start_ms<?");
+            args.push(SqlValue::Integer(end));
+        }
+        sql.push(')');
+        if !trace_ids.is_empty() {
+            sql.push_str(" OR trace_id IN (");
+            sql.push_str(&vec!["?"; trace_ids.len()].join(","));
+            sql.push(')');
+            args.extend(trace_ids.iter().cloned().map(SqlValue::Text));
+        }
+        sql.push_str(") ORDER BY ts_start_ms ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
             Ok(json!({
                 "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
                 "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
@@ -2107,27 +2473,33 @@ impl Store {
             }
             report.rows_affected += 1;
         }
-        if !bodies_only {
-            let conn = self.conn.lock().unwrap();
-            if dry_run {
+        if dry_run {
+            if !bodies_only {
+                let conn = self.conn.lock().unwrap();
                 report.rows_deleted = conn.query_row(
                     "SELECT COUNT(*) FROM traces WHERE ts_request_ms < ?1",
                     params![older_than_ms],
                     |r| r.get::<_, i64>(0),
                 )? as u64;
-            } else {
-                report.rows_deleted = conn.execute(
+            }
+        } else {
+            let mut conn = self.conn.lock().unwrap();
+            let transaction = conn.transaction()?;
+            lar_gc::prune_references(&transaction, older_than_ms, bodies_only)?;
+            if !bodies_only {
+                report.rows_deleted = transaction.execute(
                     "DELETE FROM traces WHERE ts_request_ms < ?1",
                     params![older_than_ms],
                 )? as u64;
-                report.rows_deleted += conn.execute(
+                report.rows_deleted += transaction.execute(
                     "DELETE FROM tool_calls WHERE ts_start_ms < ?1",
                     params![older_than_ms],
                 )? as u64;
-                if report.rows_deleted > 0 {
-                    if let Err(e) = conn.execute_batch("VACUUM") {
-                        tracing::warn!("prune: VACUUM skipped: {e}");
-                    }
+            }
+            transaction.commit()?;
+            if report.rows_deleted > 0 {
+                if let Err(e) = conn.execute_batch("VACUUM") {
+                    tracing::warn!("prune: VACUUM skipped: {e}");
                 }
             }
         }
@@ -2196,6 +2568,110 @@ impl Store {
                 ))
             },
         )?;
+        let mut lar_files = Vec::new();
+        let mut lar_catalog_bytes = 0_u64;
+        let mut lar_physical_bytes = 0_u64;
+        let mut lar_missing_files = 0_u64;
+        {
+            let mut statement = conn.prepare(
+                "SELECT role, state, COUNT(*), COALESCE(SUM(size_bytes), 0)
+                   FROM lar_files GROUP BY role, state ORDER BY role, state",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (role, state, files, bytes) = row?;
+                lar_catalog_bytes = lar_catalog_bytes.saturating_add(bytes);
+                lar_files.push(json!({
+                    "role": role,
+                    "state": state,
+                    "files": files,
+                    "catalog_bytes": bytes,
+                }));
+            }
+        }
+        {
+            let mut statement = conn.prepare("SELECT path FROM lar_files")?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for path in paths {
+                let path = std::path::PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.data_dir.join(path)
+                };
+                match std::fs::metadata(path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        lar_physical_bytes = lar_physical_bytes.saturating_add(metadata.len());
+                    }
+                    _ => lar_missing_files = lar_missing_files.saturating_add(1),
+                }
+            }
+        }
+        let (
+            lar_chunks,
+            lar_unique_uncompressed_bytes,
+            lar_chunk_compressed_bytes,
+            lar_unreachable_chunks,
+        ) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(uncompressed_length), 0),
+                    COALESCE(SUM(compressed_length), 0),
+                    COALESCE(SUM(CASE WHEN state='unreachable' THEN 1 ELSE 0 END), 0)
+               FROM lar_chunks",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )?;
+        let (lar_manifests, lar_unique_manifest_bytes): (u64, u64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(total_length), 0)
+               FROM lar_manifests WHERE state='ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (lar_artifact_refs, lar_referenced_body_bytes): (u64, u64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(m.total_length), 0)
+               FROM lar_trace_artifacts a
+               JOIN lar_manifests m ON m.manifest_id=a.manifest_id
+              WHERE a.validation_state='validated' AND m.state='ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (lar_header_blocks, lar_header_atoms, lar_stages): (u64, u64, u64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM lar_header_blocks),
+                    (SELECT COUNT(*) FROM lar_header_atoms),
+                    (SELECT COUNT(*) FROM lar_stage_records)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let (lar_checkpoints, lar_latest_checkpoint_ms): (u64, Option<i64>) = conn.query_row(
+            "SELECT COUNT(*), MAX(created_at_ms) FROM lar_checkpoints",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let referenced_to_unique_ratio = if lar_unique_uncompressed_bytes == 0 {
+            1.0
+        } else {
+            lar_referenced_body_bytes as f64 / lar_unique_uncompressed_bytes as f64
+        };
+        let chunk_compression_ratio = if lar_chunk_compressed_bytes == 0 {
+            1.0
+        } else {
+            lar_unique_uncompressed_bytes as f64 / lar_chunk_compressed_bytes as f64
+        };
         Ok(json!({
             "sqlite_bytes": sqlite_bytes,
             "bodies_bytes": bodies_bytes,
@@ -2203,15 +2679,46 @@ impl Store {
             "trace_rows": trace_rows,
             "oldest_ts_ms": oldest_ts_ms,
             "newest_ts_ms": newest_ts_ms,
+            "lar": {
+                "files": lar_files,
+                "catalog_bytes": lar_catalog_bytes,
+                "physical_bytes": lar_physical_bytes,
+                "missing_or_offline_files": lar_missing_files,
+                "chunks": lar_chunks,
+                "unreachable_chunks": lar_unreachable_chunks,
+                "unique_uncompressed_bytes": lar_unique_uncompressed_bytes,
+                "compressed_chunk_bytes": lar_chunk_compressed_bytes,
+                "manifests": lar_manifests,
+                "unique_manifest_bytes": lar_unique_manifest_bytes,
+                "artifact_references": lar_artifact_refs,
+                "referenced_body_bytes": lar_referenced_body_bytes,
+                "referenced_to_unique_ratio": referenced_to_unique_ratio,
+                "chunk_compression_ratio": chunk_compression_ratio,
+                "header_blocks": lar_header_blocks,
+                "header_atoms": lar_header_atoms,
+                "stages": lar_stages,
+                "checkpoints": lar_checkpoints,
+                "latest_checkpoint_ms": lar_latest_checkpoint_ms,
+            },
         }))
     }
 
     pub fn write_body(&self, trace_id: &str, kind: &str, bytes: &[u8]) -> Result<String> {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        self.write_body_dated(&date, trace_id, kind, bytes)
+        self.write_body_through_configured_store(trace_id, kind, bytes)
     }
 
+    #[cfg(test)]
     fn write_body_dated(
+        &self,
+        date: &str,
+        trace_id: &str,
+        kind: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        self.write_legacy_body_dated(date, trace_id, kind, bytes)
+    }
+
+    pub(crate) fn write_legacy_body_dated(
         &self,
         date: &str,
         trace_id: &str,
@@ -2572,6 +3079,68 @@ mod tests {
     }
 
     #[test]
+    fn session_trace_pages_scale_to_synthetic_long_session() {
+        let store = Store::open(tmpdir("session-trace-pages-long")).unwrap();
+        // The real regression session had 1,277 traces. Use 1,500, including
+        // duplicate millisecond timestamps, so cursor correctness and index
+        // behavior remain covered as sessions and subagents grow.
+        for index in 0..1_500 {
+            let id = format!("trace-{index:04}");
+            let mut row = trace(&id, 1_000 + (index / 3) as i64, None);
+            row.session_id = Some("long-session".into());
+            store.insert_trace(&row).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let latest = store
+            .session_traces_page("long-session", None, None, 50, true)
+            .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("synthetic 1,500-trace tail page: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(500));
+        assert_eq!(latest.total_count, 1_500);
+        assert_eq!(latest.rows.len(), 50);
+        assert_eq!(latest.rows.first().unwrap()["id"], "trace-1450");
+        assert_eq!(latest.rows.last().unwrap()["id"], "trace-1499");
+        assert!(latest.has_more_before);
+        assert!(!latest.has_more_after);
+
+        let first = latest.rows.first().unwrap();
+        let older = store
+            .session_traces_page(
+                "long-session",
+                None,
+                Some((
+                    first["ts_request_ms"].as_i64().unwrap(),
+                    first["id"].as_str().unwrap().to_string(),
+                )),
+                50,
+                false,
+            )
+            .unwrap();
+        assert_eq!(older.rows.first().unwrap()["id"], "trace-1400");
+        assert_eq!(older.rows.last().unwrap()["id"], "trace-1449");
+        assert!(older.has_more_before);
+        assert!(older.has_more_after);
+
+        let last = latest.rows.last().unwrap();
+        let after = store
+            .session_traces_page(
+                "long-session",
+                Some((
+                    last["ts_request_ms"].as_i64().unwrap(),
+                    last["id"].as_str().unwrap().to_string(),
+                )),
+                None,
+                50,
+                false,
+            )
+            .unwrap();
+        assert!(after.rows.is_empty());
+        assert_eq!(after.total_count, 1_500);
+    }
+
+    #[test]
     fn tool_calls_join_sessions_and_share_reset_body_accounting() {
         let store = Store::open(tmpdir("tool-calls")).unwrap();
         let args = store
@@ -2604,6 +3173,19 @@ mod tests {
         let calls = store.session_tool_calls("session").unwrap();
         assert_eq!(calls[0]["trace_id"], "trace");
         assert_eq!(calls[0]["turn_id"], "2");
+        // Explicit links remain with their trace page even when execution
+        // starts beyond the unlinked time boundary.
+        assert_eq!(
+            store
+                .session_tool_calls_page("session", &["trace".into()], 0, Some(5))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .session_tool_calls_page("session", &[], 0, Some(5))
+            .unwrap()
+            .is_empty());
         assert!(store.reset_counts().unwrap().body_files >= 2);
         store.clear_traces_and_bodies().unwrap();
         assert!(store.session_tool_calls("session").unwrap().is_empty());
@@ -2664,10 +3246,12 @@ mod tests {
         assert_eq!(imported.heartbeats_imported, 1);
         assert_eq!(store.reset_counts().unwrap().traces, 1);
         assert_eq!(store.reset_counts().unwrap().heartbeats, 1);
-        assert!(store.get_trace("backup-trace").unwrap().unwrap()["req_body_path"]
-            .as_str()
-            .unwrap()
-            .starts_with(dir.to_string_lossy().as_ref()));
+        assert!(
+            store.get_trace("backup-trace").unwrap().unwrap()["req_body_path"]
+                .as_str()
+                .unwrap()
+                .starts_with(dir.to_string_lossy().as_ref())
+        );
 
         let repeated = store.import_trace_backup_rows(&backup).unwrap();
         assert_eq!(repeated.traces_skipped, 1);
@@ -2678,8 +3262,12 @@ mod tests {
     #[test]
     fn trace_backup_import_skips_existing_rows_and_keeps_newer_history() {
         let source = Store::open(tmpdir("trace-backup-source")).unwrap();
-        source.insert_trace(&trace("existing", 1_000, None)).unwrap();
-        source.insert_trace(&trace("from-backup", 2_000, None)).unwrap();
+        source
+            .insert_trace(&trace("existing", 1_000, None))
+            .unwrap();
+        source
+            .insert_trace(&trace("from-backup", 2_000, None))
+            .unwrap();
         source
             .upsert_tool_call(&ToolCallRecord {
                 id: "existing-tool".into(),
@@ -2703,7 +3291,9 @@ mod tests {
         let mut existing = trace("existing", 9_000, None);
         existing.routed_model = Some("newer-model".into());
         destination.insert_trace(&existing).unwrap();
-        destination.insert_trace(&trace("newer", 10_000, None)).unwrap();
+        destination
+            .insert_trace(&trace("newer", 10_000, None))
+            .unwrap();
         destination
             .upsert_tool_call(&ToolCallRecord {
                 id: "existing-tool".into(),
@@ -2872,6 +3462,41 @@ mod tests {
         );
         assert!(store.get_trace("a").unwrap().is_none());
         assert!(store.get_trace("c").unwrap().is_some());
+    }
+
+    #[test]
+    fn disk_usage_reports_live_lar_dedup_and_archive_health() {
+        let data_dir = tmpdir("lar-disk-usage");
+        let store = Store::open_with_lar_body_store(
+            data_dir,
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let body = br#"{"messages":[{"role":"user","content":"repeated body"}]}"#;
+        for trace_id in ["lar-du-a", "lar-du-b"] {
+            store
+                .write_body_artifact(
+                    &LarBodyArtifact::trace(trace_id, "client_request"),
+                    "request.json",
+                    body,
+                )
+                .unwrap();
+            store
+                .insert_trace(&trace(trace_id, 1000, Some("lar-du-session")))
+                .unwrap();
+        }
+
+        let usage = store.disk_usage().unwrap();
+        assert_eq!(usage["lar"]["manifests"], 1);
+        assert_eq!(usage["lar"]["artifact_references"], 2);
+        assert_eq!(usage["lar"]["referenced_body_bytes"], body.len() * 2);
+        assert!(usage["lar"]["chunks"].as_u64().unwrap() > 0);
+        assert!(usage["lar"]["physical_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(usage["lar"]["missing_or_offline_files"], 0);
+        assert!(usage["lar"]["referenced_to_unique_ratio"].as_f64().unwrap() > 1.0);
     }
 
     #[test]
@@ -3317,10 +3942,26 @@ mod tests {
         store.insert_trace(&failover).unwrap();
         // Heartbeats on both accounts.
         store
-            .insert_heartbeat(1_000, "anthropic", Some("anthropic-oauth"), true, Some(200), 5, "ok")
+            .insert_heartbeat(
+                1_000,
+                "anthropic",
+                Some("anthropic-oauth"),
+                true,
+                Some(200),
+                5,
+                "ok",
+            )
             .unwrap();
         store
-            .insert_heartbeat(2_000, "anthropic", Some("anthropic-oauth-2"), true, Some(200), 6, "ok")
+            .insert_heartbeat(
+                2_000,
+                "anthropic",
+                Some("anthropic-oauth-2"),
+                true,
+                Some(200),
+                6,
+                "ok",
+            )
             .unwrap();
 
         let before = store.account_analytics(0, 60_000).unwrap();

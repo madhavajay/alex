@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/alex-core",
+  "crates/alex-lar",
   "crates/alex-auth",
   "crates/alex-store",
   "crates/alex-proxy",
@@ -17,6 +18,7 @@ repository = "https://github.com/madhavajay/alex"
 
 [workspace.dependencies]
 alex-core = { path = "crates/alex-core", version = "0.1.25" }
+alex-lar = { path = "crates/alex-lar", version = "0.1.25" }
 alex-auth = { path = "crates/alex-auth", version = "0.1.25" }
 alex-store = { path = "crates/alex-store", version = "0.1.25" }
 alex-proxy = { path = "crates/alex-proxy", version = "0.1.25" }

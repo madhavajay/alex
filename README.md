@@ -441,6 +441,9 @@ In-depth reference docs live in [`docs/`](docs/) (see the [docs index](docs/READ
 | [Configuration](docs/configuration.md) | Full `config.toml` key/default reference and on-disk layout |
 | [Dario](docs/dario.md) | The Dario broker: routing modes, the three-block prompt rewrite, headers, and fallback |
 | [Traces](docs/traces.md) | Trace rows and bodies, redaction, transcripts, the browser API, scoped keys, and export |
+| [LAR format plan](lar-format.md) | Requirements, wire/storage design, migration, performance targets, and implementation checklist for the seekable LLM archive |
+| [LAR v1 wire format](docs/lar-format-v1.md) | Versioned container framing, IDs, limits, recovery, conformance fixtures, and compatibility rules |
+| [LAR v1 conformance](docs/lar-conformance.md) | Public vectors, verifier, MIME proposal, compatibility workflow, and security notes |
 | [Harness integration](docs/harnesses.md) | Provider headers, lifecycle hooks, and session/sub-agent identity |
 | [Amp wrap](docs/amp-wrap.md) | `alex wrap amp` reverse HTTP/WebSocket capture for closed harnesses |
 | [Signed macOS build](docs/build-signed.md) | `build-signed.sh`, Developer ID signing, and notarization |
@@ -453,6 +456,7 @@ In-depth reference docs live in [`docs/`](docs/) (see the [docs index](docs/READ
 | [`alex-core`](crates/alex-core) | Routing, translation, quota, and pricing logic |
 | [`alex-auth`](crates/alex-auth) | Credential vault and login flows |
 | [`alex-store`](crates/alex-store) | SQLite traces and analytics |
+| [`alex-lar`](crates/alex-lar) | Seekable, deduplicated LLM traffic archive primitives |
 | [`alex-proxy`](crates/alex-proxy) | API ingress, admin API, and upstream clients |
 | [`alex-wrap`](crates/alex-wrap) | Reverse wrapping and capture for closed harnesses |
 

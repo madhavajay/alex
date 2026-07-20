@@ -20,7 +20,13 @@ use alex_core::{
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
-use alex_store::{KnownAccount, Store, ToolCallRecord, TraceFilter};
+use alex_store::{
+    KnownAccount, LarArtifactBatchRead, LarArtifactReadRequest, LarBodyArtifact,
+    LarConversationEvidenceSource, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
+    LarStreamReadCapture, LarStreamReplayError, LarStreamReplayPageOptions, LarStreamReplaySource,
+    LarUpstreamAttemptCapture, Store, ToolCallRecord, TraceFilter,
+    DEFAULT_STREAM_REPLAY_PAGE_BYTES, DEFAULT_STREAM_REPLAY_PAGE_LIMIT,
+};
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -51,6 +57,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CAPTURED_STREAM_READS: usize = 65_536;
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -583,10 +590,48 @@ impl ReauthLoginTracker {
     }
 }
 
+const LAR_STORAGE_WORKERS: usize = 2;
+
+#[derive(Default)]
+struct LarStorageWorkerMetrics {
+    started: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    join_failures: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
+    work_ns: std::sync::atomic::AtomicU64,
+    max_wait_ns: std::sync::atomic::AtomicU64,
+}
+
+impl LarStorageWorkerMetrics {
+    fn snapshot(&self, available_permits: usize) -> Value {
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+        let started = self.started.load(ordering);
+        let completed = self.completed.load(ordering);
+        let wait_ns = self.wait_ns.load(ordering);
+        let work_ns = self.work_ns.load(ordering);
+        json!({
+            "capacity": LAR_STORAGE_WORKERS,
+            "available": available_permits,
+            "active": LAR_STORAGE_WORKERS.saturating_sub(available_permits),
+            "started": started,
+            "completed": completed,
+            "join_failures": self.join_failures.load(ordering),
+            "average_wait_ms": if started == 0 { 0.0 } else { wait_ns as f64 / started as f64 / 1_000_000.0 },
+            "max_wait_ms": self.max_wait_ns.load(ordering) as f64 / 1_000_000.0,
+            "average_work_ms": if completed == 0 { 0.0 } else { work_ns as f64 / completed as f64 / 1_000_000.0 },
+        })
+    }
+}
+
 pub struct AppState {
     pub local_key: Arc<std::sync::RwLock<String>>,
     pub vault: Arc<Vault>,
     pub store: Arc<Store>,
+    /// Bounds CPU/disk-heavy trace persistence independently of Tokio's
+    /// blocking pool. Callers wait asynchronously before cloning large bodies,
+    /// so bursts apply backpressure without unbounded archive work or memory.
+    lar_storage_permits: Arc<tokio::sync::Semaphore>,
+    lar_storage_metrics: Arc<LarStorageWorkerMetrics>,
     pub http: reqwest::Client,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
@@ -910,6 +955,8 @@ pub fn build_state_with_substitution(
         local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
         store: store.clone(),
+        lar_storage_permits: Arc::new(tokio::sync::Semaphore::new(LAR_STORAGE_WORKERS)),
+        lar_storage_metrics: Arc::new(LarStorageWorkerMetrics::default()),
         http,
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
@@ -1472,6 +1519,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/storage", get(admin_storage))
         .route("/admin/storage/prune", post(admin_storage_prune))
+        .route("/admin/lar/migration", get(admin_lar_migration))
+        .route(
+            "/admin/lar/migration/pause",
+            post(admin_lar_migration_pause),
+        )
+        .route(
+            "/admin/lar/migration/resume",
+            post(admin_lar_migration_resume),
+        )
+        .route(
+            "/admin/lar/migration/verify",
+            post(admin_lar_migration_verify),
+        )
         .route("/admin/reset", post(admin_reset))
         .route("/admin/traces", get(admin_traces))
         .route(
@@ -1596,9 +1656,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/traces/sessions/{session_id}/transcript",
             get(traces_session_transcript),
         )
+        .route(
+            "/traces/sessions/{session_id}/conversation-events",
+            get(traces_session_conversation_events),
+        )
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/{id}/body/{kind}", get(trace_body))
+        .route(
+            "/traces/{id}/stages/{stage_id}/replay",
+            get(trace_stage_replay),
+        )
         .route("/tools/{id}/body/{kind}", get(tool_body))
         .route("/traces/runs/{run_id}", get(traces_run_summary))
         .route("/traces/runs/{run_id}/events", get(traces_run_events))
@@ -2792,6 +2860,9 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "in_flight_requests": in_flight_requests(&state),
         "uptime_s": (now_ms() - state.started_ms) / 1000,
         "dario": state.dario.as_ref().and_then(|dario| dario.active()).is_some(),
+        "lar_storage_workers": state.lar_storage_metrics.snapshot(
+            state.lar_storage_permits.available_permits()
+        ),
         "launchd_socket_activation": std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION")
             .as_deref() == Some(std::ffi::OsStr::new("1")),
     }))
@@ -4130,9 +4201,135 @@ async fn admin_dario_prompt_cache_delete(
 }
 
 async fn admin_storage(State(state): State<Arc<AppState>>) -> Response {
-    match state.store.disk_usage() {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let workers = state
+        .lar_storage_metrics
+        .snapshot(state.lar_storage_permits.available_permits());
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.disk_usage()).await {
+        Ok(Ok(mut value)) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("lar_storage_workers".into(), workers);
+            }
+            axum::Json(value).into_response()
+        }
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("storage metrics worker failed: {error}"),
+        ),
+    }
+}
+
+fn lar_migration_job_json(job: &alex_store::LarMigrationJob) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "state": job.state,
+        "discovered": job.discovered_count,
+        "pending": job.pending_count,
+        "migrated": job.migrated_count,
+        "skipped": job.skipped_count,
+        "failed": job.failed_count,
+        "bytes_read": job.bytes_read,
+        "unique_bytes": job.unique_bytes_written,
+        "deduplicated_bytes": job.bytes_deduplicated,
+        "last_committed_cursor": job.last_committed_cursor,
+        "last_error": job.last_error,
+        "lease_owner": job.lease_owner,
+        "lease_expires_at_ms": job.lease_expires_at_ms,
+        "paused": job.state == "paused",
+        "running": job.state == "running",
+    })
+}
+
+fn lar_migration_status_value(store: &Store) -> Result<Value> {
+    let jobs = store.list_lar_migration_jobs()?;
+    let latest = jobs.first().map(lar_migration_job_json);
+    Ok(match latest {
+        Some(mut latest) => {
+            latest["jobs"] = Value::Array(jobs.iter().map(lar_migration_job_json).collect());
+            latest
+        }
+        None => json!({
+            "state": "not_started",
+            "discovered": 0,
+            "pending": 0,
+            "migrated": 0,
+            "skipped": 0,
+            "failed": 0,
+            "bytes_read": 0,
+            "unique_bytes": 0,
+            "deduplicated_bytes": 0,
+            "paused": false,
+            "running": false,
+            "jobs": [],
+        }),
+    })
+}
+
+async fn admin_lar_migration(State(state): State<Arc<AppState>>) -> Response {
+    match lar_migration_status_value(&state.store) {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+fn select_incomplete_lar_migration_job(store: &Store) -> Result<String> {
+    let mut incomplete = store
+        .list_lar_migration_jobs()?
+        .into_iter()
+        .filter(|job| job.state != "complete")
+        .collect::<Vec<_>>();
+    match incomplete.len() {
+        0 => anyhow::bail!("no incomplete LAR migration job exists"),
+        1 => Ok(incomplete.remove(0).job_id),
+        count => anyhow::bail!(
+            "{count} incomplete LAR migration jobs exist; resolve the older jobs before changing global migration state"
+        ),
+    }
+}
+
+async fn set_admin_lar_migration_paused(state: Arc<AppState>, paused: bool) -> Response {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let job_id = select_incomplete_lar_migration_job(&store)?;
+        let changed = store.set_lar_migration_paused(&job_id, paused, now_ms())?;
+        if !changed {
+            anyhow::bail!(
+                "migration job {job_id} cannot be {} from its current state",
+                if paused { "paused" } else { "resumed" }
+            );
+        }
+        lar_migration_status_value(&store)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => axum::Json(value).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::CONFLICT, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn admin_lar_migration_pause(State(state): State<Arc<AppState>>) -> Response {
+    set_admin_lar_migration_paused(state, true).await
+}
+
+async fn admin_lar_migration_resume(State(state): State<Arc<AppState>>) -> Response {
+    set_admin_lar_migration_paused(state, false).await
+}
+
+async fn admin_lar_migration_verify(State(state): State<Arc<AppState>>) -> Response {
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.verify_lar_migration()).await {
+        Ok(Ok(report)) => {
+            let status = if report.valid {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            (status, axum::Json(report)).into_response()
+        }
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -4370,13 +4567,21 @@ async fn admin_fixture_save(
             Ok(None) => return error_response(StatusCode::NOT_FOUND, "source trace not found"),
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        let bytes = match row["resp_body_path"].as_str().and_then(read_gz_file) {
-            Some(body) => body,
-            None => {
+        let bytes = match state.store.read_lar_or_legacy_artifact(
+            "trace",
+            trace_id,
+            "client_response",
+            None,
+        ) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "source trace has no captured response body",
                 )
+            }
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
             }
         };
         ErrorFixture {
@@ -4605,6 +4810,7 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
         error_class: q.get("error_class").cloned(),
         key_fingerprint: q.get("key_fingerprint").cloned(),
         reasoning_effort: q.get("effort").cloned(),
+        text: None,
         limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
     }
 }
@@ -4655,11 +4861,23 @@ fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
 }
 
 const TEXT_SCAN_CAP: usize = 300;
+const TEXT_BODY_SCAN_BYTE_CAP: u64 = 4 * 1024 * 1024;
 
-fn trace_matches_text(row: &Value, needle: &str) -> bool {
-    for key in ["req_body_path", "resp_body_path"] {
+fn trace_matches_text(
+    row: &Value,
+    needle: &str,
+    indexed_artifacts: &HashSet<(String, String)>,
+) -> bool {
+    let trace_id = row["id"].as_str().unwrap_or_default();
+    for (key, artifact_kind) in [
+        ("req_body_path", "client_request"),
+        ("resp_body_path", "client_response"),
+    ] {
+        if indexed_artifacts.contains(&(trace_id.to_string(), artifact_kind.to_string())) {
+            continue;
+        }
         if let Some(path) = row.get(key).and_then(|v| v.as_str()) {
-            if let Some(bytes) = read_gz_file(path) {
+            if let Some(bytes) = read_gz_file_bounded(path, TEXT_BODY_SCAN_BYTE_CAP) {
                 if String::from_utf8_lossy(&bytes)
                     .to_lowercase()
                     .contains(needle)
@@ -4672,38 +4890,86 @@ fn trace_matches_text(row: &Value, needle: &str) -> bool {
     false
 }
 
+fn read_gz_file_bounded(path: &str, byte_cap: u64) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut bounded = std::io::Read::take(decoder, byte_cap.saturating_add(1));
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut buf).ok()?;
+    (buf.len() as u64 <= byte_cap).then_some(buf)
+}
+
 async fn traces_search(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let mut filter = filter_from_query(&q);
+    let filter = filter_from_query(&q);
+    let requested_limit = if filter.limit == 0 {
+        200
+    } else {
+        filter.limit.min(5000)
+    };
     let text = q
         .get("text")
         .or_else(|| q.get("q"))
         .map(|t| t.trim().to_lowercase())
         .filter(|t| !t.is_empty());
-    if text.is_some() {
-        filter.limit = TEXT_SCAN_CAP;
-    }
-    match state.store.search_traces(&filter) {
-        Ok(rows) => match text {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        Ok(match text {
             Some(needle) => {
-                let scanned = rows.len();
-                let rows = tokio::task::spawn_blocking(move || {
-                    rows.into_iter()
-                        .filter(|r| trace_matches_text(r, &needle))
-                        .collect::<Vec<_>>()
+                // The normalized FTS index covers LAR-only active and sealed
+                // bodies. Keep the bounded gzip scan as a compatibility path
+                // for traces that have not been migrated or indexed yet.
+                let mut indexed_filter = filter.clone();
+                indexed_filter.text = Some(needle.clone());
+                indexed_filter.limit = requested_limit;
+                let mut rows = store.search_traces(&indexed_filter)?;
+                let indexed_matches = rows.len();
+                let mut seen = rows
+                    .iter()
+                    .filter_map(|row| row["id"].as_str().map(String::from))
+                    .collect::<HashSet<_>>();
+
+                let mut fallback_filter = filter;
+                fallback_filter.limit = TEXT_SCAN_CAP;
+                let fallback_rows = store.search_traces(&fallback_filter)?;
+                let scanned = fallback_rows.len();
+                let fallback_ids = fallback_rows
+                    .iter()
+                    .filter_map(|row| row["id"].as_str().map(String::from))
+                    .collect::<Vec<_>>();
+                let indexed_artifacts = store.lar_normalized_indexed_artifacts(&fallback_ids)?;
+                rows.extend(
+                    fallback_rows
+                        .into_iter()
+                        .filter(|row| trace_matches_text(row, &needle, &indexed_artifacts))
+                        .filter(|row| {
+                            row["id"]
+                                .as_str()
+                                .is_none_or(|id| seen.insert(id.to_string()))
+                        }),
+                );
+                rows.sort_by_key(|row| std::cmp::Reverse(row["ts_request_ms"].as_i64()));
+                rows.truncate(requested_limit);
+                json!({
+                    "traces": trace_rows_with_display_fields(rows),
+                    "indexed_matches": indexed_matches,
+                    "scanned": scanned,
+                    "scan_cap": TEXT_SCAN_CAP,
                 })
-                .await
-                .unwrap_or_default();
-                axum::Json(json!({"traces": trace_rows_with_display_fields(rows), "scanned": scanned, "scan_cap": TEXT_SCAN_CAP}))
-                    .into_response()
             }
             None => {
-                axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
+                let rows = store.search_traces(&filter)?;
+                json!({"traces": trace_rows_with_display_fields(rows)})
             }
-        },
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => axum::Json(value).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -4741,6 +5007,7 @@ fn read_gz_json(path: Option<&str>) -> Option<Value> {
     serde_json::from_slice(&buf).ok()
 }
 
+#[cfg(test)]
 fn read_gz_text(path: Option<&str>) -> Option<String> {
     let buf = path.and_then(read_gz_file)?;
     Some(String::from_utf8_lossy(&buf).to_string())
@@ -4796,6 +5063,11 @@ fn find_dario_capture_path(state: &AppState, row: &Value, kind: &str) -> Option<
 }
 
 fn dario_capture_summary(state: &AppState, row: &Value) -> Option<Value> {
+    if let Some(trace_id) = row["id"].as_str() {
+        if let Err(error) = state.store.ingest_dario_capture_spool(trace_id) {
+            tracing::warn!(trace_id, "failed to ingest Dario capture spool: {error:#}");
+        }
+    }
     let request_path = find_dario_capture_path(state, row, "dario-upstream-request");
     let response_path = find_dario_capture_path(state, row, "dario-upstream-response");
     if request_path.is_none() && response_path.is_none() {
@@ -4824,9 +5096,11 @@ async fn traces_sessions(
 ) -> Response {
     let since = q.get("since").and_then(|s| parse_since(s, now_ms()));
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0);
-    match state.store.sessions(since, limit) {
-        Ok(rows) => axum::Json(json!({"sessions": rows})).into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.sessions(since, limit)).await {
+        Ok(Ok(rows)) => axum::Json(json!({"sessions": rows})).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -5097,14 +5371,16 @@ fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
     }
 }
 
-fn transcript_turn(row: &Value) -> Value {
+fn transcript_turn_with_request(
+    row: &Value,
+    request: Option<&Value>,
+    response_text: Option<&str>,
+) -> Value {
     use alex_core::translate;
-    let user = read_gz_json(row["req_body_path"].as_str())
-        .and_then(|req| {
-            translate::last_user_text(row["client_format"].as_str().unwrap_or(""), &req)
-        })
+    let user = request
+        .and_then(|req| translate::last_user_text(row["client_format"].as_str().unwrap_or(""), req))
         .map(|s| truncate_chars(s, 8000));
-    let resp_text = read_gz_text(row["resp_body_path"].as_str());
+    let resp_text = response_text.map(str::to_string);
     let fmt = row["upstream_format"]
         .as_str()
         .or(row["client_format"].as_str())
@@ -5173,6 +5449,13 @@ fn transcript_turn(row: &Value) -> Value {
     })
 }
 
+#[cfg(test)]
+fn transcript_turn(row: &Value) -> Value {
+    let request = read_gz_json(row["req_body_path"].as_str());
+    let response = read_gz_text(row["resp_body_path"].as_str());
+    transcript_turn_with_request(row, request.as_ref(), response.as_deref())
+}
+
 /// Counts are sent with the transcript so tab labels never need to rescan a
 /// large response while the user is typing a filter. They intentionally count
 /// displayable message halves, matching the client filter's All/User/Model
@@ -5223,59 +5506,190 @@ fn transcript_tab_counts(turns: &[Value]) -> Value {
 }
 
 fn openai_responses_user_history_signature(request: &Value) -> Option<String> {
-    let history = request["input"]
-        .as_array()?
-        .iter()
-        .filter(|item| {
-            item["type"].as_str().unwrap_or("message") == "message"
-                && item["role"].as_str() == Some("user")
-        })
-        .map(|item| item["content"].clone())
-        .collect::<Vec<_>>();
-    (!history.is_empty())
-        .then(|| serde_json::to_string(&history).ok())
-        .flatten()
+    let mut count = 0usize;
+    let mut last = None;
+    for item in request["input"].as_array()?.iter().filter(|item| {
+        item["type"].as_str().unwrap_or("message") == "message"
+            && item["role"].as_str() == Some("user")
+    }) {
+        count += 1;
+        last = Some(&item["content"]);
+    }
+    serde_json::to_string(&(count, last?)).ok()
 }
 
-fn codex_user_history_signature(row: &Value) -> Option<String> {
+fn codex_user_history_signature(row: &Value, request: Option<&Value>) -> Option<String> {
     if row["harness"].as_str() != Some("codex")
         || row["client_format"].as_str() != Some("openai-responses")
     {
         return None;
     }
-    openai_responses_user_history_signature(&read_gz_json(row["req_body_path"].as_str())?)
+    openai_responses_user_history_signature(request?)
 }
 
-async fn traces_session_transcript(
-    State(state): State<Arc<AppState>>,
-    Path(session_id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    let since = q
-        .get("since_ms")
-        .and_then(|s| s.parse::<i64>().ok())
-        .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
-    let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(500);
-    let rows = match state.store.session_traces(&session_id, since) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let tools = match state.store.session_tool_calls(&session_id) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let mut previous_codex_user_history: Option<String> = None;
-    let turns: Vec<Value> = rows
+const DEFAULT_TRANSCRIPT_BODY_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
+const MAX_TRANSCRIPT_BODY_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+struct TranscriptPageBuild {
+    turns: Vec<Value>,
+    body_bytes_loaded: u64,
+    body_errors: Vec<Value>,
+    body_truncations: Vec<Value>,
+}
+
+fn transcript_body_bytes(
+    outcome: LarArtifactBatchRead,
+    trace_id: &str,
+    artifact_kind: &str,
+    loaded: &mut u64,
+    errors: &mut Vec<Value>,
+    truncations: &mut Vec<Value>,
+) -> Option<Vec<u8>> {
+    match outcome {
+        LarArtifactBatchRead::Read(bytes) => {
+            *loaded = loaded.saturating_add(bytes.len() as u64);
+            Some(bytes)
+        }
+        LarArtifactBatchRead::Missing => None,
+        LarArtifactBatchRead::Truncated {
+            total_length,
+            budget_remaining,
+        } => {
+            truncations.push(json!({
+                "trace_id": trace_id,
+                "artifact_kind": artifact_kind,
+                "reason": "page_body_byte_budget",
+                "total_bytes": total_length,
+                "budget_remaining_bytes": budget_remaining,
+            }));
+            None
+        }
+        LarArtifactBatchRead::Error { kind, detail } => {
+            errors.push(json!({
+                "trace_id": trace_id,
+                "artifact_kind": artifact_kind,
+                "kind": kind,
+                "message": detail,
+            }));
+            None
+        }
+        LarArtifactBatchRead::ArchiveUnavailable(error) => {
+            errors.push(json!({
+                "trace_id": trace_id,
+                "artifact_kind": artifact_kind,
+                "kind": error.code(),
+                "message": error.to_string(),
+                "archive_availability": error.code(),
+                "archive_file_uuid": error.file_uuid,
+                "archive_path": error.path,
+            }));
+            None
+        }
+    }
+}
+
+fn transcript_turns(
+    store: &Store,
+    rows: &[Value],
+    tools: Vec<Value>,
+    body_byte_budget: u64,
+) -> TranscriptPageBuild {
+    let trace_id_values = rows
         .iter()
-        .take(limit)
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let trace_ids: HashSet<&str> = trace_id_values.iter().map(String::as_str).collect();
+    let (mut stages_by_trace, stage_catalog_error) =
+        match store.lar_stages_for_traces(&trace_id_values) {
+            Ok(stages) => (stages, None),
+            Err(error) => {
+                tracing::warn!("could not load LAR stage timeline for transcript page: {error:#}");
+                (HashMap::new(), Some(error.to_string()))
+            }
+        };
+    let mut tools_by_trace: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut unlinked_tools = Vec::new();
+    for tool in tools {
+        if let Some(trace_id) = tool["trace_id"].as_str() {
+            if trace_ids.contains(trace_id) {
+                tools_by_trace
+                    .entry(trace_id.to_string())
+                    .or_default()
+                    .push(tool);
+            }
+        } else {
+            unlinked_tools.push(tool);
+        }
+    }
+
+    let mut previous_codex_user_history: Option<String> = None;
+    let mut unlinked_index = 0usize;
+    let body_requests = rows
+        .iter()
+        .flat_map(|row| {
+            let trace_id = row["id"].as_str().unwrap_or_default();
+            [
+                LarArtifactReadRequest::new("trace", trace_id, "client_request"),
+                LarArtifactReadRequest::new("trace", trace_id, "client_response"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut bodies = store
+        .read_lar_or_legacy_artifact_batch_bounded(&body_requests, body_byte_budget)
+        .into_iter();
+    let mut body_bytes_loaded = 0u64;
+    let mut body_errors = Vec::new();
+    let mut body_truncations = Vec::new();
+    let turns = rows
+        .iter()
         .enumerate()
         .map(|(index, row)| {
-            let signature = codex_user_history_signature(row);
+            let trace_id = row["id"].as_str().unwrap_or_default();
+            let error_start = body_errors.len();
+            let truncation_start = body_truncations.len();
+            let request_bytes = transcript_body_bytes(
+                bodies.next().unwrap_or(LarArtifactBatchRead::Missing),
+                trace_id,
+                "client_request",
+                &mut body_bytes_loaded,
+                &mut body_errors,
+                &mut body_truncations,
+            );
+            let request = request_bytes.as_deref().and_then(|bytes| {
+                match serde_json::from_slice::<Value>(bytes) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        body_errors.push(json!({
+                            "trace_id": trace_id,
+                            "artifact_kind": "client_request",
+                            "kind": "invalid_json",
+                            "message": error.to_string(),
+                        }));
+                        None
+                    }
+                }
+            });
+            let response = transcript_body_bytes(
+                bodies.next().unwrap_or(LarArtifactBatchRead::Missing),
+                trace_id,
+                "client_response",
+                &mut body_bytes_loaded,
+                &mut body_errors,
+                &mut body_truncations,
+            )
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            let signature = codex_user_history_signature(row, request.as_ref());
             let replayed_user = signature.is_some() && signature == previous_codex_user_history;
             if signature.is_some() {
                 previous_codex_user_history = signature;
             }
-            let mut turn = transcript_turn(row);
+            let mut turn = transcript_turn_with_request(row, request.as_ref(), response.as_deref());
+            if let Some(stages) = stages_by_trace.remove(trace_id) {
+                turn["stages"] = json!(stages);
+            }
+            if let Some(error) = stage_catalog_error.as_deref() {
+                turn["stage_error"] = json!(error);
+            }
             // Pi emits a tool start after the model response that requested it
             // and before the next provider request. Associate by explicit
             // trace_id when available, otherwise by that session-local time
@@ -5283,29 +5697,219 @@ async fn traces_session_transcript(
             let next_request = rows
                 .get(index + 1)
                 .and_then(|next| next["ts_request_ms"].as_i64());
-            let trace_id = row["id"].as_str();
             let started = row["ts_request_ms"].as_i64().unwrap_or_default();
-            let executed: Vec<Value> = tools
-                .iter()
-                .filter(|tool| {
-                    tool["trace_id"].as_str() == trace_id
-                        || (tool["trace_id"].is_null()
-                            && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
-                                ts >= started && next_request.is_none_or(|next| ts < next)
-                            }))
-                })
-                .cloned()
-                .collect();
+            let mut executed = tools_by_trace.remove(trace_id).unwrap_or_default();
+            while let Some(tool) = unlinked_tools.get(unlinked_index) {
+                let ts = tool["ts_start_ms"].as_i64().unwrap_or_default();
+                if ts < started {
+                    unlinked_index += 1;
+                    continue;
+                }
+                if next_request.is_some_and(|next| ts >= next) {
+                    break;
+                }
+                executed.push(tool.clone());
+                unlinked_index += 1;
+            }
+            executed.sort_by_key(|tool| tool["ts_start_ms"].as_i64().unwrap_or_default());
             turn["executed_tools"] = json!(executed);
             if replayed_user {
                 turn["user"] = Value::Null;
             }
+            if body_errors.len() > error_start {
+                turn["body_errors"] = json!(body_errors[error_start..].to_vec());
+            }
+            if body_truncations.len() > truncation_start {
+                turn["body_truncations"] = json!(body_truncations[truncation_start..].to_vec());
+            }
             turn
         })
         .collect();
-    let tab_counts = transcript_tab_counts(&turns);
-    axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
-        .into_response()
+    TranscriptPageBuild {
+        turns,
+        body_bytes_loaded,
+        body_errors,
+        body_truncations,
+    }
+}
+
+fn transcript_cursor(
+    query: &HashMap<String, String>,
+    prefix: &str,
+) -> std::result::Result<Option<(i64, String)>, String> {
+    let ms = query.get(&format!("{prefix}_ms"));
+    let id = query.get(&format!("{prefix}_id"));
+    match (ms, id) {
+        (None, None) => Ok(None),
+        (Some(ms), Some(id)) if !id.is_empty() => ms
+            .parse::<i64>()
+            .map(|ms| Some((ms, id.clone())))
+            .map_err(|_| format!("{prefix}_ms must be an integer")),
+        _ => Err(format!(
+            "{prefix}_ms and {prefix}_id must be supplied together"
+        )),
+    }
+}
+
+async fn traces_session_conversation_events(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match q.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(500),
+            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be positive"),
+        },
+        None => 100,
+    };
+    let after = match transcript_cursor(&q, "after") {
+        Ok(cursor) => cursor,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let include_entries = match q.get("include_entries").map(String::as_str) {
+        None | Some("1") | Some("true") | Some("yes") => true,
+        Some("0") | Some("false") | Some("no") => false,
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "include_entries must be true or false",
+            )
+        }
+    };
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let page = if include_entries {
+            store.lar_conversation_events_page(&session_id, after, limit)?
+        } else {
+            store.lar_conversation_event_summaries_page(&session_id, after, limit)?
+        };
+        let (next_after_ms, next_after_id) = page
+            .next_after
+            .map(|(timestamp, trace_id)| (Some(timestamp), Some(trace_id)))
+            .unwrap_or((None, None));
+        Ok(json!({
+            "session_id": session_id,
+            "events": page.events,
+            "total_events": page.total_count,
+            "has_more_after": page.has_more_after,
+            "next_after_ms": next_after_ms,
+            "next_after_id": next_after_id,
+            "entries_included": include_entries,
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => axum::Json(value).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn traces_session_transcript(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match q.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(500),
+            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be positive"),
+        },
+        None => 500,
+    };
+    let body_byte_budget = match q.get("body_byte_budget") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) if value <= MAX_TRANSCRIPT_BODY_BYTE_BUDGET => value,
+            _ => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "body_byte_budget must be an integer between 0 and 268435456",
+                )
+            }
+        },
+        None => DEFAULT_TRANSCRIPT_BODY_BYTE_BUDGET,
+    };
+    let mut after = match transcript_cursor(&q, "after") {
+        Ok(cursor) => cursor,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let before = match transcript_cursor(&q, "before") {
+        Ok(cursor) => cursor,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    if after.is_some() && before.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "after and before cursors are mutually exclusive",
+        );
+    }
+    // Preserve the additive legacy `since[_ms]` surface while using the
+    // indexed cursor query. One millisecond earlier makes the lower bound
+    // inclusive, matching the old API.
+    if after.is_none() && before.is_none() {
+        let since = q
+            .get("since_ms")
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
+        if let Some(since) = since {
+            after = Some((since.saturating_sub(1), String::from("\u{10ffff}")));
+        }
+    }
+    let tail = q
+        .get("tail")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let page =
+            store.session_traces_page(&session_id, after.clone(), before.clone(), limit, tail)?;
+        let oldest = page.rows.first().map(|row| {
+            (
+                row["ts_request_ms"].as_i64().unwrap_or_default(),
+                row["id"].as_str().unwrap_or_default().to_string(),
+            )
+        });
+        let newest = page.rows.last().map(|row| {
+            (
+                row["ts_request_ms"].as_i64().unwrap_or_default(),
+                row["id"].as_str().unwrap_or_default().to_string(),
+            )
+        });
+        let tools = if let Some((start_ms, _)) = oldest.as_ref() {
+            let trace_ids = page
+                .rows
+                .iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            store.session_tool_calls_page(&session_id, &trace_ids, *start_ms, page.next_ts_ms)?
+        } else {
+            vec![]
+        };
+        let transcript = transcript_turns(&store, &page.rows, tools, body_byte_budget);
+        let tab_counts = transcript_tab_counts(&transcript.turns);
+        Ok(json!({
+            "session_id": session_id,
+            "turns": transcript.turns,
+            "tab_counts": tab_counts,
+            "total_turns": page.total_count,
+            "has_more_before": page.has_more_before,
+            "has_more_after": page.has_more_after,
+            "oldest_ts_ms": oldest.as_ref().map(|cursor| cursor.0),
+            "oldest_trace_id": oldest.as_ref().map(|cursor| cursor.1.clone()),
+            "newest_ts_ms": newest.as_ref().map(|cursor| cursor.0),
+            "newest_trace_id": newest.as_ref().map(|cursor| cursor.1.clone()),
+            "body_byte_budget": body_byte_budget,
+            "body_bytes_loaded": transcript.body_bytes_loaded,
+            "body_truncations": transcript.body_truncations,
+            "body_errors": transcript.body_errors,
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => axum::Json(value).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
@@ -5368,7 +5972,12 @@ fn trace_extras(req: &Value) -> Value {
 async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.store.get_trace(&id) {
         Ok(Some(row)) => {
-            let mut extras = read_gz_json(row["req_body_path"].as_str())
+            let mut extras = state
+                .store
+                .read_lar_or_legacy_artifact("trace", &id, "client_request", None)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .map(|req| trace_extras(&req))
                 .unwrap_or_else(|| json!({}));
             if let Some(summary) = dario_capture_summary(&state, &row) {
@@ -5395,12 +6004,34 @@ async fn trace_body(
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let path = match kind.as_str() {
-        "request" => row["req_body_path"].as_str().map(String::from),
-        "upstream-request" => row["upstream_req_body_path"].as_str().map(String::from),
-        "response" => row["resp_body_path"].as_str().map(String::from),
+    if kind.starts_with("dario-") {
+        if let Err(error) = state.store.ingest_dario_capture_spool(&id) {
+            tracing::warn!(
+                trace_id = id,
+                "failed to ingest Dario capture spool: {error:#}"
+            );
+        }
+    }
+    let (artifact_kind, path) = match kind.as_str() {
+        "request" => (
+            "client_request",
+            row["req_body_path"].as_str().map(String::from),
+        ),
+        "upstream-request" => (
+            "upstream_request",
+            row["upstream_req_body_path"].as_str().map(String::from),
+        ),
+        "response" => (
+            "client_response",
+            row["resp_body_path"].as_str().map(String::from),
+        ),
         "dario-upstream-request" | "dario-upstream-response" => {
-            find_dario_capture_path(&state, &row, &kind)
+            let artifact_kind = if kind == "dario-upstream-request" {
+                "dario_upstream_request"
+            } else {
+                "dario_upstream_response"
+            };
+            (artifact_kind, find_dario_capture_path(&state, &row, &kind))
         }
         _ => {
             return error_response(
@@ -5409,8 +6040,20 @@ async fn trace_body(
             )
         }
     };
-    match read_gz_text(path.as_deref()) {
-        Some(text) => {
+    let bytes = match state
+        .store
+        .read_lar_or_legacy_artifact("trace", &id, artifact_kind, None)
+    {
+        Ok(Some(bytes)) => Some(bytes),
+        // Dario suffix captures predate their catalog rows, so retain the
+        // convention-based fallback until their importer inventories them.
+        Ok(None) if artifact_kind.starts_with("dario_") => path.as_deref().and_then(read_gz_file),
+        Ok(None) => None,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    match bytes {
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
             let ct = if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
                 "application/json; charset=utf-8"
             } else {
@@ -5432,32 +6075,196 @@ async fn trace_body(
     }
 }
 
+async fn trace_stage_replay(
+    State(state): State<Arc<AppState>>,
+    Path((trace_id, stage_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let source = match query.get("source").map(String::as_str) {
+        None | Some("raw") | Some("observed") | Some("observed_reads") => {
+            LarStreamReplaySource::ObservedReads
+        }
+        Some("parsed") | Some("frames") | Some("parsed_frames") => {
+            LarStreamReplaySource::ParsedFrames
+        }
+        Some(other) => {
+            return replay_typed_error(
+                StatusCode::BAD_REQUEST,
+                "replay_invalid_request",
+                &format!(
+                    "invalid replay source '{other}'; expected observed_reads or parsed_frames"
+                ),
+                None,
+            )
+        }
+    };
+    let cursor = match query.get("cursor") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return replay_typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "replay_invalid_request",
+                    "replay cursor must be a non-negative integer",
+                    None,
+                )
+            }
+        },
+        None => 0,
+    };
+    let limit = match query.get("limit") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                return replay_typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "replay_invalid_request",
+                    "replay limit must be a positive integer",
+                    None,
+                )
+            }
+        },
+        None => DEFAULT_STREAM_REPLAY_PAGE_LIMIT,
+    };
+    let max_page_bytes = match query.get("max_page_bytes") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return replay_typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "replay_invalid_request",
+                    "replay max_page_bytes must be a positive integer",
+                    None,
+                )
+            }
+        },
+        None => DEFAULT_STREAM_REPLAY_PAGE_BYTES,
+    };
+    let options = LarStreamReplayPageOptions {
+        source,
+        cursor,
+        limit,
+        max_page_bytes,
+    };
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.lar_stream_replay_page(&trace_id, &stage_id, &options)
+    })
+    .await;
+    match result {
+        Ok(Ok(page)) => {
+            use base64::Engine;
+
+            let events = page
+                .events
+                .into_iter()
+                .map(|event| {
+                    json!({
+                        "index": event.index,
+                        "byte_offset": event.byte_offset,
+                        "byte_length": event.byte_length,
+                        "observed_delta_ns": event.observed_delta_ns,
+                        "parser": event.parser,
+                        "frame_kind": event.frame_kind,
+                        "bytes_b64": base64::engine::general_purpose::STANDARD.encode(event.bytes),
+                    })
+                })
+                .collect::<Vec<_>>();
+            axum::Json(json!({
+                "trace_id": page.trace_id,
+                "stage_id": page.stage_id,
+                "stage_kind": page.stage_kind,
+                "source": page.source.as_str(),
+                "cursor": page.cursor,
+                "next_cursor": page.next_cursor,
+                "total_events": page.total_events,
+                "page_bytes": page.page_bytes,
+                "stream_index_id": page.stream_index_id,
+                "raw_body_manifest_id": page.raw_body_manifest_id,
+                "archive_file_uuid": page.archive_file_uuid,
+                "archive_state": page.archive_state,
+                "timing": "observed_delta_ns",
+                "server_sleep": false,
+                "events": events,
+            }))
+            .into_response()
+        }
+        Ok(Err(error)) => replay_error_response(&error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+fn replay_error_response(error: &anyhow::Error) -> Response {
+    if let Some(unavailable) = error.downcast_ref::<alex_store::LarArchiveUnavailableError>() {
+        return replay_typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            unavailable.code(),
+            &unavailable.to_string(),
+            Some(json!({
+                "archive_availability": unavailable.code(),
+                "archive_file_uuid": unavailable.file_uuid,
+                "archive_path": unavailable.path,
+            })),
+        );
+    }
+    if let Some(replay) = error.downcast_ref::<LarStreamReplayError>() {
+        let status = match replay.code() {
+            "replay_stage_not_found" | "replay_not_captured" => StatusCode::NOT_FOUND,
+            "replay_invalid_request" | "replay_cursor_out_of_range" => StatusCode::BAD_REQUEST,
+            "replay_event_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            "replay_catalog_invalid" | "replay_invalid_archive" => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return replay_typed_error(status, replay.code(), &replay.to_string(), None);
+    }
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+}
+
+fn replay_typed_error(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    details: Option<Value>,
+) -> Response {
+    let mut error = json!({"type": code, "message": message});
+    if let (Some(object), Some(details)) = (error.as_object_mut(), details) {
+        if let Some(details) = details.as_object() {
+            object.extend(details.clone());
+        }
+    }
+    (status, axum::Json(json!({"error": error}))).into_response()
+}
+
 async fn tool_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
-    let row = match state.store.get_tool_call(&id) {
-        Ok(Some(row)) => row,
+    match state.store.get_tool_call(&id) {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return error_response(StatusCode::NOT_FOUND, &format!("unknown tool call '{id}'"))
         }
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let path = match kind.as_str() {
-        "args" => row["args_body_path"].as_str(),
-        "result" => row["result_body_path"].as_str(),
+    }
+    let artifact_kind = match kind.as_str() {
+        "args" => "tool_arguments",
+        "result" => "tool_result",
         _ => return error_response(StatusCode::BAD_REQUEST, "kind must be args or result"),
     };
-    match read_gz_text(path) {
-        Some(text) => Response::builder()
+    match state
+        .store
+        .read_lar_or_legacy_artifact("tool_call", &id, artifact_kind, None)
+    {
+        Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json; charset=utf-8")
-            .body(Body::from(text))
+            .body(Body::from(bytes))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-        None => error_response(
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             &format!("no {kind} body stored for tool call '{id}'"),
         ),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -5472,7 +6279,12 @@ async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<Strin
         .as_str()
         .or(row["client_format"].as_str())
         .unwrap_or("");
-    let reply = read_gz_text(row["resp_body_path"].as_str())
+    let reply = state
+        .store
+        .read_lar_or_legacy_artifact("trace", &id, "client_response", None)
+        .ok()
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .and_then(|text| translate::assistant_reply_text(fmt, &text));
     match reply {
         Some(md) => Response::builder()
@@ -6739,9 +7551,7 @@ fn redacted_headers(headers: &HeaderMap) -> String {
         .iter()
         .map(|(k, v)| {
             let key = k.as_str().to_lowercase();
-            let val = if ["authorization", "x-api-key", "cookie", "chatgpt-account-id"]
-                .contains(&key.as_str())
-            {
+            let val = if sensitive_capture_header_name(&key) {
                 "<redacted>".to_string()
             } else {
                 v.to_str().unwrap_or("<binary>").to_string()
@@ -6750,6 +7560,97 @@ fn redacted_headers(headers: &HeaderMap) -> String {
         })
         .collect();
     serde_json::to_string(&map).unwrap_or_default()
+}
+
+fn sensitive_capture_header_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-openai-api-key"
+            | "anthropic-api-key"
+            | "chatgpt-account-id"
+            | "x-amz-security-token"
+            | "access-token"
+            | "refresh-token"
+            | "x-auth-token"
+            | "x-access-token"
+            | "x-refresh-token"
+            | "x-session-token"
+            | "client-secret"
+            | "secret"
+    ) || lower.ends_with("-api-key")
+        || lower.ends_with("-access-token")
+        || lower.ends_with("-refresh-token")
+        || lower.ends_with("-auth-token")
+        || lower.ends_with("-secret")
+        || lower.contains("credential")
+}
+
+fn lar_captured_headers(headers: &HeaderMap) -> LarHeaderCapture {
+    LarHeaderCapture::observed(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes())),
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProxyLarCapture {
+    client_request_headers: Option<LarHeaderCapture>,
+    client_response_headers: Option<LarHeaderCapture>,
+    upstream_attempts: Vec<LarUpstreamAttemptCapture>,
+    upstream_stream_reads: Option<Vec<LarStreamReadCapture>>,
+    stream_timing_overflowed: bool,
+    /// Present only when the bytes sent downstream differ from the captured
+    /// upstream response (translation/destream). Identical passthrough bodies
+    /// reuse the upstream manifest ID.
+    client_response_body: Option<Vec<u8>>,
+}
+
+impl ProxyLarCapture {
+    fn record_stream_read(&mut self, byte_offset: usize, byte_length: usize, delta_ns: u64) {
+        if self.stream_timing_overflowed || byte_length == 0 {
+            return;
+        }
+        let reads = self.upstream_stream_reads.get_or_insert_with(Vec::new);
+        if reads.len() >= MAX_CAPTURED_STREAM_READS {
+            self.upstream_stream_reads = None;
+            self.stream_timing_overflowed = true;
+            return;
+        }
+        let (Ok(byte_offset), Ok(byte_length)) =
+            (u64::try_from(byte_offset), u64::try_from(byte_length))
+        else {
+            self.upstream_stream_reads = None;
+            self.stream_timing_overflowed = true;
+            return;
+        };
+        reads.push(LarStreamReadCapture {
+            byte_offset,
+            byte_length,
+            delta_from_first_byte_ns: delta_ns,
+        });
+    }
+}
+
+fn capture_generated_client_response(
+    capture: &mut ProxyLarCapture,
+    content_type: &str,
+    trace_id: &str,
+    body: &[u8],
+) {
+    capture.client_response_headers = Some(LarHeaderCapture::observed([
+        (b"content-type".as_slice(), content_type.as_bytes()),
+        (b"x-alexandria-trace-id".as_slice(), trace_id.as_bytes()),
+    ]));
+    capture.client_response_body = Some(body.to_vec());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7622,7 +8523,8 @@ mod trace_api_tests {
     use super::{
         account_plot_series, openai_responses_user_history_signature, session_from_metadata,
         trace_extras, trace_harness, trace_reasoning_fields, transcript_assistant_blocks,
-        transcript_tab_counts, transcript_turn, truncate_chars, Store,
+        transcript_tab_counts, transcript_turn, transcript_turns, truncate_chars, Store,
+        ToolCallRecord, TraceRecord, DEFAULT_TRANSCRIPT_BODY_BYTE_BUDGET,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::{json, Value};
@@ -7777,6 +8679,162 @@ mod trace_api_tests {
         assert_eq!(turn["reasoning_effort"], "minimal");
         assert_eq!(turn["billing_bucket"], "subscription");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
+    }
+
+    #[test]
+    #[ignore = "explicit large-session performance benchmark"]
+    fn synthetic_long_session_transcript_page_benchmark() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-transcript-benchmark-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).expect("open benchmark trace store");
+        let session_id = "synthetic-long-codex-session";
+        let body_shape = (0..96)
+            .map(|part| format!("field-{part:03}-{:016x}", part * 1_048_583))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Shape this after the observed 1,277-trace Codex session: accumulated
+        // Responses input history, compressed bodies, and frequent linked tool
+        // executions. Values and text are entirely synthetic.
+        for index in 0..1_500 {
+            let trace_id = format!("synthetic-trace-{index:04}");
+            let input = (0..12)
+                .map(|history_index| {
+                    json!({
+                        "type": "message",
+                        "role": if history_index % 2 == 0 { "user" } else { "assistant" },
+                        "content": [{
+                            "type": if history_index % 2 == 0 { "input_text" } else { "output_text" },
+                            "text": format!("turn {index} history {history_index} {body_shape}")
+                        }]
+                    })
+                })
+                .collect::<Vec<_>>();
+            let request = json!({
+                "model": "gpt-5.5-synthetic",
+                "input": input,
+                "tools": [{
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Synthetic command tool used only for browser benchmarks"
+                }]
+            })
+            .to_string();
+            let response = json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("synthetic answer {index} {body_shape}")}]
+                }]
+            })
+            .to_string();
+            let request_path = store
+                .write_body(&trace_id, "request.json", request.as_bytes())
+                .unwrap();
+            let response_path = store
+                .write_body(&trace_id, "response.body", response.as_bytes())
+                .unwrap();
+            let timestamp = 1_780_000_000_000 + index as i64 * 1_000;
+            store
+                .insert_trace(&TraceRecord {
+                    id: trace_id.clone(),
+                    ts_request_ms: timestamp,
+                    ts_response_ms: Some(timestamp + 800),
+                    session_id: Some(session_id.into()),
+                    harness: Some("codex".into()),
+                    client_format: Some("openai-responses".into()),
+                    upstream_format: Some("openai-responses".into()),
+                    routed_model: Some("gpt-5.5-synthetic".into()),
+                    upstream_provider: Some("openai".into()),
+                    status: Some(200),
+                    req_body_path: Some(request_path),
+                    resp_body_path: Some(response_path),
+                    usage: alex_core::Usage {
+                        input_tokens: Some(20_000),
+                        output_tokens: Some(500),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            if index % 3 == 0 {
+                store
+                    .upsert_tool_call(&ToolCallRecord {
+                        id: format!("synthetic-tool-{index:04}"),
+                        harness: "codex".into(),
+                        session_id: session_id.into(),
+                        turn_id: Some(index.to_string()),
+                        tool_call_id: format!("call-{index:04}"),
+                        trace_id: Some(trace_id),
+                        tool_name: "exec_command".into(),
+                        ts_start_ms: timestamp + 850,
+                        ts_end_ms: Some(timestamp + 900),
+                        is_error: Some(false),
+                        exit_status: Some(0),
+                        args_body_path: None,
+                        result_body_path: None,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let legacy_started = std::time::Instant::now();
+        let legacy_rows = store.session_traces(session_id, None).unwrap();
+        let legacy_tools = store.session_tool_calls(session_id).unwrap();
+        let legacy_turns = transcript_turns(
+            &store,
+            &legacy_rows,
+            legacy_tools,
+            DEFAULT_TRANSCRIPT_BODY_BYTE_BUDGET,
+        )
+        .turns;
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let page_started = std::time::Instant::now();
+        let page = store
+            .session_traces_page(session_id, None, None, 50, true)
+            .unwrap();
+        let trace_ids = page
+            .rows
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let tools = store
+            .session_tool_calls_page(
+                session_id,
+                &trace_ids,
+                page.rows[0]["ts_request_ms"].as_i64().unwrap(),
+                page.next_ts_ms,
+            )
+            .unwrap();
+        let turns = transcript_turns(
+            &store,
+            &page.rows,
+            tools,
+            DEFAULT_TRANSCRIPT_BODY_BYTE_BUDGET,
+        )
+        .turns;
+        let page_elapsed = page_started.elapsed();
+
+        eprintln!(
+            "synthetic transcript: legacy {} turns in {:?}; paged {} turns in {:?}",
+            legacy_turns.len(),
+            legacy_elapsed,
+            turns.len(),
+            page_elapsed
+        );
+        assert_eq!(legacy_turns.len(), 1_500);
+        assert_eq!(turns.len(), 50);
+        assert_eq!(page.total_count, 1_500);
+        assert!(page_elapsed < legacy_elapsed);
+        assert!(page_elapsed < std::time::Duration::from_secs(1));
     }
 
     struct RemoveTestDir(PathBuf);
@@ -9037,22 +10095,11 @@ async fn tool_event(
         |c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_',
         "_",
     );
-    let args_body_path = match tool_event_body(event.get("args").cloned()) {
-        Some(bytes) => match state.store.write_body(&id, "tool-args.json", &bytes) {
-            Ok(path) => Some(path),
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        },
-        None => None,
-    };
-    let result_body_path = match tool_event_body(event.get("result").cloned()) {
-        Some(bytes) => match state.store.write_body(&id, "tool-result.json", &bytes) {
-            Ok(path) => Some(path),
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        },
-        None => None,
-    };
+    let args_body = tool_event_body(event.get("args").cloned());
+    let result_body = tool_event_body(event.get("result").cloned());
+    let store = state.store.clone();
     let record = ToolCallRecord {
-        id,
+        id: id.clone(),
         harness: harness.to_string(),
         session_id,
         turn_id: event["turn_id"].as_str().map(String::from),
@@ -9067,12 +10114,24 @@ async fn tool_event(
         ts_end_ms: (phase == "end").then_some(ts_ms),
         is_error: event["is_error"].as_bool(),
         exit_status: event["exit_status"].as_i64(),
-        args_body_path,
-        result_body_path,
+        args_body_path: None,
+        result_body_path: None,
     };
-    match state.store.upsert_tool_call(&record) {
-        Ok(()) => axum::Json(json!({"ok": true})).into_response(),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    match run_lar_storage_job(&state, "tool event", move || -> Result<()> {
+        let mut record = record;
+        if let Some(bytes) = args_body {
+            record.args_body_path = Some(store.write_body(&id, "tool-args.json", &bytes)?);
+        }
+        if let Some(bytes) = result_body {
+            record.result_body_path = Some(store.write_body(&id, "tool-result.json", &bytes)?);
+        }
+        store.upsert_tool_call(&record)
+    })
+    .await
+    {
+        Ok(Ok(())) => axum::Json(json!({"ok": true})).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
 }
 
@@ -9148,20 +10207,6 @@ async fn traces_ingest(
     // prevents two wrap credentials racing an unused trace id and replacing
     // one another's bodies between the check and insert.
     let _ingest_guard = state.trace_ingest_lock.lock().await;
-    let existing = match state.store.get_trace(&payload.trace.id) {
-        Ok(row) => row,
-        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
-    if let Some(row) = &existing {
-        let owner = row["key_fingerprint"].as_str();
-        if !local_admin && owner != Some(fingerprint.as_str()) {
-            return error_response(
-                StatusCode::CONFLICT,
-                "trace id already belongs to another credential",
-            );
-        }
-    }
-
     payload.trace.run_id = payload
         .trace
         .run_id
@@ -9170,66 +10215,73 @@ async fn traces_ingest(
         key.as_ref().and_then(|entry| entry.tags_json.as_deref()),
         payload.trace.tags.as_deref(),
     );
-    payload.trace.key_fingerprint = Some(fingerprint);
+    payload.trace.key_fingerprint = Some(fingerprint.clone());
     payload.trace.client_ip = None;
-    payload.trace.req_body_path = existing
-        .as_ref()
-        .and_then(|row| row["req_body_path"].as_str().map(String::from));
-    payload.trace.upstream_req_body_path = existing
-        .as_ref()
-        .and_then(|row| row["upstream_req_body_path"].as_str().map(String::from));
-    payload.trace.resp_body_path = existing
-        .as_ref()
-        .and_then(|row| row["resp_body_path"].as_str().map(String::from));
+    let response_id = payload.trace.id.clone();
+    let store = state.store.clone();
+    let result = run_lar_storage_job(&state, "trace ingest", move || {
+        let existing = store
+            .get_trace(&payload.trace.id)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        if let Some(row) = &existing {
+            let owner = row["key_fingerprint"].as_str();
+            if !local_admin && owner != Some(fingerprint.as_str()) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "trace id already belongs to another credential".to_string(),
+                ));
+            }
+        }
+        payload.trace.req_body_path = existing
+            .as_ref()
+            .and_then(|row| row["req_body_path"].as_str().map(String::from));
+        payload.trace.upstream_req_body_path = existing
+            .as_ref()
+            .and_then(|row| row["upstream_req_body_path"].as_str().map(String::from));
+        payload.trace.resp_body_path = existing
+            .as_ref()
+            .and_then(|row| row["resp_body_path"].as_str().map(String::from));
 
-    if let Some(body) = request {
-        match state
-            .store
-            .write_body(&payload.trace.id, "request.json", &body)
-        {
-            Ok(path) => payload.trace.req_body_path = Some(path),
-            Err(error) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-            }
+        if let Some(body) = request {
+            payload.trace.req_body_path = Some(
+                store
+                    .write_body(&payload.trace.id, "request.json", &body)
+                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+            );
         }
-    }
-    if let Some(body) = upstream_request {
-        match state
-            .store
-            .write_body(&payload.trace.id, "upstream-request.json", &body)
-        {
-            Ok(path) => payload.trace.upstream_req_body_path = Some(path),
-            Err(error) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-            }
+        if let Some(body) = upstream_request {
+            payload.trace.upstream_req_body_path = Some(
+                store
+                    .write_body(&payload.trace.id, "upstream-request.json", &body)
+                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+            );
         }
-    }
-    if let Some(body) = response {
-        match state
-            .store
-            .write_body(&payload.trace.id, "response.body", &body)
-        {
-            Ok(path) => payload.trace.resp_body_path = Some(path),
-            Err(error) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-            }
+        if let Some(body) = response {
+            payload.trace.resp_body_path = Some(
+                store
+                    .write_body(&payload.trace.id, "response.body", &body)
+                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+            );
         }
-    }
-    if let Err(error) = state.store.insert_trace(&payload.trace) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
-    let outcome = if existing.is_some() {
-        "updated"
-    } else {
-        "inserted"
+        store
+            .insert_trace(&payload.trace)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        Ok(existing.is_some())
+    })
+    .await;
+    let existed = match result {
+        Ok(Ok(existed)) => existed,
+        Ok(Err((status, error))) => return error_response(status, &error),
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
     };
+    let outcome = if existed { "updated" } else { "inserted" };
     (
-        if existing.is_some() {
+        if existed {
             StatusCode::OK
         } else {
             StatusCode::CREATED
         },
-        axum::Json(json!({"id": payload.trace.id, "outcome": outcome})),
+        axum::Json(json!({"id": response_id, "outcome": outcome})),
     )
         .into_response()
 }
@@ -9511,6 +10563,10 @@ async fn proxy(
         ),
         client_ip: peer.map(|p| p.ip().to_string()),
         key_fingerprint: Some(client_fingerprint),
+        ..Default::default()
+    };
+    let mut lar_capture = ProxyLarCapture {
+        client_request_headers: Some(lar_captured_headers(&headers)),
         ..Default::default()
     };
 
@@ -9845,7 +10901,15 @@ async fn proxy(
         trace.ts_response_ms = Some(now_ms());
         let response_body =
             injected_body.unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
-        finalize_trace(&state, trace, &body, None, Some(&response_body));
+        finalize_trace_with_lar_async(
+            &state,
+            trace,
+            &body,
+            None,
+            Some(&response_body),
+            Some(&lar_capture),
+        )
+        .await;
         let mut response = Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
             .header("content-type", "application/json")
@@ -9925,7 +10989,8 @@ async fn proxy(
         Err((status, msg)) => {
             trace.status = Some(status.as_u16() as i64);
             trace.error = Some(msg.clone());
-            finalize_trace(&state, trace, &body, None, None);
+            finalize_trace_with_lar_async(&state, trace, &body, None, None, Some(&lar_capture))
+                .await;
             return error_response(status, &msg);
         }
     };
@@ -9976,7 +11041,15 @@ async fn proxy(
                 Err((status, msg)) => {
                     trace.status = Some(status.as_u16() as i64);
                     trace.error = Some(msg.clone());
-                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    finalize_trace_with_lar_async(
+                        &state,
+                        trace,
+                        &body,
+                        Some(&plan.body),
+                        None,
+                        Some(&lar_capture),
+                    )
+                    .await;
                     return error_response(status, &msg);
                 }
             };
@@ -9988,6 +11061,10 @@ async fn proxy(
                     up_headers.insert(name, value);
                 }
             }
+            let attempt_number =
+                u32::try_from(lar_capture.upstream_attempts.len() + 1).unwrap_or(u32::MAX);
+            let attempt_wall_time_ns = u64::try_from(now_ms().max(0)).unwrap_or(0) * 1_000_000;
+            let attempt_request_headers = lar_captured_headers(&up_headers);
             let resp = tokio::time::timeout(
                 UPSTREAM_RESPONSE_HEAD_TIMEOUT,
                 state
@@ -10006,15 +11083,47 @@ async fn proxy(
             })
             .and_then(|result| result.map_err(|error| error.to_string()));
             let resp = match resp {
-                Ok(r) => r,
+                Ok(r) => {
+                    lar_capture
+                        .upstream_attempts
+                        .push(LarUpstreamAttemptCapture {
+                            attempt_number,
+                            wall_time_ns: attempt_wall_time_ns,
+                            request_headers: Some(attempt_request_headers),
+                            response_headers: Some(lar_captured_headers(r.headers())),
+                            status_code: Some(r.status().as_u16()),
+                            error_class: None,
+                            error_message: None,
+                        });
+                    r
+                }
                 Err(e) => {
                     let msg = format!("upstream request failed: {e}");
+                    lar_capture
+                        .upstream_attempts
+                        .push(LarUpstreamAttemptCapture {
+                            attempt_number,
+                            wall_time_ns: attempt_wall_time_ns,
+                            request_headers: Some(attempt_request_headers),
+                            response_headers: None,
+                            status_code: None,
+                            error_class: Some("network".into()),
+                            error_message: Some(msg.clone()),
+                        });
                     suspect_dario(&state, &account);
                     trace.status = Some(502);
                     trace.error = Some(msg.clone());
                     trace.error_kind = Some("upstream_unreachable".into());
                     trace.error_class = Some(ErrorClass::Network.as_str().into());
-                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    finalize_trace_with_lar_async(
+                        &state,
+                        trace,
+                        &body,
+                        Some(&plan.body),
+                        None,
+                        Some(&lar_capture),
+                    )
+                    .await;
                     return error_response(StatusCode::BAD_GATEWAY, &msg);
                 }
             };
@@ -10272,8 +11381,9 @@ async fn proxy(
 
     if let Some(target) = plan.respond_as {
         use alex_core::translate;
-        let buf = match upstream_resp.bytes().await {
-            Ok(b) => b.to_vec(),
+        let buf = match collect_upstream_response_with_timing(upstream_resp, &mut lar_capture).await
+        {
+            Ok(body) => body,
             Err(e) => {
                 let msg = format!("upstream body read failed: {e}");
                 suspect_dario(&state, &account);
@@ -10281,7 +11391,15 @@ async fn proxy(
                 trace.error = Some(msg.clone());
                 trace.error_kind = Some("upstream_unreachable".into());
                 trace.error_class = Some(ErrorClass::Network.as_str().into());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                finalize_trace_with_lar_async(
+                    &state,
+                    trace,
+                    &body,
+                    Some(&plan.body),
+                    None,
+                    Some(&lar_capture),
+                )
+                .await;
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         };
@@ -10290,8 +11408,21 @@ async fn proxy(
         let buffered_sse_error =
             observe_buffered_response(&state, &mut trace, &buf, is_sse, plan.upstream_format);
         let text = String::from_utf8_lossy(&buf).to_string();
+        let trimmed = text.trim_start();
+        let looks_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
+        if !is_sse && !looks_sse {
+            lar_capture.upstream_stream_reads = None;
+        }
         if !status.is_success() {
-            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            finalize_trace_with_lar_async(
+                &state,
+                trace,
+                &body,
+                Some(&plan.body),
+                Some(&buf),
+                Some(&lar_capture),
+            )
+            .await;
             return Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
@@ -10303,11 +11434,17 @@ async fn proxy(
         }
         if let Some(error) = buffered_sse_error {
             let msg = error.trace_message();
-            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            finalize_trace_with_lar_async(
+                &state,
+                trace,
+                &body,
+                Some(&plan.body),
+                Some(&buf),
+                Some(&lar_capture),
+            )
+            .await;
             return error_response(StatusCode::BAD_GATEWAY, &msg);
         }
-        let trimmed = text.trim_start();
-        let looks_sse = trimmed.starts_with("event:") || trimmed.starts_with("data:");
         let upstream_final = if plan.upstream_format == "anthropic" {
             if is_sse || looks_sse {
                 translate::parse_anthropic_sse_to_message(&text)
@@ -10333,7 +11470,15 @@ async fn proxy(
             trace.error = Some(msg.to_string());
             trace.error_kind = Some("invalid_upstream_response".into());
             trace.error_class = Some(ErrorClass::Server.as_str().into());
-            finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+            finalize_trace_with_lar_async(
+                &state,
+                trace,
+                &body,
+                Some(&plan.body),
+                Some(&buf),
+                Some(&lar_capture),
+            )
+            .await;
             return error_response(StatusCode::BAD_GATEWAY, msg);
         };
         // A refusal / empty completion would otherwise translate to a silent
@@ -10418,7 +11563,16 @@ async fn proxy(
             trace.error.as_deref(),
         )
         .await;
-        finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+        capture_generated_client_response(&mut lar_capture, out_ct, &trace_id, &out_body);
+        finalize_trace_with_lar_async(
+            &state,
+            trace,
+            &body,
+            Some(&plan.body),
+            Some(&buf),
+            Some(&lar_capture),
+        )
+        .await;
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", out_ct)
@@ -10428,15 +11582,24 @@ async fn proxy(
     }
 
     if plan.destream {
-        let buf = match upstream_resp.bytes().await {
-            Ok(b) => b.to_vec(),
+        let buf = match collect_upstream_response_with_timing(upstream_resp, &mut lar_capture).await
+        {
+            Ok(body) => body,
             Err(e) => {
                 let msg = format!("upstream body read failed: {e}");
                 trace.status = Some(502);
                 trace.error = Some(msg.clone());
                 trace.error_kind = Some("upstream_unreachable".into());
                 trace.error_class = Some(ErrorClass::Network.as_str().into());
-                finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                finalize_trace_with_lar_async(
+                    &state,
+                    trace,
+                    &body,
+                    Some(&plan.body),
+                    None,
+                    Some(&lar_capture),
+                )
+                .await;
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         };
@@ -10444,10 +11607,22 @@ async fn proxy(
         let buffered_sse_error =
             observe_buffered_response(&state, &mut trace, &buf, is_sse, plan.upstream_format);
         let text = String::from_utf8_lossy(&buf).to_string();
+        let trimmed = text.trim_start();
+        if !is_sse && !trimmed.starts_with("event:") && !trimmed.starts_with("data:") {
+            lar_capture.upstream_stream_reads = None;
+        }
         if status.is_success() {
             if let Some(error) = buffered_sse_error {
                 let msg = error.trace_message();
-                finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+                finalize_trace_with_lar_async(
+                    &state,
+                    trace,
+                    &body,
+                    Some(&plan.body),
+                    Some(&buf),
+                    Some(&lar_capture),
+                )
+                .await;
                 return error_response(StatusCode::BAD_GATEWAY, &msg);
             }
         }
@@ -10480,7 +11655,21 @@ async fn proxy(
             trace.error.as_deref(),
         )
         .await;
-        finalize_trace(&state, trace, &body, Some(&plan.body), Some(&buf));
+        capture_generated_client_response(
+            &mut lar_capture,
+            "application/json",
+            &trace_id,
+            &out_body,
+        );
+        finalize_trace_with_lar_async(
+            &state,
+            trace,
+            &body,
+            Some(&plan.body),
+            Some(&buf),
+            Some(&lar_capture),
+        )
+        .await;
         return Response::builder()
             .status(out_status)
             .header("content-type", "application/json")
@@ -10495,6 +11684,28 @@ async fn proxy(
     let client_body = body.clone();
     let upstream_body = plan.body.clone();
     let dario_guard = plan.dario_guard.take();
+    let mut client_response_header_pairs = resp_headers
+        .iter()
+        .filter(|(name, _)| {
+            ![
+                "transfer-encoding",
+                "connection",
+                "content-encoding",
+                "content-length",
+            ]
+            .contains(&name.as_str())
+        })
+        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    client_response_header_pairs.push((
+        b"x-alexandria-trace-id".to_vec(),
+        trace_id.as_bytes().to_vec(),
+    ));
+    lar_capture.client_response_headers = Some(LarHeaderCapture::observed(
+        client_response_header_pairs
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    ));
     tokio::spawn(async move {
         let _dario_guard = dario_guard;
         let _in_flight = in_flight;
@@ -10504,7 +11715,11 @@ async fn proxy(
             &mut upstream_stream,
             &tx,
             state2.upstream_stream_idle_timeout,
-            |chunk| {
+            |chunk, delta_ns| {
+                let byte_offset = buf.len();
+                if is_sse {
+                    lar_capture.record_stream_read(byte_offset, chunk.len(), delta_ns);
+                }
                 buf.extend_from_slice(chunk);
                 if let Some(observer) = sse_error_observer.as_mut() {
                     observer.observe(chunk);
@@ -10574,13 +11789,15 @@ async fn proxy(
         .await;
 
         fill_usage_and_cost(&state2, &mut trace, &buf, is_sse);
-        finalize_trace(
+        finalize_trace_with_lar_async(
             &state2,
             trace,
             &client_body,
             Some(&upstream_body),
             Some(&buf),
-        );
+            Some(&lar_capture),
+        )
+        .await;
     });
 
     let mut response = Response::builder().status(status);
@@ -10617,12 +11834,17 @@ async fn forward_upstream_stream<S, E, F>(
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
-    F: FnMut(&Bytes),
+    F: FnMut(&Bytes, u64),
 {
+    let mut first_read_at = None;
     loop {
         match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
             Ok(Some(Ok(chunk))) => {
-                observe(&chunk);
+                let now = std::time::Instant::now();
+                let first = *first_read_at.get_or_insert(now);
+                let delta_ns =
+                    u64::try_from(now.duration_since(first).as_nanos()).unwrap_or(u64::MAX);
+                observe(&chunk, delta_ns);
                 if tx.send(Ok(chunk)).await.is_err() {
                     return Some("client disconnected before upstream stream completed".into());
                 }
@@ -10646,6 +11868,32 @@ where
             }
         }
     }
+}
+
+async fn collect_upstream_response_with_timing(
+    response: reqwest::Response,
+    capture: &mut ProxyLarCapture,
+) -> Result<Vec<u8>, reqwest::Error> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut first_read_at = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                // Callers cannot archive the partial body after this error, so
+                // do not leave an index that refers to a missing manifest.
+                capture.upstream_stream_reads = None;
+                return Err(error);
+            }
+        };
+        let now = std::time::Instant::now();
+        let first = *first_read_at.get_or_insert(now);
+        let delta_ns = u64::try_from(now.duration_since(first).as_nanos()).unwrap_or(u64::MAX);
+        capture.record_stream_read(body.len(), chunk.len(), delta_ns);
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn fill_usage_and_cost(state: &AppState, trace: &mut TraceRecord, buf: &[u8], is_sse: bool) {
@@ -11179,39 +12427,248 @@ fn extract_final_response(text: &str) -> Option<Value> {
     last
 }
 
+/// Persist one completed exchange without running hashing, compression,
+/// SQLite, or filesystem work on an async executor thread. The semaphore is
+/// acquired before body ownership is duplicated, which bounds both concurrent
+/// workers and queued archive-body memory.
+async fn run_lar_storage_job<T, F>(
+    state: &Arc<AppState>,
+    label: &str,
+    job: F,
+) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let metrics = state.lar_storage_metrics.clone();
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    metrics.started.fetch_add(1, ordering);
+    let wait_started = std::time::Instant::now();
+    let permit = state
+        .lar_storage_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| {
+            metrics.join_failures.fetch_add(1, ordering);
+            format!("LAR persistence worker gate closed for {label}: {error}")
+        })?;
+    let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    metrics.wait_ns.fetch_add(wait_ns, ordering);
+    metrics.max_wait_ns.fetch_max(wait_ns, ordering);
+    let worker_metrics = metrics.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let work_started = std::time::Instant::now();
+        let result = job();
+        let work_ns = u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        worker_metrics.work_ns.fetch_add(work_ns, ordering);
+        worker_metrics.completed.fetch_add(1, ordering);
+        result
+    })
+    .await
+    .map_err(|error| {
+        metrics.join_failures.fetch_add(1, ordering);
+        format!("LAR persistence worker {label} failed to join: {error}")
+    })
+}
+
+async fn finalize_trace_with_lar_async(
+    state: &Arc<AppState>,
+    trace: TraceRecord,
+    client_body: &[u8],
+    upstream_body: Option<&[u8]>,
+    resp_body: Option<&[u8]>,
+    lar_capture: Option<&ProxyLarCapture>,
+) {
+    let metrics = state.lar_storage_metrics.clone();
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    metrics.started.fetch_add(1, ordering);
+    let wait_started = std::time::Instant::now();
+    let permit = match state.lar_storage_permits.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            metrics.join_failures.fetch_add(1, ordering);
+            tracing::error!(
+                trace_id = trace.id,
+                "LAR persistence worker gate closed: {error}"
+            );
+            return;
+        }
+    };
+    let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    metrics.wait_ns.fetch_add(wait_ns, ordering);
+    metrics.max_wait_ns.fetch_max(wait_ns, ordering);
+    let state = state.clone();
+    let client_body = client_body.to_vec();
+    let upstream_body = upstream_body.map(<[u8]>::to_vec);
+    let resp_body = resp_body.map(<[u8]>::to_vec);
+    let lar_capture = lar_capture.cloned();
+    let worker_metrics = metrics.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let work_started = std::time::Instant::now();
+        finalize_trace_with_lar(
+            &state,
+            trace,
+            &client_body,
+            upstream_body.as_deref(),
+            resp_body.as_deref(),
+            lar_capture.as_ref(),
+        );
+        let work_ns = u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        worker_metrics.work_ns.fetch_add(work_ns, ordering);
+        worker_metrics.completed.fetch_add(1, ordering);
+    })
+    .await
+    {
+        metrics.join_failures.fetch_add(1, ordering);
+        tracing::error!("LAR persistence worker failed to join: {error}");
+    }
+}
+
+#[cfg(test)]
 fn finalize_trace(
+    state: &Arc<AppState>,
+    trace: TraceRecord,
+    client_body: &[u8],
+    upstream_body: Option<&[u8]>,
+    resp_body: Option<&[u8]>,
+) {
+    finalize_trace_with_lar(state, trace, client_body, upstream_body, resp_body, None);
+}
+
+fn finalize_trace_with_lar(
     state: &Arc<AppState>,
     mut trace: TraceRecord,
     client_body: &[u8],
     upstream_body: Option<&[u8]>,
     resp_body: Option<&[u8]>,
+    lar_capture: Option<&ProxyLarCapture>,
 ) {
     let store = &state.store;
+    let mut body_refs = LarExchangeBodyRefs::default();
     if let Some(resp) = resp_body {
         capture_response_error(&mut trace, resp);
     }
     emit_reauth_notification(state, &trace);
-    match store.write_body(&trace.id, "request.json", client_body) {
-        Ok(p) => trace.req_body_path = Some(p),
+    match store.write_body_artifact(
+        &LarBodyArtifact::trace(&trace.id, "client_request"),
+        "request.json",
+        client_body,
+    ) {
+        Ok(result) => {
+            trace.req_body_path = Some(result.legacy_path);
+            body_refs.client_request_manifest_id = result.manifest_id;
+        }
         Err(e) => tracing::warn!("failed to write request body: {e}"),
     }
     if let Some(up) = upstream_body {
         if up != client_body {
-            match store.write_body(&trace.id, "upstream-request.json", up) {
-                Ok(p) => trace.upstream_req_body_path = Some(p),
+            match store.write_body_artifact(
+                &LarBodyArtifact::trace(&trace.id, "upstream_request"),
+                "upstream-request.json",
+                up,
+            ) {
+                Ok(result) => {
+                    trace.upstream_req_body_path = Some(result.legacy_path);
+                    body_refs.upstream_request_manifest_id = result.manifest_id;
+                }
                 Err(e) => tracing::warn!("failed to write upstream request body: {e}"),
             }
+        } else {
+            body_refs.upstream_request_manifest_id = body_refs.client_request_manifest_id.clone();
         }
     }
     if let Some(resp) = resp_body {
-        match store.write_body(&trace.id, "response.body", resp) {
-            Ok(p) => trace.resp_body_path = Some(p),
-            Err(e) => tracing::warn!("failed to write response body: {e}"),
+        let client_response = lar_capture
+            .and_then(|capture| capture.client_response_body.as_deref())
+            .unwrap_or(resp);
+        if client_response == resp {
+            match store.write_body_artifact(
+                &LarBodyArtifact::trace(&trace.id, "client_response"),
+                "response.body",
+                resp,
+            ) {
+                Ok(result) => {
+                    trace.resp_body_path = Some(result.legacy_path);
+                    body_refs.upstream_response_manifest_id = result.manifest_id.clone();
+                    body_refs.client_response_manifest_id = result.manifest_id;
+                }
+                Err(error) => tracing::warn!("failed to write response body: {error}"),
+            }
+        } else {
+            match store.write_body_artifact(
+                &LarBodyArtifact::trace(&trace.id, "upstream_response"),
+                "upstream-response.body",
+                resp,
+            ) {
+                Ok(result) => body_refs.upstream_response_manifest_id = result.manifest_id,
+                Err(error) => tracing::warn!("failed to write upstream response body: {error}"),
+            }
+            match store.write_body_artifact(
+                &LarBodyArtifact::trace(&trace.id, "client_response"),
+                "response.body",
+                client_response,
+            ) {
+                Ok(result) => {
+                    trace.resp_body_path = Some(result.legacy_path);
+                    body_refs.client_response_manifest_id = result.manifest_id;
+                }
+                Err(error) => {
+                    tracing::warn!("failed to write translated client response body: {error}")
+                }
+            }
         }
     }
     if let Err(e) = store.insert_trace(&trace) {
         tracing::error!("failed to insert trace {}: {e}", trace.id);
     } else {
+        if let Some(captured) = lar_capture {
+            let exchange = LarExchangeCapture {
+                trace_id: trace.id.clone(),
+                session_id: trace.session_id.clone(),
+                run_id: trace.run_id.clone(),
+                wall_time_ns: u64::try_from(trace.ts_request_ms.max(0)).unwrap_or(0) * 1_000_000,
+                client_request_headers: captured.client_request_headers.clone(),
+                client_response_headers: captured.client_response_headers.clone(),
+                upstream_attempts: captured.upstream_attempts.clone(),
+                upstream_stream_reads: captured.upstream_stream_reads.clone(),
+                provider: trace.upstream_provider.clone(),
+                requested_model: trace.requested_model.clone(),
+                routed_model: trace.routed_model.clone(),
+                account_id: trace.account_id.clone(),
+                routing_reason: trace.substitution_reason.clone(),
+                status_code: trace.status.and_then(|value| u16::try_from(value).ok()),
+                error_class: trace.error_class.clone(),
+                error_message: trace.error.clone(),
+            };
+            if let Err(error) = store.write_lar_exchange_capture(&exchange, &body_refs) {
+                tracing::warn!(
+                    trace_id = trace.id,
+                    "failed to write live LAR exchange metadata: {error:#}"
+                );
+            }
+        }
+        if body_refs.client_request_manifest_id.is_some() {
+            if let Err(error) = store.populate_lar_conversation_for_trace(
+                &trace.id,
+                LarConversationEvidenceSource::Capture,
+            ) {
+                tracing::warn!(
+                    trace_id = trace.id,
+                    "failed to populate live conversation catalog: {error:#}"
+                );
+            }
+        }
+        if trace.via_dario {
+            if let Err(error) = store.ingest_dario_capture_spool(&trace.id) {
+                tracing::warn!(
+                    trace_id = trace.id,
+                    "failed to ingest Dario capture spool during trace finalization: {error:#}"
+                );
+            }
+        }
         let _ = state.plugins.invoke(
             "on_trace",
             serde_json::to_value(&trace).unwrap_or(Value::Null),
@@ -12132,8 +13589,7 @@ mod tests {
         let paste = reauth_link_body(Some("paste"), "work", "https://auth.test", false);
         assert!(paste.contains("After approving, paste the code#state here."));
         let device = reauth_link_body(Some("device"), "work", "https://auth.test", false);
-        assert!(device
-            .contains("Alex is waiting for authorization and will finish automatically."));
+        assert!(device.contains("Alex is waiting for authorization and will finish automatically."));
         assert!(!device.contains("code#state"));
     }
 
@@ -12194,9 +13650,7 @@ mod tests {
     #[tokio::test]
     async fn watchdog_anthropic_alert_binds_paste_and_completes_reauth() {
         let (url, received, sink) = webhook_sink().await;
-        let (token_url, token_server) = invalid_grant_token_server().await;
         let state = test_state("watchdog-anthropic-paste-complete");
-        state.vault.set_refresh_endpoint_override(Some(token_url));
         let account_id = "anthropic-oauth-work";
         let account = anthropic_account_full(
             account_id,
@@ -12227,8 +13681,15 @@ mod tests {
                 account_id: account_id.into(),
             }));
 
-        let refresh_error = state.vault.refresh(account_id, true).await.unwrap_err();
-        assert!(alex_auth::refresh_error_needs_reauth(&refresh_error));
+        // This test owns the watchdog/paste flow, not native credential
+        // discovery. Mark the isolated fixture explicitly: a failed refresh
+        // may otherwise import a real host CLI account into this temporary
+        // vault and race the expected notification.
+        state
+            .vault
+            .set_account_meta(account_id, "needs_reauth", json!(true))
+            .await
+            .unwrap();
         assert!(needs_reauth_flag(&state, account_id).await);
         reauth_watch_once(&state).await;
 
@@ -12238,7 +13699,10 @@ mod tests {
         )
         .await;
         let text = payload["text"].as_str().unwrap();
-        assert!(text.contains("work@example.test"));
+        assert!(
+            text.contains("work@example.test"),
+            "unexpected watchdog alert text: {text}"
+        );
         assert!(text.contains("https://claude.ai/oauth/authorize"));
         assert!(text.contains("After approving, paste the code#state here."));
         assert!(matches!(
@@ -12284,7 +13748,6 @@ mod tests {
             Some("fresh-anthropic-access")
         );
         sink.abort();
-        token_server.abort();
     }
 
     #[tokio::test]
@@ -12776,6 +14239,806 @@ mod tests {
         (format!("http://{address}/"), received, server)
     }
 
+    #[tokio::test]
+    async fn conversation_events_endpoint_pages_canonical_refs_without_loading_bodies() {
+        use alex_store::{
+            LarBodyStoreConfig, LarBodyStoreMode, LarConversationEntryCapture,
+            LarConversationEntryKind, LarConversationGenerationEvent, LarConversationRawRange,
+            LarConversationRole, LarConversationSemantics, LarConversationTurnCapture,
+        };
+
+        let data_dir = tmpdir("conversation-events-endpoint-store");
+        let store = Store::open_with_lar_body_store(
+            data_dir,
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (trace_id, timestamp) in [("event-first", 10), ("event-second", 20)] {
+            store
+                .insert_trace(&TraceRecord {
+                    id: trace_id.into(),
+                    session_id: Some("event-session".into()),
+                    ts_request_ms: timestamp,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let body = b"[first][second]";
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("event-first", "client_request"),
+                "request.json",
+                body,
+            )
+            .unwrap();
+        let manifest_id = written.manifest_id.unwrap();
+        let entry = |offset, length| LarConversationEntryCapture {
+            semantics: LarConversationSemantics::Known {
+                source_format: "test-wire-v1".into(),
+                role: LarConversationRole::User,
+                kind: LarConversationEntryKind::Message,
+                name: None,
+                tool_call_id: None,
+            },
+            raw_ranges: vec![LarConversationRawRange {
+                manifest_id: manifest_id.clone(),
+                byte_offset: offset,
+                byte_length: length,
+            }],
+        };
+        let first_entry = store.register_lar_conversation_entry(&entry(0, 7)).unwrap();
+        let second_entry = store.register_lar_conversation_entry(&entry(7, 8)).unwrap();
+        let initial = store
+            .record_lar_conversation_turn(&LarConversationTurnCapture {
+                trace_id: "event-first".into(),
+                session_id: "event-session".into(),
+                event: LarConversationGenerationEvent::Initial,
+                generation_entry_ids: vec![first_entry.clone()],
+                upto_index: 0,
+                response_entry_ids: vec![],
+            })
+            .unwrap();
+        store
+            .record_lar_conversation_turn(&LarConversationTurnCapture {
+                trace_id: "event-second".into(),
+                session_id: "event-session".into(),
+                event: LarConversationGenerationEvent::Append {
+                    parent_generation_id: initial.generation_id,
+                },
+                generation_entry_ids: vec![first_entry, second_entry],
+                upto_index: 1,
+                response_entry_ids: vec![],
+            })
+            .unwrap();
+
+        let state = test_state_with_store("conversation-events-endpoint-state", store);
+        let response = traces_session_conversation_events(
+            State(state.clone()),
+            Path("event-session".into()),
+            Query(HashMap::from([("limit".into(), "1".into())])),
+        )
+        .await;
+        let (status, first) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["total_events"], 2);
+        assert_eq!(first["events"].as_array().unwrap().len(), 1);
+        assert_eq!(first["events"][0]["reason"], "initial");
+        assert_eq!(
+            first["events"][0]["entries"][0]["raw_ranges"][0]["manifest_id"],
+            manifest_id
+        );
+        assert!(first["events"][0].get("body").is_none());
+        assert_eq!(first["has_more_after"], true);
+
+        let response = traces_session_conversation_events(
+            State(state.clone()),
+            Path("event-session".into()),
+            Query(HashMap::from([
+                (
+                    "after_ms".into(),
+                    first["next_after_ms"].as_i64().unwrap().to_string(),
+                ),
+                (
+                    "after_id".into(),
+                    first["next_after_id"].as_str().unwrap().to_string(),
+                ),
+                ("limit".into(), "1".into()),
+            ])),
+        )
+        .await;
+        let (status, second) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["events"].as_array().unwrap().len(), 1);
+        assert_eq!(second["events"][0]["reason"], "append");
+        assert_eq!(second["has_more_after"], false);
+
+        let response = traces_session_conversation_events(
+            State(state.clone()),
+            Path("event-session".into()),
+            Query(HashMap::from([("include_entries".into(), "false".into())])),
+        )
+        .await;
+        let (status, summary) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        assert_eq!(summary["entries_included"], false);
+        assert_eq!(summary["events"].as_array().unwrap().len(), 2);
+        assert!(summary["events"][0]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(summary["events"][1]["response_entries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn live_finalization_populates_exact_conversation_spans_idempotently() {
+        let data_dir = tmpdir("live-conversation-population");
+        let store = Store::open_with_lar_body_store(
+            data_dir,
+            alex_store::LarBodyStoreConfig {
+                mode: alex_store::LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = test_state_with_store("live-conversation-state", store);
+        let first_request = br#"{"messages":[ {"role":"user","content":"one"} ]}"#;
+        let first_response =
+            br#"{"id":"m1","role":"assistant","content":[{"type":"text","text":"two"}]}"#;
+        finalize_trace(
+            &state,
+            TraceRecord {
+                id: "live-conversation-1".into(),
+                session_id: Some("live-conversation-session".into()),
+                ts_request_ms: 10,
+                client_format: Some("anthropic".into()),
+                upstream_format: Some("anthropic".into()),
+                status: Some(200),
+                ..Default::default()
+            },
+            first_request,
+            Some(first_request),
+            Some(first_response),
+        );
+        let second_request = br#"{"messages":[ {"role":"user","content":"one"}, {"role":"assistant","content":[{"type":"text","text":"two"}]}, {"role":"user","content":"three"} ]}"#;
+        let second_response =
+            br#"{"id":"m2","role":"assistant","content":[{"type":"text","text":"four"}]}"#;
+        finalize_trace(
+            &state,
+            TraceRecord {
+                id: "live-conversation-2".into(),
+                session_id: Some("live-conversation-session".into()),
+                ts_request_ms: 20,
+                client_format: Some("anthropic".into()),
+                upstream_format: Some("anthropic".into()),
+                status: Some(200),
+                ..Default::default()
+            },
+            second_request,
+            Some(second_request),
+            Some(second_response),
+        );
+
+        let before = state
+            .store
+            .lar_conversation_events_page("live-conversation-session", None, 10)
+            .unwrap();
+        assert_eq!(before.events.len(), 2);
+        assert_eq!(before.events[0].reason, "initial");
+        assert_eq!(before.events[1].reason, "append");
+        assert_eq!(
+            before.events[0].entries[0].entry_id, before.events[1].entries[0].entry_id,
+            "live growing prefixes must reuse their original raw span"
+        );
+        let exact = &before.events[1].entries[2].raw_ranges[0];
+        let manifest = state
+            .store
+            .read_lar_manifest_body(&exact.manifest_id)
+            .unwrap();
+        assert_eq!(
+            &manifest[exact.byte_offset as usize..(exact.byte_offset + exact.byte_length) as usize],
+            br#"{"role":"user","content":"three"}"#
+        );
+
+        let retried = state
+            .store
+            .populate_lar_conversation_for_trace(
+                "live-conversation-2",
+                LarConversationEvidenceSource::Capture,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.generation_id, before.events[1].generation_id);
+        assert_eq!(retried.turn_view_id, before.events[1].turn_view_id);
+        assert_eq!(
+            state
+                .store
+                .lar_conversation_events_page("live-conversation-session", None, 10)
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_endpoint_pages_tail_and_older_rows() {
+        use tower::ServiceExt;
+
+        let state = test_state("transcript-pagination");
+        for index in 0..6 {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: format!("trace-{index}"),
+                    ts_request_ms: 1_000 + index,
+                    ts_response_ms: Some(1_100 + index),
+                    session_id: Some("long-session".into()),
+                    status: Some(200),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let tail =
+            axum::http::Request::get("/traces/sessions/long-session/transcript?limit=2&tail=true")
+                .header("x-api-key", "alx-local")
+                .body(Body::empty())
+                .unwrap();
+        let (status, body) =
+            response_json(router(state.clone()).oneshot(tail).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_turns"], 6);
+        assert_eq!(body["turns"][0]["trace_id"], "trace-4");
+        assert_eq!(body["turns"][1]["trace_id"], "trace-5");
+        assert_eq!(body["has_more_before"], true);
+        assert_eq!(body["has_more_after"], false);
+
+        let older = axum::http::Request::get(
+            "/traces/sessions/long-session/transcript?limit=2&before_ms=1004&before_id=trace-4",
+        )
+        .header("x-api-key", "alx-local")
+        .body(Body::empty())
+        .unwrap();
+        let (status, body) = response_json(router(state).oneshot(older).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["turns"][0]["trace_id"], "trace-2");
+        assert_eq!(body["turns"][1]["trace_id"], "trace-3");
+        assert_eq!(body["has_more_before"], true);
+        assert_eq!(body["has_more_after"], true);
+    }
+
+    #[tokio::test]
+    async fn transcript_page_reads_catalog_only_manifest_spanning_live_packs() {
+        let data_dir = tmpdir("transcript-live-catalog-store");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        config.max_pack_bytes = 1;
+        config.chunker.min_size = 4;
+        config.chunker.target_size = 4;
+        config.chunker.max_size = 4;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+
+        // Seed the first four request bytes in an older pack. The real request
+        // reuses that chunk and writes its remaining chunks after rotation, so
+        // its SQLite-only manifest genuinely spans body packs.
+        store
+            .write_body("seed", "request.json", br#"{"mo"#)
+            .unwrap();
+        let request = br#"{"messages":[{"role":"user","content":"live catalog"}]}"#;
+        let response = br#"{"content":[{"type":"text","text":"live response"}]}"#;
+        let request_result = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("trace-live", "client_request"),
+                "request.json",
+                request,
+            )
+            .unwrap();
+        let response_result = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("trace-live", "client_response"),
+                "response.body",
+                response,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "trace-live".into(),
+                ts_request_ms: 10,
+                ts_response_ms: Some(20),
+                session_id: Some("session-live".into()),
+                client_format: Some("anthropic".into()),
+                upstream_format: Some("anthropic".into()),
+                req_body_path: Some(request_result.legacy_path.clone()),
+                resp_body_path: Some(response_result.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .write_lar_exchange_capture(
+                &LarExchangeCapture {
+                    trace_id: "trace-live".into(),
+                    session_id: Some("session-live".into()),
+                    run_id: None,
+                    wall_time_ns: 10_000_000,
+                    client_request_headers: None,
+                    client_response_headers: None,
+                    upstream_attempts: vec![LarUpstreamAttemptCapture {
+                        attempt_number: 1,
+                        wall_time_ns: 11_000_000,
+                        request_headers: None,
+                        response_headers: None,
+                        status_code: Some(200),
+                        error_class: None,
+                        error_message: None,
+                    }],
+                    upstream_stream_reads: None,
+                    provider: None,
+                    requested_model: None,
+                    routed_model: None,
+                    account_id: None,
+                    routing_reason: None,
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+                &LarExchangeBodyRefs {
+                    client_request_manifest_id: request_result.manifest_id.clone(),
+                    upstream_request_manifest_id: request_result.manifest_id,
+                    upstream_response_manifest_id: response_result.manifest_id.clone(),
+                    client_response_manifest_id: response_result.manifest_id,
+                },
+            )
+            .unwrap();
+        std::fs::remove_file(request_result.legacy_path).unwrap();
+        std::fs::remove_file(response_result.legacy_path).unwrap();
+
+        let state = test_state_with_store("transcript-live-catalog-state", store);
+        let response = traces_session_transcript(
+            State(state),
+            Path("session-live".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["turns"][0]["user"], "live catalog");
+        assert_eq!(body["turns"][0]["assistant"], "live response");
+        assert_eq!(body["turns"][0]["stages"].as_array().unwrap().len(), 5);
+        assert_eq!(body["turns"][0]["stages"][0]["kind"], "client_request");
+        assert_eq!(body["turns"][0]["stages"][2]["kind"], "upstream_request");
+        assert_eq!(body["turns"][0]["stages"][2]["attempt_number"], 1);
+        assert_eq!(
+            body["turns"][0]["stages"][0]["request_body_manifest_ref"],
+            body["turns"][0]["stages"][2]["request_body_manifest_ref"]
+        );
+        assert_eq!(
+            body["turns"][0]["stages"][3]["response_body_manifest_ref"],
+            body["turns"][0]["stages"][4]["response_body_manifest_ref"]
+        );
+        assert_eq!(body["body_errors"], json!([]));
+        assert_eq!(body["body_truncations"], json!([]));
+        assert!(body["body_bytes_loaded"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn transcript_page_keeps_daemon_available_when_archive_is_offline_or_missing() {
+        let data_dir = tmpdir("transcript-archive-unavailable");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        config.max_pack_bytes = 1;
+        config.chunker.min_size = 4;
+        config.chunker.target_size = 4;
+        config.chunker.max_size = 4;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let request = br#"{"messages":[{"role":"user","content":"archived request"}]}"#;
+        let archived = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("trace-archived", "client_request"),
+                "request.json",
+                request,
+            )
+            .unwrap();
+        store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("trace-rotate", "client_request"),
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"rotate"}]}"#,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "trace-archived".into(),
+                ts_request_ms: 10,
+                session_id: Some("session-archived".into()),
+                client_format: Some("anthropic".into()),
+                req_body_path: Some(archived.legacy_path),
+                ..Default::default()
+            })
+            .unwrap();
+        let sealed = store
+            .lar_archive_file_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|file| file.role == "body-pack" && file.catalog_state == "sealed")
+            .unwrap();
+        let original_path = PathBuf::from(&sealed.resolved_path);
+        store.detach_lar_archive(&sealed.file_uuid).unwrap();
+        let state = test_state_with_store("transcript-archive-unavailable-state", store);
+
+        let response = traces_session_transcript(
+            State(state.clone()),
+            Path("session-archived".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body_errors"].as_array().unwrap().len(), 1);
+        assert_eq!(body["body_errors"][0]["kind"], "archived_offline");
+        assert_eq!(
+            body["body_errors"][0]["archive_availability"],
+            "archived_offline"
+        );
+        assert_eq!(
+            body["body_errors"][0]["archive_file_uuid"],
+            sealed.file_uuid
+        );
+        assert_eq!(body["body_errors"][0]["archive_path"], sealed.resolved_path);
+        assert_eq!(
+            body["turns"][0]["body_errors"][0]["archive_availability"],
+            "archived_offline"
+        );
+
+        state
+            .store
+            .reattach_lar_archive(
+                &sealed.file_uuid,
+                &original_path,
+                &alex_store::LarArchiveReattachOptions::default(),
+            )
+            .unwrap();
+        let parked = original_path.with_extension("parked.lar");
+        std::fs::rename(&original_path, &parked).unwrap();
+        let response = traces_session_transcript(
+            State(state),
+            Path("session-archived".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body_errors"][0]["kind"], "archived_missing");
+        assert_eq!(
+            body["body_errors"][0]["archive_availability"],
+            "archived_missing"
+        );
+        assert_eq!(
+            body["body_errors"][0]["archive_file_uuid"],
+            sealed.file_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_page_budget_omits_oversized_growing_prefixes_explicitly() {
+        let state = test_state("transcript-byte-budget");
+        for index in 0..2 {
+            let body = json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "x".repeat(2_000 + index * 1_000),
+                }]
+            });
+            let path = state
+                .store
+                .write_body(
+                    &format!("large-{index}"),
+                    "request.json",
+                    &serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: format!("large-{index}"),
+                    ts_request_ms: 100 + index as i64,
+                    session_id: Some("large-session".into()),
+                    client_format: Some("anthropic".into()),
+                    req_body_path: Some(path),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let mut query = HashMap::new();
+        query.insert("body_byte_budget".into(), "128".into());
+        let response =
+            traces_session_transcript(State(state), Path("large-session".into()), Query(query))
+                .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body_byte_budget"], 128);
+        assert_eq!(body["body_bytes_loaded"], 0);
+        assert_eq!(body["body_truncations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["body_truncations"][0]["reason"],
+            "page_body_byte_budget"
+        );
+        assert_eq!(body["turns"][0]["user"], Value::Null);
+        assert_eq!(
+            body["turns"][0]["body_truncations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_page_surfaces_one_body_error_without_blanking_other_turns() {
+        let state = test_state("transcript-body-error");
+        let corrupt = state.store.data_dir.join("corrupt-request.json.gz");
+        std::fs::write(&corrupt, b"not a gzip member").unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "corrupt".into(),
+                ts_request_ms: 1,
+                session_id: Some("error-session".into()),
+                client_format: Some("anthropic".into()),
+                req_body_path: Some(corrupt.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        let healthy_path = state
+            .store
+            .write_body(
+                "healthy",
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"still visible"}]}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "healthy".into(),
+                ts_request_ms: 2,
+                session_id: Some("error-session".into()),
+                client_format: Some("anthropic".into()),
+                req_body_path: Some(healthy_path),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let response = traces_session_transcript(
+            State(state),
+            Path("error-session".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["body_errors"].as_array().unwrap().len(), 1);
+        assert_eq!(body["body_errors"][0]["trace_id"], "corrupt");
+        assert_eq!(body["turns"][0]["body_errors"][0]["kind"], "legacy_read");
+        assert_eq!(body["turns"][1]["user"], "still visible");
+    }
+
+    #[tokio::test]
+    async fn trace_text_search_finds_lar_only_body_and_preserves_anchors() {
+        let data_dir = tmpdir("trace-fts-store");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("fts-trace", "client_request"),
+                "request.json",
+                br#"{"messages":[{"role":"user","content":"catalog-only quasar phrase"}]}"#,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "fts-trace".into(),
+                session_id: Some("fts-session".into()),
+                ts_request_ms: 7_700,
+                req_body_path: Some(written.legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(written.legacy_path).unwrap();
+        let state = test_state_with_store("trace-fts-state", store);
+        let response = traces_search(
+            State(state),
+            Query(HashMap::from([("text".into(), "quasar".into())])),
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["indexed_matches"], 1);
+        assert_eq!(body["traces"][0]["id"], "fts-trace");
+        assert_eq!(body["traces"][0]["session_id"], "fts-session");
+        assert_eq!(body["traces"][0]["ts_request_ms"], 7_700);
+    }
+
+    #[tokio::test]
+    async fn trace_stage_replay_pages_binary_bytes_and_surfaces_offline_archive() {
+        use base64::Engine;
+        use tower::ServiceExt;
+
+        let data_dir = tmpdir("trace-replay-store");
+        let mut config = alex_store::LarBodyStoreConfig::default();
+        config.mode = alex_store::LarBodyStoreMode::LarWithFallback;
+        config.max_pack_bytes = 1;
+        config.chunker.min_size = 4;
+        config.chunker.target_size = 4;
+        config.chunker.max_size = 4;
+        let store = Store::open_with_lar_body_store(data_dir, config).unwrap();
+        let raw = vec![0, 255, 1, 2, 3, 128, 4, 5];
+        let written = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("replay-trace", "client_response"),
+                "response.body",
+                &raw,
+            )
+            .unwrap();
+        store
+            .insert_trace(&TraceRecord {
+                id: "replay-trace".into(),
+                session_id: Some("replay-session".into()),
+                ts_request_ms: 8_800,
+                resp_body_path: Some(written.legacy_path),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .write_lar_exchange_capture(
+                &LarExchangeCapture {
+                    trace_id: "replay-trace".into(),
+                    session_id: Some("replay-session".into()),
+                    run_id: None,
+                    wall_time_ns: 1_000_000,
+                    client_request_headers: None,
+                    client_response_headers: None,
+                    upstream_attempts: vec![LarUpstreamAttemptCapture {
+                        attempt_number: 1,
+                        wall_time_ns: 1_100_000,
+                        request_headers: None,
+                        response_headers: None,
+                        status_code: Some(200),
+                        error_class: None,
+                        error_message: None,
+                    }],
+                    upstream_stream_reads: Some(vec![
+                        LarStreamReadCapture {
+                            byte_offset: 0,
+                            byte_length: 3,
+                            delta_from_first_byte_ns: 0,
+                        },
+                        LarStreamReadCapture {
+                            byte_offset: 3,
+                            byte_length: 5,
+                            delta_from_first_byte_ns: 6_000_000,
+                        },
+                    ]),
+                    provider: Some("test".into()),
+                    requested_model: None,
+                    routed_model: None,
+                    account_id: None,
+                    routing_reason: None,
+                    status_code: Some(200),
+                    error_class: None,
+                    error_message: None,
+                },
+                &LarExchangeBodyRefs {
+                    upstream_response_manifest_id: written.manifest_id.clone(),
+                    client_response_manifest_id: written.manifest_id,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let stage_id = store
+            .lar_stages_for_traces(&["replay-trace".into()])
+            .unwrap()
+            .remove("replay-trace")
+            .unwrap()
+            .into_iter()
+            .find(|stage| stage["kind"] == "upstream_response")
+            .unwrap()["stage_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let state = test_state_with_store("trace-replay-state", store);
+
+        let first = router(state.clone())
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/traces/replay-trace/stages/{stage_id}/replay?limit=1"
+                ))
+                .header("x-api-key", "alx-local")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, first) = response_json(first).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["source"], "observed_reads");
+        assert_eq!(first["next_cursor"], 1);
+        assert_eq!(first["events"][0]["observed_delta_ns"], 0);
+        assert_eq!(first["server_sleep"], false);
+        let archive_file_uuid = first["archive_file_uuid"].as_str().unwrap().to_string();
+        let mut reconstructed = base64::engine::general_purpose::STANDARD
+            .decode(first["events"][0]["bytes_b64"].as_str().unwrap())
+            .unwrap();
+
+        let second = trace_stage_replay(
+            State(state.clone()),
+            Path(("replay-trace".into(), stage_id.clone())),
+            Query(HashMap::from([
+                ("cursor".into(), "1".into()),
+                ("limit".into(), "1".into()),
+            ])),
+        )
+        .await;
+        let (status, second) = response_json(second).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert!(second["next_cursor"].is_null());
+        assert_eq!(second["events"][0]["observed_delta_ns"], 6_000_000);
+        reconstructed.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(second["events"][0]["bytes_b64"].as_str().unwrap())
+                .unwrap(),
+        );
+        assert_eq!(reconstructed, raw);
+
+        let parsed = trace_stage_replay(
+            State(state.clone()),
+            Path(("replay-trace".into(), stage_id.clone())),
+            Query(HashMap::from([("source".into(), "parsed".into())])),
+        )
+        .await;
+        let (status, parsed) = response_json(parsed).await;
+        assert_eq!(status, StatusCode::OK, "{parsed}");
+        assert_eq!(parsed["total_events"], 0);
+        assert!(parsed["events"].as_array().unwrap().is_empty());
+
+        let invalid = trace_stage_replay(
+            State(state.clone()),
+            Path(("replay-trace".into(), stage_id.clone())),
+            Query(HashMap::from([("limit".into(), "0".into())])),
+        )
+        .await;
+        let (status, invalid) = response_json(invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid["error"]["type"], "replay_invalid_request");
+
+        state
+            .store
+            .write_body_artifact(
+                &LarBodyArtifact::trace("replay-rotation", "client_request"),
+                "request.json",
+                b"rotate",
+            )
+            .unwrap();
+        state.store.detach_lar_archive(&archive_file_uuid).unwrap();
+        let offline = trace_stage_replay(
+            State(state),
+            Path(("replay-trace".into(), stage_id)),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, offline) = response_json(offline).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{offline}");
+        assert_eq!(offline["error"]["type"], "archived_offline");
+        assert_eq!(offline["error"]["archive_file_uuid"], archive_file_uuid);
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "alex-proxy-{name}-{}-{}",
@@ -12791,6 +15054,33 @@ mod tests {
 
     fn test_state(name: &str) -> Arc<AppState> {
         test_state_with_dario(name, None)
+    }
+
+    #[test]
+    fn trace_header_json_redacts_google_keys_and_all_cookie_values() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-goog-api-key", HeaderValue::from_static("google-secret"));
+        headers.append("cookie", HeaderValue::from_static("session=secret"));
+        headers.append("set-cookie", HeaderValue::from_static("upstream=secret"));
+        headers.append("x-repeat", HeaderValue::from_static("visible"));
+        let encoded = redacted_headers(&headers);
+        assert!(!encoded.contains("google-secret"));
+        assert!(!encoded.contains("session=secret"));
+        assert!(!encoded.contains("upstream=secret"));
+        assert!(encoded.contains("visible"));
+    }
+
+    fn test_state_with_store(name: &str, store: Store) -> Arc<AppState> {
+        let dir = tmpdir(name);
+        let vault = Arc::new(Vault::open(dir.join("vault")).unwrap());
+        build_state(
+            "alx-local".into(),
+            vault,
+            Arc::new(store),
+            None,
+            "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
+        )
     }
 
     fn test_state_with_substitution(name: &str, substitution: SubstitutionConfig) -> Arc<AppState> {
@@ -13175,6 +15465,12 @@ mod tests {
         assert_eq!(body["in_flight_requests"][0]["model"], "gpt-5.5");
         assert_eq!(body["in_flight_requests"][0]["session_id"], "session-123");
         assert_eq!(body["in_flight_requests"][0]["harness"], "codex");
+        assert_eq!(body["lar_storage_workers"]["capacity"], LAR_STORAGE_WORKERS);
+        assert_eq!(
+            body["lar_storage_workers"]["available"],
+            LAR_STORAGE_WORKERS
+        );
+        assert_eq!(body["lar_storage_workers"]["join_failures"], 0);
     }
 
     #[tokio::test]
@@ -13478,7 +15774,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let _in_flight = guard;
             let mut stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_, _| {}).await
         });
 
         tokio::task::yield_now().await;
@@ -13522,7 +15818,7 @@ mod tests {
         })
         .boxed();
         let task = tokio::spawn(async move {
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_, _| {}).await
         });
 
         tokio::task::yield_now().await;
@@ -13539,6 +15835,44 @@ mod tests {
             Bytes::from_static(b"token")
         );
         assert_eq!(task.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_callback_observes_read_order_and_monotonic_deltas() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"second")),
+        ]);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_observed = observed.clone();
+        let result = forward_upstream_stream(
+            &mut stream,
+            &tx,
+            Duration::from_secs(5),
+            move |chunk, delta_ns| {
+                callback_observed
+                    .lock()
+                    .unwrap()
+                    .push((chunk.to_vec(), delta_ns));
+            },
+        )
+        .await;
+        assert!(result.is_none());
+        drop(tx);
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"second")
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed[0].0, b"first");
+        assert_eq!(observed[0].1, 0);
+        assert_eq!(observed[1].0, b"second");
+        assert!(observed[1].1 >= observed[0].1);
     }
 
     fn anthropic_account() -> Account {
@@ -14015,6 +16349,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lar_migration_admin_status_and_pause_resume_share_catalog_state() {
+        let state = test_state("lar-migration-admin");
+        let (status, empty) = response_json(admin_lar_migration(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty["state"], "not_started");
+        assert_eq!(empty["jobs"], json!([]));
+
+        state
+            .store
+            .ensure_lar_migration_job(
+                &alex_store::LarMigrationJobSpec {
+                    job_id: "migration-1".into(),
+                    format_version: 1,
+                    source_version: "legacy-gzip-v1".into(),
+                    source_key: "test-store".into(),
+                },
+                now_ms(),
+            )
+            .unwrap();
+
+        let (status, paused) =
+            response_json(admin_lar_migration_pause(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(paused["job_id"], "migration-1");
+        assert_eq!(paused["state"], "paused");
+        assert_eq!(paused["paused"], true);
+
+        let (status, resumed) =
+            response_json(admin_lar_migration_resume(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resumed["state"], "pending");
+        assert_eq!(resumed["paused"], false);
+
+        let (status, verification) =
+            response_json(admin_lar_migration_verify(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(verification["valid"], true);
+        assert_eq!(verification["files_checked"], 0);
+    }
+
+    #[tokio::test]
+    async fn trace_and_tool_body_endpoints_read_validated_lar_after_migration() {
+        let state = test_state("lar-mixed-body-endpoints");
+        let request_body = br#"{"messages":[{"role":"user","content":"request from lar"}]}"#;
+        let request_path = state
+            .store
+            .write_body("trace-lar", "request.json", request_body)
+            .unwrap();
+        let response_path = state
+            .store
+            .write_body(
+                "trace-lar",
+                "response.json",
+                br#"{"content":[{"type":"text","text":"response from lar"}]}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "trace-lar".into(),
+                ts_request_ms: 1,
+                session_id: Some("session-lar".into()),
+                client_format: Some("anthropic".into()),
+                upstream_format: Some("anthropic".into()),
+                req_body_path: Some(request_path.clone()),
+                resp_body_path: Some(response_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let args_path = state
+            .store
+            .write_body("tool-lar", "args.json", br#"{"command":"pwd"}"#)
+            .unwrap();
+        state
+            .store
+            .upsert_tool_call(&ToolCallRecord {
+                id: "tool-lar".into(),
+                harness: "pi".into(),
+                session_id: "session-lar".into(),
+                turn_id: None,
+                tool_call_id: "call-lar".into(),
+                trace_id: Some("trace-lar".into()),
+                tool_name: "bash".into(),
+                ts_start_ms: 2,
+                ts_end_ms: None,
+                is_error: None,
+                exit_status: None,
+                args_body_path: Some(args_path.clone()),
+                result_body_path: None,
+            })
+            .unwrap();
+        let report = state
+            .store
+            .run_lar_legacy_import(&alex_store::LarLegacyImportOptions::default())
+            .unwrap();
+        assert_eq!(report.migrated, 3);
+
+        // Prove both handlers select their published LAR pointer, rather than
+        // accidentally continuing to depend on the retained legacy source.
+        std::fs::remove_file(request_path).unwrap();
+        std::fs::remove_file(response_path).unwrap();
+        std::fs::remove_file(args_path).unwrap();
+
+        let response = trace_body(
+            State(state.clone()),
+            Path(("trace-lar".into(), "request".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            Bytes::from_static(request_body)
+        );
+
+        let response = tool_body(
+            State(state.clone()),
+            Path(("tool-lar".into(), "args".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            Bytes::from_static(br#"{"command":"pwd"}"#)
+        );
+
+        let response = traces_session_transcript(
+            State(state),
+            Path("session-lar".into()),
+            Query(HashMap::new()),
+        )
+        .await;
+        let (status, transcript) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(transcript["turns"][0]["user"], "request from lar");
+        assert_eq!(transcript["turns"][0]["assistant"], "response from lar");
+    }
+
+    #[tokio::test]
     async fn vault_export_requires_passphrase_and_is_decryptable() {
         let state = test_state("vault-export");
         state.vault.upsert(anthropic_account()).await.unwrap();
@@ -14483,6 +16959,147 @@ mod tests {
         assert_eq!(stored["error_class"], "server");
         assert!(stored["input_tokens"].is_null());
         assert!(stored["output_tokens"].is_null());
+    }
+
+    #[test]
+    fn lar_finalization_archives_distinct_upstream_and_translated_client_bytes() {
+        let data_dir = tmpdir("lar-translated-finalization");
+        let store = Store::open_with_lar_body_store(
+            data_dir,
+            alex_store::LarBodyStoreConfig {
+                mode: alex_store::LarBodyStoreMode::LarWithFallback,
+                max_pack_bytes: 16 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = test_state_with_store("lar-translated-finalization-state", store);
+        let trace = TraceRecord {
+            id: "lar-translated-finalization".into(),
+            ts_request_ms: now_ms(),
+            status: Some(200),
+            upstream_provider: Some("anthropic".into()),
+            upstream_format: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let upstream = b"event: message\ndata: upstream-wire\n\n";
+        let translated = br#"{"translated":"client-wire"}"#;
+        let capture = ProxyLarCapture {
+            client_response_headers: Some(LarHeaderCapture::observed([(
+                "content-type",
+                "application/json",
+            )])),
+            client_response_body: Some(translated.to_vec()),
+            ..Default::default()
+        };
+        finalize_trace_with_lar(
+            &state,
+            trace,
+            b"{}",
+            Some(b"{}"),
+            Some(upstream),
+            Some(&capture),
+        );
+
+        assert_eq!(
+            state
+                .store
+                .read_lar_or_legacy_artifact(
+                    "trace",
+                    "lar-translated-finalization",
+                    "client_response",
+                    None,
+                )
+                .unwrap()
+                .unwrap(),
+            translated
+        );
+        assert_eq!(
+            state
+                .store
+                .read_lar_or_legacy_artifact(
+                    "trace",
+                    "lar-translated-finalization",
+                    "upstream_response",
+                    None,
+                )
+                .unwrap()
+                .unwrap(),
+            upstream
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_lar_finalization_applies_bounded_backpressure_and_publishes_after_write() {
+        let data_dir = tmpdir("lar-bounded-finalization");
+        let store = Store::open_with_lar_body_store(
+            data_dir,
+            alex_store::LarBodyStoreConfig {
+                mode: alex_store::LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = test_state_with_store("lar-bounded-finalization-state", store);
+        let first = state
+            .lar_storage_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let second = state
+            .lar_storage_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let trace = TraceRecord {
+            id: "lar-bounded-finalization".into(),
+            ts_request_ms: now_ms(),
+            status: Some(200),
+            ..Default::default()
+        };
+        let pending = finalize_trace_with_lar_async(
+            &state,
+            trace,
+            br#"{"request":true}"#,
+            None,
+            Some(br#"{"response":true}"#),
+            None,
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(state
+            .store
+            .get_trace("lar-bounded-finalization")
+            .unwrap()
+            .is_none());
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), &mut pending)
+            .await
+            .expect("bounded persistence worker should run after one permit is released");
+        drop(second);
+        assert!(state
+            .store
+            .get_trace("lar-bounded-finalization")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            state.lar_storage_permits.available_permits(),
+            LAR_STORAGE_WORKERS
+        );
+        let metrics = state
+            .lar_storage_metrics
+            .snapshot(state.lar_storage_permits.available_permits());
+        assert_eq!(metrics["started"], 1);
+        assert_eq!(metrics["completed"], 1);
+        assert_eq!(metrics["join_failures"], 0);
+        assert!(metrics["max_wait_ms"].as_f64().unwrap() >= 20.0);
     }
 
     #[test]
@@ -17023,9 +19640,10 @@ mod tests {
             "url": "http://127.0.0.1:1/send",
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], true);
 
@@ -17035,9 +19653,10 @@ mod tests {
             "url": "http://127.0.0.1:1/send",
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], true);
 
@@ -17048,9 +19667,10 @@ mod tests {
             "allow_commands": false,
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], false);
     }
@@ -17903,7 +20523,10 @@ mod tests {
         let count = received.lock().unwrap().len();
         sink.abort();
         token_server.abort();
-        assert_eq!(count, 0, "a recovered one-off refresh failure must stay silent");
+        assert_eq!(
+            count, 0,
+            "a recovered one-off refresh failure must stay silent"
+        );
         assert!(
             !needs_reauth_flag(&state, "openai-oauth-transient-recovery").await,
             "a successful retry must clear the transient failure state"

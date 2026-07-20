@@ -8,7 +8,7 @@ use alex_auth::{
     decrypt_bundle, encrypt_bundle, export_bundle, import_all, import_bundle, named_account_id,
     now_ms, AccountPolicy, BundleSelection, Vault,
 };
-use alex_store::{KnownAccount, Store};
+use alex_store::{KnownAccount, LarLegacyImportOptions, Store};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::Rng;
@@ -19,6 +19,7 @@ mod commands;
 mod dario;
 mod harness_connect;
 mod harness_e2e;
+mod lar_cli;
 mod reset;
 mod selfupdate;
 mod status;
@@ -73,6 +74,11 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Import, inspect, search, verify, repair, and export LAR archives
+    Lar {
+        #[command(subcommand)]
+        command: lar_cli::LarCommand,
     },
     /// Print env exports for pointing harnesses at the daemon
     Env,
@@ -840,9 +846,7 @@ enum TracesCommand {
         force: bool,
     },
     /// Restore missing trace history and captured bodies from a backup (offline)
-    Import {
-        path: PathBuf,
-    },
+    Import { path: PathBuf },
     /// List legacy orphan groups, or attach one group after explicit confirmation (offline)
     Reattach {
         /// The old, now-unresolvable account id shown by the listing
@@ -1036,6 +1040,15 @@ struct Config {
     dario_probe_model: String,
     #[serde(default = "default_trace_body_retention_days")]
     trace_body_retention_days: u64,
+    /// Body capture rollout mode. Legacy gzip remains the default. The
+    /// ALEXANDRIA_LAR_BODY_STORE environment variable overrides this at daemon
+    /// startup without rewriting config.toml.
+    #[serde(default)]
+    lar_body_store_mode: alex_store::LarBodyStoreMode,
+    #[serde(default = "default_lar_migration_batch_size")]
+    lar_migration_batch_size: usize,
+    #[serde(default)]
+    lar_migration_resources: alex_store::LarLegacyResourceControls,
     #[serde(default)]
     trace_row_retention_days: u64,
     #[serde(default = "default_update_check_hours")]
@@ -1226,6 +1239,22 @@ fn default_trace_body_retention_days() -> u64 {
     30
 }
 
+fn lar_body_store_config(
+    config: &Config,
+    env_override: Option<&str>,
+) -> Result<alex_store::LarBodyStoreConfig> {
+    let mode = match env_override.filter(|value| !value.trim().is_empty()) {
+        Some(value) => value.parse().with_context(|| {
+            "parsing ALEXANDRIA_LAR_BODY_STORE; use legacy, dual-write-validated, or lar-with-fallback"
+        })?,
+        None => config.lar_body_store_mode,
+    };
+    Ok(alex_store::LarBodyStoreConfig {
+        mode,
+        ..Default::default()
+    })
+}
+
 fn default_update_check_hours() -> u64 {
     24
 }
@@ -1390,6 +1419,9 @@ impl Config {
             dario_probe_failures: default_dario_probe_failures(),
             dario_probe_model: default_dario_probe_model(),
             trace_body_retention_days: default_trace_body_retention_days(),
+            lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_migration_batch_size: default_lar_migration_batch_size(),
+            lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
@@ -3308,6 +3340,115 @@ async fn bind_daemon_listener_with_fallback(
     }
 }
 
+const STARTUP_LAR_MIGRATION_BATCH: usize = 32;
+
+fn default_lar_migration_batch_size() -> usize {
+    STARTUP_LAR_MIGRATION_BATCH
+}
+
+fn should_run_startup_lar_migration(mode: alex_store::LarBodyStoreMode) -> bool {
+    mode != alex_store::LarBodyStoreMode::DualWriteValidated
+}
+
+/// Start the resumable legacy-body conversion only after the daemon has
+/// answered its public health endpoint. Every pass is bounded and blocking IO
+/// stays off Tokio's executor; legacy sources are retained by the importer.
+fn spawn_startup_lar_migration_after_ready(
+    store: Arc<Store>,
+    health_url: String,
+    batch_size: usize,
+    resources: alex_store::LarLegacyResourceControls,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let readiness_client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "could not create LAR migration readiness client");
+                return;
+            }
+        };
+        let mut ready = false;
+        for _ in 0..60 {
+            if readiness_client
+                .get(&health_url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        if !ready {
+            tracing::warn!(%health_url, "LAR startup migration did not begin because daemon readiness was not observed");
+            return;
+        }
+
+        loop {
+            let worker_store = store.clone();
+            let resources = resources.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                worker_store.run_lar_legacy_import(&LarLegacyImportOptions {
+                    limit: Some(batch_size),
+                    batch_size,
+                    resources,
+                    lease_owner: format!("alex-startup-lar-{}", std::process::id()),
+                    ..LarLegacyImportOptions::default()
+                })
+            })
+            .await;
+            let report = match result {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "LAR startup migration pass failed");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "LAR startup migration worker stopped unexpectedly");
+                    return;
+                }
+            };
+            tracing::info!(
+                job = %report.job_id,
+                state = %report.job_state,
+                migrated = report.migrated,
+                skipped = report.skipped,
+                failed = report.failed,
+                bytes_read = report.bytes_read,
+                progress_percent = report.progress_percent,
+                throughput_bytes_per_second = report.throughput_bytes_per_second,
+                eta_seconds = report.eta_seconds,
+                dedup_ratio = report.dedup_ratio,
+                throttled_ms = report.throttled_ms,
+                paused_reason = report.paused_reason.as_deref().unwrap_or(""),
+                last_error = report.last_error.as_deref().unwrap_or(""),
+                "LAR startup migration pass finished"
+            );
+            // A completed body migration can still have a bounded
+            // conversation-catalog backfill page outstanding after upgrading
+            // from a version that did not populate normalized generations.
+            if report.job_state == "complete" && report.limit_reached {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            if !report.claimed
+                || report.job_state == "complete"
+                || report.job_state == "paused"
+                || report.paused_reason.is_some()
+                || report.failed > 0
+                || !report.limit_reached
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -3387,7 +3528,33 @@ async fn main() -> Result<()> {
             }
             let host = host_val;
             let port = port_val;
-            let store = Arc::new(Store::open(config.data_dir.clone())?);
+            let lar_body_store = lar_body_store_config(
+                &config,
+                std::env::var("ALEXANDRIA_LAR_BODY_STORE").ok().as_deref(),
+            )?;
+            tracing::info!(
+                mode = %lar_body_store.mode,
+                "configured trace body storage mode"
+            );
+            if lar_body_store.mode != alex_store::LarBodyStoreMode::Legacy {
+                eprintln!(
+                    "body storage: {} (experimental; gzip rollback copies retained)",
+                    lar_body_store.mode
+                );
+            }
+            let store = Arc::new(Store::open_with_lar_body_store(
+                config.data_dir.clone(),
+                lar_body_store,
+            )?);
+            match store.ingest_pending_dario_captures() {
+                Ok(count) if count > 0 => {
+                    tracing::info!(count, "recovered pending Dario captures through body store")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("failed to recover pending Dario capture spool: {error:#}")
+                }
+            }
             let vault = Arc::new(open_vault(&config)?);
             if vault.list().await.is_empty() {
                 eprintln!("warning: no accounts in vault — run `alexandria auth import` first");
@@ -3439,7 +3606,7 @@ async fn main() -> Result<()> {
             let settings = dario::DarioSettings {
                 install_root: config.data_dir.join("dario"),
                 log_root: config.data_dir.join("dario").join("logs"),
-                capture_root: config.data_dir.join("bodies"),
+                capture_root: config.data_dir.join("dario-capture-spool"),
                 prompt_cache_root: config.data_dir.join("dario-prompt-cache"),
                 api_key: config.dario_api_key.clone(),
                 update_check_minutes: config.dario_update_check_minutes,
@@ -3733,7 +3900,9 @@ async fn main() -> Result<()> {
             )
             .await?;
             if let Some(reason) = fallback_reason {
-                eprintln!("\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}");
+                eprintln!(
+                    "\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}"
+                );
                 eprintln!("WARNING: Falling back to loopback (127.0.0.1) so the daemon remains available locally.");
                 eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
             }
@@ -3756,6 +3925,22 @@ async fn main() -> Result<()> {
                     "local clients and harnesses remain available at http://127.0.0.1:{port}"
                 );
             }
+            let readiness_port = listener
+                .local_addr()
+                .context("reading bound daemon address for LAR migration readiness")?
+                .port();
+            let lar_migration_task =
+                should_run_startup_lar_migration(state.store.lar_body_store_mode()).then(|| {
+                    spawn_startup_lar_migration_after_ready(
+                        state.store.clone(),
+                        format!(
+                            "{}/health",
+                            daemon_connect_base_url(&bound_host, readiness_port)
+                        ),
+                        config.lar_migration_batch_size,
+                        config.lar_migration_resources.clone(),
+                    )
+                });
             let (telegram_command_supervisor, telegram_command_count) =
                 telegram::spawn_command_poller_supervisor(
                     daemon_config.clone(),
@@ -3810,6 +3995,9 @@ async fn main() -> Result<()> {
                 primary.await
             };
             shutdown_task.abort();
+            if let Some(task) = lar_migration_task {
+                task.abort();
+            }
             for task in telegram_command_tasks {
                 task.abort();
             }
@@ -4252,6 +4440,9 @@ async fn main() -> Result<()> {
                 traces_push_cmd(&config, &run_id, &remote_trace).await?;
             }
         },
+        Command::Lar { command } => {
+            lar_cli::run(&config.data_dir, command)?;
+        }
         Command::Env => {
             print_env(&config.host, config.port, &config.local_key);
         }
@@ -5173,9 +5364,7 @@ fn ensure_wrap_launcher_connected(harness: &str, config_dir: &Path) -> Result<()
         _ => unreachable!("wrap launchers are only defined for Claude and Codex"),
     };
     if !connected {
-        anyhow::bail!(
-            "{harness} is not connected to Alex; run `alex connect {harness}` first"
-        );
+        anyhow::bail!("{harness} is not connected to Alex; run `alex connect {harness}` first");
     }
     Ok(())
 }
@@ -6493,6 +6682,7 @@ fn extract_user_query(s: &str) -> String {
     s.trim().to_string()
 }
 
+#[cfg(test)]
 fn agent_trace_bodies(
     transcript_id: &str,
     turn_index: usize,
@@ -7533,13 +7723,26 @@ async fn traces_reattach_cmd(
 }
 
 const TRACE_BACKUP_FORMAT: &str = "alex-trace-backup";
-const TRACE_BACKUP_VERSION: u32 = 1;
+const TRACE_BACKUP_LEGACY_VERSION: u32 = 1;
+const TRACE_BACKUP_VERSION: u32 = 2;
+const TRACE_BACKUP_LAR_PATH: &str = "capture.lar";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TraceBackupManifest {
     format: String,
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lar: Option<TraceBackupLarManifest>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceBackupLarManifest {
+    path: String,
+    bytes: u64,
+    blake3: String,
+    tool_artifacts: Vec<alex_store::LarBackupArtifactRef>,
 }
 
 fn trace_backup_temp_path(parent: &Path, label: &str) -> PathBuf {
@@ -7604,7 +7807,10 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
             destination.display()
         );
     }
-    let parent = destination.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     let store = Store::open(config.data_dir.clone())?;
@@ -7620,15 +7826,10 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         write_trace_jsonl(&traces_jsonl, &rows.traces)?;
         write_trace_jsonl(&tool_calls_jsonl, &rows.tool_calls)?;
         write_trace_jsonl(&heartbeats_jsonl, &rows.heartbeats)?;
-
-        let mut body_files = Vec::new();
-        collect_trace_body_files(
-            &config.data_dir.join("bodies"),
-            &config.data_dir.join("bodies"),
-            &[destination, &temporary_archive],
-            &mut body_files,
-        )?;
-        body_files.sort_by(|left, right| left.1.cmp(&right.1));
+        let (lar_bytes, tool_artifacts) = lar_cli::build_trace_backup_lar(&store, &rows)?;
+        let lar_path = staging.join(TRACE_BACKUP_LAR_PATH);
+        std::fs::write(&lar_path, &lar_bytes)?;
+        let lar_blake3 = blake3::hash(&lar_bytes).to_hex().to_string();
 
         let file = std::fs::File::create(&temporary_archive).with_context(|| {
             format!("creating temporary archive {}", temporary_archive.display())
@@ -7638,6 +7839,12 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         let manifest = serde_json::to_vec(&TraceBackupManifest {
             format: TRACE_BACKUP_FORMAT.into(),
             version: TRACE_BACKUP_VERSION,
+            lar: Some(TraceBackupLarManifest {
+                path: TRACE_BACKUP_LAR_PATH.into(),
+                bytes: lar_bytes.len() as u64,
+                blake3: lar_blake3,
+                tool_artifacts,
+            }),
         })?;
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o644);
@@ -7647,14 +7854,12 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         archive.append_path_with_name(&traces_jsonl, "traces.jsonl")?;
         archive.append_path_with_name(&tool_calls_jsonl, "tool_calls.jsonl")?;
         archive.append_path_with_name(&heartbeats_jsonl, "heartbeats.jsonl")?;
-        for (source, archive_path) in &body_files {
-            archive.append_path_with_name(source, archive_path)?;
-        }
+        archive.append_path_with_name(&lar_path, TRACE_BACKUP_LAR_PATH)?;
         archive.finish()?;
         let encoder = archive.into_inner()?;
         let file = encoder.finish()?;
         file.sync_all()?;
-        Ok((body_files.len(), std::fs::metadata(&temporary_archive)?.len()))
+        Ok((1, std::fs::metadata(&temporary_archive)?.len()))
     })();
 
     let _ = std::fs::remove_dir_all(&staging);
@@ -7665,11 +7870,10 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
             return Err(error);
         }
     };
-    std::fs::rename(&temporary_archive, destination).with_context(|| {
-        format!("moving completed archive to {}", destination.display())
-    })?;
+    std::fs::rename(&temporary_archive, destination)
+        .with_context(|| format!("moving completed archive to {}", destination.display()))?;
     println!(
-        "exported {} traces, {} tool calls, {} heartbeats, {} body files to {} ({})",
+        "exported {} traces, {} tool calls, {} heartbeats, {} standalone LAR to {} ({})",
         rows.traces.len(),
         rows.tool_calls.len(),
         rows.heartbeats.len(),
@@ -7682,7 +7886,9 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
 
 fn safe_trace_archive_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
-        && path.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn read_trace_jsonl(path: &Path, label: &str) -> Result<Vec<serde_json::Value>> {
@@ -7704,6 +7910,75 @@ fn read_trace_jsonl(path: &Path, label: &str) -> Result<Vec<serde_json::Value>> 
         .collect()
 }
 
+fn trace_backup_file_blake3(path: &Path) -> Result<(u64, String)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("trace backup LAR size overflow")?;
+    }
+    Ok((bytes, hasher.finalize().to_hex().to_string()))
+}
+
+fn publish_trace_backup_lar(data_dir: &Path, staged: &Path, digest: &str) -> Result<PathBuf> {
+    use std::io::Write;
+
+    let directory = data_dir.join("lar").join("restored-backups");
+    std::fs::create_dir_all(&directory)?;
+    let destination = directory.join(format!("{digest}.lar"));
+    if destination.exists() {
+        let (_, existing_digest) = trace_backup_file_blake3(&destination)?;
+        if existing_digest != digest {
+            bail!(
+                "restored backup LAR path contains different bytes: {}",
+                destination.display()
+            );
+        }
+        return Ok(destination);
+    }
+    let temporary = trace_backup_temp_path(&directory, "publish-lar.tmp");
+    let result = (|| -> Result<()> {
+        let mut input = std::fs::File::open(staged)?;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        std::fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(destination)
+}
+
+fn clear_restored_legacy_body_paths(rows: &mut alex_store::TraceBackupRows) {
+    for row in &mut rows.traces {
+        for column in ["req_body_path", "upstream_req_body_path", "resp_body_path"] {
+            row[column] = serde_json::Value::Null;
+        }
+    }
+    for row in &mut rows.tool_calls {
+        for column in ["args_body_path", "result_body_path"] {
+            row[column] = serde_json::Value::Null;
+        }
+    }
+}
+
 fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::collections::HashSet;
@@ -7723,13 +7998,22 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             if !safe_trace_archive_path(&path) || !seen.insert(path.clone()) {
                 bail!("invalid or duplicate archive path {}", path.display());
             }
-            let root = path.components().next().and_then(|component| match component {
-                std::path::Component::Normal(value) => value.to_str(),
-                _ => None,
-            });
+            let root = path
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    std::path::Component::Normal(value) => value.to_str(),
+                    _ => None,
+                });
             let known_root_file = matches!(
                 path.to_str(),
-                Some("manifest.json" | "traces.jsonl" | "tool_calls.jsonl" | "heartbeats.jsonl")
+                Some(
+                    "manifest.json"
+                        | "traces.jsonl"
+                        | "tool_calls.jsonl"
+                        | "heartbeats.jsonl"
+                        | TRACE_BACKUP_LAR_PATH
+                )
             );
             let is_body = root == Some("bodies") && path.components().count() > 1;
             let entry_type = entry.header().entry_type();
@@ -7751,27 +8035,72 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             std::io::copy(&mut entry, &mut output)?;
         }
 
-        for required in ["manifest.json", "traces.jsonl", "tool_calls.jsonl", "heartbeats.jsonl"] {
+        for required in [
+            "manifest.json",
+            "traces.jsonl",
+            "tool_calls.jsonl",
+            "heartbeats.jsonl",
+        ] {
             if !seen.contains(Path::new(required)) {
                 bail!("trace backup is missing {required}");
             }
         }
-        let manifest: TraceBackupManifest = serde_json::from_reader(std::fs::File::open(
-            staging.join("manifest.json"),
-        )?)
-        .context("invalid trace backup manifest")?;
-        if manifest.format != TRACE_BACKUP_FORMAT || manifest.version != TRACE_BACKUP_VERSION {
+        let manifest: TraceBackupManifest =
+            serde_json::from_reader(std::fs::File::open(staging.join("manifest.json"))?)
+                .context("invalid trace backup manifest")?;
+        if manifest.format != TRACE_BACKUP_FORMAT
+            || !matches!(
+                manifest.version,
+                TRACE_BACKUP_LEGACY_VERSION | TRACE_BACKUP_VERSION
+            )
+        {
             bail!(
                 "unsupported trace backup format/version: {}/{}",
                 manifest.format,
                 manifest.version
             );
         }
-        let rows = alex_store::TraceBackupRows {
+        let mut rows = alex_store::TraceBackupRows {
             traces: read_trace_jsonl(&staging.join("traces.jsonl"), "traces.jsonl")?,
             tool_calls: read_trace_jsonl(&staging.join("tool_calls.jsonl"), "tool_calls.jsonl")?,
             heartbeats: read_trace_jsonl(&staging.join("heartbeats.jsonl"), "heartbeats.jsonl")?,
         };
+        if manifest.version == TRACE_BACKUP_VERSION {
+            let lar = manifest
+                .lar
+                .context("trace backup v2 manifest is missing its LAR descriptor")?;
+            if lar.path != TRACE_BACKUP_LAR_PATH {
+                bail!("trace backup v2 has an unsupported LAR path: {}", lar.path);
+            }
+            let staged_lar = staging.join(TRACE_BACKUP_LAR_PATH);
+            if !seen.contains(Path::new(TRACE_BACKUP_LAR_PATH)) {
+                bail!("trace backup is missing {TRACE_BACKUP_LAR_PATH}");
+            }
+            let (actual_bytes, actual_blake3) = trace_backup_file_blake3(&staged_lar)?;
+            if actual_bytes != lar.bytes || actual_blake3 != lar.blake3 {
+                bail!("trace backup LAR size or BLAKE3 digest does not match its manifest");
+            }
+            let published =
+                publish_trace_backup_lar(&config.data_dir, &staged_lar, &actual_blake3)?;
+            store.import_sealed_lar_archive(
+                &published,
+                &alex_store::LarStandaloneImportOptions {
+                    insert_trace_rows: false,
+                    ..Default::default()
+                },
+            )?;
+            clear_restored_legacy_body_paths(&mut rows);
+            let counts = store.import_trace_backup_rows(&rows)?;
+            store.attach_validated_backup_artifacts(
+                &lar.tool_artifacts,
+                &format!("trace-backup:{actual_blake3}"),
+            )?;
+            return Ok((counts, lar.tool_artifacts.len() as u64, 0));
+        }
+
+        if manifest.lar.is_some() {
+            bail!("legacy trace backup unexpectedly contains a LAR descriptor");
+        }
         let counts = store.import_trace_backup_rows(&rows)?;
 
         let mut bodies_imported = 0u64;
@@ -7788,9 +8117,8 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(&staged, &destination).with_context(|| {
-                format!("restoring body file {}", destination.display())
-            })?;
+            std::fs::copy(&staged, &destination)
+                .with_context(|| format!("restoring body file {}", destination.display()))?;
             bodies_imported += 1;
         }
         Ok((counts, bodies_imported, bodies_skipped))
@@ -7798,7 +8126,7 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(&staging);
     let (counts, bodies_imported, bodies_skipped) = result?;
     println!(
-        "imported {} traces, {} tool calls, {} heartbeats, {} body files; skipped {} traces, {} tool calls, {} heartbeats, {} body files",
+        "imported {} traces, {} tool calls, {} heartbeats, {} body archive/file(s); skipped {} traces, {} tool calls, {} heartbeats, {} body archive/file(s)",
         counts.traces_imported,
         counts.tool_calls_imported,
         counts.heartbeats_imported,
@@ -10149,6 +10477,136 @@ mod tests {
         dir
     }
 
+    fn extract_backup_lar(archive_path: &Path, output: &Path) -> TraceBackupLarManifest {
+        use std::io::Read;
+
+        let file = std::fs::File::open(archive_path).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        let mut manifest = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            if path == Path::new("manifest.json") {
+                manifest =
+                    Some(serde_json::from_reader::<_, TraceBackupManifest>(&mut entry).unwrap());
+            } else if path == Path::new(TRACE_BACKUP_LAR_PATH) {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                std::fs::write(output, bytes).unwrap();
+            }
+        }
+        manifest.unwrap().lar.unwrap()
+    }
+
+    fn write_corrupt_backup_lar(source: &Path, destination: &Path) {
+        use std::io::Read;
+
+        let input = std::fs::File::open(source).unwrap();
+        let mut input = tar::Archive::new(flate2::read::GzDecoder::new(input));
+        let output = std::fs::File::create(destination).unwrap();
+        let encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+        let mut output = tar::Builder::new(encoder);
+        for entry in input.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if path == Path::new(TRACE_BACKUP_LAR_PATH) {
+                let index = bytes.len() / 2;
+                bytes[index] ^= 0x40;
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            output
+                .append_data(&mut header, &path, bytes.as_slice())
+                .unwrap();
+        }
+        output.finish().unwrap();
+        output
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    fn write_legacy_trace_backup(config: &Config, destination: &Path) {
+        let store = Store::open(config.data_dir.clone()).unwrap();
+        let rows = store.export_trace_backup_rows().unwrap();
+        let staging = tmpdir("legacy-trace-backup");
+        let traces = staging.join("traces.jsonl");
+        let tools = staging.join("tool_calls.jsonl");
+        let heartbeats = staging.join("heartbeats.jsonl");
+        write_trace_jsonl(&traces, &rows.traces).unwrap();
+        write_trace_jsonl(&tools, &rows.tool_calls).unwrap();
+        write_trace_jsonl(&heartbeats, &rows.heartbeats).unwrap();
+        let mut bodies = Vec::new();
+        collect_trace_body_files(
+            &config.data_dir.join("bodies"),
+            &config.data_dir.join("bodies"),
+            &[],
+            &mut bodies,
+        )
+        .unwrap();
+        let file = std::fs::File::create(destination).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let manifest = serde_json::to_vec(&TraceBackupManifest {
+            format: TRACE_BACKUP_FORMAT.into(),
+            version: TRACE_BACKUP_LEGACY_VERSION,
+            lar: None,
+        })
+        .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(manifest.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "manifest.json", manifest.as_slice())
+            .unwrap();
+        archive
+            .append_path_with_name(&traces, "traces.jsonl")
+            .unwrap();
+        archive
+            .append_path_with_name(&tools, "tool_calls.jsonl")
+            .unwrap();
+        archive
+            .append_path_with_name(&heartbeats, "heartbeats.jsonl")
+            .unwrap();
+        for (source, path) in bodies {
+            archive.append_path_with_name(source, path).unwrap();
+        }
+        archive.finish().unwrap();
+        archive
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        std::fs::remove_dir_all(staging).unwrap();
+    }
+
+    #[test]
+    fn lar_cli_is_nested_under_the_alex_command() {
+        let cli =
+            Cli::try_parse_from(["alex", "lar", "import-legacy", "--dry-run", "--limit", "12"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Lar {
+                command: lar_cli::LarCommand::ImportLegacy(lar_cli::ImportLegacyArgs {
+                    dry_run: true,
+                    limit: Some(12),
+                    ..
+                })
+            })
+        ));
+    }
+
     #[test]
     fn tool_capture_cli_parses_harness_state_and_json() {
         let cli = Cli::try_parse_from(["alex", "tool-capture", "codex", "on", "--json"]).unwrap();
@@ -11258,6 +11716,9 @@ mod tests {
             dario_probe_failures: 2,
             dario_probe_model: "claude-haiku-4-5".into(),
             trace_body_retention_days: default_trace_body_retention_days(),
+            lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_migration_batch_size: default_lar_migration_batch_size(),
+            lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
@@ -11274,7 +11735,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_backup_archive_round_trip_restores_rows_and_body_files() {
+    fn trace_backup_archive_v2_round_trip_restores_rows_and_lar_bodies() {
         let data_dir = tmpdir("trace-backup-archive-round-trip");
         let archive = data_dir.parent().unwrap().join(format!(
             "alex-trace-backup-round-trip-{}.tar.gz",
@@ -11283,10 +11744,11 @@ mod tests {
         let _ = std::fs::remove_file(&archive);
         let config = test_config(data_dir.clone());
         let store = Store::open(data_dir.clone()).unwrap();
-        for (id, ts, body) in [
+        let trace_bodies = [
             ("archive-trace-1", 1_000, b"request one".as_slice()),
             ("archive-trace-2", 2_000, b"request two".as_slice()),
-        ] {
+        ];
+        for (id, ts, body) in trace_bodies {
             let mut trace = alex_core::TraceRecord {
                 id: id.into(),
                 ts_request_ms: ts,
@@ -11327,25 +11789,41 @@ mod tests {
 
         traces_backup_import_cmd(&config, &archive).unwrap();
         let counts = store.reset_counts().unwrap();
-        assert_eq!((counts.traces, counts.heartbeats, counts.body_files), (2, 1, 3));
-        assert_eq!(store.session_tool_calls("archive-session").unwrap().len(), 1);
-        for id in ["archive-trace-1", "archive-trace-2"] {
-            let path = store.get_trace(id).unwrap().unwrap()["req_body_path"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            assert!(Path::new(&path).exists(), "restored body missing: {path}");
-            assert!(Path::new(&path).starts_with(data_dir.join("bodies")));
+        assert_eq!(
+            (counts.traces, counts.heartbeats, counts.body_files),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            store.session_tool_calls("archive-session").unwrap().len(),
+            1
+        );
+        for (id, _, expected) in trace_bodies {
+            assert!(store.get_trace(id).unwrap().unwrap()["req_body_path"].is_null());
+            assert_eq!(
+                store
+                    .read_lar_or_legacy_artifact("trace", id, "client_request", None)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
         }
-        let tool_path = store.get_tool_call("archive-tool").unwrap().unwrap()["result_body_path"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(Path::new(&tool_path).exists());
+        assert!(
+            store.get_tool_call("archive-tool").unwrap().unwrap()["result_body_path"].is_null()
+        );
+        assert_eq!(
+            store
+                .read_lar_or_legacy_artifact("tool_call", "archive-tool", "tool_result", None,)
+                .unwrap()
+                .as_deref(),
+            Some(b"tool result".as_slice())
+        );
 
         traces_backup_import_cmd(&config, &archive).unwrap();
         let repeated = store.reset_counts().unwrap();
-        assert_eq!((repeated.traces, repeated.heartbeats, repeated.body_files), (2, 1, 3));
+        assert_eq!(
+            (repeated.traces, repeated.heartbeats, repeated.body_files),
+            (2, 1, 0)
+        );
         let _ = std::fs::remove_file(&archive);
     }
 
@@ -11407,15 +11885,142 @@ mod tests {
     }
 
     #[test]
+    fn trace_backup_v2_resume_after_lar_publication_is_idempotent() {
+        let source_dir = tmpdir("trace-backup-resume-source");
+        let destination_dir = tmpdir("trace-backup-resume-destination");
+        let archive = source_dir.join("backup.tar.gz");
+        let source_config = test_config(source_dir.clone());
+        let source = Store::open(source_dir).unwrap();
+        let mut row = alex_core::TraceRecord {
+            id: "resume-trace".into(),
+            ts_request_ms: 1_000,
+            routed_model: Some("restored-model".into()),
+            ..Default::default()
+        };
+        row.req_body_path = Some(
+            source
+                .write_body("resume-trace", "request.json", b"resume body")
+                .unwrap(),
+        );
+        source.insert_trace(&row).unwrap();
+        traces_backup_export_cmd(&source_config, &archive, false).unwrap();
+
+        let staged_lar = destination_dir.join("staged.lar");
+        let descriptor = extract_backup_lar(&archive, &staged_lar);
+        let published =
+            publish_trace_backup_lar(&destination_dir, &staged_lar, descriptor.blake3.as_str())
+                .unwrap();
+        let destination = Store::open(destination_dir.clone()).unwrap();
+        destination
+            .import_sealed_lar_archive(
+                &published,
+                &alex_store::LarStandaloneImportOptions {
+                    insert_trace_rows: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(destination.reset_counts().unwrap().traces, 0);
+        drop(destination);
+
+        let destination_config = test_config(destination_dir.clone());
+        traces_backup_import_cmd(&destination_config, &archive).unwrap();
+        traces_backup_import_cmd(&destination_config, &archive).unwrap();
+        let destination = Store::open(destination_dir).unwrap();
+        assert_eq!(destination.reset_counts().unwrap().traces, 1);
+        assert_eq!(
+            destination.get_trace("resume-trace").unwrap().unwrap()["routed_model"],
+            "restored-model"
+        );
+        assert_eq!(
+            destination
+                .read_lar_or_legacy_artifact("trace", "resume-trace", "client_request", None,)
+                .unwrap()
+                .as_deref(),
+            Some(b"resume body".as_slice())
+        );
+    }
+
+    #[test]
+    fn trace_backup_v2_rejects_corrupt_lar_before_restoring_rows() {
+        let source_dir = tmpdir("trace-backup-corrupt-source");
+        let destination_dir = tmpdir("trace-backup-corrupt-destination");
+        let archive = source_dir.join("backup.tar.gz");
+        let corrupt = source_dir.join("corrupt.tar.gz");
+        let source_config = test_config(source_dir.clone());
+        let source = Store::open(source_dir).unwrap();
+        source
+            .insert_trace(&alex_core::TraceRecord {
+                id: "must-not-restore".into(),
+                ts_request_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        traces_backup_export_cmd(&source_config, &archive, false).unwrap();
+        write_corrupt_backup_lar(&archive, &corrupt);
+
+        let destination_config = test_config(destination_dir.clone());
+        let error = traces_backup_import_cmd(&destination_config, &corrupt).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("digest"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            Store::open(destination_dir)
+                .unwrap()
+                .reset_counts()
+                .unwrap()
+                .traces,
+            0
+        );
+    }
+
+    #[test]
+    fn trace_backup_import_remains_compatible_with_v1_body_archives() {
+        let source_dir = tmpdir("trace-backup-v1-source");
+        let destination_dir = tmpdir("trace-backup-v1-destination");
+        let archive = source_dir.join("legacy.tar.gz");
+        let source_config = test_config(source_dir.clone());
+        let source = Store::open(source_dir).unwrap();
+        let mut row = alex_core::TraceRecord {
+            id: "legacy-backup-trace".into(),
+            ts_request_ms: 1_000,
+            ..Default::default()
+        };
+        row.req_body_path = Some(
+            source
+                .write_body("legacy-backup-trace", "request.json", b"legacy backup body")
+                .unwrap(),
+        );
+        source.insert_trace(&row).unwrap();
+        write_legacy_trace_backup(&source_config, &archive);
+
+        let destination_config = test_config(destination_dir.clone());
+        traces_backup_import_cmd(&destination_config, &archive).unwrap();
+        let destination = Store::open(destination_dir).unwrap();
+        let restored = destination
+            .get_trace("legacy-backup-trace")
+            .unwrap()
+            .unwrap();
+        assert!(Path::new(restored["req_body_path"].as_str().unwrap()).is_file());
+        assert_eq!(
+            destination
+                .read_lar_or_legacy_artifact(
+                    "trace",
+                    "legacy-backup-trace",
+                    "client_request",
+                    None,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(b"legacy backup body".as_slice())
+        );
+    }
+
+    #[test]
     fn trace_backup_cli_surface_and_junk_archive_validation() {
-        let export = Cli::try_parse_from([
-            "alex",
-            "traces",
-            "export",
-            "backup.tar.gz",
-            "--force",
-        ])
-        .unwrap();
+        let export =
+            Cli::try_parse_from(["alex", "traces", "export", "backup.tar.gz", "--force"]).unwrap();
         match export.command {
             Some(Command::Traces {
                 command: Some(TracesCommand::Export { path, force }),
@@ -11444,7 +12049,14 @@ mod tests {
             error_chain.contains("archive") || error_chain.contains("gzip"),
             "unexpected error: {error:#}"
         );
-        assert_eq!(Store::open(data_dir).unwrap().reset_counts().unwrap().traces, 0);
+        assert_eq!(
+            Store::open(data_dir)
+                .unwrap()
+                .reset_counts()
+                .unwrap()
+                .traces,
+            0
+        );
     }
 
     #[cfg(unix)]
@@ -11776,6 +12388,52 @@ mod tests {
         assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
+    #[tokio::test]
+    async fn startup_lar_migration_waits_for_health_and_keeps_legacy_source() {
+        let data_dir = tmpdir("startup-lar-ready");
+        let store = Arc::new(Store::open(data_dir.clone()).unwrap());
+        let legacy_path = store
+            .write_body("trace-startup", "request.json", b"startup body")
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: "trace-startup".into(),
+                ts_request_ms: 1,
+                req_body_path: Some(legacy_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_url = format!("http://{}/health", listener.local_addr().unwrap());
+        let worker = spawn_startup_lar_migration_after_ready(
+            store.clone(),
+            health_url,
+            default_lar_migration_batch_size(),
+            alex_store::LarLegacyResourceControls::default(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!data_dir.join("lar").exists());
+
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("startup migration should finish")
+            .unwrap();
+
+        let verification = store.verify_lar_migration().unwrap();
+        assert!(verification.valid, "{:?}", verification.issues);
+        assert_eq!(verification.artifacts_checked, 1);
+        assert!(std::path::Path::new(&legacy_path).exists());
+        server.abort();
+    }
+
     #[test]
     fn graceful_failure_always_runs_the_hard_restart_fallback() {
         let called = std::cell::Cell::new(false);
@@ -11874,6 +12532,9 @@ mod tests {
             dario_probe_failures: 2,
             dario_probe_model: "claude-haiku-4-5".into(),
             trace_body_retention_days: default_trace_body_retention_days(),
+            lar_body_store_mode: alex_store::LarBodyStoreMode::Legacy,
+            lar_migration_batch_size: default_lar_migration_batch_size(),
+            lar_migration_resources: alex_store::LarLegacyResourceControls::default(),
             trace_row_retention_days: 0,
             update_check_hours: default_update_check_hours(),
             update_channel: default_update_channel(),
@@ -11892,6 +12553,10 @@ mod tests {
         assert_eq!(reloaded.port, config.port);
         assert_eq!(reloaded.local_key, config.local_key);
         assert_eq!(reloaded.data_dir, config.data_dir);
+        assert_eq!(
+            reloaded.lar_body_store_mode,
+            alex_store::LarBodyStoreMode::Legacy
+        );
         assert!(reloaded.data_dir.is_absolute());
     }
 
@@ -11940,6 +12605,83 @@ local_key = "alx-test"
         assert_eq!(config.protection.retries, 1);
         assert!(config.protection.auto_return);
         assert!(config.protection.equivalencies.is_empty());
+        assert_eq!(
+            config.lar_body_store_mode,
+            alex_store::LarBodyStoreMode::Legacy
+        );
+        assert_eq!(
+            config.lar_migration_batch_size,
+            default_lar_migration_batch_size()
+        );
+        assert_eq!(
+            config.lar_migration_resources,
+            alex_store::LarLegacyResourceControls::default()
+        );
+    }
+
+    #[test]
+    fn lar_migration_resource_config_deserializes_explicit_limits() {
+        let config: Config = toml::from_str(
+            r#"
+host = "127.0.0.1"
+port = 4100
+data_dir = "/tmp/alex-lar-resource-config-test"
+local_key = "alx-test"
+lar_migration_batch_size = 17
+
+[lar_migration_resources]
+worker_count = 3
+io_bytes_per_second = 1048576
+cpu_budget_percent = 40
+yield_every_artifacts = 5
+max_memory_bytes = 8388608
+min_free_disk_bytes = 1073741824
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.lar_migration_batch_size, 17);
+        assert_eq!(config.lar_migration_resources.worker_count, 3);
+        assert_eq!(
+            config.lar_migration_resources.io_bytes_per_second,
+            Some(1_048_576)
+        );
+        assert_eq!(config.lar_migration_resources.cpu_budget_percent, 40);
+        assert_eq!(config.lar_migration_resources.yield_every_artifacts, 5);
+        assert_eq!(config.lar_migration_resources.max_memory_bytes, 8_388_608);
+        assert_eq!(
+            config.lar_migration_resources.min_free_disk_bytes,
+            Some(1_073_741_824)
+        );
+    }
+
+    #[test]
+    fn lar_body_store_environment_override_is_explicit() {
+        let mut config = test_config(tmpdir("lar-body-mode"));
+        config.lar_body_store_mode = alex_store::LarBodyStoreMode::DualWriteValidated;
+        assert_eq!(
+            lar_body_store_config(&config, None).unwrap().mode,
+            alex_store::LarBodyStoreMode::DualWriteValidated
+        );
+        assert_eq!(
+            lar_body_store_config(&config, Some("lar-with-fallback"))
+                .unwrap()
+                .mode,
+            alex_store::LarBodyStoreMode::LarWithFallback
+        );
+        assert!(lar_body_store_config(&config, Some("lar")).is_err());
+    }
+
+    #[test]
+    fn shadow_mode_never_runs_pointer_publishing_startup_migration() {
+        assert!(should_run_startup_lar_migration(
+            alex_store::LarBodyStoreMode::Legacy
+        ));
+        assert!(!should_run_startup_lar_migration(
+            alex_store::LarBodyStoreMode::DualWriteValidated
+        ));
+        assert!(should_run_startup_lar_migration(
+            alex_store::LarBodyStoreMode::LarWithFallback
+        ));
     }
 
     #[tokio::test]
