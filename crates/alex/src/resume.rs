@@ -923,9 +923,11 @@ fn validate_codex_response_item(payload: &Value, line: usize) -> std::result::Re
                 && payload["name"].as_str().is_some()
                 && payload["arguments"].as_str().is_some() => {}
         Some("function_call_output")
-            if payload["call_id"].as_str().is_some() && payload["output"].as_str().is_some() => {}
+            if payload["call_id"].as_str().is_some()
+                && (payload["output"].is_string() || payload["output"].is_array()) => {}
         Some(
             "reasoning"
+            | "agent_message"
             | "custom_tool_call"
             | "custom_tool_call_output"
             | "web_search_call"
@@ -2393,6 +2395,30 @@ mod tests {
     use super::*;
     use alex_core::TraceRecord;
 
+    const CLAUDE_REAL_SHAPE_FIXTURE: &str = concat!(
+        r#"{"type":"system","subtype":"away_summary","content":"fixture summary","isMeta":false,"uuid":"00000000-0000-4000-8000-000000000000","parentUuid":null,"sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","version":"2.1.215","timestamp":"2026-07-20T01:02:03.000Z","cwd":"/fixture/project","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli"}"#,
+        "\n",
+        r#"{"type":"user","uuid":"10000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","version":"2.1.215","timestamp":"2026-07-20T01:02:03.001Z","cwd":"/fixture/project","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","message":{"role":"user","content":"inspect it"}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"20000000-0000-4000-8000-000000000002","parentUuid":"10000000-0000-4000-8000-000000000001","sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","version":"2.1.215","timestamp":"2026-07-20T01:02:03.002Z","cwd":"/fixture/project","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","requestId":"req_fixture","message":{"id":"msg_fixture","type":"message","role":"assistant","model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_fixture","name":"Read","input":{"file_path":"src/main.rs"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"30000000-0000-4000-8000-000000000003","parentUuid":"20000000-0000-4000-8000-000000000002","sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","version":"2.1.215","timestamp":"2026-07-20T01:02:03.003Z","cwd":"/fixture/project","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","sourceToolAssistantUUID":"20000000-0000-4000-8000-000000000002","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fixture","content":"fn main() {}"}]},"toolUseResult":{"content":"fn main() {}","filePath":"src/main.rs","type":"text"}}"#,
+        "\n"
+    );
+
+    const CODEX_REAL_SHAPE_FIXTURE: &str = concat!(
+        r#"{"timestamp":"2026-07-20T01:02:03.000Z","type":"session_meta","payload":{"session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","timestamp":"2026-07-20T01:02:03.000Z","cwd":"/fixture/project","originator":"codex-tui","cli_version":"0.144.6","source":"cli","thread_source":"user","model_provider":"alexandria","history_mode":"legacy"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-20T01:02:03.001Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect it"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-20T01:02:03.002Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","id":"msg_fixture","content":[{"type":"output_text","text":"I'll inspect."}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-20T01:02:03.003Z","type":"response_item","payload":{"type":"function_call","id":"fc_fixture","name":"read","arguments":"{\"path\":\"src/main.rs\"}","call_id":"call_fixture"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-20T01:02:03.004Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_fixture","output":[{"type":"input_text","text":"fn main() {}"}]}}"#,
+        "\n"
+    );
+
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "alex-resume-{name}-{}-{}",
@@ -2404,6 +2430,49 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn native_writer_context() -> ResumeContext {
+        ResumeContext {
+            prompt: "fixture".into(),
+            entries: vec![
+                ResumeEntry {
+                    role: "user",
+                    content: vec![json!({"type":"text", "text":"inspect it"})],
+                },
+                ResumeEntry {
+                    role: "assistant",
+                    content: vec![
+                        json!({"type":"text", "text":"I'll inspect."}),
+                        json!({
+                            "type":"tool_call",
+                            "id":"source-call-1",
+                            "name":"read",
+                            "arguments":{"path":"src/main.rs"}
+                        }),
+                    ],
+                },
+                ResumeEntry {
+                    role: "tool",
+                    content: vec![json!({
+                        "type":"tool_result",
+                        "tool_call_id":"source-call-1",
+                        "name":"read",
+                        "content":"fn main() {}",
+                        "is_error":false
+                    })],
+                },
+                ResumeEntry {
+                    role: "assistant",
+                    content: vec![json!({"type":"text", "text":"It is a small program."})],
+                },
+            ],
+            truncated: false,
+            omitted_entries: 0,
+            included_entries: 4,
+            original_chars: 7,
+            prompt_chars: 7,
+        }
     }
 
     #[test]
@@ -2445,46 +2514,7 @@ mod tests {
 
     #[test]
     fn pi_writer_emits_v3_native_history_with_fresh_linked_tool_ids() {
-        let context = ResumeContext {
-            prompt: "fixture".into(),
-            entries: vec![
-                ResumeEntry {
-                    role: "user",
-                    content: vec![json!({"type":"text", "text":"inspect it"})],
-                },
-                ResumeEntry {
-                    role: "assistant",
-                    content: vec![
-                        json!({"type":"text", "text":"I'll inspect."}),
-                        json!({
-                            "type":"tool_call",
-                            "id":"source-call-1",
-                            "name":"read",
-                            "arguments":{"path":"src/main.rs"}
-                        }),
-                    ],
-                },
-                ResumeEntry {
-                    role: "tool",
-                    content: vec![json!({
-                        "type":"tool_result",
-                        "tool_call_id":"source-call-1",
-                        "name":"read",
-                        "content":"fn main() {}",
-                        "is_error":false
-                    })],
-                },
-                ResumeEntry {
-                    role: "assistant",
-                    content: vec![json!({"type":"text", "text":"It is a small program."})],
-                },
-            ],
-            truncated: false,
-            omitted_entries: 0,
-            included_entries: 4,
-            original_chars: 7,
-            prompt_chars: 7,
-        };
+        let context = native_writer_context();
         let session_id = "11111111-2222-3333-4444-555555556666";
         let timestamp = "2026-07-20T01:02:03.004Z";
         let rendered = render_pi_session(
@@ -2540,6 +2570,109 @@ mod tests {
         );
         assert!(!rendered.contains("source-call-1"));
         validate_pi_session_jsonl(&rendered).unwrap();
+    }
+
+    #[test]
+    fn claude_real_shape_fixture_and_golden_writer_preserve_linked_tool_turn() {
+        assert_eq!(
+            validate_claude_session_jsonl(CLAUDE_REAL_SHAPE_FIXTURE).unwrap(),
+            ClaudeSessionFormat {
+                version: "2.1.215".into()
+            }
+        );
+
+        let session_id = "11111111-2222-4333-8444-555555556666";
+        let timestamp = "2026-07-20T01:02:03.004Z";
+        let rendered = render_claude_session(
+            &native_writer_context(),
+            Path::new("/fixture/project"),
+            "alex/claude-fable-5",
+            session_id,
+            "2.1.215",
+            timestamp,
+        )
+        .unwrap();
+        let lines = rendered
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["type"], "user");
+        assert!(lines[0]["parentUuid"].is_null());
+        assert_eq!(lines[0]["sessionId"], session_id);
+        assert_eq!(lines[0]["version"], "2.1.215");
+        assert_eq!(lines[1]["type"], "assistant");
+        assert_eq!(lines[1]["parentUuid"], lines[0]["uuid"]);
+        assert_eq!(
+            lines[1]["message"]["content"][1],
+            json!({
+                "type":"tool_use",
+                "id":format!("toolu_alex_{}_0001", session_id.replace('-', "")),
+                "name":"read",
+                "input":{"path":"src/main.rs"}
+            })
+        );
+        assert_eq!(lines[2]["type"], "user");
+        assert_eq!(lines[2]["parentUuid"], lines[1]["uuid"]);
+        assert_eq!(lines[2]["sourceToolAssistantUUID"], lines[1]["uuid"]);
+        assert_eq!(
+            lines[2]["message"]["content"][0]["tool_use_id"],
+            lines[1]["message"]["content"][1]["id"]
+        );
+        assert_eq!(lines[2]["toolUseResult"], "fn main() {}");
+        assert_eq!(lines[3]["parentUuid"], lines[2]["uuid"]);
+        assert!(!rendered.contains("source-call-1"));
+        validate_claude_session_jsonl(&rendered).unwrap();
+    }
+
+    #[test]
+    fn codex_real_shape_fixture_and_golden_writer_preserve_linked_tool_turn() {
+        assert_eq!(
+            validate_codex_session_jsonl(CODEX_REAL_SHAPE_FIXTURE).unwrap(),
+            CodexSessionFormat {
+                cli_version: "0.144.6".into(),
+                history_mode: "legacy".into(),
+            }
+        );
+
+        let session_id = "11111111-2222-4333-8444-555555556666";
+        let timestamp = "2026-07-20T01:02:03.004Z";
+        let rendered = render_codex_session(
+            &native_writer_context(),
+            Path::new("/fixture/project"),
+            session_id,
+            &CodexSessionFormat {
+                cli_version: "0.144.6".into(),
+                history_mode: "legacy".into(),
+            },
+            timestamp,
+        )
+        .unwrap();
+        let lines = rendered
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0]["type"], "session_meta");
+        assert_eq!(lines[0]["payload"]["id"], session_id);
+        assert_eq!(lines[0]["payload"]["cli_version"], "0.144.6");
+        assert_eq!(lines[1]["payload"]["role"], "user");
+        assert_eq!(lines[2]["payload"]["role"], "assistant");
+        assert_eq!(lines[3]["payload"]["type"], "function_call");
+        assert_eq!(
+            lines[3]["payload"]["arguments"],
+            r#"{"path":"src/main.rs"}"#
+        );
+        assert_eq!(lines[4]["payload"]["type"], "function_call_output");
+        assert_eq!(
+            lines[4]["payload"]["call_id"],
+            lines[3]["payload"]["call_id"]
+        );
+        assert_eq!(lines[5]["payload"]["role"], "assistant");
+        assert!(!rendered.contains("source-call-1"));
+        validate_codex_session_jsonl(&rendered).unwrap();
     }
 
     #[test]
@@ -2599,12 +2732,76 @@ mod tests {
     }
 
     #[test]
+    fn claude_version_sniff_rejects_unknown_recent_shape_without_reading_home() {
+        let root = tmpdir("claude-version-sniff");
+        let projects = root.join("projects").join("-fixture-project");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("recent.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"version\":\"99.0.0\",",
+                "\"sessionId\":\"future\",\"timestamp\":\"2026-07-20T00:00:00.000Z\",",
+                "\"cwd\":\"/fixture\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let reason = sniff_claude_session_format(&root.join("projects")).unwrap_err();
+        assert!(reason.contains("format was not recognized"));
+        assert!(reason.contains("invalid Claude user envelope"));
+    }
+
+    #[test]
+    fn codex_version_sniff_rejects_unknown_recent_shape_without_reading_home() {
+        let root = tmpdir("codex-version-sniff");
+        let sessions = root.join("sessions").join("2026/07/20");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("recent.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-07-20T00:00:00.000Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"session_id\":\"future\",\"id\":\"future\",",
+                "\"timestamp\":\"2026-07-20T00:00:00.000Z\",\"cwd\":\"/fixture\",",
+                "\"originator\":\"codex-tui\",\"cli_version\":\"99.0.0\",",
+                "\"source\":\"cli\",\"model_provider\":\"alexandria\",",
+                "\"history_mode\":\"signed-v99\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let reason = sniff_codex_session_format(&root.join("sessions")).unwrap_err();
+        assert!(reason.contains("format was not recognized"));
+        assert!(reason.contains("unsupported Codex history_mode"));
+    }
+
+    #[test]
     fn pi_cwd_slug_matches_native_pi_encoding() {
         assert_eq!(pi_cwd_slug(Path::new("/private/tmp")), "--private-tmp--");
         assert_eq!(
             pi_cwd_slug(Path::new("/Users/example/project")),
             "--Users-example-project--"
         );
+    }
+
+    #[test]
+    fn claude_cwd_slug_matches_native_claude_encoding() {
+        assert_eq!(claude_cwd_slug(Path::new("/private/tmp")), "-private-tmp");
+        assert_eq!(
+            claude_cwd_slug(Path::new("/Users/example/project")),
+            "-Users-example-project"
+        );
+    }
+
+    #[test]
+    fn native_materialization_never_overwrites_an_existing_session() {
+        let root = tmpdir("native-create-new");
+        let path = root.join("sessions/fresh.jsonl");
+        materialize_native_session(&path, "first\n", "fixture").unwrap();
+        let error = materialize_native_session(&path, "second\n", "fixture").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("without overwriting existing files"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\n");
     }
 
     #[test]
