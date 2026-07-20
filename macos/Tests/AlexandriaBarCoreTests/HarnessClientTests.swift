@@ -6,6 +6,35 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite(.serialized) struct HarnessClientTests {
+    @Test func harnessKeyMintUsesHarnessKindLabelAndNoExpiry() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/run-keys")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["kind"] as? String == "harness")
+            #expect(json["label"] as? String == "codex-remote")
+            #expect(json["ttl_seconds"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"id":"rk-remote","key":"alxk-fresh","kind":"harness","label":"codex-remote","tags":{},"expires_ms":null}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let minted = try await client.mintRunKey(
+            label: "codex-remote", model: nil, ttlSeconds: nil, kind: .harness)
+        #expect(minted.kind == "harness")
+        #expect(minted.key == "alxk-fresh")
+    }
+
     @Test func darioRepairPostsToRepairEndpoint() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/dario/repair")

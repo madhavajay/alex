@@ -79,15 +79,21 @@ private struct SavedNotificationTestBody: Encodable {
 }
 
 private struct MintRunKeyBody: Encodable {
-    let kind = "run"
+    let kind: String
     let label: String?
     let tags: [String: String]
-    let ttlSeconds: Int
+    let ttlSeconds: Int?
 
     enum CodingKeys: String, CodingKey {
         case kind, label, tags
         case ttlSeconds = "ttl_seconds"
     }
+}
+
+public enum RunKeyKind: String, Sendable {
+    case run
+    case harness
+    case wrap
 }
 
 private struct RunKeysRevokedResponse: Decodable {
@@ -253,10 +259,10 @@ public struct AlexandriaClient: Sendable {
         try await get("admin/credentials", as: CredentialsResponse.self)
     }
 
-    /// Creates a one-time model-only run key. The returned secret must be
+    /// Creates a one-time scoped key response. The returned secret must be
     /// handled ephemerally by the caller and is never available from `credentials()`.
     public func mintRunKey(
-        label: String?, model: String?, ttlSeconds: Int
+        label: String?, model: String?, ttlSeconds: Int?, kind: RunKeyKind = .run
     ) async throws -> MintedRunKey {
         let normalizedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
         var tags: [String: String] = [:]
@@ -266,6 +272,7 @@ public struct AlexandriaClient: Sendable {
         let data = try await request(
             "admin/run-keys", method: "POST",
             body: body(MintRunKeyBody(
+                kind: kind.rawValue,
                 label: normalizedLabel?.isEmpty == false ? normalizedLabel : nil,
                 tags: tags, ttlSeconds: ttlSeconds)))
         return try JSONDecoder().decode(MintedRunKey.self, from: data)

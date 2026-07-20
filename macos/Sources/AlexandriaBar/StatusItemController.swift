@@ -692,6 +692,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         action("Configure…", symbol: "gearshape") { [weak self] in
             self?.openPreferences(section: .harnesses)
         }
+        if let config = store.config {
+            let remoteItem = NSMenuItem()
+            let remoteView = NSHostingView(rootView: MenuRemoteOneLinerButton(
+                harness: harness.name, config: config))
+            remoteView.frame = NSRect(origin: .zero, size: remoteView.fittingSize)
+            remoteItem.view = remoteView
+            remoteItem.isEnabled = true
+            sub.addItem(remoteItem)
+        }
         if harness.connected {
             if harness.name == "amp" {
                 action("Launch Wrapped Amp", symbol: "terminal") {
