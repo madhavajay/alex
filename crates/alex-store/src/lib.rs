@@ -612,6 +612,11 @@ fn migrate_run_keys(conn: &Connection) -> Result<()> {
 pub struct TraceFilter {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
+    /// Stable descending cursor used by bounded browser/API pagination.
+    /// `before_id` is only meaningful together with `before_ms`; the pair
+    /// avoids skipping rows that share the same millisecond timestamp.
+    pub before_ms: Option<i64>,
+    pub before_id: Option<String>,
     pub run_id: Option<String>,
     pub session: Option<String>,
     pub model: Option<String>,
@@ -669,6 +674,8 @@ impl Default for TraceFilter {
         Self {
             since_ms: None,
             until_ms: None,
+            before_ms: None,
+            before_id: None,
             run_id: None,
             session: None,
             model: None,
@@ -1370,6 +1377,17 @@ impl Store {
             sql.push_str(" AND ts_request_ms <= ?");
             args.push(until.to_string());
         }
+        if let Some(before_ms) = f.before_ms {
+            if let Some(before_id) = &f.before_id {
+                sql.push_str(" AND (ts_request_ms < ? OR (ts_request_ms = ? AND id < ?))");
+                args.push(before_ms.to_string());
+                args.push(before_ms.to_string());
+                args.push(before_id.clone());
+            } else {
+                sql.push_str(" AND ts_request_ms < ?");
+                args.push(before_ms.to_string());
+            }
+        }
         if let Some(r) = &f.run_id {
             sql.push_str(" AND run_id = ?");
             args.push(r.clone());
@@ -1427,7 +1445,7 @@ impl Store {
             sql.push_str(" AND reasoning_effort = ?");
             args.push(e.clone());
         }
-        sql.push_str(" ORDER BY ts_request_ms DESC LIMIT ?");
+        sql.push_str(" ORDER BY ts_request_ms DESC, id DESC LIMIT ?");
         args.push(effective_limit(f.limit).to_string());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
@@ -2711,6 +2729,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(limited.len(), 1);
+
+        // Browser pagination uses the timestamp + id pair so rows written in
+        // the same millisecond are neither skipped nor repeated.
+        let mut d = trace("d", 3000, None);
+        d.status = Some(201);
+        store.insert_trace(&d).unwrap();
+        let first = store
+            .search_traces(&TraceFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(first[0]["id"], "d");
+        let second = store
+            .search_traces(&TraceFilter {
+                before_ms: Some(3000),
+                before_id: Some("d".into()),
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(second[0]["id"], "c");
+        let third = store
+            .search_traces(&TraceFilter {
+                before_ms: Some(3000),
+                before_id: Some("c".into()),
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(third[0]["id"], "b");
     }
 
     #[test]

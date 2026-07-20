@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Alex</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">ALEX LOCAL CONTROL PLANE</p>
+      <h1>Alex</h1>
+    </div>
+    <span id="daemon-status" class="chip pending">Connecting…</span>
+  </header>
+  <nav aria-label="Primary">
+    <button data-view="status" aria-current="page">Status</button>
+    <button data-view="onboarding">Onboarding</button>
+    <button data-view="traces">Traces</button>
+  </nav>
+  <main>
+    <section id="status-view" data-panel>
+      <h2>System status</h2>
+      <p class="lede">A small, local-first view of daemon and provider health.</p>
+      <div id="status-cards" class="cards" aria-live="polite"></div>
+      <aside class="notice"><strong>Platform note.</strong> Core status, provider setup, middleware APIs, and traces are shared. The menu-bar app, Launch at Login, and native notifications remain macOS-only.</aside>
+    </section>
+
+    <section id="onboarding-view" data-panel hidden>
+      <h2>Connect a provider</h2>
+      <p class="lede">Use an existing account or start a secure provider flow. Credentials stay in your local Alex vault.</p>
+      <div id="accounts" class="cards" aria-live="polite"></div>
+      <div id="providers" class="provider-grid"></div>
+      <div id="login-flow" class="flow" hidden aria-live="polite"></div>
+      <details>
+        <summary>API-key and local providers</summary>
+        <form id="openrouter-form" class="stack">
+          <label>OpenRouter name <input name="display_name" required autocomplete="off"></label>
+          <label>OpenRouter key <input name="key" type="password" required autocomplete="off"></label>
+          <button type="submit">Save OpenRouter key</button>
+        </form>
+        <form id="exo-form" class="stack">
+          <label>Exo endpoint <input name="url" type="url" value="http://127.0.0.1:52415" required></label>
+          <button type="submit">Probe and save Exo</button>
+        </form>
+      </details>
+    </section>
+
+    <section id="traces-view" data-panel hidden>
+      <div class="section-heading">
+        <div><h2>Trace summaries</h2><p class="lede">Bodies load only when you open an individual trace.</p></div>
+        <button id="refresh-traces">Refresh</button>
+      </div>
+      <div id="trace-list" class="trace-list" aria-live="polite"></div>
+      <button id="more-traces" hidden>Load older traces</button>
+      <article id="trace-detail" hidden></article>
+    </section>
+  </main>
+  <noscript><p class="noscript">Alex is running. This first shared web preview needs JavaScript for authenticated local status and trace requests. Use <code>alex status</code> and <code>alex traces</code> without JavaScript.</p></noscript>
+  <footer>Local UI preview · no product telemetry · <a href="https://github.com/madhavajay/alex">Documentation</a></footer>
+  <script src="/ui/app.js" defer></script>
+</body>
+</html>

@@ -279,6 +279,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start the local daemon if needed and open the shared web UI
+    Web {
+        /// Print the URL without launching a browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Mint, list, and revoke ephemeral run keys (requires a running daemon)
     Keys {
         #[command(subcommand)]
@@ -364,7 +370,7 @@ enum ServiceCommand {
         /// loopback (127.0.0.1), all (0.0.0.0), or a detected interface address
         target: String,
     },
-    /// Gracefully drain and restart the loaded launchd service
+    /// Restart the loaded launchd or systemd user service
     Restart {
         /// Use the legacy hard restart (routed requests may be interrupted)
         #[arg(long)]
@@ -4703,6 +4709,19 @@ async fn main() -> Result<()> {
             doctor::print_report(&report, json)?;
             if !report.healthy {
                 std::process::exit(1);
+            }
+        }
+        Command::Web { no_open } => {
+            let base = config.base_url();
+            if !daemon_healthy(&base).await {
+                daemon_background(&config.host, config.port, None, None).await?;
+            }
+            let url = web_ui_url(&config);
+            if no_open {
+                println!("{url}");
+            } else {
+                launch_browser(&url)?;
+                println!("opened Alex web UI at {url}");
             }
         }
         Command::Credentials { json, host } => {
@@ -9532,15 +9551,47 @@ fn service_set_bind(config: &Config, target: &str) -> Result<()> {
 }
 
 async fn service_restart(config: &Config, force: bool) -> Result<()> {
-    if !cfg!(target_os = "macos") {
-        anyhow::bail!("service restart supports macOS launchd only");
+    #[cfg(target_os = "macos")]
+    {
+        let mut launchctl = SystemLaunchctl::new();
+        if !launchctl.is_loaded()? {
+            anyhow::bail!("no loaded launchd daemon to restart; run alex service install first");
+        }
+        return restart_launchd_daemon(config, force).await;
     }
 
-    let mut launchctl = SystemLaunchctl::new();
-    if !launchctl.is_loaded()? {
-        anyhow::bail!("no loaded launchd daemon to restart; run alex service install first");
+    #[cfg(target_os = "linux")]
+    {
+        if force {
+            eprintln!("note: --force is a launchd compatibility flag; systemd restart is already a hard service restart");
+        }
+        let output = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "alexandria"])
+            .output()
+            .context("restarting the systemd user service")?;
+        if !output.status.success() {
+            bail!(
+                "systemctl --user restart alexandria failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if !wait_for_local_health(config).await? {
+            bail!(
+                "systemd restarted but the daemon did not become healthy at {}",
+                config.base_url()
+            );
+        }
+        println!("systemd user service restarted");
+        return Ok(());
     }
-    restart_launchd_daemon(config, force).await
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (config, force);
+        anyhow::bail!(
+            "service restart is not available on this OS; use `alex daemon --background`"
+        )
+    }
 }
 
 fn launchd_hard_restart() -> Result<()> {
@@ -10138,6 +10189,64 @@ async fn daemon_healthy(base_url: &str) -> bool {
         .await
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+fn web_ui_url(config: &Config) -> String {
+    format!("{}/ui/", config.base_url().trim_end_matches('/'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopPlatform {
+    Macos,
+    Linux,
+    Windows,
+    Unsupported,
+}
+
+fn current_desktop_platform() -> DesktopPlatform {
+    if cfg!(target_os = "macos") {
+        DesktopPlatform::Macos
+    } else if cfg!(target_os = "linux") {
+        DesktopPlatform::Linux
+    } else if cfg!(target_os = "windows") {
+        DesktopPlatform::Windows
+    } else {
+        DesktopPlatform::Unsupported
+    }
+}
+
+fn browser_command_for(
+    platform: DesktopPlatform,
+    url: &str,
+) -> Result<(OsString, Vec<OsString>)> {
+    let url = OsString::from(url);
+    match platform {
+        DesktopPlatform::Macos => Ok(("open".into(), vec![url])),
+        DesktopPlatform::Linux => Ok(("xdg-open".into(), vec![url])),
+        // The empty title is required by cmd.exe's `start` built-in. The URL
+        // remains one argument so spaces in future local paths are preserved.
+        DesktopPlatform::Windows => Ok((
+            "cmd".into(),
+            vec!["/C".into(), "start".into(), "".into(), url],
+        )),
+        DesktopPlatform::Unsupported => bail!(
+            "automatic browser launch is unsupported on this OS; use `alex web --no-open`"
+        ),
+    }
+}
+
+fn launch_browser(url: &str) -> Result<()> {
+    let (program, args) = browser_command_for(current_desktop_platform(), url)?;
+    std::process::Command::new(&program)
+        .args(&args)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "launching the browser with {}; use `alex web --no-open` to print the URL",
+                Path::new(&program).display()
+            )
+        })?;
+    Ok(())
 }
 
 async fn mint_up_key(config: &Config, harness: &str) -> Result<(String, String)> {
@@ -12399,6 +12508,32 @@ continue = true
         let mut config = test_config(tmpdir("tailscale-local-base-url"));
         config.host = "100.101.102.103".into();
         assert_eq!(config.base_url(), "http://127.0.0.1:4100");
+        assert_eq!(web_ui_url(&config), "http://127.0.0.1:4100/ui/");
+    }
+
+    #[test]
+    fn browser_launch_commands_are_platform_specific_and_keep_url_atomic() {
+        let url = "http://127.0.0.1:4100/ui/";
+        let (program, args) = browser_command_for(DesktopPlatform::Macos, url).unwrap();
+        assert_eq!(program, OsString::from("open"));
+        assert_eq!(args, vec![OsString::from(url)]);
+
+        let (program, args) = browser_command_for(DesktopPlatform::Linux, url).unwrap();
+        assert_eq!(program, OsString::from("xdg-open"));
+        assert_eq!(args, vec![OsString::from(url)]);
+
+        let (program, args) = browser_command_for(DesktopPlatform::Windows, url).unwrap();
+        assert_eq!(program, OsString::from("cmd"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/C"),
+                OsString::from("start"),
+                OsString::from(""),
+                OsString::from(url),
+            ]
+        );
+        assert!(browser_command_for(DesktopPlatform::Unsupported, url).is_err());
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | [Configuration](configuration.md) | Full `config.toml` key/default reference, environment variables, and on-disk layout. |
 | [Dario](dario.md) | Dario routing modes, three-block prompt rewrite, header handling, generations, health, and fallback behavior. |
 | [Traces](traces.md) | Trace rows and gzip bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
+| [Shared web UI](web-ui.md) | Cross-platform local status/onboarding/trace preview, bounded pagination, launch and smoke-test behavior. |
 
 ## Harnesses and capture
 

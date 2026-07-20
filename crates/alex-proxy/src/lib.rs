@@ -9,6 +9,7 @@ mod plugins;
 mod middleware;
 pub use plugins::{PluginManager, PluginManifest};
 pub mod notify;
+mod web;
 
 use alex_auth::{
     encrypt_bundle, export_bundle, harness_cred_paths, now_ms, routing_reserve_blocked,
@@ -1769,6 +1770,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/auth/login/{id}", get(admin_auth_login_status))
         .route("/traces/search", get(traces_search))
+        .route("/traces/summaries", get(traces_summaries))
         .route("/traces/accounts", get(traces_accounts))
         .route("/traces/export.ndjson", get(traces_export))
         .route("/traces/sessions", get(traces_sessions))
@@ -1821,6 +1823,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         ));
 
     Router::new()
+        .route("/ui", get(web::index))
+        .route("/ui/", get(web::index))
+        .route("/ui/app.js", get(web::app_js))
+        .route("/ui/styles.css", get(web::styles))
         .route("/health", get(health))
         .route("/connect", get(connect_info))
         .route("/v1/models", get(models))
@@ -4940,6 +4946,8 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
     TraceFilter {
         since_ms: q.get("since").and_then(|s| parse_since(s, now)),
         until_ms: q.get("until").and_then(|s| parse_since(s, now)),
+        before_ms: None,
+        before_id: None,
         run_id: q.get("run_id").cloned(),
         session: q.get("session").cloned(),
         model: q.get("model").cloned(),
@@ -5064,6 +5072,90 @@ async fn traces_search(
             }
         },
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+const WEB_TRACE_PAGE_DEFAULT: usize = 25;
+const WEB_TRACE_PAGE_MAX: usize = 100;
+
+fn trace_summary(row: &Value) -> Value {
+    json!({
+        "id": row["id"],
+        "ts_request_ms": row["ts_request_ms"],
+        "ts_response_ms": row["ts_response_ms"],
+        "session_id": row["session_id"],
+        "run_id": row["run_id"],
+        "model": row["routed_model"],
+        "served_model": row["served_model"],
+        "provider": row["upstream_provider"],
+        "account_id": row["account_id"],
+        "harness": row["harness"],
+        "path": row["path"],
+        "status": row["status"],
+        "error": row["error"],
+        "error_class": row["error_class"],
+        "latency_ms": row["latency_ms"],
+        "input_tokens": row["input_tokens"],
+        "output_tokens": row["output_tokens"],
+        "substituted": row["substituted"],
+        "middleware_decisions": row["middleware_decisions"],
+    })
+}
+
+/// Bounded, cursor-paginated summaries for the shared web Trace Browser.
+/// Bodies are deliberately absent and remain lazy `/traces/{id}/body/*`
+/// requests. The timestamp + id cursor is deterministic even when a burst of
+/// traces is committed in one millisecond.
+async fn traces_summaries(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match q.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(WEB_TRACE_PAGE_MAX),
+            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+        },
+        None => WEB_TRACE_PAGE_DEFAULT,
+    };
+    let before_ms = match q.get("before_ms") {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "before_ms must be an integer"),
+        },
+        None => None,
+    };
+    let before_id = q.get("before_id").cloned();
+    if before_id.is_some() && before_ms.is_none() {
+        return error_response(StatusCode::BAD_REQUEST, "before_id requires before_ms");
+    }
+    if before_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 200) {
+        return error_response(StatusCode::BAD_REQUEST, "before_id is invalid");
+    }
+
+    let mut filter = filter_from_query(&q);
+    filter.before_ms = before_ms;
+    filter.before_id = before_id;
+    filter.limit = limit + 1;
+    match state.store.search_traces(&filter) {
+        Ok(mut rows) => {
+            let has_more = rows.len() > limit;
+            rows.truncate(limit);
+            let next_cursor = rows.last().and_then(|row| {
+                Some(json!({
+                    "before_ms": row["ts_request_ms"].as_i64()?,
+                    "before_id": row["id"].as_str()?,
+                }))
+            });
+            let traces = rows.iter().map(trace_summary).collect::<Vec<_>>();
+            axum::Json(json!({
+                "traces": traces,
+                "limit": limit,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }))
+            .into_response()
+        }
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -15209,6 +15301,188 @@ mod tests {
         server.abort();
     }
 
+    /// Cross-platform V1 smoke foundation. It uses only loopback TCP, a mock
+    /// OpenAI-compatible upstream, and a temporary data root, so the exact same
+    /// scenario is safe on macOS, Linux, and Windows CI runners.
+    #[tokio::test]
+    async fn deterministic_platform_smoke_daemon_route_trace_and_restart_recovery() {
+        use axum::routing::post;
+
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["model"], "smoke/model");
+                axum::Json(json!({
+                    "id": "mock-completion",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "mock ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                }))
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let root = tmpdir("deterministic-platform-smoke");
+        let store_root = root.join("store");
+        let vault_root = root.join("vault");
+        let build = || {
+            let state = build_state(
+                "alx-local".into(),
+                Arc::new(Vault::open(vault_root.clone()).unwrap()),
+                Arc::new(Store::open(store_root.clone()).unwrap()),
+                None,
+                "http://127.0.0.1:4100".into(),
+                Duration::from_secs(30),
+            );
+            set_exo_config(
+                &state,
+                ExoConfig {
+                    url: format!("http://{upstream_addr}"),
+                    enabled_models: vec!["smoke/model".into()],
+                },
+            );
+            state
+        };
+        let serve = |state: Arc<AppState>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router(state)
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            (address, server)
+        };
+
+        let client = reqwest::Client::new();
+        let state = build();
+        let (address, server) = serve(state.clone()).await;
+        let base = format!("http://{address}");
+
+        let health: Value = client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "ok");
+        let ui = client
+            .get(format!("{base}/ui/"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(ui.contains("ALEX LOCAL CONTROL PLANE"));
+
+        let routed: Value = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("x-api-key", "alx-local")
+            .header("x-alexandria-harness", "platform-smoke")
+            .json(&json!({
+                "model": "alex/smoke/model",
+                "stream": false,
+                "messages": [{"role": "user", "content": "deterministic smoke"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(routed["choices"][0]["message"]["content"], "mock ok");
+
+        let summaries: Value = client
+            .get(format!("{base}/traces/summaries?limit=1"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(summaries["limit"], 1);
+        assert_eq!(summaries["traces"].as_array().unwrap().len(), 1);
+        assert!(summaries["traces"][0].get("req_body_path").is_none());
+        let trace_id = summaries["traces"][0]["id"].as_str().unwrap().to_string();
+        let opened: Value = client
+            .get(format!("{base}/traces/{trace_id}"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(opened["trace"]["id"], trace_id);
+
+        server.abort();
+        let _ = server.await;
+        drop(state);
+
+        // Reopen the same durable roots behind a fresh daemon state. The trace
+        // summary and individual trace must survive the restart boundary.
+        let restarted_state = build();
+        let (restarted_address, restarted_server) = serve(restarted_state).await;
+        let restarted_base = format!("http://{restarted_address}");
+        let recovered: Value = client
+            .get(format!("{restarted_base}/traces/summaries?limit=25"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(recovered["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trace| trace["id"] == trace_id));
+        client
+            .get(format!("{restarted_base}/traces/{trace_id}"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        restarted_server.abort();
+        upstream_server.abort();
+    }
+
     #[tokio::test]
     async fn health_reports_in_flight_age_model_session_and_harness() {
         let state = test_state("in-flight-registry");
@@ -15258,6 +15532,77 @@ mod tests {
         assert_eq!(body["traces"].as_array().unwrap().len(), 1);
         assert_eq!(body["traces"][0]["id"], "trace-in-run");
         assert_eq!(body["traces"][0]["run_id"], "hreg-1");
+    }
+
+    #[tokio::test]
+    async fn trace_summaries_are_bounded_body_free_and_cursor_paginated() {
+        let state = test_state("trace-summary-pagination");
+        for id in ["a", "b", "c"] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: 1_000,
+                    req_body_path: Some(format!("secret-{id}.json.gz")),
+                    routed_model: Some(format!("model-{id}")),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let (status, first) = response_json(
+            traces_summaries(
+                State(state.clone()),
+                Query(HashMap::from([("limit".into(), "2".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["traces"][0]["id"], "c");
+        assert_eq!(first["traces"][1]["id"], "b");
+        assert_eq!(first["has_more"], true);
+        assert!(first["traces"][0].get("req_body_path").is_none());
+
+        let cursor = first["next_cursor"].clone();
+        let (_, second) = response_json(
+            traces_summaries(
+                State(state.clone()),
+                Query(HashMap::from([
+                    ("limit".into(), "2".into()),
+                    (
+                        "before_ms".into(),
+                        cursor["before_ms"].as_i64().unwrap().to_string(),
+                    ),
+                    (
+                        "before_id".into(),
+                        cursor["before_id"].as_str().unwrap().to_string(),
+                    ),
+                ])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(second["traces"][0]["id"], "a");
+        assert_eq!(second["has_more"], false);
+
+        let (_, capped) = response_json(
+            traces_summaries(
+                State(state.clone()),
+                Query(HashMap::from([("limit".into(), "9999".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(capped["limit"], WEB_TRACE_PAGE_MAX);
+
+        let invalid = traces_summaries(
+            State(state),
+            Query(HashMap::from([("before_id".into(), "b".into())])),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

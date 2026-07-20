@@ -24,6 +24,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
+      - name: Deterministic shared-web platform smoke
+        run: cargo test -p alex-proxy deterministic_platform_smoke -- --nocapture
+      - name: Platform browser-launch contract
+        run: cargo test -p alex browser_launch_commands_are_platform_specific -- --nocapture
       - run: cargo test --workspace
       - run: cargo package -p alex-core
 

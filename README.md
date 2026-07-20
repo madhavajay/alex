@@ -135,6 +135,14 @@ Requests, responses, token usage, latency, cost, sessions, subagents, requested 
 Local and inspectable by default.
 The daemon listens on 127.0.0.1, stores traces in local SQLite, and keeps provider credentials on your machine.
 
+Open the shared local status, onboarding, and Trace Browser preview on macOS, Linux, or Windows:
+
+```bash
+alex web
+```
+
+Use `alex web --no-open` to print the loopback URL. Native menu-bar integration remains macOS-only; see [Shared web UI](docs/web-ui.md) for the current platform support boundary.
+
 Built for real multi-agent workflows.
 Scoped run keys, session tagging, remote trace ingestion, account routing, rate-limit failover, harness integrations, and regression tests make Alex useful beyond simple API forwarding.
 
