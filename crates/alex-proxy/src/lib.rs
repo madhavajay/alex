@@ -41,6 +41,7 @@ const OPENAI_BASE: &str = "https://api.openai.com";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 /// Kimi Code (Moonshot AI) OpenAI-compatible coding endpoint.
 const KIMI_BASE: &str = "https://api.kimi.com/coding/v1";
+const KIMI_QUOTA_EXHAUSTED_BODY: &str = r#"{"error":{"message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota","type":"access_terminated_error"}}"#;
 const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const XAI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION: &str = "0.2.77";
@@ -4241,13 +4242,6 @@ fn fixture_path(root: &std::path::Path, name: &str) -> Result<PathBuf, String> {
 
 fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
-    if std::fs::read_dir(root)
-        .map_err(|e| e.to_string())?
-        .next()
-        .is_some()
-    {
-        return Ok(());
-    }
     let rows = [
         (
             "anthropic-relogin-401",
@@ -4262,6 +4256,13 @@ fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
             429,
             "rate_limit_error",
             r#"{"type":"error","error":{"type":"rate_limit_error","message":"Overloaded"}}"#,
+        ),
+        (
+            "kimi-quota-exhausted-403",
+            "kimi",
+            403,
+            "access_terminated_error",
+            KIMI_QUOTA_EXHAUSTED_BODY,
         ),
         (
             "upstream-503",
@@ -4290,6 +4291,11 @@ fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
             source_trace_id: None,
         };
         let path = fixture_path(root, name)?;
+        // Seed new built-ins on upgrade without overwriting a fixture the
+        // operator may already have captured or edited under the same name.
+        if path.exists() {
+            continue;
+        }
         std::fs::write(
             path,
             serde_json::to_vec_pretty(&fixture).map_err(|e| e.to_string())?,
@@ -10019,6 +10025,29 @@ async fn proxy(
                 }
             };
 
+            // Kimi (and potentially other subscription providers) can return
+            // quota exhaustion as HTTP 401/403. Inspect those small error
+            // bodies before the auth refresh and failover decisions; the
+            // helper rebuilds the response for normal forwarding/finalization.
+            let (resp, error_class) = match classify_upstream_response(
+                current_provider.as_str(),
+                plan.upstream_format,
+                resp,
+            )
+            .await
+            {
+                Ok(classified) => classified,
+                Err(msg) => {
+                    suspect_dario(&state, &account);
+                    trace.status = Some(502);
+                    trace.error = Some(msg.clone());
+                    trace.error_kind = Some("upstream_unreachable".into());
+                    trace.error_class = Some(ErrorClass::Network.as_str().into());
+                    finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                    return error_response(StatusCode::BAD_GATEWAY, &msg);
+                }
+            };
+
             if account.kind == "oauth" {
                 if let Some(snapshot) =
                     routing_limits_from_headers(account.provider, resp.headers())
@@ -10035,6 +10064,7 @@ async fn proxy(
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 && account.kind == "oauth"
                 && !forced_oauth_refresh
+                && error_class == ErrorClass::Auth
             {
                 tracing::warn!(
                     account = %account.id,
@@ -10054,11 +10084,6 @@ async fn proxy(
                 }
             }
 
-            let error_class = classify_error(
-                current_provider.as_str(),
-                Some(resp.status().as_u16()),
-                None,
-            );
             let protection = state
                 .protection
                 .read()
@@ -10815,7 +10840,25 @@ fn surface_upstream_refusal(
 }
 
 /// The sole error taxonomy used by trace storage and later substitution work.
-fn classify_error(_provider: &str, status: Option<u16>, error_kind: Option<&str>) -> ErrorClass {
+fn quota_exhaustion_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("usage limit")
+        || message.contains("usage-limit")
+        || message.contains("quota exceeded")
+        || message.contains("quota exhausted")
+        || (message.contains("quota")
+            && (message.contains("billing cycle")
+                || message.contains("next cycle")
+                || message.contains("purchase extra usage")
+                || message.contains("upgrade your plan")))
+}
+
+fn classify_error_with_message(
+    _provider: &str,
+    status: Option<u16>,
+    error_kind: Option<&str>,
+    error_message: Option<&str>,
+) -> ErrorClass {
     let kind = error_kind.unwrap_or("").to_ascii_lowercase();
     if kind == "client_disconnect" {
         return ErrorClass::ClientDisconnect;
@@ -10829,6 +10872,15 @@ fn classify_error(_provider: &str, status: Option<u16>, error_kind: Option<&str>
         || kind.contains("early-eof")
     {
         return ErrorClass::Network;
+    }
+    // Some subscription providers use 401/403 for exhausted paid quota even
+    // though the credential is still valid. This capacity shape must win over
+    // the status-only auth fallback: re-authentication cannot replenish quota.
+    if matches!(status, Some(401 | 403))
+        && (kind == "access_terminated_error"
+            || error_message.is_some_and(quota_exhaustion_message))
+    {
+        return ErrorClass::Capacity;
     }
     if matches!(status, Some(401 | 403))
         || matches!(
@@ -10864,6 +10916,50 @@ fn classify_error(_provider: &str, status: Option<u16>, error_kind: Option<&str>
         return ErrorClass::Server;
     }
     ErrorClass::Other
+}
+
+fn classify_error(provider: &str, status: Option<u16>, error_kind: Option<&str>) -> ErrorClass {
+    classify_error_with_message(provider, status, error_kind, None)
+}
+
+/// Inspect auth-looking response bodies before deciding whether to refresh or
+/// fail over, then rebuild the response so the normal forwarding path can
+/// still consume it. Other statuses stay streaming and are classified by
+/// status/kind as before.
+async fn classify_upstream_response(
+    provider: &str,
+    format: &str,
+    response: reqwest::Response,
+) -> std::result::Result<(reqwest::Response, ErrorClass), String> {
+    let status = response.status();
+    if !matches!(status.as_u16(), 401 | 403) {
+        return Ok((
+            response,
+            classify_error(provider, Some(status.as_u16()), None),
+        ));
+    }
+
+    let version = response.version();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("upstream body read failed: {error}"))?;
+    let parsed = parse_upstream_error(format, status.as_u16(), &body);
+    let class = classify_error_with_message(
+        provider,
+        Some(status.as_u16()),
+        parsed.as_ref().and_then(|error| error.kind.as_deref()),
+        parsed.as_ref().and_then(|error| error.message.as_deref()),
+    );
+
+    let mut rebuilt = axum::http::Response::builder()
+        .status(status)
+        .version(version)
+        .body(reqwest::Body::from(body))
+        .map_err(|error| format!("could not rebuild buffered upstream response: {error}"))?;
+    *rebuilt.headers_mut() = headers;
+    Ok((reqwest::Response::from(rebuilt), class))
 }
 
 fn json_string(value: &Value) -> Option<String> {
@@ -10915,6 +11011,7 @@ fn capture_response_error(trace: &mut TraceRecord, body: &[u8]) {
         .as_ref()
         .and_then(|error| error.code.clone())
         .unwrap_or_else(|| status.to_string());
+    let message = parsed.as_ref().and_then(|error| error.message.clone());
     if trace.error_kind.is_none() {
         trace.error_kind = Some(kind.clone());
     }
@@ -10922,17 +11019,18 @@ fn capture_response_error(trace: &mut TraceRecord, body: &[u8]) {
         trace.error_code = Some(code);
     }
     if trace.error.is_none() {
-        let message = parsed
-            .and_then(|error| error.message)
+        let message = message
+            .clone()
             .unwrap_or_else(|| format!("upstream returned HTTP {status}"));
         trace.error = Some(format!("{kind}: {message}"));
     }
     if trace.error_class.is_none() {
         trace.error_class = Some(
-            classify_error(
+            classify_error_with_message(
                 trace.upstream_provider.as_deref().unwrap_or("unknown"),
                 Some(status),
                 trace.error_kind.as_deref(),
+                message.as_deref(),
             )
             .as_str()
             .into(),
@@ -16588,6 +16686,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn kimi_quota_403_is_capacity_reroutable_and_does_not_mark_reauth() {
+        let upstream = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(403)
+                .header("content-type", "application/json")
+                .body(reqwest::Body::from(KIMI_QUOTA_EXHAUSTED_BODY))
+                .unwrap(),
+        );
+        let (rebuilt, class) =
+            classify_upstream_response("kimi", "openai-chat", upstream)
+                .await
+                .unwrap();
+        assert_eq!(class, ErrorClass::Capacity);
+        assert!(reroutable_error_class(class));
+        assert_eq!(
+            rebuilt.bytes().await.unwrap().as_ref(),
+            KIMI_QUOTA_EXHAUSTED_BODY.as_bytes()
+        );
+
+        let state = test_state("kimi-quota-capacity");
+        state.vault.upsert(test_kimi_account()).await.unwrap();
+        let trace = TraceRecord {
+            id: "kimi-quota-403".into(),
+            ts_request_ms: now_ms(),
+            account_id: Some("kimi-oauth".into()),
+            upstream_provider: Some("kimi".into()),
+            upstream_format: Some("openai-chat".into()),
+            status: Some(403),
+            ..Default::default()
+        };
+
+        finalize_trace(
+            &state,
+            trace,
+            b"{}",
+            None,
+            Some(KIMI_QUOTA_EXHAUSTED_BODY.as_bytes()),
+        );
+
+        let stored = state.store.get_trace("kimi-quota-403").unwrap().unwrap();
+        assert_eq!(stored["error_kind"], "access_terminated_error");
+        assert_eq!(stored["error_class"], "capacity");
+        assert!(!needs_reauth_flag(&state, "kimi-oauth").await);
+
+        // The message fallback also protects providers that omit or vary the
+        // error type while retaining Kimi's quota-exhaustion wording.
+        assert_eq!(
+            classify_error_with_message(
+                "kimi",
+                Some(403),
+                Some("permission_error"),
+                Some("You've reached your usage limit; quota refreshes next cycle"),
+            ),
+            ErrorClass::Capacity
+        );
+    }
+
+    #[test]
+    fn starter_fixtures_include_exact_kimi_quota_response() {
+        let root = tmpdir("kimi-quota-fixture");
+        std::fs::write(root.join("operator-captured.json"), b"preserve me").unwrap();
+        starter_fixtures(&root).unwrap();
+        let fixture: ErrorFixture = serde_json::from_slice(
+            &std::fs::read(root.join("kimi-quota-exhausted-403.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fixture.name, "kimi-quota-exhausted-403");
+        assert_eq!(fixture.provider, "kimi");
+        assert_eq!(fixture.status, 403);
+        assert_eq!(fixture.error_kind, "access_terminated_error");
+        assert_eq!(fixture.body, KIMI_QUOTA_EXHAUSTED_BODY);
+        assert!(matches!(fixture.direction, Direction::UpstreamToClient));
+        assert_eq!(
+            std::fs::read(root.join("operator-captured.json")).unwrap(),
+            b"preserve me"
+        );
+    }
+
     #[test]
     fn failover_statuses_are_limited_to_capacity_and_server_errors() {
         for status in [
@@ -17641,6 +17818,49 @@ mod tests {
         assert_eq!(
             state.store.get_trace("retained-401").unwrap().unwrap()["error_class"],
             "auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_quota_403_never_emits_reauth_notification() {
+        let (url, received, sink) = webhook_sink().await;
+        let state = test_state("kimi-quota-no-reauth-notification");
+        state.vault.upsert(test_kimi_account()).await.unwrap();
+        // A stale marker must not make a capacity trace enter the re-auth
+        // notification path; the trace class is the final category guard.
+        mark_account_needs_reauth(&state, "kimi-oauth", true).await;
+        set_notifications(&state, reauth_channel(url));
+        let trace = TraceRecord {
+            id: "kimi-quota-no-notify".into(),
+            ts_request_ms: now_ms(),
+            account_id: Some("kimi-oauth".into()),
+            upstream_provider: Some("kimi".into()),
+            upstream_format: Some("openai-chat".into()),
+            status: Some(403),
+            ..Default::default()
+        };
+
+        finalize_trace(
+            &state,
+            trace,
+            b"{}",
+            None,
+            Some(KIMI_QUOTA_EXHAUSTED_BODY.as_bytes()),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        sink.abort();
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "quota exhaustion must not produce a re-auth notification"
+        );
+        assert_eq!(
+            state
+                .store
+                .get_trace("kimi-quota-no-notify")
+                .unwrap()
+                .unwrap()["error_class"],
+            "capacity"
         );
     }
 

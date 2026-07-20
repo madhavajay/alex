@@ -11,6 +11,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var traceBrowser: TraceBrowserWindowController?
     private var darioWindow: DarioWindowController?
     private var onboardingWindow: OnboardingWindowController?
+    private let reauthWizard: ReauthWizardWindowController
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
     private let geminiKeyWindow = GeminiKeyWindowController()
@@ -27,6 +28,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     init(store: SnapshotStore) {
         self.store = store
+        self.reauthWizard = ReauthWizardWindowController(store: store)
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         statusItem.autosaveName = "AlexandriaBar"
@@ -100,6 +102,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         buildHeader()
         buildIssues()
+        buildReauthentication()
         // The app (Sparkle) update is independent of daemon health, so this
         // stays outside the `daemonUp` gate — unlike the daemon row, it can
         // still render "Update Alex UI" while the daemon itself is down.
@@ -292,6 +295,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         Dictionary(uniqueKeysWithValues: store.healthAccounts.compactMap { account in
             account.lastHeartbeat.map { (account.id, $0) }
         })
+    }
+
+    private var accountsNeedingReauthentication: [Account] {
+        Reauthentication.accountsNeedingReauthentication(
+            store.accounts, healthAccounts: store.healthAccounts)
+    }
+
+    private func buildReauthentication() {
+        let accounts = accountsNeedingReauthentication
+        guard !accounts.isEmpty else { return }
+        addHostedView(MenuReauthBannerView(
+            accounts: accounts,
+            onReauthenticate: { [weak self] in
+                guard let self else { return }
+                self.menu.cancelTrackingWithoutAnimation()
+                self.reauthWizard.show(accounts: accounts)
+            }), edgeToEdge: true)
+        menu.addItem(.separator())
     }
 
     private func buildLimits() {

@@ -135,6 +135,59 @@ struct MenuStatsBarView: View {
     }
 }
 
+// MARK: - Re-authentication banner
+
+/// High-priority menu entry point shown only when one or more subscription
+/// accounts resolve to `.needsReauth`.
+struct MenuReauthBannerView: View {
+    let accounts: [Account]
+    let onReauthenticate: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PillButton(
+                title: "Re-auth subscriptions (\(accounts.count))",
+                variant: .danger,
+                systemImage: "key.fill",
+                fontSize: 12,
+                horizontalPadding: 12,
+                verticalPadding: 7,
+                action: onReauthenticate)
+
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(accounts) { account in
+                    HStack(spacing: 7) {
+                        HarnessIconView(
+                            harness: ProviderInfo.loginArg(account.provider),
+                            tags: nil,
+                            size: 14,
+                            showsFallback: true)
+                        Text(ProviderInfo.displayName(account.provider))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(AlexTheme.Colors.foreground)
+                        Text("· \(account.name)")
+                            .font(AlexTheme.Fonts.mono(10))
+                            .foregroundStyle(AlexTheme.Colors.textSecondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .padding(.leading, 3)
+        }
+        .padding(.horizontal, MenuMetrics.inset)
+        .padding(.vertical, 10)
+        .frame(width: MenuMetrics.width, alignment: .leading)
+        .background(AlexTheme.Colors.destructive.opacity(0.055))
+        .overlay(alignment: .top) {
+            Rectangle().fill(AlexTheme.Colors.destructive.opacity(0.15)).frame(height: 1)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AlexTheme.Colors.destructive.opacity(0.15)).frame(height: 1)
+        }
+    }
+}
+
 // MARK: - Update banner
 
 /// Orange update band (mock App.tsx:592-635, `UpdateSection`). Shows an "App"
