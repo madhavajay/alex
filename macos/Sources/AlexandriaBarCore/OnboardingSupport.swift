@@ -156,7 +156,7 @@ public enum OnboardingSupport {
         case "codex": "In Codex, use `/model \(model)` or start it with `-m \(model)`."
         case "kimi": "In Kimi, use `/model \(model)` or start it with `-m \(model)`."
         case "pi": "In Pi, enter `/model \(model)`."
-        case "amp": "In Amp, enter `/model \(model)`."
+        case "amp": "Amp keeps its native models. Launch it through `alex wrap amp` so Alex can capture the trace."
         case "gemini": "In Gemini CLI, enter `/model \(model)`."
         case "opencode": "In OpenCode, enter `/model \(model)`."
         case let name?: "In \(HarnessCatalog.displayName(name)), choose `\(model)` with `/model` or `-m`."
@@ -176,6 +176,7 @@ public enum OnboardingSupport {
         case "codex":
             "codex --profile alex exec --skip-git-repo-check -m \(model) \"test\""
         case "pi": "pi --model \(model) -p \"test\""
+        case "amp": "alex wrap amp -- -x \"test\""
         case let name?: "\(name) -m \(model) -p \"test\""
         case nil: "<your harness> --model \(model)"
         }

@@ -2083,6 +2083,81 @@ pub async fn save_openrouter_api_key(
     Ok("openrouter-api-key".into())
 }
 
+/// Save an OpenRouter key under a user-facing identity. OpenRouter keys do not
+/// expose an account profile, so onboarding asks for this label. Reusing the
+/// same label or key updates the existing vault row; a different label/key
+/// creates another routable OpenRouter account.
+pub async fn save_named_openrouter_api_key(
+    vault: &Vault,
+    display_name: &str,
+    api_key: &str,
+    http_referer: Option<&str>,
+    x_title: Option<&str>,
+) -> Result<String> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        bail!("empty openrouter account name");
+    }
+    if display_name.chars().count() > 80 {
+        bail!("openrouter account name must be 80 characters or fewer");
+    }
+    let key = api_key.trim();
+    if key.is_empty() {
+        bail!("empty openrouter api key");
+    }
+    let existing = vault.list().await.into_iter().find(|account| {
+        account.provider == Provider::Openrouter
+            && (account.api_key.as_deref() == Some(key)
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.eq_ignore_ascii_case(display_name)))
+    });
+    let digest = Sha256::digest(display_name.to_lowercase().as_bytes());
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let id = existing
+        .as_ref()
+        .map(|account| account.id.clone())
+        .unwrap_or_else(|| format!("openrouter-api-key-{suffix}"));
+    let name = existing
+        .as_ref()
+        .map(|account| account.name.clone())
+        .unwrap_or_else(|| format!("acct-{suffix}"));
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+    let account = Account {
+        id: id.clone(),
+        provider: Provider::Openrouter,
+        kind: "api_key".into(),
+        name,
+        description: Some(display_name.to_string()),
+        paused: existing.as_ref().is_some_and(|account| account.paused),
+        label: Some(display_name.to_string()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(key.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: json!({
+            "http_referer": clean(http_referer),
+            "x_title": clean(x_title),
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: existing.and_then(|account| account.path),
+    };
+    vault.upsert(account).await?;
+    Ok(id)
+}
+
 /// Remove the single OpenRouter API-key account. Both the CLI and admin API
 /// use this helper so the account identity and idempotent removal semantics
 /// stay aligned.
@@ -2689,6 +2764,36 @@ mod tests {
             "https://alexandria.example"
         );
         assert_eq!(account.account_meta["x_title"], "Alexandria");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_openrouter_keys_add_and_replace_by_display_identity() {
+        let dir = temp_dir("named-openrouter-keys");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let personal = save_named_openrouter_api_key(&vault, "Personal", "or-personal", None, None)
+            .await
+            .unwrap();
+        let work = save_named_openrouter_api_key(&vault, "Work", "or-work", None, None)
+            .await
+            .unwrap();
+        assert_ne!(personal, work);
+        assert_eq!(vault.list().await.len(), 2);
+
+        let replaced =
+            save_named_openrouter_api_key(&vault, "personal", "or-personal-fresh", None, None)
+                .await
+                .unwrap();
+        assert_eq!(replaced, personal);
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.id == personal)
+                .and_then(|account| account.api_key.as_deref()),
+            Some("or-personal-fresh")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

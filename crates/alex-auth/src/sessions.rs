@@ -8,13 +8,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::login::{
-    anthropic_authorize_url, claude_exchange, codex_device_exchange_auto,
+    anthropic_authorize_url, claude_exchange, claude_exchange_auto, codex_device_exchange_auto,
     codex_device_exchange_named, codex_device_poll_once, codex_device_start, codex_exchange_named,
-    generate_pkce, kimi_device_poll_once_at,
-    kimi_device_start_at, kimi_oauth_host, kimi_upsert_from_tokens, kimi_verification_url,
+    gemini_exchange_auto, generate_pkce, kimi_device_poll_once_at, kimi_device_start_at,
+    kimi_oauth_host, kimi_upsert_from_tokens, kimi_upsert_from_tokens_auto, kimi_verification_url,
     openai_authorize_url, poll_device_flow, validate_account_name, wait_for_openai_callback,
-    xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, DeviceFlowError,
-    OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
+    xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, xai_upsert_from_tokens_auto,
+    DeviceFlowError, OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
 };
 use crate::{now_ms, Vault};
 
@@ -38,6 +38,7 @@ pub struct LoginSession {
     pub created_ms: i64,
     pub expires_at_ms: i64,
     account_name: String,
+    auto_identity: bool,
     verifier: Option<String>,
     pub phase: LoginPhase,
 }
@@ -79,6 +80,7 @@ pub trait PasteCodeExchanger: Send + Sync {
         verifier: String,
         input: String,
         account_name: String,
+        auto_identity: bool,
     ) -> PasteCodeExchangeFuture;
 }
 
@@ -91,8 +93,15 @@ impl PasteCodeExchanger for ClaudePasteCodeExchanger {
         verifier: String,
         input: String,
         account_name: String,
+        auto_identity: bool,
     ) -> PasteCodeExchangeFuture {
-        Box::pin(async move { claude_exchange(&vault, &verifier, &input, &account_name).await })
+        Box::pin(async move {
+            if auto_identity {
+                claude_exchange_auto(&vault, &verifier, &input).await
+            } else {
+                claude_exchange(&vault, &verifier, &input, &account_name).await
+            }
+        })
     }
 }
 
@@ -157,13 +166,24 @@ impl LoginManager {
         validate_account_name(account_name)?;
         let id = random_id();
         let shared = match provider {
-            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, account_name))),
+            "claude" | "anthropic" => Arc::new(Mutex::new(
+                self.start_claude(&id, Some(account_name.to_string())),
+            )),
             "codex" | "openai" | "chatgpt" => {
                 self.start_codex(&id, vault.clone(), account_name).await?
             }
-            "grok" | "xai" => self.start_grok(&id, vault.clone(), account_name).await?,
-            "kimi" | "kimi-code" => self.start_kimi(&id, vault.clone(), account_name).await?,
-            "gemini" | "google" => self.start_gemini(&id, vault.clone(), account_name).await?,
+            "grok" | "xai" => {
+                self.start_grok(&id, vault.clone(), Some(account_name.to_string()))
+                    .await?
+            }
+            "kimi" | "kimi-code" => {
+                self.start_kimi(&id, vault.clone(), Some(account_name.to_string()))
+                    .await?
+            }
+            "gemini" | "google" => {
+                self.start_gemini(&id, vault.clone(), Some(account_name.to_string()))
+                    .await?
+            }
             "amp" | "ampcode" => {
                 // Amp uses CLI secrets / API key, not OAuth paste. Import now.
                 let imported = crate::import_amp(&vault).await;
@@ -178,6 +198,7 @@ impl LoginManager {
                     created_ms: now_ms(),
                     expires_at_ms: now_ms() + SESSION_TTL_MS,
                     account_name: account_name.to_string(),
+                    auto_identity: false,
                     verifier: None,
                     phase: if let Some(aid) = imported.imported.first() {
                         LoginPhase::Done {
@@ -204,11 +225,16 @@ impl LoginManager {
 
     pub async fn start_auto(&self, vault: Arc<Vault>, provider: &str) -> Result<Value> {
         self.prune().await;
-        if !matches!(provider, "codex" | "openai" | "chatgpt") {
-            bail!("automatic identity login is currently supported only for Codex");
-        }
         let id = random_id();
-        let shared = self.start_codex_device(&id, vault, None).await?;
+        let shared = match provider {
+            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, None))),
+            "codex" | "openai" | "chatgpt" => self.start_codex_device(&id, vault, None).await?,
+            "grok" | "xai" => self.start_grok(&id, vault, None).await?,
+            "kimi" | "kimi-code" => self.start_kimi(&id, vault, None).await?,
+            "gemini" | "google" => self.start_gemini(&id, vault, None).await?,
+            "amp" | "ampcode" => return self.start(vault, "amp", "default").await,
+            other => bail!("provider '{other}' does not support automatic identity login"),
+        };
         let snapshot = shared.lock().await.snapshot();
         self.sessions.lock().await.insert(id, shared);
         Ok(snapshot)
@@ -233,10 +259,21 @@ impl LoginManager {
                 self.start_codex_device(&id, vault, Some(account_name.to_string()))
                     .await?
             }
-            "claude" | "anthropic" => Arc::new(Mutex::new(self.start_claude(&id, account_name))),
-            "grok" | "xai" => self.start_grok(&id, vault, account_name).await?,
-            "kimi" | "kimi-code" => self.start_kimi(&id, vault, account_name).await?,
-            "gemini" | "google" => self.start_gemini(&id, vault, account_name).await?,
+            "claude" | "anthropic" => Arc::new(Mutex::new(
+                self.start_claude(&id, Some(account_name.to_string())),
+            )),
+            "grok" | "xai" => {
+                self.start_grok(&id, vault, Some(account_name.to_string()))
+                    .await?
+            }
+            "kimi" | "kimi-code" => {
+                self.start_kimi(&id, vault, Some(account_name.to_string()))
+                    .await?
+            }
+            "gemini" | "google" => {
+                self.start_gemini(&id, vault, Some(account_name.to_string()))
+                    .await?
+            }
             other => bail!("provider '{other}' does not support managed re-authentication"),
         };
         {
@@ -304,6 +341,7 @@ impl LoginManager {
                 verifier,
                 input.to_string(),
                 session.account_name.clone(),
+                session.auto_identity,
             )
             .await
         {
@@ -317,7 +355,7 @@ impl LoginManager {
         Ok(session.snapshot())
     }
 
-    fn start_claude(&self, id: &str, account_name: &str) -> LoginSession {
+    fn start_claude(&self, id: &str, account_name: Option<String>) -> LoginSession {
         let pkce = generate_pkce();
         let url = anthropic_authorize_url(&pkce.challenge, &pkce.verifier);
         LoginSession {
@@ -330,7 +368,8 @@ impl LoginManager {
             verification_uri_complete: None,
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
-            account_name: account_name.to_string(),
+            account_name: account_name.clone().unwrap_or_default(),
+            auto_identity: account_name.is_none(),
             verifier: Some(pkce.verifier),
             phase: LoginPhase::Pending,
         }
@@ -361,6 +400,7 @@ impl LoginManager {
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
             account_name: account_name.to_string(),
+            auto_identity: false,
             verifier: None,
             phase: LoginPhase::Pending,
         };
@@ -423,6 +463,7 @@ impl LoginManager {
             created_ms: now_ms(),
             expires_at_ms: now_ms() + DEVICE_TTL_MS,
             account_name: account_name.clone().unwrap_or_default(),
+            auto_identity: account_name.is_none(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
@@ -473,7 +514,7 @@ impl LoginManager {
         &self,
         id: &str,
         vault: Arc<Vault>,
-        account_name: &str,
+        account_name: Option<String>,
     ) -> Result<SharedSession> {
         let (listener, port) = crate::login::bind_loopback().await?;
         let redirect_uri = format!(
@@ -493,14 +534,15 @@ impl LoginManager {
             verification_uri_complete: None,
             created_ms: now_ms(),
             expires_at_ms: now_ms() + SESSION_TTL_MS,
-            account_name: account_name.to_string(),
+            account_name: account_name.clone().unwrap_or_default(),
+            auto_identity: account_name.is_none(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
         let verifier = pkce.verifier;
-        let account_name = account_name.to_string();
+        let account_name = account_name.clone();
         let worker_task = tokio::spawn(async move {
             let deadline = std::time::Duration::from_millis(SESSION_TTL_MS as u64);
             let phase = match tokio::time::timeout(
@@ -514,15 +556,19 @@ impl LoginManager {
             .await
             {
                 Ok(Ok(code)) => {
-                    match crate::login::gemini_exchange(
-                        &vault,
-                        &verifier,
-                        &redirect_uri,
-                        &code,
-                        &account_name,
-                    )
-                    .await
-                    {
+                    let exchanged = if let Some(account_name) = account_name.as_deref() {
+                        crate::login::gemini_exchange(
+                            &vault,
+                            &verifier,
+                            &redirect_uri,
+                            &code,
+                            account_name,
+                        )
+                        .await
+                    } else {
+                        gemini_exchange_auto(&vault, &verifier, &redirect_uri, &code).await
+                    };
+                    match exchanged {
                         Ok(account_id) => LoginPhase::Done { account_id },
                         Err(e) => LoginPhase::Failed {
                             error: e.to_string(),
@@ -549,7 +595,7 @@ impl LoginManager {
         &self,
         id: &str,
         vault: Arc<Vault>,
-        account_name: &str,
+        account_name: Option<String>,
     ) -> Result<SharedSession> {
         let http = reqwest::Client::new();
         let start = xai_device_start(&http).await?;
@@ -571,13 +617,14 @@ impl LoginManager {
             ),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
-            account_name: account_name.to_string(),
+            account_name: account_name.clone().unwrap_or_default(),
+            auto_identity: account_name.is_none(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
-        let account_name = account_name.to_string();
+        let account_name = account_name.clone();
         let worker_task = tokio::spawn(async move {
             let phase = match poll_device_flow(
                 now_ms() + start.expires_in * 1000,
@@ -586,7 +633,11 @@ impl LoginManager {
             )
             .await
             {
-                Ok(tokens) => match xai_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                Ok(tokens) => match if let Some(account_name) = account_name.as_deref() {
+                    xai_upsert_from_tokens(&vault, &tokens, account_name).await
+                } else {
+                    xai_upsert_from_tokens_auto(&vault, &tokens).await
+                } {
                     Ok(account_id) => LoginPhase::Done { account_id },
                     Err(error) => LoginPhase::Failed {
                         error: error.to_string(),
@@ -614,7 +665,7 @@ impl LoginManager {
         &self,
         id: &str,
         vault: Arc<Vault>,
-        account_name: &str,
+        account_name: Option<String>,
     ) -> Result<SharedSession> {
         let oauth_host = self.kimi_oauth_host.clone().unwrap_or_else(kimi_oauth_host);
         let http = reqwest::Client::new();
@@ -631,13 +682,14 @@ impl LoginManager {
             verification_uri_complete: Some(kimi_verification_url(&start)),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
-            account_name: account_name.to_string(),
+            account_name: account_name.clone().unwrap_or_default(),
+            auto_identity: account_name.is_none(),
             verifier: None,
             phase: LoginPhase::Pending,
         };
         let shared = Arc::new(Mutex::new(session));
         let worker = shared.clone();
-        let account_name = account_name.to_string();
+        let account_name = account_name.clone();
         let worker_task = tokio::spawn(async move {
             let phase = match poll_device_flow(
                 now_ms() + start.expires_in * 1000,
@@ -646,7 +698,11 @@ impl LoginManager {
             )
             .await
             {
-                Ok(tokens) => match kimi_upsert_from_tokens(&vault, &tokens, &account_name).await {
+                Ok(tokens) => match if let Some(account_name) = account_name.as_deref() {
+                    kimi_upsert_from_tokens(&vault, &tokens, account_name).await
+                } else {
+                    kimi_upsert_from_tokens_auto(&vault, &tokens).await
+                } {
                     Ok(account_id) => LoginPhase::Done { account_id },
                     Err(error) => LoginPhase::Failed {
                         error: error.to_string(),
@@ -724,6 +780,20 @@ mod tests {
         assert_eq!(bad["state"], "failed");
         assert!(bad["error"].as_str().unwrap().contains("state mismatch"));
         assert!(mgr.status("nope").await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn automatic_claude_session_starts_without_a_local_nickname() {
+        let (dir, vault) = temp_vault("claude-auto");
+        let mgr = LoginManager::default();
+        let snap = mgr.start_auto(vault, "anthropic").await.unwrap();
+        assert_eq!(snap["mode"], "paste");
+        assert_eq!(snap["state"], "pending");
+        assert_eq!(snap["provider"], "claude");
+        assert!(snap["authorize_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("https://claude.ai/oauth/authorize")));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -61,6 +61,8 @@ struct OnboardingSupportTests {
             "In Claude Code, enter `/model alex/claude-sonnet-4`.")
         #expect(OnboardingSupport.modelHint(harness: "codex", model: "alex/gpt-5").contains("-m alex/gpt-5"))
         #expect(OnboardingSupport.modelHint(harness: "pi", model: "alex/gpt-5").contains("/model alex/gpt-5"))
+        #expect(OnboardingSupport.modelHint(harness: "amp", model: "alex/gpt-5")
+            .contains("alex wrap amp"))
     }
 
     @Test func harnessTestCommands() {
@@ -70,6 +72,8 @@ struct OnboardingSupportTests {
             "kimi -m alex/kimi-k2 -p \"test\"")
         #expect(OnboardingSupport.testCommand(harness: "codex", model: "alex/gpt-5") ==
             "codex --profile alex exec --skip-git-repo-check -m alex/gpt-5 \"test\"")
+        #expect(OnboardingSupport.testCommand(harness: "amp", model: "alex/gpt-5") ==
+            "alex wrap amp -- -x \"test\"")
     }
 
     @Test func environmentUsesLiveDaemonBaseURL() {

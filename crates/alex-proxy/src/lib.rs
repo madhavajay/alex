@@ -2762,13 +2762,13 @@ async fn admin_auth_openrouter_key(
         None => false,
     };
     if remove {
-        let has_configuration = ["key", "http_referer", "x_title"]
+        let has_configuration = ["key", "display_name", "http_referer", "x_title"]
             .iter()
             .any(|field| body.0.get(*field).is_some_and(|value| !value.is_null()));
         if has_configuration {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "'remove' cannot be combined with 'key', 'http_referer', or 'x_title'",
+                "'remove' cannot be combined with key configuration",
             );
         }
         return match alex_auth::remove_openrouter_api_key(&state.vault).await {
@@ -2787,7 +2787,7 @@ async fn admin_auth_openrouter_key(
     else {
         return error_response(StatusCode::BAD_REQUEST, "missing 'key'");
     };
-    for field in ["http_referer", "x_title"] {
+    for field in ["display_name", "http_referer", "x_title"] {
         if body
             .0
             .get(field)
@@ -2799,14 +2799,29 @@ async fn admin_auth_openrouter_key(
             );
         }
     }
-    match alex_auth::save_openrouter_api_key(
-        &state.vault,
-        key,
-        body.0["http_referer"].as_str(),
-        body.0["x_title"].as_str(),
-    )
-    .await
+    let saved = if let Some(display_name) = body.0["display_name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
     {
+        alex_auth::save_named_openrouter_api_key(
+            &state.vault,
+            display_name,
+            key,
+            body.0["http_referer"].as_str(),
+            body.0["x_title"].as_str(),
+        )
+        .await
+    } else {
+        alex_auth::save_openrouter_api_key(
+            &state.vault,
+            key,
+            body.0["http_referer"].as_str(),
+            body.0["x_title"].as_str(),
+        )
+        .await
+    };
+    match saved {
         Ok(id) => axum::Json(json!({"saved": id})).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
@@ -12950,6 +12965,7 @@ mod tests {
             _verifier: String,
             input: String,
             _account_name: String,
+            _auto_identity: bool,
         ) -> alex_auth::sessions::PasteCodeExchangeFuture {
             self.inputs.lock().unwrap().push(input);
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -12973,6 +12989,7 @@ mod tests {
             _verifier: String,
             _input: String,
             _account_name: String,
+            _auto_identity: bool,
         ) -> alex_auth::sessions::PasteCodeExchangeFuture {
             let account_id = self.account_id.clone();
             Box::pin(async move {
@@ -16005,6 +16022,30 @@ mod tests {
         );
         assert_eq!(account.account_meta["x_title"], "Alexandria");
 
+        let named: Value = client
+            .post(&endpoint)
+            .header("x-api-key", "alx-local")
+            .json(&json!({
+                "key": "or-work-secret",
+                "display_name": "Work"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(named["saved"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("openrouter-api-key-")));
+        assert!(state.vault.list().await.iter().any(|account| {
+            account.provider == Provider::Openrouter
+                && account.label.as_deref() == Some("Work")
+                && account.api_key.as_deref() == Some("or-work-secret")
+        }));
+
         let removed: Value = client
             .post(&endpoint)
             .header("x-api-key", "alx-local")
@@ -16023,7 +16064,10 @@ mod tests {
             .list()
             .await
             .iter()
-            .all(|account| account.provider != Provider::Openrouter));
+            .all(|account| account.id != "openrouter-api-key"));
+        assert!(state.vault.list().await.iter().any(|account| {
+            account.provider == Provider::Openrouter && account.label.as_deref() == Some("Work")
+        }));
 
         server.abort();
     }

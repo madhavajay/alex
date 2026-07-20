@@ -28,15 +28,21 @@ private struct ReauthNotifyBody: Encodable {
 
 private struct OpenRouterKeyBody: Encodable {
     let key: String?
+    let displayName: String?
     let httpReferer: String?
     let xTitle: String?
     let remove: Bool?
 
     enum CodingKeys: String, CodingKey {
         case key, remove
+        case displayName = "display_name"
         case httpReferer = "http_referer"
         case xTitle = "x_title"
     }
+}
+
+private struct OpenRouterKeyResponse: Decodable {
+    let saved: String
 }
 
 private struct OpenRouterExposedBody: Encodable {
@@ -861,14 +867,18 @@ public struct AlexandriaClient: Sendable {
         _ = try await request("admin/auth/gemini-key", method: "POST", body: body(["key": key]))
     }
 
+    @discardableResult
     public func setOpenRouterKey(
-        _ key: String, httpReferer: String? = nil, xTitle: String? = nil
-    ) async throws {
-        _ = try await request(
+        _ key: String, displayName: String? = nil,
+        httpReferer: String? = nil, xTitle: String? = nil
+    ) async throws -> String {
+        let data = try await request(
             "admin/auth/openrouter-key",
             method: "POST",
             body: body(OpenRouterKeyBody(
-                key: key, httpReferer: httpReferer, xTitle: xTitle, remove: nil)))
+                key: key, displayName: displayName, httpReferer: httpReferer,
+                xTitle: xTitle, remove: nil)))
+        return try JSONDecoder().decode(OpenRouterKeyResponse.self, from: data).saved
     }
 
     public func removeOpenRouterKey() async throws {
@@ -876,6 +886,6 @@ public struct AlexandriaClient: Sendable {
             "admin/auth/openrouter-key",
             method: "POST",
             body: body(OpenRouterKeyBody(
-                key: nil, httpReferer: nil, xTitle: nil, remove: true)))
+                key: nil, displayName: nil, httpReferer: nil, xTitle: nil, remove: true)))
     }
 }

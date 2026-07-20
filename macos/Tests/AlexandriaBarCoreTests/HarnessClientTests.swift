@@ -193,6 +193,7 @@ import Testing
             let json = try #require(
                 JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
             #expect(json["key"] as? String == "or-secret")
+            #expect(json["display_name"] as? String == "Personal")
             #expect(json["http_referer"] as? String == "https://alexandria.example")
             #expect(json["x_title"] as? String == "Alexandria")
             #expect(json["remove"] == nil)
@@ -208,10 +209,11 @@ import Testing
             config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
             session: URLSession(configuration: cfg))
 
-        try await client.setOpenRouterKey(
-            "or-secret",
+        let saved = try await client.setOpenRouterKey(
+            "or-secret", displayName: "Personal",
             httpReferer: "https://alexandria.example",
             xTitle: "Alexandria")
+        #expect(saved == "openrouter-api-key")
     }
 
     @Test func openRouterKeyRemovalPostsNoSecret() async throws {

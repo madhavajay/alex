@@ -559,7 +559,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self?.confirmStartCodexWindow()
             }
         }
-        if account.provider == "openai" {
+        if ["anthropic", "openai", "gemini", "xai", "kimi", "amp"]
+            .contains(account.provider)
+        {
             sub.addItem(.separator())
             action("Add another \(name) account…", symbol: "person.badge.plus") { [weak self] in
                 self?.addAnotherAccount(provider: account.provider)
@@ -838,7 +840,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func addAnotherAccount(provider: String) {
-        guard provider == "openai" else { return }
         openAuth(provider: provider, accountName: nil, autoIdentity: true)
     }
 

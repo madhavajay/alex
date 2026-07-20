@@ -3,6 +3,14 @@ import SwiftUI
 import Observation
 import AlexandriaBarCore
 
+private enum OnboardingSetupError: LocalizedError {
+    case message(String)
+
+    var errorDescription: String? {
+        switch self { case .message(let message): message }
+    }
+}
+
 @MainActor
 @Observable
 final class OnboardingModel {
@@ -37,8 +45,10 @@ final class OnboardingModel {
     var selectedProvider: String?
     var selectedProviderAccountID: String?
     var addingProviderAccount = false
-    var newProviderAccountName = ""
-    var newProviderAccountNameError: String?
+    var openRouterAccountName = ""
+    var openRouterAPIKey = ""
+    var revealOpenRouterAPIKey = false
+    var exoEndpoint = "http://localhost:52415"
     var selectedHarness: String?
     var authModel: AuthFlowModel?
     var providerState: OperationState = .idle
@@ -141,8 +151,6 @@ final class OnboardingModel {
         authModel?.cancel()
         authModel = nil
         addingProviderAccount = false
-        newProviderAccountName = ""
-        newProviderAccountNameError = nil
         selectedProviderAccountID = account.id
         providerState = .working(
             account.provider == "anthropic"
@@ -157,46 +165,17 @@ final class OnboardingModel {
         selectedProviderAccountID = nil
         providerState = .idle
         if provider == "openrouter" || provider == "exo" {
-            let name = ProviderInfo.displayName(provider)
-            providerState = .failure(
-                "\(name) is configured in Settings → Providers. Finish setup there, then skip this step to continue.")
-            openProviderSettings()
-            return
-        }
-
-        // Codex can derive a stable local identity from the upstream account.
-        // Other providers need a distinct local nickname once `default`
-        // already exists, so ask before beginning OAuth instead of replacing it.
-        if provider != "openai", !accounts(for: provider).isEmpty {
             addingProviderAccount = true
-            newProviderAccountName = ""
-            newProviderAccountNameError = nil
             return
         }
         beginProviderAuthorization(provider: provider, accountName: nil)
-    }
-
-    func confirmAddProviderAccount() {
-        guard let provider = selectedProvider else { return }
-        let name = newProviderAccountName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard name.range(of: #"^[a-z0-9_-]{1,32}$"#, options: .regularExpression) != nil else {
-            newProviderAccountNameError = "Use 1–32 lowercase letters, numbers, dashes, or underscores."
-            return
-        }
-        guard !accounts(for: provider).contains(where: { $0.name == name }) else {
-            newProviderAccountNameError = "That local account name is already in use."
-            return
-        }
-        addingProviderAccount = false
-        newProviderAccountNameError = nil
-        beginProviderAuthorization(provider: provider, accountName: name)
     }
 
     private func beginProviderAuthorization(provider: String, accountName: String?) {
         providerState = .working("Starting secure authorization…")
         let auth = AuthFlowModel(
             provider: provider, accountName: accountName,
-            autoIdentity: provider == "openai", store: store)
+            autoIdentity: accountName == nil, store: store)
         auth.onAuthenticated = { [weak self] authenticatedProvider in
             guard let self, self.selectedProvider == authenticatedProvider else { return }
             Task {
@@ -218,12 +197,87 @@ final class OnboardingModel {
         auth.begin()
     }
 
+    func connectOpenRouter() {
+        let name = openRouterAccountName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            providerState = .failure("Enter a name for this OpenRouter key.")
+            return
+        }
+        guard !key.isEmpty else {
+            providerState = .failure("Enter an OpenRouter API key.")
+            return
+        }
+        guard let config = store.config ?? DaemonDiscovery.load() else {
+            providerState = .failure("The Alex daemon configuration is not available.")
+            return
+        }
+        providerState = .working("Saving the OpenRouter key…")
+        Task {
+            do {
+                let id = try await AlexandriaClient(config: config).setOpenRouterKey(
+                    key, displayName: name)
+                openRouterAPIKey = ""
+                revealOpenRouterAPIKey = false
+                await refreshStore()
+                guard selectedProvider == "openrouter" else { return }
+                selectedProviderAccountID = id
+                addingProviderAccount = false
+                let account = store.accounts.first { $0.id == id }
+                providerState = .success(accountIdentity(account, provider: "openrouter"))
+            } catch {
+                guard selectedProvider == "openrouter" else { return }
+                providerState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
+    func connectExo() {
+        let endpoint = exoEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: endpoint), ["http", "https"].contains(url.scheme?.lowercased()) else {
+            providerState = .failure("Enter a valid http:// or https:// Exo endpoint.")
+            return
+        }
+        guard let config = store.config ?? DaemonDiscovery.load() else {
+            providerState = .failure("The Alex daemon configuration is not available.")
+            return
+        }
+        providerState = .working("Checking the Exo endpoint…")
+        Task {
+            do {
+                let client = AlexandriaClient(config: config)
+                let current = (try? await client.exoConfig()) ?? ExoConfig()
+                _ = try await client.updateExoConfig(ExoConfig(
+                    url: endpoint, enabledModels: current.enabledModels))
+                let status = try await client.exoStatus()
+                guard status.running else {
+                    throw OnboardingSetupError.message(
+                        status.error ?? "Exo did not respond at \(endpoint).")
+                }
+                let models = try await client.exoModels()
+                if current.enabledModels.isEmpty, !models.isEmpty {
+                    _ = try await client.updateExoConfig(ExoConfig(
+                        url: endpoint, enabledModels: models.map(\.id)))
+                }
+                await refreshStore()
+                guard selectedProvider == "exo" else { return }
+                addingProviderAccount = false
+                providerState = .success(
+                    "Exo online — \(models.count) model\(models.count == 1 ? "" : "s") found")
+            } catch {
+                guard selectedProvider == "exo" else { return }
+                providerState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
     private func resetProviderDependentState() {
         pollTask?.cancel()
         selectedProviderAccountID = nil
         addingProviderAccount = false
-        newProviderAccountName = ""
-        newProviderAccountNameError = nil
+        openRouterAccountName = ""
+        openRouterAPIKey = ""
+        revealOpenRouterAPIKey = false
         traceState = .idle
         traceCheckRunning = false
         discoveredTrace = nil
@@ -627,10 +681,16 @@ struct OnboardingView: View {
         VStack(spacing: 0) {
             header
             Divider().overlay(AlexTheme.Colors.cardBorder)
-            ScrollView {
-                stepContent
-                    .padding(30)
-                    .frame(maxWidth: .infinity, minHeight: 410, alignment: .topLeading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Color.clear.frame(height: 0).id("onboarding-step-top")
+                    stepContent
+                        .padding(30)
+                        .frame(maxWidth: .infinity, minHeight: 410, alignment: .topLeading)
+                }
+                .onChange(of: model.step) { _, _ in scrollToStepTop(proxy) }
+                .onChange(of: model.selectedProvider) { _, _ in scrollToStepTop(proxy) }
+                .onChange(of: model.addingProviderAccount) { _, _ in scrollToStepTop(proxy) }
             }
             Divider().overlay(AlexTheme.Colors.cardBorder)
             footer
@@ -641,6 +701,13 @@ struct OnboardingView: View {
         .onMoveCommand { direction in
             if direction == .left { model.back() }
             if direction == .right { model.next() }
+        }
+    }
+
+    private func scrollToStepTop(_ proxy: ScrollViewProxy) {
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo("onboarding-step-top", anchor: .top)
         }
     }
 
@@ -710,7 +777,19 @@ struct OnboardingView: View {
                     ) { model.chooseProvider(provider) }
                 }
             }
-            if let authModel = model.authModel {
+            if let provider = model.selectedProvider,
+               model.addingProviderAccount,
+               provider == "openrouter"
+            {
+                openRouterOnboarding
+                operation(model.providerState)
+            } else if let provider = model.selectedProvider,
+                      model.addingProviderAccount,
+                      provider == "exo"
+            {
+                exoOnboarding
+                operation(model.providerState)
+            } else if let authModel = model.authModel {
                 HStack(spacing: 10) {
                     Text("Authenticating \(ProviderInfo.displayName(authModel.provider))")
                         .font(.system(size: 12, weight: .medium))
@@ -730,11 +809,76 @@ struct OnboardingView: View {
                       !model.accounts(for: provider).isEmpty
             {
                 providerAccountChooser(provider)
-                operation(model.providerState)
+                if !model.providerState.isSuccess {
+                    operation(model.providerState)
+                }
             } else {
                 operation(model.providerState)
             }
         }
+    }
+
+    private var openRouterOnboarding: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Connect OpenRouter")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("OpenRouter keys do not include an account identity, so give this key a recognizable name.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            TextField("Account name, e.g. Personal", text: $model.openRouterAccountName)
+                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 8) {
+                Group {
+                    if model.revealOpenRouterAPIKey {
+                        TextField("OpenRouter API key", text: $model.openRouterAPIKey)
+                    } else {
+                        SecureField("OpenRouter API key", text: $model.openRouterAPIKey)
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+                .font(AlexTheme.Fonts.mono(11))
+                PillButton(
+                    title: model.revealOpenRouterAPIKey ? "Hide" : "Show",
+                    variant: .bordered,
+                    systemImage: model.revealOpenRouterAPIKey ? "eye.slash" : "eye"
+                ) { model.revealOpenRouterAPIKey.toggle() }
+            }
+            PillButton(
+                title: "Save and connect", variant: .solidAccent,
+                systemImage: "key",
+                isEnabled: !model.providerState.isWorking
+                    && !model.openRouterAccountName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !model.openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                isBusy: model.providerState.isWorking
+            ) { model.connectOpenRouter() }
+        }
+        .padding(12)
+        .cardStyle()
+    }
+
+    private var exoOnboarding: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Connect Exo")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("Enter the Exo API endpoint. Alex will save it and verify that it responds before continuing.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            TextField("http://localhost:52415", text: $model.exoEndpoint)
+                .textFieldStyle(.roundedBorder)
+                .font(AlexTheme.Fonts.mono(11))
+                .onSubmit { model.connectExo() }
+            PillButton(
+                title: "Check and connect", variant: .solidAccent,
+                systemImage: "network",
+                isEnabled: !model.providerState.isWorking
+                    && !model.exoEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                isBusy: model.providerState.isWorking
+            ) { model.connectExo() }
+        }
+        .padding(12)
+        .cardStyle()
     }
 
     private func providerAccountChooser(_ provider: String) -> some View {
@@ -780,36 +924,10 @@ struct OnboardingView: View {
                 .buttonStyle(.plain)
             }
 
-            if model.addingProviderAccount {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Local nickname for the new account")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(AlexTheme.Colors.textSecondary)
-                    HStack(spacing: 8) {
-                        TextField("work", text: $model.newProviderAccountName)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { model.confirmAddProviderAccount() }
-                        PillButton(
-                            title: "Continue", variant: .solidAccent,
-                            isEnabled: !model.newProviderAccountName.isEmpty
-                        ) { model.confirmAddProviderAccount() }
-                    }
-                    if let error = model.newProviderAccountNameError {
-                        Text(error)
-                            .font(.system(size: 11))
-                            .foregroundStyle(AlexTheme.Colors.destructive)
-                    }
-                }
-                .padding(10)
-                .background(
-                    RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
-                        .fill(AlexTheme.Colors.overlay(0.035)))
-            } else {
-                PillButton(
-                    title: "Add another \(ProviderInfo.displayName(provider)) account",
-                    variant: .bordered, systemImage: "plus"
-                ) { model.addProviderAccount() }
-            }
+            PillButton(
+                title: "Add another \(ProviderInfo.displayName(provider)) account",
+                variant: .bordered, systemImage: "plus"
+            ) { model.addProviderAccount() }
         }
         .padding(12)
         .cardStyle()

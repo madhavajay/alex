@@ -417,6 +417,79 @@ async fn save_named_login_account(
     Ok(id)
 }
 
+/// Stable upstream identity for an OAuth account. Prefer a provider-issued
+/// account id, then the verified/display email, then the OIDC subject carried
+/// by a token returned directly from the provider's token endpoint.
+fn automatic_account_identity(account: &Account) -> Option<String> {
+    let provider = account.provider.as_str();
+    if let Some(account_id) = account
+        .account_meta
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("{provider}:account:{account_id}"));
+    }
+    if let Some(email) = account.email() {
+        return Some(format!("{provider}:email:{email}"));
+    }
+    [account.id_token.as_deref(), account.access_token.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|token| {
+            jwt_payload(token)
+                .and_then(|payload| payload.get("sub").and_then(Value::as_str).map(String::from))
+        })
+        .map(|subject| format!("{provider}:subject:{subject}"))
+}
+
+/// Save a subscription login without asking the user for a local nickname.
+/// A fresh upstream identity gets a generated local id; logging into the same
+/// identity again replaces its credentials while retaining its local routing
+/// history and settings.
+async fn save_auto_login_account(vault: &Vault, mut account: Account) -> Result<String> {
+    let identity = automatic_account_identity(&account).with_context(|| {
+        format!(
+            "{} login succeeded but no account identity or email was returned",
+            account.provider.as_str()
+        )
+    })?;
+    let existing = vault.list().await.into_iter().find(|candidate| {
+        candidate.provider == account.provider
+            && candidate.kind == account.kind
+            && automatic_account_identity(candidate).as_deref() == Some(identity.as_str())
+    });
+    if let Some(existing) = existing {
+        if let (Some(old), Some(new)) = (
+            existing.account_meta.as_object(),
+            account.account_meta.as_object_mut(),
+        ) {
+            for (key, value) in old {
+                new.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        account.id = existing.id;
+        account.name = existing.name;
+        account.description = account.description.or(existing.description);
+        account.paused = existing.paused;
+        account.cooldown_until_ms = None;
+        account.path = existing.path;
+    } else {
+        let digest = Sha256::digest(identity.as_bytes());
+        let suffix: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        account.name = format!("acct-{suffix}");
+        account.id = named_account_id(account.provider, &account.kind, &account.name);
+        account.path = None;
+    }
+    let id = account.id.clone();
+    vault.upsert(account).await?;
+    Ok(id)
+}
+
 /// Amp auth: prefer importing CLI secrets, else AMP_API_KEY env, else paste prompt.
 async fn login_amp(vault: &Vault) -> Result<String> {
     let imported = import_amp(vault).await;
@@ -454,11 +527,11 @@ async fn login_amp(vault: &Vault) -> Result<String> {
     save_amp_api_key(vault, key).await
 }
 
-pub async fn claude_exchange(
+async fn claude_exchange_with_identity(
     vault: &Vault,
     verifier: &str,
     input: &str,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     let (code, state) = parse_authorization_input(input);
     let code = code.ok_or_else(|| anyhow!("no authorization code provided"))?;
@@ -521,7 +594,23 @@ pub async fn claude_exchange(
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn claude_exchange(
+    vault: &Vault,
+    verifier: &str,
+    input: &str,
+    account_name: &str,
+) -> Result<String> {
+    claude_exchange_with_identity(vault, verifier, input, Some(account_name)).await
+}
+
+pub async fn claude_exchange_auto(vault: &Vault, verifier: &str, input: &str) -> Result<String> {
+    claude_exchange_with_identity(vault, verifier, input, None).await
 }
 
 async fn login_claude(vault: &Vault, account_name: &str) -> Result<String> {
@@ -1074,12 +1163,12 @@ pub fn gemini_authorize_url(challenge: &str, state: &str, redirect_uri: &str) ->
     url.to_string()
 }
 
-pub async fn gemini_exchange(
+async fn gemini_exchange_with_identity(
     vault: &Vault,
     verifier: &str,
     redirect_uri: &str,
     code: &str,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     let resp = reqwest::Client::new()
         .post(crate::GOOGLE_TOKEN_URL)
@@ -1122,7 +1211,29 @@ pub async fn gemini_exchange(
         status: "active".into(),
         path: None,
     };
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn gemini_exchange(
+    vault: &Vault,
+    verifier: &str,
+    redirect_uri: &str,
+    code: &str,
+    account_name: &str,
+) -> Result<String> {
+    gemini_exchange_with_identity(vault, verifier, redirect_uri, code, Some(account_name)).await
+}
+
+pub async fn gemini_exchange_auto(
+    vault: &Vault,
+    verifier: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<String> {
+    gemini_exchange_with_identity(vault, verifier, redirect_uri, code, None).await
 }
 
 pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
@@ -1270,10 +1381,10 @@ pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> 
     }
 }
 
-pub async fn xai_upsert_from_tokens(
+async fn xai_upsert_from_tokens_with_identity(
     vault: &Vault,
     tokens: &XaiTokens,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     // Prefer xAI's HTTPS OIDC userinfo response over locally decoded JWT
     // claims. The latter are not signature-verified here.
@@ -1312,7 +1423,22 @@ pub async fn xai_upsert_from_tokens(
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn xai_upsert_from_tokens(
+    vault: &Vault,
+    tokens: &XaiTokens,
+    account_name: &str,
+) -> Result<String> {
+    xai_upsert_from_tokens_with_identity(vault, tokens, Some(account_name)).await
+}
+
+pub async fn xai_upsert_from_tokens_auto(vault: &Vault, tokens: &XaiTokens) -> Result<String> {
+    xai_upsert_from_tokens_with_identity(vault, tokens, None).await
 }
 
 async fn login_grok(vault: &Vault, account_name: &str) -> Result<String> {
@@ -1528,6 +1654,17 @@ pub async fn kimi_upsert_from_tokens(
     save_named_login_account(vault, account, account_name).await
 }
 
+pub async fn kimi_upsert_from_tokens_auto(vault: &Vault, tokens: &KimiTokens) -> Result<String> {
+    let account = crate::kimi_account_from_credentials(
+        tokens.access_token.clone(),
+        tokens.refresh_token.clone(),
+        None,
+        tokens.expires_in,
+        tokens.scope.clone(),
+    );
+    save_auto_login_account(vault, account).await
+}
+
 async fn login_kimi(vault: &Vault, account_name: &str) -> Result<String> {
     let http = reqwest::Client::new();
     let start = match kimi_device_start(&http).await {
@@ -1651,6 +1788,57 @@ mod tests {
                 .find(|account| account.id == "anthropic-oauth-work")
                 .and_then(|account| account.access_token.as_deref()),
             Some("work-token")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn identified_claude_account(token: &str, email: &str) -> Account {
+        let mut account = test_claude_account(token);
+        account.description = Some(email.into());
+        account.label = Some(format!("claude ({email})"));
+        account.account_meta = json!({"email": email, "scopes": []});
+        account
+    }
+
+    #[tokio::test]
+    async fn automatic_subscription_identity_adds_new_and_replaces_same_login() {
+        let dir = std::env::temp_dir().join(format!(
+            "alexandria-auto-subscription-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let vault = Vault::open(dir.clone()).unwrap();
+
+        let first_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("first-token", "person@example.com"),
+        )
+        .await
+        .unwrap();
+        let second_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("second-token", "work@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(vault.list().await.len(), 2);
+
+        let replaced_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("fresh-token", "PERSON@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced_id, first_id);
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.id == first_id)
+                .and_then(|account| account.access_token.as_deref()),
+            Some("fresh-token")
         );
         std::fs::remove_dir_all(dir).ok();
     }

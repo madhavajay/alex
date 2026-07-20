@@ -38,8 +38,6 @@ struct ProvidersPreferencesSection: View {
     let store: SnapshotStore
     let onAuthenticate: (String, String?, Bool, Bool) -> Void
     @State private var selectedProvider: String? = "openai"
-    @State private var providerAwaitingName: String?
-    @State private var newAccountName = ""
     @AppStorage("ProvidersChartRange") private var chartRangeValue =
         ProvidersChartRange.twentyFourHours.rawValue
     @State private var accountAnalyticsLoadID: UUID?
@@ -179,59 +177,6 @@ struct ProvidersPreferencesSection: View {
             else { return }
             chartRangeValue = ProvidersChartRange.twentyFourHours.rawValue
         }
-        .sheet(
-            isPresented: Binding(
-                get: { providerAwaitingName != nil },
-                set: { if !$0 { providerAwaitingName = nil } }
-            )
-        ) {
-            if let provider = providerAwaitingName {
-                accountNameSheet(provider)
-            }
-        }
-    }
-
-    /// Adding a second account to a provider needs a distinct local name —
-    /// the first login owns the compatible `default` identifier.
-    private func accountNameSheet(_ provider: String) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Add another \(ProviderInfo.displayName(provider)) account")
-                .font(AlexTheme.Fonts.panelTitle)
-                .foregroundStyle(AlexTheme.Colors.foreground)
-            Text("Give this subscription a local name so you can choose, pause, and order it later.")
-                .font(.system(size: 12))
-                .foregroundStyle(AlexTheme.Colors.textTertiary)
-            TextField("e.g. work", text: $newAccountName)
-                .textFieldStyle(.roundedBorder)
-                .font(AlexTheme.Fonts.mono(11))
-            Text("Lowercase letters, numbers, _ and - only.")
-                .font(.system(size: 10))
-                .foregroundStyle(AlexTheme.Colors.textTertiary)
-            HStack(spacing: 8) {
-                Spacer()
-                PillButton(
-                    title: "Cancel", variant: .bordered,
-                    keyboardShortcut: .cancelAction
-                ) {
-                    providerAwaitingName = nil
-                    newAccountName = ""
-                }
-                PillButton(
-                    title: "Continue", variant: .primary,
-                    isEnabled: newAccountName.range(
-                        of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil,
-                    keyboardShortcut: .defaultAction
-                ) {
-                    let name = newAccountName
-                    providerAwaitingName = nil
-                    newAccountName = ""
-                    onAuthenticate(provider, name, false, false)
-                }
-            }
-        }
-        .padding(20)
-        .frame(width: 400)
-        .background(AlexTheme.Colors.background)
     }
 
     /// Provider sidebar (§1.26 of the design spec): brand dot rows with a
@@ -349,18 +294,10 @@ struct ProvidersPreferencesSection: View {
             // First-class provider details own local endpoint/API-key setup.
             selectedProvider = provider
         default:
-            // OAuth-login providers (anthropic/openai/gemini/xai/kimi) run the
-            // device/browser auth flow; amp adopts its CLI credentials via the
-            // same window's import path. The first account keeps the compatible
-            // `default` name; adding another to the same provider needs a
-            // distinct local name, so prompt for one.
-            if ProviderPresentation.hasAccount(for: provider, in: displayedAccounts),
-                provider != "openai"
-            {
-                providerAwaitingName = provider
-            } else {
-                onAuthenticate(provider, nil, provider == "openai", false)
-            }
+            // Subscription providers derive identity after browser/device
+            // authentication. New upstream identities are added; signing into
+            // the same identity replaces that account's credentials.
+            onAuthenticate(provider, nil, true, false)
         }
     }
 
@@ -451,9 +388,7 @@ private struct ProviderPreferencesDetail: View {
         Dictionary(uniqueKeysWithValues: (routing?.accounts ?? []).map { ($0.accountId, $0) })
     }
 
-    private var showsAddAccount: Bool {
-        provider == "openai" || accounts.isEmpty
-    }
+    private var showsAddAccount: Bool { true }
 
     /// Stable per-account series/bar color, assigned by list position.
     private func accountColor(_ accountId: String) -> Color {
