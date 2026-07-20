@@ -525,7 +525,7 @@ final class OnboardingModel {
         let harness = selectedHarness?.lowercased()
         if let match = sessions
             .filter({ $0.lastTsMs >= since })
-            .filter({ harness == nil || $0.harness?.lowercased() == harness })
+            .filter({ OnboardingSupport.traceMatchesHarness($0, harness: harness) })
             .max(by: { $0.lastTsMs < $1.lastTsMs })
         {
             let initial = OnboardingSupport.traceOutcome(

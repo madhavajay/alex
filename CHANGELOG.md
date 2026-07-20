@@ -15,6 +15,9 @@ predate this file — see the git history and GitHub releases.
   out of the provider step cancels the old flow and restores a clean chooser.
   This fixes Gemini's expanded loopback screen remaining selected across
   Back/Next navigation.
+- **Kimi test requests unlock onboarding.** Trace matching now recognizes the
+  canonical `harness=kimi` tag even when the session field contains Kimi's
+  versioned `kimi-code-cli/*` user agent.
 
 ## [0.1.29-beta.7] - 2026-07-20
 

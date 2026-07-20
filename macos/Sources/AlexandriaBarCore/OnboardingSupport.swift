@@ -108,6 +108,15 @@ public enum OnboardingSupport {
         return .rejected("Provider returned an error")
     }
 
+    /// Match the copied onboarding command using the same field-or-tag logic
+    /// as Trace Browser. Some harnesses expose a versioned user agent in the
+    /// session field (for example `kimi-code-cli/0.27.0`) while Alex stores the
+    /// canonical connection name (`kimi`) in the trace tags.
+    public static func traceMatchesHarness(_ session: TraceSession, harness: String?) -> Bool {
+        guard let harness, !harness.isEmpty else { return true }
+        return OmniQuery.parse("harness:\(harness)").matches(session)
+    }
+
     public static func fallbackModels(for provider: String?) -> [String] {
         switch provider?.lowercased() {
         case "anthropic": ["alex/claude-sonnet-4", "alex/claude-opus-4"]

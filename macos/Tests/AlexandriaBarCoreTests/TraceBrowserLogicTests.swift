@@ -122,6 +122,16 @@ import Testing
         #expect(!OmniQuery.parse("tag:x").matches(untagged))
     }
 
+    @Test func onboardingHarnessMatchAcceptsVersionedKimiUserAgent() {
+        let kimi = makeSession(
+            id: "auto-456d7766a9aa8ea2", models: ["gpt-5.6-sol"],
+            harness: "kimi-code-cli/0.27.0", runId: nil, lastStatus: 200,
+            tags: ["harness": "kimi"])
+        #expect(OnboardingSupport.traceMatchesHarness(kimi, harness: "kimi"))
+        #expect(!OnboardingSupport.traceMatchesHarness(kimi, harness: "codex"))
+        #expect(OnboardingSupport.traceMatchesHarness(kimi, harness: nil))
+    }
+
     @Test func freeTextMatchesTagValues() {
         let tagged = makeSession(
             id: "sess-4", models: nil, harness: nil, runId: nil, lastStatus: nil,
