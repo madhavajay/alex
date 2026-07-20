@@ -1,18 +1,26 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::time::Duration;
 
-use alex_core::{build_resume_context_from_captures, ClientFormat, ResumeCapture, ResumeContext};
+use alex_core::{
+    build_resume_context_from_captures, ClientFormat, ResumeCapture, ResumeContext, ResumeEntry,
+};
 use alex_store::{SessionForkRecord, Store, TraceFilter};
 use anyhow::{bail, Context, Result};
+use chrono::{SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde_json::Value;
+use serde_json::{json, Value};
+use toml_edit::DocumentMut;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{harness_connect, now_ms, ui, Config, RawModeGuard};
 
@@ -22,6 +30,7 @@ const RESUME_CONTEXT_MAX_CHARS: usize = 200_000;
 const RESUME_PROMPT_MAX_BYTES: usize = 96 * 1024;
 const RESUME_HARNESSES: &[&str] = &["pi", "claude", "codex"];
 const FORK_DISCOVERY_LIMIT: usize = 100;
+const PI_SESSION_VERSION: u64 = 3;
 
 #[derive(Debug)]
 struct CapturedExchange {
@@ -36,6 +45,7 @@ struct ResumeSource {
     session_id: String,
     harness: String,
     captures: Vec<CapturedExchange>,
+    requested_model: Option<String>,
     routed_model: Option<String>,
     trace_count: usize,
     warnings: Vec<String>,
@@ -56,6 +66,27 @@ struct LaunchPlan {
     args: Vec<OsString>,
     cwd: PathBuf,
     config_dir: PathBuf,
+    model: ModelSelection,
+    mode: ResumeMode,
+}
+
+#[derive(Debug, Clone)]
+struct ModelSelection {
+    model: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+enum ResumeMode {
+    PromptPaste { reason: String },
+    NativePi(PiSessionDraft),
+}
+
+#[derive(Debug)]
+struct PiSessionDraft {
+    id: String,
+    path: PathBuf,
+    jsonl: String,
 }
 
 pub(crate) async fn resume_cmd(
@@ -63,6 +94,8 @@ pub(crate) async fn resume_cmd(
     session_id: &str,
     requested_harness: Option<&str>,
     source_harness: Option<&str>,
+    requested_model: Option<&str>,
+    paste: bool,
     dry_run: bool,
 ) -> Result<()> {
     let session_id = session_id.trim();
@@ -82,7 +115,16 @@ pub(crate) async fn resume_cmd(
             source.session_id
         );
     }
-    let plan = build_launch_plan(config, &target, &source, &directory.path, &prompt)?;
+    let plan = build_launch_plan(
+        config,
+        &target,
+        &source,
+        &context,
+        &directory.path,
+        &prompt,
+        requested_model,
+        paste,
+    )?;
 
     print_resume_summary(&source, &context, &directory, &plan, dry_run);
     if dry_run {
@@ -225,11 +267,16 @@ fn load_resume_source(
         .iter()
         .rev()
         .find_map(|row| row["routed_model"].as_str().map(String::from));
+    let requested_model = rows
+        .iter()
+        .rev()
+        .find_map(|row| row["requested_model"].as_str().map(String::from));
 
     Ok(ResumeSource {
         session_id: session_id.to_string(),
         harness,
         captures,
+        requested_model,
         routed_model,
         trace_count: rows.len(),
         warnings,
@@ -415,76 +462,664 @@ fn build_launch_plan(
     config: &Config,
     target: &str,
     source: &ResumeSource,
+    context: &ResumeContext,
     cwd: &Path,
     prompt: &str,
+    requested_model: Option<&str>,
+    paste: bool,
 ) -> Result<LaunchPlan> {
     let spec = harness_connect::spec_by_name(target)
         .with_context(|| format!("unknown harness '{target}'"))?;
     let config_dir = harness_connect::resolve_config_dir(config, spec, None);
     let binary = harness_connect::resolve_harness_binary(config, spec)
         .with_context(|| format!("{target} is not installed or not on PATH"))?;
+    let model = select_resume_model(target, &config_dir, source, requested_model)?;
     let mut args = match target {
-        "pi" => {
-            let model = pi_resume_model(&config_dir, source.routed_model.as_deref())?;
-            vec![
-                OsString::from("--provider"),
-                OsString::from("alexandria"),
-                OsString::from("--model"),
-                OsString::from(model),
-            ]
-        }
+        "pi" => vec![
+            OsString::from("--provider"),
+            OsString::from("alexandria"),
+            OsString::from("--model"),
+            OsString::from(&model.model),
+        ],
         "claude" => vec![
             OsString::from("--settings"),
             config_dir
                 .join(harness_connect::CLAUDE_PROFILE_FILE)
                 .into_os_string(),
+            OsString::from("--model"),
+            OsString::from(&model.model),
         ],
-        "codex" => vec![OsString::from("--profile"), OsString::from("alex")],
+        "codex" => vec![
+            OsString::from("--profile"),
+            OsString::from("alex"),
+            OsString::from("--model"),
+            OsString::from(&model.model),
+        ],
         _ => unreachable!("target validation restricts resume harnesses"),
     };
-    args.push(OsString::from(prompt.replace('\0', "�")));
+    let mode = if target != "pi" {
+        args.push(OsString::from(prompt.replace('\0', "�")));
+        ResumeMode::PromptPaste {
+            reason: "native session injection is Pi-only".into(),
+        }
+    } else if paste {
+        args.push(OsString::from(prompt.replace('\0', "�")));
+        ResumeMode::PromptPaste {
+            reason: "forced by --paste".into(),
+        }
+    } else {
+        match sniff_pi_session_format(&config_dir.join("sessions")) {
+            Ok(()) => {
+                let draft = build_pi_session_draft(&config_dir, cwd, &model.model, context)?;
+                args.push(OsString::from("--session"));
+                args.push(OsString::from(&draft.id));
+                ResumeMode::NativePi(draft)
+            }
+            Err(reason) => {
+                args.push(OsString::from(prompt.replace('\0', "�")));
+                ResumeMode::PromptPaste { reason }
+            }
+        }
+    };
     Ok(LaunchPlan {
         harness: target.to_string(),
         binary,
         args,
         cwd: cwd.to_path_buf(),
         config_dir,
+        model,
+        mode,
     })
 }
 
-fn pi_resume_model(config_dir: &Path, source_model: Option<&str>) -> Result<String> {
-    let models = harness_connect::read_pi_model_ids(config_dir);
+fn select_resume_model(
+    target: &str,
+    config_dir: &Path,
+    source: &ResumeSource,
+    requested_model: Option<&str>,
+) -> Result<ModelSelection> {
+    let models = target_model_ids(target, config_dir);
     if models.is_empty() {
-        bail!("Pi's Alex model catalog is empty; run `alex connect pi` again");
+        bail!("{target}'s Alex model catalog is empty; run `alex connect {target}` again");
     }
-    let normalized_source = source_model.map(|model| {
-        if model.starts_with("alex/") {
-            model.to_string()
-        } else {
-            format!("alex/{model}")
+    if let Some(requested) = requested_model {
+        let normalized = alex_model_id(requested);
+        if models.contains(&normalized) {
+            return Ok(ModelSelection {
+                model: normalized,
+                reason: None,
+            });
         }
-    });
-    if let Some(model) = normalized_source.filter(|model| models.contains(model)) {
-        return Ok(model);
+        bail!("model {requested} is not available in {target}'s Alex model catalog");
     }
-    let settings_path = config_dir.join("settings.json");
-    if let Ok(raw) = std::fs::read_to_string(settings_path) {
-        if let Ok(settings) = serde_json::from_str::<Value>(&raw) {
-            if settings["defaultProvider"].as_str() == Some("alexandria") {
-                if let Some(model) = settings["defaultModel"].as_str() {
-                    let model = if model.starts_with("alex/") {
-                        model.to_string()
-                    } else {
-                        format!("alex/{model}")
-                    };
-                    if models.contains(&model) {
-                        return Ok(model);
-                    }
+
+    let default =
+        target_default_model(target, config_dir, &models).unwrap_or_else(|| models[0].clone());
+    let source_model = source
+        .routed_model
+        .as_deref()
+        .or(source.requested_model.as_deref());
+    if let Some(source_model) = source_model {
+        let normalized = alex_model_id(source_model);
+        if models.contains(&normalized) {
+            return Ok(ModelSelection {
+                model: normalized,
+                reason: None,
+            });
+        }
+        return Ok(ModelSelection {
+            model: default.clone(),
+            reason: Some(format!(
+                "source model {source_model} not available in {target}; using {default}"
+            )),
+        });
+    }
+    Ok(ModelSelection {
+        model: default.clone(),
+        reason: Some(format!(
+            "source session did not record a model; using {target}'s current default {default}"
+        )),
+    })
+}
+
+fn target_model_ids(target: &str, config_dir: &Path) -> Vec<String> {
+    match target {
+        "pi" => harness_connect::read_pi_model_ids(config_dir),
+        "claude" => harness_connect::read_claude_model_ids(config_dir),
+        "codex" => harness_connect::read_codex_model_ids(config_dir),
+        _ => Vec::new(),
+    }
+}
+
+fn alex_model_id(model: &str) -> String {
+    let model = model.trim();
+    let bare = ["alex/", "alexandria/", "cove/", "claude-alex/"]
+        .iter()
+        .find_map(|prefix| model.strip_prefix(prefix))
+        .unwrap_or(model);
+    format!("alex/{bare}")
+}
+
+fn target_default_model(target: &str, config_dir: &Path, models: &[String]) -> Option<String> {
+    let configured = match target {
+        "pi" => std::fs::read_to_string(config_dir.join("settings.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(|settings| settings["defaultProvider"].as_str() == Some("alexandria"))
+            .and_then(|settings| settings["defaultModel"].as_str().map(String::from)),
+        "claude" => std::fs::read_to_string(config_dir.join(harness_connect::CLAUDE_PROFILE_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|settings| settings["model"].as_str().map(String::from)),
+        "codex" => {
+            std::fs::read_to_string(config_dir.join(harness_connect::CODEX_ALEX_PROFILE_FILE))
+                .ok()
+                .and_then(|raw| DocumentMut::from_str(&raw).ok())
+                .and_then(|doc| {
+                    doc.get("model")
+                        .and_then(|item| item.as_str())
+                        .map(String::from)
+                })
+        }
+        _ => None,
+    };
+    configured
+        .map(|model| alex_model_id(&model))
+        .filter(|model| models.contains(model))
+}
+
+fn sniff_pi_session_format(session_root: &Path) -> std::result::Result<(), String> {
+    let recent = most_recent_pi_session(session_root).ok_or_else(|| {
+        format!(
+            "no existing Pi session under {} was available for the format safety check",
+            session_root.display()
+        )
+    })?;
+    let raw = std::fs::read_to_string(&recent).map_err(|error| {
+        format!(
+            "could not read recent Pi session {}: {error}",
+            recent.display()
+        )
+    })?;
+    validate_pi_session_jsonl(&raw)
+        .map_err(|reason| format!("recent Pi session format was not recognized: {reason}"))
+}
+
+fn most_recent_pi_session(root: &Path) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut newest = None;
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                if newest.as_ref().is_none_or(
+                    |(current, _): &(Option<std::time::SystemTime>, PathBuf)| modified > *current,
+                ) {
+                    newest = Some((modified, path));
                 }
             }
         }
     }
-    Ok(models[0].clone())
+    newest.map(|(_, path)| path)
+}
+
+fn validate_pi_session_jsonl(raw: &str) -> std::result::Result<(), String> {
+    let mut values = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(line)
+            .map_err(|error| format!("line {} is not JSON: {error}", index + 1))?;
+        values.push(value);
+    }
+    let header = values
+        .first()
+        .ok_or_else(|| "session is empty".to_string())?;
+    if header["type"].as_str() != Some("session")
+        || header["version"].as_u64() != Some(PI_SESSION_VERSION)
+        || header["id"].as_str().is_none()
+        || header["timestamp"].as_str().is_none()
+        || header["cwd"].as_str().is_none()
+    {
+        return Err(format!(
+            "expected a Pi v{PI_SESSION_VERSION} session header on the first line"
+        ));
+    }
+    for (offset, entry) in values.iter().enumerate().skip(1) {
+        let line = offset + 1;
+        let kind = entry["type"]
+            .as_str()
+            .ok_or_else(|| format!("line {line} has no entry type"))?;
+        if entry["id"].as_str().is_none()
+            || !(entry["parentId"].is_null() || entry["parentId"].as_str().is_some())
+            || entry["timestamp"].as_str().is_none()
+        {
+            return Err(format!("line {line} has an invalid {kind} entry envelope"));
+        }
+        match kind {
+            "model_change"
+                if entry["provider"].as_str().is_some() && entry["modelId"].as_str().is_some() => {}
+            "thinking_level_change" if entry["thinkingLevel"].as_str().is_some() => {}
+            "message" => validate_pi_message(&entry["message"], line)?,
+            "compaction"
+                if entry["summary"].as_str().is_some()
+                    && entry["firstKeptEntryId"].as_str().is_some()
+                    && entry["tokensBefore"].as_u64().is_some() => {}
+            "branch_summary"
+                if entry["fromId"].as_str().is_some() && entry["summary"].as_str().is_some() => {}
+            "custom" if entry["customType"].as_str().is_some() => {}
+            "custom_message"
+                if entry["customType"].as_str().is_some()
+                    && entry["display"].as_bool().is_some()
+                    && (entry["content"].is_string() || entry["content"].is_array()) => {}
+            "label"
+                if entry["targetId"].as_str().is_some()
+                    && (entry["label"].is_null() || entry["label"].as_str().is_some()) => {}
+            "session_info" if entry["name"].is_null() || entry["name"].as_str().is_some() => {}
+            _ => return Err(format!("line {line} has an unknown {kind:?} entry shape")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_pi_message(message: &Value, line: usize) -> std::result::Result<(), String> {
+    let role = message["role"]
+        .as_str()
+        .ok_or_else(|| format!("line {line} message has no role"))?;
+    if message["timestamp"].as_i64().is_none() && message["timestamp"].as_u64().is_none() {
+        return Err(format!("line {line} message has no millisecond timestamp"));
+    }
+    let content = message["content"]
+        .as_array()
+        .ok_or_else(|| format!("line {line} {role} content is not an array"))?;
+    match role {
+        "user" => validate_pi_content(content, line, false),
+        "assistant" => {
+            if message["api"].as_str().is_none()
+                || message["provider"].as_str().is_none()
+                || message["model"].as_str().is_none()
+                || message["usage"].as_object().is_none()
+                || message["stopReason"].as_str().is_none()
+            {
+                return Err(format!("line {line} assistant metadata is incomplete"));
+            }
+            validate_pi_content(content, line, true)
+        }
+        "toolResult" => {
+            if message["toolCallId"].as_str().is_none()
+                || message["toolName"].as_str().is_none()
+                || message["isError"].as_bool().is_none()
+            {
+                return Err(format!("line {line} toolResult metadata is incomplete"));
+            }
+            validate_pi_content(content, line, false)
+        }
+        _ => Err(format!("line {line} has unknown message role {role:?}")),
+    }
+}
+
+fn validate_pi_content(
+    content: &[Value],
+    line: usize,
+    assistant: bool,
+) -> std::result::Result<(), String> {
+    for block in content {
+        match block["type"].as_str() {
+            Some("text") if block["text"].as_str().is_some() => {}
+            Some("image")
+                if !assistant
+                    && block["data"].as_str().is_some()
+                    && block["mimeType"].as_str().is_some() => {}
+            Some("thinking")
+                if assistant
+                    && (block["thinking"].as_str().is_some()
+                        || block["thinkingSignature"].as_str().is_some()) => {}
+            Some("toolCall")
+                if assistant
+                    && block["id"].as_str().is_some()
+                    && block["name"].as_str().is_some()
+                    && block["arguments"].as_object().is_some() => {}
+            kind => {
+                return Err(format!(
+                    "line {line} has an unknown {kind:?} content block shape"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_pi_session_draft(
+    config_dir: &Path,
+    cwd: &Path,
+    model: &str,
+    context: &ResumeContext,
+) -> Result<PiSessionDraft> {
+    let id = Uuid::new_v4().to_string();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let message_timestamp_ms = Utc::now().timestamp_millis();
+    let session_dir = config_dir.join("sessions").join(pi_cwd_slug(cwd));
+    let filename_timestamp = timestamp.replace([':', '.'], "-");
+    let path = session_dir.join(format!("{filename_timestamp}_{id}.jsonl"));
+    let jsonl = render_pi_session(context, cwd, model, &id, &timestamp, message_timestamp_ms)?;
+    Ok(PiSessionDraft { id, path, jsonl })
+}
+
+fn pi_cwd_slug(cwd: &Path) -> String {
+    let path = cwd.to_string_lossy();
+    let without_root = path
+        .strip_prefix('/')
+        .or_else(|| path.strip_prefix('\\'))
+        .unwrap_or(&path);
+    let safe = without_root
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    format!("--{safe}--")
+}
+
+struct PiIds {
+    session_hex: String,
+    entry_index: u32,
+    tool_index: u32,
+}
+
+impl PiIds {
+    fn new(session_id: &str) -> Self {
+        Self {
+            session_hex: session_id.chars().filter(|ch| *ch != '-').collect(),
+            entry_index: 0,
+            tool_index: 0,
+        }
+    }
+
+    fn entry(&mut self) -> String {
+        self.entry_index += 1;
+        let suffix = self
+            .session_hex
+            .get(self.session_hex.len().saturating_sub(4)..)
+            .unwrap_or("0000");
+        format!("{suffix}{:04x}", self.entry_index)
+    }
+
+    fn tool_call(&mut self) -> String {
+        self.tool_index += 1;
+        format!("call_alex_{}_{:04x}", self.session_hex, self.tool_index)
+    }
+}
+
+fn render_pi_session(
+    context: &ResumeContext,
+    cwd: &Path,
+    model: &str,
+    session_id: &str,
+    timestamp: &str,
+    message_timestamp_ms: i64,
+) -> Result<String> {
+    let mut ids = PiIds::new(session_id);
+    let mut lines = vec![json!({
+        "type": "session",
+        "version": PI_SESSION_VERSION,
+        "id": session_id,
+        "timestamp": timestamp,
+        "cwd": cwd,
+    })];
+    let model_entry_id = ids.entry();
+    lines.push(json!({
+        "type": "model_change",
+        "id": model_entry_id,
+        "parentId": Value::Null,
+        "timestamp": timestamp,
+        "provider": "alexandria",
+        "modelId": model,
+    }));
+    let thinking_entry_id = ids.entry();
+    lines.push(json!({
+        "type": "thinking_level_change",
+        "id": thinking_entry_id,
+        "parentId": model_entry_id,
+        "timestamp": timestamp,
+        "thinkingLevel": "off",
+    }));
+
+    let mut parent_id = thinking_entry_id;
+    let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
+    let mut message_offset = 0i64;
+    for entry in &context.entries {
+        let messages = pi_messages_from_resume_entry(
+            entry,
+            model,
+            message_timestamp_ms + message_offset,
+            &mut ids,
+            &mut tool_calls,
+        );
+        for message in messages {
+            message_offset += 1;
+            let id = ids.entry();
+            lines.push(json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "message": message,
+            }));
+            parent_id = id;
+        }
+    }
+
+    let mut output = String::new();
+    for line in lines {
+        output.push_str(&serde_json::to_string(&line)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn pi_messages_from_resume_entry(
+    entry: &ResumeEntry,
+    model: &str,
+    timestamp_ms: i64,
+    ids: &mut PiIds,
+    tool_calls: &mut HashMap<String, (String, String)>,
+) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut buffered = Vec::new();
+    for block in &entry.content {
+        match block["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = block["text"].as_str() {
+                    buffered.push(json!({"type":"text", "text":text}));
+                }
+            }
+            Some("tool_call") if entry.role == "assistant" => {
+                let Some(name) = block["name"].as_str().filter(|name| !name.is_empty()) else {
+                    buffered.push(pi_degraded_block("tool call without a name", block));
+                    continue;
+                };
+                let Some(arguments) = block["arguments"].as_object() else {
+                    buffered.push(pi_degraded_block(
+                        "tool call arguments were not a JSON object",
+                        block,
+                    ));
+                    continue;
+                };
+                let fresh_id = ids.tool_call();
+                if let Some(source_id) = block["id"].as_str().filter(|id| !id.is_empty()) {
+                    tool_calls.insert(source_id.to_string(), (fresh_id.clone(), name.to_string()));
+                }
+                buffered.push(json!({
+                    "type":"toolCall",
+                    "id":fresh_id,
+                    "name":name,
+                    "arguments":arguments,
+                }));
+            }
+            Some("tool_result") => {
+                let next_timestamp = timestamp_ms + messages.len() as i64;
+                flush_pi_message(
+                    &mut messages,
+                    entry.role,
+                    &mut buffered,
+                    model,
+                    next_timestamp,
+                );
+                messages.push(pi_tool_result_or_degraded(
+                    block,
+                    timestamp_ms + messages.len() as i64,
+                    tool_calls,
+                ));
+            }
+            Some("content") => buffered.push(pi_degraded_block(
+                "source content has no native Pi representation",
+                &block["value"],
+            )),
+            Some(kind) => buffered.push(pi_degraded_block(
+                &format!("unsupported source content block {kind}"),
+                block,
+            )),
+            None => buffered.push(pi_degraded_block("source content block had no type", block)),
+        }
+    }
+    let next_timestamp = timestamp_ms + messages.len() as i64;
+    flush_pi_message(
+        &mut messages,
+        entry.role,
+        &mut buffered,
+        model,
+        next_timestamp,
+    );
+    messages
+}
+
+fn flush_pi_message(
+    messages: &mut Vec<Value>,
+    source_role: &str,
+    content: &mut Vec<Value>,
+    model: &str,
+    timestamp_ms: i64,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let content = std::mem::take(content);
+    if source_role == "assistant" {
+        let tool_use = content.iter().any(|block| block["type"] == "toolCall");
+        messages.push(json!({
+            "role":"assistant",
+            "content":content,
+            "api":"anthropic-messages",
+            "provider":"alexandria",
+            "model":model,
+            "usage":pi_zero_usage(),
+            "stopReason":if tool_use { "toolUse" } else { "stop" },
+            "timestamp":timestamp_ms,
+        }));
+    } else {
+        let content = if source_role == "user" {
+            content
+        } else {
+            let mut marked = vec![json!({
+                "type":"text",
+                "text":format!("[Alex resume: source role {source_role:?} was represented as a Pi user message]")
+            })];
+            marked.extend(content);
+            marked
+        };
+        messages.push(json!({
+            "role":"user",
+            "content":content,
+            "timestamp":timestamp_ms,
+        }));
+    }
+}
+
+fn pi_tool_result_or_degraded(
+    block: &Value,
+    timestamp_ms: i64,
+    tool_calls: &HashMap<String, (String, String)>,
+) -> Value {
+    let source_id = block["tool_call_id"].as_str().filter(|id| !id.is_empty());
+    if let Some((fresh_id, mapped_name)) = source_id.and_then(|id| tool_calls.get(id)) {
+        let name = block["name"].as_str().unwrap_or(mapped_name);
+        return json!({
+            "role":"toolResult",
+            "toolCallId":fresh_id,
+            "toolName":name,
+            "content":[{"type":"text", "text":pi_result_text(&block["content"])}],
+            "isError":block["is_error"].as_bool().unwrap_or(false),
+            "timestamp":timestamp_ms,
+        });
+    }
+    json!({
+        "role":"user",
+        "content":[pi_degraded_block(
+            "tool result could not be linked to a representable tool call",
+            block,
+        )],
+        "timestamp":timestamp_ms,
+    })
+}
+
+fn pi_result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                part["text"].as_str().map(String::from).unwrap_or_else(|| {
+                    format!("[Alex resume: tool result content block represented as text]\n{part}")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => format!("[Alex resume: tool result represented as text]\n{other}"),
+    }
+}
+
+fn pi_degraded_block(reason: &str, original: &Value) -> Value {
+    json!({
+        "type":"text",
+        "text":format!("[Alex resume: {reason}]\n{original}"),
+    })
+}
+
+fn pi_zero_usage() -> Value {
+    json!({
+        "input":0,
+        "output":0,
+        "cacheRead":0,
+        "cacheWrite":0,
+        "totalTokens":0,
+        "cost":{
+            "input":0,
+            "output":0,
+            "cacheRead":0,
+            "cacheWrite":0,
+            "total":0,
+        }
+    })
 }
 
 fn print_resume_summary(
@@ -533,6 +1168,14 @@ fn print_resume_summary(
         plan.binary.display(),
         if dry_run { " [dry run]" } else { "" }
     );
+    println!("model: {}", plan.model.model);
+    if let Some(reason) = &plan.model.reason {
+        println!("{reason}");
+    }
+    match &plan.mode {
+        ResumeMode::NativePi(draft) => println!("mode: native pi session {}", draft.id),
+        ResumeMode::PromptPaste { reason } => println!("mode: prompt-paste ({reason})"),
+    }
     println!("config: {}", plan.config_dir.display());
     for warning in &source.warnings {
         println!("warning: {warning}");
@@ -546,6 +1189,13 @@ async fn launch_and_record_fork(
     plan: LaunchPlan,
     token: &str,
 ) -> Result<()> {
+    let native_target_session = match &plan.mode {
+        ResumeMode::NativePi(draft) => {
+            materialize_pi_session(draft)?;
+            Some(draft.id.clone())
+        }
+        ResumeMode::PromptPaste { .. } => None,
+    };
     let started_ms = now_ms();
     let mut child = Command::new(&plan.binary)
         .args(&plan.args)
@@ -557,22 +1207,20 @@ async fn launch_and_record_fork(
         .with_context(|| format!("could not launch {}", plan.binary.display()))?;
 
     let mut recorded = false;
+    if let Some(target_session_id) = native_target_session.as_deref() {
+        record_fork(store, source, directory, &plan.harness, target_session_id)?;
+        eprintln!(
+            "Alex recorded fork {} → {}",
+            source.session_id, target_session_id
+        );
+        recorded = true;
+    }
     let status = loop {
         if !recorded {
             if let Some(target_session_id) =
                 find_fork_target(store, &plan.harness, token, started_ms)?
             {
-                store.record_session_fork(&SessionForkRecord {
-                    source_session_id: source.session_id.clone(),
-                    source_harness: source.harness.clone(),
-                    target_session_id: target_session_id.clone(),
-                    target_harness: plan.harness.clone(),
-                    created_ms: now_ms(),
-                    recovered_cwd: directory
-                        .evidence
-                        .as_ref()
-                        .map(|_| directory.path.to_string_lossy().into_owned()),
-                })?;
+                record_fork(store, source, directory, &plan.harness, &target_session_id)?;
                 eprintln!(
                     "Alex recorded fork {} → {}",
                     source.session_id, target_session_id
@@ -592,17 +1240,7 @@ async fn launch_and_record_fork(
             if let Some(target_session_id) =
                 find_fork_target(store, &plan.harness, token, started_ms)?
             {
-                store.record_session_fork(&SessionForkRecord {
-                    source_session_id: source.session_id.clone(),
-                    source_harness: source.harness.clone(),
-                    target_session_id,
-                    target_harness: plan.harness.clone(),
-                    created_ms: now_ms(),
-                    recovered_cwd: directory
-                        .evidence
-                        .as_ref()
-                        .map(|_| directory.path.to_string_lossy().into_owned()),
-                })?;
+                record_fork(store, source, directory, &plan.harness, &target_session_id)?;
                 recorded = true;
                 break;
             }
@@ -615,6 +1253,51 @@ async fn launch_and_record_fork(
         );
     }
     exit_status(status)
+}
+
+fn materialize_pi_session(draft: &PiSessionDraft) -> Result<()> {
+    let parent = draft
+        .path
+        .parent()
+        .context("native Pi session path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating Pi session directory {}", parent.display()))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&draft.path).with_context(|| {
+        format!(
+            "creating fresh native Pi session {} without overwriting existing files",
+            draft.path.display()
+        )
+    })?;
+    file.write_all(draft.jsonl.as_bytes())
+        .with_context(|| format!("writing native Pi session {}", draft.path.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing native Pi session {}", draft.path.display()))?;
+    Ok(())
+}
+
+fn record_fork(
+    store: &Store,
+    source: &ResumeSource,
+    directory: &DirectoryResolution,
+    target_harness: &str,
+    target_session_id: &str,
+) -> Result<()> {
+    store.record_session_fork(&SessionForkRecord {
+        source_session_id: source.session_id.clone(),
+        source_harness: source.harness.clone(),
+        target_session_id: target_session_id.to_string(),
+        target_harness: target_harness.to_string(),
+        created_ms: now_ms(),
+        recovered_cwd: directory
+            .evidence
+            .as_ref()
+            .map(|_| directory.path.to_string_lossy().into_owned()),
+    })?;
+    Ok(())
 }
 
 fn exit_status(status: ExitStatus) -> Result<()> {
@@ -937,6 +1620,9 @@ mod tests {
             "pi",
             "--source-harness",
             "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--paste",
             "--dry-run",
         ])
         .unwrap();
@@ -945,15 +1631,183 @@ mod tests {
                 session,
                 harness,
                 source_harness,
+                model,
+                paste,
                 dry_run,
             } => {
                 assert_eq!(session, "session-1");
                 assert_eq!(harness.as_deref(), Some("pi"));
                 assert_eq!(source_harness.as_deref(), Some("codex"));
+                assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                assert!(paste);
                 assert!(dry_run);
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn pi_writer_emits_v3_native_history_with_fresh_linked_tool_ids() {
+        let context = ResumeContext {
+            prompt: "fixture".into(),
+            entries: vec![
+                ResumeEntry {
+                    role: "user",
+                    content: vec![json!({"type":"text", "text":"inspect it"})],
+                },
+                ResumeEntry {
+                    role: "assistant",
+                    content: vec![
+                        json!({"type":"text", "text":"I'll inspect."}),
+                        json!({
+                            "type":"tool_call",
+                            "id":"source-call-1",
+                            "name":"read",
+                            "arguments":{"path":"src/main.rs"}
+                        }),
+                    ],
+                },
+                ResumeEntry {
+                    role: "tool",
+                    content: vec![json!({
+                        "type":"tool_result",
+                        "tool_call_id":"source-call-1",
+                        "name":"read",
+                        "content":"fn main() {}",
+                        "is_error":false
+                    })],
+                },
+                ResumeEntry {
+                    role: "assistant",
+                    content: vec![json!({"type":"text", "text":"It is a small program."})],
+                },
+            ],
+            truncated: false,
+            omitted_entries: 0,
+            included_entries: 4,
+            original_chars: 7,
+            prompt_chars: 7,
+        };
+        let session_id = "11111111-2222-3333-4444-555555556666";
+        let timestamp = "2026-07-20T01:02:03.004Z";
+        let rendered = render_pi_session(
+            &context,
+            Path::new("/fixture/project"),
+            "alex/gpt-5.6-sol",
+            session_id,
+            timestamp,
+            1_750_000_000_000,
+        )
+        .unwrap();
+        let lines = rendered
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 7);
+        assert_eq!(
+            lines[0],
+            json!({
+                "type":"session", "version":3, "id":session_id,
+                "timestamp":timestamp, "cwd":"/fixture/project"
+            })
+        );
+        assert_eq!(
+            lines[1],
+            json!({
+                "type":"model_change", "id":"66660001", "parentId":null,
+                "timestamp":timestamp, "provider":"alexandria", "modelId":"alex/gpt-5.6-sol"
+            })
+        );
+        assert_eq!(lines[2]["type"], "thinking_level_change");
+        assert_eq!(lines[3]["message"]["role"], "user");
+        assert_eq!(lines[3]["parentId"], lines[2]["id"]);
+        assert_eq!(lines[4]["message"]["role"], "assistant");
+        assert_eq!(
+            lines[4]["message"]["content"][1],
+            json!({
+                "type":"toolCall",
+                "id":format!("call_alex_{}_0001", session_id.replace('-', "")),
+                "name":"read",
+                "arguments":{"path":"src/main.rs"}
+            })
+        );
+        assert_eq!(lines[5]["message"]["role"], "toolResult");
+        assert_eq!(
+            lines[5]["message"]["toolCallId"],
+            lines[4]["message"]["content"][1]["id"]
+        );
+        assert_eq!(
+            lines[6]["message"]["content"][0]["text"],
+            "It is a small program."
+        );
+        assert!(!rendered.contains("source-call-1"));
+        validate_pi_session_jsonl(&rendered).unwrap();
+    }
+
+    #[test]
+    fn source_model_mismatch_falls_back_to_target_default_with_reason() {
+        let config_dir = tmpdir("model-fallback");
+        std::fs::write(
+            config_dir.join("models.json"),
+            json!({
+                "providers": {"alexandria": {"models": [
+                    {"id":"alex/claude-sonnet-5"},
+                    {"id":"alex/gpt-5.6-sol"}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            json!({"defaultProvider":"alexandria", "defaultModel":"gpt-5.6-sol"}).to_string(),
+        )
+        .unwrap();
+        let source = ResumeSource {
+            session_id: "source".into(),
+            harness: "claude".into(),
+            captures: Vec::new(),
+            requested_model: Some("claude-fable-5".into()),
+            routed_model: None,
+            trace_count: 1,
+            warnings: Vec::new(),
+        };
+
+        let selected = select_resume_model("pi", &config_dir, &source, None).unwrap();
+        assert_eq!(selected.model, "alex/gpt-5.6-sol");
+        assert_eq!(
+            selected.reason.as_deref(),
+            Some("source model claude-fable-5 not available in pi; using alex/gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn pi_version_sniff_rejects_unknown_recent_shape_without_reading_home() {
+        let root = tmpdir("pi-version-sniff");
+        let sessions = root.join("sessions").join("--fixture--");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("recent.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"version\":4,\"id\":\"future\",",
+                "\"timestamp\":\"2026-07-20T00:00:00.000Z\",\"cwd\":\"/fixture\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let reason = sniff_pi_session_format(&root.join("sessions")).unwrap_err();
+        assert!(reason.contains("format was not recognized"));
+        assert!(reason.contains("expected a Pi v3 session header"));
+    }
+
+    #[test]
+    fn pi_cwd_slug_matches_native_pi_encoding() {
+        assert_eq!(pi_cwd_slug(Path::new("/private/tmp")), "--private-tmp--");
+        assert_eq!(
+            pi_cwd_slug(Path::new("/Users/example/project")),
+            "--Users-example-project--"
+        );
     }
 
     #[test]
@@ -1136,6 +1990,7 @@ mod tests {
                 })
                 .to_string(),
             }],
+            requested_model: None,
             routed_model: None,
             trace_count: 1,
             warnings: Vec::new(),

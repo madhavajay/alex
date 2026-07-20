@@ -17,6 +17,7 @@ pub use openrouter_catalog::parse_models_response as parse_openrouter_models_res
 pub use quota::quota_state;
 pub use resume_context::{
     build_resume_context, build_resume_context_from_captures, ResumeCapture, ResumeContext,
+    ResumeEntry,
 };
 
 use serde::{Deserialize, Serialize};
