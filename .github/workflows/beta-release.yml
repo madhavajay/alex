@@ -205,14 +205,20 @@ jobs:
       - name: Check CLI signing secrets
         id: cli_signing
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
           SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
           for key in \
+            APPLE_ID \
+            APPLE_PASSWORD \
             APPLE_SIGNING_IDENTITY \
+            APPLE_TEAM_ID \
             SIGNING_CERTIFICATE_P12_DATA \
             SIGNING_CERTIFICATE_PASSWORD
           do
@@ -266,9 +272,51 @@ jobs:
             "$RUNNER_TEMP/alex-cli-release-x86_64/alexandria"
           do
             codesign --remove-signature "$bin" 2>/dev/null || true
-            codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
+            case "$(basename "$bin")" in
+              alex) identifier="com.madhavajay.alex.cli" ;;
+              alexandria) identifier="com.madhavajay.alex.daemon" ;;
+            esac
+            codesign --force --options runtime --timestamp \
+              --identifier "$identifier" --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
+
+      - name: Notarize CLI binaries
+        if: steps.cli_signing.outputs.available == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          notary_root="$RUNNER_TEMP/alex-cli-notary"
+          notary_zip="$RUNNER_TEMP/alex-cli-notary.zip"
+          notary_result="$RUNNER_TEMP/alex-cli-notary-result.json"
+          rm -rf "$notary_root" "$notary_zip" "$notary_result"
+          mkdir -p "$notary_root/aarch64" "$notary_root/x86_64"
+          cp "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
+            "$RUNNER_TEMP/alex-cli-release-aarch64/alexandria" \
+            "$notary_root/aarch64/"
+          cp "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
+            "$RUNNER_TEMP/alex-cli-release-x86_64/alexandria" \
+            "$notary_root/x86_64/"
+          ditto -c -k --sequesterRsrc "$notary_root" "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --output-format json > "$notary_result"
+          verdict="$(plutil -extract status raw -o - "$notary_result")"
+          if [[ "$verdict" != "Accepted" ]]; then
+            submission_id="$(plutil -extract id raw -o - "$notary_result")"
+            xcrun notarytool log "$submission_id" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            echo "CLI notarization failed with status: $verdict" >&2
+            exit 1
+          fi
 
       - name: Package CLI binaries
         run: |
@@ -310,9 +358,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
 
+  macos-cli-verify:
+    needs: [meta, macos-cli-asset]
+    if: ${{ !cancelled() && needs.macos-cli-asset.result == 'success' }}
+    runs-on: namespace-profile-mac-medium
+    permissions:
+      contents: read
+    steps:
+      - name: Download and independently verify packaged CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          tag="${{ needs.meta.outputs.tag }}"
+          asset="alex-cli-${version}-macos-aarch64.tar.gz"
+          root="$RUNNER_TEMP/alex-cli-independent-verify"
+          rm -rf "$root"
+          mkdir -p "$root/extracted"
+          gh release download "$tag" --repo "${{ github.repository }}" \
+            --dir "$root" --pattern "$asset" --pattern "$asset.sha256"
+          sed 's#dist/##' "$root/$asset.sha256" | (cd "$root" && shasum -a 256 -c -)
+          tar -xzf "$root/$asset" -C "$root/extracted"
+          for bin in "$root/extracted/alex" "$root/extracted/alexandria"; do
+            codesign --verify --strict --verbose=2 "$bin"
+            spctl --assess --type execute --verbose=2 "$bin"
+          done
+
   manifest:
-    needs: [meta, linux-asset, linux-musl-asset, windows-asset, macos-cli-asset]
-    if: ${{ !cancelled() && needs.linux-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.windows-asset.result == 'success' && needs.macos-cli-asset.result == 'success' }}
+    needs: [meta, linux-asset, linux-musl-asset, windows-asset, macos-cli-asset, macos-cli-verify]
+    if: ${{ !cancelled() && needs.linux-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.windows-asset.result == 'success' && needs.macos-cli-asset.result == 'success' && needs.macos-cli-verify.result == 'success' }}
     runs-on: namespace-profile-linux-medium
     steps:
       - uses: actions/checkout@v4

@@ -7,14 +7,22 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
-## [0.1.29-beta.10] - 2026-07-20
+## [0.1.29-beta.11] - 2026-07-20
 
 ### Fixed
-- **macOS CLI archives preserve a valid code signature.** Release jobs now sign
-  fresh staging copies after removing the linker signature, extract the
-  finished archives onto new inodes, and verify every packaged `alex` and
-  `alexandria` binary before upload. The same guard protects beta and stable
-  releases.
+- **Standalone macOS CLIs are notarized and independently verified.** The
+  release pipeline gives `alex` and `alexandria` stable signing identifiers,
+  submits both architectures to Apple's notary service, then downloads the
+  published archive on a separate clean macOS runner for checksum, code-signing
+  and Gatekeeper assessment before the manifest or app release can proceed.
+
+## [0.1.29-beta.10] - 2026-07-20
+
+### Changed
+- **macOS CLI signing moved to fresh staging copies.** This beta added
+  post-archive checks, but same-run code-signing caches made that check
+  insufficient on a clean Mac. Use beta.11 or newer for standalone macOS CLI
+  archives; the beta.10 app DMG itself remains notarized and valid.
 
 ## [0.1.29-beta.9] - 2026-07-20
 
