@@ -3369,6 +3369,41 @@ fn should_run_startup_lar_migration(enabled: bool, mode: alex_store::LarBodyStor
     enabled && mode != alex_store::LarBodyStoreMode::DualWriteValidated
 }
 
+fn should_run_periodic_lar_maintenance(mode: alex_store::LarBodyStoreMode) -> bool {
+    mode == alex_store::LarBodyStoreMode::LarWithFallback
+}
+
+/// Run conservative physical maintenance once per day after the daemon has
+/// entered authoritative LAR mode. GC only removes unreachable catalog roots;
+/// repack rewrites at most one sealed pack that exceeds the default 64 MiB/25%
+/// garbage threshold and retires its source through quarantine.
+fn spawn_periodic_lar_maintenance(store: Arc<Store>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let maintenance_store = store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let now = now_ms();
+                let gc = maintenance_store.run_lar_gc(now)?;
+                let repack = maintenance_store
+                    .run_lar_repack(&alex_store::LarRepackConfig::default(), now + 1)?;
+                Ok::<_, anyhow::Error>((gc, repack))
+            })
+            .await
+            {
+                Ok(Ok((gc, repack))) => {
+                    tracing::info!(?gc, ?repack, "periodic LAR maintenance complete")
+                }
+                Ok(Err(error)) => tracing::warn!(%error, "periodic LAR maintenance failed"),
+                Err(error) => tracing::warn!(%error, "periodic LAR maintenance task failed"),
+            }
+        }
+    })
+}
+
 /// Start the resumable legacy-body conversion only after the daemon has
 /// answered its public health endpoint. Every pass is bounded and blocking IO
 /// stays off Tokio's executor; legacy sources are retained by the importer.
@@ -3903,6 +3938,12 @@ async fn main() -> Result<()> {
                     "retention: bodies {} / rows {} (daily check)",
                     describe(body_days),
                     describe(row_days)
+                );
+            }
+            if should_run_periodic_lar_maintenance(state.store.lar_body_store_mode()) {
+                spawn_periodic_lar_maintenance(state.store.clone());
+                eprintln!(
+                    "LAR maintenance: daily verified GC and one threshold-eligible sealed-pack repack"
                 );
             }
             if let Err(error_value) = refresh_harness_cache(config.clone()).await {
@@ -12903,6 +12944,19 @@ min_free_disk_bytes = 1073741824
         assert!(should_run_startup_lar_migration(
             true,
             alex_store::LarBodyStoreMode::Legacy
+        ));
+    }
+
+    #[test]
+    fn periodic_lar_maintenance_only_runs_for_authoritative_lar_mode() {
+        assert!(!should_run_periodic_lar_maintenance(
+            alex_store::LarBodyStoreMode::Legacy
+        ));
+        assert!(!should_run_periodic_lar_maintenance(
+            alex_store::LarBodyStoreMode::DualWriteValidated
+        ));
+        assert!(should_run_periodic_lar_maintenance(
+            alex_store::LarBodyStoreMode::LarWithFallback
         ));
     }
 

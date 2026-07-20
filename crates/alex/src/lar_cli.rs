@@ -11,8 +11,9 @@ use alex_lar::{
     StreamReplayTiming, TokenUsage, REQUIRED_FEATURE_CONVERSATION_DAG,
 };
 use alex_store::{
-    LarArtifactLocation, LarBackupArtifactRef, LarBodyStoreConfig, LarBodyStoreMode,
-    LarCatalogGrepMatch, LarJsonlImportOptions, LarLegacyImportOptions, LarMigrationJob,
+    grep_lar_archive_records, LarArchiveReattachOptions, LarArtifactLocation, LarBackupArtifactRef,
+    LarBodyStoreConfig, LarBodyStoreMode, LarCatalogGrepMatch, LarJsonlImportOptions,
+    LarLegacyImportOptions, LarMigrationJob, LarRecordGrepCoverage, LarRecordGrepMatch,
     LarRepackConfig, LarStandaloneImportOptions, Store, TraceBackupRows,
 };
 use anyhow::{bail, Context, Result};
@@ -27,6 +28,10 @@ use sha2::{Digest as _, Sha256};
 pub(crate) enum LarCommand {
     /// Import a sealed standalone LAR archive or Alex JSONL export
     Import(ImportArgs),
+    /// Mark one sealed cataloged archive offline without moving its bytes
+    Detach(DetachArgs),
+    /// Identity-validate and reattach one offline or relocated archive
+    Reattach(ReattachArgs),
     /// Convert legacy gzip body files into the LAR store
     ImportLegacy(ImportLegacyArgs),
     /// Inspect or control the background legacy migration
@@ -71,6 +76,29 @@ pub(crate) struct ImportArgs {
     /// Input representation; auto inspects file magic/content
     #[arg(long, value_enum, default_value_t = LarImportFormat::Auto)]
     pub(crate) format: LarImportFormat,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DetachArgs {
+    /// Exact 32-hex-digit catalog file UUID; active writers cannot be detached
+    #[arg(long, value_name = "FILE_UUID", value_parser = parse_lar_file_uuid)]
+    pub(crate) file_uuid: String,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReattachArgs {
+    /// Exact 32-hex-digit catalog file UUID expected inside the archive
+    #[arg(long, value_name = "FILE_UUID", value_parser = parse_lar_file_uuid)]
+    pub(crate) file_uuid: String,
+    /// Clean sealed archive candidate; its immutable identity must match
+    #[arg(long, value_name = "PATH")]
+    pub(crate) archive: PathBuf,
     /// Emit machine-readable JSON
     #[arg(long)]
     pub(crate) json: bool,
@@ -256,9 +284,18 @@ pub(crate) struct GrepArgs {
     /// Stop after this many referencing trace/stage matches
     #[arg(long, default_value_t = 100, value_parser = parse_nonzero_usize)]
     pub(crate) limit: usize,
+    /// Search body bytes only, or bodies plus safe canonical record fields
+    #[arg(long, value_enum, default_value_t = LarGrepScope::Bodies)]
+    pub(crate) scope: LarGrepScope,
     /// Emit machine-readable JSON
     #[arg(long)]
     pub(crate) json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum LarGrepScope {
+    Bodies,
+    WholeRecord,
 }
 
 #[derive(Debug, Args)]
@@ -424,6 +461,8 @@ impl LarCommandBackend for LocalLarBackend {
     fn execute(&self, data_dir: &Path, command: &LarCommand) -> Result<LarCommandOutput> {
         match command {
             LarCommand::Import(args) => import_archive(data_dir, args),
+            LarCommand::Detach(args) => detach_archive(data_dir, args),
+            LarCommand::Reattach(args) => reattach_archive(data_dir, args),
             LarCommand::ImportLegacy(args) if args.dry_run => {
                 legacy_import_inventory(data_dir, args.limit, args.verify)
             }
@@ -470,6 +509,8 @@ impl LarCommand {
     fn json(&self) -> bool {
         match self {
             Self::Import(args) => args.json,
+            Self::Detach(args) => args.json,
+            Self::Reattach(args) => args.json,
             Self::ImportLegacy(args) => args.json,
             Self::Migration { command } => match command {
                 LarMigrationCommand::Status { json }
@@ -664,6 +705,70 @@ fn import_archive(data_dir: &Path, args: &ImportArgs) -> Result<LarCommandOutput
         }
         LarImportFormat::Auto => unreachable!("auto import format was resolved"),
     }
+}
+
+fn detach_archive(data_dir: &Path, args: &DetachArgs) -> Result<LarCommandOutput> {
+    let store = Store::open(data_dir.to_path_buf()).context("opening the Alex storage catalog")?;
+    let report = store
+        .detach_lar_archive(&args.file_uuid)
+        .with_context(|| format!("detaching LAR archive {}", args.file_uuid))?;
+    let human = if report.already_offline {
+        format!(
+            "LAR archive {} was already archived_offline (role {}, catalog path {}, bytes currently present: {}); detach does not move or delete files",
+            report.file.file_uuid,
+            report.file.role,
+            report.file.catalog_path,
+            report.file.exists,
+        )
+    } else {
+        format!(
+            "LAR archive {} marked archived_offline (role {}, catalog path {}, bytes currently present: {}); detach changed catalog state only and did not move or delete files",
+            report.file.file_uuid,
+            report.file.role,
+            report.file.catalog_path,
+            report.file.exists,
+        )
+    };
+    Ok(LarCommandOutput {
+        human,
+        json: serde_json::to_value(report)?,
+        raw_body: None,
+    })
+}
+
+fn reattach_archive(data_dir: &Path, args: &ReattachArgs) -> Result<LarCommandOutput> {
+    let store = Store::open(data_dir.to_path_buf()).context("opening the Alex storage catalog")?;
+    let report = store
+        .reattach_lar_archive(
+            &args.file_uuid,
+            &args.archive,
+            &LarArchiveReattachOptions::default(),
+        )
+        .with_context(|| {
+            format!(
+                "reattaching LAR archive {} from {}",
+                args.file_uuid,
+                args.archive.display()
+            )
+        })?;
+    let disposition = if report.relocated {
+        "relocated"
+    } else if report.already_attached {
+        "already attached"
+    } else {
+        "reattached"
+    };
+    Ok(LarCommandOutput {
+        human: format!(
+            "LAR archive {} {disposition} at {} after sealed-file identity validation ({} bytes, blake3:{})",
+            report.file_uuid,
+            report.catalog_path,
+            report.source_size,
+            report.source_blake3,
+        ),
+        json: serde_json::to_value(report)?,
+        raw_body: None,
+    })
 }
 
 fn detect_import_format(path: &Path) -> Result<LarImportFormat> {
@@ -1343,24 +1448,37 @@ fn live_catalog_summary(data_dir: &Path, args: &ListArgs) -> Result<LarCommandOu
     let jobs = store
         .list_lar_migration_jobs()
         .context("reading LAR migration jobs")?;
+    let archive_files = store
+        .lar_archive_file_statuses()
+        .context("reading LAR archive file statuses")?;
     let listed_jobs = jobs.iter().take(args.limit).collect::<Vec<_>>();
+    let listed_archive_files = archive_files.iter().take(args.limit).collect::<Vec<_>>();
     let incomplete_jobs = jobs.iter().filter(|job| job.state != "complete").count();
+    let unavailable_archive_files = archive_files
+        .iter()
+        .filter(|file| file.availability.code() != "online")
+        .count();
     let json = serde_json::json!({
         "kind": "live_catalog",
         "schema_version": schema_version,
+        "archive_files": listed_archive_files,
+        "archive_file_count": archive_files.len(),
+        "unavailable_archive_files": unavailable_archive_files,
         "migration_jobs": listed_jobs
             .iter()
             .map(|job| MigrationJobOutput::from(*job))
             .collect::<Vec<_>>(),
         "migration_job_count": jobs.len(),
         "incomplete_migration_jobs": incomplete_jobs,
-        "limited": listed_jobs.len() < jobs.len(),
+        "limited": listed_jobs.len() < jobs.len()
+            || listed_archive_files.len() < archive_files.len(),
     });
     let human = format!(
-        "live LAR catalog schema v{schema_version}: {} migration job(s), {incomplete_jobs} incomplete{}",
+        "live LAR catalog schema v{schema_version}: {} archive file(s), {unavailable_archive_files} unavailable; {} migration job(s), {incomplete_jobs} incomplete{}",
+        archive_files.len(),
         jobs.len(),
-        if listed_jobs.len() < jobs.len() {
-            format!("; showing the newest {}", listed_jobs.len())
+        if listed_jobs.len() < jobs.len() || listed_archive_files.len() < archive_files.len() {
+            format!("; each list limited to {}", args.limit)
         } else {
             String::new()
         }
@@ -1390,6 +1508,15 @@ fn parse_ratio(value: &str) -> std::result::Result<f64, String> {
         return Err(format!("ratio must be between 0 and 1, got {value:?}"));
     }
     Ok(ratio)
+}
+
+fn parse_lar_file_uuid(value: &str) -> std::result::Result<String, String> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected a 32-hex-digit LAR file UUID, got {value:?}"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn preflight_archive(path: &Path) -> Result<()> {
@@ -1425,8 +1552,16 @@ struct ArchiveSummary {
     last_valid_offset: Option<u64>,
     truncated_tail_bytes: u64,
     verified_manifest_count: usize,
+    verification_failures: Vec<ArchiveVerificationFailure>,
     manifest_ids: Vec<String>,
     limited: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveVerificationFailure {
+    kind: &'static str,
+    manifest_id: Option<String>,
+    detail: String,
 }
 
 fn open_archive_summary(
@@ -1434,21 +1569,41 @@ fn open_archive_summary(
     verify_bodies: bool,
     manifest_limit: usize,
 ) -> Result<ArchiveSummary> {
+    open_archive_summary_with_policy(path, verify_bodies, manifest_limit, false)
+}
+
+fn open_archive_summary_with_policy(
+    path: &Path,
+    verify_bodies: bool,
+    manifest_limit: usize,
+    keep_going: bool,
+) -> Result<ArchiveSummary> {
     preflight_archive(path)?;
     let file =
         fs::File::open(path).with_context(|| format!("opening LAR archive {}", path.display()))?;
     let mut reader = ArchiveReader::open(file, Limits::default())
         .map_err(|error| anyhow::anyhow!(error))
         .with_context(|| format!("scanning LAR archive {}", path.display()))?;
-    let manifest_ids = reader.manifest_ids().copied().collect::<Vec<_>>();
+    let mut manifest_ids = reader.manifest_ids().copied().collect::<Vec<_>>();
+    manifest_ids.sort_by_key(ToString::to_string);
     let mut verified_manifest_count = 0;
+    let mut verification_failures = Vec::new();
     if verify_bodies {
         for manifest_id in &manifest_ids {
-            reader
-                .write_body(manifest_id, std::io::sink())
-                .map_err(|error| anyhow::anyhow!(error))
-                .with_context(|| format!("verifying manifest {manifest_id}"))?;
-            verified_manifest_count += 1;
+            match reader.write_body(manifest_id, std::io::sink()) {
+                Ok(_) => verified_manifest_count += 1,
+                Err(error) if keep_going => {
+                    verification_failures.push(ArchiveVerificationFailure {
+                        kind: "manifest",
+                        manifest_id: Some(manifest_id.to_string()),
+                        detail: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(error))
+                        .with_context(|| format!("verifying manifest {manifest_id}"));
+                }
+            }
         }
     }
     let (recovery, last_valid_offset, truncated_tail_bytes) = match reader.recovery_status() {
@@ -1487,21 +1642,52 @@ fn open_archive_summary(
         last_valid_offset,
         truncated_tail_bytes,
         verified_manifest_count,
+        verification_failures,
         manifest_ids: listed_ids,
         limited: manifest_ids.len() > manifest_limit,
     })
 }
 
-fn verify_archive(path: &Path, _keep_going: bool) -> Result<LarCommandOutput> {
-    let summary = open_archive_summary(path, true, usize::MAX)?;
+fn verify_archive(path: &Path, keep_going: bool) -> Result<LarCommandOutput> {
+    let mut summary = open_archive_summary_with_policy(path, true, usize::MAX, keep_going)?;
     if summary.recovery != "clean" {
-        bail!(
-            "LAR archive {} has recovery state {} with {} tail bytes after offset {}; run `alex lar repair {} --output <new-file>`",
-            path.display(),
+        let detail = format!(
+            "recovery state {} with {} tail bytes after offset {}; run `alex lar repair {} --output <new-file>`",
             summary.recovery,
             summary.truncated_tail_bytes,
             summary.last_valid_offset.unwrap_or_default(),
             path.display(),
+        );
+        if !keep_going {
+            bail!("LAR archive {} has {detail}", path.display());
+        }
+        summary
+            .verification_failures
+            .push(ArchiveVerificationFailure {
+                kind: "recovery",
+                manifest_id: None,
+                detail,
+            });
+    }
+    if !summary.verification_failures.is_empty() {
+        let details = summary
+            .verification_failures
+            .iter()
+            .map(|failure| match &failure.manifest_id {
+                Some(manifest_id) => {
+                    format!("- {} {manifest_id}: {}", failure.kind, failure.detail)
+                }
+                None => format!("- {}: {}", failure.kind, failure.detail),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "LAR archive {} failed verification with {} issue(s) after reconstructing {}/{} manifests:\n{}",
+            path.display(),
+            summary.verification_failures.len(),
+            summary.verified_manifest_count,
+            summary.manifest_count,
+            details,
         );
     }
     let human = format!(
@@ -1665,6 +1851,22 @@ struct GrepSourceStats {
     decompressed_chunk_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct GrepRecordMatch {
+    source: String,
+    archive: Option<String>,
+    #[serde(flatten)]
+    matched: LarRecordGrepMatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct GrepRecordCoverage {
+    source: String,
+    archive: Option<String>,
+    #[serde(flatten)]
+    coverage: LarRecordGrepCoverage,
+}
+
 impl GrepSourceStats {
     fn new(source: String, archive: Option<String>, stats: RawSearchStats) -> Self {
         Self {
@@ -1699,6 +1901,30 @@ fn grep_records(data_dir: &Path, args: &GrepArgs) -> Result<LarCommandOutput> {
         None,
         live.stats,
     )];
+    let mut record_matches = Vec::<GrepRecordMatch>::new();
+    let mut record_coverage = Vec::<GrepRecordCoverage>::new();
+    if args.scope == LarGrepScope::WholeRecord {
+        let report = store
+            .grep_lar_catalog_records(literal, args.limit)
+            .context("searching safe canonical records in the configured live LAR store")?;
+        append_cli_record_matches(
+            &mut record_matches,
+            report.matches,
+            "live-catalog",
+            None,
+            args.limit.saturating_sub(matches.len()),
+        )?;
+        record_coverage.extend(
+            report
+                .coverage
+                .into_iter()
+                .map(|coverage| GrepRecordCoverage {
+                    source: "live-catalog".into(),
+                    archive: None,
+                    coverage,
+                }),
+        );
+    }
 
     let mut archives = args.archives.clone();
     archives.sort();
@@ -1707,34 +1933,115 @@ fn grep_records(data_dir: &Path, args: &GrepArgs) -> Result<LarCommandOutput> {
         preflight_archive(&archive)?;
         let stats = grep_sealed_archive(&archive, literal, args.limit, &mut matches)?;
         sources.push(stats);
+        if matches.len() + record_matches.len() > args.limit {
+            bail!(
+                "LAR grep result limit exceeded (more than {} matches); refine the literal or raise --limit",
+                args.limit
+            );
+        }
+        if args.scope == LarGrepScope::WholeRecord {
+            let report = grep_sealed_archive_records(&archive, literal, args.limit)?;
+            let archive_name = archive.display().to_string();
+            let remaining = args
+                .limit
+                .saturating_sub(matches.len() + record_matches.len());
+            append_cli_record_matches(
+                &mut record_matches,
+                report.matches,
+                &format!("archive:{archive_name}"),
+                Some(&archive_name),
+                remaining,
+            )?;
+            record_coverage.extend(report.coverage.into_iter().map(|coverage| {
+                GrepRecordCoverage {
+                    source: format!("archive:{archive_name}"),
+                    archive: Some(archive_name.clone()),
+                    coverage,
+                }
+            }));
+        }
     }
     matches.sort();
-    let human = if matches.is_empty() {
+    record_matches.sort_by(|left, right| {
+        (&left.source, &left.archive, &left.matched).cmp(&(
+            &right.source,
+            &right.archive,
+            &right.matched,
+        ))
+    });
+    let total_matches = matches.len() + record_matches.len();
+    let human = if total_matches == 0 {
         format!(
-            "no exact raw byte matches for {:?}; scanned {} source(s)",
+            "no exact {:?} matches for {:?}; scanned {} source(s)",
+            grep_scope_name(args.scope),
             args.literal,
             sources.len()
         )
     } else {
         let mut lines = matches.iter().map(grep_match_human).collect::<Vec<_>>();
+        lines.extend(record_matches.iter().map(grep_record_match_human));
         lines.push(format!(
-            "{} exact reference match(es) across {} source(s)",
-            matches.len(),
+            "{} exact {} match(es) across {} source(s)",
+            total_matches,
+            grep_scope_name(args.scope),
             sources.len()
         ));
         lines.join("\n")
     };
-    Ok(LarCommandOutput {
-        human,
-        json: serde_json::json!({
+    let json = if args.scope == LarGrepScope::Bodies {
+        serde_json::json!({
             "literal": args.literal,
             "literal_hex": hex_bytes(literal),
             "match_count": matches.len(),
             "matches": matches,
             "sources": sources,
-        }),
+        })
+    } else {
+        serde_json::json!({
+            "scope": "whole-record",
+            "literal": args.literal,
+            "literal_hex": hex_bytes(literal),
+            "match_count": total_matches,
+            "body_match_count": matches.len(),
+            "record_match_count": record_matches.len(),
+            "body_matches": matches,
+            "record_matches": record_matches,
+            "sources": sources,
+            "record_coverage": record_coverage,
+        })
+    };
+    Ok(LarCommandOutput {
+        human,
+        json,
         raw_body: None,
     })
+}
+
+fn grep_scope_name(scope: LarGrepScope) -> &'static str {
+    match scope {
+        LarGrepScope::Bodies => "raw body byte",
+        LarGrepScope::WholeRecord => "whole-record",
+    }
+}
+
+fn append_cli_record_matches(
+    output: &mut Vec<GrepRecordMatch>,
+    values: Vec<LarRecordGrepMatch>,
+    source: &str,
+    archive: Option<&str>,
+    remaining: usize,
+) -> Result<()> {
+    if values.len() > remaining {
+        bail!(
+            "LAR grep result limit exceeded after combining body and canonical-record matches; refine the literal or raise --limit"
+        );
+    }
+    output.extend(values.into_iter().map(|matched| GrepRecordMatch {
+        source: source.into(),
+        archive: archive.map(str::to_owned),
+        matched,
+    }));
+    Ok(())
 }
 
 fn live_grep_match(value: LarCatalogGrepMatch) -> GrepMatch {
@@ -1839,6 +2146,26 @@ fn grep_sealed_archive(
     Ok(GrepSourceStats::new(source, Some(archive), scanner.stats()))
 }
 
+fn grep_sealed_archive_records(
+    path: &Path,
+    literal: &[u8],
+    result_limit: usize,
+) -> Result<alex_store::LarRecordGrepReport> {
+    let file =
+        fs::File::open(path).with_context(|| format!("opening LAR archive {}", path.display()))?;
+    let reader = ArchiveReader::open(file, Limits::default())
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("opening LAR archive {}", path.display()))?;
+    if !reader.is_sealed() {
+        bail!(
+            "supplied LAR archive is not sealed: {}; active packs must be searched through the live catalog",
+            path.display()
+        );
+    }
+    grep_lar_archive_records(&reader, literal, result_limit)
+        .with_context(|| format!("searching canonical records in {}", path.display()))
+}
+
 fn push_archive_grep_match(
     matches: &mut Vec<GrepMatch>,
     value: GrepMatch,
@@ -1939,6 +2266,27 @@ fn grep_match_human(value: &GrepMatch) -> String {
     if let Some(timestamp) = value.timestamp_ns {
         fields.push(format!("timestamp_ns={timestamp}"));
     }
+    fields.join(" ")
+}
+
+fn grep_record_match_human(value: &GrepRecordMatch) -> String {
+    let mut fields = vec![
+        value.source.clone(),
+        format!("category={}", value.matched.category),
+        format!("field={}", value.matched.field),
+        format!("offset={}", value.matched.match_offset),
+        format!("trace={}", value.matched.trace_id),
+    ];
+    if let Some(stage_id) = &value.matched.stage_id {
+        fields.push(format!("stage={stage_id}"));
+    }
+    if let Some(ordinal) = value.matched.header_ordinal {
+        fields.push(format!("header_ordinal={ordinal}"));
+    }
+    if let Some(session_id) = &value.matched.session_id {
+        fields.push(format!("session={session_id}"));
+    }
+    fields.push(format!("timestamp_ns={}", value.matched.timestamp_ns));
     fields.join(" ")
 }
 
@@ -3820,6 +4168,96 @@ mod tests {
         }
     }
 
+    fn write_identity_archive(path: &Path, file_uuid: [u8; 16], body: &[u8]) -> String {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut writer = ArchiveWriter::create(
+            file,
+            FileHeader::standalone(file_uuid, 123, b"lar-cli-archive-lifecycle".to_vec()),
+            ChunkerConfig::default(),
+            Limits::default(),
+        )
+        .unwrap();
+        let manifest = writer.append_body(body).unwrap();
+        writer.seal().unwrap();
+        let file = writer.into_inner().unwrap();
+        file.sync_all().unwrap();
+        manifest.to_string()
+    }
+
+    fn write_archive_with_two_corrupt_manifests(path: &Path) -> Vec<String> {
+        use std::io::{Seek, SeekFrom};
+
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut writer = ArchiveWriter::create(
+            file,
+            FileHeader::standalone([6; 16], 123, b"lar-verify-keep-going".to_vec()),
+            ChunkerConfig::default(),
+            Limits::default(),
+        )
+        .unwrap();
+        let mut manifest_ids = [
+            writer
+                .append_body(b"first independently corrupt body")
+                .unwrap(),
+            writer
+                .append_body(b"second independently corrupt body")
+                .unwrap(),
+        ]
+        .map(|manifest| manifest.to_string())
+        .to_vec();
+        manifest_ids.sort();
+        writer.seal().unwrap();
+        let file = writer.into_inner().unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reader = ArchiveReader::open(fs::File::open(path).unwrap(), Limits::default()).unwrap();
+        let mut chunk_offsets = reader
+            .chunk_records()
+            .map(|descriptor| descriptor.frame_offset)
+            .collect::<Vec<_>>();
+        chunk_offsets.sort_unstable();
+        assert_eq!(chunk_offsets.len(), 2);
+        drop(reader);
+
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        for frame_offset in chunk_offsets {
+            file.seek(SeekFrom::Start(frame_offset)).unwrap();
+            let (status, frame) = alex_lar::FrameReader::new(&mut file, &Limits::default())
+                .read_next()
+                .unwrap();
+            assert_eq!(status, alex_lar::FrameRead::Frame);
+            let mut frame = frame.unwrap();
+            assert_eq!(frame.record_type, alex_lar::RecordType::Chunk);
+            // Keep the frame structurally valid (including its CRC) while
+            // changing the compressed body. Fast footer loading can still
+            // index the archive; the corruption surfaces only when a
+            // referencing manifest reconstructs and verifies its chunk.
+            *frame.payload.last_mut().unwrap() ^= 1;
+            file.seek(SeekFrom::Start(frame_offset)).unwrap();
+            frame.write(&mut file).unwrap();
+        }
+        file.sync_all().unwrap();
+        manifest_ids
+    }
+
     fn write_search_archive(path: &Path) {
         let file = fs::OpenOptions::new()
             .create_new(true)
@@ -3845,6 +4283,43 @@ mod tests {
             let manifest = writer.append_body(body).unwrap();
             let mut stage = StageData::new(StageKind::ClientRequest, 1_000 + index as u64);
             stage.request_body_manifest_ref = Some(manifest);
+            if index == 0 {
+                stage.provider = Some(b"sealed-provider-needle".to_vec());
+                stage.routing_reason = Some(b"sealed-control-needle".to_vec());
+                stage.request_headers_ref = Some(
+                    writer
+                        .append_header_block(HeaderBlock::new(
+                            HeaderFidelity::Exact,
+                            vec![
+                                HeaderAtom {
+                                    original_name: b"x-search-safe".to_vec(),
+                                    value: b"sealed-header-needle".to_vec(),
+                                    flags: 0,
+                                },
+                                // Deliberately unflagged to model a foreign
+                                // archive: name-based safety must still win.
+                                HeaderAtom {
+                                    original_name: b"Authorization".to_vec(),
+                                    value: b"sealed-secret-must-not-match".to_vec(),
+                                    flags: 0,
+                                },
+                            ],
+                        ))
+                        .unwrap(),
+                );
+                stage.trailers_ref = Some(
+                    writer
+                        .append_header_block(HeaderBlock::new(
+                            HeaderFidelity::Exact,
+                            vec![HeaderAtom {
+                                original_name: b"x-safe-trailer".to_vec(),
+                                value: b"sealed-trailer-needle".to_vec(),
+                                flags: 0,
+                            }],
+                        ))
+                        .unwrap(),
+                );
+            }
             let stage_id = writer.append_stage(Stage::new(stage)).unwrap();
             let mut exchange = ExchangeData::new(
                 format!("trace-{index}"),
@@ -3853,7 +4328,13 @@ mod tests {
                 vec![stage_id],
             );
             exchange.session_id = Some(format!("session-{index}").into_bytes());
-            writer.append_exchange(Exchange::new(exchange)).unwrap();
+            let mut metadata = ExchangeMetadataData::default();
+            if index == 0 {
+                metadata.harness = Some(b"sealed-harness-needle".to_vec());
+            }
+            writer
+                .append_exchange_with_metadata(Exchange::new(exchange), metadata)
+                .unwrap();
         }
         writer.seal().unwrap();
         let file = writer.into_inner().unwrap();
@@ -3937,6 +4418,7 @@ mod tests {
             literal: literal.into(),
             archives,
             limit,
+            scope: LarGrepScope::Bodies,
             json: true,
         }
     }
@@ -4006,6 +4488,26 @@ mod tests {
             parse(&["upgrade", "old.lar", "--output", "new.lar", "--json"]),
             LarCommand::Upgrade(UpgradeArgs { json: true, .. })
         ));
+        assert!(matches!(
+            parse(&[
+                "detach",
+                "--file-uuid",
+                "07070707070707070707070707070707",
+                "--json"
+            ]),
+            LarCommand::Detach(DetachArgs { json: true, .. })
+        ));
+        assert!(matches!(
+            parse(&[
+                "reattach",
+                "--file-uuid",
+                "07070707070707070707070707070707",
+                "--archive",
+                "cold/archive.lar",
+                "--json"
+            ]),
+            LarCommand::Reattach(ReattachArgs { json: true, .. })
+        ));
         assert!(TestCli::try_parse_from([
             "lar-test",
             "import-legacy",
@@ -4022,6 +4524,17 @@ mod tests {
             "1.01",
         ])
         .is_err());
+        assert!(
+            TestCli::try_parse_from(["lar-test", "detach", "--file-uuid", "not-a-file-uuid",])
+                .is_err()
+        );
+        assert!(TestCli::try_parse_from([
+            "lar-test",
+            "reattach",
+            "--file-uuid",
+            "07070707070707070707070707070707",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -4029,6 +4542,8 @@ mod tests {
         let help = TestCli::command().render_long_help().to_string();
         for command in [
             "import",
+            "detach",
+            "reattach",
             "import-legacy",
             "migration",
             "cleanup",
@@ -4052,6 +4567,98 @@ mod tests {
         assert!(TestCli::try_parse_from(["lar-test", "cleanup"]).is_err());
         assert!(TestCli::try_parse_from(["lar-test", "cleanup", "--dry-run", "--apply"]).is_err());
         assert!(TestCli::try_parse_from(["lar-test", "cleanup", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn detach_move_and_identity_validated_reattach_are_operator_safe() {
+        let dir = tmpdir("archive-lifecycle");
+        let source = dir.join("archives/source.lar");
+        let expected = b"archive lifecycle body";
+        let manifest_id = write_identity_archive(&source, [0x31; 16], expected);
+        let imported = LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&["import", source.to_str().unwrap(), "--json"]),
+            )
+            .unwrap();
+        let file_uuid = imported.json["file_uuid"].as_str().unwrap().to_owned();
+        assert_eq!(file_uuid, "31".repeat(16));
+
+        let detached = LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&["detach", "--file-uuid", &file_uuid, "--json"]),
+            )
+            .unwrap();
+        assert_eq!(detached.json["already_offline"], false);
+        assert_eq!(detached.json["file"]["availability"], "archived_offline");
+        assert_eq!(detached.json["file"]["identity_validated"], true);
+        assert_eq!(detached.json["file"]["exists"], true);
+        assert!(detached.human.contains("did not move or delete files"));
+        let listing = LocalLarBackend
+            .execute(&dir, &parse(&["ls", "--json"]))
+            .unwrap();
+        assert_eq!(listing.json["archive_file_count"], 1);
+        assert_eq!(listing.json["unavailable_archive_files"], 1);
+        assert_eq!(listing.json["archive_files"][0]["file_uuid"], file_uuid);
+
+        let moved = dir.join("cold/moved.lar");
+        fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        fs::rename(&source, &moved).unwrap();
+        let wrong = dir.join("cold/wrong.lar");
+        write_identity_archive(&wrong, [0x32; 16], expected);
+
+        let rejected = LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "reattach",
+                    "--file-uuid",
+                    &file_uuid,
+                    "--archive",
+                    wrong.to_str().unwrap(),
+                    "--json",
+                ]),
+            )
+            .unwrap_err();
+        assert!(rejected.to_string().contains("reattaching LAR archive"));
+        let still_offline = Store::open(dir.clone())
+            .unwrap()
+            .lar_archive_file_status(&file_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_offline.availability.code(), "archived_offline");
+        assert_eq!(still_offline.catalog_path, "archives/source.lar");
+        assert!(!still_offline.exists);
+
+        let reattached = LocalLarBackend
+            .execute(
+                &dir,
+                &parse(&[
+                    "reattach",
+                    "--file-uuid",
+                    &file_uuid,
+                    "--archive",
+                    moved.to_str().unwrap(),
+                    "--json",
+                ]),
+            )
+            .unwrap();
+        assert_eq!(reattached.json["file_uuid"], file_uuid);
+        assert_eq!(reattached.json["catalog_path"], "cold/moved.lar");
+        assert_eq!(reattached.json["relocated"], true);
+        assert_eq!(reattached.json["file"]["availability"], "online");
+        assert_eq!(reattached.json["file"]["identity_validated"], true);
+        assert_eq!(reattached.json["source_blake3"].as_str().unwrap().len(), 64);
+        assert!(reattached.human.contains("sealed-file identity validation"));
+        assert_eq!(
+            Store::open(dir.clone())
+                .unwrap()
+                .read_lar_manifest_body(&manifest_id)
+                .unwrap(),
+            expected
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -4179,6 +4786,147 @@ mod tests {
     }
 
     #[test]
+    fn whole_record_grep_searches_sealed_safe_headers_trailers_and_metadata() {
+        let dir = tmpdir("grep-sealed-whole-record");
+        let archive = dir.join("sealed.lar");
+        write_search_archive(&archive);
+        let search = |literal: &str| {
+            let mut args = grep_args(literal, vec![archive.clone()], 20);
+            args.scope = LarGrepScope::WholeRecord;
+            grep_records(&dir.join("empty-live"), &args).unwrap().json
+        };
+
+        let header = search("sealed-header-needle");
+        assert_eq!(header["record_match_count"], 1);
+        assert_eq!(header["record_matches"][0]["category"], "ordered_headers");
+        assert_eq!(
+            header["record_matches"][0]["field"],
+            "request_headers.value"
+        );
+        assert_eq!(header["record_matches"][0]["header_ordinal"], 0);
+
+        let trailer = search("sealed-trailer-needle");
+        assert_eq!(trailer["record_matches"][0]["category"], "ordered_trailers");
+        let provider = search("sealed-provider-needle");
+        assert_eq!(provider["record_matches"][0]["field"], "provider");
+        let harness = search("sealed-harness-needle");
+        assert_eq!(harness["record_matches"][0]["field"], "harness");
+        let body = search("NEED");
+        assert_eq!(body["body_match_count"], 1);
+
+        let secret = search("sealed-secret-must-not-match");
+        assert_eq!(secret["match_count"], 0);
+        let header_coverage = secret["record_coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item["archive"].as_str() == Some(archive.to_str().unwrap())
+                    && item["category"] == "ordered_headers"
+            })
+            .unwrap();
+        assert_eq!(header_coverage["values_skipped"], 1);
+    }
+
+    #[test]
+    fn whole_record_grep_searches_active_catalog_and_preserves_body_default() {
+        use alex_store::{
+            LarBodyArtifact, LarExchangeBodyRefs, LarExchangeCapture, LarHeaderCapture,
+        };
+
+        let data_dir = tmpdir("grep-active-whole-record");
+        let store = Store::open_with_lar_body_store(
+            data_dir.clone(),
+            LarBodyStoreConfig {
+                mode: LarBodyStoreMode::LarWithFallback,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trace_id = "active-whole-record-trace";
+        let manifest_id = store
+            .write_body_artifact(
+                &LarBodyArtifact::trace(trace_id, "client_request"),
+                "request.json",
+                b"active-body-needle",
+            )
+            .unwrap()
+            .manifest_id
+            .unwrap();
+        store
+            .insert_trace(&alex_core::TraceRecord {
+                id: trace_id.into(),
+                ts_request_ms: 42,
+                session_id: Some("active-whole-session".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let capture = LarExchangeCapture {
+            trace_id: trace_id.into(),
+            session_id: Some("active-whole-session".into()),
+            run_id: None,
+            wall_time_ns: 42_000_000,
+            client_request_headers: Some(LarHeaderCapture::observed([
+                ("x-safe-active", "active-header-needle"),
+                ("authorization", "active-secret-must-not-match"),
+            ])),
+            client_request_trailers: Some(LarHeaderCapture::observed([(
+                "x-active-trailer",
+                "active-trailer-needle",
+            )])),
+            client_response_headers: None,
+            client_response_trailers: None,
+            upstream_attempts: Vec::new(),
+            upstream_stream_reads: None,
+            provider: Some("active-provider-needle".into()),
+            requested_model: Some("active-model-needle".into()),
+            routed_model: None,
+            account_id: Some("active-account-excluded".into()),
+            routing_reason: Some("active-control-needle".into()),
+            status_code: Some(200),
+            error_class: None,
+            error_message: None,
+        };
+        store
+            .write_lar_exchange_capture(
+                &capture,
+                &LarExchangeBodyRefs {
+                    client_request_manifest_id: Some(manifest_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let whole = |literal: &str| {
+            let mut args = grep_args(literal, vec![], 20);
+            args.scope = LarGrepScope::WholeRecord;
+            grep_records(&data_dir, &args).unwrap().json
+        };
+        for literal in [
+            "active-header-needle",
+            "active-trailer-needle",
+            "active-provider-needle",
+        ] {
+            assert!(whole(literal)["record_match_count"].as_u64().unwrap() >= 1);
+        }
+        assert!(
+            whole("active-body-needle")["body_match_count"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(whole("active-secret-must-not-match")["match_count"], 0);
+        assert_eq!(whole("active-account-excluded")["match_count"], 0);
+
+        let body_default =
+            grep_records(&data_dir, &grep_args("active-header-needle", vec![], 20)).unwrap();
+        assert_eq!(body_default.json["match_count"], 0);
+        assert!(body_default.json.get("record_matches").is_none());
+    }
+
+    #[test]
     fn grep_live_catalog_reconstructs_cross_pack_manifest_and_anchors_trace() {
         let data_dir = tmpdir("grep-live-cross-pack");
         let mut config = alex_store::LarBodyStoreConfig::default();
@@ -4285,6 +5033,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(verified.json["verified_manifest_count"], 1);
+        assert_eq!(
+            verified.json["verification_failures"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archive_verify_keep_going_reports_every_manifest_failure() {
+        let dir = tmpdir("archive-verify-keep-going");
+        let archive = dir.join("corrupt.lar");
+        let manifest_ids = write_archive_with_two_corrupt_manifests(&archive);
+
+        let fail_fast = format!("{:#}", verify_archive(&archive, false).unwrap_err());
+        assert_eq!(
+            manifest_ids
+                .iter()
+                .filter(|manifest_id| fail_fast.contains(manifest_id.as_str()))
+                .count(),
+            1,
+            "fail-fast verification should report only the first failed manifest: {fail_fast}"
+        );
+
+        let complete = format!("{:#}", verify_archive(&archive, true).unwrap_err());
+        assert!(complete.contains("2 issue(s)"), "{complete}");
+        assert!(
+            complete.contains("reconstructing 0/2 manifests"),
+            "{complete}"
+        );
+        for manifest_id in manifest_ids {
+            assert!(
+                complete.contains(&manifest_id),
+                "keep-going report omitted {manifest_id}: {complete}"
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5180,16 +5966,20 @@ mod tests {
                 ("x-repeat", "one"),
                 ("x-repeat", "two"),
             ])),
+            client_request_trailers: None,
             client_response_headers: Some(LarHeaderCapture::observed([(
                 "content-type",
                 "application/json",
             )])),
+            client_response_trailers: None,
             upstream_attempts: vec![
                 LarUpstreamAttemptCapture {
                     attempt_number: 1,
                     wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 10,
                     request_headers: Some(LarHeaderCapture::observed([("x-attempt", "one")])),
+                    request_trailers: None,
                     response_headers: Some(LarHeaderCapture::observed([("retry-after", "1")])),
+                    response_trailers: None,
                     status_code: Some(429),
                     error_class: Some("rate_limit".into()),
                     error_message: Some("retry".into()),
@@ -5198,10 +5988,12 @@ mod tests {
                     attempt_number: 2,
                     wall_time_ns: trace.ts_request_ms as u64 * 1_000_000 + 20,
                     request_headers: Some(LarHeaderCapture::observed([("x-attempt", "two")])),
+                    request_trailers: None,
                     response_headers: Some(LarHeaderCapture::observed([(
                         "content-type",
                         "text/event-stream",
                     )])),
+                    response_trailers: None,
                     status_code: Some(200),
                     error_class: None,
                     error_message: None,

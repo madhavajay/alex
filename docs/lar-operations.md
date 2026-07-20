@@ -24,6 +24,24 @@ The default remains `legacy`. A conservative rollout is:
    older binary can still read the retained gzip files.
 4. Leave legacy cleanup disabled for the documented compatibility window.
 
+### Compatibility support window
+
+The compatibility clock starts with the first generally available Alex
+release that enables LAR writes by default. From that release, Alex will keep
+mixed legacy-gzip/LAR reads for **at least two subsequent minor releases and at
+least 90 days**, whichever is longer. A release that intends to remove a
+legacy read or write path must announce that change at least one minor release
+in advance and must retain the standalone importer and verified backup/restore
+path.
+
+This window is a minimum, not an automatic deletion date. Legacy cleanup
+remains an explicit operator action, and quarantine is not purged merely
+because the window elapsed. Within the window, rollback to a current LAR-aware
+release is configuration-only. Downgrade to a pre-LAR release is supported
+only while its gzip files remain in place; after cleanup, restore quarantine or
+a pre-cleanup backup before starting that binary. A store containing LAR-only
+bodies must never be opened by a pre-LAR binary as a supported downgrade path.
+
 Set the mode in `config.toml` or for one daemon process with
 `ALEXANDRIA_LAR_BODY_STORE`. Invalid values fail startup rather than silently
 selecting another mode.
@@ -94,6 +112,7 @@ owner pointers; manual dry-run and import commands remain explicit. Monitor
 alex lar migration status --json
 alex lar verify
 alex lar grep 'known canary text' --limit 100 --json
+alex lar grep 'provider-or-header-value' --scope whole-record --limit 100 --json
 ```
 
 The health/storage responses report body-store worker queue and work latency,
@@ -159,9 +178,9 @@ alex lar cleanup --dry-run --json
 `cleanup --apply` moves eligible gzip files into recoverable
 `lar/quarantine/`; it does not delete LAR data. Applying it changes the
 downgrade boundary: a pre-LAR binary needs those quarantined files restored to
-read bodies. Keep compatibility reads and quarantine for the declared support
-window. Permanent legacy-write removal is a later release decision, not part
-of LAR v1 rollout.
+read bodies. Keep compatibility reads and quarantine for the support window
+defined above. Permanent legacy-write removal is a later release decision, not
+part of LAR v1 rollout.
 
 ## Rollback and downgrade
 
@@ -201,6 +220,13 @@ quarantine. Combined packs preserve manifests, cross-pack external manifest
 references, ordered headers, stream indexes, repeated/shared Stage occurrences,
 zero-stage exchanges, exact ExchangeMetadata companion presence, and the
 transitive conversation DAG. It never edits a sealed source in place.
+
+In authoritative `lar-with-fallback` mode, the daemon also runs this maintenance
+once per day. The automatic pass performs verified GC and rewrites at most one
+sealed pack using the conservative default threshold (at least 64 MiB and 25%
+garbage). It is disabled in `legacy` and shadow-only `dual-write-validated`
+modes. Manual plan/apply remains available for inspection, catch-up, and
+operator-controlled archive work.
 
 Selection is intentionally conservative: a source must be a clean sealed body
 pack under Alex's managed LAR directory whose schemas and physical extensions
@@ -267,6 +293,35 @@ metadata remains available and affected bodies report `archived_offline` or
 same clean sealed file: Alex verifies its role, UUID, length, whole-file digest,
 footer, chunks, manifests, and bodies before switching the path. Do not replace
 an expected archive with a different file at the same pathname.
+
+List the catalog and record the exact file UUID before moving anything:
+
+```bash
+alex lar ls --json
+alex lar detach --file-uuid FILE_UUID --json
+```
+
+Detach accepts only an exact 32-hex-digit file UUID and refuses an active
+writer, repairing file, or retired file. It establishes the sealed file's
+immutable identity when necessary and then marks it `archived_offline`; it
+does not move, copy, or delete the archive. After detach succeeds, move the
+named file with normal filesystem tooling and retain the command's JSON report.
+
+To bring it online at its new location:
+
+```bash
+alex lar reattach --file-uuid FILE_UUID \
+  --archive /Volumes/archive/alex/moved.lar --json
+```
+
+Reattach canonicalizes the candidate path and accepts only the clean sealed
+archive already bound to that file UUID. It checks the header role and format
+features, byte length, whole-file BLAKE3, footer, every local chunk, every
+self-contained manifest/body, and that the file did not change during
+validation. Only then does one transaction update the catalog path and return
+the file to `online`. A failed validation leaves the old path and offline state
+unchanged. Paths inside the Alex data directory are stored relative to that
+directory; external archive paths remain absolute.
 
 ## Incident checklist
 

@@ -68,32 +68,32 @@ Optional release gates:
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P95_MS`
 - `ALEX_LAR_BENCH_MAX_PROXY_ADDED_P99_MS`
 
-## Live capture during migration and maintenance accounting
+## Live capture during migration and physical maintenance
 
 Run the production-path coexistence measurement with:
 
 ```sh
 cargo test -p alex-proxy --test lar_rollout_benchmark --release \
-  live_capture_during_migration_and_gc_repack_accounting -- \
+  live_capture_during_migration_and_gc_repack -- \
   --ignored --nocapture --test-threads=1
 ```
 
 The default fixture starts four clients sending 32 requests each through the
 public OpenAI chat route with a 32 KiB prefix. At the same time, the production
 legacy importer converts 128 deterministic, incompressible 64 KiB request
-bodies under a 2 MiB/s I/O throttle, while another thread repeatedly runs the
-production GC reachability query and repack-candidate planner. The fixture
-first creates deleted LAR roots in sealed packs, so both accounting paths have
-real garbage to inspect. It requires the migration to be active when foreground
-capture starts, checks migration and accounting errors, and verifies every
-captured foreground trace found by the benchmark has a published LAR request
-pointer.
+bodies under a 2 MiB/s I/O throttle. A maintenance thread executes production
+GC followed by one complete copy-verify-switch-retire repack, then continues
+running reachability and candidate accounting until foreground capture ends.
+The fixture first creates deleted LAR roots in sealed packs, so physical GC and
+repack have real garbage to process. It requires migration and physical
+maintenance to overlap foreground capture, checks all errors, and verifies
+every captured foreground trace found by the benchmark has a published LAR
+request pointer.
 
 The JSON report includes foreground error count/rate, throughput, and request
-latency p50/p95/p99; importer throughput and throttle/yield counters; and
-GC/repack-planning p50/p95/p99 plus their maximum observed garbage counts.
-Only reachability and candidate accounting run here: the benchmark does not
-execute repacks or mutate sealed archive packs.
+latency p50/p95/p99; importer throughput and throttle/yield counters; physical
+GC/repack duration and reclaimed bytes; and subsequent GC/repack-planning
+p50/p95/p99 plus their maximum observed garbage counts.
 
 Workload overrides:
 
@@ -120,15 +120,14 @@ harness is criterion 9 regression evidence, but it does not establish the
 latency/error budget or complete acceptance: the agreed workload, thresholds,
 and Mac hardware run remain required.
 
-A reduced Linux release smoke on 2026-07-20 used 2 clients × 4 turns, 4 KiB
-prefixes, 16 × 16 KiB legacy bodies throttled to 64 KiB/s, and 12 × 64 KiB
-deleted LAR roots. All eight live requests succeeded and published LAR pointers;
-foreground p50/p95/p99 was 43.006/43.916/43.916 ms at 44.76 ops/s. Across 934
-concurrent passes, GC accounting was 0.616/0.857/1.078 ms and repack planning
-was 2.712/3.047/3.323 ms at p50/p95/p99. Migration remained active through the
-foreground workload and completed 16/16 bodies with no failures. Every gate
-was unconfigured. The tiny sample validates overlap and report wiring only; it
-is not a representative latency result or Mac acceptance evidence.
+The full default Linux release run on 2026-07-21 completed 128/128 foreground
+requests without errors at 78.57 ops/s. Foreground p50/p95/p99 was
+47.948/68.953/76.788 ms. The concurrent importer migrated all 128 bodies (8
+MiB logical) with no failures and was still running when foreground capture
+ended. Physical GC completed in 8.537 ms and observed 870 unreachable chunks;
+the copy-verify-switch-retire repack completed in 12.234 ms and reclaimed
+499,395 logical bytes. Every release gate was unconfigured. This is a Linux
+regression baseline, not target-Mac acceptance evidence.
 
 ## Long-session Trace Browser backend
 

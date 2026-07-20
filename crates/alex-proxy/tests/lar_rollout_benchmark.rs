@@ -563,7 +563,13 @@ async fn send_observed_request(
     }
 }
 
-struct AccountingReport {
+struct MaintenanceReport {
+    actual_gc_latency: Duration,
+    actual_gc_unreachable_chunks: u64,
+    actual_repack_latency: Duration,
+    actual_repacked: bool,
+    actual_repack_logical_bytes_reclaimed: u64,
+    started_during_foreground: bool,
     gc_latencies: Vec<Duration>,
     repack_plan_latencies: Vec<Duration>,
     errors: Vec<String>,
@@ -572,11 +578,12 @@ struct AccountingReport {
 }
 
 /// Local production-path evidence for the live-capture budget while the
-/// startup importer and read-only GC/repack accounting overlap. This does not
-/// mutate packs or replace the required threshold run on the rollout Mac.
+/// startup importer and actual GC/repack overlap. The synthetic run exercises
+/// the production copy-verify-switch-retire path, but does not replace the
+/// required threshold run on the rollout Mac.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "manual release gate for live capture during migration and maintenance accounting"]
-async fn live_capture_during_migration_and_gc_repack_accounting() {
+#[ignore = "manual release gate for live capture during migration and physical maintenance"]
+async fn live_capture_during_migration_and_gc_repack() {
     let workers = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_WORKERS", 4);
     let turns_per_worker = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_TURNS_PER_WORKER", 32);
     let prefix_bytes = env_usize("ALEX_LAR_BENCH_MAINT_PROXY_PREFIX_BYTES", 32 * 1024);
@@ -700,19 +707,44 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
         .expect("migration did not reach the claimed boundary");
 
     let accounting_stop = Arc::new(AtomicBool::new(false));
+    let foreground_active = Arc::new(AtomicBool::new(false));
+    let (maintenance_start_tx, maintenance_start_rx) = mpsc::channel();
     let accounting_store = store.clone();
     let accounting_stop_worker = accounting_stop.clone();
+    let foreground_active_worker = foreground_active.clone();
     let accounting_worker = std::thread::spawn(move || {
-        let mut report = AccountingReport {
+        maintenance_start_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("foreground workload did not release maintenance");
+        let started_during_foreground = foreground_active_worker.load(Ordering::Acquire);
+        let began = Instant::now();
+        let actual_gc = accounting_store
+            .run_lar_gc(1_800_000_000_000)
+            .expect("running physical GC during foreground capture");
+        let actual_gc_latency = began.elapsed();
+        let repack_config = LarRepackConfig {
+            min_garbage_bytes: 1,
+            min_garbage_ratio: 0.01,
+        };
+        let began = Instant::now();
+        let actual_repack = accounting_store
+            .run_lar_repack(&repack_config, 1_800_000_000_001)
+            .expect("running physical repack during foreground capture");
+        let actual_repack_latency = began.elapsed();
+        let mut report = MaintenanceReport {
+            actual_gc_latency,
+            actual_gc_unreachable_chunks: actual_gc.unreachable_chunks,
+            actual_repack_latency,
+            actual_repacked: actual_repack.is_some(),
+            actual_repack_logical_bytes_reclaimed: actual_repack
+                .as_ref()
+                .map_or(0, |report| report.logical_bytes_reclaimed),
+            started_during_foreground,
             gc_latencies: Vec::new(),
             repack_plan_latencies: Vec::new(),
             errors: Vec::new(),
             max_unreachable_chunks: 0,
             max_repack_candidates: 0,
-        };
-        let repack_config = LarRepackConfig {
-            min_garbage_bytes: 1,
-            min_garbage_ratio: 0.01,
         };
         while !accounting_stop_worker.load(Ordering::Acquire) {
             let began = Instant::now();
@@ -771,12 +803,17 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
         })
         .collect::<Vec<_>>();
     let foreground_started_at = Instant::now();
+    foreground_active.store(true, Ordering::Release);
     barrier.wait().await;
+    maintenance_start_tx
+        .send(())
+        .expect("maintenance worker stopped before foreground capture");
     let mut observations = Vec::with_capacity(workers * turns_per_worker);
     for handle in foreground_handles {
         observations.extend(handle.await.unwrap());
     }
     let foreground_elapsed = foreground_started_at.elapsed();
+    foreground_active.store(false, Ordering::Release);
     let migration_overlapped_foreground_end = !migration_finished.load(Ordering::Acquire);
 
     let migration_report = migration_worker.join().unwrap().unwrap();
@@ -795,8 +832,19 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
     );
     assert!(!accounting_report.gc_latencies.is_empty());
     assert!(!accounting_report.repack_plan_latencies.is_empty());
-    assert!(accounting_report.max_unreachable_chunks >= initial_unreachable_chunks);
-    assert!(accounting_report.max_repack_candidates >= initial_repack_candidates);
+    assert!(accounting_report.started_during_foreground);
+    assert!(
+        accounting_report.actual_gc_unreachable_chunks >= initial_unreachable_chunks,
+        "physical GC did not observe the seeded unreachable chunks"
+    );
+    assert!(
+        accounting_report.actual_repacked,
+        "physical maintenance found no seeded repack candidate"
+    );
+    assert!(
+        accounting_report.actual_repack_logical_bytes_reclaimed > 0,
+        "physical repack reclaimed no logical bytes"
+    );
 
     let foreground_operations = workers * turns_per_worker;
     let errors = observations
@@ -845,7 +893,7 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
     }
 
     emit_report(
-        "live_capture_during_migration_and_gc_repack_accounting",
+        "live_capture_during_migration_and_gc_repack",
         json!({
             "workload": {
                 "proxy_workers": workers,
@@ -860,7 +908,7 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
                 "garbage_body_bytes": garbage_body_bytes,
                 "garbage_logical_bytes": garbage_logical_bytes,
                 "accounting_interval_ms": accounting_interval_ms,
-                "maintenance_scope": "legacy_import_plus_read_only_gc_and_repack_candidate_accounting",
+                "maintenance_scope": "legacy_import_plus_physical_gc_and_copy_verify_switch_retire_repack",
                 "transport": "loopback_http_public_openai_chat_route",
             },
             "foreground": {
@@ -885,6 +933,12 @@ async fn live_capture_during_migration_and_gc_repack_accounting() {
                 "still_running_at_foreground_end": migration_overlapped_foreground_end,
             },
             "accounting": {
+                "actual_gc_latency_ms": accounting_report.actual_gc_latency.as_secs_f64() * 1_000.0,
+                "actual_gc_unreachable_chunks": accounting_report.actual_gc_unreachable_chunks,
+                "actual_repack_latency_ms": accounting_report.actual_repack_latency.as_secs_f64() * 1_000.0,
+                "actual_repacked": accounting_report.actual_repacked,
+                "actual_repack_logical_bytes_reclaimed": accounting_report.actual_repack_logical_bytes_reclaimed,
+                "actual_maintenance_started_during_foreground": accounting_report.started_during_foreground,
                 "gc_latency": percentile_report(accounting_report.gc_latencies),
                 "repack_plan_latency": percentile_report(accounting_report.repack_plan_latencies),
                 "max_unreachable_chunks": accounting_report.max_unreachable_chunks,

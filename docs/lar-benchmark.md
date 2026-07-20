@@ -247,25 +247,50 @@ The ignored release benchmark for success criterion 9 can be rerun with:
 
 ```sh
 cargo test -p alex-proxy --test lar_rollout_benchmark --release \
-  live_capture_during_migration_and_gc_repack_accounting -- \
+  live_capture_during_migration_and_gc_repack -- \
   --ignored --nocapture --test-threads=1
 ```
 
 It sends concurrent requests through the real loopback proxy and live
-`LarWithFallback` writer while the production throttled legacy importer and
-repeated production GC/repack-candidate accounting are active. It reports
-foreground errors, throughput, and p50/p95/p99 latency separately from
-maintenance timings. Repack planning is read-only in this harness; no archive
-pack is rewritten. Workload controls and optional operator thresholds are
+`LarWithFallback` writer while the production throttled legacy importer,
+physical GC, and a complete copy-verify-switch-retire repack are active. It
+reports foreground errors, throughput, and p50/p95/p99 latency separately from
+physical maintenance and follow-up accounting timings. Workload controls and
+optional operator thresholds are
 listed in
-[LAR rollout performance gates](lar-rollout-performance-gates.md#live-capture-during-migration-and-maintenance-accounting).
+[LAR rollout performance gates](lar-rollout-performance-gates.md#live-capture-during-migration-and-physical-maintenance).
 
 The fixture is deterministic and uses production paths, but it remains local
 synthetic evidence. Criterion 9 stays open until its representative workload,
 latency/error budget, and target-Mac run are agreed and recorded. An unset
 threshold is printed as `unconfigured`, never as a passing gate.
 
+The full default Linux release run on 2026-07-21 passed 128/128 foreground
+requests at 78.57 ops/s with 47.948/68.953/76.788 ms p50/p95/p99 while all 128
+legacy bodies migrated. Physical GC observed 870 unreachable chunks in 8.537
+ms; one complete repack reclaimed 499,395 logical bytes in 12.234 ms. All
+acceptance thresholds remained unconfigured.
+
 ## Long-session Trace Browser backend
+
+The focused cancellation regression can be rerun with:
+
+```sh
+cargo test -p alex-proxy \
+  disconnected_body_search_cancels_between_pages_and_keeps_http_responsive \
+  -- --nocapture
+```
+
+It drives the production `/traces/search` route through a real loopback HTTP
+connection with the normalized index empty, pauses the fallback scan after its
+first 500-row cursor page, and disconnects the client. A test-only observer
+proves that Axum dropped the request handler, the handler set the production
+cooperative-cancellation flag, and the blocking scan observed that flag before
+starting another page. The same daemon must then complete a replacement body
+search within two seconds and `/health` within one second. This directly covers
+server-side cancellation at the documented between-page boundary; it does not
+claim to interrupt body decompression already in progress within one page or
+to exercise macOS URLSession/UI cancellation behavior.
 
 The ignored release benchmark can be rerun with:
 
@@ -320,9 +345,13 @@ external mode:
 ```sh
 ALEX_LAR_RANDOM_ACCESS_CACHE_MODE=external \
 ALEX_LAR_COLD_CACHE_HELPER=/absolute/path/to/cache-drop-and-verify \
+ALEX_LAR_BENCH_MAX_EXTERNAL_COLD_P99_MS=AGREED_VALUE \
 cargo test -p alex-lar --test index_benchmark --release -- \
   --ignored --nocapture --test-threads=1
 ```
+
+Replace `AGREED_VALUE` with the approved target-hardware p99 limit in
+milliseconds; the literal placeholder is intentionally invalid.
 
 The helper is invoked before every measured random-access sample with the
 archive path as its only argument and `ALEX_LAR_COLD_CACHE_PROTOCOL=1` in its
@@ -335,6 +364,15 @@ page-cache or storage-controller state. The Rust benchmark cannot inspect that
 state portably. On macOS, a wrapper around a privileged `purge` plus
 site-specific verification is one possible implementation; no macOS result is
 recorded here.
+
+The benchmark emits an `ALEX_LAR_COLD_CACHE_BENCHMARK` JSON record. Its p99 gate
+can report `pass` only when the cache mode is `external-helper-attested` and
+`ALEX_LAR_BENCH_MAX_EXTERNAL_COLD_P99_MS` is configured. External mode without
+a limit reports `unconfigured`. Warm and advisory modes report
+`non_acceptance`; setting the acceptance threshold in either mode is rejected
+instead of comparing advisory evidence with the rollout limit. A successful
+helper marker is necessary evidence supplied by the test site, not independent
+proof by the Rust process that every cache layer was cold.
 
 On this Linux workspace, the corrected exact-descriptor benchmark over a
 sealed archive containing 2,000 manifests opened through its footer and
@@ -352,8 +390,8 @@ opening and validating the footer/index, random manifest lookup, locating the
 chunk, and decompression to first output rather than only index parsing. The
 Linux `posix_fadvise` samples above are advisory-eviction evidence, not a
 controlled cold-cache result. A controlled run still requires the external
-helper protocol on the agreed hardware profile; the agreed Mac run remains a
-rollout gate.
+helper protocol, an explicitly configured p99 limit, and a passing result on
+the agreed hardware profile; the agreed Mac run remains a rollout gate.
 
 ## Native framing versus an MCAP profile
 

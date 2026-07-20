@@ -10,6 +10,7 @@ use std::time::Instant;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 const CACHE_MODE_ENV: &str = "ALEX_LAR_RANDOM_ACCESS_CACHE_MODE";
 const CACHE_HELPER_ENV: &str = "ALEX_LAR_COLD_CACHE_HELPER";
+const EXTERNAL_COLD_P99_GATE_ENV: &str = "ALEX_LAR_BENCH_MAX_EXTERNAL_COLD_P99_MS";
 const EXTERNAL_READY_MARKER: &str = "alex-lar-cold-cache-ready-v1";
 
 struct TempArchive(PathBuf);
@@ -101,6 +102,68 @@ impl CacheMode {
             Self::ExternalAttested { .. } => "external-helper-attested",
         }
     }
+
+    fn is_external_attested(&self) -> bool {
+        matches!(self, Self::ExternalAttested { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ColdCacheGate {
+    status: &'static str,
+    configured_max_ms: Option<f64>,
+    measured_p99_ms: f64,
+    failure: Option<String>,
+}
+
+fn external_cold_p99_gate(
+    mode: &CacheMode,
+    configured: Option<&str>,
+    measured_p99: Duration,
+) -> Result<ColdCacheGate, String> {
+    let measured_p99_ms = measured_p99.as_secs_f64() * 1_000.0;
+    if !mode.is_external_attested() {
+        if configured.is_some() {
+            return Err(format!(
+                "{EXTERNAL_COLD_P99_GATE_ENV} is only valid when {CACHE_MODE_ENV}=external with a successful {CACHE_HELPER_ENV} attestation"
+            ));
+        }
+        return Ok(ColdCacheGate {
+            status: "non_acceptance",
+            configured_max_ms: None,
+            measured_p99_ms,
+            failure: None,
+        });
+    }
+
+    let Some(raw) = configured else {
+        return Ok(ColdCacheGate {
+            status: "unconfigured",
+            configured_max_ms: None,
+            measured_p99_ms,
+            failure: None,
+        });
+    };
+    let configured_max_ms = raw
+        .parse::<f64>()
+        .map_err(|error| format!("{EXTERNAL_COLD_P99_GATE_ENV} must be a number: {error}"))?;
+    if !configured_max_ms.is_finite() || configured_max_ms < 0.0 {
+        return Err(format!(
+            "{EXTERNAL_COLD_P99_GATE_ENV} must be a finite non-negative number"
+        ));
+    }
+    let passed = measured_p99_ms <= configured_max_ms;
+    let failure = (!passed).then(|| {
+        format!(
+            "{EXTERNAL_COLD_P99_GATE_ENV} maximum gate failed: measured {measured_p99_ms:.3} ms, configured {configured_max_ms:.3} ms"
+        )
+    });
+    Ok(ColdCacheGate {
+        status: if passed { "pass" } else { "fail" },
+        configured_max_ms: Some(configured_max_ms),
+        measured_p99_ms,
+        failure,
+    })
 }
 
 fn parse_cache_mode(mode: Option<&str>, helper: Option<PathBuf>) -> Result<CacheMode, String> {
@@ -290,9 +353,40 @@ fn persisted_footer_avoids_the_forward_scan() {
     let cache_p50 = percentile(&mut cache_controlled.clone(), 50);
     let cache_p95 = percentile(&mut cache_controlled.clone(), 95);
     let cache_p99 = percentile(&mut cache_controlled, 99);
+    let configured_gate = std::env::var(EXTERNAL_COLD_P99_GATE_ENV).ok();
+    let gate = external_cold_p99_gate(
+        &advised_or_external_mode,
+        configured_gate.as_deref(),
+        cache_p99,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     eprintln!(
         "2,000-manifest random filesystem open+1KiB body TTFT: first-forward={first_scan:?}, first-footer={first_footer:?}, footer-warm p50={p50:?} p95={p95:?} p99={p99:?}, cache-mode={} p50={cache_p50:?} p95={cache_p95:?} p99={cache_p99:?}",
         advised_or_external_mode.label(),
+    );
+    eprintln!(
+        "ALEX_LAR_COLD_CACHE_BENCHMARK {}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "alex-lar-cold-cache-benchmark-v1",
+            "cache_mode": advised_or_external_mode.label(),
+            "samples": cache_controlled.len(),
+            "p50_ms": cache_p50.as_secs_f64() * 1_000.0,
+            "p95_ms": cache_p95.as_secs_f64() * 1_000.0,
+            "p99_ms": cache_p99.as_secs_f64() * 1_000.0,
+            "gate": {
+                "environment": EXTERNAL_COLD_P99_GATE_ENV,
+                "status": gate.status,
+                "configured_max_ms": gate.configured_max_ms,
+                "measured_p99_ms": gate.measured_p99_ms,
+                "acceptance_requires": "external-helper-attested",
+            },
+        }))
+        .unwrap()
+    );
+    assert!(
+        gate.failure.is_none(),
+        "{}",
+        gate.failure.unwrap_or_default()
     );
 }
 
@@ -311,6 +405,38 @@ fn cache_mode_requires_an_explicit_verified_external_helper() {
             helper: PathBuf::from("helper")
         }
     );
+}
+
+#[test]
+fn cold_cache_gate_only_passes_for_external_attestation_and_a_configured_limit() {
+    let advisory = CacheMode::Advisory;
+    let external = CacheMode::ExternalAttested {
+        helper: PathBuf::from("helper"),
+    };
+
+    let advisory_report =
+        external_cold_p99_gate(&advisory, None, Duration::from_millis(7)).unwrap();
+    assert_eq!(advisory_report.status, "non_acceptance");
+    assert_eq!(advisory_report.configured_max_ms, None);
+    assert!(external_cold_p99_gate(&advisory, Some("10"), Duration::from_millis(7)).is_err());
+
+    let unconfigured = external_cold_p99_gate(&external, None, Duration::from_millis(7)).unwrap();
+    assert_eq!(unconfigured.status, "unconfigured");
+    assert_eq!(unconfigured.configured_max_ms, None);
+
+    let passing = external_cold_p99_gate(&external, Some("10"), Duration::from_millis(7)).unwrap();
+    assert_eq!(passing.status, "pass");
+    assert_eq!(passing.configured_max_ms, Some(10.0));
+    assert!(passing.failure.is_none());
+
+    let failing = external_cold_p99_gate(&external, Some("6.5"), Duration::from_millis(7)).unwrap();
+    assert_eq!(failing.status, "fail");
+    assert!(failing.failure.is_some());
+    for invalid in ["-1", "NaN", "infinity"] {
+        assert!(
+            external_cold_p99_gate(&external, Some(invalid), Duration::from_millis(7)).is_err()
+        );
+    }
 }
 
 #[cfg(unix)]

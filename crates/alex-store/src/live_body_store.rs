@@ -13,9 +13,9 @@ use alex_lar::{
     read_chunk_record_at, read_file_header, ArchiveReader, ArchiveWriter, BodyManifest,
     CheckpointRecordDescriptor, ChunkHash, ChunkRecordDescriptor, ChunkRef, ChunkerConfig,
     Exchange, ExchangeData, ExchangeMetadataData, FileHeader, FrameRead, FrameReader, HeaderAtom,
-    HeaderBlock, HeaderFidelity, Limits, ManifestId, RecordFrame, RecordType, RecoveryStatus,
-    Stage, StageData, StageKind, StreamIndex, StreamRead, StreamingChunker, TokenUsage,
-    REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS,
+    HeaderBlock, HeaderFidelity, Limits, ManifestId, ParsedFrame, RecordFrame, RecordType,
+    RecoveryStatus, Stage, StageData, StageKind, StreamFrameKind, StreamIndex, StreamParser,
+    StreamRead, StreamingChunker, TokenUsage, REQUIRED_FEATURE_ARCHIVE_SET_BODY_REFS,
 };
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
@@ -27,6 +27,7 @@ use crate::{
 };
 
 static LIVE_PACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_CAPTURED_STREAM_FRAMES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -317,7 +318,11 @@ pub struct LarUpstreamAttemptCapture {
     pub attempt_number: u32,
     pub wall_time_ns: u64,
     pub request_headers: Option<LarHeaderCapture>,
+    /// Ordered request trailers when the upstream HTTP client exposes them.
+    pub request_trailers: Option<LarHeaderCapture>,
     pub response_headers: Option<LarHeaderCapture>,
+    /// Ordered response trailers when the upstream HTTP client exposes them.
+    pub response_trailers: Option<LarHeaderCapture>,
     pub status_code: Option<u16>,
     pub error_class: Option<String>,
     pub error_message: Option<String>,
@@ -345,7 +350,11 @@ pub struct LarExchangeCapture {
     pub run_id: Option<String>,
     pub wall_time_ns: u64,
     pub client_request_headers: Option<LarHeaderCapture>,
+    /// Ordered client request trailers when the server stack exposes them.
+    pub client_request_trailers: Option<LarHeaderCapture>,
     pub client_response_headers: Option<LarHeaderCapture>,
+    /// Ordered client response trailers when the response producer emits them.
+    pub client_response_trailers: Option<LarHeaderCapture>,
     pub upstream_attempts: Vec<LarUpstreamAttemptCapture>,
     /// Exact read boundaries observed while consuming the final raw upstream
     /// stream. `None` means timing was not observed or capture overflowed.
@@ -360,7 +369,214 @@ pub struct LarExchangeCapture {
     pub error_message: Option<String>,
 }
 
-fn sensitive_header_name(name: &[u8]) -> bool {
+#[derive(Debug, Eq, PartialEq)]
+enum LiveFrameParse {
+    Frames(Vec<ParsedFrame>),
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushLiveFrame {
+    Added,
+    Skipped,
+    Overflow,
+}
+
+fn live_stream_parser(capture: &LarExchangeCapture) -> Option<StreamParser> {
+    let headers = capture
+        .upstream_attempts
+        .last()?
+        .response_headers
+        .as_ref()?;
+    let content_type = headers.atoms.iter().find_map(|atom| {
+        atom.original_name
+            .eq_ignore_ascii_case(b"content-type")
+            .then_some(atom.value.as_slice())
+    })?;
+    let media_type = content_type
+        .split(|byte| *byte == b';')
+        .next()
+        .map(trim_ascii)?;
+    if media_type.eq_ignore_ascii_case(b"text/event-stream") {
+        Some(StreamParser::Sse)
+    } else if media_type.eq_ignore_ascii_case(b"application/x-ndjson")
+        || media_type.eq_ignore_ascii_case(b"application/ndjson")
+    {
+        Some(StreamParser::Ndjson)
+    } else {
+        None
+    }
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// Return `(content_end, raw_line_end)` for one LF, CRLF, CR, or EOF-ended
+/// line beginning at `start`.
+fn raw_line(body: &[u8], start: usize) -> Option<(usize, usize)> {
+    if start >= body.len() {
+        return None;
+    }
+    let relative_end = body[start..]
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'));
+    let Some(relative_end) = relative_end else {
+        return Some((body.len(), body.len()));
+    };
+    let content_end = start + relative_end;
+    let raw_end = if body[content_end] == b'\r' && body.get(content_end + 1).copied() == Some(b'\n')
+    {
+        content_end + 2
+    } else {
+        content_end + 1
+    };
+    Some((content_end, raw_end))
+}
+
+fn frame_completion_delta(reads: &[LarStreamReadCapture], frame_end: u64) -> Option<u64> {
+    reads.iter().find_map(|read| {
+        read.byte_offset
+            .checked_add(read.byte_length)
+            .filter(|read_end| *read_end >= frame_end && read.byte_offset < frame_end)
+            .map(|_| read.delta_from_first_byte_ns)
+    })
+}
+
+fn valid_sse_json_event(bytes: &[u8]) -> bool {
+    if std::str::from_utf8(bytes).is_err() {
+        return false;
+    }
+    let mut cursor = 0;
+    let mut data = Vec::new();
+    let mut saw_data = false;
+    while let Some((content_end, raw_end)) = raw_line(bytes, cursor) {
+        let line = &bytes[cursor..content_end];
+        cursor = raw_end;
+        if line.starts_with(b":") {
+            continue;
+        }
+        let (field, mut value) = match line.iter().position(|byte| *byte == b':') {
+            Some(colon) => (&line[..colon], &line[colon + 1..]),
+            None => (line, &[][..]),
+        };
+        if field != b"data" {
+            continue;
+        }
+        if value.first().copied() == Some(b' ') {
+            value = &value[1..];
+        }
+        if saw_data {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(value);
+        saw_data = true;
+    }
+    if !saw_data {
+        return false;
+    }
+    let data = trim_ascii(&data);
+    data == b"[DONE]" || serde_json::from_slice::<serde_json::Value>(data).is_ok()
+}
+
+fn push_live_frame(
+    frames: &mut Vec<ParsedFrame>,
+    parser: StreamParser,
+    frame_kind: StreamFrameKind,
+    start: usize,
+    end: usize,
+    reads: &[LarStreamReadCapture],
+    max_frames: usize,
+) -> PushLiveFrame {
+    if frames.len() >= max_frames {
+        return PushLiveFrame::Overflow;
+    }
+    let (Ok(byte_offset), Ok(byte_length), Ok(frame_end)) = (
+        u64::try_from(start),
+        u64::try_from(end.saturating_sub(start)),
+        u64::try_from(end),
+    ) else {
+        return PushLiveFrame::Overflow;
+    };
+    let Some(delta_from_first_byte_ns) = frame_completion_delta(reads, frame_end) else {
+        // The authoritative read index validation will diagnose bad coverage.
+        // Never invent timing for a derived frame.
+        return PushLiveFrame::Skipped;
+    };
+    frames.push(ParsedFrame {
+        byte_offset,
+        byte_length,
+        delta_from_first_byte_ns,
+        parser,
+        frame_kind,
+    });
+    PushLiveFrame::Added
+}
+
+fn parse_live_stream_frames_bounded(
+    parser: StreamParser,
+    body: &[u8],
+    reads: &[LarStreamReadCapture],
+    max_frames: usize,
+) -> LiveFrameParse {
+    let mut frames = Vec::new();
+    let mut cursor = 0;
+    match parser {
+        StreamParser::Sse => {
+            let mut event_start = 0;
+            while let Some((content_end, raw_end)) = raw_line(body, cursor) {
+                if content_end == cursor {
+                    if cursor > event_start && valid_sse_json_event(&body[event_start..cursor]) {
+                        if push_live_frame(
+                            &mut frames,
+                            parser,
+                            StreamFrameKind::SseEvent,
+                            event_start,
+                            raw_end,
+                            reads,
+                            max_frames,
+                        ) == PushLiveFrame::Overflow
+                        {
+                            return LiveFrameParse::Overflow;
+                        }
+                    }
+                    event_start = raw_end;
+                }
+                cursor = raw_end;
+            }
+        }
+        StreamParser::Ndjson => {
+            while let Some((content_end, raw_end)) = raw_line(body, cursor) {
+                let record = trim_ascii(&body[cursor..content_end]);
+                if !record.is_empty()
+                    && serde_json::from_slice::<serde_json::Value>(record).is_ok()
+                    && push_live_frame(
+                        &mut frames,
+                        parser,
+                        StreamFrameKind::NdjsonRecord,
+                        cursor,
+                        raw_end,
+                        reads,
+                        max_frames,
+                    ) == PushLiveFrame::Overflow
+                {
+                    return LiveFrameParse::Overflow;
+                }
+                cursor = raw_end;
+            }
+        }
+        StreamParser::Opaque | StreamParser::Unknown(_) => {}
+    }
+    LiveFrameParse::Frames(frames)
+}
+
+pub(crate) fn sensitive_header_name(name: &[u8]) -> bool {
     let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
     matches!(
         lower.as_str(),
@@ -922,6 +1138,42 @@ impl Store {
             bail!("LAR exchange trace ID must not be empty");
         }
 
+        let parsed_stream_frames = match (
+            capture.upstream_stream_reads.as_deref(),
+            live_stream_parser(capture),
+            bodies.upstream_response_manifest_id.as_deref(),
+        ) {
+            (Some(reads @ [_, ..]), Some(parser), Some(manifest_id)) => {
+                match self.read_lar_manifest_body(manifest_id) {
+                    Ok(body) => match parse_live_stream_frames_bounded(
+                        parser,
+                        &body,
+                        reads,
+                        MAX_CAPTURED_STREAM_FRAMES,
+                    ) {
+                        LiveFrameParse::Frames(frames) => frames,
+                        LiveFrameParse::Overflow => {
+                            tracing::warn!(
+                                trace_id = capture.trace_id,
+                                max_frames = MAX_CAPTURED_STREAM_FRAMES,
+                                "live parsed stream frame capture overflowed; preserving raw reads without parsed annotations"
+                            );
+                            Vec::new()
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            trace_id = capture.trace_id,
+                            error = %format_args!("{error:#}"),
+                            "could not derive live parsed stream frames; preserving raw reads without parsed annotations"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+
         let mut state = self.lock_live_lar_writer("exchange", &capture.trace_id)?;
         let result = (|| -> Result<Option<String>> {
             let mut conn = self.conn.lock().unwrap();
@@ -996,7 +1248,7 @@ impl Store {
                         })
                         .collect();
                     Some((
-                        StreamIndex::new(manifest_id, reads, Vec::new()),
+                        StreamIndex::new(manifest_id, reads, parsed_stream_frames.clone()),
                         body_length,
                     ))
                 }
@@ -1007,8 +1259,12 @@ impl Store {
             let writer = &mut active.writer;
             let client_request_headers =
                 append_capture_header(writer, capture.client_request_headers.as_ref())?;
+            let client_request_trailers =
+                append_capture_header(writer, capture.client_request_trailers.as_ref())?;
             let client_response_headers =
                 append_capture_header(writer, capture.client_response_headers.as_ref())?;
+            let client_response_trailers =
+                append_capture_header(writer, capture.client_response_trailers.as_ref())?;
             let stream_index_ref = external_stream
                 .map(|(index, body_length)| {
                     writer.append_stream_index_with_external_manifest(index, body_length)
@@ -1018,6 +1274,7 @@ impl Store {
 
             let mut client_request = StageData::new(StageKind::ClientRequest, capture.wall_time_ns);
             client_request.request_headers_ref = client_request_headers;
+            client_request.trailers_ref = client_request_trailers;
             client_request.request_body_manifest_ref =
                 parse_optional_manifest(bodies.client_request_manifest_id.as_deref())?;
             stages.push(writer.append_stage_with_external_manifests(
@@ -1057,11 +1314,16 @@ impl Store {
             for (index, attempt) in capture.upstream_attempts.iter().enumerate() {
                 let request_headers =
                     append_capture_header(writer, attempt.request_headers.as_ref())?;
+                let request_trailers =
+                    append_capture_header(writer, attempt.request_trailers.as_ref())?;
                 let response_headers =
                     append_capture_header(writer, attempt.response_headers.as_ref())?;
+                let response_trailers =
+                    append_capture_header(writer, attempt.response_trailers.as_ref())?;
                 let mut request = StageData::new(StageKind::UpstreamRequest, attempt.wall_time_ns);
                 request.attempt_number = Some(attempt.attempt_number);
                 request.request_headers_ref = request_headers;
+                request.trailers_ref = request_trailers;
                 if index == last_attempt {
                     request.request_body_manifest_ref =
                         parse_optional_manifest(bodies.upstream_request_manifest_id.as_deref())?;
@@ -1071,15 +1333,18 @@ impl Store {
                     &external_manifests,
                 )?);
 
-                let response_kind =
-                    if attempt.response_headers.is_some() || attempt.status_code.is_some() {
-                        StageKind::UpstreamResponse
-                    } else {
-                        StageKind::UpstreamFailure
-                    };
+                let response_kind = if attempt.response_headers.is_some()
+                    || attempt.response_trailers.is_some()
+                    || attempt.status_code.is_some()
+                {
+                    StageKind::UpstreamResponse
+                } else {
+                    StageKind::UpstreamFailure
+                };
                 let mut response = StageData::new(response_kind, attempt.wall_time_ns);
                 response.attempt_number = Some(attempt.attempt_number);
                 response.response_headers_ref = response_headers;
+                response.trailers_ref = response_trailers;
                 response.status_code = attempt.status_code;
                 response.error_class = attempt
                     .error_class
@@ -1111,6 +1376,7 @@ impl Store {
             );
             let mut client_response = StageData::new(StageKind::ClientResponse, response_time);
             client_response.response_headers_ref = client_response_headers;
+            client_response.trailers_ref = client_response_trailers;
             client_response.status_code = capture.status_code;
             client_response.error_class = capture
                 .error_class
@@ -1738,15 +2004,27 @@ fn all_capture_headers(capture: &LarExchangeCapture) -> Vec<&LarHeaderCapture> {
     if let Some(value) = capture.client_request_headers.as_ref() {
         headers.push(value);
     }
+    if let Some(value) = capture.client_request_trailers.as_ref() {
+        headers.push(value);
+    }
     for attempt in &capture.upstream_attempts {
         if let Some(value) = attempt.request_headers.as_ref() {
+            headers.push(value);
+        }
+        if let Some(value) = attempt.request_trailers.as_ref() {
             headers.push(value);
         }
         if let Some(value) = attempt.response_headers.as_ref() {
             headers.push(value);
         }
+        if let Some(value) = attempt.response_trailers.as_ref() {
+            headers.push(value);
+        }
     }
     if let Some(value) = capture.client_response_headers.as_ref() {
+        headers.push(value);
+    }
+    if let Some(value) = capture.client_response_trailers.as_ref() {
         headers.push(value);
     }
     headers
@@ -3202,6 +3480,127 @@ mod tests {
         }
     }
 
+    fn captured_reads(parts: &[(&[u8], u64)]) -> (Vec<u8>, Vec<LarStreamReadCapture>) {
+        let mut body = Vec::new();
+        let mut reads = Vec::new();
+        for (part, delta) in parts {
+            reads.push(LarStreamReadCapture {
+                byte_offset: body.len() as u64,
+                byte_length: part.len() as u64,
+                delta_from_first_byte_ns: *delta,
+            });
+            body.extend_from_slice(part);
+        }
+        (body, reads)
+    }
+
+    #[test]
+    fn live_sse_frames_handle_split_joined_crlf_comments_done_and_malformed_gaps() {
+        let comment = b": heartbeat\r\n\r\n";
+        let first = b": attached comment\r\ndata: {\"n\":1}\r\n\r\n";
+        let done = b"data: [DONE]\r\n\r\n";
+        let malformed = b"data: {broken}\r\n\r\n";
+        let last = b"data: {\"n\":2}\r\n\r\n";
+        let split = 9;
+        let joined = [
+            &first[split..],
+            done.as_slice(),
+            malformed.as_slice(),
+            &last[..7],
+        ]
+        .concat();
+        let (body, reads) = captured_reads(&[
+            (&[comment.as_slice(), &first[..split]].concat(), 0),
+            (&joined, 7_000_000),
+            (&last[7..], 11_000_000),
+        ]);
+
+        let LiveFrameParse::Frames(frames) = parse_live_stream_frames_bounded(
+            StreamParser::Sse,
+            &body,
+            &reads,
+            MAX_CAPTURED_STREAM_FRAMES,
+        ) else {
+            panic!("small fixture must not overflow");
+        };
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (
+                    frame.byte_offset,
+                    frame.byte_length,
+                    frame.delta_from_first_byte_ns,
+                    frame.frame_kind,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    comment.len() as u64,
+                    first.len() as u64,
+                    7_000_000,
+                    StreamFrameKind::SseEvent,
+                ),
+                (
+                    (comment.len() + first.len()) as u64,
+                    done.len() as u64,
+                    7_000_000,
+                    StreamFrameKind::SseEvent,
+                ),
+                (
+                    (comment.len() + first.len() + done.len() + malformed.len()) as u64,
+                    last.len() as u64,
+                    11_000_000,
+                    StreamFrameKind::SseEvent,
+                ),
+            ]
+        );
+        assert!(frames.iter().all(|frame| frame.parser == StreamParser::Sse));
+    }
+
+    #[test]
+    fn live_ndjson_frames_skip_bad_and_blank_lines_and_accept_final_eof_record() {
+        let first_half = b"{\"n\":";
+        let joined = b"1}\r\nnot-json\n\n{\"n\":2}\n{\"n\":";
+        let final_half = b"3}";
+        let (body, reads) = captured_reads(&[
+            (first_half, 0),
+            (joined, 5_000_000),
+            (final_half, 9_000_000),
+        ]);
+        let LiveFrameParse::Frames(frames) = parse_live_stream_frames_bounded(
+            StreamParser::Ndjson,
+            &body,
+            &reads,
+            MAX_CAPTURED_STREAM_FRAMES,
+        ) else {
+            panic!("small fixture must not overflow");
+        };
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].delta_from_first_byte_ns, 5_000_000);
+        assert_eq!(frames[1].delta_from_first_byte_ns, 5_000_000);
+        assert_eq!(frames[2].delta_from_first_byte_ns, 9_000_000);
+        assert!(frames.iter().all(|frame| {
+            frame.parser == StreamParser::Ndjson
+                && frame.frame_kind == StreamFrameKind::NdjsonRecord
+        }));
+    }
+
+    #[test]
+    fn live_frame_overflow_discards_annotations_without_changing_raw_reads() {
+        let body = b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n";
+        let reads = vec![LarStreamReadCapture {
+            byte_offset: 0,
+            byte_length: body.len() as u64,
+            delta_from_first_byte_ns: 0,
+        }];
+        assert_eq!(
+            parse_live_stream_frames_bounded(StreamParser::Ndjson, body, &reads, 2),
+            LiveFrameParse::Overflow
+        );
+        assert_eq!(reads[0].byte_length, body.len() as u64);
+    }
+
     #[test]
     fn concurrent_duplicate_writes_create_one_catalog_chunk() {
         let store = Arc::new(
@@ -3271,7 +3670,9 @@ mod tests {
                     run_id: Some("contended-run".into()),
                     wall_time_ns: 1_000 + index as u64,
                     client_request_headers: None,
+                    client_request_trailers: None,
                     client_response_headers: None,
+                    client_response_trailers: None,
                     upstream_attempts: Vec::new(),
                     upstream_stream_reads: None,
                     provider: Some("test".into()),

@@ -44,10 +44,12 @@ fn capture() -> LarExchangeCapture {
             ("X-Repeat", "two"),
             ("Authorization", "must-not-survive"),
         ])),
+        client_request_trailers: None,
         client_response_headers: Some(LarHeaderCapture::legacy_normalized([
             ("content-type", "application/json"),
             ("x-response", "client"),
         ])),
+        client_response_trailers: None,
         upstream_attempts: vec![
             LarUpstreamAttemptCapture {
                 attempt_number: 1,
@@ -57,7 +59,9 @@ fn capture() -> LarExchangeCapture {
                     ("x-repeat", "one"),
                     ("x-repeat", "two"),
                 ])),
+                request_trailers: None,
                 response_headers: Some(LarHeaderCapture::observed([("retry-after", "1")])),
+                response_trailers: None,
                 status_code: Some(429),
                 error_class: Some("capacity".into()),
                 error_message: Some("retry".into()),
@@ -70,10 +74,12 @@ fn capture() -> LarExchangeCapture {
                     ("x-repeat", "one"),
                     ("x-repeat", "two"),
                 ])),
+                request_trailers: None,
                 response_headers: Some(LarHeaderCapture::observed([
                     ("content-type", "application/json"),
                     ("x-response", "upstream"),
                 ])),
+                response_trailers: None,
                 status_code: Some(200),
                 error_class: None,
                 error_message: None,

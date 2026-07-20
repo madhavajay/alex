@@ -156,7 +156,7 @@ fn verify_lar(path: &Path, fixture: &Value, bytes: &[u8]) -> Result<(), String> 
     Ok(())
 }
 
-fn run() -> Result<(), String> {
+pub(crate) fn run() -> Result<(), String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
     let manifest_path = root.join("conformance-v1.json");
     let manifest: Value = serde_json::from_slice(
@@ -207,13 +207,5 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("LAR conformance: {error}");
         std::process::exit(2);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn published_corpus_verifies() {
-        super::run().unwrap();
     }
 }

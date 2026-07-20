@@ -49,7 +49,10 @@ pub use lar_conversation::{
 };
 pub use lar_fts::{LarFtsRebuildOptions, LarFtsRebuildReport, LAR_NORMALIZED_INDEX_SCHEMA_VERSION};
 pub use lar_gc::LarGcReport;
-pub use lar_grep::{LarCatalogGrepMatch, LarCatalogGrepReport};
+pub use lar_grep::{
+    grep_lar_archive_records, LarCatalogGrepMatch, LarCatalogGrepReport, LarRecordGrepCoverage,
+    LarRecordGrepMatch, LarRecordGrepReport,
+};
 pub use lar_jsonl_import::{LarJsonlImportOptions, LarJsonlImportReport};
 pub use lar_repack::{LarRepackCandidate, LarRepackConfig, LarRepackReport};
 pub use lar_stage_content::{

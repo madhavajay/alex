@@ -351,13 +351,22 @@ navigation while retaining exactly one body.
 
 Alex's live producer records the boundaries yielded by the upstream HTTP
 client, not TCP/TLS packet boundaries. The first observed read has time zero;
-later reads use monotonic deltas from it. Malformed SSE/NDJSON remains fully
-replayable as the raw manifest with no parsed-frame annotations. Live timing
-capture is capped at 65,536 reads (about 1.5 MiB of fixed-width metadata before
-encoding); on overflow Alex omits the stream index but still stores the exact
-body. Buffered translation does not create another upstream body copy: its
-timing index references the upstream manifest, while any different bytes sent
-to the client use their own manifest.
+later reads use monotonic deltas from it. For final upstream responses labeled
+`text/event-stream`, `application/x-ndjson`, or `application/ndjson`, the live
+producer adds ranges for complete JSON/`[DONE]` SSE events or valid NDJSON
+records. A range receives the delta of the observed read that completed it, so
+events split across reads and multiple events joined in one read retain honest
+timing. Comments, delimiters, malformed records, and other unparsed gaps remain
+only in the authoritative raw replay; the index never copies their bytes or
+invents semantic payloads.
+
+Live timing and parsed-frame capture are each capped at 65,536 entries. Read
+overflow omits the stream index because complete raw timing coverage is no
+longer available. Parsed-frame overflow instead discards all derived frame
+annotations while preserving the complete observed-read index and exact body.
+Buffered translation does not create another upstream body copy: its timing
+index references the upstream manifest, while any different bytes sent to the
+client use their own manifest.
 
 `ArchiveReader::read_stream_replay` reconstructs that manifest once and returns
 a zero-copy schedule over either observed reads or parsed frames. Schedule

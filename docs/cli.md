@@ -91,6 +91,8 @@ source files.
 | Subcommand | Behavior |
 | --- | --- |
 | `import SOURCE [--format auto\|lar\|jsonl]` | Auto-detect a sealed LAR archive or Alex JSONL v1 export, or require the selected format explicitly. Sealed LAR remains a validate-then-attach operation. JSONL is read one bounded line at a time; schema/types, duplicate trace IDs, base64 lengths, and BLAKE3 body hashes are validated before writes. Each completed JSONL trace publishes its SQLite row last and exact re-imports are skipped. |
+| `detach --file-uuid FILE_UUID` | Mark exactly one sealed cataloged archive `archived_offline`. The required 32-hex-digit file UUID prevents path-based ambiguity. Detach first validates or records the immutable file identity, changes catalog state only, and never moves or deletes bytes. Active writers, repairing files, and retired files are rejected. |
+| `reattach --file-uuid FILE_UUID --archive PATH` | Reattach an offline, missing, or relocated clean sealed archive. Before one catalog transaction, Alex verifies the candidate's role, UUID, format/features, length, whole-file BLAKE3, footer, chunks, manifests, and reconstructed bodies against the identity recorded at detach. A different file at the expected path is rejected. |
 | `import-legacy` | Run the shared resumable importer. `--dry-run` inventories only; `--verify` also verifies dry-run gzip sources; `--limit N` bounds one invocation; `--json` reports counters and failures. Published pointers always pass normal-reader length and BLAKE3 validation. |
 | `migration status` | Show all durable jobs, leases, counters, deduplicated bytes, and the last error. |
 | `migration pause` / `resume` | Control the one incomplete migration job without changing converted artifacts. |
@@ -100,8 +102,8 @@ source files.
 | `verify [ARCHIVE]` | Verify the live store when no path is supplied, or frame/checksum/reconstruction integrity for one archive. |
 | `repair INPUT --output OUTPUT` | Copy only the valid prefix into a different file and verify it; never modifies the input. |
 | `upgrade INPUT --output OUTPUT` | Rewrite one clean, sealed, exactly supported v1 archive into a newly sealed latest-v1 file with a new physical UUID. Canonical body/header/stream/exchange/conversation records and opaque unknown optional outer records remain byte-identical and in order; derived indexes/footer are regenerated. The command rejects existing or aliased output paths and file/header/schema extensions it cannot reproduce, verifies bodies plus exact canonical equivalence, then publishes atomically without modifying the input or live catalog. `--json` includes UUIDs, SHA-256 identities, byte/count totals, and verification state. |
-| `ls [ARCHIVE]` | Summarize the live catalog or one archive. |
-| `grep LITERAL [ARCHIVE...]` | Search exact raw body bytes in the live catalog plus any supplied sealed archives. Shared chunks are decompressed once per source, matches may span manifest ranges, and results include manifest/stage/trace/session/time anchors where available. The default 512 MiB charged chunk-cache limit is a RAM budget: verified evictions spill to an auto-cleaned temporary file and remain reusable without decompression. Scan-limit, temporary-disk, corruption, and `--limit N` failures abort rather than return an incomplete result set. |
+| `ls [ARCHIVE]` | Summarize one archive, or list live catalog archive-file UUIDs, paths, identity/availability states, and migration jobs. |
+| `grep LITERAL [ARCHIVE...]` | Search exact raw body bytes in the live catalog plus any supplied sealed archives. This body-only, deduplicated scan remains the default. `--scope whole-record` additionally searches safe ordered header/trailer atoms and canonical model/provider/error/control metadata. Sensitive header values and privacy-sensitive metadata fields are excluded and listed in the JSON `record_coverage` report; the command never searches arbitrary SQLite columns or unreferenced file bytes. Shared chunks are decompressed once per source, matches may span manifest ranges, and results include manifest/stage/trace/session/time anchors where available. The default 512 MiB charged chunk-cache limit is a RAM budget: verified evictions spill to an auto-cleaned temporary file and remain reusable without decompression. Scan-limit, temporary-disk, corruption, and `--limit N` failures abort rather than return an incomplete result set. |
 | `extract --trace-id ID --artifact KIND` | Write exact mixed legacy/LAR bytes to stdout or `--output`; kinds are `request`, `upstream-request`, `response`, and `raw-stream`. `--force` is required to replace an output. |
 | `replay ARCHIVE --trace-id ID` | Replay a captured stream from a standalone or sealed archive. Raw mode preserves observed HTTP-client read boundaries; `--parsed` independently emits recorded SSE/NDJSON ranges. `--speed instant\|0.25x\|0.5x\|1x\|2x\|4x` controls timing and defaults to instant so a long capture cannot accidentally block for hours. Use `--stage-id` when a trace has multiple streams and `--output` for a file. |
 | `export OUTPUT --format lar\|har\|warc\|jsonl\|otel\|openinference` | Export one `--trace-id`, one `--session`, or the complete live trace catalog. For cataloged LAR traces, standalone LAR copies the exact ordered stage/header/logical-body/stream closure plus existing ExchangeMetadata and transitive conversation ancestors/response entries; an older exchange without a companion derives supported fields from its current trace row. Manifest media/encoding is retained and dependent IDs are recomputed if destination chunking changes topology. Unavailable cataloged sources fail instead of degrading, while legacy-only traces use a declared synthesized-fidelity path. LAR output is written to a sibling temp file, sealed, body-verified, and atomically no-clobber published; forced replacement semantics are platform-dependent. Body-copy memory is currently bounded by the largest artifact, while writer/index and selection metadata scale with the archive. Interchange outputs embed an explicit fidelity-loss report. `otel` uses current `gen_ai.*` names and `openinference` is a distinct OpenInference-on-OpenTelemetry attribute vocabulary. `--force` is required to replace output. |
@@ -111,6 +113,11 @@ source files.
 ```bash
 alex lar import-legacy --dry-run --verify --json
 alex lar import cold-archive.lar --json
+alex lar ls --json
+alex lar detach --file-uuid FILE_UUID --json
+mv ~/.alexandria/archives/source.lar /Volumes/archive/alex/source.lar
+alex lar reattach --file-uuid FILE_UUID \
+  --archive /Volumes/archive/alex/source.lar --json
 alex lar import traces.jsonl --format jsonl --json
 alex lar export traces.openinference.jsonl --format openinference --session SESSION_ID
 alex lar migration status
@@ -119,6 +126,7 @@ alex lar gc plan --json
 alex lar repack plan --min-garbage-ratio 0.25 --json
 alex lar upgrade archived-v1.lar --output archived-latest.lar --json
 alex lar grep 'tool_call_id' archived-2026-07-19.lar --limit 500 --json
+alex lar grep 'rate_limit' archived-2026-07-19.lar --scope whole-record --json
 alex lar cleanup --dry-run --json
 alex lar extract --trace-id 019f6872-a3ee-7431-b4bb-2bafbabb7235 \
   --artifact response --output response.sse

@@ -62,6 +62,17 @@ const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CAPTURED_STREAM_READS: usize = 65_536;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextSearchTestEvent {
+    FallbackPageComplete { scanned: usize },
+    HandlerDropped,
+    CancellationObserved { scanned: usize },
+}
+
+#[cfg(test)]
+type TextSearchTestHook = Arc<dyn Fn(TextSearchTestEvent) + Send + Sync + 'static>;
+
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -684,6 +695,10 @@ pub struct AppState {
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
+    /// Deterministic observation seam for cancellation tests. Production
+    /// builds contain neither this field nor calls into the hook.
+    #[cfg(test)]
+    text_search_test_hook: std::sync::RwLock<Option<TextSearchTestHook>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1005,6 +1020,8 @@ pub fn build_state_with_substitution(
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        text_search_test_hook: std::sync::RwLock::new(None),
     })
 }
 
@@ -4968,11 +4985,20 @@ struct FallbackTextPage {
     coverage_complete: bool,
 }
 
-struct CancelSearchOnDrop(Arc<std::sync::atomic::AtomicBool>);
+struct CancelSearchOnDrop {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    test_hook: Option<TextSearchTestHook>,
+}
 
 impl Drop for CancelSearchOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hook {
+            hook(TextSearchTestEvent::HandlerDropped);
+        }
     }
 }
 
@@ -5059,8 +5085,18 @@ async fn traces_search(
         .map(|t| t.trim().to_lowercase())
         .filter(|t| !t.is_empty());
     let store = state.store.clone();
+    #[cfg(test)]
+    let test_hook = state
+        .text_search_test_hook
+        .read()
+        .ok()
+        .and_then(|hook| hook.clone());
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _cancel_search_on_drop = CancelSearchOnDrop(cancelled.clone());
+    let _cancel_search_on_drop = CancelSearchOnDrop {
+        cancelled: cancelled.clone(),
+        #[cfg(test)]
+        test_hook: test_hook.clone(),
+    };
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
         Ok(match text {
             Some(needle) => {
@@ -5086,6 +5122,10 @@ async fn traces_search(
                 let mut coverage_limit_reasons = Vec::new();
                 loop {
                     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        #[cfg(test)]
+                        if let Some(hook) = &test_hook {
+                            hook(TextSearchTestEvent::CancellationObserved { scanned });
+                        }
                         coverage_complete = false;
                         coverage_limit_reasons.push("cancelled");
                         break;
@@ -5137,6 +5177,10 @@ async fn traces_search(
                             })
                             .cloned(),
                     );
+                    #[cfg(test)]
+                    if let Some(hook) = &test_hook {
+                        hook(TextSearchTestEvent::FallbackPageComplete { scanned });
+                    }
                     let last_cursor = fallback_rows.last().and_then(|row| {
                         Some((
                             row["ts_request_ms"].as_i64()?,
@@ -8258,7 +8302,14 @@ fn lar_captured_headers(headers: &HeaderMap) -> LarHeaderCapture {
 #[derive(Clone, Debug, Default)]
 struct ProxyLarCapture {
     client_request_headers: Option<LarHeaderCapture>,
+    // The route currently uses Axum's `Bytes` extractor, which exposes body
+    // data but not request trailer frames. Kept as a capture seam for a future
+    // frame-aware request body without fabricating an empty trailer block.
+    client_request_trailers: Option<LarHeaderCapture>,
     client_response_headers: Option<LarHeaderCapture>,
+    // Alex's current response bodies emit data frames only. Populate this when
+    // a response path actually emits trailers.
+    client_response_trailers: Option<LarHeaderCapture>,
     upstream_attempts: Vec<LarUpstreamAttemptCapture>,
     upstream_stream_reads: Option<Vec<LarStreamReadCapture>>,
     stream_timing_overflowed: bool,
@@ -11744,7 +11795,13 @@ async fn proxy(
                             attempt_number,
                             wall_time_ns: attempt_wall_time_ns,
                             request_headers: Some(attempt_request_headers),
+                            // Alex sends a bytes-only Reqwest request body, so
+                            // it emits no request trailers. Reqwest's
+                            // `bytes_stream` response path does not expose
+                            // ordered response trailer fields.
+                            request_trailers: None,
                             response_headers: Some(lar_captured_headers(r.headers())),
+                            response_trailers: None,
                             status_code: Some(r.status().as_u16()),
                             error_class: None,
                             error_message: None,
@@ -11759,7 +11816,9 @@ async fn proxy(
                             attempt_number,
                             wall_time_ns: attempt_wall_time_ns,
                             request_headers: Some(attempt_request_headers),
+                            request_trailers: None,
                             response_headers: None,
+                            response_trailers: None,
                             status_code: None,
                             error_class: Some("network".into()),
                             error_message: Some(msg.clone()),
@@ -13285,7 +13344,9 @@ fn finalize_trace_with_lar(
                 run_id: trace.run_id.clone(),
                 wall_time_ns: u64::try_from(trace.ts_request_ms.max(0)).unwrap_or(0) * 1_000_000,
                 client_request_headers: captured.client_request_headers.clone(),
+                client_request_trailers: captured.client_request_trailers.clone(),
                 client_response_headers: captured.client_response_headers.clone(),
+                client_response_trailers: captured.client_response_trailers.clone(),
                 upstream_attempts: captured.upstream_attempts.clone(),
                 upstream_stream_reads: captured.upstream_stream_reads.clone(),
                 provider: trace.upstream_provider.clone(),
@@ -14223,6 +14284,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     #[test]
     fn reauth_login_tracker_dedupes_pending_and_replaces_expired_session() {
@@ -15266,12 +15328,16 @@ mod tests {
                     run_id: None,
                     wall_time_ns: 10_000_000,
                     client_request_headers: None,
+                    client_request_trailers: None,
                     client_response_headers: None,
+                    client_response_trailers: None,
                     upstream_attempts: vec![LarUpstreamAttemptCapture {
                         attempt_number: 1,
                         wall_time_ns: 11_000_000,
                         request_headers: None,
+                        request_trailers: None,
                         response_headers: None,
+                        response_trailers: None,
                         status_code: Some(200),
                         error_class: None,
                         error_message: None,
@@ -15606,7 +15672,9 @@ mod tests {
                         ("X-Repeat", "one"),
                         ("X-Repeat", "two"),
                     ])),
+                    client_request_trailers: None,
                     client_response_headers: None,
+                    client_response_trailers: None,
                     upstream_attempts: vec![LarUpstreamAttemptCapture {
                         attempt_number: 1,
                         wall_time_ns: 1_100_000,
@@ -15615,7 +15683,9 @@ mod tests {
                             ("x-repeat", "one"),
                             ("x-repeat", "two"),
                         ])),
+                        request_trailers: None,
                         response_headers: None,
+                        response_trailers: None,
                         status_code: Some(200),
                         error_class: None,
                         error_message: None,
@@ -22003,6 +22073,147 @@ mod tests {
         assert_eq!(response["coverage_complete"], true);
         assert!(response["body_bytes_read"].as_u64().unwrap() > 4 * 1024 * 1024);
         assert_eq!(response["coverage_limit_reasons"], json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnected_body_search_cancels_between_pages_and_keeps_http_responsive() {
+        let store = Store::open(tmpdir("fallback-search-http-cancellation")).unwrap();
+        for index in 0..1_200 {
+            store
+                .insert_trace(&TraceRecord {
+                    id: format!("cancellation-{index:04}"),
+                    ts_request_ms: index,
+                    session_id: Some("cancellation-long-session".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        store
+            .insert_trace(&TraceRecord {
+                id: "replacement-search-match".into(),
+                ts_request_ms: 1_201,
+                session_id: Some("replacement-session".into()),
+                req_headers_json: Some(
+                    r#"{"content-type":"application/replacement-search-needle"}"#.into(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        store.clear_lar_normalized_index().unwrap();
+        let state = test_state_with_store("fallback-search-http-cancellation-state", store);
+
+        let (page_tx, page_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (handler_dropped_tx, handler_dropped_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let first_page = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_first_page = first_page.clone();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *state.text_search_test_hook.write().unwrap() = Some(Arc::new(move |event| match event {
+            TextSearchTestEvent::FallbackPageComplete { scanned }
+                if hook_first_page.swap(false, Ordering::SeqCst) =>
+            {
+                let _ = page_tx.send(scanned);
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test did not release the paused fallback page");
+            }
+            TextSearchTestEvent::CancellationObserved { scanned } => {
+                let _ = cancelled_tx.send(scanned);
+            }
+            TextSearchTestEvent::HandlerDropped => {
+                let _ = handler_dropped_tx.send(());
+            }
+            TextSearchTestEvent::FallbackPageComplete { .. } => {}
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
+            .build()
+            .unwrap();
+        let cancelled_client = client.clone();
+        let cancelled_url = format!("{base_url}/traces/search?text=never-present-body-needle");
+        let cancelled_request = tokio::spawn(async move {
+            cancelled_client
+                .get(cancelled_url)
+                .header("x-api-key", "alx-local")
+                .send()
+                .await
+        });
+
+        let first_page_scanned = tokio::task::spawn_blocking(move || {
+            page_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fallback search did not complete its first page")
+        })
+        .await
+        .unwrap();
+        assert_eq!(first_page_scanned, TEXT_SCAN_PAGE);
+        cancelled_request.abort();
+        assert!(cancelled_request.await.unwrap_err().is_cancelled());
+        tokio::task::spawn_blocking(move || {
+            handler_dropped_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("disconnect did not drop the server search handler")
+        })
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+
+        let cancelled_after = tokio::task::spawn_blocking(move || {
+            cancelled_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server fallback scan did not observe the disconnected HTTP client")
+        })
+        .await
+        .unwrap();
+        assert_eq!(cancelled_after, TEXT_SCAN_PAGE);
+
+        let replacement_started = Instant::now();
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!(
+                    "{base_url}/traces/search?text=replacement-search-needle&limit=1"
+                ))
+                .header("x-api-key", "alx-local")
+                .send(),
+        )
+        .await
+        .expect("replacement body search exceeded two seconds")
+        .unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let replacement: Value = replacement.json().await.unwrap();
+        assert_eq!(replacement["traces"][0]["id"], "replacement-search-match");
+        assert_eq!(replacement["coverage_complete"], true);
+        assert!(replacement_started.elapsed() < Duration::from_secs(2));
+
+        let health_started = Instant::now();
+        let health = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.get(format!("{base_url}/health")).send(),
+        )
+        .await
+        .expect("health check exceeded one second")
+        .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let health: Value = health.json().await.unwrap();
+        assert_eq!(health["status"], "ok");
+        assert!(health_started.elapsed() < Duration::from_secs(1));
+        server.abort();
     }
 
     #[tokio::test]

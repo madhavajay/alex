@@ -2081,10 +2081,12 @@ impl Store {
             run_id: source.run_id.clone(),
             wall_time_ns,
             client_request_headers: request_headers.capture,
+            client_request_trailers: None,
             // The old field was populated from upstream response headers. It
             // is carried here only so the shared catalog helper emits atoms;
             // the stage builder attaches it to UpstreamResponse below.
             client_response_headers: response_headers.capture,
+            client_response_trailers: None,
             upstream_attempts: Vec::new(),
             upstream_stream_reads: None,
             provider: source.provider.clone(),
@@ -2378,7 +2380,9 @@ impl Store {
             run_id: None,
             wall_time_ns,
             client_request_headers: None,
+            client_request_trailers: None,
             client_response_headers: None,
+            client_response_trailers: None,
             upstream_attempts: Vec::new(),
             upstream_stream_reads: None,
             provider: None,

@@ -32,7 +32,7 @@ fn config() -> LarBodyStoreConfig {
 }
 
 #[test]
-fn ordered_headers_stages_and_raw_body_identity_are_preserved() {
+fn ordered_headers_trailers_stages_and_raw_body_identity_are_preserved() {
     let root = tmpdir("fidelity");
     let store = Store::open_with_lar_body_store(root.clone(), config()).unwrap();
     let request = store
@@ -68,21 +68,37 @@ fn ordered_headers_stages_and_raw_body_identity_are_preserved() {
         ("content-type", "text/event-stream"),
         ("set-cookie", "provider-session=secret"),
     ]);
+    let client_request_trailers = LarHeaderCapture::observed([
+        ("x-client-request-trailer", "first"),
+        ("x-client-request-trailer", "second"),
+    ]);
+    let client_response_trailers =
+        LarHeaderCapture::observed([("x-client-response-trailer", "complete")]);
+    let upstream_request_trailers =
+        LarHeaderCapture::observed([("x-upstream-request-trailer", "sent")]);
+    let upstream_response_trailers = LarHeaderCapture::observed([
+        ("x-upstream-response-trailer", "received"),
+        ("authorization", "Bearer trailer-secret"),
+    ]);
     let capture = LarExchangeCapture {
         trace_id: "trace-ordered".into(),
         session_id: Some("session-ordered".into()),
         run_id: Some("run-ordered".into()),
         wall_time_ns: 1_000_000,
         client_request_headers: Some(client_headers),
+        client_request_trailers: Some(client_request_trailers),
         client_response_headers: Some(LarHeaderCapture::observed([
             ("content-type", "text/event-stream"),
             ("x-alexandria-trace-id", "trace-ordered"),
         ])),
+        client_response_trailers: Some(client_response_trailers),
         upstream_attempts: vec![LarUpstreamAttemptCapture {
             attempt_number: 1,
             wall_time_ns: 1_100_000,
             request_headers: Some(upstream_headers),
+            request_trailers: Some(upstream_request_trailers),
             response_headers: Some(upstream_response_headers),
+            response_trailers: Some(upstream_response_trailers),
             status_code: Some(200),
             error_class: None,
             error_message: None,
@@ -161,6 +177,20 @@ fn ordered_headers_stages_and_raw_body_identity_are_preserved() {
     assert_eq!(catalog_stages[2]["attempt_number"], 1);
     assert_eq!(catalog_stages[3]["kind"], "upstream_response");
     assert!(catalog_stages[3]["stream_index_ref"].is_string());
+    for stage in [
+        &catalog_stages[0],
+        &catalog_stages[2],
+        &catalog_stages[3],
+        &catalog_stages[4],
+    ] {
+        assert!(stage["trailers_ref"].is_string());
+    }
+    let cataloged_header_blocks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM lar_header_blocks", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(cataloged_header_blocks, 8);
     assert_eq!(
         catalog_stages[3]["response_body_manifest_ref"],
         catalog_stages[4]["response_body_manifest_ref"]
@@ -198,6 +228,38 @@ fn ordered_headers_stages_and_raw_body_identity_are_preserved() {
             .value,
         b"<redacted>"
     );
+    let client_request_trailer_block = reader
+        .header_block(&stages[0].data.trailers_ref.unwrap())
+        .unwrap();
+    assert_eq!(client_request_trailer_block.atoms.len(), 2);
+    assert_eq!(
+        client_request_trailer_block
+            .atoms
+            .iter()
+            .map(|atom| atom.value.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    let upstream_request_trailer_block = reader
+        .header_block(&stages[2].data.trailers_ref.unwrap())
+        .unwrap();
+    assert_eq!(upstream_request_trailer_block.atoms[0].value, b"sent");
+    let upstream_response_trailer_block = reader
+        .header_block(&stages[3].data.trailers_ref.unwrap())
+        .unwrap();
+    assert_eq!(upstream_response_trailer_block.atoms[0].value, b"received");
+    assert_eq!(
+        upstream_response_trailer_block.atoms[1].value,
+        b"<redacted>"
+    );
+    assert_eq!(
+        upstream_response_trailer_block.atoms[1].flags & LAR_HEADER_FLAG_REDACTED,
+        LAR_HEADER_FLAG_REDACTED
+    );
+    let client_response_trailer_block = reader
+        .header_block(&stages[4].data.trailers_ref.unwrap())
+        .unwrap();
+    assert_eq!(client_response_trailer_block.atoms[0].value, b"complete");
     let stream_index = reader
         .stream_index(&stages[3].data.stream_index_ref.unwrap())
         .unwrap();
@@ -269,7 +331,9 @@ fn normalized_legacy_headers_are_never_labeled_exact() {
             ("x-api-key", "old-secret"),
             ("content-type", "application/json"),
         ])),
+        client_request_trailers: None,
         client_response_headers: None,
+        client_response_trailers: None,
         upstream_attempts: vec![],
         upstream_stream_reads: None,
         provider: None,
@@ -321,12 +385,16 @@ fn non_stream_response_does_not_emit_a_stream_index() {
                 run_id: None,
                 wall_time_ns: 2_500_000,
                 client_request_headers: None,
+                client_request_trailers: None,
                 client_response_headers: None,
+                client_response_trailers: None,
                 upstream_attempts: vec![LarUpstreamAttemptCapture {
                     attempt_number: 1,
                     wall_time_ns: 2_600_000,
                     request_headers: None,
+                    request_trailers: None,
                     response_headers: None,
+                    response_trailers: None,
                     status_code: Some(200),
                     error_class: None,
                     error_message: None,
@@ -372,7 +440,7 @@ fn non_stream_response_does_not_emit_a_stream_index() {
 fn translated_client_bytes_get_their_own_manifest_and_stage_reference() {
     let root = tmpdir("translated");
     let store = Store::open_with_lar_body_store(root.clone(), config()).unwrap();
-    let upstream_body = b"event: message\ndata: upstream-wire\n\n";
+    let upstream_body = b"event: message\ndata: {\"wire\":\"upstream\"}\n\n";
     let upstream = store
         .write_body_artifact(
             &LarBodyArtifact::trace("trace-translated", "upstream_response"),
@@ -402,18 +470,22 @@ fn translated_client_bytes_get_their_own_manifest_and_stage_reference() {
             "content-type",
             "application/json",
         )])),
+        client_request_trailers: None,
         client_response_headers: Some(LarHeaderCapture::observed([(
             "content-type",
             "application/json",
         )])),
+        client_response_trailers: None,
         upstream_attempts: vec![LarUpstreamAttemptCapture {
             attempt_number: 1,
             wall_time_ns: 3_100_000,
             request_headers: None,
+            request_trailers: None,
             response_headers: Some(LarHeaderCapture::observed([(
                 "content-type",
                 "text/event-stream",
             )])),
+            response_trailers: None,
             status_code: Some(200),
             error_class: None,
             error_message: None,
@@ -483,6 +555,17 @@ fn translated_client_bytes_get_their_own_manifest_and_stage_reference() {
             .to_string(),
         client
     );
-    assert!(stages[3].data.stream_index_ref.is_some());
+    let stream = reader
+        .stream_index(&stages[3].data.stream_index_ref.unwrap())
+        .unwrap();
+    assert_eq!(stream.frames.len(), 1);
+    assert_eq!(stream.frames[0].byte_offset, 0);
+    assert_eq!(stream.frames[0].byte_length, upstream_body.len() as u64);
+    assert_eq!(stream.frames[0].delta_from_first_byte_ns, 0);
+    assert_eq!(stream.frames[0].parser, alex_lar::StreamParser::Sse);
+    assert_eq!(
+        stream.frames[0].frame_kind,
+        alex_lar::StreamFrameKind::SseEvent
+    );
     assert!(stages[4].data.stream_index_ref.is_none());
 }

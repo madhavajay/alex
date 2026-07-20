@@ -733,7 +733,9 @@ artifacts and produces a signed/checksummed migration report.
 
 ### 12.9 Rollback and cleanup
 
-- Keep legacy path columns readable for at least one compatibility window.
+- Keep legacy path columns readable for at least two subsequent minor releases
+  and at least 90 days after LAR writes become the default, whichever is
+  longer. Announce removal at least one minor release in advance.
 - Do not delete a legacy body during the startup migration.
 - All supported write modes retain gzip; current mixed readers can reopen data
   in any supported mode. A pre-LAR downgrade remains supported only until
@@ -1004,13 +1006,15 @@ Criterion 1 passes the deterministic representative corpus at 5.50x
 (tool-heavy: 17.20x) but still requires the anonymized real-corpus run.
 Criteria 7 and 9 remain rollout gates: criterion 9 now has an ignored
 production-path benchmark reporting live proxy error rate and p50/p95/p99 while
-the throttled importer plus GC/repack accounting run concurrently, but its
+the throttled importer, physical GC, and copy-verify-switch-retire repack run concurrently, but its
 target-Mac thresholds remain unset. The sealed filesystem open plus 1 KiB body
 benchmark is now below 10 ms at 6.10 ms warm p99, but cold-cache evidence on the
 agreed Mac hardware profile remains pending. Built-in Linux/macOS cache advice
 now stays on the exact descriptor used by the reader but is explicitly not
 called cold; the benchmark has an external cache-drop-and-verification helper
-mode for the controlled hardware run. The documented 500 MiB/s warm
+mode plus an explicitly configured p99 gate for the controlled hardware run.
+Only an external-helper-attested run can report that gate as passing; advisory
+cache-control results remain non-acceptance evidence. The documented 500 MiB/s warm
 large-body reconstruction target passes at 724.9 MiB/s p95 on this Linux host
 with the adaptive large-body profile. The
 3.28/3.67/4.48 ms fresh-pack p50/p95/p99 measurement remains a narrower
@@ -1076,6 +1080,17 @@ work, even when a narrower prototype exists.
 - [x] Add unified artifact references and legacy fallback reads.
 - [x] Route new request, upstream-request, response, tool, Dario, and fixture
       artifacts through manifests.
+- [ ] Append live harness tool-call/tool-result events to the immutable ordered
+      exchange stage timeline as well as the separate tool table, matching the
+      canonical stage graph synthesized by legacy import.
+- [x] Persist ordered trailer blocks when a capture source supplies them; the
+      current HTTP proxy stacks expose data frames but not HTTP trailer frames,
+      so absent trailers remain explicitly absent rather than fabricated.
+- [x] Populate bounded parsed SSE/NDJSON frame ranges on live captures from the
+      final upstream content type, alongside the authoritative observed raw
+      read index. Frames carry the completion time of their observed read;
+      malformed gaps remain raw-only, and frame overflow drops all derived
+      annotations without dropping raw reads or body bytes.
 - [x] Reuse one manifest for identical stages.
 - [x] Move hashing/compression/parsing to bounded blocking workers.
 - [x] Add pack rotation and periodic checkpoints.
@@ -1129,6 +1144,13 @@ work, even when a narrower prototype exists.
       The scanner has bounded charged RAM, spills verified decompressed chunks
       to an auto-cleaned temporary file for reuse, carries matches across
       manifest ranges, and fails explicitly on scan/result limits.
+- [x] Add an explicit whole-record search mode covering body bytes, safe ordered
+      headers/trailers, and canonical exchange/stage control metadata including
+      models, providers, routing reasons, and errors. Sensitive header values
+      are excluded even for foreign archives that lack Alex's redaction flag;
+      structured coverage reports list every searched, excluded, missing, or
+      offline category. Body grep remains the default deduplicated byte-search
+      path.
 - [x] Prototype page Bloom/trigram filters and measure value/size/privacy cost.
 - [x] Add offline/archive-missing states without showing daemon down.
 - [ ] Run an end-to-end macOS long-session Trace Browser benchmark covering
@@ -1173,10 +1195,21 @@ work, even when a narrower prototype exists.
 
 - [x] Implement raw artifact extraction.
 - [x] Implement timed and instant stream replay.
-- [x] Implement HAR export with loss report.
-- [x] Implement WARC export with record IDs, digests, and references.
-- [x] Implement JSONL export/import.
-- [x] Implement distinct OpenTelemetry GenAI and OpenInference export adapters.
+- [x] Implement legacy-compatible HAR export with an explicit loss report.
+- [x] Implement legacy-compatible WARC export with record IDs, digests,
+      references, and an explicit loss report.
+- [x] Implement explicitly lossy, legacy-compatible JSONL export/import.
+- [x] Implement distinct legacy-compatible OpenTelemetry GenAI and
+      OpenInference export adapters with explicit loss reports.
+- [ ] Derive HAR, WARC, JSONL, OpenTelemetry, and OpenInference export from the
+      canonical LAR exchange/stage graph when it exists, including every
+      upstream attempt, ordered header/trailer block, stream index, and linked
+      tool event instead of reducing modern captures to three legacy bodies.
+- [ ] Add a raw transaction replay/export that reconstructs method/path,
+      ordered stage sequence, headers/trailers, raw artifact bytes, and stream
+      timing from one canonical exchange.
+- [ ] Stream bulk non-LAR conversion with memory bounded independently of the
+      total selected logical body size.
 - [x] Evaluate OTAP/Arrow analytics export after the semantic schema stabilizes.
 - [x] Publish format specification, MIME proposal, examples, and CLI guide.
 - [x] Publish conformance corpus and reader/writer test vectors.
@@ -1266,21 +1299,30 @@ LAR v1 is complete when:
 - Trace Browser remains responsive on the long-session benchmark;
 - rollback, downgrade, repair, and operator documentation are complete.
 
-## 23. Open design gates
+## 23. Resolved decisions and remaining design gate
 
-These are decisions to resolve through Phase 0 measurements rather than taste:
+Phase 0 resolved the v1 choices with reproducible benchmarks and ADRs:
 
-1. Custom LAR framing versus an MCAP-compatible profile.
-2. Chunking algorithm and min/target/max sizes.
-3. Independent chunk frames versus bounded multi-chunk pages.
-4. Static zstd dictionary value and versioning policy.
-5. CBOR versus FlatBuffers for large sealed indexes only.
-6. Default body-pack/event-log rotation sizes and checkpoint cadence.
-7. Sync/batch durability default.
-8. FTS-only v1 versus portable page filters in sealed archives.
-9. Compatibility-window length and exact downgrade behavior.
-10. Whether standalone exports include a portable search index by default.
+- native LAR framing, not an MCAP envelope;
+- adaptive Gear CDC (512/2 KiB/8 KiB for ordinary bodies and wider boundaries
+  for bodies at least 8 MiB);
+- independent zstd frames/pages at level 3, with self-contained optional
+  dictionaries but no mandatory static body dictionary;
+- schema-numbered canonical binary control records rather than CBOR or
+  FlatBuffers for v1;
+- 512 MiB/one-hour body-pack rotation, 8 MiB/30-second checkpoints, and `sync`
+  durability by default;
+- SQLite FTS plus exact unique-chunk raw grep for v1. Portable Bloom search
+  pages remain optional until a real multi-file corpus justifies their privacy
+  and roughly 3% storage cost.
 
-None of these gates changes the central invariants: raw bytes live in the
+The only remaining container-design gate is whether standalone exports should
+include a portable search index by default. The compatibility window is also
+resolved operationally in `docs/lar-operations.md`: at least two subsequent
+minor releases and 90 days after default LAR writes, whichever is longer;
+pre-LAR downgrade requires retained gzip files or restoration from
+quarantine/backup.
+
+These choices do not change the central invariants: raw bytes live in the
 content-addressed chunk store, exchanges preserve ordered stage/header history,
 and legacy migration must validate before switching pointers or deleting data.
