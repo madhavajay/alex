@@ -7,6 +7,40 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29-beta.9] - 2026-07-20
+
+### Added
+- **Declarative middleware and failover.** Alex now has a typed middleware rule
+  engine, atomic rule reload, persisted session leases, built-in account/model/
+  auth failover policies, Fable-to-Sol fallback, trace attempts and decisions,
+  and response notices that preserve the client's original protocol and model
+  identity.
+- **Middleware management surfaces.** The CLI exposes `alex middleware` status,
+  rule lifecycle, validation, dry-run and lease commands. The macOS app adds a
+  Middleware settings pane and guided rule builder while retaining the legacy
+  protection API as a compatibility adapter for one beta cycle.
+
+### Fixed
+- **OAuth onboarding uses provider identity instead of nicknames.** Claude,
+  Codex, Gemini, Grok, Kimi and Amp flows now add a new account when the
+  authenticated identity is new and replace the matching account when it is
+  the same. Existing accounts remain explicit choices alongside **Add another
+  account**.
+- **OpenRouter and Exo configure inline.** OpenRouter asks for a local display
+  name and API key inside onboarding; Exo asks for its endpoint and verifies it
+  before continuing instead of jumping to the full Settings window.
+- **Provider and harness selection stays reversible.** Going Back or choosing
+  **Change provider/harness** clears stale authentication, request and trace
+  state. Provider cards remain visible after scrolling, and selected existing
+  accounts no longer render a redundant confirmation badge.
+- **Harness smoke commands match their real CLIs.** Amp uses `alex wrap amp`
+  with its native model support boundary explained; Codex keeps the repository
+  trust bypass; Kimi requests are detectable both automatically and through
+  **Check for Request**.
+- **Stable publishing includes the middleware crate.** `alex-middleware` is
+  published before `alex-proxy`, preserving dependency order for the next
+  stable crates.io release.
+
 ## [0.1.29-beta.8] - 2026-07-20
 
 ### Fixed
