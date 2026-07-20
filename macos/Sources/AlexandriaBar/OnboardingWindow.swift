@@ -111,6 +111,15 @@ final class OnboardingModel {
         addProviderAccount()
     }
 
+    func clearProviderSelection() {
+        authModel?.cancel()
+        authModel = nil
+        resetProviderDependentState()
+        selectedProvider = nil
+        providerState = .idle
+        exampleModel = OnboardingSupport.defaultExampleModel
+    }
+
     func accounts(for provider: String) -> [Account] {
         store.accounts.filter { $0.provider == provider }.sorted {
             accountDisplayName($0).localizedCaseInsensitiveCompare(accountDisplayName($1))
@@ -351,6 +360,13 @@ final class OnboardingModel {
 
     func back() {
         guard step > 0 else { return }
+        // Returning to the provider page is an explicit opportunity to choose
+        // again. Do not preserve an expanded OAuth flow (Gemini loopback in
+        // particular can otherwise leave the provider grid above the retained
+        // scroll position), and do the same when leaving the picker backward.
+        if step == 1 || step == 2 {
+            clearProviderSelection()
+        }
         go(to: step - 1)
     }
 
@@ -695,6 +711,18 @@ struct OnboardingView: View {
                 }
             }
             if let authModel = model.authModel {
+                HStack(spacing: 10) {
+                    Text("Authenticating \(ProviderInfo.displayName(authModel.provider))")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    Spacer()
+                    PillButton(
+                        title: "Change provider", variant: .bordered,
+                        systemImage: "arrow.left.arrow.right"
+                    ) { model.clearProviderSelection() }
+                }
+                .padding(10)
+                .cardStyle()
                 AuthFlowView(model: authModel, close: {}, embedded: true)
                     .padding(.top, 4)
                     .cardStyle()

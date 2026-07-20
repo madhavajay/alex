@@ -7,6 +7,15 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29-beta.8] - 2026-07-20
+
+### Fixed
+- **Provider OAuth no longer traps onboarding on one provider.** Every active
+  embedded auth flow now has **Change provider**, and Back navigation into or
+  out of the provider step cancels the old flow and restores a clean chooser.
+  This fixes Gemini's expanded loopback screen remaining selected across
+  Back/Next navigation.
+
 ## [0.1.29-beta.7] - 2026-07-20
 
 ### Fixed
