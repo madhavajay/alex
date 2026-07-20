@@ -62,6 +62,49 @@ import Testing
         #expect(row.tagsSummary.isEmpty)
         #expect(row.iconAsset == nil)
         #expect(row.duration == "0s")
+        #expect(row.forkedFromSessionId == nil)
+        #expect(row.forkedFromHarness == nil)
+        #expect(row.forkedAtMs == nil)
+        #expect(row.recoveredCwd == nil)
+        #expect(row.forkCount == 0)
+        #expect(row.forkRelationshipSummary.isEmpty)
+        #expect(row.forkRelationshipTooltip == nil)
+    }
+
+    @Test func forkAnnotationsRemainDistinctFromSubagentLineage() throws {
+        let json = #"""
+        {"session_id":"target-session","first_ts_ms":100,"last_ts_ms":200,"trace_count":1,"harness":"pi","parent_session_id":"subagent-parent","child_count":3,"forked_from_session_id":"source-session-id-that-is-long-enough-to-shorten","forked_from_harness":"codex","forked_at_ms":1783484392318,"recovered_cwd":"/work/original","fork_count":2}
+        """#
+        let decoded = try JSONDecoder().decode(TraceSession.self, from: Data(json.utf8))
+        let row = SessionRow(session: decoded)
+
+        #expect(decoded.forkedFromSessionId == "source-session-id-that-is-long-enough-to-shorten")
+        #expect(decoded.forkedFromHarness == "codex")
+        #expect(decoded.forkedAtMs == 1_783_484_392_318)
+        #expect(decoded.recoveredCwd == "/work/original")
+        #expect(decoded.forkCount == 2)
+        #expect(row.parentSessionId == "subagent-parent")
+        #expect(row.childCount == 3)
+        #expect(row.forkedFromSessionId == decoded.forkedFromSessionId)
+        #expect(row.forkedAtMs == decoded.forkedAtMs)
+        #expect(row.recoveredCwd == "/work/original")
+        #expect(row.forkCount == 2)
+        #expect(row.forkRelationshipSummary == "from codex source-ses…-shorten · 2 forks")
+        #expect(row.forkRelationshipTooltip == "Forked from codex session source-session-id-that-is-long-enough-to-shorten\nRecovered directory: /work/original\n2 sessions forked from this session")
+    }
+
+    @Test func forkAnnotationsInvalidateSessionFingerprint() {
+        let original = session(["session_id": "target"])
+        let forked = session([
+            "session_id": "target",
+            "forked_from_session_id": "source",
+            "forked_from_harness": "claude",
+            "forked_at_ms": 123,
+            "recovered_cwd": "/work/source",
+            "fork_count": 1,
+        ])
+
+        #expect(TraceFingerprint.sessions([original]) != TraceFingerprint.sessions([forked]))
     }
 
     @Test func rowPrefersAdditiveDaemonDisplayFields() {
@@ -295,11 +338,13 @@ import Testing
         var customization = TableColumnCustomization<SessionRow>()
         customization[visibility: "errors"] = .visible
         customization[visibility: "harness"] = .hidden
+        customization[visibility: "forkLineage"] = .visible
         let data = try JSONEncoder().encode(customization)
         let decoded = try JSONDecoder().decode(
             TableColumnCustomization<SessionRow>.self, from: data)
         #expect(decoded[visibility: "errors"] == .visible)
         #expect(decoded[visibility: "harness"] == .hidden)
+        #expect(decoded[visibility: "forkLineage"] == .visible)
         #expect(decoded[visibility: "tags"] == .automatic)
     }
     #endif

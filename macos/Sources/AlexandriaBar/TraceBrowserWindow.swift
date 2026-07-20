@@ -1000,6 +1000,12 @@ final class TraceBrowserModel {
         NSPasteboard.general.setString(session.sessionId, forType: .string)
     }
 
+    func copyForkCommand(_ session: TraceSession) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(
+            SessionForkCommand.command(sessionId: session.sessionId), forType: .string)
+    }
+
     /// Fetches the fixture menu once per window opening. The menu reads this
     /// small cache so right-clicking a row stays instant.
     func loadSimulationFixtures() async {
@@ -1910,6 +1916,17 @@ private struct SessionListView: View {
         }
         .customizationID("run")
         .defaultVisibility(.hidden)
+        TableColumn("Fork lineage", value: \.forkRelationshipSummary) { (row: SessionRow) in
+            Text(row.forkRelationshipSummary)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(row.forkRelationshipTooltip ?? "")
+        }
+        .width(min: 110, ideal: 190)
+        .customizationID("forkLineage")
+        .defaultVisibility(.hidden)
         TableColumn("Tags", value: \.tagsSummary) { (row: SessionRow) in
             Text(row.tagsSummary)
                 .font(.system(size: 9, design: .monospaced))
@@ -1995,6 +2012,12 @@ private struct SessionListView: View {
             Button("Save as fixture…") { model.promptSaveFixture(from: session) }
         }
         Divider()
+        Button {
+            model.copyForkCommand(session)
+        } label: {
+            Label("Fork session with…", systemImage: "doc.on.doc")
+        }
+        .disabled(!hasSessionId)
         Button("Copy Session ID") { model.copySessionId(session) }
         Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
         Button("Export Session…") { model.exportSession(session) }
@@ -2120,6 +2143,23 @@ private struct SessionCellView: View {
                 Text("\(row.childCount) agent\(row.childCount == 1 ? "" : "s")")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.secondary)
+            }
+            if row.forkedFromSessionId != nil {
+                Label("fork", systemImage: "arrow.triangle.branch")
+                    .labelStyle(.titleAndIcon)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.teal)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.teal.opacity(0.12)))
+                    .help(row.forkRelationshipTooltip ?? "Forked session")
+                    .accessibilityLabel(row.forkRelationshipTooltip ?? "Forked session")
+            }
+            if row.forkCount > 0 {
+                Text("\(row.forkCount) fork\(row.forkCount == 1 ? "" : "s")")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .help(row.forkRelationshipTooltip ?? "")
             }
             if row.errors > 0 {
                 Text("✗ \(row.errors)")

@@ -38,6 +38,13 @@ public struct TraceSession: Codable, Sendable, Identifiable {
     public let subagentStartedMs: Int64?
     public let subagentStoppedMs: Int64?
     public let childCount: Int?
+    /// User-initiated fork provenance. This is deliberately separate from
+    /// `parentSessionId`, which describes harness-managed sub-agent lineage.
+    public let forkedFromSessionId: String?
+    public let forkedFromHarness: String?
+    public let forkedAtMs: Int64?
+    public let recoveredCwd: String?
+    public let forkCount: Int?
     /// Additive server-side display fields. Older daemons omit these and the
     /// client retains the portable fallback below.
     public let shortId: String?
@@ -70,6 +77,11 @@ public struct TraceSession: Codable, Sendable, Identifiable {
         case subagentStartedMs = "subagent_started_ms"
         case subagentStoppedMs = "subagent_stopped_ms"
         case childCount = "child_count"
+        case forkedFromSessionId = "forked_from_session_id"
+        case forkedFromHarness = "forked_from_harness"
+        case forkedAtMs = "forked_at_ms"
+        case recoveredCwd = "recovered_cwd"
+        case forkCount = "fork_count"
         case shortId = "short_id"
         case durationMs = "duration_ms"
         case tagsSummary = "tags_summary"
@@ -1197,6 +1209,11 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
     public let iconAsset: String?
     public let parentSessionId: String?
     public let agentType: String?
+    public let forkedFromSessionId: String?
+    public let forkedFromHarness: String?
+    public let forkedAtMs: Int64?
+    public let recoveredCwd: String?
+    public let forkCount: Int
     public var lineageDepth: Int
     public var childCount: Int
 
@@ -1244,8 +1261,59 @@ public struct SessionRow: Identifiable, Sendable, Equatable {
         iconAsset = HarnessIcon.assetName(harness: session.harness, tags: session.tags)
         parentSessionId = session.parentSessionId
         agentType = session.agentType
+        forkedFromSessionId = session.forkedFromSessionId
+        forkedFromHarness = session.forkedFromHarness
+        forkedAtMs = session.forkedAtMs
+        recoveredCwd = session.recoveredCwd
+        forkCount = session.forkCount ?? 0
         lineageDepth = 0
         childCount = session.childCount ?? 0
+    }
+
+    /// Compact sortable text used by the optional fork-lineage table column.
+    public var forkRelationshipSummary: String {
+        var parts: [String] = []
+        if let source = forkSourceSummary {
+            parts.append("from \(source)")
+        }
+        if forkCount > 0 {
+            parts.append("\(forkCount) fork\(forkCount == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Full provenance for hover and accessibility text. A directory is only
+    /// included when the launcher recovered and validated it, so this never
+    /// implies a guessed working directory.
+    public var forkRelationshipTooltip: String? {
+        var lines: [String] = []
+        if let sourceId = forkedFromSessionId {
+            let sourceHarness = forkedFromHarness?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let sourceHarness, !sourceHarness.isEmpty {
+                lines.append("Forked from \(sourceHarness) session \(sourceId)")
+            } else {
+                lines.append("Forked from session \(sourceId)")
+            }
+            if let recoveredCwd, !recoveredCwd.isEmpty {
+                lines.append("Recovered directory: \(recoveredCwd)")
+            }
+        }
+        if forkCount > 0 {
+            lines.append(
+                "\(forkCount) session\(forkCount == 1 ? "" : "s") forked from this session")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
+    private var forkSourceSummary: String? {
+        guard let sourceId = forkedFromSessionId else { return nil }
+        let sourceShort = Self.shortId(sourceId)
+        guard let sourceHarness = forkedFromHarness?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !sourceHarness.isEmpty
+        else { return sourceShort }
+        return "\(sourceHarness) \(sourceShort)"
     }
 
     static func shortId(_ id: String, maxLength: Int = 22) -> String {
@@ -1933,6 +2001,11 @@ public enum TraceFingerprint {
             hasher.combine(session.subagentStartedMs)
             hasher.combine(session.subagentStoppedMs)
             hasher.combine(session.childCount)
+            hasher.combine(session.forkedFromSessionId)
+            hasher.combine(session.forkedFromHarness)
+            hasher.combine(session.forkedAtMs)
+            hasher.combine(session.recoveredCwd)
+            hasher.combine(session.forkCount)
             for (key, value) in (session.tags ?? [:]).sorted(by: { $0.key < $1.key }) {
                 hasher.combine(key)
                 hasher.combine(value)
