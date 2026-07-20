@@ -53,7 +53,7 @@ It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, and Grok su
 ### At a glance
 
 - **Use any model in any harness, like Fable 5 in Codex.**
-- **Fork sessions across harnesses.** `alex resume SESSION pi` — take a captured Claude Code conversation and continue it in Pi or Codex, tools, history, and working directory intact.
+- **Fork any session.** `alex resume SESSION pi` — every conversation Alex captures can be continued in another harness: history, tool calls, model, and working directory carry over. Pi resumes as a native session (the forked chat *is* real, scrollable history); Claude Code and Codex currently fork via transcript hand-off with native resume coming, and more harnesses are on the way. Any session from any of them can be continued in any other.
 - **See everything.** Inspect all model traffic and every turn-by-turn event.
 - **Have your agents meta-analyze all your traces in an outer loop.**
 - **Tokenmax across accounts.** Bond multiple subscriptions for more aggregate capacity.

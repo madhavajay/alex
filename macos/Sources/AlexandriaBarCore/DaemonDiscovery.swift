@@ -21,7 +21,8 @@ public struct DaemonConfig: Sendable, Equatable {
         return URL(string: "http://\(renderedHost):\(port)")!
     }
     public var lanEnabled: Bool {
-        !["127.0.0.1", "::1", "localhost"].contains(host.lowercased())
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["", "127.0.0.1", "::1", "[::1]", "localhost"].contains(normalized)
     }
     public var darioEnabled: Bool { anthropicUpstream == "dario" }
 

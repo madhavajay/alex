@@ -33,6 +33,11 @@ pub struct ResumeCapture<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeContext {
     pub prompt: String,
+    /// The normalized entries represented by `prompt`, after any oldest-entry truncation.
+    ///
+    /// Native-session resume adapters use this rather than parsing the defensive prompt
+    /// envelope back into structured conversation data.
+    pub entries: Vec<ResumeEntry>,
     pub truncated: bool,
     pub omitted_entries: usize,
     pub included_entries: usize,
@@ -41,18 +46,18 @@ pub struct ResumeContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TranscriptEntry {
-    role: &'static str,
-    content: Vec<Value>,
+pub struct ResumeEntry {
+    pub role: &'static str,
+    pub content: Vec<Value>,
 }
 
-impl TranscriptEntry {
+impl ResumeEntry {
     fn new(role: &'static str, content: Vec<Value>) -> Option<Self> {
         (!content.is_empty()).then_some(Self { role, content })
     }
 
     fn line(&self) -> String {
-        // TranscriptEntry contains only strings and serde_json::Value, neither of which can fail
+        // ResumeEntry contains only strings and serde_json::Value, neither of which can fail
         // JSON serialization.  Keep a deterministic valid line even if serde changes that fact.
         serde_json::to_string(self).unwrap_or_else(|_| {
             r#"{"role":"unknown","content":[{"type":"serialization_error"}]}"#.to_string()
@@ -108,7 +113,7 @@ pub fn build_resume_context_from_captures(
     build_resume_context_from_entries(source_session_id, entries, max_chars)
 }
 
-fn merge_capture_entries(existing: &mut Vec<TranscriptEntry>, incoming: Vec<TranscriptEntry>) {
+fn merge_capture_entries(existing: &mut Vec<ResumeEntry>, incoming: Vec<ResumeEntry>) {
     let max_overlap = existing.len().min(incoming.len());
     let overlap = (1..=max_overlap)
         .rev()
@@ -119,15 +124,16 @@ fn merge_capture_entries(existing: &mut Vec<TranscriptEntry>, incoming: Vec<Tran
 
 fn build_resume_context_from_entries(
     source_session_id: &str,
-    entries: Vec<TranscriptEntry>,
+    entries: Vec<ResumeEntry>,
     max_chars: usize,
 ) -> ResumeContext {
-    let lines: Vec<String> = entries.iter().map(TranscriptEntry::line).collect();
+    let lines: Vec<String> = entries.iter().map(ResumeEntry::line).collect();
     let original_prompt = render_prompt(source_session_id, &lines, 0);
     let original_chars = char_count(&original_prompt);
     if original_chars <= max_chars {
         return ResumeContext {
             prompt: original_prompt,
+            entries,
             truncated: false,
             omitted_entries: 0,
             included_entries: lines.len(),
@@ -146,6 +152,7 @@ fn build_resume_context_from_entries(
         if candidate_chars <= max_chars {
             return ResumeContext {
                 prompt: candidate,
+                entries: entries[omitted..].to_vec(),
                 truncated: true,
                 omitted_entries: omitted,
                 included_entries: lines.len() - omitted,
@@ -166,6 +173,7 @@ fn build_resume_context_from_entries(
     let prompt_chars = char_count(&prompt);
     ResumeContext {
         prompt,
+        entries: Vec::new(),
         truncated: true,
         omitted_entries: lines.len(),
         included_entries: 0,
@@ -174,7 +182,13 @@ fn build_resume_context_from_entries(
     }
 }
 
-fn request_entries(format: ClientFormat, request: &Value) -> Vec<TranscriptEntry> {
+/// Normalize the visible messages carried in one request body.
+///
+/// Transcript presentation uses the same normalization as session forking so
+/// Anthropic, OpenAI, Responses, and Gemini history are interpreted
+/// consistently. System/developer instructions and hidden reasoning are
+/// intentionally omitted.
+pub fn request_entries(format: ClientFormat, request: &Value) -> Vec<ResumeEntry> {
     let mut entries = Vec::new();
     match format {
         ClientFormat::AnthropicMessages => {
@@ -190,7 +204,7 @@ fn request_entries(format: ClientFormat, request: &Value) -> Vec<TranscriptEntry
         ClientFormat::OpenaiResponses => match &request["input"] {
             Value::String(text) => push_entry(
                 &mut entries,
-                TranscriptEntry::new("user", vec![text_block(text)]),
+                ResumeEntry::new("user", vec![text_block(text)]),
             ),
             Value::Array(items) => push_responses_items(items, &mut entries),
             _ => {}
@@ -204,7 +218,7 @@ fn request_entries(format: ClientFormat, request: &Value) -> Vec<TranscriptEntry
     entries
 }
 
-fn response_entries(format: ClientFormat, raw_response: &str) -> Vec<TranscriptEntry> {
+fn response_entries(format: ClientFormat, raw_response: &str) -> Vec<ResumeEntry> {
     if raw_response.trim().is_empty() {
         return Vec::new();
     }
@@ -271,7 +285,7 @@ fn looks_like_sse(raw: &str) -> bool {
     trimmed.starts_with("data:") || trimmed.starts_with("event:") || trimmed.starts_with(':')
 }
 
-fn push_anthropic_message(message: &Value, entries: &mut Vec<TranscriptEntry>) {
+fn push_anthropic_message(message: &Value, entries: &mut Vec<ResumeEntry>) {
     let role = match message["role"].as_str() {
         Some("user") => "user",
         Some("assistant") => "assistant",
@@ -324,10 +338,10 @@ fn push_anthropic_message(message: &Value, entries: &mut Vec<TranscriptEntry>) {
         }
         _ => {}
     }
-    push_entry(entries, TranscriptEntry::new(role, content));
+    push_entry(entries, ResumeEntry::new(role, content));
 }
 
-fn push_openai_chat_message(message: &Value, entries: &mut Vec<TranscriptEntry>) {
+fn push_openai_chat_message(message: &Value, entries: &mut Vec<ResumeEntry>) {
     let role = match message["role"].as_str() {
         Some("user") => "user",
         Some("assistant") => "assistant",
@@ -373,7 +387,7 @@ fn push_openai_chat_message(message: &Value, entries: &mut Vec<TranscriptEntry>)
         ));
     }
 
-    push_entry(entries, TranscriptEntry::new(role, content));
+    push_entry(entries, ResumeEntry::new(role, content));
 }
 
 fn normalize_openai_message_content(content: &Value, role: &str) -> Vec<Value> {
@@ -408,7 +422,7 @@ fn normalize_openai_message_content(content: &Value, role: &str) -> Vec<Value> {
     normalized
 }
 
-fn push_responses_items(items: &[Value], entries: &mut Vec<TranscriptEntry>) {
+fn push_responses_items(items: &[Value], entries: &mut Vec<ResumeEntry>) {
     for item in items {
         let kind = item["type"].as_str().unwrap_or("message");
         if hidden_kind(kind) {
@@ -423,7 +437,7 @@ fn push_responses_items(items: &[Value], entries: &mut Vec<TranscriptEntry>) {
                     Some(_) => continue,
                 };
                 let content = normalize_openai_message_content(&item["content"], role);
-                push_entry(entries, TranscriptEntry::new(role, content));
+                push_entry(entries, ResumeEntry::new(role, content));
             }
             kind if is_tool_result_kind(kind) => {
                 let output = first_value(item, &["output", "result", "content"]);
@@ -433,7 +447,7 @@ fn push_responses_items(items: &[Value], entries: &mut Vec<TranscriptEntry>) {
                     output,
                     item.get("is_error").and_then(Value::as_bool),
                 );
-                push_entry(entries, TranscriptEntry::new("tool", vec![block]));
+                push_entry(entries, ResumeEntry::new("tool", vec![block]));
             }
             kind if is_tool_call_kind(kind) => {
                 let name = first_string(item, &["name", "tool_name"]).unwrap_or(kind);
@@ -443,14 +457,14 @@ fn push_responses_items(items: &[Value], entries: &mut Vec<TranscriptEntry>) {
                     name,
                     arguments,
                 );
-                push_entry(entries, TranscriptEntry::new("assistant", vec![block]));
+                push_entry(entries, ResumeEntry::new("assistant", vec![block]));
             }
             _ => {}
         }
     }
 }
 
-fn push_gemini_content(content_value: &Value, entries: &mut Vec<TranscriptEntry>) {
+fn push_gemini_content(content_value: &Value, entries: &mut Vec<ResumeEntry>) {
     let role = match content_value["role"].as_str() {
         Some("model" | "assistant") => "assistant",
         Some("user") | None => "user",
@@ -483,7 +497,7 @@ fn push_gemini_content(content_value: &Value, entries: &mut Vec<TranscriptEntry>
             content.push(json!({"type": "content", "value": part}));
         }
     }
-    push_entry(entries, TranscriptEntry::new(role, content));
+    push_entry(entries, ResumeEntry::new(role, content));
 }
 
 fn hidden_kind(kind: &str) -> bool {
@@ -566,7 +580,7 @@ fn first_value(value: &Value, keys: &[&str]) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn push_entry(entries: &mut Vec<TranscriptEntry>, entry: Option<TranscriptEntry>) {
+fn push_entry(entries: &mut Vec<ResumeEntry>, entry: Option<ResumeEntry>) {
     if let Some(entry) = entry {
         entries.push(entry);
     }

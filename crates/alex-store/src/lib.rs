@@ -1476,14 +1476,7 @@ impl Store {
                     GROUP_CONCAT(tags_json, char(31)),
                     GROUP_CONCAT(DISTINCT reasoning_effort),
                     GROUP_CONCAT(DISTINCT account_id),
-                    GROUP_CONCAT(DISTINCT upstream_provider),
-                    COALESCE(SUM(CASE WHEN error_class = 'auth' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'capacity' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'bad_request' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'server' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'client_disconnect' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'network' THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN error_class = 'other' THEN 1 ELSE 0 END),0)
+                    GROUP_CONCAT(DISTINCT upstream_provider)
              FROM traces WHERE session_id IS NOT NULL",
         );
         let mut args: Vec<String> = vec![];
@@ -1524,21 +1517,6 @@ impl Store {
                 .get::<_, Option<String>>(15)?
                 .map(|s| s.split(',').map(str::to_string).collect())
                 .unwrap_or_default();
-            let error_class_counts: serde_json::Map<String, Value> = [
-                ("auth", 17),
-                ("capacity", 18),
-                ("bad_request", 19),
-                ("server", 20),
-                ("client_disconnect", 21),
-                ("network", 22),
-                ("other", 23),
-            ]
-            .into_iter()
-            .filter_map(|(class, index)| {
-                let count = r.get::<_, i64>(index).ok()?;
-                (count > 0).then(|| (class.to_string(), json!(count)))
-            })
-            .collect();
             Ok(json!({
                 "session_id": r.get::<_, String>(0)?,
                 "run_id": r.get::<_, Option<String>>(1)?,
@@ -1556,15 +1534,99 @@ impl Store {
                 "tags": tags,
                 "efforts": efforts,
                 "account_ids": account_ids,
-                "error_class_counts": error_class_counts,
+                "error_class_counts": {},
             }))
         })?;
         let mut rows: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
         drop(stmt);
+
+        // The persisted class is authoritative. Only old rows that predate
+        // `error_class` use the legacy status/kind taxonomy below. Keep this
+        // as a grouped query instead of positional SUM columns: adding a
+        // session aggregate column must never shift one class into another.
+        let legacy_class = r#"CASE
+            WHEN error_class IS NOT NULL THEN error_class
+            WHEN lower(COALESCE(error_kind, '')) = 'client_disconnect'
+                THEN 'client_disconnect'
+            WHEN lower(COALESCE(error_kind, '')) IN
+                    ('stream_error', 'idle_timeout', 'upstream_unreachable')
+                OR lower(COALESCE(error_kind, '')) LIKE '%timeout%'
+                OR lower(COALESCE(error_kind, '')) LIKE '%connect%'
+                OR lower(COALESCE(error_kind, '')) LIKE '%reset%'
+                OR lower(COALESCE(error_kind, '')) LIKE '%early-eof%'
+                THEN 'network'
+            WHEN status IN (401, 403) AND (
+                    lower(COALESCE(error_kind, '')) = 'access_terminated_error'
+                    OR lower(COALESCE(error, '')) LIKE '%usage limit%'
+                    OR lower(COALESCE(error, '')) LIKE '%usage-limit%'
+                    OR lower(COALESCE(error, '')) LIKE '%quota exceeded%'
+                    OR lower(COALESCE(error, '')) LIKE '%quota exhausted%')
+                THEN 'capacity'
+            WHEN status IN (401, 403)
+                OR lower(COALESCE(error_kind, '')) IN
+                    ('authentication_error', 'permission_error', 'invalid_api_key',
+                     'token_refresh_failure', 'token-refresh-failure')
+                THEN 'auth'
+            WHEN status = 429
+                OR lower(COALESCE(error_kind, '')) IN
+                    ('rate_limit_error', 'overloaded_error', 'insufficient_quota',
+                     'quota_exceeded')
+                OR lower(COALESCE(error_kind, '')) LIKE '%at capacity%'
+                THEN 'capacity'
+            WHEN status IN (400, 404, 422)
+                OR lower(COALESCE(error_kind, '')) = 'invalid_request_error'
+                OR lower(COALESCE(error_kind, '')) LIKE '%model_not_found%'
+                OR lower(COALESCE(error_kind, '')) LIKE '%model-not-found%'
+                THEN 'bad_request'
+            WHEN status >= 500
+                OR lower(COALESCE(error_kind, '')) IN ('api_error', 'internal_server_error')
+                THEN 'server'
+            WHEN error IS NOT NULL OR status >= 400 THEN 'other'
+            ELSE NULL
+        END"#;
+        let mut class_sql = format!(
+            "SELECT session_id, aggregated_error_class, COUNT(*)
+             FROM (
+                SELECT session_id, {legacy_class} AS aggregated_error_class
+                FROM traces WHERE session_id IS NOT NULL"
+        );
+        let mut class_args: Vec<String> = vec![];
+        if let Some(since) = since_ms {
+            class_sql.push_str(" AND ts_request_ms >= ?");
+            class_args.push(since.to_string());
+        }
+        class_sql.push_str(
+            ") WHERE aggregated_error_class IS NOT NULL
+             GROUP BY session_id, aggregated_error_class",
+        );
+        let mut class_stmt = conn.prepare(&class_sql)?;
+        let class_rows =
+            class_stmt.query_map(rusqlite::params_from_iter(class_args.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+        let mut counts_by_session: std::collections::HashMap<
+            String,
+            serde_json::Map<String, Value>,
+        > = std::collections::HashMap::new();
+        for class_row in class_rows {
+            let (session_id, class, count) = class_row?;
+            counts_by_session
+                .entry(session_id)
+                .or_default()
+                .insert(class, json!(count));
+        }
+        drop(class_stmt);
+
         for row in &mut rows {
             let Some(session_id) = row["session_id"].as_str().map(String::from) else {
                 continue;
             };
+            row["error_class_counts"] =
+                Value::Object(counts_by_session.remove(&session_id).unwrap_or_default());
             let harness = row["harness"].as_str().map(String::from);
             let lineage = conn
                 .query_row(
@@ -2628,6 +2690,39 @@ mod tests {
         assert_eq!(recent[0]["session_id"], "ses_2");
         let limited = store.sessions(None, 1).unwrap();
         assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn sessions_count_the_stored_client_disconnect_class() {
+        let store = Store::open(tmpdir("sessions-stored-error-class")).unwrap();
+        let mut row = trace("client-cancel", 1000, None);
+        row.session_id = Some("019f7e25-b771-7ee2-92b9-a4da55f0c00f".into());
+        row.status = Some(500);
+        row.error = Some("response stream closed by client".into());
+        row.error_kind = Some("client_disconnect".into());
+        row.error_class = Some("client_disconnect".into());
+        store.insert_trace(&row).unwrap();
+
+        let sessions = store.sessions(None, 0).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["error_class_counts"]["client_disconnect"], 1);
+        assert!(sessions[0]["error_class_counts"].get("server").is_none());
+    }
+
+    #[test]
+    fn sessions_derive_error_class_only_for_legacy_null_rows() {
+        let store = Store::open(tmpdir("sessions-legacy-error-class")).unwrap();
+        let mut legacy = trace("legacy-cancel", 1000, None);
+        legacy.session_id = Some("legacy-session".into());
+        legacy.status = Some(500);
+        legacy.error = Some("response stream closed by client".into());
+        legacy.error_kind = Some("client_disconnect".into());
+        legacy.error_class = None;
+        store.insert_trace(&legacy).unwrap();
+
+        let sessions = store.sessions(None, 0).unwrap();
+        assert_eq!(sessions[0]["error_class_counts"]["client_disconnect"], 1);
+        assert!(sessions[0]["error_class_counts"].get("server").is_none());
     }
 
     #[test]

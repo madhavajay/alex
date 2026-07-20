@@ -219,6 +219,12 @@ enum Command {
         /// Disambiguate a source session ID shared by more than one harness
         #[arg(long)]
         source_harness: Option<String>,
+        /// Alex model to use; defaults to the source model when the target supports it
+        #[arg(long)]
+        model: Option<String>,
+        /// Force legacy prompt-paste mode instead of native session injection
+        #[arg(long)]
+        paste: bool,
         /// Reconstruct and validate the fork without launching a harness
         #[arg(long)]
         dry_run: bool,
@@ -4300,6 +4306,8 @@ async fn main() -> Result<()> {
             session,
             harness,
             source_harness,
+            model,
+            paste,
             dry_run,
         } => {
             resume::resume_cmd(
@@ -4307,6 +4315,8 @@ async fn main() -> Result<()> {
                 &session,
                 harness.as_deref(),
                 source_harness.as_deref(),
+                model.as_deref(),
+                paste,
                 dry_run,
             )
             .await?;

@@ -6,6 +6,35 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite(.serialized) struct HarnessClientTests {
+    @Test func harnessKeyMintUsesHarnessKindLabelAndNoExpiry() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/run-keys")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["kind"] as? String == "harness")
+            #expect(json["label"] as? String == "codex-remote")
+            #expect(json["ttl_seconds"] == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"id":"rk-remote","key":"alxk-fresh","kind":"harness","label":"codex-remote","tags":{},"expires_ms":null}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let minted = try await client.mintRunKey(
+            label: "codex-remote", model: nil, ttlSeconds: nil, kind: .harness)
+        #expect(minted.kind == "harness")
+        #expect(minted.key == "alxk-fresh")
+    }
+
     @Test func darioRepairPostsToRepairEndpoint() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/dario/repair")
@@ -616,6 +645,7 @@ import Testing
             #expect(json["traces"] as? Bool == true)
             #expect(json["harnesses"] as? Bool == true)
             #expect(json["cache"] as? Bool == false)
+            #expect(json["mode"] as? String == "immediate")
             let dryRun = try #require(json["dry_run"] as? Bool)
             #expect(dryRun == (requests == 0))
             requests += 1
@@ -648,6 +678,49 @@ import Testing
         #expect(!result.dryRun)
         #expect(result.applied)
         #expect(requests == 2)
+    }
+
+    @Test func resetSupportsGracefulModeProgressPollingAndDrainCancellation() async throws {
+        var requests = 0
+        HarnessEndpointURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            defer { requests += 1 }
+            switch requests {
+            case 0:
+                #expect(request.url?.path == "/admin/reset")
+                #expect(request.httpMethod == "POST")
+                let json = try #require(
+                    JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+                #expect(json["mode"] as? String == "graceful")
+                #expect(json["dry_run"] as? Bool == false)
+                return (response, Data(#"{"dry_run":false,"applied":true,"selected":["traces"],"counts":{"accounts":0,"run_keys":0,"traces":1,"heartbeats":0,"bodies":{"files":2,"bytes":30},"connected_harnesses":0,"pricing":0,"dario_prompt_cache":{"files":0,"bytes":0}},"harnesses":[],"actions":{"credentials":null,"settings":null,"traces":"clear","harnesses":null,"cache":null},"settings":{"preserves_update_channel":false,"preserves_local_key":false,"rotates_local_key":false}}"#.utf8))
+            case 1:
+                #expect(request.url?.path == "/admin/reset/progress")
+                #expect(request.httpMethod == "GET")
+                return (response, Data(#"{"status":"draining","phase":"draining","detail":"Waiting for routed requests to finish","in_flight":3}"#.utf8))
+            default:
+                #expect(request.url?.path == "/admin/reset")
+                #expect(request.httpMethod == "DELETE")
+                return (response, Data(#"{"cancelled":true}"#.utf8))
+            }
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let result = try await client.reset(ResetSelection(traces: true), mode: .graceful)
+        #expect(result.applied)
+        let progress = try await client.resetProgress()
+        #expect(progress.status == "draining")
+        #expect(progress.phase == "draining")
+        #expect(progress.inFlight == 3)
+        #expect(try await client.cancelResetDrain().cancelled)
+        #expect(requests == 3)
     }
 
     @Test func runKeyBulkMethodsUseStaticRoutesAndDecodeCounts() async throws {

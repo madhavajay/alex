@@ -335,10 +335,47 @@ pub struct ResetRequest {
     pub cache: bool,
     #[serde(default = "reset_dry_run_default")]
     pub dry_run: bool,
+    /// Applies immediately unless the caller explicitly requests a drain.
+    #[serde(default)]
+    pub mode: ResetMode,
 }
 
 fn reset_dry_run_default() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetMode {
+    #[default]
+    Immediate,
+    Graceful,
+}
+
+#[derive(Debug, Clone)]
+enum ResetActivity {
+    Idle,
+    Draining(u64),
+    Applying(u64),
+}
+
+#[derive(Debug, Clone)]
+struct ResetControl {
+    next_id: u64,
+    activity: ResetActivity,
+    phase: String,
+    detail: String,
+}
+
+impl Default for ResetControl {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            activity: ResetActivity::Idle,
+            phase: "idle".into(),
+            detail: String::new(),
+        }
+    }
 }
 
 pub type ResetFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
@@ -595,7 +632,14 @@ pub struct AppState {
     /// to discard lifecycle-induced transport failures instead of persisting
     /// them as provider health history.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Immediate reset uses the shutdown suppression path without claiming the
+    /// daemon itself is permanently shutting down.
+    reset_suppresses_health: std::sync::atomic::AtomicBool,
     in_flight_requests: std::sync::Mutex<HashMap<String, InFlightRequest>>,
+    reset_control: std::sync::Mutex<ResetControl>,
+    reset_changed: tokio::sync::Notify,
+    reset_abort: tokio::sync::watch::Sender<u64>,
+    reset_apply_lock: tokio::sync::Mutex<()>,
     upstream_stream_idle_timeout: Duration,
     pub started_ms: i64,
     pub base_url: String,
@@ -651,6 +695,31 @@ impl AppState {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .reset_suppresses_health
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Update the coarse reset phase exposed to polling clients.
+    pub fn set_reset_progress(&self, phase: impl Into<String>, detail: impl Into<String>) {
+        let mut control = self
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.phase = phase.into();
+        control.detail = detail.into();
+        drop(control);
+        self.reset_changed.notify_waiters();
+    }
+
+    fn reset_active(&self) -> bool {
+        !matches!(
+            self.reset_control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .activity,
+            ResetActivity::Idle
+        )
     }
 }
 
@@ -810,6 +879,7 @@ struct InFlightRequest {
 struct InFlight {
     state: Arc<AppState>,
     id: String,
+    reset_abort: tokio::sync::watch::Receiver<u64>,
 }
 
 impl InFlight {
@@ -818,7 +888,17 @@ impl InFlight {
         model: String,
         session_id: Option<String>,
         harness: Option<String>,
-    ) -> Self {
+    ) -> Option<Self> {
+        // Registration and reset activation share one mutex, closing the race
+        // where a request passed the early route gate just as a drain began.
+        let control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(control.activity, ResetActivity::Idle) {
+            return None;
+        }
+        let reset_abort = state.reset_abort.subscribe();
         let id = uuid::Uuid::new_v4().to_string();
         state
             .in_flight_requests
@@ -836,10 +916,12 @@ impl InFlight {
         state
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self {
+        drop(control);
+        Some(Self {
             state: state.clone(),
             id,
-        }
+            reset_abort,
+        })
     }
 }
 
@@ -853,6 +935,7 @@ impl Drop for InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.id);
+        self.state.reset_changed.notify_waiters();
     }
 }
 
@@ -922,6 +1005,7 @@ pub fn build_state_with_substitution(
         .connect_timeout(Duration::from_secs(15))
         .build()
         .expect("reqwest client");
+    let (reset_abort, _) = tokio::sync::watch::channel(0u64);
     Arc::new(AppState {
         local_key: Arc::new(std::sync::RwLock::new(local_key)),
         vault,
@@ -930,7 +1014,12 @@ pub fn build_state_with_substitution(
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        reset_suppresses_health: std::sync::atomic::AtomicBool::new(false),
         in_flight_requests: std::sync::Mutex::new(HashMap::new()),
+        reset_control: std::sync::Mutex::new(ResetControl::default()),
+        reset_changed: tokio::sync::Notify::new(),
+        reset_abort,
+        reset_apply_lock: tokio::sync::Mutex::new(()),
         upstream_stream_idle_timeout,
         started_ms: now_ms(),
         base_url,
@@ -1489,7 +1578,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/storage", get(admin_storage))
         .route("/admin/storage/prune", post(admin_storage_prune))
-        .route("/admin/reset", post(admin_reset))
+        .route("/admin/reset", post(admin_reset).delete(admin_reset_cancel))
+        .route("/admin/reset/progress", get(admin_reset_progress))
         .route("/admin/traces", get(admin_traces))
         .route(
             "/admin/fixtures",
@@ -2197,13 +2287,6 @@ async fn admin_reset(
     body: Option<axum::Json<ResetRequest>>,
 ) -> Response {
     let request = body.map(|body| body.0).unwrap_or_default();
-    let in_flight = state.in_flight.load(std::sync::atomic::Ordering::SeqCst);
-    if !request.dry_run && in_flight > 0 {
-        return error_response(
-            StatusCode::CONFLICT,
-            "cannot reset while routed requests are in flight; retry after they complete",
-        );
-    }
     let handler = state
         .reset_handler
         .read()
@@ -2215,10 +2298,163 @@ async fn admin_reset(
             "reset is not configured by this daemon",
         );
     };
-    match handler.reset(state, request).await {
+
+    if request.dry_run {
+        state.set_reset_progress("counting_bodies", "Counting captured bodies");
+        return match handler.reset(state.clone(), request).await {
+            Ok(plan) => {
+                state.set_reset_progress("complete", "Dry run complete");
+                axum::Json(plan).into_response()
+            }
+            Err(e) => {
+                state.set_reset_progress("failed", e.to_string());
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            }
+        };
+    }
+
+    let operation_id = {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.next_id = control.next_id.wrapping_add(1);
+        let id = control.next_id;
+        match request.mode {
+            ResetMode::Immediate => {
+                control.activity = ResetActivity::Applying(id);
+                control.phase = "aborting_requests".into();
+                control.detail = "Closing routed requests".into();
+                state
+                    .reset_suppresses_health
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .reset_abort
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            ResetMode::Graceful => {
+                control.activity = ResetActivity::Draining(id);
+                control.phase = "draining".into();
+                control.detail = "Waiting for routed requests to finish".into();
+            }
+        }
+        id
+    };
+    state.reset_changed.notify_waiters();
+
+    loop {
+        let notified = state.reset_changed.notified();
+        let activity = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activity
+            .clone();
+        let still_owned = matches!(
+            activity,
+            ResetActivity::Draining(id) | ResetActivity::Applying(id) if id == operation_id
+        );
+        if !still_owned {
+            return error_response(
+                StatusCode::CONFLICT,
+                "reset drain was cancelled or overridden",
+            );
+        }
+        if state.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            break;
+        }
+        notified.await;
+    }
+
+    let _apply = state.reset_apply_lock.lock().await;
+    {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let still_owned = matches!(
+            control.activity,
+            ResetActivity::Draining(id) | ResetActivity::Applying(id) if id == operation_id
+        );
+        if !still_owned {
+            return error_response(
+                StatusCode::CONFLICT,
+                "reset drain was cancelled or overridden",
+            );
+        }
+        control.activity = ResetActivity::Applying(operation_id);
+        control.phase = "counting_bodies".into();
+        control.detail = "Counting captured bodies".into();
+    }
+    state.reset_changed.notify_waiters();
+
+    let result = handler.reset(state.clone(), request).await;
+    let finished_owned = {
+        let mut control = state
+            .reset_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owns_operation =
+            matches!(control.activity, ResetActivity::Applying(id) if id == operation_id);
+        if owns_operation {
+            control.activity = ResetActivity::Idle;
+            match &result {
+                Ok(_) => {
+                    control.phase = "complete".into();
+                    control.detail = "Reset complete".into();
+                }
+                Err(error) => {
+                    control.phase = "failed".into();
+                    control.detail = error.to_string();
+                }
+            }
+        }
+        owns_operation
+    };
+    if finished_owned {
+        state
+            .reset_suppresses_health
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    state.reset_changed.notify_waiters();
+    match result {
         Ok(plan) => axum::Json(plan).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+async fn admin_reset_progress(State(state): State<Arc<AppState>>) -> axum::Json<Value> {
+    let control = state
+        .reset_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let status = match control.activity {
+        ResetActivity::Idle => "idle",
+        ResetActivity::Draining(_) => "draining",
+        ResetActivity::Applying(_) => "applying",
+    };
+    axum::Json(json!({
+        "status": status,
+        "phase": control.phase,
+        "detail": control.detail,
+        "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+    }))
+}
+
+async fn admin_reset_cancel(State(state): State<Arc<AppState>>) -> Response {
+    let mut control = state
+        .reset_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !matches!(control.activity, ResetActivity::Draining(_)) {
+        return error_response(StatusCode::CONFLICT, "no graceful reset drain is active");
+    }
+    control.activity = ResetActivity::Idle;
+    control.phase = "cancelled".into();
+    control.detail = "Graceful reset cancelled".into();
+    drop(control);
+    state.reset_changed.notify_waiters();
+    axum::Json(json!({"cancelled": true})).into_response()
 }
 
 async fn admin_auth_import(
@@ -5195,6 +5431,162 @@ fn transcript_turn(row: &Value) -> Value {
     })
 }
 
+fn transcript_request_format(format: &str) -> Option<alex_core::ClientFormat> {
+    match format {
+        "anthropic" => Some(alex_core::ClientFormat::AnthropicMessages),
+        "openai-chat" => Some(alex_core::ClientFormat::OpenaiChat),
+        "openai-responses" => Some(alex_core::ClientFormat::OpenaiResponses),
+        "gemini" => Some(alex_core::ClientFormat::GeminiGenerate),
+        _ => None,
+    }
+}
+
+fn transcript_content_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(transcript_content_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
+fn inherited_entry_turn(row: &Value, index: usize, entry: &alex_core::ResumeEntry) -> Value {
+    let mut text = Vec::new();
+    let mut assistant_blocks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in &entry.content {
+        match block["type"].as_str() {
+            Some("text") => {
+                let Some(value) = block["text"].as_str().filter(|text| !text.is_empty()) else {
+                    continue;
+                };
+                text.push(value.to_string());
+                if entry.role == "assistant" {
+                    assistant_blocks.push(json!({
+                        "type": "text",
+                        "text": truncate_chars(value.to_string(), 8000),
+                    }));
+                }
+            }
+            Some("tool_call") => {
+                let arguments = match &block["arguments"] {
+                    Value::String(value) => value.clone(),
+                    Value::Null => String::new(),
+                    value => value.to_string(),
+                };
+                let mut call = json!({
+                    "name": block["name"].as_str().unwrap_or("tool"),
+                    "arguments": truncate_chars(arguments, 600),
+                });
+                if let Some(id) = block["id"].as_str().filter(|id| !id.is_empty()) {
+                    call["id"] = json!(id);
+                }
+                tool_calls.push(call.clone());
+                let mut assistant_block = call;
+                assistant_block["type"] = json!("tool_call");
+                assistant_blocks.push(assistant_block);
+            }
+            Some("tool_result") => {
+                let result = transcript_content_text(&block["content"]);
+                if !result.is_empty() {
+                    text.push(format!("[tool result] {result}"));
+                }
+            }
+            Some("content") => {
+                let value = transcript_content_text(&block["value"]);
+                if !value.is_empty() {
+                    text.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = (!text.is_empty()).then(|| truncate_chars(text.join("\n\n"), 8000));
+    let trace_id = format!(
+        "{}:inherited:{index}",
+        row["id"].as_str().unwrap_or("trace")
+    );
+    json!({
+        "trace_id": trace_id,
+        "ts_request_ms": row["ts_request_ms"],
+        "ts_response_ms": Value::Null,
+        "model": Value::Null,
+        "provider": Value::Null,
+        "status": Value::Null,
+        "input_tokens": Value::Null,
+        "output_tokens": Value::Null,
+        "reasoning_effort": Value::Null,
+        "thinking_budget": Value::Null,
+        "cost_usd": Value::Null,
+        "billing_bucket": Value::Null,
+        "account_id": Value::Null,
+        "error": Value::Null,
+        "error_kind": Value::Null,
+        "error_code": Value::Null,
+        "error_class": Value::Null,
+        "user": if matches!(entry.role, "user" | "tool") { text.clone() } else { None },
+        "assistant": if entry.role == "assistant" { text } else { None },
+        "tool_calls": tool_calls,
+        "assistant_blocks": assistant_blocks,
+        "executed_tools": [],
+        "role": entry.role,
+        "inherited": true,
+    })
+}
+
+/// Return the history prefix embedded in a fork's first provider request.
+/// The final user/tool entry remains on the real trace turn, where it is
+/// paired with that trace's response. A plain first request (system + one
+/// user message) therefore produces no synthetic entries.
+fn transcript_inherited_turns(row: &Value) -> Vec<Value> {
+    let Some(format) = row["client_format"]
+        .as_str()
+        .and_then(transcript_request_format)
+    else {
+        return Vec::new();
+    };
+    let Some(request) = read_gz_json(row["req_body_path"].as_str()) else {
+        return Vec::new();
+    };
+    let entries = alex_core::request_entries(format, &request);
+    let Some(current_index) = entries
+        .iter()
+        .rposition(|entry| matches!(entry.role, "user" | "tool"))
+    else {
+        return Vec::new();
+    };
+    // `last_user_text` renders the trailing request entry on the real turn.
+    // Do not guess at requests that end in an assistant message.
+    if current_index + 1 != entries.len() {
+        return Vec::new();
+    }
+    let history = &entries[..current_index];
+    let genuine_prior_history = history.iter().any(|entry| {
+        matches!(entry.role, "assistant" | "tool")
+            || entry.content.iter().any(|block| {
+                matches!(block["type"].as_str(), Some("tool_call" | "tool_result"))
+            })
+    });
+    if !genuine_prior_history {
+        return Vec::new();
+    }
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| inherited_entry_turn(row, index, entry))
+        .collect()
+}
+
 /// Counts are sent with the transcript so tab labels never need to rescan a
 /// large response while the user is typing a filter. They intentionally count
 /// displayable message halves, matching the client filter's All/User/Model
@@ -5268,6 +5660,48 @@ fn codex_user_history_signature(row: &Value) -> Option<String> {
     openai_responses_user_history_signature(&read_gz_json(row["req_body_path"].as_str())?)
 }
 
+fn build_session_transcript(rows: &[Value], tools: &[Value], limit: usize) -> Vec<Value> {
+    let mut previous_codex_user_history: Option<String> = None;
+    let mut turns = Vec::new();
+    for (index, row) in rows.iter().take(limit).enumerate() {
+        if index == 0 {
+            turns.extend(transcript_inherited_turns(row));
+        }
+        let signature = codex_user_history_signature(row);
+        let replayed_user = signature.is_some() && signature == previous_codex_user_history;
+        if signature.is_some() {
+            previous_codex_user_history = signature;
+        }
+        let mut turn = transcript_turn(row);
+        // Pi emits a tool start after the model response that requested it
+        // and before the next provider request. Associate by explicit
+        // trace_id when available, otherwise by that session-local time
+        // interval. `turn_id` remains on each tool row for Pi-level joins.
+        let next_request = rows
+            .get(index + 1)
+            .and_then(|next| next["ts_request_ms"].as_i64());
+        let trace_id = row["id"].as_str();
+        let started = row["ts_request_ms"].as_i64().unwrap_or_default();
+        let executed: Vec<Value> = tools
+            .iter()
+            .filter(|tool| {
+                tool["trace_id"].as_str() == trace_id
+                    || (tool["trace_id"].is_null()
+                        && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
+                            ts >= started && next_request.is_none_or(|next| ts < next)
+                        }))
+            })
+            .cloned()
+            .collect();
+        turn["executed_tools"] = json!(executed);
+        if replayed_user {
+            turn["user"] = Value::Null;
+        }
+        turns.push(turn);
+    }
+    turns
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5286,45 +5720,7 @@ async fn traces_session_transcript(
         Ok(rows) => rows,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let mut previous_codex_user_history: Option<String> = None;
-    let turns: Vec<Value> = rows
-        .iter()
-        .take(limit)
-        .enumerate()
-        .map(|(index, row)| {
-            let signature = codex_user_history_signature(row);
-            let replayed_user = signature.is_some() && signature == previous_codex_user_history;
-            if signature.is_some() {
-                previous_codex_user_history = signature;
-            }
-            let mut turn = transcript_turn(row);
-            // Pi emits a tool start after the model response that requested it
-            // and before the next provider request. Associate by explicit
-            // trace_id when available, otherwise by that session-local time
-            // interval. `turn_id` remains on each tool row for Pi-level joins.
-            let next_request = rows
-                .get(index + 1)
-                .and_then(|next| next["ts_request_ms"].as_i64());
-            let trace_id = row["id"].as_str();
-            let started = row["ts_request_ms"].as_i64().unwrap_or_default();
-            let executed: Vec<Value> = tools
-                .iter()
-                .filter(|tool| {
-                    tool["trace_id"].as_str() == trace_id
-                        || (tool["trace_id"].is_null()
-                            && tool["ts_start_ms"].as_i64().is_some_and(|ts| {
-                                ts >= started && next_request.is_none_or(|next| ts < next)
-                            }))
-                })
-                .cloned()
-                .collect();
-            turn["executed_tools"] = json!(executed);
-            if replayed_user {
-                turn["user"] = Value::Null;
-            }
-            turn
-        })
-        .collect();
+    let turns = build_session_transcript(&rows, &tools, limit);
     let tab_counts = transcript_tab_counts(&turns);
     axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
         .into_response()
@@ -6585,6 +6981,9 @@ async fn record_dario_response_probe(
     status: Option<u16>,
     error: Option<&str>,
 ) {
+    if state.is_shutting_down() {
+        return;
+    }
     let Some((account_id, status)) = account_id.zip(status) else {
         return;
     };
@@ -7689,9 +8088,9 @@ async fn plan_upstream(
 #[cfg(test)]
 mod trace_api_tests {
     use super::{
-        account_plot_series, openai_responses_user_history_signature, session_from_metadata,
-        trace_extras, trace_harness, trace_reasoning_fields, transcript_assistant_blocks,
-        transcript_tab_counts, transcript_turn, truncate_chars, Store,
+        account_plot_series, build_session_transcript, openai_responses_user_history_signature,
+        session_from_metadata, trace_extras, trace_harness, trace_reasoning_fields,
+        transcript_assistant_blocks, transcript_tab_counts, transcript_turn, truncate_chars, Store,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::{json, Value};
@@ -7846,6 +8245,79 @@ mod trace_api_tests {
         assert_eq!(turn["reasoning_effort"], "minimal");
         assert_eq!(turn["billing_bucket"], "subscription");
         assert_eq!(turn["thinking_budget"], serde_json::Value::Null);
+    }
+
+    fn first_request_row(store: &Store, id: &str, request: &str) -> Value {
+        let request_path = store
+            .write_body(id, "request.json", request.as_bytes())
+            .expect("gzip-write first request body");
+        json!({
+            "id": id,
+            "ts_request_ms": 1_783_564_098_000_i64,
+            "ts_response_ms": null,
+            "routed_model": "claude-sonnet-4-5",
+            "upstream_provider": "anthropic",
+            "status": 200,
+            "input_tokens": null,
+            "output_tokens": null,
+            "cost_usd": null,
+            "error": null,
+            "client_format": "anthropic",
+            "upstream_format": "anthropic",
+            "req_body_path": request_path,
+            "resp_body_path": null,
+        })
+    }
+
+    #[test]
+    fn transcript_first_fork_request_renders_inherited_history_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-inherited-transcript-{}",
+            std::process::id()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).unwrap();
+        let row = first_request_row(
+            &store,
+            "fork-first",
+            include_str!("../tests/fixtures/transcript/fork_first_request.json"),
+        );
+
+        let turns = build_session_transcript(&[row], &[], 500);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0]["user"], "Inspect the failing test.");
+        assert_eq!(turns[0]["inherited"], true);
+        assert_eq!(turns[1]["assistant"], "I will inspect it.");
+        assert_eq!(turns[1]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(turns[1]["inherited"], true);
+        assert!(turns[2]["user"]
+            .as_str()
+            .is_some_and(|text| text.contains("fn broken() {}")));
+        assert_eq!(turns[2]["inherited"], true);
+        assert_eq!(turns[3]["assistant"], "The failure is in broken().");
+        assert_eq!(turns[3]["inherited"], true);
+        assert_eq!(turns[4]["user"], "Fix it and run the tests.");
+        assert!(turns[4].get("inherited").is_none());
+    }
+
+    #[test]
+    fn transcript_normal_first_request_does_not_duplicate_its_user() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-normal-transcript-{}",
+            std::process::id()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).unwrap();
+        let row = first_request_row(
+            &store,
+            "normal-first",
+            include_str!("../tests/fixtures/transcript/normal_first_request.json"),
+        );
+
+        let turns = build_session_transcript(&[row], &[], 500);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["user"], "Start a new task.");
+        assert!(turns[0].get("inherited").is_none());
     }
 
     struct RemoveTestDir(PathBuf);
@@ -9523,6 +9995,9 @@ async fn proxy(
     body: Bytes,
     peer: Option<std::net::SocketAddr>,
 ) -> Response {
+    if state.reset_active() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "resetting");
+    }
     let mut run_key: Option<CachedRunKey> = None;
     let mut local_key_request = false;
     let client_fingerprint = match client_key(&headers) {
@@ -9940,12 +10415,14 @@ async fn proxy(
             .body(Body::from(response_body))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
-    let in_flight = InFlight::new(
+    let Some(in_flight) = InFlight::new(
         &state,
         routed_model.clone(),
         trace.session_id.clone(),
         trace.harness.clone(),
-    );
+    ) else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "resetting");
+    };
 
     // Resolve verified Codex/Claude children to the lineage root so every
     // descendant prefers the same upstream account while retaining its own
@@ -10596,13 +11073,14 @@ async fn proxy(
     let dario_guard = plan.dario_guard.take();
     tokio::spawn(async move {
         let _dario_guard = dario_guard;
-        let _in_flight = in_flight;
+        let mut in_flight = in_flight;
         let mut buf: Vec<u8> = Vec::new();
         let mut sse_error_observer = is_sse.then(|| SseErrorObserver::new(plan.upstream_format));
         let stream_error = forward_upstream_stream(
             &mut upstream_stream,
             &tx,
             state2.upstream_stream_idle_timeout,
+            Some(&mut in_flight.reset_abort),
             |chunk| {
                 buf.extend_from_slice(chunk);
                 if let Some(observer) = sse_error_observer.as_mut() {
@@ -10651,7 +11129,7 @@ async fn proxy(
                 .into(),
             );
         }
-        if trace.error.is_some() {
+        if trace.error.is_some() && !state2.is_shutting_down() {
             if let (Some(dario), Some(gen)) = (
                 &state2.dario,
                 trace
@@ -10711,6 +11189,7 @@ async fn forward_upstream_stream<S, E, F>(
     upstream_stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     idle_timeout: Duration,
+    mut reset_abort: Option<&mut tokio::sync::watch::Receiver<u64>>,
     mut observe: F,
 ) -> Option<String>
 where
@@ -10719,7 +11198,17 @@ where
     F: FnMut(&Bytes),
 {
     loop {
-        match tokio::time::timeout(idle_timeout, upstream_stream.next()).await {
+        let next = if let Some(reset_abort) = reset_abort.as_deref_mut() {
+            tokio::select! {
+                _ = reset_abort.changed() => {
+                    return Some("stream aborted by immediate reset".into());
+                }
+                result = tokio::time::timeout(idle_timeout, upstream_stream.next()) => result,
+            }
+        } else {
+            tokio::time::timeout(idle_timeout, upstream_stream.next()).await
+        };
+        match next {
             Ok(Some(Ok(chunk))) => {
                 observe(&chunk);
                 if tx.send(Ok(chunk)).await.is_err() {
@@ -13645,12 +14134,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_upstream_releases_the_in_flight_guard_after_idle_timeout() {
         let state = test_state("in-flight-idle-timeout");
-        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             let _in_flight = guard;
             let mut stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), None, |_| {}).await
         });
 
         tokio::task::yield_now().await;
@@ -13667,7 +14156,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_guard_is_released_when_the_stream_task_panics() {
         let state = test_state("in-flight-panic");
-        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None);
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
         let task = tokio::spawn(async move {
             let _in_flight = guard;
             panic!("fake streaming task panic");
@@ -13676,6 +14165,202 @@ mod tests {
         assert!(task.await.is_err());
         assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(in_flight_requests(&state).is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingResetHandler {
+        calls: AtomicUsize,
+    }
+
+    impl ResetHandler for RecordingResetHandler {
+        fn reset(&self, _state: Arc<AppState>, request: ResetRequest) -> ResetFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(json!({
+                    "dry_run": request.dry_run,
+                    "applied": !request.dry_run,
+                }))
+            })
+        }
+    }
+
+    fn reset_request(method: &str, path: &str, body: Value) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-api-key", "alx-local")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn wait_for_reset_status(state: &Arc<AppState>, wanted: &str) {
+        for _ in 0..100 {
+            let status = {
+                let control = state
+                    .reset_control
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match control.activity {
+                    ResetActivity::Idle => "idle",
+                    ResetActivity::Draining(_) => "draining",
+                    ResetActivity::Applying(_) => "applying",
+                }
+            };
+            if status == wanted {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("reset did not enter {wanted}");
+    }
+
+    #[tokio::test]
+    async fn immediate_reset_aborts_a_fake_in_flight_stream_and_succeeds() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-immediate-aborts-stream");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let mut guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let stream = tokio::spawn(async move {
+            let mut upstream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+            forward_upstream_stream(
+                &mut upstream,
+                &tx,
+                Duration::from_secs(300),
+                Some(&mut guard.reset_abort),
+                |_| {},
+            )
+            .await
+        });
+
+        let response = router(state.clone())
+            .oneshot(reset_request(
+                "POST",
+                "/admin/reset",
+                json!({"dry_run": false, "mode": "immediate", "traces": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            stream.await.unwrap().as_deref(),
+            Some("stream aborted by immediate reset")
+        );
+        assert_eq!(state.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        assert!(!state.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn graceful_reset_rejects_new_routes_and_applies_at_zero_in_flight() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-graceful");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let reset_state = state.clone();
+        let pending = tokio::spawn(async move {
+            router(reset_state)
+                .oneshot(reset_request(
+                    "POST",
+                    "/admin/reset",
+                    json!({"dry_run": false, "mode": "graceful", "traces": true}),
+                ))
+                .await
+                .unwrap()
+        });
+        wait_for_reset_status(&state, "draining").await;
+
+        assert_eq!(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                HeaderMap::new(),
+                Bytes::new(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+
+        drop(guard);
+        assert_eq!(pending.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_cancel_graceful_drain_restores_routed_service() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-graceful-cancel");
+        let handler = Arc::new(RecordingResetHandler::default());
+        set_reset_handler(&state, handler.clone());
+        let guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        let reset_state = state.clone();
+        let pending = tokio::spawn(async move {
+            router(reset_state)
+                .oneshot(reset_request(
+                    "POST",
+                    "/admin/reset",
+                    json!({"dry_run": false, "mode": "graceful", "traces": true}),
+                ))
+                .await
+                .unwrap()
+        });
+        wait_for_reset_status(&state, "draining").await;
+
+        let cancel = router(state.clone())
+            .oneshot(reset_request("DELETE", "/admin/reset", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::OK);
+        assert_ne!(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                HeaderMap::new(),
+                Bytes::new(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(pending.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn reset_progress_endpoint_reports_current_phases_and_in_flight() {
+        use tower::ServiceExt;
+
+        let state = test_state("reset-progress");
+        let _guard = InFlight::new(&state, "gpt-5.5".into(), None, None).unwrap();
+        for (phase, detail) in [
+            ("counting_bodies", "Counting captured bodies"),
+            ("disconnecting_harnesses", "Disconnecting harnesses (3/6)"),
+            ("clearing_caches", "Clearing derived caches"),
+        ] {
+            state.set_reset_progress(phase, detail);
+            let response = router(state.clone())
+                .oneshot(reset_request("GET", "/admin/reset/progress", json!({})))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["phase"], phase);
+            assert_eq!(body["detail"], detail);
+            assert_eq!(body["in_flight"], 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -13694,7 +14379,7 @@ mod tests {
         })
         .boxed();
         let task = tokio::spawn(async move {
-            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), |_| {}).await
+            forward_upstream_stream(&mut stream, &tx, Duration::from_secs(5), None, |_| {}).await
         });
 
         tokio::task::yield_now().await;

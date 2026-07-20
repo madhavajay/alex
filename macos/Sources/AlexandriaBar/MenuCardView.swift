@@ -541,6 +541,99 @@ struct MenuMiniButton: View {
     }
 }
 
+/// A hosted submenu action so the harness flyout can stay open while a fresh
+/// key is minted, then show copy confirmation or an inline error.
+struct MenuRemoteOneLinerButton: View {
+    private enum Phase: Equatable {
+        case idle
+        case copying
+        case copied
+        case failed(String)
+    }
+
+    let harness: String
+    let config: DaemonConfig
+    @State private var phase: Phase = .idle
+    @State private var copyTask: Task<Void, Never>?
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button(action: copy) {
+                HStack(spacing: 7) {
+                    Image(systemName: phase == .copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 11))
+                        .foregroundStyle(phase == .copied
+                            ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
+                    Text(title)
+                        .font(.system(size: 12))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    Spacer(minLength: 8)
+                    if phase == .copying {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.7)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(hovering ? AlexTheme.Colors.overlay(0.08) : .clear))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(phase == .copying)
+            .onHover { hovering = $0 }
+
+            if case let .failed(message) = phase {
+                Text(message)
+                    .font(.system(size: 9))
+                    .foregroundStyle(AlexTheme.Colors.destructive)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+            }
+            if !config.lanEnabled {
+                Text(RemoteOneLiner.localhostWarning)
+                    .font(.system(size: 9))
+                    .foregroundStyle(AlexTheme.Colors.warningOrange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+            }
+        }
+        .padding(.vertical, 2)
+        .frame(width: 300, alignment: .leading)
+    }
+
+    private var title: String {
+        switch phase {
+        case .idle, .failed: "Copy remote 1-liner"
+        case .copying: "Minting harness key…"
+        case .copied: "Remote 1-liner copied"
+        }
+    }
+
+    private func copy() {
+        guard phase != .copying else { return }
+        phase = .copying
+        copyTask?.cancel()
+        copyTask = Task {
+            do {
+                try await RemoteOneLinerClipboard.copy(harness: harness, config: config)
+                phase = .copied
+                try await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                phase = .idle
+            } catch is CancellationError {
+                return
+            } catch {
+                NSSound.beep()
+                phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+}
+
 /// Async refresh control with the same short-lived confirmation pattern as
 /// `CopyButton`: spinner while awaiting the snapshot, then success/failure
 /// feedback for two seconds before returning to its idle label.

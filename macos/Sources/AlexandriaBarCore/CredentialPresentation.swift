@@ -119,7 +119,9 @@ public enum ConnectSnippetBuilder {
                 ("Authorization", "Bearer \(key)"),
                 ("content-type", "application/json"),
             ]
-            body = "{\"model\":\(jsonQuoted(model)),\"input\":\(jsonQuoted(prompt))}"
+            // The codex upstream requires the list form of `input`; a bare
+            // string (though valid per the OpenAI spec) is rejected upstream.
+            body = "{\"model\":\(jsonQuoted(model)),\"input\":[{\"role\":\"user\",\"content\":\(jsonQuoted(prompt))}]}"
         case .geminiGenerateContent:
             let pathModel = model.addingPercentEncoding(
                 withAllowedCharacters: CharacterSet.urlPathAllowed

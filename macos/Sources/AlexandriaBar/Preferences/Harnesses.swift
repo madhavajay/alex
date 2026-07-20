@@ -118,22 +118,32 @@ struct HarnessesPreferencesSection: View {
                 await store.refresh()
             }
         } else {
-            ScrollView {
-                VStack(spacing: 0) {
-                    ForEach(Array(rows.enumerated()), id: \.element.id) { index, harness in
-                        HarnessRowView(
-                            harness: harness,
-                            store: store,
-                            onOpenTraceBrowser: onOpenTraceBrowser)
-                        if index < rows.count - 1 {
-                            Rectangle()
-                                .fill(AlexTheme.Colors.divider)
-                                .frame(height: 1)
-                                .padding(.horizontal, 16)
+            VStack(alignment: .leading, spacing: 0) {
+                if store.config?.lanEnabled == false {
+                    Text(RemoteOneLiner.localhostWarning)
+                        .font(.system(size: 10))
+                        .foregroundStyle(AlexTheme.Colors.warningOrange)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, harness in
+                            HarnessRowView(
+                                harness: harness,
+                                store: store,
+                                onOpenTraceBrowser: onOpenTraceBrowser)
+                            if index < rows.count - 1 {
+                                Rectangle()
+                                    .fill(AlexTheme.Colors.divider)
+                                    .frame(height: 1)
+                                    .padding(.horizontal, 16)
+                            }
                         }
                     }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
             }
         }
     }
@@ -193,6 +203,9 @@ private struct HarnessRowView: View {
     @State private var actionModel: HarnessActionSheetModel?
     @State private var hovered = false
     @State private var confirmingDisconnect = false
+    @State private var copyingRemote = false
+    @State private var copiedRemote = false
+    @State private var copyConfirmationTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -294,6 +307,20 @@ private struct HarnessRowView: View {
                 ProgressView()
                     .controlSize(.small)
             } else {
+                PillButton(
+                    title: copiedRemote ? "Copied" : "Copy 1-liner",
+                    variant: .bordered,
+                    systemImage: copiedRemote ? "checkmark" : "doc.on.doc",
+                    fontSize: 9,
+                    horizontalPadding: 6,
+                    verticalPadding: 3,
+                    cornerRadius: 5,
+                    isEnabled: store.config != nil && !copyingRemote,
+                    isBusy: copyingRemote
+                ) {
+                    copyRemoteOneLiner()
+                }
+                .help("Mint a fresh harness key and copy a remote install/connect/launch command")
                 if harness.connected && harness.supportsConnect {
                     PillButton(
                         title: "Remove", variant: .danger
@@ -347,6 +374,31 @@ private struct HarnessRowView: View {
         let model = HarnessActionSheetModel(store: store, harness: harness, kind: kind)
         actionModel = model
         model.start()
+    }
+
+    private func copyRemoteOneLiner() {
+        guard let config = store.config, !copyingRemote else { return }
+        error = nil
+        copiedRemote = false
+        copyingRemote = true
+        copyConfirmationTask?.cancel()
+        Task {
+            defer { copyingRemote = false }
+            do {
+                try await RemoteOneLinerClipboard.copy(harness: harness.name, config: config)
+                copiedRemote = true
+                copyConfirmationTask = Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled else { return }
+                    copiedRemote = false
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                NSSound.beep()
+                self.error = "Could not copy remote 1-liner: \(error.localizedDescription)"
+            }
+        }
     }
 
 }
