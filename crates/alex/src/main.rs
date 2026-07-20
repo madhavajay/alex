@@ -17,6 +17,7 @@ use serde_json::json;
 
 mod commands;
 mod dario;
+mod doctor;
 mod harness_connect;
 mod harness_e2e;
 mod reset;
@@ -29,7 +30,7 @@ mod ui;
 
 #[derive(Parser)]
 #[command(
-    name = "alexandria",
+    name = "alex",
     version,
     about = "LLM credential vault + routing proxy + trace capture"
 )]
@@ -269,6 +270,12 @@ enum Command {
     },
     /// One-shot overview: daemon, service, accounts, limits, dario
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose first-run, service, storage, provider, and Dario problems
+    Doctor {
+        /// Emit a stable machine-readable report; credentials are never included
         #[arg(long)]
         json: bool,
     },
@@ -1768,6 +1775,11 @@ fn alexandria_home() -> PathBuf {
 fn load_or_create_config() -> Result<(Config, bool)> {
     let home = alexandria_home();
     std::fs::create_dir_all(&home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    }
     let path = home.join("config.toml");
     if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
@@ -3387,7 +3399,7 @@ async fn main() -> Result<()> {
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 anyhow::bail!(
-                    "no subcommand given and stdout is not a terminal — try `alexandria --help`"
+                    "no subcommand given and stdout is not a terminal — try `alex --help`"
                 );
             }
             Command::Tui
@@ -3461,7 +3473,7 @@ async fn main() -> Result<()> {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             if vault.list().await.is_empty() {
-                eprintln!("warning: no accounts in vault — run `alexandria auth import` first");
+                eprintln!("warning: no accounts in vault — run `alex auth import` first");
             }
             if !config.gemini_project.is_empty() {
                 let _ = vault
@@ -4048,7 +4060,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => anyhow::bail!(
-                        "usage: alexandria auth login <provider> — providers: {}",
+                        "usage: alex auth login <provider> — providers: {}",
                         alex_auth::login::PROVIDERS.join(", ")
                     ),
                 };
@@ -4114,7 +4126,7 @@ async fn main() -> Result<()> {
                     .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                     .filter(|k| !k.trim().is_empty())
                     .context(
-                        "provide the key: `alexandria auth gemini-key <KEY>` (get one at https://aistudio.google.com/apikey)",
+                        "provide the key: `alex auth gemini-key <KEY>` (get one at https://aistudio.google.com/apikey)",
                     )?;
                 let vault = open_vault(&config)?;
                 let account = alex_auth::Account {
@@ -4147,7 +4159,7 @@ async fn main() -> Result<()> {
                     .or_else(|| std::env::var("AMP_API_KEY").ok())
                     .filter(|k| !k.trim().is_empty())
                     .context(
-                        "provide the key: `alexandria auth amp-key <KEY>` (create one at https://ampcode.com/settings) or set AMP_API_KEY",
+                        "provide the key: `alex auth amp-key <KEY>` (create one at https://ampcode.com/settings) or set AMP_API_KEY",
                     )?;
                 let vault = open_vault(&config)?;
                 let id = alex_auth::save_amp_api_key(&vault, &key).await?;
@@ -4179,7 +4191,7 @@ async fn main() -> Result<()> {
                         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                         .filter(|k| !k.trim().is_empty())
                         .context(
-                            "provide the key: `alexandria auth openrouter-key <KEY>` or set OPENROUTER_API_KEY",
+                            "provide the key: `alex auth openrouter-key <KEY>` or set OPENROUTER_API_KEY",
                         )?;
                     let id = alex_auth::save_openrouter_api_key(
                         &vault,
@@ -4198,7 +4210,7 @@ async fn main() -> Result<()> {
                 let vault = open_vault(&config)?;
                 let accounts = vault.list().await;
                 if accounts.is_empty() {
-                    println!("no accounts — run `alexandria auth import`");
+                    println!("no accounts — run `alex auth import`");
                 }
                 for a in accounts {
                     let (dot, expiry) = account_indicators(&a);
@@ -4232,7 +4244,7 @@ async fn main() -> Result<()> {
                     .send()
                     .await
                     .with_context(|| {
-                        format!("could not reach the alexandria daemon at {base} — is it running?")
+                        format!("could not reach the Alex daemon at {base} — is it running?")
                     })?;
                 let status = response.status();
                 let body: serde_json::Value = response.json().await.unwrap_or_default();
@@ -4444,7 +4456,7 @@ async fn main() -> Result<()> {
                 ]
             };
             if providers.is_empty() && !wants_dario {
-                println!("no pingable accounts — run `alexandria auth import`");
+                println!("no pingable accounts — run `alex auth import`");
                 return Ok(());
             }
             let mut results = if providers.is_empty() {
@@ -4588,7 +4600,7 @@ async fn main() -> Result<()> {
                 }
             }
             .with_context(|| {
-                format!("could not reach the alexandria daemon at {base} — is it running?")
+                format!("could not reach the Alex daemon at {base} — is it running?")
             })?;
             let status = response.status();
             let body: serde_json::Value = response.json().await.unwrap_or_default();
@@ -4685,6 +4697,13 @@ async fn main() -> Result<()> {
         }
         Command::Status { json } => {
             run_status(&config, json).await?;
+        }
+        Command::Doctor { json } => {
+            let report = doctor::diagnose(&config).await;
+            doctor::print_report(&report, json)?;
+            if !report.healthy {
+                std::process::exit(1);
+            }
         }
         Command::Credentials { json, host } => {
             let base = match host {
@@ -4828,7 +4847,7 @@ async fn main() -> Result<()> {
                 }
             };
             let resp = result.with_context(|| {
-                format!("could not reach the alexandria daemon at {base} — is it running?")
+                format!("could not reach the Alex daemon at {base} — is it running?")
             })?;
             let status = resp.status();
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -7497,7 +7516,7 @@ async fn daemon_get(
         .send()
         .await
         .with_context(|| {
-            format!("could not reach the alexandria daemon at {base} — is it running?")
+            format!("could not reach the Alex daemon at {base} — is it running?")
         })?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -8338,7 +8357,7 @@ async fn daemon_send(
         req = req.json(&b);
     }
     let resp = req.send().await.with_context(|| {
-        format!("could not reach the alexandria daemon at {base} — is it running?")
+        format!("could not reach the Alex daemon at {base} — is it running?")
     })?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -8545,7 +8564,7 @@ fn print_limits(snap: &serde_json::Value) {
     let providers = snap["providers"].as_array().cloned().unwrap_or_default();
     if providers.is_empty() {
         println!(
-            "no limit data yet — send some traffic through the proxy (or run `alexandria ping`)"
+            "no limit data yet — send some traffic through the proxy (or run `alex ping`)"
         );
         return;
     }
@@ -9818,10 +9837,10 @@ fn service_state_label(state: &ServiceState) -> String {
         }
         ServiceState::LaunchdLoaded { pid: None } => "launchd: installed + loaded".into(),
         ServiceState::LaunchdNotLoaded => {
-            "launchd: installed but not loaded → alexandria service install".into()
+            "launchd: installed but not loaded → alex service install".into()
         }
         ServiceState::LaunchdNotInstalled => {
-            "launchd: not installed → alexandria service install".into()
+            "launchd: not installed → alex service install".into()
         }
         ServiceState::Systemd {
             enabled: true,
@@ -9842,7 +9861,7 @@ fn service_state_label(state: &ServiceState) -> String {
             unit_present: true, ..
         } => "systemd: installed but disabled → systemctl --user enable --now alexandria".into(),
         ServiceState::Systemd { .. } => {
-            "systemd: not installed → alexandria service install".into()
+            "systemd: not installed → alex service install".into()
         }
         ServiceState::SystemdMissing => "systemd: systemctl not found".into(),
         ServiceState::Unsupported => "service management: unsupported OS".into(),
@@ -9945,7 +9964,7 @@ fn parse_dario_update_notice(raw: &str) -> Option<String> {
     let latest = v["latest"].as_str()?;
     let running = v["active_version"].as_str().unwrap_or("unknown");
     Some(format!(
-        "dario {latest} available (running {running}) — alexandria dario update"
+        "dario {latest} available (running {running}) — alex dario update"
     ))
 }
 
@@ -10534,7 +10553,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             println!(
                 "  {} {}",
                 ui::pad_right("", 10),
-                ui::dim("start: alexandria daemon --background")
+                ui::dim("start: alex daemon --background")
             );
         }
     }
@@ -10566,7 +10585,7 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
     println!();
     println!("{}", ui::section("accounts"));
     if accounts.is_empty() {
-        println!("{}", ui::dim("no accounts — run `alexandria auth import`"));
+        println!("{}", ui::dim("no accounts — run `alex auth import`"));
     }
     for a in accounts {
         let (dot, expiry) = status_account_indicators(a);
@@ -10662,6 +10681,22 @@ mod tests {
             } => assert_eq!(harness, "codex"),
             _ => panic!("unexpected tool-capture command"),
         }
+    }
+
+    #[test]
+    fn doctor_cli_parses_human_and_json_modes() {
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "doctor"])
+                .unwrap()
+                .command,
+            Some(Command::Doctor { json: false })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["alex", "doctor", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Doctor { json: true })
+        ));
     }
 
     #[test]
@@ -13809,9 +13844,9 @@ fi"#,
             "launchd: installed + loaded"
         );
         assert!(service_state_label(&ServiceState::LaunchdNotLoaded)
-            .contains("alexandria service install"));
+            .contains("alex service install"));
         assert!(service_state_label(&ServiceState::LaunchdNotInstalled)
-            .contains("alexandria service install"));
+            .contains("alex service install"));
         assert_eq!(
             service_state_label(&ServiceState::Systemd {
                 enabled: true,
@@ -13872,7 +13907,7 @@ fi"#,
         let raw = r#"{"checked_at_ms":1,"latest":"4.8.140","active_version":"4.8.139","pinned":null,"update_available":true}"#;
         assert_eq!(
             parse_dario_update_notice(raw),
-            Some("dario 4.8.140 available (running 4.8.139) — alexandria dario update".into())
+            Some("dario 4.8.140 available (running 4.8.139) — alex dario update".into())
         );
         assert_eq!(
             parse_dario_update_notice(
@@ -13887,7 +13922,7 @@ fi"#,
         );
         assert_eq!(
             parse_dario_update_notice(r#"{"latest":"5","update_available":true}"#),
-            Some("dario 5 available (running unknown) — alexandria dario update".into())
+            Some("dario 5 available (running unknown) — alex dario update".into())
         );
     }
 

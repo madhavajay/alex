@@ -53,7 +53,7 @@ It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, and Grok su
 ### At a glance
 
 - **Use any model in any harness, like Fable 5 in Codex.**
-- **Fork any session.** `alex resume SESSION pi` — every conversation Alex captures can be continued in another harness: history, tool calls, model, and working directory carry over. Pi resumes as a native session (the forked chat *is* real, scrollable history); Claude Code and Codex currently fork via transcript hand-off with native resume coming, and more harnesses are on the way. Any session from any of them can be continued in any other.
+- **Fork any session.** `alex resume SESSION pi` — captured Pi, Claude Code, and Codex conversations can be reconstructed into native sessions in any of those three harnesses. History, tool calls, model, and a verified working directory carry over when the target format supports them; unsupported or changed private formats fall back visibly to prompt hand-off.
 - **See everything.** Inspect all model traffic and every turn-by-turn event.
 - **Have your agents meta-analyze all your traces in an outer loop.**
 - **Tokenmax across accounts.** Bond multiple subscriptions for more aggregate capacity.
@@ -143,7 +143,7 @@ The CLI and macOS menu bar app show account health, authentication failures, sub
 
 alex auth import
 alex daemon --background
-alex harness connect pi
+alex connect pi
 pi --model alex/gpt-5.6-sol
 
 One proxy. Your subscriptions. Any harness. Every trace.
@@ -170,12 +170,13 @@ After running the installer, import your existing CLI logins, start Alex, and co
 alex auth import
 alex daemon --background
 alex status
+alex doctor
 
 alex connect pi
 pi --model alex/gpt-5.6-sol
 ```
 
-`alex status` shows daemon health, accounts, limits, and Dario state. For a guided setup that can install, connect, configure, and launch a supported harness, run `alex up pi`.
+`alex status` shows daemon health, accounts, limits, and Dario state. `alex doctor` checks the executable, service, local port, credential state, provider health, storage integrity, permissions, and Dario prerequisites without displaying secrets. For a guided setup that can install, connect, configure, and launch a supported harness, run `alex up pi`.
 
 ## Compatibility
 
@@ -418,7 +419,7 @@ Any harness pointed at Alex can set these per request:
 
 ## Platforms and alternative installation
 
-macOS and Linux are the supported platforms. Windows x86-64 CLI builds are published with releases, but they are experimental. First-class Windows support, including service integration, is coming soon.
+macOS and Linux are the supported platforms. Windows x86-64 CLI builds are published for deterministic testing, but the service lifecycle and shared web onboarding remain experimental until the V1 Windows smoke gate is mandatory.
 
 Alternative installation methods:
 

@@ -363,6 +363,22 @@ One-shot daemon, service, accounts, limits, and Dario overview.
 alex status --json
 ```
 
+## `doctor`
+
+Run bounded, secret-safe diagnostics for the activation path:
+
+```bash
+alex doctor
+alex doctor --json
+```
+
+The report checks the running executable and detected harnesses, duplicate Alex
+installs, data/config permissions, storage writability and SQLite integrity,
+the OS user service, the local daemon port, connected credential state,
+provider health, and Dario readiness/runtime prerequisites. It does not print
+tokens, API keys, request bodies, or response bodies. The command exits nonzero
+when a blocking check fails; warnings leave the exit status successful.
+
 ## `keys`
 
 Manage scoped run, harness, and wrap keys through the running daemon. Raw keys
