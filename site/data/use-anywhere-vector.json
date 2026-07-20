@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "use-it-anywhere",
+  "title": "Your Claude subscription. The harness you prefer.",
+  "description": "A Pi request uses Alex's model namespace, routes through Dario because the caller is not Claude Code, and retains the harness and subscription provenance in one trace.",
+  "steps": [
+    {
+      "id": "connect",
+      "label": "Connect the Claude subscription",
+      "detail": "OAuth credentials stay in Alex's encrypted local vault",
+      "kind": "request"
+    },
+    {
+      "id": "configure-pi",
+      "label": "Connect Pi to Alex",
+      "detail": "alex connect pi installs the scoped local route",
+      "kind": "route"
+    },
+    {
+      "id": "request",
+      "label": "Pi asks for Opus 4.8",
+      "detail": "pi --model alex/claude-opus-4-8 -p “Review this”",
+      "kind": "request"
+    },
+    {
+      "id": "dario",
+      "label": "Alex selects the subscription path",
+      "detail": "Non-Claude-Code Anthropic traffic is routed through Dario",
+      "kind": "decision"
+    },
+    {
+      "id": "proof",
+      "label": "The trace proves where it ran",
+      "detail": "Pi · Anthropic · Opus 4.8 · subscription identity · Dario",
+      "kind": "success"
+    }
+  ],
+  "request": {
+    "harness": "pi",
+    "model": "alex/claude-opus-4-8"
+  },
+  "trace": {
+    "harness": "pi",
+    "provider": "anthropic",
+    "served_model": "claude-opus-4-8",
+    "via_dario": true,
+    "subscription_identity": "local account identity"
+  },
+  "source_contracts": [
+    "claude-opus-4-8",
+    "alex connect pi",
+    "non_claude_code_anthropic_uses_dario_even_with_legacy_direct_flag",
+    "via_dario",
+    "subscription_identity"
+  ]
+}

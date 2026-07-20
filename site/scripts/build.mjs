@@ -13,6 +13,14 @@ const vectorPath = path.join(repoRoot, "crates/alex-proxy/tests/fixtures/middlew
 const failurePath = path.join(repoRoot, "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json");
 const builtinPath = path.join(repoRoot, "crates/alex-middleware/src/builtins.rs");
 const rulePath = path.join(siteRoot, "data/fable-to-sol-rule.json");
+const useAnywherePath = path.join(siteRoot, "data/use-anywhere-vector.json");
+const askAnotherPath = path.join(siteRoot, "data/ask-another-model-vector.json");
+const corePath = path.join(repoRoot, "crates/alex-core/src/lib.rs");
+const cliPath = path.join(repoRoot, "crates/alex/src/main.rs");
+const harnessConnectPath = path.join(repoRoot, "crates/alex/src/harness_connect.rs");
+const resumePath = path.join(repoRoot, "crates/alex/src/resume.rs");
+const storePath = path.join(repoRoot, "crates/alex-store/src/lib.rs");
+const proxyPath = path.join(repoRoot, "crates/alex-proxy/src/lib.rs");
 
 function assert(condition, message) {
   if (!condition) throw new Error(`site build invariant failed: ${message}`);
@@ -88,6 +96,23 @@ function validateSources(vector, failure, rule, builtinSource) {
   assert(rule.then.reroute.scope === "session", "reroute must remain session-scoped");
   assert(rule.then.reroute.max_attempts === 3, "attempt guard must match the built-in");
   assert(rule.then.reroute.required_capabilities.portable_history === true, "portable history must remain required");
+}
+
+function validateSourceCheckedScenario(vector, sourceFiles) {
+  assert(vector.schema_version === 1, `${vector.id} schema must be version 1`);
+  assert(Array.isArray(vector.steps) && vector.steps.length >= 5, `${vector.id} needs a complete walkthrough`);
+  assert(Array.isArray(vector.source_contracts) && vector.source_contracts.length > 0, `${vector.id} needs source contracts`);
+  const combinedSource = sourceFiles.map((entry) => entry.content).join("\n");
+  for (const contract of vector.source_contracts) {
+    assert(combinedSource.includes(contract), `${vector.id} source contract is missing ${contract}`);
+  }
+  return {
+    ...vector,
+    source_evidence: Object.fromEntries(sourceFiles.map((entry) => [
+      path.relative(repoRoot, entry.path),
+      sha256(entry.content)
+    ]))
+  };
 }
 
 function buildScenario(vector, failure, rule, hashes) {
@@ -174,15 +199,38 @@ async function filesRecursively(directory, prefix = "") {
 }
 
 export async function build() {
-  const [vectorRaw, failureRaw, ruleRaw, builtinSource] = await Promise.all([
+  const [
+    vectorRaw,
+    failureRaw,
+    ruleRaw,
+    builtinSource,
+    useAnywhereRaw,
+    askAnotherRaw,
+    coreSource,
+    cliSource,
+    harnessConnectSource,
+    resumeSource,
+    storeSource,
+    proxySource
+  ] = await Promise.all([
     readFile(vectorPath, "utf8"),
     readFile(failurePath, "utf8"),
     readFile(rulePath, "utf8"),
-    readFile(builtinPath, "utf8")
+    readFile(builtinPath, "utf8"),
+    readFile(useAnywherePath, "utf8"),
+    readFile(askAnotherPath, "utf8"),
+    readFile(corePath, "utf8"),
+    readFile(cliPath, "utf8"),
+    readFile(harnessConnectPath, "utf8"),
+    readFile(resumePath, "utf8"),
+    readFile(storePath, "utf8"),
+    readFile(proxyPath, "utf8")
   ]);
   const vector = JSON.parse(vectorRaw);
   const failure = JSON.parse(failureRaw);
   const rule = JSON.parse(ruleRaw);
+  const useAnywhere = JSON.parse(useAnywhereRaw);
+  const askAnother = JSON.parse(askAnotherRaw);
   validateSources(vector, failure, rule, builtinSource);
 
   const scenario = buildScenario(vector, failure, rule, {
@@ -191,6 +239,21 @@ export async function build() {
     rule: sha256(ruleRaw),
     rule_builtin: sha256(builtinSource)
   });
+  const useAnywhereScenario = validateSourceCheckedScenario(useAnywhere, [
+    { path: corePath, content: coreSource },
+    { path: cliPath, content: cliSource },
+    { path: harnessConnectPath, content: harnessConnectSource },
+    { path: resumePath, content: resumeSource },
+    { path: storePath, content: storeSource },
+    { path: proxyPath, content: proxySource }
+  ]);
+  const askAnotherScenario = validateSourceCheckedScenario(askAnother, [
+    { path: cliPath, content: cliSource },
+    { path: resumePath, content: resumeSource },
+    { path: storePath, content: storeSource },
+    { path: proxyPath, content: proxySource }
+  ]);
+  const scenarios = [useAnywhereScenario, scenario, askAnotherScenario];
 
   await rm(outputRoot, { recursive: true, force: true });
   await mkdir(path.join(outputRoot, "assets"), { recursive: true });
@@ -199,11 +262,14 @@ export async function build() {
   const templatePath = path.join(outputRoot, "index.html");
   let html = await readFile(templatePath, "utf8");
   html = html
+    .replace("<!-- BUILD:USE_ANYWHERE_STEPS -->", scenarioMarkup(useAnywhereScenario.steps))
     .replace("<!-- BUILD:SCENARIO_STEPS -->", scenarioMarkup(scenario.steps))
+    .replace("<!-- BUILD:ASK_ANOTHER_STEPS -->", scenarioMarkup(askAnotherScenario.steps))
     .replace("<!-- BUILD:RULE_SOURCE -->", escapeHtml(JSON.stringify(rule, null, 2)));
   assert(!html.includes("<!-- BUILD:"), "all build placeholders must be replaced");
   await writeFile(templatePath, html);
   await writeFile(path.join(outputRoot, "assets/scenario.json"), `${JSON.stringify(scenario, null, 2)}\n`);
+  await writeFile(path.join(outputRoot, "assets/scenarios.json"), `${JSON.stringify(scenarios, null, 2)}\n`);
 
   const manifest = {};
   for (const relative of await filesRecursively(outputRoot)) {
@@ -211,7 +277,7 @@ export async function build() {
     manifest[relative] = sha256(content);
   }
   await writeFile(path.join(outputRoot, "build-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-  return { outputRoot, scenario, manifest };
+  return { outputRoot, scenario, scenarios, manifest };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

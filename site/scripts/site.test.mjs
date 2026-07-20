@@ -30,13 +30,30 @@ test("build is deterministic and generated from the proxy fixture", async () => 
   assert.equal(scenario.next_turn.anthropic_attempts, 0);
   assert.equal(scenario.steps.length, 6);
   for (const hash of Object.values(scenario.source.sha256)) assert.match(hash, /^[a-f0-9]{64}$/);
+
+  const scenarios = JSON.parse(await readFile(path.join(siteRoot, "dist/assets/scenarios.json"), "utf8"));
+  assert.deepEqual(scenarios.map(({ id }) => id), [
+    "use-it-anywhere",
+    "fable-to-sol-overload",
+    "ask-another-model"
+  ]);
+  assert.equal(scenarios[0].trace.via_dario, true);
+  assert.equal(scenarios[2].target.forked_from_harness, "claude");
+  for (const sourceChecked of [scenarios[0], scenarios[2]]) {
+    for (const hash of Object.values(sourceChecked.source_evidence)) assert.match(hash, /^[a-f0-9]{64}$/);
+  }
 });
 
 test("built HTML has a useful static fallback and accessible controls", async () => {
   await build();
   const html = await readFile(path.join(siteRoot, "dist/index.html"), "utf8");
-  assert.equal((html.match(/data-demo-step/g) ?? []).length, 6);
+  assert.equal((html.match(/data-demo="/g) ?? []).length, 3);
+  assert.equal((html.match(/data-demo-step/g) ?? []).length, 16);
+  assert.equal((html.match(/data-action="start"/g) ?? []).length, 3);
+  assert.equal((html.match(/data-demo-action=/g) ?? []).length, 3);
   assert.match(html, /Play the whole route, pause it/);
+  assert.match(html, /Your Claude subscription\. The harness you prefer/);
+  assert.match(html, /Keep the first answer\. Ask for another opinion/);
   assert.match(html, /<noscript>/);
   assert.match(html, /Reveal the actual middleware rule/);
   assert.match(html, /example\.fable-overload-to-sol/);
@@ -47,6 +64,7 @@ test("built HTML has a useful static fallback and accessible controls", async ()
 test("analytics schema exposes the full privacy-safe funnel", () => {
   assert.deepEqual(Object.keys(ANALYTICS_SCHEMA).sort(), [
     "cliproxyapi_docs_opened",
+    "demo_action_clicked",
     "demo_completed",
     "demo_started",
     "download_clicked",
@@ -70,6 +88,14 @@ test("analytics schema exposes the full privacy-safe funnel", () => {
     entry_point: "play_control"
   });
   assert.equal(sanitizeProperties("not_declared", { anything: "no" }), null);
+  assert.deepEqual(sanitizeProperties("demo_action_clicked", {
+    demo_id: "ask-another-model",
+    action: "resume_docs",
+    url: "https://example.test/private"
+  }), {
+    demo_id: "ask-another-model",
+    action: "resume_docs"
+  });
 });
 
 test("analytics transport honors browser privacy signals", async () => {
@@ -104,4 +130,12 @@ test("motion and mobile fallbacks are explicit", async () => {
   const css = await readFile(path.join(siteRoot, "src/styles.css"), "utf8");
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(css, /@media \(max-width: 760px\)/);
+});
+
+test("each walkthrough has isolated controls and completion analytics", async () => {
+  const source = await readFile(path.join(siteRoot, "src/app.js"), "utf8");
+  assert.match(source, /querySelectorAll\("\[data-demo\]"\)\.forEach\(setupDemo\)/);
+  assert.match(source, /demo\.querySelectorAll\("\[data-demo-step\]"\)/);
+  assert.match(source, /captureEvent\("demo_completed"/);
+  assert.match(source, /captureEvent\("demo_action_clicked"/);
 });

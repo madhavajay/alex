@@ -81,6 +81,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
 button:disabled { cursor: default; opacity: .7; }
 
 .demo-wrap { padding-block: 2rem 5rem; }
+.walkthrough-intro { max-width: 760px; margin-bottom: 1.4rem; }
+.walkthrough-intro h2 { margin: .35rem 0; font-size: clamp(1.8rem, 5vw, 3.3rem); }
+.walkthrough-intro p { margin: 0; color: var(--muted); }
 .demo-card, .cta-card, .provider-card {
   border: 1px solid var(--line);
   border-radius: 1.25rem;
@@ -88,6 +91,7 @@ button:disabled { cursor: default; opacity: .7; }
   box-shadow: 0 30px 90px rgba(0, 0, 0, .25);
 }
 .demo-card { overflow: hidden; }
+.demo-card + .demo-card { margin-top: 1.5rem; }
 .demo-head { display: grid; grid-template-columns: 1fr auto; gap: 1.25rem; align-items: end; padding: clamp(1.2rem, 3vw, 2rem); border-bottom: 1px solid var(--line); }
 .demo-head h2 { margin: .2rem 0; font-size: clamp(1.5rem, 4vw, 2.35rem); }
 .demo-head p { margin: 0; color: var(--muted); }
@@ -122,6 +126,8 @@ details.rule { border-top: 1px solid var(--line); padding: 1.2rem clamp(1.2rem, 
 details.rule summary { cursor: pointer; font-weight: 750; }
 details.rule p { color: var(--muted); }
 pre { max-height: 30rem; overflow: auto; padding: 1rem; border: 1px solid var(--line); border-radius: .8rem; background: #050810; color: #cde6ff; font: .82rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.demo-next { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.2rem clamp(1.2rem, 3vw, 2rem); border-top: 1px solid var(--line); background: rgba(4, 8, 16, .28); }
+.demo-next span { color: var(--muted); }
 
 .privacy-note { margin: 1rem 0 0; color: var(--muted); font-size: .86rem; }
 .privacy-note strong { color: var(--ink); }
@@ -148,6 +154,7 @@ footer { padding: 1.5rem 0 3rem; border-top: 1px solid var(--line); color: var(-
   .demo-controls { width: 100%; }
   .demo-controls button { flex: 1; }
   .install-command { flex-direction: column; }
+  .demo-next { align-items: stretch; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {

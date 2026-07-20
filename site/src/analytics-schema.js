@@ -10,6 +10,7 @@ export const ANALYTICS_SCHEMA = Object.freeze({
   ],
   demo_started: ["demo_id", "entry_point"],
   demo_completed: ["demo_id", "steps_count"],
+  demo_action_clicked: ["demo_id", "action"],
   rule_revealed: ["demo_id", "rule_id"],
   install_copied: ["surface"],
   download_clicked: ["platform", "surface"],

@@ -31,7 +31,49 @@
       </div>
     </section>
 
-    <section id="demo" class="demo-wrap shell" aria-labelledby="demo-title">
+    <section id="demo" class="demo-wrap shell" aria-labelledby="walkthroughs-title">
+      <div class="walkthrough-intro">
+        <div class="eyebrow">Three source-checked walkthroughs</div>
+        <h2 id="walkthroughs-title">Route it. Rescue it. Ask again.</h2>
+        <p>Each replay is synthetic, contains no visitor data, and is checked against the implementation during the site build.</p>
+      </div>
+
+      <article class="demo-card" data-demo="use-it-anywhere">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Use it anywhere</div>
+            <h2>Your Claude subscription. The harness you prefer.</h2>
+            <p>Connect once, then use Opus from Pi while Alex preserves the real route.</p>
+          </div>
+          <div class="demo-controls" aria-label="Use it anywhere walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="5" aria-label="Use it anywhere walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            <!-- BUILD:USE_ANYWHERE_STEPS -->
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting cross-harness trace summary">
+            <h3>Trace proof</h3>
+            <div class="trace-row"><span>Harness</span><strong>Pi</strong></div>
+            <div class="trace-row"><span>Requested</span><strong>alex/claude-opus-4-8</strong></div>
+            <div class="trace-row"><span>Provider</span><strong>Anthropic subscription</strong></div>
+            <div class="trace-row"><span>Path</span><strong>Dario</strong></div>
+            <div class="trace-row"><span>Result</span><strong class="status-good">Opus 4.8 · 200</strong></div>
+            <p class="privacy-note"><strong>No credential is shown.</strong> The trace keeps a local account identity, not its OAuth token.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <div class="demo-next">
+          <span>Try this route locally.</span>
+          <a class="button primary" data-demo-action="use_anywhere_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/harnesses.md">Connect a harness</a>
+        </div>
+      </article>
+
       <article class="demo-card" data-demo="fable-to-sol-overload">
         <div class="demo-head">
           <div>
@@ -71,6 +113,46 @@
         <noscript>
           <p class="privacy-note" style="padding: 0 2rem 1rem"><strong>JavaScript is off.</strong> Every routing step and the complete rule remain available above; only automatic playback and anonymous engagement measurement are disabled.</p>
         </noscript>
+        <div class="demo-next">
+          <span>Install the built-in preset and replay its fixture.</span>
+          <a class="button primary" data-demo-action="middleware_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/middleware.md">Open middleware docs</a>
+        </div>
+      </article>
+
+      <article class="demo-card" data-demo="ask-another-model">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Ask a second model</div>
+            <h2>Keep the first answer. Ask for another opinion.</h2>
+            <p>Fork the captured session into Pi and Sol without losing which model produced which answer.</p>
+          </div>
+          <div class="demo-controls" aria-label="Ask another model walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="5" aria-label="Ask another model walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            <!-- BUILD:ASK_ANOTHER_STEPS -->
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting oracle lineage summary">
+            <h3>Lineage proof</h3>
+            <div class="trace-row"><span>First answer</span><strong>Claude · Opus 4.8</strong></div>
+            <div class="trace-row"><span>Fork action</span><strong>alex resume</strong></div>
+            <div class="trace-row"><span>Second answer</span><strong>Pi · Sol 5.6</strong></div>
+            <div class="trace-row"><span>Source</span><strong>session-42 · Claude</strong></div>
+            <div class="trace-row"><span>Provenance</span><strong class="status-good">both retained</strong></div>
+            <p class="privacy-note"><strong>This is synthetic.</strong> It mirrors Alex's durable cross-harness fork record and transcript-order tests.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <div class="demo-next">
+          <span>Fork a real captured session into another harness.</span>
+          <a class="button primary" data-demo-action="resume_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/cli.md">Read session-fork docs</a>
+        </div>
       </article>
     </section>
 
