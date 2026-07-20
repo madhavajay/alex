@@ -69,7 +69,7 @@ struct OnboardingSupportTests {
         #expect(OnboardingSupport.testCommand(harness: "kimi", model: "alex/kimi-k2") ==
             "kimi -m alex/kimi-k2 -p \"test\"")
         #expect(OnboardingSupport.testCommand(harness: "codex", model: "alex/gpt-5") ==
-            "codex --profile alex exec \"test\"")
+            "codex --profile alex exec --skip-git-repo-check -m alex/gpt-5 \"test\"")
     }
 
     @Test func environmentUsesLiveDaemonBaseURL() {

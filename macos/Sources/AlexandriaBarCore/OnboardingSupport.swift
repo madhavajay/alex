@@ -164,7 +164,8 @@ public enum OnboardingSupport {
         case "claude":
             "claude --settings ~/.claude/alexandria-settings.json -p \"test\" --model \(model)"
         case "kimi": "kimi -m \(model) -p \"test\""
-        case "codex": "codex --profile alex exec \"test\""
+        case "codex":
+            "codex --profile alex exec --skip-git-repo-check -m \(model) \"test\""
         case "pi": "pi --model \(model) -p \"test\""
         case let name?: "\(name) -m \(model) -p \"test\""
         case nil: "<your harness> --model \(model)"

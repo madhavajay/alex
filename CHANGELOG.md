@@ -7,6 +7,21 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29-beta.7] - 2026-07-20
+
+### Fixed
+- **Resumed onboarding no longer forces an existing provider account.** Picking
+  a provider with connected subscriptions now presents every existing account
+  alongside **Add another account**. Codex uses automatic upstream identity;
+  providers with local account names ask for a distinct nickname before OAuth.
+- **A completed harness can be changed during onboarding.** The collapsed
+  harness stage now exposes **Change harness**, which clears its plan and stale
+  test/trace state without discarding the selected provider.
+- **The Codex onboarding smoke command works outside Git repositories.** The
+  copied command includes `--skip-git-repo-check` and the selected `alex/*`
+  model, so running it from `/tmp` reaches Alex instead of failing Codex's local
+  workspace trust check.
+
 ## [0.1.29-beta.6] - 2026-07-20
 
 ### Fixed

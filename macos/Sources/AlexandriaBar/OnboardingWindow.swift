@@ -35,6 +35,10 @@ final class OnboardingModel {
 
     var step = 0
     var selectedProvider: String?
+    var selectedProviderAccountID: String?
+    var addingProviderAccount = false
+    var newProviderAccountName = ""
+    var newProviderAccountNameError: String?
     var selectedHarness: String?
     var authModel: AuthFlowModel?
     var providerState: OperationState = .idle
@@ -97,29 +101,106 @@ final class OnboardingModel {
         resetProviderDependentState()
         selectedProvider = provider
         exampleModel = OnboardingSupport.exampleModel(for: provider)
-        if let account = store.accounts.last(where: { $0.provider == provider }) {
-            authModel = nil
-            providerState = .working(
-                provider == "anthropic" ? "Preparing Claude routing…" : "Using connected account…")
-            Task { await completeProviderSelection(provider, account: account) }
+        providerState = .idle
+        if !accounts(for: provider).isEmpty {
+            // Resuming onboarding must not silently pick an arbitrary account.
+            // Let the user choose an existing subscription or deliberately add
+            // another one.
             return
         }
+        addProviderAccount()
+    }
+
+    func accounts(for provider: String) -> [Account] {
+        store.accounts.filter { $0.provider == provider }.sorted {
+            accountDisplayName($0).localizedCaseInsensitiveCompare(accountDisplayName($1))
+                == .orderedAscending
+        }
+    }
+
+    func accountDisplayName(_ account: Account) -> String {
+        account.email ?? account.label ?? account.name
+    }
+
+    func accountDisplayDetail(_ account: Account) -> String {
+        if accountDisplayName(account) != account.name { return account.name }
+        return account.kind == "oauth" ? "Connected subscription" : account.kind
+    }
+
+    func useExistingProviderAccount(_ account: Account) {
+        guard selectedProvider == account.provider else { return }
+        authModel?.cancel()
+        authModel = nil
+        addingProviderAccount = false
+        newProviderAccountName = ""
+        newProviderAccountNameError = nil
+        selectedProviderAccountID = account.id
+        providerState = .working(
+            account.provider == "anthropic"
+                ? "Preparing Claude routing…" : "Using connected account…")
+        Task { await completeProviderSelection(account.provider, account: account) }
+    }
+
+    func addProviderAccount() {
+        guard let provider = selectedProvider else { return }
+        authModel?.cancel()
+        authModel = nil
+        selectedProviderAccountID = nil
+        providerState = .idle
         if provider == "openrouter" || provider == "exo" {
-            authModel = nil
             let name = ProviderInfo.displayName(provider)
             providerState = .failure(
                 "\(name) is configured in Settings → Providers. Finish setup there, then skip this step to continue.")
             openProviderSettings()
             return
         }
+
+        // Codex can derive a stable local identity from the upstream account.
+        // Other providers need a distinct local nickname once `default`
+        // already exists, so ask before beginning OAuth instead of replacing it.
+        if provider != "openai", !accounts(for: provider).isEmpty {
+            addingProviderAccount = true
+            newProviderAccountName = ""
+            newProviderAccountNameError = nil
+            return
+        }
+        beginProviderAuthorization(provider: provider, accountName: nil)
+    }
+
+    func confirmAddProviderAccount() {
+        guard let provider = selectedProvider else { return }
+        let name = newProviderAccountName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.range(of: #"^[a-z0-9_-]{1,32}$"#, options: .regularExpression) != nil else {
+            newProviderAccountNameError = "Use 1–32 lowercase letters, numbers, dashes, or underscores."
+            return
+        }
+        guard !accounts(for: provider).contains(where: { $0.name == name }) else {
+            newProviderAccountNameError = "That local account name is already in use."
+            return
+        }
+        addingProviderAccount = false
+        newProviderAccountNameError = nil
+        beginProviderAuthorization(provider: provider, accountName: name)
+    }
+
+    private func beginProviderAuthorization(provider: String, accountName: String?) {
         providerState = .working("Starting secure authorization…")
         let auth = AuthFlowModel(
-            provider: provider, accountName: nil, autoIdentity: provider == "openai", store: store)
+            provider: provider, accountName: accountName,
+            autoIdentity: provider == "openai", store: store)
         auth.onAuthenticated = { [weak self] authenticatedProvider in
             guard let self, self.selectedProvider == authenticatedProvider else { return }
             Task {
                 await self.refreshStore()
-                let account = self.store.accounts.last { $0.provider == authenticatedProvider }
+                let authenticatedID = self.authModel?.session?.accountId
+                let account = authenticatedID.flatMap { id in
+                    self.store.accounts.first { $0.id == id }
+                } ?? accountName.flatMap { name in
+                    self.store.accounts.first {
+                        $0.provider == authenticatedProvider && $0.name == name
+                    }
+                } ?? self.store.accounts.last { $0.provider == authenticatedProvider }
+                self.selectedProviderAccountID = account?.id
                 await self.completeProviderSelection(authenticatedProvider, account: account)
             }
         }
@@ -130,6 +211,10 @@ final class OnboardingModel {
 
     private func resetProviderDependentState() {
         pollTask?.cancel()
+        selectedProviderAccountID = nil
+        addingProviderAccount = false
+        newProviderAccountName = ""
+        newProviderAccountNameError = nil
         traceState = .idle
         traceCheckRunning = false
         discoveredTrace = nil
@@ -176,7 +261,10 @@ final class OnboardingModel {
                 return
             }
         }
-        let refreshedAccount = store.accounts.last { $0.provider == provider } ?? account
+        let refreshedAccount = account.flatMap { selected in
+            store.accounts.first { $0.id == selected.id }
+        } ?? account ?? store.accounts.last { $0.provider == provider }
+        selectedProviderAccountID = refreshedAccount?.id
         providerState = .success(accountIdentity(refreshedAccount, provider: provider))
     }
 
@@ -187,7 +275,12 @@ final class OnboardingModel {
         harnessState = .idle
         connectedModelsCount = 0
         traceState = .idle
+        traceCheckRunning = false
         discoveredTrace = nil
+        traceEnteredMs = nil
+        lastRejectedSessionId = nil
+        troubleshootExpanded = false
+        checks = []
         harnessPlanState = .working("Previewing changes…")
         guard let config = store.config else {
             harnessPlanState = .failure("The Alex daemon configuration is not available.")
@@ -204,6 +297,25 @@ final class OnboardingModel {
                 harnessPlanState = .failure(error.localizedDescription)
             }
         }
+    }
+
+    func changeHarness() {
+        pollTask?.cancel()
+        selectedHarness = nil
+        harnessPlan = []
+        harnessPlanState = .idle
+        harnessState = .idle
+        connectedModelsCount = 0
+        exampleModelLoading = false
+        exampleModel = OnboardingSupport.exampleModel(for: selectedProvider)
+        traceState = .idle
+        traceCheckRunning = false
+        discoveredTrace = nil
+        traceEnteredMs = nil
+        lastRejectedSessionId = nil
+        troubleshootExpanded = false
+        checks = []
+        checksRunning = false
     }
 
     func connectSelectedHarness() {
@@ -572,9 +684,12 @@ struct OnboardingView: View {
             intro("Connect a real provider", "Choose a provider and complete its secure authentication here. You can skip for now at any point.")
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                 ForEach(ProviderInfo.supportedProviders, id: \.self) { provider in
+                    let connectedCount = model.accounts(for: provider).count
                     choiceButton(
                         title: ProviderInfo.displayName(provider),
-                        subtitle: provider == model.selectedProvider ? "Selected" : "Connect",
+                        subtitle: provider == model.selectedProvider
+                            ? "Selected"
+                            : (connectedCount > 0 ? "\(connectedCount) connected" : "Connect"),
                         icon: ProviderInfo.loginArg(provider), selected: provider == model.selectedProvider
                     ) { model.chooseProvider(provider) }
                 }
@@ -583,10 +698,93 @@ struct OnboardingView: View {
                 AuthFlowView(model: authModel, close: {}, embedded: true)
                     .padding(.top, 4)
                     .cardStyle()
+            } else if let provider = model.selectedProvider,
+                      !model.accounts(for: provider).isEmpty
+            {
+                providerAccountChooser(provider)
+                operation(model.providerState)
             } else {
                 operation(model.providerState)
             }
         }
+    }
+
+    private func providerAccountChooser(_ provider: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Choose an existing account or add a new one")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            ForEach(model.accounts(for: provider)) { account in
+                Button { model.useExistingProviderAccount(account) } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "person.crop.circle")
+                            .font(.system(size: 18))
+                            .foregroundStyle(AlexTheme.Colors.primary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.accountDisplayName(account))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(AlexTheme.Colors.foreground)
+                            Text(model.accountDisplayDetail(account))
+                                .font(AlexTheme.Fonts.metaLabel)
+                                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        }
+                        Spacer()
+                        if model.selectedProviderAccountID == account.id {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(AlexTheme.Colors.success)
+                        } else {
+                            Text("Use")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(AlexTheme.Colors.primary)
+                        }
+                    }
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                            .fill(AlexTheme.Colors.overlay(0.035)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                            .strokeBorder(
+                                model.selectedProviderAccountID == account.id
+                                    ? AlexTheme.Colors.success.opacity(0.4)
+                                    : AlexTheme.Colors.cardBorder))
+                }
+                .buttonStyle(.plain)
+            }
+
+            if model.addingProviderAccount {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Local nickname for the new account")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                    HStack(spacing: 8) {
+                        TextField("work", text: $model.newProviderAccountName)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { model.confirmAddProviderAccount() }
+                        PillButton(
+                            title: "Continue", variant: .solidAccent,
+                            isEnabled: !model.newProviderAccountName.isEmpty
+                        ) { model.confirmAddProviderAccount() }
+                    }
+                    if let error = model.newProviderAccountNameError {
+                        Text(error)
+                            .font(.system(size: 11))
+                            .foregroundStyle(AlexTheme.Colors.destructive)
+                    }
+                }
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: AlexTheme.Radius.sm)
+                        .fill(AlexTheme.Colors.overlay(0.035)))
+            } else {
+                PillButton(
+                    title: "Add another \(ProviderInfo.displayName(provider)) account",
+                    variant: .bordered, systemImage: "plus"
+                ) { model.addProviderAccount() }
+            }
+        }
+        .padding(12)
+        .cardStyle()
     }
 
     private var stagedConnect: some View {
@@ -600,7 +798,8 @@ struct OnboardingView: View {
 
     private var stageOne: some View {
         stageCard(number: 1, title: "Pick your harness", completed: model.harnessState.isSuccess,
-                  summary: model.harnessState.message) {
+                  summary: model.harnessState.message,
+                  completedActionTitle: "Change harness", completedAction: model.changeHarness) {
             if model.connectableHarnesses.isEmpty {
                 statusCard(icon: "terminal", tint: AlexTheme.Colors.warningOrange,
                            text: "No installed, connectable harnesses were detected. You can skip this page and continue.")
@@ -920,6 +1119,7 @@ struct OnboardingView: View {
 
     private func stageCard<Content: View>(
         number: Int, title: String, completed: Bool, summary: String?, locked: Bool = false,
+        completedActionTitle: String? = nil, completedAction: (() -> Void)? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -927,10 +1127,18 @@ struct OnboardingView: View {
                 Image(systemName: completed ? "checkmark.circle.fill" : (locked ? "lock.fill" : "\(number).circle.fill"))
                     .foregroundStyle(completed ? AlexTheme.Colors.success : (locked ? AlexTheme.Colors.textFaintest : AlexTheme.Colors.primary))
                 Text(title).font(.system(size: 14, weight: .semibold))
-                if completed, let summary {
+                if completed {
                     Spacer()
-                    Text(summary).font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(AlexTheme.Colors.success)
+                    if let summary {
+                        Text(summary).font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(AlexTheme.Colors.success)
+                    }
+                    if let completedActionTitle, let completedAction {
+                        PillButton(
+                            title: completedActionTitle, variant: .bordered,
+                            systemImage: "arrow.triangle.2.circlepath"
+                        ) { completedAction() }
+                    }
                 }
             }
             if !completed && !locked { content() }
