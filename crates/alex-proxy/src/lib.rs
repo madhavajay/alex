@@ -6394,7 +6394,7 @@ async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         Ok(tools) => tools.into_iter().map(expanded_turn_tool).collect::<Vec<_>>(),
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let mut turn = transcript_turn(&row);
+    let mut turn = transcript_turn(&state.store, &row);
     turn["executed_tools"] = json!(tools);
     axum::Json(json!({"turn": turn})).into_response()
 }
@@ -16821,7 +16821,11 @@ mod tests {
         let state = test_state("large-transcript-page-boundaries");
         let body_root = state.store.data_dir.join("bodies");
         let session_id = "large-lazy-session";
-        let mut selected_paths = Vec::new();
+        // Request/response bodies are migrated to LAR by the combined V1
+        // store, so their exact reads are proven by the expanded content
+        // assertions below. Tool bodies remain legacy gzip files and give us
+        // a file-level observer for the selected-vs-unrelated boundary.
+        let mut selected_legacy_paths = Vec::new();
         let mut unrelated_paths = Vec::new();
 
         for index in 0..125 {
@@ -16844,9 +16848,7 @@ mod tests {
                         .as_bytes(),
                 )
                 .unwrap();
-            if index == 0 {
-                selected_paths.extend([request_path.clone(), response_path.clone()]);
-            } else if index == 1 {
+            if index == 1 {
                 unrelated_paths.extend([request_path.clone(), response_path.clone()]);
             }
             state
@@ -16880,7 +16882,7 @@ mod tests {
                 .write_body(&id, "result.txt", format!("result {index}").as_bytes())
                 .unwrap();
             if index == 0 {
-                selected_paths.extend([arguments_path.clone(), result_path.clone()]);
+                selected_legacy_paths.extend([arguments_path.clone(), result_path.clone()]);
             } else {
                 unrelated_paths.extend([arguments_path.clone(), result_path.clone()]);
             }
@@ -16977,8 +16979,8 @@ mod tests {
 
         let mut reads = test_body_file_reads_under(&body_root);
         reads.sort();
-        selected_paths.sort();
-        assert_eq!(reads, selected_paths);
+        selected_legacy_paths.sort();
+        assert_eq!(reads, selected_legacy_paths);
         assert!(unrelated_paths.iter().all(|path| !reads.contains(path)));
     }
 
