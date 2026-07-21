@@ -70,8 +70,12 @@ a tag or changes the source worktree.
   `29794145323`).
 - [x] macOS Rust, Swift, and app-bundle CI are green on the release candidate
   (PR run `29794145323`).
-- [ ] Run clean-machine install/start/connect/route/trace/restart smoke tests on
-  macOS, Ubuntu x86-64, and Windows 11 x86-64.
+- [x] macOS packaged clean-machine smoke installs the app and CLI, manages the
+  real launchd service, routes through a loopback provider, persists trace
+  `ab299c6d-fee4-4f48-b332-d85ee6a76960`, replaces daemon PID `1692` with
+  `1921`, and reads the same trace after restart (PR run `29796666004`).
+- [ ] Run the equivalent packaged smoke on Ubuntu x86-64.
+- [ ] Run the equivalent packaged smoke manually on Windows 11 x86-64.
 
 ## Fable to Sol middleware preset
 
