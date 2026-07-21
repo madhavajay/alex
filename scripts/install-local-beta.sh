@@ -112,8 +112,17 @@ fi
 
 CLI_VERSION="$($PREFIX/alex --version)"
 APP_VERSION="$(defaults read "$HOME/Applications/Alex.app/Contents/Info" CFBundleShortVersionString)"
-if [[ "$CLI_VERSION" != *"$VERSION"* || "$APP_VERSION" != "$VERSION" ]]; then
-  echo "installed version mismatch: cli='$CLI_VERSION' app='$APP_VERSION'" >&2
+PORT=4100
+CONFIG="$HOME/.alexandria/config.toml"
+if [[ -f "$CONFIG" ]]; then
+  CONFIG_PORT="$(sed -n 's/^port *= *\([0-9]*\)/\1/p' "$CONFIG" | head -1)"
+  PORT="${CONFIG_PORT:-4100}"
+fi
+DAEMON_VERSION="$(curl -fsS --max-time 15 "http://127.0.0.1:$PORT/health" \
+  | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+if [[ "$CLI_VERSION" != *"$VERSION"* || "$APP_VERSION" != "$VERSION" \
+    || "$DAEMON_VERSION" != "$VERSION" ]]; then
+  echo "installed version mismatch: cli='$CLI_VERSION' app='$APP_VERSION' daemon='$DAEMON_VERSION'" >&2
   exit 1
 fi
 
@@ -122,4 +131,3 @@ echo "◆ installed local Alex $VERSION"
 echo "  commit: $COMMIT"
 echo "  cli:    $PREFIX/alex"
 echo "  app:    $HOME/Applications/Alex.app"
-

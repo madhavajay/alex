@@ -9511,6 +9511,10 @@ impl SystemLaunchctl {
     fn bootstrap(&mut self, plist: &Path) -> Result<()> {
         self.run("bootstrap", plist)
     }
+
+    fn bootout(&mut self, plist: &Path) -> Result<()> {
+        self.run("bootout", plist)
+    }
 }
 
 fn launchd_plist_path() -> Result<PathBuf> {
@@ -9770,14 +9774,17 @@ fn service_install(config: &Config) -> Result<()> {
         )?;
         std::fs::write(&dst, plist)?;
         if loaded {
-            eprintln!("launchd plist updated; run `alex service restart` to load it.");
-            anyhow::bail!("launchd service plist updated but not yet loaded (exit 1)");
+            launchctl.bootout(&dst)?;
         }
         launchctl.bootstrap(&dst)?;
         println!(
             "{} {}",
             ui::gold(ui::diamond()),
-            ui::bold("launchd service installed and started")
+            ui::bold(if loaded {
+                "launchd service updated and restarted"
+            } else {
+                "launchd service installed and started"
+            })
         );
         println!("  {}", ui::dim(&dst.to_string_lossy()));
     } else if cfg!(target_os = "linux") {

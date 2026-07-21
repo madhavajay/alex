@@ -111,9 +111,24 @@ PLIST_LABEL=com.alexandria.daemon
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 
 SYSTEMD_UNIT="$HOME/.config/systemd/user/alexandria.service"
+SERVICE_RELOADED=0
 
 if [ "$SERVICE" = "1" ]; then
   "$BIN" service install
+fi
+
+# An upgrade may install to a different prefix than the currently loaded
+# service (for example Homebrew on PATH while an older plist still points at
+# ~/.local/bin). Restarting launchd without rewriting that plist would keep
+# serving the old binary indefinitely.
+if [ "$UPGRADE" = "1" ] && [ "$(uname)" = "Darwin" ] \
+    && launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
+  CURRENT_SERVICE_BIN=$(plutil -extract ProgramArguments.0 raw -o - "$PLIST_DST" 2>/dev/null || true)
+  if [ -n "$CURRENT_SERVICE_BIN" ] && [ "$CURRENT_SERVICE_BIN" != "$BIN" ]; then
+    say "◆ launchd points at $CURRENT_SERVICE_BIN; reloading it with $BIN"
+    "$BIN" service install
+    SERVICE_RELOADED=1
+  fi
 fi
 
 if [ "$UPGRADE" = "1" ]; then
@@ -136,9 +151,13 @@ if [ "$UPGRADE" = "1" ]; then
     nohup "$BIN" daemon >> "$HOME/.alexandria/daemon.log" 2>&1 &
     NEW_PID=$!
   elif [ "$(uname)" = "Darwin" ] && launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
-    echo "daemon is launchd-managed: using kickstart (drain happens before restart;"
-    echo "expect a short accept gap while the old instance drains)"
-    launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
+    if [ "$SERVICE_RELOADED" = "1" ]; then
+      echo "daemon is launchd-managed and was already reloaded with the installed binary"
+    else
+      echo "daemon is launchd-managed: using kickstart (drain happens before restart;"
+      echo "expect a short accept gap while the old instance drains)"
+      launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
+    fi
     NEW_PID=""
   elif [ "$(uname)" = "Linux" ] && command -v systemctl >/dev/null \
       && systemctl --user is-active alexandria >/dev/null 2>&1; then
