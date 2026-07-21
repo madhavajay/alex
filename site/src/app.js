@@ -3,6 +3,17 @@ import { captureEvent, preserveCampaignParameters } from "./analytics.js";
 document.documentElement.classList.add("js-ready");
 
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const routeInterest = { provider: null, harness: null };
+
+function recordRouteInterest() {
+  const status = document.querySelector("[data-route-interest]");
+  if (!routeInterest.provider || !routeInterest.harness) {
+    if (status) status.textContent = "Pick a provider and harness to see the route you are interested in.";
+    return;
+  }
+  if (status) status.textContent = `${routeInterest.provider} → Alex → ${routeInterest.harness}`;
+  captureEvent("route_interest_selected", routeInterest);
+}
 
 function setupDemo(demo) {
   const steps = [...demo.querySelectorAll("[data-demo-step]")];
@@ -138,6 +149,18 @@ for (const button of document.querySelectorAll("[data-provider]")) {
       provider: button.dataset.provider,
       surface: "provider_interest"
     });
+    routeInterest.provider = button.dataset.provider;
+    recordRouteInterest();
+  });
+}
+
+for (const button of document.querySelectorAll("[data-harness]")) {
+  button.addEventListener("click", () => {
+    document.querySelectorAll("[data-harness]").forEach((item) => {
+      item.setAttribute("aria-pressed", String(item === button));
+    });
+    routeInterest.harness = button.dataset.harness;
+    recordRouteInterest();
   });
 }
 

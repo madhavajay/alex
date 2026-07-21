@@ -51,6 +51,7 @@ test("built HTML has a useful static fallback and accessible controls", async ()
   assert.equal((html.match(/data-demo-step/g) ?? []).length, 16);
   assert.equal((html.match(/data-action="start"/g) ?? []).length, 3);
   assert.equal((html.match(/data-demo-action=/g) ?? []).length, 3);
+  assert.equal((html.match(/data-harness=/g) ?? []).length, 4);
   assert.match(html, /Play the whole route, pause it/);
   assert.match(html, /Your Claude subscription\. The harness you prefer/);
   assert.match(html, /Keep the first answer\. Ask for another opinion/);
@@ -71,6 +72,7 @@ test("analytics schema exposes the full privacy-safe funnel", () => {
     "install_copied",
     "page_view",
     "provider_selected",
+    "route_interest_selected",
     "rule_revealed"
   ]);
 
@@ -95,6 +97,14 @@ test("analytics schema exposes the full privacy-safe funnel", () => {
   }), {
     demo_id: "ask-another-model",
     action: "resume_docs"
+  });
+  assert.deepEqual(sanitizeProperties("route_interest_selected", {
+    provider: "cliproxyapi",
+    harness: "pi",
+    credential: "secret"
+  }), {
+    provider: "cliproxyapi",
+    harness: "pi"
   });
 });
 

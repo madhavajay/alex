@@ -15,6 +15,7 @@ export const ANALYTICS_SCHEMA = Object.freeze({
   install_copied: ["surface"],
   download_clicked: ["platform", "surface"],
   provider_selected: ["provider", "surface"],
+  route_interest_selected: ["provider", "harness"],
   cliproxyapi_docs_opened: ["surface"]
 });
 
