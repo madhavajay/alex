@@ -65,11 +65,11 @@ a tag or changes the source worktree.
 - [x] Windows Task Scheduler service support is implemented and is a required
   CI gate.
 - [x] Linux Rust/service/web CI is green on the release candidate (PR run
-  `29798681461`).
+  `29800336043`).
 - [x] Windows Rust/service/web CI is green on the release candidate (PR run
-  `29798681461`).
+  `29800336043`).
 - [x] macOS Rust, Swift, and app-bundle CI are green on the release candidate
-  (PR run `29798681461`).
+  (PR run `29800336043`).
 - [x] macOS packaged clean-machine smoke installs the app and CLI, manages the
   real launchd service, routes through a loopback provider, persists trace
   `ab299c6d-fee4-4f48-b332-d85ee6a76960`, replaces daemon PID `1692` with
@@ -137,26 +137,30 @@ a tag or changes the source worktree.
   Claude Code may route directly (routing regression tests plus live beta.12
   Pi → `alex/claude-opus-4-8` trace
   `e780d4cc-884a-4473-a4eb-9a678f0f1691`, `via_dario: true`).
-- [ ] Verify fresh installs create missing daemon/harness configuration files
-  instead of blocking onboarding.
+- [x] Fresh daemon and harness configuration paths are created with private
+  permissions instead of blocking onboarding (Rust/Swift first-run regression
+  tests plus the clean Ubuntu package install in PR run `29800336043`).
 - [ ] Build, install, and record the final `0.1.29-beta.N` candidate.
 - [ ] Complete the full clean-user launch story on every supported platform.
 - [x] Gate Linux pull requests with local release-format A → B → A packages,
-  managed-service replacement, and state/trace preservation evidence.
+  managed-service replacement, and state/trace preservation evidence (PR run
+  `29800336043`: PIDs `212` → `317` → `420`; base trace
+  `e9ee9d15-53dd-43a1-8f0d-c859bca89007` and candidate trace
+  `08b53fbc-be72-44a4-9c4f-d7fff62a5af0` survived rollback).
 - [ ] Stamp `0.1.29`, generate signed/notarized release assets, publish stable
   update metadata, and verify upgrade/rollback using the actual previous stable
   and signed candidate packages on every supported platform.
 
 ## Current checkpoint
 
-- Installed checkpoint: `0.1.29-beta.13` at `193ea40` (CLI, Alex.app,
-  launchd service path, single listener, daemon health, Dario, and
+- Installed checkpoint: `0.1.29-beta.14` at `9cef51b` (CLI, Alex.app,
+  launchd service path, running app, daemon health, Dario, and
   `/v1/models` owner metadata verified; this is not yet the final release
   candidate).
 - Branch: `v1/integration`
 - Draft PR: <https://github.com/madhavajay/alex/pull/26>
-- Combined local gates: Rust workspace and all targets pass; Swift passes 298
-  Swift Testing + 14 XCTest cases; site passes 7 tests and deterministic build;
+- Combined local gates: Rust workspace and all targets pass; Swift passes 306
+  Swift Testing + 14 XCTest cases; site passes 10 tests and deterministic build;
   pinned CLIProxyAPI Docker matrix passes both directions.
 - Local browser visual automation was unavailable in the current environment;
   visual checks remain intentionally open rather than inferred from markup.
