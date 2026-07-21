@@ -408,6 +408,12 @@ fn routing_binding_reset(account: &Account, now_s: i64) -> Option<i64> {
     routing_reset_selection(account, now_s)?["resets_at_s"].as_i64()
 }
 
+fn routing_binding_used_basis_points(account: &Account, now_s: i64) -> Option<u32> {
+    routing_reset_selection(account, now_s)?["used_pct"]
+        .as_f64()
+        .map(|used| (used.clamp(0.0, 100.0) * 100.0).round() as u32)
+}
+
 fn account_proxy_eligible(account: &Account, policy: &AccountPolicy) -> bool {
     !policy
         .disabled
@@ -465,6 +471,22 @@ fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oa
                 )
             });
         }
+        AccountPolicyMode::HighestQuota => {
+            accounts.sort_by_key(|a| {
+                (
+                    oauth_rank(a, prefer_oauth),
+                    routing_reserve_blocked(a, routing_reserve_pct(a, policy), now_s),
+                    // The quota APIs expose percentages rather than absolute
+                    // plan allowances. Lowest usage in the binding (most
+                    // consumed) active window therefore means the greatest
+                    // reliably observable remaining quota.
+                    routing_binding_used_basis_points(a, now_s).unwrap_or(u32::MAX),
+                    policy_rank(policy, &a.name),
+                    a.name.clone(),
+                    a.id.clone(),
+                )
+            });
+        }
     }
 }
 
@@ -490,6 +512,7 @@ pub enum AccountPolicyMode {
     RoundRobin,
     Threshold,
     ResetFirst,
+    HighestQuota,
 }
 
 impl Default for AccountPolicyMode {
@@ -3494,6 +3517,41 @@ mod tests {
                 .unwrap()
                 .name,
             "later"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn highest_quota_prefers_lowest_binding_usage() {
+        let dir = temp_dir("highest-quota");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let now_s = now_ms() / 1000;
+        let mut fuller = api_key_account("openai-api_key-fuller", Provider::Openai);
+        fuller.name = "fuller".into();
+        fuller.account_meta = codex_limits(70.0, now_s + 600);
+        let mut emptier = api_key_account("openai-api_key-emptier", Provider::Openai);
+        emptier.name = "emptier".into();
+        emptier.account_meta = codex_limits(25.0, now_s + 3600);
+        vault.upsert(fuller).await.unwrap();
+        vault.upsert(emptier).await.unwrap();
+        vault
+            .set_policies(vec![(
+                Provider::Openai,
+                AccountPolicy {
+                    mode: AccountPolicyMode::HighestQuota,
+                    reserve_pct: Some(10),
+                    ..AccountPolicy::default()
+                },
+            )])
+            .await;
+
+        assert_eq!(
+            vault
+                .account_for(Provider::Openai, false)
+                .await
+                .unwrap()
+                .name,
+            "emptier"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

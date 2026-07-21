@@ -732,15 +732,71 @@ impl From<CodexDevicePoll> for DeviceFlowPoll<(String, String)> {
 }
 
 pub async fn codex_device_start(client: &reqwest::Client) -> Result<CodexDeviceStart> {
-    let response = client
-        .post(OPENAI_DEVICE_USER_CODE_URL)
-        .json(&json!({"client_id": OPENAI_CLIENT_ID}))
-        .send()
-        .await?;
-    let status = response.status();
-    let raw: Value = response.json().await?;
-    if !status.is_success() {
-        bail!("Codex device login could not start ({status})");
+    // Cloudflare occasionally terminates a successful device-code response
+    // before reqwest can decode its body. A device code has no durable side
+    // effect until the user authorizes it, so one bounded retry is safe and
+    // prevents a transient upstream body error surfacing as an opaque local
+    // HTTP 400 in Settings.
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let response = match client
+            .post(OPENAI_DEVICE_USER_CODE_URL)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&json!({"client_id": OPENAI_CLIENT_ID}))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(anyhow!(error).context("requesting a Codex device code"));
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        match response.bytes().await {
+            Ok(body) => match parse_codex_device_start(status.as_u16(), &body) {
+                Ok(start) => return Ok(start),
+                Err(error) => {
+                    let retryable = status.is_success();
+                    last_error = Some(error);
+                    if attempt == 0 && retryable {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break;
+                }
+            },
+            Err(error) => {
+                last_error = Some(anyhow!(error).context("reading the Codex device-code response"));
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Codex device login could not start")))
+}
+
+fn parse_codex_device_start(status: u16, body: &[u8]) -> Result<CodexDeviceStart> {
+    let raw: Value = serde_json::from_slice(body).with_context(|| {
+        format!("Codex device login returned an invalid response (HTTP {status})")
+    })?;
+    if !(200..300).contains(&status) {
+        let detail = raw
+            .pointer("/error/message")
+            .or_else(|| raw.get("message"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty());
+        if let Some(detail) = detail {
+            bail!("Codex device login could not start (HTTP {status}): {detail}");
+        }
+        bail!("Codex device login could not start (HTTP {status})");
     }
     let device_auth_id = raw
         .get("device_auth_id")
@@ -2093,6 +2149,29 @@ mod tests {
             parse_codex_device_poll(200, &bad),
             CodexDevicePoll::Failed(_)
         ));
+    }
+
+    #[test]
+    fn codex_device_start_parses_success_and_explains_upstream_errors() {
+        let start = parse_codex_device_start(
+            200,
+            br#"{"device_auth_id":"device-1","user_code":"ABCD-EFGH","interval":"7"}"#,
+        )
+        .unwrap();
+        assert_eq!(start.device_auth_id, "device-1");
+        assert_eq!(start.user_code, "ABCD-EFGH");
+        assert_eq!(start.interval_s, 7);
+
+        let error = parse_codex_device_start(429, br#"{"error":{"message":"try again later"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 429"));
+        assert!(error.contains("try again later"));
+
+        let malformed = parse_codex_device_start(200, b"not-json")
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("invalid response"));
     }
 
     #[test]

@@ -1099,7 +1099,8 @@ struct LimitsCardView: View {
     private func modeChip(_ strategy: ProviderRoutingStrategy) -> some View {
         let (label, symbol): (String, String) = switch strategy {
         case .roundRobin: ("Round Robin", "shuffle")
-        case .resetFirst: ("Expires First", "clock")
+        case .resetFirst: ("Soonest Reset", "clock")
+        case .highestQuota: ("Most Remaining", "gauge.medium")
         case .priority: ("Priority", "list.number")
         }
         return HStack(spacing: 4) {

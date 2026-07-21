@@ -169,6 +169,12 @@ import Testing
         #expect(!routing.accounts[1].eligible)
     }
 
+    @Test func routingDecodesHighestQuotaStrategy() throws {
+        let json = #"{"provider":"openai","strategy":"highest_quota","reserve_pct":10,"accounts":[]}"#
+        let routing = try decode(json, as: CodexRoutingResponse.self)
+        #expect(routing.strategy == .highestQuota)
+    }
+
     @Test func codexRoutingDecodesPerAccountReserveFailoverAndResetSelection() throws {
         let json = #"""
         {"provider":"openai","strategy":"reset_first","reserve_pct":10,"allow_mid_thread_failover":false,"accounts":[

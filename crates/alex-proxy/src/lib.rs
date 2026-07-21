@@ -6881,6 +6881,7 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
 fn routing_strategy_name(mode: &AccountPolicyMode) -> &'static str {
     match mode {
         AccountPolicyMode::ResetFirst => "reset_first",
+        AccountPolicyMode::HighestQuota => "highest_quota",
         AccountPolicyMode::RoundRobin => "round_robin",
         AccountPolicyMode::Priority | AccountPolicyMode::Threshold => "priority",
     }
@@ -6961,12 +6962,13 @@ async fn update_routing(state: Arc<AppState>, provider: Provider, body: Value) -
     let current_policy = state.vault.policy(provider);
     let mode = match body.get("strategy").and_then(Value::as_str) {
         Some("reset_first") => AccountPolicyMode::ResetFirst,
+        Some("highest_quota") => AccountPolicyMode::HighestQuota,
         Some("priority") => AccountPolicyMode::Priority,
         Some("round_robin") => AccountPolicyMode::RoundRobin,
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "strategy must be reset_first, priority, or round_robin",
+                "strategy must be reset_first, highest_quota, priority, or round_robin",
             )
         }
     };

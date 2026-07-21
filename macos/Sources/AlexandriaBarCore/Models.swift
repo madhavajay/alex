@@ -690,6 +690,7 @@ public struct AccountUsageBucket: Codable, Sendable, Identifiable {
 
 public enum CodexRoutingStrategy: String, Codable, Sendable, CaseIterable, Hashable {
     case resetFirst = "reset_first"
+    case highestQuota = "highest_quota"
     case priority
     case roundRobin = "round_robin"
 }

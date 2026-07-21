@@ -1596,7 +1596,7 @@ private struct ProviderRoutingPreferencesSection: View {
     }
 
     private var displayedAccounts: [CodexRoutingAccountUpdate] {
-        guard strategy == .resetFirst else { return draftAccounts }
+        guard strategy == .resetFirst || strategy == .highestQuota else { return draftAccounts }
         return draftAccounts.sorted { lhs, rhs in
             let leftUsable = isUsable(lhs)
             let rightUsable = isUsable(rhs)
@@ -1604,9 +1604,15 @@ private struct ProviderRoutingPreferencesSection: View {
             let leftBlocked = reserveBlocked[lhs.accountId] ?? false
             let rightBlocked = reserveBlocked[rhs.accountId] ?? false
             if leftBlocked != rightBlocked { return !leftBlocked && rightBlocked }
-            let left = resetSelections[lhs.accountId]?.resetsAtS ?? Int64.max
-            let right = resetSelections[rhs.accountId]?.resetsAtS ?? Int64.max
-            if left != right { return left < right }
+            if strategy == .highestQuota {
+                let left = resetSelections[lhs.accountId]?.usedPct ?? Double.greatestFiniteMagnitude
+                let right = resetSelections[rhs.accountId]?.usedPct ?? Double.greatestFiniteMagnitude
+                if left != right { return left < right }
+            } else {
+                let left = resetSelections[lhs.accountId]?.resetsAtS ?? Int64.max
+                let right = resetSelections[rhs.accountId]?.resetsAtS ?? Int64.max
+                if left != right { return left < right }
+            }
             return lhs.priority < rhs.priority
         }
     }
@@ -1735,6 +1741,11 @@ private struct ProviderRoutingPreferencesSection: View {
                 .font(.system(size: 10))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
                 .help(resetHelp(accountId))
+        case .highestQuota:
+            Label(quotaRemainingLabel(accountId: accountId), systemImage: "gauge.medium")
+                .font(.system(size: 10))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                .help(quotaRemainingHelp(accountId))
         }
     }
 
@@ -1762,6 +1773,19 @@ private struct ProviderRoutingPreferencesSection: View {
         return "Backend selected the \(selection.window ?? "active") window at \(selection.usedPct.formatted(.number.precision(.fractionLength(0))))% used; exact reset: \(selection.resetsDate.formatted(date: .abbreviated, time: .standard))"
     }
 
+    private func quotaRemainingLabel(accountId: String) -> String {
+        guard let selection = resetSelections[accountId] else { return "quota unavailable" }
+        let remaining = max(0, 100 - selection.usedPct)
+        return "\(remaining.formatted(.number.precision(.fractionLength(0))))% remaining"
+    }
+
+    private func quotaRemainingHelp(_ accountId: String) -> String {
+        guard let selection = resetSelections[accountId] else {
+            return "Waiting for this account's quota data"
+        }
+        return "Uses the remaining percentage in the account's most constrained active window (\(selection.window ?? "active")); it does not compare plan prices or absolute token allowances."
+    }
+
     private func save() {
         guard let config = store.config else { return }
         busy = true
@@ -1787,7 +1811,8 @@ private struct ProviderRoutingPreferencesSection: View {
 private extension CodexRoutingStrategy {
     var displayName: String {
         switch self {
-        case .resetFirst: "Reset first"
+        case .resetFirst: "Soonest reset"
+        case .highestQuota: "Most quota remaining"
         case .priority: "Priority"
         case .roundRobin: "Round robin"
         }
@@ -1796,7 +1821,9 @@ private extension CodexRoutingStrategy {
     var explanation: String {
         switch self {
         case .resetFirst:
-            "Assign each new session to an eligible account whose active limit resets sooner, while respecting the reserve."
+            "Assign each new session to the eligible account whose most constrained active usage window resets soonest, while respecting the reserve."
+        case .highestQuota:
+            "Assign each new session to the eligible account with the greatest observed remaining percentage in its most constrained active usage window."
         case .priority:
             "Assign each new session to the first eligible account below that remains above the reserve."
         case .roundRobin:
