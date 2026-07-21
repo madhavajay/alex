@@ -13084,6 +13084,16 @@ continue = true
         assert!(!service_managed(&ServiceState::Unsupported));
     }
 
+    #[test]
+    fn systemd_unit_allows_a_fresh_user_without_an_npm_directory() {
+        assert!(SYSTEMD_TEMPLATE
+            .lines()
+            .any(|line| line == "ReadWritePaths=%h/.alexandria -%h/.npm"));
+        assert!(!SYSTEMD_TEMPLATE
+            .lines()
+            .any(|line| line == "ReadWritePaths=%h/.alexandria %h/.npm"));
+    }
+
     #[tokio::test]
     async fn unavailable_configured_bind_falls_back_to_loopback() {
         // RFC 5737 TEST-NET-1 is never a locally assigned interface address.

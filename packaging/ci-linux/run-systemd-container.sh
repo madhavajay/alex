@@ -64,6 +64,14 @@ cleanup() {
 
   if [[ "$CONTAINER_STARTED" -eq 1 ]] \
     && docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    if [[ "$status" -ne 0 ]]; then
+      echo "::group::Linux installed-service diagnostics"
+      user_exec systemctl --user status "$SERVICE_NAME" --no-pager --full || true
+      user_exec journalctl --user-unit="$SERVICE_NAME" --no-pager -n 200 || true
+      docker exec "$CONTAINER_NAME" cat \
+        "$CONTAINER_HOME/.config/systemd/user/$SERVICE_NAME.service" || true
+      echo "::endgroup::"
+    fi
     user_exec systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1
     docker exec "$CONTAINER_NAME" systemctl stop "user@$CONTAINER_UID.service" \
       >/dev/null 2>&1
