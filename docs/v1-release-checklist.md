@@ -51,7 +51,8 @@ a tag or changes the source worktree.
 - [x] Interrupted append recovery and bounded body reads have regression tests.
 - [ ] Pass the reproducible 55,000-trace/~9.4-GB benchmark and publish memory,
   initial-render, search, and individual-turn budgets.
-- [ ] Export, sanitize, reopen, and replay the release fixture end to end.
+- [x] Export, sanitize, reopen, and replay the release fixture end to end
+  (`alex-lar-scale fixture`; structural redaction and archive verification).
 - [ ] Manually open and search a real archive at current production scale.
 
 ## Shared platform path
@@ -72,8 +73,9 @@ a tag or changes the source worktree.
 - [x] The built-in preset, readable rule source, dry run, editing, disabling,
   replay, trace attempts, explanation, and session lease are implemented.
 - [x] The public walkthrough is checked against the shared scenario fixture.
-- [ ] Verify explicit fixture cases for overload, recovery, non-match, and no
-  healthy fallback account in the combined release branch.
+- [x] Explicit combined-branch fixture cases cover overload, lease-expiry
+  recovery, non-match, and no healthy fallback account (`cargo test -p
+  alex-proxy fable_`).
 - [ ] Manually run the preset through the installed beta and inspect the trace,
   provenance, explanation, and lease expiry.
 
@@ -85,11 +87,13 @@ a tag or changes the source worktree.
   capability negotiation, correlation headers, and loop rejection.
 - [x] Deterministic Chat, Responses, Anthropic, streaming tool-call, and
   structured-error tests cover both arrangements.
-- [ ] Run a pinned real CLIProxyAPI Docker/binary version matrix, including an
-  end-to-end streaming tool call in both arrangements.
+- [x] Pinned CLIProxyAPI v7.2.92 Docker matrix passes both arrangements,
+  including OpenAI Chat/Responses, Anthropic Messages, streaming tool calls,
+  structured failures, authentication, correlation, and loop rejection
+  (`./test.sh cliproxyapi --only CLIPROXYAPI`).
 - [ ] Manually test both arrangements through the installed beta and confirm
   model names, usage, errors, and trace correlation are not double-prefixed.
-- [ ] Track the documented CLIProxyAPI v7 limitation: non-2xx status and JSON
+- [x] Track the documented CLIProxyAPI v7 limitation: non-2xx status and JSON
   survive the second hop, but upstream error headers do not.
 
 ## Stable activation baseline
@@ -118,5 +122,8 @@ a tag or changes the source worktree.
 - Candidate: `0.1.29-beta.12` (planned; not yet cut)
 - Branch: `v1/integration`
 - Draft PR: <https://github.com/madhavajay/alex/pull/26>
+- Combined local gates: Rust workspace and all targets pass; Swift passes 298
+  Swift Testing + 14 XCTest cases; site passes 7 tests and deterministic build;
+  pinned CLIProxyAPI Docker matrix passes both directions.
 - Local browser visual automation was unavailable in the current environment;
   visual checks remain intentionally open rather than inferred from markup.

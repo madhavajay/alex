@@ -513,14 +513,14 @@ import Testing
 
     @Test func alexErrorSessionOnlyExposesKnownPendingCredentialForApproval() throws {
         let pending = try decode(
-            #"{"session_id":"alex-error-auth-abc","first_ts_ms":1,"last_ts_ms":2,"trace_count":1,"tags":{"alex_error":"true","alex_error_kind":"auth","approval_state":"pending","credential_fingerprint":"0123456789abcdef"}}"#,
+            #"{"session_id":"alex-error-auth-abc","first_ts_ms":1,"last_ts_ms":2,"trace_count":1,"tags":{"alex_error":"true","alex_error_kind":"auth","approval_state":"pending","credential_fingerprint":"0000000000000001"}}"#,
             as: TraceSession.self)
         #expect(pending.isAlexError)
-        #expect(pending.approvableCredentialFingerprint == "0123456789abcdef")
+        #expect(pending.approvableCredentialFingerprint == "0000000000000001")
         #expect(SessionRow(session: pending).isAlexError)
 
         let unknown = try decode(
-            #"{"session_id":"alex-error-auth-unknown","first_ts_ms":1,"last_ts_ms":2,"trace_count":1,"tags":{"alex_error":"true","approval_state":"unavailable","credential_fingerprint":"fedcba9876543210"}}"#,
+            #"{"session_id":"alex-error-auth-unknown","first_ts_ms":1,"last_ts_ms":2,"trace_count":1,"tags":{"alex_error":"true","approval_state":"unavailable","credential_fingerprint":"0000000000000002"}}"#,
             as: TraceSession.self)
         #expect(unknown.isAlexError)
         #expect(unknown.approvableCredentialFingerprint == nil)
