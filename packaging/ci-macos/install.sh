@@ -64,7 +64,7 @@ restore_previous() {
 
   restart_service
   open "$APP_DEST"
-  echo "Restored the pre-CI Alexandria app and daemon."
+  echo "Restored the pre-CI Alex app and daemon."
 }
 
 install_ci_build() {

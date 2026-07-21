@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Bootstrap installer for the Alexandria BETA channel.
+# Bootstrap installer for the Alex BETA channel.
 #
 # The beta channel setting ships inside the beta build, so a stable install has
 # no way to ask for one -- this script is the way in. Once it has run, the app's
@@ -150,13 +150,13 @@ platform_asset() {
       case "$(uname -m)" in
         arm64) printf 'macos-aarch64\n' ;;
         x86_64) printf 'macos-x86_64\n' ;;
-        *) say "No Alexandria beta binary is published for $(uname -m) macOS." >&2; exit 1 ;;
+        *) say "No Alex beta binary is published for $(uname -m) macOS." >&2; exit 1 ;;
       esac
       ;;
     Linux)
       case "$(uname -m)" in
         x86_64|amd64) printf 'linux-x86_64\n' ;;
-        *) say "No Alexandria beta binary is published for $(uname -m) Linux." >&2; exit 1 ;;
+        *) say "No Alex beta binary is published for $(uname -m) Linux." >&2; exit 1 ;;
       esac
       ;;
     *) say "This installer supports macOS and Linux." >&2; exit 1 ;;
@@ -164,7 +164,7 @@ platform_asset() {
 }
 
 install_cli() {
-  say "Installing Alexandria beta $1 ($2)..."
+  say "Installing Alex beta $1 ($2)..."
   curl -fsSL "$4/$3" -o "$5/$3" </dev/null
   curl -fsSL "$4/$3.sha256" -o "$5/$3.sha256" </dev/null
 
@@ -251,7 +251,7 @@ install_app() {
 main() {
   tag="$(resolve_beta_tag)"
   if [ -z "$tag" ]; then
-    say "Could not find any Alexandria beta prerelease." >&2
+    say "Could not find any Alex beta prerelease." >&2
     say "Check https://github.com/$REPO/releases, or pin one: ALEX_BETA_TAG=v0.1.26-beta.4" >&2
     exit 1
   fi
@@ -277,7 +277,7 @@ main() {
   fi
 
   say ""
-  say "Alexandria beta $version installed. Later betas arrive automatically:"
+  say "Alex beta $version installed. Later betas arrive automatically:"
   say "  CLI: alex update            (channel is now 'beta')"
   say "  App: Preferences -> Updates -> Release channel"
   say "Back to stable at any time: alex update --set-channel stable"

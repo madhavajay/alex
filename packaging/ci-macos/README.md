@@ -1,4 +1,4 @@
-# Alexandria macOS PR test bundle
+# Alex macOS PR test bundle
 
 This archive contains the exact pull-request build of:
 
@@ -19,7 +19,7 @@ From Terminal, in the extracted bundle directory:
 
 The script stops the current menu app, saves the first app and CLI builds it
 replaces, clears quarantine from this ad-hoc build, installs the CLI under
-`~/.local/bin`, registers/restarts Alexandria's launchd user service, and opens
+`~/.local/bin`, registers/restarts Alex's launchd user service, and opens
 the app. Existing data under `~/.alexandria` is left untouched.
 
 The app uses the same bundle identifier as production, so only one

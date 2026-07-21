@@ -1,4 +1,4 @@
-# Shared web UI (preview)
+# Shared web UI
 
 The daemon serves Alex's first shared macOS, Linux, and Windows product surface. Start the daemon when needed and open it with:
 
@@ -35,7 +35,7 @@ This preview includes:
 - bounded, cursor-paginated session turns (20 at a time), with request/response
   bodies and tool data loaded only when one turn is expanded.
 
-The menu-bar app and native notifications remain macOS-only. Linux uses the systemd user service; Windows uses a per-user Task Scheduler entry. Both are managed with `alex service install`, `alex service restart`, and `alex service uninstall`. The CI Windows job remains advisory until a clean Windows 11 runner has exercised install, restart, routing, and trace inspection end to end.
+The menu-bar app and native notifications remain macOS-only. Linux uses the systemd user service; Windows uses a per-user Task Scheduler entry. Both are managed with `alex service install`, `alex service restart`, and `alex service uninstall`. Linux, Windows, and macOS Rust jobs are required CI gates; the release checklist separately records clean-machine install, restart, routing, and trace-inspection smoke results.
 
 ## HTTP surface
 
@@ -58,6 +58,10 @@ The Middleware view reads `GET /admin/middleware` and `GET /admin/fixtures`. Tog
 
 CI runs the cross-platform `deterministic_platform_smoke` test with local TCP listeners and mock OpenAI-compatible OpenAI/Exo routes. It checks daemon health, the shared UI, a basic request, a streamed and reassembled tool call, an OpenAI-to-Exo middleware reroute with recorded decisions/provenance, bounded trace listing, and persistence of traces, streamed bodies, and the rule after the daemon/store is reopened. No provider credential or public network is involved.
 
-The same macOS, Linux, and Windows matrix also runs pure browser-launch and background-daemon lifecycle contracts. These prove URLs, executable paths containing spaces, and daemon arguments stay OS-native and shell-free without installing or mutating a real platform service. Windows remains advisory until its separate service lifecycle and existing Windows-only failures are fixed.
+The same macOS, Linux, and Windows matrix also runs browser-launch,
+background-daemon, and platform service-lifecycle contracts. These prove URLs,
+executable paths containing spaces, daemon arguments, and Windows Task
+Scheduler state stay OS-native and shell-free. A failure on any supported Rust
+platform blocks the release candidate.
 
 Provider OAuth itself remains a short manual/live smoke because public CI cannot safely hold subscription credentials.
