@@ -1,15 +1,15 @@
 # Pam
 
 Pam is an experimental, opt-in Pi package that recreates Amp's low / medium /
-high / ultra capability dial using models routed through Alexandria. It is kept
-under `plugins/` and is not installed or enabled by Alexandria.
+high / ultra capability dial using models routed through Alex. It is kept
+under `plugins/` and is not installed or enabled by Alex.
 
 ## Try it
 
-First refresh Pi's Alexandria model catalog, then load Pam for one run:
+First refresh Pi's Alex model catalog, then load Pam for one run:
 
 ```sh
-alex harness connect pi
+alex connect pi
 pi -e ./plugins/pam
 ```
 
@@ -53,7 +53,7 @@ the changed slot is the active tier's agent, Pam also switches the running Pi
 session to the new model immediately.
 
 You can still edit `settings.json` by hand. Models must use an `alex/*` ID from
-Pi's Alexandria catalog; run `/reload` in Pi after manual edits. Pam resolves
+Pi's Alex catalog; run `/reload` in Pi after manual edits. Pam resolves
 those routing IDs through Pi's model catalog and displays their familiar names,
 such as `GPT-5.6 Luna`, while retaining the exact `alex/*` ID for requests.
 
@@ -90,16 +90,16 @@ The checked-in defaults are:
 | high | `alex/gpt-5.6-sol` | xhigh | `alex/claude-fable-5` | high |
 | ultra | `alex/claude-fable-5` | high | `alex/gpt-5.6-sol` | high |
 
-The direct Sol and Fable routes are preferred. Their Alexandria OpenRouter
+The direct Sol and Fable routes are preferred. Their Alex OpenRouter
 routes are accepted as fallbacks when those are the models present in Pi's
 catalog. Low intentionally has no silent fallback: if GLM-5.2 is unavailable,
-Pam reports that the Alexandria catalog needs refreshing.
+Pam reports that the Alex catalog needs refreshing.
 
 Pam registers `pam_oracle`, an LLM-callable tool that sends a concrete review
 question to the active mode's oracle model. The oracle call uses its own model
 and reasoning effort without changing the main agent.
 
-This package changes no Alexandria configuration and contains no install hook.
+This package changes no Alex configuration and contains no install hook.
 Remove an explicit local installation with:
 
 ```sh
