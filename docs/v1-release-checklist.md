@@ -107,8 +107,9 @@ a tag or changes the source worktree.
 - [x] `alex doctor` checks executables, credentials, Dario, ports, permissions,
   service state, storage, and provider health without printing secrets.
 - [x] OpenAI-compatible model IDs use the `alex/*` namespace.
-- [ ] Complete the user-visible Alexandria-to-Alex naming and stale capability
-  claim audit.
+- [x] Complete the user-visible Alexandria-to-Alex naming and stale capability
+  claim audit (public copy, onboarding, package descriptions, model metadata,
+  Dario/Amp wording, and the bundled capability-map artwork).
 - [ ] Verify reset returns to onboarding and a provider-less menu offers
   **Start Onboarding**.
 - [ ] Verify onboarding can move backward/forward and freely change harness,
