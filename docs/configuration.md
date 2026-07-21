@@ -1,6 +1,8 @@
 # Configuration and local state
 
-The main configuration file is `~/.alexandria/config.toml`. Set
+The main configuration file is `~/.alex/config.toml`. Existing
+`~/.alexandria` state is moved atomically on first launch and retained as a
+compatibility alias. Set
 `ALEXANDRIA_HOME` to move that root. `data_dir` then controls the SQLite,
 account, body, Dario, fixture, and wrap state root; on a fresh install it is the
 same directory as `ALEXANDRIA_HOME`.
@@ -249,7 +251,7 @@ instead of hard-coding a bind wildcard as a client URL.
 Paths below are relative to `data_dir` unless stated otherwise:
 
 ```text
-~/.alexandria/config.toml         main config (always under ALEXANDRIA_HOME)
+~/.alex/config.toml               main config (always under ALEXANDRIA_HOME)
 <data_dir>/accounts/*.json        active vault accounts, mode 0600 writes
 <data_dir>/accounts/removed-accounts/*.json
 <data_dir>/accounts/.routing-policies
@@ -261,8 +263,8 @@ Paths below are relative to `data_dir` unless stated otherwise:
 <data_dir>/dario-prompt-cache/*.json
 <data_dir>/fixtures/              saved error fixtures
 <data_dir>/wrap/<harness>/        settings, flows.jsonl, WS/body sidecars, logs
-~/.alexandria/wrap-harnesses.json optional replacement wrap catalog
-~/.alexandria/daemon.log          background-daemon log
+~/.alex/wrap-harnesses.json       optional replacement wrap catalog
+~/.alex/daemon.log                background-daemon log
 ```
 
 Connected harness configuration is stored under each tool's native config

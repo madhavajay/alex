@@ -301,7 +301,7 @@ if ([string]::IsNullOrWhiteSpace($SmokeRoot)) {
     )
 }
 $SmokeRoot = [IO.Path]::GetFullPath($SmokeRoot)
-$StateDirectory = Join-Path $env:USERPROFILE ".alexandria"
+$StateDirectory = Join-Path $env:USERPROFILE ".alex"
 $AlexBin = Join-Path $InstallDirectory "alex.exe"
 $LegacyBin = Join-Path $InstallDirectory "alexandria.exe"
 $ReadyFile = Join-Path $SmokeRoot "mock.port"

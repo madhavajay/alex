@@ -20,7 +20,7 @@ From Terminal, in the extracted bundle directory:
 The script stops the current menu app, saves the first app and CLI builds it
 replaces, clears quarantine from this ad-hoc build, installs the CLI under
 `~/.local/bin`, registers/restarts Alex's launchd user service, and opens
-the app. Existing data under `~/.alexandria` is left untouched.
+the app. Existing data under `~/.alex` is left untouched.
 
 Automation can copy the same bundle without opening the app or registering a
 service:

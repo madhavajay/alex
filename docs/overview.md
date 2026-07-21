@@ -100,11 +100,11 @@ operator reads those traces through the local-key-gated API.
 
 ## Local state
 
-The state root defaults to `~/.alexandria`; `ALEXANDRIA_HOME` changes the config
+The state root defaults to `~/.alex`; `ALEXANDRIA_HOME` changes the config
 root, and a custom `data_dir` can place runtime data elsewhere.
 
 ```text
-~/.alexandria/
+~/.alex/
   config.toml                 daemon settings and local admin key (mode 0600)
   accounts/                   one JSON file per vault account
     removed-accounts/         non-secret account tombstones

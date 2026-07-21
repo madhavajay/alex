@@ -111,9 +111,15 @@ fi
 )
 
 CLI_VERSION="$($PREFIX/alex --version)"
-APP_VERSION="$(defaults read "$HOME/Applications/Alex.app/Contents/Info" CFBundleShortVersionString)"
+APP_VERSION="$(defaults read "/Applications/Alex.app/Contents/Info" CFBundleShortVersionString)"
 PORT=4100
-CONFIG="$HOME/.alexandria/config.toml"
+if [[ -n "${ALEXANDRIA_HOME:-}" ]]; then
+  CONFIG="$ALEXANDRIA_HOME/config.toml"
+elif [[ -f "$HOME/.alex/config.toml" ]]; then
+  CONFIG="$HOME/.alex/config.toml"
+else
+  CONFIG="$HOME/.alexandria/config.toml"
+fi
 if [[ -f "$CONFIG" ]]; then
   CONFIG_PORT="$(sed -n 's/^port *= *\([0-9]*\)/\1/p' "$CONFIG" | head -1)"
   PORT="${CONFIG_PORT:-4100}"
@@ -130,4 +136,4 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse "${REF}^{commit}")"
 echo "◆ installed local Alex $VERSION"
 echo "  commit: $COMMIT"
 echo "  cli:    $PREFIX/alex"
-echo "  app:    $HOME/Applications/Alex.app"
+echo "  app:    /Applications/Alex.app"

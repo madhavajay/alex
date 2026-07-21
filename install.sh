@@ -95,7 +95,18 @@ if ! "$BIN" dario bootstrap; then
   echo "warning: Dario could not be prepared; install Node.js 18+ and npm, pnpm, or Bun, then run: $BIN dario bootstrap" >&2
 fi
 
-CONFIG="$HOME/.alexandria/config.toml"
+if [ -n "${ALEXANDRIA_HOME:-}" ]; then
+  STATE_DIR="$ALEXANDRIA_HOME"
+elif [ -d "$HOME/.alex" ]; then
+  STATE_DIR="$HOME/.alex"
+elif [ -d "$HOME/.alexandria" ]; then
+  # The newly installed binary atomically migrates this directory on launch.
+  STATE_DIR="$HOME/.alexandria"
+else
+  STATE_DIR="$HOME/.alex"
+fi
+CONFIG="$STATE_DIR/config.toml"
+DAEMON_LOG="$STATE_DIR/daemon.log"
 PORT=4100
 HOST=127.0.0.1
 if [ -f "$CONFIG" ]; then
@@ -151,7 +162,8 @@ if [ "$UPGRADE" = "1" ]; then
     NEW_PID=""
   elif [ -z "$OLD_PIDS" ]; then
     say "no running daemon found; starting fresh"
-    nohup "$BIN" daemon >> "$HOME/.alexandria/daemon.log" 2>&1 &
+    mkdir -p "$STATE_DIR"
+    nohup "$BIN" daemon >> "$DAEMON_LOG" 2>&1 &
     NEW_PID=$!
   elif [ "$(uname)" = "Darwin" ] && launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
     echo "daemon is launchd-managed: using kickstart (drain happens before restart;"
@@ -166,7 +178,8 @@ if [ "$UPGRADE" = "1" ]; then
     NEW_PID=""
   else
     say "old daemon pid(s): $OLD_PIDS"
-    nohup "$BIN" daemon >> "$HOME/.alexandria/daemon.log" 2>&1 &
+    mkdir -p "$STATE_DIR"
+    nohup "$BIN" daemon >> "$DAEMON_LOG" 2>&1 &
     NEW_PID=$!
     say "started new daemon pid $NEW_PID; waiting for it to listen"
     i=0
@@ -178,8 +191,8 @@ if [ "$UPGRADE" = "1" ]; then
         exit 1
       fi
       if ! kill -0 "$NEW_PID" 2>/dev/null; then
-        echo "new daemon exited during startup — leaving old daemon untouched; see ~/.alexandria/daemon.log" >&2
-        if tail -5 "$HOME/.alexandria/daemon.log" 2>/dev/null | grep -q "Address already in use"; then
+        echo "new daemon exited during startup — leaving old daemon untouched; see $DAEMON_LOG" >&2
+        if tail -5 "$DAEMON_LOG" 2>/dev/null | grep -q "Address already in use"; then
           echo "the running daemon predates SO_REUSEPORT support, so the port cannot be shared." >&2
           echo "one-time migration: stop it (kill \$(lsof -ti tcp:$PORT -sTCP:LISTEN)), start the new" >&2
           echo "binary once ($BIN daemon), and every future --upgrade will be zero-downtime." >&2

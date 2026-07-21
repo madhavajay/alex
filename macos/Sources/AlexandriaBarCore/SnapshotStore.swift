@@ -139,7 +139,7 @@ public final class SnapshotStore {
             exoStatus = nil
             exoModels = []
             providerPauses = []
-            lastError = "no config at ~/.alexandria/config.toml"
+            lastError = "no config at ~/.alex/config.toml"
             return
         }
         config = cfg
@@ -390,7 +390,7 @@ public final class SnapshotStore {
             out.append(StoreAlert(
                 id: "no-config", severity: .critical,
                 title: "Alex not configured",
-                body: "No config found at ~/.alexandria/config.toml"))
+                body: "No config found at ~/.alex/config.toml"))
             return out
         }
         let hasAnthropicAccount = ProviderPresentation.shouldPresentDario(for: accounts)

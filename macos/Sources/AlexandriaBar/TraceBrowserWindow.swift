@@ -395,7 +395,7 @@ final class TraceBrowserModel {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: bodyPath)])
             } else {
                 let fallback = FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent(".alexandria/bodies")
+                    .appendingPathComponent(".alex/bodies")
                 NSWorkspace.shared.activateFileViewerSelecting([fallback])
             }
         }

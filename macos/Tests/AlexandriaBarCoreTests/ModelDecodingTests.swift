@@ -8,7 +8,7 @@ import Testing
     }
 
     @Test func health() throws {
-        let json = #"{"dario":true,"in_flight":0,"service":"alexandria","status":"ok","uptime_s":479,"version":"0.1.0"}"#
+        let json = #"{"dario":true,"in_flight":0,"service":"alex","status":"ok","uptime_s":479,"version":"0.1.0"}"#
         let h = try decode(json, as: DaemonHealth.self)
         #expect(h.version == "0.1.0")
         #expect(h.dario)

@@ -14,7 +14,7 @@ ProtectSystem=full
 # A fresh Linux user may not have used npm yet. The leading "-" keeps the
 # optional cache path writable when present without making service startup
 # fail when the directory does not exist.
-ReadWritePaths=%h/.alexandria -%h/.npm
+ReadWritePaths=%h/.alex -%h/.alexandria -%h/.npm
 PrivateTmp=true
 TimeoutStopSec=300
 

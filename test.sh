@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alexandria/config.toml}"
+CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alex/config.toml}"
 PROMPT="Reply with exactly: alexandria-test-ok"
 
 TIERS=""

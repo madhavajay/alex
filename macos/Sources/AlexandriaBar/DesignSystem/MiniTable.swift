@@ -229,7 +229,7 @@ struct MiniTable: View {
                     cells: [
                         .stacked(
                             "claude-haiku-4-5",
-                            "~/.alexandria/dario-prompt-cache/claude-haiku.json"),
+                            "~/.alex/dario-prompt-cache/claude-haiku.json"),
                         .text("hit", tint: AlexTheme.Colors.success),
                         .text("26,941"),
                         .button("Clear", {}),
@@ -240,7 +240,7 @@ struct MiniTable: View {
                     cells: [
                         .stacked(
                             "claude-opus-4-8",
-                            "~/.alexandria/dario-prompt-cache/claude-opus.json"),
+                            "~/.alex/dario-prompt-cache/claude-opus.json"),
                         .text("miss", tint: AlexTheme.Colors.warningOrange),
                         .text("–"),
                         .button("Clear", isEnabled: false, {}),

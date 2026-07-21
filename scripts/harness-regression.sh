@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alexandria/config.toml}"
+CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alex/config.toml}"
 ONLY="${ALEX_INTEGRATION_ONLY:-}"
 TIMEOUT="${ALEX_INTEGRATION_TIMEOUT:-600}"
 HOST="${ALEX_INTEGRATION_HOST:-}"

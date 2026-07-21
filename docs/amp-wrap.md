@@ -27,7 +27,7 @@ alex wrap status
 Capture artifacts (default):
 
 ```text
-~/.alexandria/wrap/amp/
+~/.alex/wrap/amp/
   settings.json   # amp.url = wrap base URL
   amp.log         # AMP_LOG_FILE / --log-file
   flows.jsonl     # reverse wrap request/response events
@@ -101,7 +101,7 @@ Native Amp inference is **actor WebSocket (Rivet)**, not OpenAI-style `/v1` thro
 ### Config-driven catalog
 
 Profiles: `crates/alex-wrap/config/wrap-harnesses.json`  
-Optional override: `~/.alexandria/wrap-harnesses.json`
+Optional override: `~/.alex/wrap-harnesses.json`
 
 Amp profile knobs (no code change for renames):
 

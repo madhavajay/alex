@@ -79,7 +79,7 @@ final class AuthFlowModel {
         }
     }
 
-    /// The app can be launched after `~/.alexandria` was removed while the CLI
+    /// The app can be launched after `~/.alex` was removed while the CLI
     /// and launchd service remain installed. Treat that as recoverable setup:
     /// ask the CLI to recreate config, restart so the daemon loads its new key,
     /// then refresh the shared snapshot before starting OAuth.

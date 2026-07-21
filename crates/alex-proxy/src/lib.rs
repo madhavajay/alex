@@ -3485,7 +3485,7 @@ async fn admin_auth_login_status(
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(json!({
         "status": "ok",
-        "service": "alexandria",
+        "service": "alex",
         "version": env!("CARGO_PKG_VERSION"),
         "in_flight": state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
         "in_flight_requests": in_flight_requests(&state),
@@ -3513,7 +3513,7 @@ pub fn connect_payload(base_url: &str, local_key: &str) -> (Value, String) {
          export GOOGLE_GENAI_USE_GCA=false\n"
     );
     let payload = json!({
-        "service": "alexandria",
+        "service": "alex",
         "base_url": base,
         "api_key": local_key,
         "anthropic": {"base_url": base, "env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": local_key}},
@@ -8430,7 +8430,7 @@ async fn gemini_generate(
 fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,
-        axum::Json(json!({"error": {"type": "alexandria", "message": message}})),
+        axum::Json(json!({"error": {"type": "alex", "message": message}})),
     )
         .into_response()
 }
@@ -11463,7 +11463,7 @@ fn alex_error_trace_response(
     }
 
     let response_body = serde_json::to_vec(&json!({
-        "error": {"type": "alexandria", "message": message}
+        "error": {"type": "alex", "message": message}
     }))
     .unwrap_or_default();
     finalize_trace(state, trace, body, None, Some(&response_body));
@@ -13449,7 +13449,7 @@ async fn proxy(
                     (
                         StatusCode::BAD_GATEWAY,
                         serde_json::to_vec(
-                            &json!({"error": {"type": "alexandria", "message": msg}}),
+                            &json!({"error": {"type": "alex", "message": msg}}),
                         )
                         .unwrap_or_default(),
                     )
@@ -19896,7 +19896,7 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
         let missing_body: Value = missing.json().await.unwrap();
-        assert_eq!(missing_body["error"]["type"], "alexandria");
+        assert_eq!(missing_body["error"]["type"], "alex");
         assert_eq!(missing_body["error"]["message"], "missing 'key'");
 
         let saved: Value = client
@@ -22653,7 +22653,7 @@ mod tests {
             .expect("local webhook sink did not receive the test event")
             .unwrap();
         assert_eq!(event["category"], "test");
-        assert_eq!(event["account"]["provider"], "alexandria");
+        assert_eq!(event["account"]["provider"], "alex");
 
         let listing = client
             .get(format!("http://{admin_address}/admin/notifications"))

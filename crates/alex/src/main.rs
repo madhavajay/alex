@@ -48,7 +48,7 @@ enum Command {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
-        /// Detach and run in the background, logging to ~/.alexandria/daemon.log
+        /// Detach and run in the background, logging to ~/.alex/daemon.log
         #[arg(long)]
         background: bool,
     },
@@ -607,7 +607,7 @@ enum MiddlewareLeasesCommand {
 
 #[derive(Subcommand)]
 enum WrapCommand {
-    /// List configured wrap harnesses (from embedded catalog / ~/.alexandria/wrap-harnesses.json)
+    /// List configured wrap harnesses (from embedded catalog / ~/.alex/wrap-harnesses.json)
     Status {
         #[arg(long)]
         json: bool,
@@ -1818,11 +1818,106 @@ fn set_daemon_host(config: &mut Config, address: &str) -> Result<bool> {
     Ok(true)
 }
 
+const ALEX_HOME_DIR: &str = ".alex";
+const LEGACY_ALEX_HOME_DIR: &str = ".alexandria";
+const HOME_MIGRATION_MARKER: &str = ".migrated-from-alexandria-v1";
+
 fn alexandria_home() -> PathBuf {
     if let Some(path) = std::env::var_os("ALEXANDRIA_HOME") {
         return PathBuf::from(path);
     }
-    dirs::home_dir().expect("no home dir").join(".alexandria")
+    let platform_home = dirs::home_dir().expect("no home dir");
+    migrate_default_alex_home(&platform_home)
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(unix)]
+fn create_legacy_home_alias(current: &Path, legacy: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(current, legacy)
+}
+
+#[cfg(windows)]
+fn create_legacy_home_alias(current: &Path, legacy: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(current, legacy)
+}
+
+/// Move the old default state directory exactly once. A rename keeps the
+/// migration atomic and a compatibility link lets older Alex binaries keep
+/// using the same state after an upgrade/rollback. Explicit ALEXANDRIA_HOME
+/// values bypass this function entirely.
+fn migrate_default_alex_home(platform_home: &Path) -> PathBuf {
+    let current = platform_home.join(ALEX_HOME_DIR);
+    let legacy = platform_home.join(LEGACY_ALEX_HOME_DIR);
+
+    if path_entry_exists(&current) {
+        if current.join(HOME_MIGRATION_MARKER).exists() && !path_entry_exists(&legacy) {
+            if let Err(error) = create_legacy_home_alias(&current, &legacy) {
+                eprintln!(
+                    "warning: migrated Alex state to {} but could not create the legacy {} alias: {error}",
+                    current.display(),
+                    legacy.display()
+                );
+            }
+        }
+        return current;
+    }
+    if !path_entry_exists(&legacy) {
+        return current;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&legacy) else {
+        return current;
+    };
+    if !metadata.file_type().is_dir() {
+        eprintln!(
+            "warning: {} is not a state directory; leaving it untouched and using {}",
+            legacy.display(),
+            current.display()
+        );
+        return current;
+    }
+
+    // The marker allows the next launch to finish creating the compatibility
+    // alias if this process exits between the rename and symlink operations.
+    if let Err(error) = std::fs::write(legacy.join(HOME_MIGRATION_MARKER), b"v1\n") {
+        if path_entry_exists(&current) {
+            return current;
+        }
+        eprintln!(
+            "warning: could not prepare Alex state migration from {}: {error}; continuing with the legacy directory",
+            legacy.display()
+        );
+        return legacy;
+    }
+    if let Err(error) = std::fs::rename(&legacy, &current) {
+        if path_entry_exists(&current) {
+            return current;
+        }
+        eprintln!(
+            "warning: could not migrate Alex state from {} to {}: {error}; continuing with the legacy directory",
+            legacy.display(),
+            current.display()
+        );
+        return legacy;
+    }
+    if let Err(error) = create_legacy_home_alias(&current, &legacy) {
+        eprintln!(
+            "warning: migrated Alex state to {} but could not create the legacy {} alias: {error}",
+            current.display(),
+            legacy.display()
+        );
+    }
+    current
+}
+
+fn migrate_default_data_dir(config: &mut Config, selected_home: &Path, platform_home: &Path) {
+    let current = platform_home.join(ALEX_HOME_DIR);
+    let legacy = platform_home.join(LEGACY_ALEX_HOME_DIR);
+    if selected_home == current && config.data_dir == legacy {
+        config.data_dir = current;
+    }
 }
 
 fn load_or_create_config() -> Result<(Config, bool)> {
@@ -1839,6 +1934,11 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         let mut config: Config =
             toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
         config.heal();
+        if std::env::var_os("ALEXANDRIA_HOME").is_none() {
+            if let Some(platform_home) = dirs::home_dir() {
+                migrate_default_data_dir(&mut config, &home, &platform_home);
+            }
+        }
         let upgraded = toml::to_string_pretty(&config)?;
         if upgraded != raw {
             std::fs::write(&path, upgraded)?;
@@ -3531,7 +3631,7 @@ async fn main() -> Result<()> {
 
     // Cove runs this command in a container with only a scoped harness key.
     // Handle the fully remote form before loading config so it neither needs
-    // nor creates ~/.alexandria/config.toml in that container.
+    // nor creates ~/.alex/config.toml in that container.
     if let Command::Connect {
         harness,
         config_dir,
@@ -10526,7 +10626,7 @@ async fn daemon_background(
     println!(
         "{}",
         ui::gold(&format!(
-            "{} daemon started in the background (pid {}) — log: ~/.alexandria/daemon.log",
+            "{} daemon started in the background (pid {}) — log: ~/.alex/daemon.log",
             ui::diamond(),
             child.id()
         ))
@@ -10547,7 +10647,7 @@ async fn daemon_background(
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     println!(
-        "{} daemon did not become ready within 15s — check: tail -n 50 ~/.alexandria/daemon.log",
+        "{} daemon did not become ready within 15s — check: tail -n 50 ~/.alex/daemon.log",
         ui::red(ui::dot())
     );
     std::process::exit(1);
@@ -13082,10 +13182,10 @@ continue = true
     fn systemd_unit_allows_a_fresh_user_without_an_npm_directory() {
         assert!(SYSTEMD_TEMPLATE
             .lines()
-            .any(|line| line == "ReadWritePaths=%h/.alexandria -%h/.npm"));
+            .any(|line| line == "ReadWritePaths=%h/.alex -%h/.alexandria -%h/.npm"));
         assert!(!SYSTEMD_TEMPLATE
             .lines()
-            .any(|line| line == "ReadWritePaths=%h/.alexandria %h/.npm"));
+            .any(|line| line == "ReadWritePaths=%h/.alex %h/.alexandria %h/.npm"));
     }
 
     #[tokio::test]
@@ -13298,12 +13398,72 @@ continue = true
     }
 
     #[test]
-    fn home_dir_is_platform_native() {
+    fn fresh_default_home_uses_alex_name() {
+        let platform_home = tmpdir("fresh-default-home");
+        assert_eq!(
+            migrate_default_alex_home(&platform_home),
+            platform_home.join(".alex")
+        );
+        assert!(!platform_home.join(".alexandria").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_default_home_is_moved_once_and_keeps_a_compatibility_alias() {
+        let platform_home = tmpdir("legacy-default-home");
+        let legacy = platform_home.join(".alexandria");
+        let current = platform_home.join(".alex");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("config.toml"), "port = 4100\n").unwrap();
+
+        assert_eq!(migrate_default_alex_home(&platform_home), current);
+        assert_eq!(
+            std::fs::read_to_string(current.join("config.toml")).unwrap(),
+            "port = 4100\n"
+        );
+        assert!(std::fs::symlink_metadata(&legacy)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(migrate_default_alex_home(&platform_home), current);
+    }
+
+    #[test]
+    fn existing_alex_home_never_merges_or_removes_legacy_state() {
+        let platform_home = tmpdir("two-default-homes");
+        let legacy = platform_home.join(".alexandria");
+        let current = platform_home.join(".alex");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::create_dir(&current).unwrap();
+        std::fs::write(legacy.join("legacy-only"), "keep").unwrap();
+        std::fs::write(current.join("current-only"), "use").unwrap();
+
+        assert_eq!(migrate_default_alex_home(&platform_home), current);
+        assert!(legacy.join("legacy-only").exists());
+        assert!(current.join("current-only").exists());
+    }
+
+    #[test]
+    fn explicit_alexandria_home_remains_authoritative() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let explicit = tmpdir("explicit-alexandria-home");
+        std::env::set_var("ALEXANDRIA_HOME", &explicit);
+        assert_eq!(alexandria_home(), explicit);
         std::env::remove_var("ALEXANDRIA_HOME");
-        let home = alexandria_home();
-        assert!(home.ends_with(".alexandria"));
-        assert!(home.is_absolute());
+    }
+
+    #[test]
+    fn migrated_default_data_dir_tracks_the_new_home_but_custom_paths_survive() {
+        let platform_home = tmpdir("data-dir-migration");
+        let current = platform_home.join(".alex");
+        let mut config = test_config(platform_home.join(".alexandria"));
+        migrate_default_data_dir(&mut config, &current, &platform_home);
+        assert_eq!(config.data_dir, current);
+
+        let custom = platform_home.join("custom-state");
+        config.data_dir = custom.clone();
+        migrate_default_data_dir(&mut config, &current, &platform_home);
+        assert_eq!(config.data_dir, custom);
     }
 
     #[cfg(windows)]
@@ -13336,7 +13496,7 @@ continue = true
         let config = Config {
             host: "127.0.0.1".into(),
             port: 4100,
-            data_dir: alexandria_home(),
+            data_dir: tmpdir("native-config-path").join(".alex"),
             local_key: "alx-test".into(),
             heartbeat_minutes: default_heartbeat_minutes(),
             reauth_check_minutes: default_reauth_check_minutes(),
@@ -14249,7 +14409,8 @@ local_key = "alx-test"
             .collect();
         assert!(added.contains(&"alex/kimi/k3"), "added models: {added:?}");
         let written = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
-        assert!(written.contains("alexandria"));
+        assert!(written.contains("[providers.alex]"));
+        assert!(!written.contains("[providers.alexandria]"));
         assert!(written.contains("alex/kimi/k3"));
         assert!(state
             .store

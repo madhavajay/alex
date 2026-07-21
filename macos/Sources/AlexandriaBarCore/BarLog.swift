@@ -19,7 +19,7 @@ public enum BarLog {
 
     public static var fileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".alexandria/bar.log")
+            .appendingPathComponent(".alex/bar.log")
     }
 
     public static func info(_ category: Category, _ message: String) {

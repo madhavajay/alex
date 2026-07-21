@@ -58,7 +58,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     func showOnboardingIfNeeded() {
-        // The completion flag lives outside ~/.alexandria and survives a data
+        // The completion flag lives outside ~/.alex and survives a data
         // wipe, so a live zero-account daemon must also re-enter onboarding.
         let shouldPresent = OnboardingLaunchPolicy.shouldAutoPresent(
             hasCompletionRecord: UserDefaults.standard.object(

@@ -7,7 +7,7 @@ Usage: ./install-macos.sh [--bar-only] [--no-bar] [...install.sh flags]
 
 Installs the full Alex macOS experience:
   1. the alex binary + daemon             (delegates to ./install.sh)
-  2. Alex menu-bar app                    (macos/, builds + installs to ~/Applications)
+  2. Alex menu-bar app                    (macos/, builds + installs to /Applications)
 
   --bar-only   only build/install the menu bar app
   --no-bar     only run install.sh (skip the menu bar app)
@@ -50,10 +50,19 @@ if [ "$NO_BAR" = "0" ]; then
   echo "◆ building Alex (menu bar app)…"
   (cd macos && VERSION="$VERSION" ./Scripts/package_app.sh)
   quit_alex_apps
-  mkdir -p ~/Applications
-  rm -rf ~/Applications/Alex.app
-  cp -R macos/dist/Alex.app ~/Applications/
-  remove_legacy_app "$HOME/Applications"
-  open ~/Applications/Alex.app
-  echo "◆ Alex installed to ~/Applications and launched"
+  if [ -w /Applications ]; then
+    rm -rf /Applications/Alex.app
+    ditto macos/dist/Alex.app /Applications/Alex.app
+  else
+    sudo rm -rf /Applications/Alex.app
+    sudo ditto macos/dist/Alex.app /Applications/Alex.app
+  fi
+  remove_legacy_app /Applications
+  # Older local builds installed a second copy here. Remove only the exact
+  # obsolete Alex bundle, and only after /Applications/Alex.app is complete.
+  if [ -e "$HOME/Applications/Alex.app" ]; then
+    rm -rf "$HOME/Applications/Alex.app"
+  fi
+  open /Applications/Alex.app
+  echo "◆ Alex installed to /Applications and launched"
 fi

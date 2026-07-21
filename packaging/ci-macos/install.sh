@@ -148,7 +148,7 @@ install_ci_build() {
   "$BIN_DEST/alex" --version
   echo "Installed the CI app at $APP_DEST"
   echo "Installed the CI daemon/CLI in $BIN_DEST"
-  echo "Your existing ~/.alexandria configuration and accounts were preserved."
+  echo "Your existing ~/.alex configuration and accounts were preserved."
   echo "Run '$SCRIPT_DIR/install.sh --restore' to switch back to the saved build."
 }
 

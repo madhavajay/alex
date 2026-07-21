@@ -36,9 +36,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-/// Default override path: `~/.alexandria/wrap-harnesses.json` (optional).
+/// Default override path: `~/.alex/wrap-harnesses.json` (optional).
 pub fn user_catalog_override_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".alexandria/wrap-harnesses.json"))
+    home_dir().map(|h| h.join(".alex/wrap-harnesses.json"))
 }
 
 /// Load catalog: user override if present, else embedded defaults.

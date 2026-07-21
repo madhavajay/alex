@@ -39,8 +39,13 @@ public enum DaemonDiscovery {
     nonisolated(unsafe) private static var cachedModificationDate: Date?
     nonisolated(unsafe) private static var cachedConfig: DaemonConfig?
     public static var configPath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".alexandria/config.toml")
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let current = home.appendingPathComponent(".alex/config.toml")
+        if FileManager.default.fileExists(atPath: current.path) {
+            return current
+        }
+        let legacy = home.appendingPathComponent(".alexandria/config.toml")
+        return FileManager.default.fileExists(atPath: legacy.path) ? legacy : current
     }
 
     public static func load() -> DaemonConfig? {

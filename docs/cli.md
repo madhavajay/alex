@@ -11,7 +11,7 @@ supports `--version`.
 
 ## `daemon`
 
-Run the proxy in the foreground, or detach to `~/.alexandria/daemon.log`.
+Run the proxy in the foreground, or detach to `~/.alex/daemon.log`.
 
 | Syntax | Important arguments | Example |
 | --- | --- | --- |
@@ -141,7 +141,7 @@ alex connect cliproxyapi --url http://127.0.0.1:8317/v1 --key '<redacted>'
 ```
 
 The fully remote pre-minted form is handled before local config loading, so it
-does not create `~/.alexandria/config.toml` in a worker/container.
+does not create `~/.alex/config.toml` in a worker/container.
 
 `cliproxyapi` is a provider connection rather than a harness connection. Alex
 probes the upstream `/v1/models` endpoint with the bearer credential before it
