@@ -65,16 +65,21 @@ a tag or changes the source worktree.
 - [x] Windows Task Scheduler service support is implemented and is a required
   CI gate.
 - [x] Linux Rust/service/web CI is green on the release candidate (PR run
-  `29794145323`).
+  `29798681461`).
 - [x] Windows Rust/service/web CI is green on the release candidate (PR run
-  `29794145323`).
+  `29798681461`).
 - [x] macOS Rust, Swift, and app-bundle CI are green on the release candidate
-  (PR run `29794145323`).
+  (PR run `29798681461`).
 - [x] macOS packaged clean-machine smoke installs the app and CLI, manages the
   real launchd service, routes through a loopback provider, persists trace
   `ab299c6d-fee4-4f48-b332-d85ee6a76960`, replaces daemon PID `1692` with
   `1921`, and reads the same trace after restart (PR run `29796666004`).
-- [ ] Run the equivalent packaged smoke on Ubuntu x86-64.
+- [x] Ubuntu x86-64 packaged clean-machine smoke downloads and verifies the
+  release-format archive, installs both binaries, manages the real non-root
+  `systemd --user` service, routes through loopback Exo, persists trace
+  `64044200-49f9-48c4-b118-e95e018631f3`, replaces daemon PID `206` with
+  `290`, reads the same trace/body after restart, and removes the isolated
+  service/container (PR run `29798681461`).
 - [ ] Run the equivalent packaged smoke manually on Windows 11 x86-64.
 
 ## Fable to Sol middleware preset
