@@ -9,7 +9,10 @@ SERVICE_NAME="alexandria"
 SERVICE_UNIT="$HOME/.config/systemd/user/alexandria.service"
 STATE_DIR="$HOME/.alexandria"
 BASE_URL="http://127.0.0.1:4100"
-MODEL="ci-upgrade-model"
+# Keep this aligned with the shared deterministic OpenAI mock. The transition
+# itself is identified by the trace/session labels below, not by inventing a
+# model ID that the deliberately strict mock rejects.
+MODEL="ci-smoke-model"
 
 fail() {
   echo "Linux upgrade/rollback smoke: $*" >&2
