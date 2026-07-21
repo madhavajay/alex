@@ -413,6 +413,24 @@ import Testing
         #expect(info.hasSuffix("INFO [ui] x"))
     }
 
+    @Test func appLogDoesNotPreemptLegacyStateMigration() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("alex-bar-log-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(
+            at: home.appendingPathComponent(".alexandria"),
+            withIntermediateDirectories: true)
+
+        #expect(BarLog.stateDirectory(home: home).lastPathComponent == ".alexandria")
+        #expect(!FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".alex").path))
+
+        try FileManager.default.createDirectory(
+            at: home.appendingPathComponent(".alex"),
+            withIntermediateDirectories: true)
+        #expect(BarLog.stateDirectory(home: home).lastPathComponent == ".alex")
+    }
+
     @Test func logRotationDecision() {
         #expect(!BarLog.shouldRotate(fileBytes: 0))
         #expect(!BarLog.shouldRotate(fileBytes: BarLog.maxFileBytes))

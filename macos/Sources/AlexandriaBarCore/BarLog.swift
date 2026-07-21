@@ -18,8 +18,19 @@ public enum BarLog {
     public static let slowThresholdMs: Double = 100
 
     public static var fileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".alex/bar.log")
+        stateDirectory(home: FileManager.default.homeDirectoryForCurrentUser)
+            .appendingPathComponent("bar.log")
+    }
+
+    /// Do not create the new directory ahead of the daemon's atomic migration.
+    /// On an upgrade the menu app can start first; writing its first log to a
+    /// missing `~/.alex` would otherwise make the daemon see two state roots
+    /// and (correctly) refuse to merge them.
+    public static func stateDirectory(home: URL) -> URL {
+        let current = home.appendingPathComponent(".alex", isDirectory: true)
+        if FileManager.default.fileExists(atPath: current.path) { return current }
+        let legacy = home.appendingPathComponent(".alexandria", isDirectory: true)
+        return FileManager.default.fileExists(atPath: legacy.path) ? legacy : current
     }
 
     public static func info(_ category: Category, _ message: String) {

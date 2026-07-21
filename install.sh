@@ -57,6 +57,19 @@ say() {
   echo "$1"
 }
 
+wait_for_daemon_health() {
+  attempts=0
+  while [ "$attempts" -lt 120 ]; do
+    if curl -fsS --max-time 2 "http://$CHECK_HOST:$PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.5
+  done
+  echo "daemon did not become healthy at http://$CHECK_HOST:$PORT/health within 60 seconds" >&2
+  return 1
+}
+
 is_alex_daemon_pid() {
   ps -p "$1" -o command= 2>/dev/null | awk '
     NR == 1 {
@@ -214,7 +227,7 @@ if [ "$UPGRADE" = "1" ]; then
   fi
   say "◆ upgrade complete — old instance drains in-flight requests then exits"
 
-  sleep 1
+  wait_for_daemon_health
   curl -fsS --max-time 5 "http://$CHECK_HOST:$PORT/health" && echo
 fi
 

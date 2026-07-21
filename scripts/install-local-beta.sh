@@ -124,8 +124,19 @@ if [[ -f "$CONFIG" ]]; then
   CONFIG_PORT="$(sed -n 's/^port *= *\([0-9]*\)/\1/p' "$CONFIG" | head -1)"
   PORT="${CONFIG_PORT:-4100}"
 fi
-DAEMON_VERSION="$(curl -fsS --max-time 15 "http://127.0.0.1:$PORT/health" \
-  | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+DAEMON_VERSION=""
+ATTEMPTS=0
+while [[ "$ATTEMPTS" -lt 120 ]]; do
+  HEALTH_JSON="$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  if [[ -n "$HEALTH_JSON" ]]; then
+    DAEMON_VERSION="$(/usr/bin/python3 -c \
+      'import json,sys; print(json.load(sys.stdin).get("version", ""))' \
+      <<<"$HEALTH_JSON" 2>/dev/null || true)"
+    [[ "$DAEMON_VERSION" == "$VERSION" ]] && break
+  fi
+  ATTEMPTS=$((ATTEMPTS + 1))
+  sleep 0.5
+done
 if [[ "$CLI_VERSION" != *"$VERSION"* || "$APP_VERSION" != "$VERSION" \
     || "$DAEMON_VERSION" != "$VERSION" ]]; then
   echo "installed version mismatch: cli='$CLI_VERSION' app='$APP_VERSION' daemon='$DAEMON_VERSION'" >&2
