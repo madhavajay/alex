@@ -58,7 +58,7 @@ import Testing
 
     @Test func canonicalProviderCatalogIncludesEveryProvider() {
         #expect(Set(ProviderInfo.supportedProviders) == Set([
-            "anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"
+            "anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "cliproxyapi", "exo", "amp"
         ]))
     }
 
@@ -466,6 +466,12 @@ import Testing
         #expect(ProviderInfo.displayName("openrouter") == "OpenRouter")
         #expect(ProviderInfo.loginArg("openrouter") == "openrouter")
         #expect(ProviderInfo.pingArg("openrouter") == "openrouter")
+    }
+
+    @Test func cliProxyAPIProviderMetadata() {
+        #expect(ProviderInfo.displayName("cliproxyapi") == "CLIProxyAPI")
+        #expect(ProviderInfo.loginArg("cliproxyapi") == "cliproxyapi")
+        #expect(ProviderInfo.pingArg("cliproxyapi") == "cliproxyapi")
     }
 
     @Test func routingReserveResolutionAndDisplay() {

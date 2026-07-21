@@ -24,6 +24,9 @@ struct OnboardingSupportTests {
         #expect(OnboardingSupport.exampleModel(for: "kimi") == "alex/kimi/k3")
         #expect(OnboardingSupport.exampleModel(for: "gemini") == "alex/gemini-2.5-flash")
         #expect(OnboardingSupport.exampleModel(for: "amp") == "alex/claude-haiku-4-5")
+        #expect(OnboardingSupport.exampleModel(
+            for: "cliproxyapi", cliProxyAPIModels: ["openai/gpt-5"])
+            == "alex/cliproxyapi/openai/gpt-5")
     }
 
     @Test func dynamicExampleModelsPreserveDaemonOrder() {

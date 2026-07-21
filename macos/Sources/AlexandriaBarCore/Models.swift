@@ -19,6 +19,43 @@ public struct AccountsResponse: Codable, Sendable {
     public let accounts: [Account]
 }
 
+public struct CLIProxyAPICapabilities: Codable, Sendable {
+    public let openAIChat: Bool
+    public let openAIResponses: Bool
+    public let anthropicTranslation: Bool
+    public let streaming: Bool
+    public let toolCalls: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case streaming
+        case openAIChat = "openai_chat"
+        case openAIResponses = "openai_responses"
+        case anthropicTranslation = "anthropic_translation"
+        case toolCalls = "tool_calls"
+    }
+}
+
+public struct CLIProxyAPIConnectResponse: Codable, Sendable {
+    public let saved: String
+    public let url: String
+    public let models: [String]
+    public let capabilities: CLIProxyAPICapabilities
+}
+
+public struct CLIProxyAPIStatusResponse: Codable, Sendable {
+    public let connected: Bool
+    public let accountID: String?
+    public let url: String?
+    public let models: [String]
+    public let paused: Bool?
+    public let status: String?
+
+    enum CodingKeys: String, CodingKey {
+        case connected, url, models, paused, status
+        case accountID = "account_id"
+    }
+}
+
 /// A delivery threshold for daemon runtime notifications.
 public enum NotificationLevel: String, Codable, Sendable, CaseIterable {
     case info
@@ -1366,6 +1403,7 @@ public enum ProviderInfo {
         case "kimi": "Kimi"
         case "openrouter": "OpenRouter"
         case "exo": "Exo"
+        case "cliproxyapi": "CLIProxyAPI"
         default: provider.capitalized
         }
     }
@@ -1383,14 +1421,14 @@ public enum ProviderInfo {
 
     public static func pingArg(_ provider: String) -> String? {
         switch provider {
-        case "anthropic", "openai", "gemini", "amp", "kimi", "openrouter", "exo": provider
+        case "anthropic", "openai", "gemini", "amp", "kimi", "openrouter", "exo", "cliproxyapi": provider
         case "xai": "grok"
         default: nil
         }
     }
 
     public static var supportedProviders: [String] {
-        ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "exo", "amp"]
+        ["anthropic", "openai", "gemini", "xai", "kimi", "openrouter", "cliproxyapi", "exo", "amp"]
     }
 }
 

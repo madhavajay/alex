@@ -241,6 +241,36 @@ import Testing
         try await client.removeOpenRouterKey()
     }
 
+    @Test func cliProxyAPIConnectProbesThroughDaemonAndDecodesCapabilities() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/cliproxyapi")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["url"] as? String == "http://127.0.0.1:8317/v1")
+            #expect(json["credential"] as? String == "cpa-secret")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"saved":"cliproxyapi-default","url":"http://127.0.0.1:8317/v1","models":["openai/gpt-5"],"capabilities":{"openai_chat":true,"openai_responses":true,"anthropic_translation":true,"streaming":true,"tool_calls":true}}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let result = try await client.connectCLIProxyAPI(
+            url: "http://127.0.0.1:8317/v1", credential: "cpa-secret")
+        #expect(result.saved == "cliproxyapi-default")
+        #expect(result.models == ["openai/gpt-5"])
+        #expect(result.capabilities.streaming)
+        #expect(result.capabilities.toolCalls)
+    }
+
     @Test func codexRoutingGetsPolicyAndPerAccountWindows() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/accounts/routing/openai")

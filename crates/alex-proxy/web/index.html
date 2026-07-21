@@ -35,7 +35,7 @@
       <div id="accounts" class="cards" aria-live="polite"></div>
       <div id="providers" class="provider-grid"></div>
       <div id="login-flow" class="flow" hidden aria-live="polite"></div>
-      <details>
+      <details id="api-provider-details">
         <summary>API-key and local providers</summary>
         <form id="openrouter-form" class="stack">
           <label>OpenRouter name <input name="display_name" required autocomplete="off"></label>
@@ -46,6 +46,14 @@
           <label>Exo endpoint <input name="url" type="url" value="http://127.0.0.1:52415" required></label>
           <button type="submit">Probe and save Exo</button>
         </form>
+        <form id="cliproxyapi-form" class="stack">
+          <strong>CLIProxyAPI</strong>
+          <span class="muted">Keep your existing proxy setup. Alex probes its model catalogue before saving anything.</span>
+          <label>CLIProxyAPI endpoint <input name="url" type="url" value="http://127.0.0.1:8317/v1" required></label>
+          <label>CLIProxyAPI credential <input name="credential" type="password" required autocomplete="off"></label>
+          <button type="submit">Probe and connect CLIProxyAPI</button>
+        </form>
+        <div id="cliproxyapi-result" class="flow" hidden aria-live="polite"></div>
       </details>
     </section>
 

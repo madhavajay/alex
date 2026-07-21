@@ -66,6 +66,7 @@ public enum OnboardingSupport {
     public static func exampleModel(
         for provider: String?,
         openRouterExposed: [String] = [],
+        cliProxyAPIModels: [String] = [],
         exoModels: [ExoModel] = []
     ) -> String {
         switch provider?.lowercased() {
@@ -80,6 +81,12 @@ public enum OnboardingSupport {
             }
             if first.hasPrefix("alex/") { return first }
             return "alex/openrouter/\(first)"
+        case "cliproxyapi":
+            guard let first = cliProxyAPIModels.first(where: { !$0.isEmpty }) else {
+                return defaultExampleModel
+            }
+            if first.hasPrefix("alex/") { return first }
+            return "alex/cliproxyapi/\(first)"
         case "exo":
             guard let first = exoModels.first(where: \.enabled)?.id, !first.isEmpty else {
                 return defaultExampleModel
@@ -125,6 +132,7 @@ public enum OnboardingSupport {
         case "xai": ["alex/grok-4"]
         case "kimi": ["alex/kimi-k2"]
         case "openrouter": ["alex/openrouter/anthropic/claude-sonnet-4"]
+        case "cliproxyapi": ["alex/cliproxyapi/gpt-4o"]
         case "exo": ["alex/exo/local-model"]
         case "amp": ["alex/claude-sonnet-4"]
         default: ["alex/claude-sonnet-4", "alex/gpt-5"]
@@ -140,6 +148,7 @@ public enum OnboardingSupport {
         case "xai": prefix = "alex/grok-"
         case "kimi": prefix = "alex/kimi-"
         case "openrouter": prefix = "alex/openrouter/"
+        case "cliproxyapi": prefix = "alex/cliproxyapi/"
         case "exo": prefix = "alex/exo/"
         default: prefix = nil
         }

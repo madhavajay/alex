@@ -49,6 +49,11 @@ private struct OpenRouterExposedBody: Encodable {
     let exposed: [String]
 }
 
+private struct CLIProxyAPIConnectBody: Encodable {
+    let url: String
+    let credential: String
+}
+
 private struct FixtureInjectionBody: Encodable {
     let fixture: String
     let count: Int?
@@ -968,5 +973,19 @@ public struct AlexandriaClient: Sendable {
             method: "POST",
             body: body(OpenRouterKeyBody(
                 key: nil, displayName: nil, httpReferer: nil, xTitle: nil, remove: true)))
+    }
+
+    @discardableResult
+    public func connectCLIProxyAPI(
+        url: String, credential: String
+    ) async throws -> CLIProxyAPIConnectResponse {
+        let data = try await request(
+            "admin/auth/cliproxyapi", method: "POST",
+            body: body(CLIProxyAPIConnectBody(url: url, credential: credential)))
+        return try JSONDecoder().decode(CLIProxyAPIConnectResponse.self, from: data)
+    }
+
+    public func cliProxyAPIStatus() async throws -> CLIProxyAPIStatusResponse {
+        try await get("admin/cliproxyapi", as: CLIProxyAPIStatusResponse.self)
     }
 }

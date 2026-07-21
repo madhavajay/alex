@@ -1,4 +1,4 @@
-const state={key:null,cursor:null,traceFilters:{},middleware:null,fixtures:[]};
+const state={key:null,cursor:null,traceFilters:{},middleware:null,fixtures:[],cliproxyapi:null};
 const $=selector=>document.querySelector(selector);
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const display=value=>value===null||value===undefined||value===''?'—':String(value);
@@ -10,7 +10,7 @@ async function bootstrap(){
     const response=await fetch('/connect');
     if(!response.ok)throw new Error('Open this UI from the same machine as Alex.');
     state.key=(await response.json()).api_key;
-    await Promise.all([loadStatus(),loadAccounts()]);
+    await Promise.all([loadStatus(),loadAccounts(),loadCLIProxyAPI()]);
   }catch(error){setDaemon(false,error.message)}
 }
 
@@ -52,9 +52,14 @@ async function loadAccounts(){
   $('#accounts').innerHTML=accounts.length?accounts.map(account=>`<div class="card"><span class="muted">${escapeHtml(account.provider)}</span><strong>${escapeHtml(account.email||account.label||account.name)}</strong><small>${escapeHtml(account.health||account.status||'configured')}</small></div>`).join(''):'<div class="card"><strong>No provider connected</strong><span class="muted">Pick one below to begin.</span></div>';
   const connected=new Map();
   for(const account of accounts)connected.set(account.provider,(connected.get(account.provider)||0)+1);
-  const providers=[['claude','Anthropic'],['codex','OpenAI'],['gemini','Google'],['grok','xAI'],['kimi','Moonshot'],['amp','Amp']];
-  $('#providers').innerHTML=providers.map(([id,label])=>`<button data-provider="${id}"><strong>${label}</strong><span>${connected.get(id)||connected.get(id==='claude'?'anthropic':id==='codex'?'openai':id==='grok'?'xai':id)||0} connected · add another</span></button>`).join('');
-  document.querySelectorAll('[data-provider]').forEach(button=>button.onclick=()=>startLogin(button.dataset.provider));
+  const providers=[['claude','Anthropic','oauth'],['codex','OpenAI','oauth'],['gemini','Google','oauth'],['grok','xAI','oauth'],['kimi','Moonshot','oauth'],['amp','Amp','oauth'],['cliproxyapi','CLIProxyAPI','form']];
+  $('#providers').innerHTML=providers.map(([id,label,mode])=>`<button data-provider="${id}" data-provider-mode="${mode}"><strong>${label}</strong><span>${connected.get(id)||connected.get(id==='claude'?'anthropic':id==='codex'?'openai':id==='grok'?'xai':id)||0} connected · ${mode==='form'?'configure':'add another'}</span></button>`).join('');
+  document.querySelectorAll('[data-provider]').forEach(button=>button.onclick=()=>button.dataset.providerMode==='form'?showProviderForm(button.dataset.provider):startLogin(button.dataset.provider));
+}
+
+function showProviderForm(provider){
+  const details=$('#api-provider-details');details.open=true;
+  const form=$(`#${provider}-form`);if(form){form.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});form.querySelector('input')?.focus()}
 }
 
 async function startLogin(provider){
@@ -77,6 +82,44 @@ async function completeLogin(event,id){event.preventDefault();const input=new Fo
 async function pollLogin(id){for(let attempt=0;attempt<180;attempt++){await new Promise(resolve=>setTimeout(resolve,2000));try{const session=await api(`/admin/auth/login/${encodeURIComponent(id)}`);renderLogin(session);if(session.state!=='pending'){await Promise.all([loadAccounts(),loadStatus()]);return}}catch(error){$('#login-flow').textContent=error.message;return}}}
 async function saveOpenRouter(event){event.preventDefault();const form=new FormData(event.currentTarget);try{await api('/admin/auth/openrouter-key',{method:'POST',body:JSON.stringify(Object.fromEntries(form))});event.currentTarget.reset();await Promise.all([loadAccounts(),loadStatus()])}catch(error){alert(error.message)}}
 async function saveExo(event){event.preventDefault();const url=new FormData(event.currentTarget).get('url');try{await api('/admin/exo',{method:'PUT',body:JSON.stringify({url,enabled_models:[]})});const status=await api('/admin/exo/status');if(!status.running)throw new Error(status.error||'Exo did not respond');await loadStatus()}catch(error){alert(error.message)}}
+
+function renderCLIProxyAPI(result,message){
+  state.cliproxyapi=result;
+  const panel=$('#cliproxyapi-result');panel.hidden=false;
+  const models=result?.models||[];
+  const test=models.length?`<button id="cliproxyapi-test" type="button">Send test request</button>`:'';
+  panel.innerHTML=`<strong>${escapeHtml(message||((result?.connected||result?.saved)?'CLIProxyAPI connected':'CLIProxyAPI is not connected'))}</strong>${result?.url?`<p><code>${escapeHtml(result.url)}</code></p>`:''}<p>${escapeHtml(models.length)} safe model${models.length===1?'':'s'} discovered.</p>${test}<div id="cliproxyapi-test-result" aria-live="polite"></div>`;
+  const button=$('#cliproxyapi-test');if(button)button.onclick=testCLIProxyAPI;
+}
+
+async function loadCLIProxyAPI(){
+  try{const result=await api('/admin/cliproxyapi');if(result.connected)renderCLIProxyAPI(result)}catch(error){console.warn('CLIProxyAPI status unavailable',error)}
+}
+
+async function saveCLIProxyAPI(event){
+  event.preventDefault();const form=event.currentTarget;const values=new FormData(form);const panel=$('#cliproxyapi-result');panel.hidden=false;panel.textContent='Probing CLIProxyAPI…';
+  try{
+    const result=await api('/admin/auth/cliproxyapi',{method:'POST',body:JSON.stringify({url:values.get('url'),credential:values.get('credential')})});
+    form.elements.credential.value='';renderCLIProxyAPI({...result,connected:true},'CLIProxyAPI connected and ready');
+    await Promise.all([loadAccounts(),loadStatus()]);
+  }catch(error){panel.innerHTML=`<strong>CLIProxyAPI connection failed</strong><p class="error-text">${escapeHtml(error.message)}</p>`}
+}
+
+async function testCLIProxyAPI(){
+  const model=state.cliproxyapi?.models?.[0];const output=$('#cliproxyapi-test-result');if(!model||!output)return;
+  output.innerHTML='<p class="muted">Sending a routed test request…</p>';
+  try{
+    const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'authorization':`Bearer ${state.key}`,'content-type':'application/json','x-alexandria-harness':'shared-web-onboarding'},body:JSON.stringify({model:`cliproxyapi/${model}`,stream:false,messages:[{role:'user',content:'Reply with: Alex CLIProxyAPI test received.'}]})});
+    const payload=await response.json().catch(()=>null);const trace=response.headers.get('x-alexandria-trace-id');
+    if(!response.ok)throw new Error(payload?.error?.message||`HTTP ${response.status}`);
+    output.innerHTML=`<p class="chip ok">Test request completed</p>${trace?` <button id="cliproxyapi-open-trace" type="button">Open trace ${escapeHtml(trace)}</button>`:''}`;
+    const open=$('#cliproxyapi-open-trace');if(open)open.onclick=()=>showTrace(trace);
+  }catch(error){output.innerHTML=`<p class="error-text">Test request failed: ${escapeHtml(error.message)}</p>`}
+}
+
+function showTrace(id){
+  const tab=document.querySelector('nav button[data-view="traces"]');if(tab)tab.click();openTrace(id);
+}
 
 function writableRule(rule){
   const {api_version,built_in,hit_count,last_matched_ms,...payload}=rule;
@@ -258,4 +301,5 @@ $('#trace-filters').onsubmit=applyTraceFilters;
 $('#trace-filters').onreset=()=>{state.traceFilters={};state.cursor=null;setTimeout(()=>loadTraces(false),0)};
 $('#openrouter-form').onsubmit=saveOpenRouter;
 $('#exo-form').onsubmit=saveExo;
+$('#cliproxyapi-form').onsubmit=saveCLIProxyAPI;
 bootstrap();

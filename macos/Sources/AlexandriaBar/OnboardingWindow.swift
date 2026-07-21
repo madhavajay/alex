@@ -48,6 +48,9 @@ final class OnboardingModel {
     var openRouterAccountName = ""
     var openRouterAPIKey = ""
     var revealOpenRouterAPIKey = false
+    var cliProxyAPIEndpoint = "http://127.0.0.1:8317/v1"
+    var cliProxyAPICredential = ""
+    var revealCLIProxyAPICredential = false
     var exoEndpoint = "http://localhost:52415"
     var selectedHarness: String?
     var authModel: AuthFlowModel?
@@ -164,7 +167,7 @@ final class OnboardingModel {
         authModel = nil
         selectedProviderAccountID = nil
         providerState = .idle
-        if provider == "openrouter" || provider == "exo" {
+        if provider == "openrouter" || provider == "cliproxyapi" || provider == "exo" {
             addingProviderAccount = true
             return
         }
@@ -271,6 +274,43 @@ final class OnboardingModel {
         }
     }
 
+    func connectCLIProxyAPI() {
+        let endpoint = cliProxyAPIEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let credential = cliProxyAPICredential.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: endpoint), ["http", "https"].contains(url.scheme?.lowercased()) else {
+            providerState = .failure("Enter a valid http:// or https:// CLIProxyAPI endpoint.")
+            return
+        }
+        guard !credential.isEmpty else {
+            providerState = .failure("Enter the CLIProxyAPI credential.")
+            return
+        }
+        guard let config = store.config ?? DaemonDiscovery.load() else {
+            providerState = .failure("The Alex daemon configuration is not available.")
+            return
+        }
+        providerState = .working("Probing CLIProxyAPI capabilities…")
+        Task {
+            do {
+                let result = try await AlexandriaClient(config: config).connectCLIProxyAPI(
+                    url: endpoint, credential: credential)
+                cliProxyAPICredential = ""
+                revealCLIProxyAPICredential = false
+                await refreshStore()
+                guard selectedProvider == "cliproxyapi" else { return }
+                selectedProviderAccountID = result.saved
+                exampleModel = OnboardingSupport.exampleModel(
+                    for: "cliproxyapi", cliProxyAPIModels: result.models)
+                addingProviderAccount = false
+                providerState = .success(
+                    "CLIProxyAPI ready — \(result.models.count) model\(result.models.count == 1 ? "" : "s") found")
+            } catch {
+                guard selectedProvider == "cliproxyapi" else { return }
+                providerState = .failure(error.localizedDescription)
+            }
+        }
+    }
+
     private func resetProviderDependentState() {
         pollTask?.cancel()
         selectedProviderAccountID = nil
@@ -278,6 +318,8 @@ final class OnboardingModel {
         openRouterAccountName = ""
         openRouterAPIKey = ""
         revealOpenRouterAPIKey = false
+        cliProxyAPICredential = ""
+        revealCLIProxyAPICredential = false
         traceState = .idle
         traceCheckRunning = false
         discoveredTrace = nil
@@ -309,6 +351,20 @@ final class OnboardingModel {
     /// daemon sees that subscription before onboarding asks Pi to test it.
     private func completeProviderSelection(_ provider: String, account: Account?) async {
         guard selectedProvider == provider else { return }
+        if provider == "cliproxyapi", let config = store.config ?? DaemonDiscovery.load() {
+            do {
+                let status = try await AlexandriaClient(config: config).cliProxyAPIStatus()
+                guard status.connected, !status.models.isEmpty else {
+                    providerState = .failure("CLIProxyAPI is saved but did not return a usable model catalogue.")
+                    return
+                }
+                exampleModel = OnboardingSupport.exampleModel(
+                    for: provider, cliProxyAPIModels: status.models)
+            } catch {
+                providerState = .failure(error.localizedDescription)
+                return
+            }
+        }
         if provider == "anthropic", store.dario?.routeEnabled != true {
             providerState = .working("Starting Claude subscription routing through Dario…")
             let result = await DaemonController.restartDaemon()
@@ -785,6 +841,12 @@ struct OnboardingView: View {
                 operation(model.providerState)
             } else if let provider = model.selectedProvider,
                       model.addingProviderAccount,
+                      provider == "cliproxyapi"
+            {
+                cliProxyAPIOnboarding
+                operation(model.providerState)
+            } else if let provider = model.selectedProvider,
+                      model.addingProviderAccount,
                       provider == "exo"
             {
                 exoOnboarding
@@ -876,6 +938,46 @@ struct OnboardingView: View {
                     && !model.exoEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                 isBusy: model.providerState.isWorking
             ) { model.connectExo() }
+        }
+        .padding(12)
+        .cardStyle()
+    }
+
+    private var cliProxyAPIOnboarding: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Connect CLIProxyAPI")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("Enter your existing CLIProxyAPI endpoint and credential. Alex probes /v1/models before saving either setting.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            TextField("http://127.0.0.1:8317/v1", text: $model.cliProxyAPIEndpoint)
+                .textFieldStyle(.roundedBorder)
+                .font(AlexTheme.Fonts.mono(11))
+            HStack(spacing: 8) {
+                Group {
+                    if model.revealCLIProxyAPICredential {
+                        TextField("CLIProxyAPI credential", text: $model.cliProxyAPICredential)
+                    } else {
+                        SecureField("CLIProxyAPI credential", text: $model.cliProxyAPICredential)
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+                .font(AlexTheme.Fonts.mono(11))
+                PillButton(
+                    title: model.revealCLIProxyAPICredential ? "Hide" : "Show",
+                    variant: .bordered,
+                    systemImage: model.revealCLIProxyAPICredential ? "eye.slash" : "eye"
+                ) { model.revealCLIProxyAPICredential.toggle() }
+            }
+            PillButton(
+                title: "Probe and connect", variant: .solidAccent,
+                systemImage: "arrow.triangle.branch",
+                isEnabled: !model.providerState.isWorking
+                    && !model.cliProxyAPIEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !model.cliProxyAPICredential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                isBusy: model.providerState.isWorking
+            ) { model.connectCLIProxyAPI() }
         }
         .padding(12)
         .cardStyle()
