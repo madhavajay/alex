@@ -154,12 +154,26 @@ install_linux() {
 
   tar -xzf "$tmp/$asset" -C "$tmp"
   mkdir -p "$INSTALL_DIR"
+  service_was_active=0
+  if command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user is-active --quiet alexandria; then
+    service_was_active=1
+  fi
   install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
   install -m 0755 "$tmp/alexandria" "$INSTALL_DIR/alexandria"
 
   if [ "$NO_SERVICE" = "1" ]; then
     say "Alex is installed; skipped user service registration (ALEX_NO_SERVICE=1)."
   elif "$INSTALL_DIR/alex" service install; then
+    # `systemctl enable --now` starts a fresh service but deliberately does not
+    # restart one that is already active. An upgrade or pinned rollback must
+    # replace that running process as well as the on-disk executable.
+    if [ "$service_was_active" = "1" ]; then
+      if ! "$INSTALL_DIR/alex" service restart; then
+        say "Alex $version was installed, but the running service could not be replaced." >&2
+        exit 1
+      fi
+    fi
     say "Alex is installed and its user service is running."
   else
     say "Alex is installed, but the user service could not be registered."

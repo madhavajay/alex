@@ -27,7 +27,34 @@ RESULT_TMP="$RESULT_PATH.tmp"
 VERSION="${ALEX_CI_LINUX_VERSION:?set ALEX_CI_LINUX_VERSION}"
 ASSET_DIR="${ALEX_CI_LINUX_ASSET_DIR:?set ALEX_CI_LINUX_ASSET_DIR}"
 CONTAINER_NAME="${ALEX_CI_LINUX_CONTAINER_NAME:-alex-linux-installed-smoke}"
+SMOKE_MODE="${ALEX_CI_LINUX_SMOKE_MODE:-installed}"
+BASE_VERSION="${ALEX_CI_LINUX_BASE_VERSION:-}"
+BASE_SHA="${ALEX_CI_LINUX_BASE_SHA:-}"
+CANDIDATE_SHA="${ALEX_CI_LINUX_CANDIDATE_SHA:-}"
 ASSET_NAME="alex-cli-$VERSION-linux-x86_64.tar.gz"
+BASE_ASSET_NAME=""
+
+case "$SMOKE_MODE" in
+  installed)
+    SMOKE_SCRIPT="smoke-installed.sh"
+    ;;
+  upgrade-rollback)
+    SMOKE_SCRIPT="smoke-upgrade-rollback.sh"
+    [[ -n "$BASE_VERSION" ]] || fail "set ALEX_CI_LINUX_BASE_VERSION for upgrade-rollback"
+    [[ -n "$BASE_SHA" ]] || fail "set ALEX_CI_LINUX_BASE_SHA for upgrade-rollback"
+    [[ -n "$CANDIDATE_SHA" ]] || fail "set ALEX_CI_LINUX_CANDIDATE_SHA for upgrade-rollback"
+    [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "upgrade base SHA is invalid"
+    [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "candidate SHA is invalid"
+    [[ "$BASE_SHA" != "$CANDIDATE_SHA" ]] \
+      || fail "base and candidate commits must differ"
+    [[ "$BASE_VERSION" != "$VERSION" ]] \
+      || fail "base and candidate versions must differ"
+    BASE_ASSET_NAME="alex-cli-$BASE_VERSION-linux-x86_64.tar.gz"
+    ;;
+  *)
+    fail "unsupported ALEX_CI_LINUX_SMOKE_MODE: $SMOKE_MODE"
+    ;;
+esac
 
 [[ "$RESULT_PATH" = /* ]] || fail "ALEX_CI_LINUX_SMOKE_RESULT must be absolute"
 [[ "$ASSET_DIR" = /* ]] || fail "ALEX_CI_LINUX_ASSET_DIR must be absolute"
@@ -35,8 +62,12 @@ ASSET_NAME="alex-cli-$VERSION-linux-x86_64.tar.gz"
   || fail "ALEX_CI_LINUX_CONTAINER_NAME contains unsupported characters"
 [[ -f "$ASSET_DIR/$ASSET_NAME" ]] || fail "candidate archive is missing"
 [[ -f "$ASSET_DIR/$ASSET_NAME.sha256" ]] || fail "candidate checksum is missing"
+if [[ -n "$BASE_ASSET_NAME" ]]; then
+  [[ -f "$ASSET_DIR/$BASE_ASSET_NAME" ]] || fail "base archive is missing"
+  [[ -f "$ASSET_DIR/$BASE_ASSET_NAME.sha256" ]] || fail "base checksum is missing"
+fi
 [[ -x "$REPO_ROOT/install-release.sh" ]] || fail "release installer is not executable"
-[[ -x "$SCRIPT_DIR/smoke-installed.sh" ]] || fail "installed smoke is not executable"
+[[ -x "$SCRIPT_DIR/$SMOKE_SCRIPT" ]] || fail "$SMOKE_MODE smoke is not executable"
 [[ -x "$SCRIPT_DIR/serve-assets.py" ]] || fail "asset server is not executable"
 [[ -x "$REPO_ROOT/packaging/ci-macos/mock-openai.py" ]] \
   || fail "shared deterministic OpenAI mock is not executable"
@@ -99,16 +130,30 @@ mkdir -p \
   "$PAYLOAD_ROOT/output"
 cp "$REPO_ROOT/install-release.sh" "$PAYLOAD_ROOT/repo/install-release.sh"
 cp "$SCRIPT_DIR/smoke-installed.sh" "$PAYLOAD_ROOT/repo/packaging/ci-linux/"
+if [[ "$SMOKE_MODE" == "upgrade-rollback" ]]; then
+  cp "$SCRIPT_DIR/smoke-upgrade-rollback.sh" "$PAYLOAD_ROOT/repo/packaging/ci-linux/"
+fi
 cp "$SCRIPT_DIR/serve-assets.py" "$PAYLOAD_ROOT/repo/packaging/ci-linux/"
 cp "$REPO_ROOT/packaging/ci-macos/mock-openai.py" \
   "$PAYLOAD_ROOT/repo/packaging/ci-macos/"
 cp "$ASSET_DIR/$ASSET_NAME" "$ASSET_DIR/$ASSET_NAME.sha256" "$PAYLOAD_ROOT/assets/"
+if [[ -n "$BASE_ASSET_NAME" ]]; then
+  cp "$ASSET_DIR/$BASE_ASSET_NAME" "$ASSET_DIR/$BASE_ASSET_NAME.sha256" \
+    "$PAYLOAD_ROOT/assets/"
+fi
 
 docker build \
   --platform linux/amd64 \
   --file "$DOCKERFILE" \
   --tag "$IMAGE_TAG" \
   "$SCRIPT_DIR"
+
+CONTAINER_NETWORK_ARGS=()
+if [[ "$SMOKE_MODE" == "upgrade-rollback" ]]; then
+  # A and B are copied into the container before it starts. Disable external
+  # networking so every installer and provider request is provably loopback.
+  CONTAINER_NETWORK_ARGS+=(--network none)
+fi
 
 docker run \
   --detach \
@@ -119,6 +164,7 @@ docker run \
   --tmpfs /run \
   --tmpfs /run/lock \
   --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
+  "${CONTAINER_NETWORK_ARGS[@]}" \
   "$IMAGE_TAG" >/dev/null
 CONTAINER_STARTED=1
 
@@ -160,8 +206,11 @@ user_exec env \
   "ALEX_CI_LINUX_SMOKE_ROOT=$CONTAINER_ROOT" \
   "ALEX_CI_LINUX_SMOKE_RESULT=$CONTAINER_RESULT" \
   "ALEX_CI_LINUX_VERSION=$VERSION" \
+  "ALEX_CI_LINUX_BASE_VERSION=$BASE_VERSION" \
+  "ALEX_CI_LINUX_BASE_SHA=$BASE_SHA" \
+  "ALEX_CI_LINUX_CANDIDATE_SHA=$CANDIDATE_SHA" \
   "ALEX_CI_LINUX_ASSET_DIR=$CONTAINER_PAYLOAD/assets" \
-  "$CONTAINER_PAYLOAD/repo/packaging/ci-linux/smoke-installed.sh"
+  "$CONTAINER_PAYLOAD/repo/packaging/ci-linux/$SMOKE_SCRIPT"
 
 mkdir -p "$(dirname "$RESULT_PATH")"
 docker cp "$CONTAINER_NAME:$CONTAINER_RESULT" "$RESULT_TMP"

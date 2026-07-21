@@ -140,8 +140,11 @@ a tag or changes the source worktree.
   instead of blocking onboarding.
 - [ ] Build, install, and record the final `0.1.29-beta.N` candidate.
 - [ ] Complete the full clean-user launch story on every supported platform.
+- [x] Gate Linux pull requests with local release-format A → B → A packages,
+  managed-service replacement, and state/trace preservation evidence.
 - [ ] Stamp `0.1.29`, generate signed/notarized release assets, publish stable
-  update metadata, and verify upgrade/rollback behavior.
+  update metadata, and verify upgrade/rollback using the actual previous stable
+  and signed candidate packages on every supported platform.
 
 ## Current checkpoint
 
