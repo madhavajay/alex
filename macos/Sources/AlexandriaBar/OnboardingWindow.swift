@@ -54,6 +54,10 @@ final class OnboardingModel {
     var exoEndpoint = "http://localhost:52415"
     var selectedHarness: String?
     var authModel: AuthFlowModel?
+    var credentialImportCandidates: [CredentialImportCandidate] = []
+    var selectedCredentialImports: Set<String> = []
+    var credentialImportCandidatesLoaded = false
+    var credentialImportCandidatesLoading = false
     var providerState: OperationState = .idle
     var harnessPlanState: OperationState = .idle
     var harnessPlan: [HarnessPlanStep] = []
@@ -121,7 +125,99 @@ final class OnboardingModel {
             // another one.
             return
         }
+        if !credentialImportCandidatesLoaded || !importCandidates(for: provider).isEmpty {
+            // Discovery is read-only. Keep the choice visible until the user
+            // explicitly confirms an import or chooses a fresh browser flow.
+            return
+        }
         addProviderAccount()
+    }
+
+    func loadCredentialImportCandidates() async {
+        guard !credentialImportCandidatesLoaded, !credentialImportCandidatesLoading else { return }
+        guard let config = store.config ?? DaemonDiscovery.load() else { return }
+        credentialImportCandidatesLoading = true
+        defer { credentialImportCandidatesLoading = false }
+        do {
+            let response = try await AlexandriaClient(config: config).credentialImportCandidates()
+            credentialImportCandidates = response.candidates
+            selectedCredentialImports = Set(response.candidates.map(\.source))
+            credentialImportCandidatesLoaded = true
+            if let provider = selectedProvider,
+               accounts(for: provider).isEmpty,
+               importCandidates(for: provider).isEmpty,
+               authModel == nil,
+               !addingProviderAccount
+            {
+                addProviderAccount()
+            }
+        } catch {
+            // Discovery is a convenience and must never block a normal login.
+            credentialImportCandidatesLoaded = true
+            if let provider = selectedProvider,
+               accounts(for: provider).isEmpty,
+               authModel == nil,
+               !addingProviderAccount
+            {
+                addProviderAccount()
+            }
+        }
+    }
+
+    func importCandidates(for provider: String) -> [CredentialImportCandidate] {
+        credentialImportCandidates.filter { $0.provider == provider }
+    }
+
+    func credentialImportBinding(_ source: String) -> Binding<Bool> {
+        Binding {
+            self.selectedCredentialImports.contains(source)
+        } set: { selected in
+            if selected {
+                self.selectedCredentialImports.insert(source)
+            } else {
+                self.selectedCredentialImports.remove(source)
+            }
+        }
+    }
+
+    func importDetectedCredentials(for provider: String) {
+        let selected = importCandidates(for: provider).filter {
+            selectedCredentialImports.contains($0.source)
+        }
+        guard !selected.isEmpty else {
+            providerState = .failure("Select a detected credential to import, or connect a new account.")
+            return
+        }
+        guard let config = store.config ?? DaemonDiscovery.load() else {
+            providerState = .failure("The Alex daemon configuration is not available.")
+            return
+        }
+        providerState = .working("Importing the selected credential…")
+        Task {
+            do {
+                var importedIDs: [String] = []
+                var notes: [String] = []
+                for candidate in selected {
+                    let outcomes = try await AlexandriaClient(config: config)
+                        .authImport(source: candidate.source)
+                    importedIDs.append(contentsOf: outcomes.flatMap(\.imported))
+                    notes.append(contentsOf: outcomes.compactMap(\.note))
+                }
+                await refreshStore()
+                guard selectedProvider == provider else { return }
+                guard let account = importedIDs.compactMap({ id in
+                    store.accounts.first { $0.id == id }
+                }).first ?? store.accounts.last(where: { $0.provider == provider }) else {
+                    throw OnboardingSetupError.message(
+                        notes.first ?? "The detected credential could not be imported.")
+                }
+                selectedProviderAccountID = account.id
+                await completeProviderSelection(provider, account: account)
+            } catch {
+                guard selectedProvider == provider else { return }
+                providerState = .failure(error.localizedDescription)
+            }
+        }
     }
 
     func clearProviderSelection() {
@@ -778,6 +874,7 @@ struct OnboardingView: View {
             if direction == .left { model.back() }
             if direction == .right { model.next() }
         }
+        .task { await model.loadCredentialImportCandidates() }
     }
 
     private func scrollToStepTop(_ proxy: ScrollViewProxy) {
@@ -849,11 +946,14 @@ struct OnboardingView: View {
             ) {
                 ForEach(ProviderInfo.supportedProviders, id: \.self) { provider in
                     let connectedCount = model.accounts(for: provider).count
+                    let detectedCount = model.importCandidates(for: provider).count
                     choiceButton(
                         title: ProviderInfo.displayName(provider),
                         subtitle: provider == model.selectedProvider
                             ? "Selected"
-                            : (connectedCount > 0 ? "\(connectedCount) connected" : "Connect"),
+                            : (connectedCount > 0
+                                ? "\(connectedCount) connected"
+                                : (detectedCount > 0 ? "Detected login" : "Connect")),
                         icon: ProviderInfo.loginArg(provider), selected: provider == model.selectedProvider
                     ) { model.chooseProvider(provider) }
                 }
@@ -880,6 +980,24 @@ struct OnboardingView: View {
                 AuthFlowView(model: authModel, close: {}, embedded: true)
                     .padding(.top, 4)
                     .cardStyle()
+            } else if let provider = model.selectedProvider,
+                      model.accounts(for: provider).isEmpty,
+                      !model.credentialImportCandidatesLoaded
+            {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking for existing provider logins…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                .padding(12)
+                .cardStyle()
+            } else if let provider = model.selectedProvider,
+                      model.accounts(for: provider).isEmpty,
+                      !model.importCandidates(for: provider).isEmpty
+            {
+                detectedCredentialChooser(provider)
+                operation(model.providerState)
             } else if let provider = model.selectedProvider,
                       !model.accounts(for: provider).isEmpty
             {
@@ -1039,6 +1157,26 @@ struct OnboardingView: View {
                 .buttonStyle(.plain)
             }
 
+            if !model.importCandidates(for: provider).isEmpty {
+                Divider().overlay(AlexTheme.Colors.cardBorder)
+                Text("Detected outside Alex")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(AlexTheme.Colors.textSecondary)
+                Text("These remain owned by their original apps. Alex imports only the credentials you leave checked.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                detectedCredentialRows(provider)
+                PillButton(
+                    title: "Import checked credential", variant: .bordered,
+                    systemImage: "square.and.arrow.down",
+                    isEnabled: !model.providerState.isWorking
+                        && model.importCandidates(for: provider).contains {
+                            model.selectedCredentialImports.contains($0.source)
+                        },
+                    isBusy: model.providerState.isWorking
+                ) { model.importDetectedCredentials(for: provider) }
+            }
+
             PillButton(
                 title: "Add another \(ProviderInfo.displayName(provider)) account",
                 variant: .bordered, systemImage: "plus"
@@ -1046,6 +1184,53 @@ struct OnboardingView: View {
         }
         .padding(12)
         .cardStyle()
+    }
+
+    private func detectedCredentialChooser(_ provider: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Existing login detected")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AlexTheme.Colors.foreground)
+            Text("Choose whether Alex may import it. Reset never deletes credentials owned by another app.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+            detectedCredentialRows(provider)
+            HStack(spacing: 8) {
+                PillButton(
+                    title: "Import checked credential", variant: .solidAccent,
+                    systemImage: "square.and.arrow.down",
+                    isEnabled: !model.providerState.isWorking
+                        && model.importCandidates(for: provider).contains {
+                            model.selectedCredentialImports.contains($0.source)
+                        },
+                    isBusy: model.providerState.isWorking
+                ) { model.importDetectedCredentials(for: provider) }
+                PillButton(
+                    title: "Connect a new account", variant: .bordered,
+                    systemImage: "plus", isEnabled: !model.providerState.isWorking
+                ) { model.addProviderAccount() }
+            }
+        }
+        .padding(12)
+        .cardStyle()
+    }
+
+    @ViewBuilder
+    private func detectedCredentialRows(_ provider: String) -> some View {
+        ForEach(model.importCandidates(for: provider)) { candidate in
+            Toggle(isOn: model.credentialImportBinding(candidate.source)) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(candidate.label)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    Text("\(candidate.kind.replacingOccurrences(of: "_", with: " ")) · \(candidate.sourcePath)")
+                        .font(AlexTheme.Fonts.metaLabel)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+            .toggleStyle(.checkbox)
+        }
     }
 
     private var stagedConnect: some View {

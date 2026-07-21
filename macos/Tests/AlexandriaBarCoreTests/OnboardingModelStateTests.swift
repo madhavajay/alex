@@ -7,11 +7,15 @@ import Testing
 @MainActor
 @Suite struct OnboardingModelStateTests {
     private func makeModel() -> OnboardingModel {
-        OnboardingModel(
+        let model = OnboardingModel(
             store: SnapshotStore(),
             openProviderSettings: {},
             openTraceBrowser: { _ in },
             finish: {})
+        // Unit tests do not run the view's discovery task. Mark discovery as
+        // complete unless a test is specifically exercising detected logins.
+        model.credentialImportCandidatesLoaded = true
+        return model
     }
 
     private func account(
@@ -114,6 +118,23 @@ import Testing
         #expect(model.addingProviderAccount)
         #expect(model.providerState == .idle)
         #expect(model.traceState == .idle)
+    }
+
+    @Test func detectedCredentialRequiresExplicitImportChoice() throws {
+        let model = makeModel()
+        let response = try JSONDecoder().decode(
+            CredentialImportCandidatesResponse.self,
+            from: Data(
+                #"{"candidates":[{"source":"amp","provider":"amp","label":"Amp","kind":"api_key","source_path":"~/.local/share/amp/secrets.json","requires_confirmation":true}],"requires_confirmation":true}"#.utf8))
+        model.credentialImportCandidates = response.candidates
+        model.selectedCredentialImports = Set(response.candidates.map(\.source))
+
+        model.chooseProvider("amp")
+
+        #expect(model.selectedProvider == "amp")
+        #expect(model.authModel == nil)
+        #expect(!model.addingProviderAccount)
+        #expect(model.selectedCredentialImports == ["amp"])
     }
 
     @Test func supportedOnboardingWidthUsesThreeProviderColumnsAndRoomyChips() {
