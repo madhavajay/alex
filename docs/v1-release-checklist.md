@@ -64,9 +64,12 @@ a tag or changes the source worktree.
   persistence, and restart recovery.
 - [x] Windows Task Scheduler service support is implemented and is a required
   CI gate.
-- [ ] Linux Rust/service/web CI is green on the release candidate.
-- [ ] Windows Rust/service/web CI is green on the release candidate.
-- [ ] macOS Rust, Swift, and app-bundle CI are green on the release candidate.
+- [x] Linux Rust/service/web CI is green on the release candidate (PR run
+  `29794145323`).
+- [x] Windows Rust/service/web CI is green on the release candidate (PR run
+  `29794145323`).
+- [x] macOS Rust, Swift, and app-bundle CI are green on the release candidate
+  (PR run `29794145323`).
 - [ ] Run clean-machine install/start/connect/route/trace/restart smoke tests on
   macOS, Ubuntu x86-64, and Windows 11 x86-64.
 
@@ -123,9 +126,10 @@ a tag or changes the source worktree.
 
 ## Current checkpoint
 
-- Installed checkpoint: `0.1.29-beta.12` at `4420271` (CLI, Alex.app,
-  launchd service path, daemon health, Dario, and live Pi → Opus route
-  verified; this is not yet the final release candidate).
+- Installed checkpoint: `0.1.29-beta.13` at `193ea40` (CLI, Alex.app,
+  launchd service path, single listener, daemon health, Dario, and
+  `/v1/models` owner metadata verified; this is not yet the final release
+  candidate).
 - Branch: `v1/integration`
 - Draft PR: <https://github.com/madhavajay/alex/pull/26>
 - Combined local gates: Rust workspace and all targets pass; Swift passes 298
