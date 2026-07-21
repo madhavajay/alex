@@ -1,4 +1,5 @@
 const state={key:null,cursor:null,traceFilters:{},middleware:null,fixtures:[],cliproxyapi:null};
+const TURN_PAGE_SIZE=20;
 const $=selector=>document.querySelector(selector);
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const display=value=>value===null||value===undefined||value===''?'—':String(value);
@@ -272,15 +273,42 @@ async function loadTraceBody(id,node){
   try{output.textContent=await apiText(`/traces/${encodeURIComponent(id)}/body/${encodeURIComponent(node.dataset.bodyKind)}`)}catch(error){output.textContent=`Could not load body: ${error.message}`}
 }
 
-function renderTurn(turn,index){
-  const assistant=turn.assistant||parseList(turn.assistant_blocks).filter(block=>block.type==='text').map(block=>block.text).join('\n\n');
-  return `<article class="turn"><h5>Turn ${index+1}</h5>${turn.user?`<div><strong>User</strong><pre>${escapeHtml(turn.user)}</pre></div>`:''}${assistant?`<div><strong>Assistant</strong><pre>${escapeHtml(assistant)}</pre></div>`:''}${facts([['Trace',turn.trace_id],['Model',turn.model||turn.served_model],['Status',turn.status]])}</article>`;
+function renderExecutedTools(tools){
+  if(!tools?.length)return '';
+  return `<div class="executed-tools"><h6>Executed tools</h6>${tools.map(tool=>{const args=typeof tool.arguments==='string'?tool.arguments:JSON.stringify(tool.arguments,null,2);return `<details><summary>${escapeHtml(tool.tool_name||'tool')} ${tool.is_error?'<span class="error-text">error</span>':''}</summary>${args?`<strong>Arguments</strong><pre>${escapeHtml(args)}</pre>`:''}${tool.result?`<strong>Result</strong><pre>${escapeHtml(tool.result)}</pre>`:''}</details>`}).join('')}</div>`;
 }
 
-async function loadTranscript(node){
-  node.dataset.loaded='true';const target=node.querySelector('div');target.textContent='Loading turns…';
-  try{const data=await api(`/traces/sessions/${encodeURIComponent(node.dataset.transcript)}/transcript?limit=100`);target.innerHTML=(data.turns||[]).map(renderTurn).join('')||'<p class="muted">No turns found.</p>'}catch(error){target.textContent=`Could not load turns: ${error.message}`}
+function renderTurn(turn){
+  const assistant=turn.assistant||parseList(turn.assistant_blocks).filter(block=>block.type==='text').map(block=>block.text).join('\n\n');
+  return `<article class="turn">${turn.user?`<div><strong>User</strong><pre>${escapeHtml(turn.user)}</pre></div>`:''}${assistant?`<div><strong>Assistant</strong><pre>${escapeHtml(assistant)}</pre></div>`:''}${renderExecutedTools(turn.executed_tools)}${facts([['Trace',turn.trace_id],['Model',turn.model||turn.served_model],['Status',turn.status],['Input tokens',turn.input_tokens],['Output tokens',turn.output_tokens]])}</article>`;
 }
+
+function renderTurnSummary(turn){
+  return `<details class="turn-summary" data-turn-trace="${escapeHtml(turn.trace_id)}"><summary><span><code>${escapeHtml(turn.model||turn.trace_id)}</code> · ${escapeHtml(turn.provider||'unrouted')}</span><span>${escapeHtml(turn.status??'—')} · ${escapeHtml(formatTime(turn.ts_request_ms))}</span></summary><div class="turn-detail muted">Open to load only this turn.</div></details>`;
+}
+
+function replaceTranscriptPage(target,html){target.replaceChildren();target.insertAdjacentHTML('afterbegin',html)}
+
+async function loadTranscriptTurn(node){
+  node.dataset.loaded='true';const target=node.querySelector('.turn-detail');target.textContent='Loading this turn…';
+  try{const data=await api(`/traces/${encodeURIComponent(node.dataset.turnTrace)}/turn`);target.classList.remove('muted');target.innerHTML=renderTurn(data.turn)}catch(error){delete node.dataset.loaded;target.textContent=`Could not load turn: ${error.message}`}
+}
+
+async function loadTranscriptPage(node,cursor){
+  const target=node.querySelector('.session-turns');target.textContent='Loading a bounded page…';
+  const params=new URLSearchParams({limit:String(TURN_PAGE_SIZE)});if(cursor){params.set('after_ms',cursor.after_ms);params.set('after_id',cursor.after_id)}
+  try{
+    const data=await api(`/traces/sessions/${encodeURIComponent(node.dataset.transcript)}/transcript/page?${params}`);
+    const turns=(data.turns||[]).map(renderTurnSummary).join('')||'<p class="muted">No turns found.</p>';
+    const controls=`<div class="turn-page-controls"><button data-turn-previous ${node._pageIndex?'':'disabled'}>Previous page</button><span>Page ${node._pageIndex+1} · up to ${TURN_PAGE_SIZE} turns</span><button data-turn-next ${data.has_more?'':'disabled'}>Next page</button></div>`;
+    replaceTranscriptPage(target,`${turns}${controls}`);
+    target.querySelectorAll('[data-turn-trace]').forEach(turn=>turn.ontoggle=()=>{if(turn.open&&!turn.dataset.loaded)loadTranscriptTurn(turn)});
+    target.querySelector('[data-turn-previous]').onclick=()=>{if(node._pageIndex>0){node._pageIndex-=1;loadTranscriptPage(node,node._pageStarts[node._pageIndex])}};
+    target.querySelector('[data-turn-next]').onclick=()=>{if(data.next_cursor){node._pageStarts=node._pageStarts.slice(0,node._pageIndex+1);node._pageStarts.push(data.next_cursor);node._pageIndex+=1;loadTranscriptPage(node,data.next_cursor)}};
+  }catch(error){target.textContent=`Could not load turns: ${error.message}`}
+}
+
+async function loadTranscript(node){node.dataset.loaded='true';node._pageStarts=[null];node._pageIndex=0;const holder=node.querySelector('div');holder.className='session-turns';await loadTranscriptPage(node,null)}
 
 function applyTraceFilters(event){
   event.preventDefault();const values=new FormData(event.currentTarget);state.traceFilters={};

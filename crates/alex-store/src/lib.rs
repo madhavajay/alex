@@ -566,6 +566,19 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     }))
 }
 
+fn tool_call_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
+        "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
+        "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
+        "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
+        "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+        "exit_status": r.get::<_, Option<i64>>(9)?,
+        "args_body_path": r.get::<_, Option<String>>(10)?,
+        "result_body_path": r.get::<_, Option<String>>(11)?,
+    }))
+}
+
 fn annotate_trace_accounts(conn: &Connection, rows: &mut [Value]) -> Result<()> {
     for row in rows {
         let identity = row["subscription_identity"].as_str();
@@ -2043,6 +2056,37 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Stable ascending page of one session's trace metadata. This is separate
+    /// from `session_traces` so new browser clients cannot accidentally load an
+    /// unbounded session before applying their page limit.
+    pub fn session_trace_page(
+        &self,
+        session_id: &str,
+        after_ms: Option<i64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = format!("SELECT {TRACE_COLS} FROM traces WHERE session_id = ?");
+        let mut args = vec![session_id.to_string()];
+        if let Some(after_ms) = after_ms {
+            if let Some(after_id) = after_id {
+                sql.push_str(" AND (ts_request_ms > ? OR (ts_request_ms = ? AND id > ?))");
+                args.push(after_ms.to_string());
+                args.push(after_ms.to_string());
+                args.push(after_id.to_string());
+            } else {
+                sql.push_str(" AND ts_request_ms > ?");
+                args.push(after_ms.to_string());
+            }
+        }
+        sql.push_str(" ORDER BY ts_request_ms ASC, id ASC LIMIT ?");
+        args.push(effective_limit(limit).to_string());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
     pub fn get_trace(&self, id: &str) -> Result<Option<Value>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -2408,18 +2452,21 @@ impl Store {
                     ts_end_ms, is_error, exit_status, args_body_path, result_body_path
              FROM tool_calls WHERE session_id=?1 ORDER BY ts_start_ms ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| {
-            Ok(json!({
-                "id": r.get::<_, String>(0)?, "session_id": r.get::<_, String>(1)?,
-                "turn_id": r.get::<_, Option<String>>(2)?, "tool_call_id": r.get::<_, String>(3)?,
-                "trace_id": r.get::<_, Option<String>>(4)?, "tool_name": r.get::<_, String>(5)?,
-                "ts_start_ms": r.get::<_, i64>(6)?, "ts_end_ms": r.get::<_, Option<i64>>(7)?,
-                "is_error": r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
-                "exit_status": r.get::<_, Option<i64>>(9)?,
-                "args_body_path": r.get::<_, Option<String>>(10)?,
-                "result_body_path": r.get::<_, Option<String>>(11)?,
-            }))
-        })?;
+        let rows = stmt.query_map(params![session_id], tool_call_row_json)?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Tool metadata explicitly linked to one trace. Callers may then decide
+    /// whether to open only these tools' body files; unrelated session tools
+    /// are never selected.
+    pub fn trace_tool_calls(&self, trace_id: &str) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_id, tool_call_id, trace_id, tool_name, ts_start_ms,
+                    ts_end_ms, is_error, exit_status, args_body_path, result_body_path
+             FROM tool_calls WHERE trace_id=?1 ORDER BY ts_start_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![trace_id], tool_call_row_json)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
@@ -3690,6 +3737,34 @@ mod tests {
     }
 
     #[test]
+    fn session_trace_pages_are_bounded_and_cursor_stable() {
+        let store = Store::open(tmpdir("session-trace-pages")).unwrap();
+        for index in 0..205 {
+            let id = format!("trace-{index:03}");
+            let mut row = trace(&id, 1_000 + (index / 3) as i64, None);
+            row.session_id = Some("large-session".into());
+            row.req_body_path = Some(format!("/must-not-open/{id}.request.gz"));
+            store.insert_trace(&row).unwrap();
+        }
+
+        let first = store
+            .session_trace_page("large-session", None, None, 25)
+            .unwrap();
+        assert_eq!(first.len(), 25);
+        assert_eq!(first[0]["id"], "trace-000");
+        assert_eq!(first[24]["id"], "trace-024");
+        let cursor_ms = first[24]["ts_request_ms"].as_i64().unwrap();
+        let cursor_id = first[24]["id"].as_str().unwrap();
+        let second = store
+            .session_trace_page("large-session", Some(cursor_ms), Some(cursor_id), 25)
+            .unwrap();
+        assert_eq!(second.len(), 25);
+        assert_eq!(second[0]["id"], "trace-025");
+        assert_eq!(second[24]["id"], "trace-049");
+        assert!(first.iter().all(|row| row["session_id"] == "large-session"));
+    }
+
+    #[test]
     fn tool_calls_join_sessions_and_share_reset_body_accounting() {
         let store = Store::open(tmpdir("tool-calls")).unwrap();
         let args = store
@@ -3726,6 +3801,37 @@ mod tests {
         store.clear_traces_and_bodies().unwrap();
         assert!(store.session_tool_calls("session").unwrap().is_empty());
         assert_eq!(store.reset_counts().unwrap().body_files, 0);
+    }
+
+    #[test]
+    fn trace_tool_calls_never_include_an_unrelated_turn() {
+        let store = Store::open(tmpdir("trace-tool-calls")).unwrap();
+        for (id, trace_id, started) in [
+            ("tool-first", "trace-first", 10),
+            ("tool-second", "trace-second", 20),
+        ] {
+            store
+                .upsert_tool_call(&ToolCallRecord {
+                    id: id.into(),
+                    harness: "pi".into(),
+                    session_id: "shared-session".into(),
+                    turn_id: None,
+                    tool_call_id: id.into(),
+                    trace_id: Some(trace_id.into()),
+                    tool_name: "bash".into(),
+                    ts_start_ms: started,
+                    ts_end_ms: Some(started + 1),
+                    is_error: Some(false),
+                    exit_status: Some(0),
+                    args_body_path: Some(format!("/must-not-open/{id}.args.gz")),
+                    result_body_path: Some(format!("/must-not-open/{id}.result.gz")),
+                })
+                .unwrap();
+        }
+        let first = store.trace_tool_calls("trace-first").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["id"], "tool-first");
+        assert_eq!(first[0]["trace_id"], "trace-first");
     }
 
     #[test]

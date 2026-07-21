@@ -32,7 +32,8 @@ This preview includes:
 - cursor-paginated trace summaries (25 at a time, maximum 100 per request);
 - metadata filters for model, provider, harness, status, and errors;
 - per-trace summary, provenance, attempts, and middleware decisions;
-- explicit lazy loading of individual request/response bodies and session transcripts.
+- bounded, cursor-paginated session turns (20 at a time), with request/response
+  bodies and tool data loaded only when one turn is expanded.
 
 The menu-bar app and native notifications remain macOS-only. Linux uses the systemd user service; Windows uses a per-user Task Scheduler entry. Both are managed with `alex service install`, `alex service restart`, and `alex service uninstall`. The CI Windows job remains advisory until a clean Windows 11 runner has exercised install, restart, routing, and trace inspection end to end.
 
@@ -40,7 +41,16 @@ The menu-bar app and native notifications remain macOS-only. Linux uses the syst
 
 The static assets are served directly by the daemon under `/ui/`; there is no separate web server or build-time service. Administrative calls require the normal local key.
 
-`GET /traces/summaries` is the bounded list endpoint used by the page. It accepts `limit` (1–100), the normal trace filters, and an optional stable `before_ms` + `before_id` cursor returned as `next_cursor`. It never returns captured bodies. Open body-free detail with `GET /traces/{id}/metadata`; fetch a body with `GET /traces/{id}/body/{kind}` or a transcript with `GET /traces/sessions/{session_id}/transcript` only when its disclosure is opened.
+`GET /traces/summaries` is the bounded list endpoint used by the page. It accepts `limit` (1–100), the normal trace filters, and an optional stable `before_ms` + `before_id` cursor returned as `next_cursor`. It never returns captured bodies. Open body-free detail with `GET /traces/{id}/metadata` and fetch one body with `GET /traces/{id}/body/{kind}`.
+
+Session history uses `GET /traces/sessions/{session_id}/transcript/page`, with a
+limit of 1–50 and the returned `after_ms` + `after_id` cursor. Page rows contain
+metadata and body-presence flags only. Expanding a row calls
+`GET /traces/{id}/turn`, which reads only that trace's request, response, and
+trace-linked tool payloads. The browser replaces the current 20-row page rather
+than accumulating every turn in the DOM. The original
+`GET /traces/sessions/{session_id}/transcript` endpoint remains available for
+older clients.
 
 The Middleware view reads `GET /admin/middleware` and `GET /admin/fixtures`. Toggling a rule replaces its canonical rule document through `PUT /admin/middleware/rules/{id}`. A dry-run calls `POST /admin/middleware/test` against one named fixture; testing a disabled rule does not enable it in the live runtime.
 

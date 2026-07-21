@@ -1979,7 +1979,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/traces/sessions/{session_id}/transcript",
             get(traces_session_transcript),
         )
+        .route(
+            "/traces/sessions/{session_id}/transcript/page",
+            get(traces_session_transcript_page),
+        )
         .route("/traces/{id}/metadata", get(trace_metadata))
+        .route("/traces/{id}/turn", get(trace_turn))
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/{id}/body/{kind}", get(trace_body))
@@ -5258,7 +5263,24 @@ fn wants_bodies(q: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+static TEST_BODY_FILE_READS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn test_body_file_reads_under(root: &std::path::Path) -> Vec<String> {
+    TEST_BODY_FILE_READS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|path| std::path::Path::new(path).starts_with(root))
+        .cloned()
+        .collect()
+}
+
 fn read_gz_file(path: &str) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    TEST_BODY_FILE_READS.lock().unwrap().push(path.to_string());
     let file = std::fs::File::open(path).ok()?;
     let mut decoder = flate2::read::GzDecoder::new(file);
     let mut buf = Vec::new();
@@ -6250,6 +6272,131 @@ async fn traces_session_transcript(
     let tab_counts = transcript_tab_counts(&turns);
     axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
         .into_response()
+}
+
+const TRANSCRIPT_PAGE_DEFAULT: usize = 20;
+const TRANSCRIPT_PAGE_MAX: usize = 50;
+
+fn transcript_turn_metadata(row: &Value) -> Value {
+    json!({
+        "trace_id": row["id"],
+        "ts_request_ms": row["ts_request_ms"],
+        "ts_response_ms": row["ts_response_ms"],
+        "harness": row["harness"],
+        "model": row["routed_model"],
+        "provider": row["upstream_provider"],
+        "status": row["status"],
+        "input_tokens": row["input_tokens"],
+        "output_tokens": row["output_tokens"],
+        "error": row["error"],
+        "error_kind": row["error_kind"],
+        "streamed": row["streamed"],
+        "has_request": row["req_body_path"].as_str().is_some(),
+        "has_response": row["resp_body_path"].as_str().is_some(),
+    })
+}
+
+/// Body-free, bounded transcript metadata. The original `/transcript` route
+/// remains unchanged for compatibility; the shared web browser uses this
+/// stable ascending cursor and opens one full turn explicitly.
+async fn traces_session_transcript_page(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match query.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(TRANSCRIPT_PAGE_MAX),
+            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+        },
+        None => TRANSCRIPT_PAGE_DEFAULT,
+    };
+    let after_ms = match query.get("after_ms") {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "after_ms must be an integer"),
+        },
+        None => None,
+    };
+    let after_id = query.get("after_id").map(String::as_str);
+    if after_ms.is_some() != after_id.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "after_ms and after_id must be provided together",
+        );
+    }
+    if after_id.is_some_and(|id| id.is_empty() || id.len() > 200) {
+        return error_response(StatusCode::BAD_REQUEST, "after_id is invalid");
+    }
+
+    let mut rows = match state
+        .store
+        .session_trace_page(&session_id, after_ms, after_id, limit + 1)
+    {
+        Ok(rows) => rows,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last().map(|row| {
+            json!({
+                "after_ms": row["ts_request_ms"],
+                "after_id": row["id"],
+            })
+        })
+    } else {
+        None
+    };
+    let turns = rows
+        .iter()
+        .map(transcript_turn_metadata)
+        .collect::<Vec<_>>();
+    axum::Json(json!({
+        "session_id": session_id,
+        "turns": turns,
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }))
+    .into_response()
+}
+
+fn expanded_turn_tool(mut tool: Value) -> Value {
+    let arguments = tool["args_body_path"]
+        .as_str()
+        .and_then(|path| read_gz_text(Some(path)))
+        .map(|text| truncate_chars(text, 2_000))
+        .map(|text| serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!(text)));
+    let result = tool["result_body_path"]
+        .as_str()
+        .and_then(|path| read_gz_text(Some(path)))
+        .map(|text| truncate_chars(text, 8_000));
+    if let Some(object) = tool.as_object_mut() {
+        object.remove("args_body_path");
+        object.remove("result_body_path");
+        object.insert("arguments".into(), json!(arguments));
+        object.insert("result".into(), json!(result));
+    }
+    tool
+}
+
+/// Expand exactly one persisted trace into one display turn. Request/response
+/// bodies and explicitly trace-linked tool bodies are read here—and nowhere in
+/// the page endpoint—so an unrelated turn can never be pulled into the read.
+async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let row = match state.store.get_trace(&id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let tools = match state.store.trace_tool_calls(&id) {
+        Ok(tools) => tools.into_iter().map(expanded_turn_tool).collect::<Vec<_>>(),
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let mut turn = transcript_turn(&row);
+    turn["executed_tools"] = json!(tools);
+    axum::Json(json!({"turn": turn})).into_response()
 }
 
 fn trace_reasoning_fields(req: &Value) -> (Option<String>, Option<i64>) {
@@ -16667,6 +16814,172 @@ mod tests {
         )
         .await;
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn large_transcript_pages_and_single_turn_reads_obey_body_boundaries() {
+        let state = test_state("large-transcript-page-boundaries");
+        let body_root = state.store.data_dir.join("bodies");
+        let session_id = "large-lazy-session";
+        let mut selected_paths = Vec::new();
+        let mut unrelated_paths = Vec::new();
+
+        for index in 0..125 {
+            let id = format!("lazy-trace-{index:03}");
+            let request_path = state
+                .store
+                .write_body(
+                    &id,
+                    "request.json",
+                    format!(r#"{{"messages":[{{"role":"user","content":"user {index}"}}]}}"#)
+                        .as_bytes(),
+                )
+                .unwrap();
+            let response_path = state
+                .store
+                .write_body(
+                    &id,
+                    "response.json",
+                    format!(r#"{{"choices":[{{"message":{{"content":"assistant {index}"}}}}]}}"#)
+                        .as_bytes(),
+                )
+                .unwrap();
+            if index == 0 {
+                selected_paths.extend([request_path.clone(), response_path.clone()]);
+            } else if index == 1 {
+                unrelated_paths.extend([request_path.clone(), response_path.clone()]);
+            }
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id,
+                    ts_request_ms: 10_000 + (index / 2) as i64,
+                    ts_response_ms: Some(10_001 + (index / 2) as i64),
+                    session_id: Some(session_id.into()),
+                    harness: Some("pi".into()),
+                    client_format: Some("openai-chat".into()),
+                    upstream_provider: Some("openai".into()),
+                    upstream_format: Some("openai-chat".into()),
+                    routed_model: Some("smoke/model".into()),
+                    status: Some(200),
+                    req_body_path: Some(request_path),
+                    resp_body_path: Some(response_path),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        for index in 0..2 {
+            let id = format!("lazy-tool-{index}");
+            let arguments_path = state
+                .store
+                .write_body(&id, "args.json", format!(r#"{{"index":{index}}}"#).as_bytes())
+                .unwrap();
+            let result_path = state
+                .store
+                .write_body(&id, "result.txt", format!("result {index}").as_bytes())
+                .unwrap();
+            if index == 0 {
+                selected_paths.extend([arguments_path.clone(), result_path.clone()]);
+            } else {
+                unrelated_paths.extend([arguments_path.clone(), result_path.clone()]);
+            }
+            state
+                .store
+                .upsert_tool_call(&ToolCallRecord {
+                    id: id.clone(),
+                    harness: "pi".into(),
+                    session_id: session_id.into(),
+                    turn_id: Some(index.to_string()),
+                    tool_call_id: id,
+                    trace_id: Some(format!("lazy-trace-{index:03}")),
+                    tool_name: "bash".into(),
+                    ts_start_ms: 10_000 + index,
+                    ts_end_ms: Some(10_001 + index),
+                    is_error: Some(false),
+                    exit_status: Some(0),
+                    args_body_path: Some(arguments_path),
+                    result_body_path: Some(result_path),
+                })
+                .unwrap();
+        }
+
+        let (_, summaries) = response_json(
+            traces_summaries(
+                State(state.clone()),
+                Query(HashMap::from([("limit".into(), "25".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(summaries["traces"].as_array().unwrap().len(), 25);
+        assert!(test_body_file_reads_under(&body_root).is_empty());
+
+        let invalid_cursor = traces_session_transcript_page(
+            State(state.clone()),
+            Path(session_id.into()),
+            Query(HashMap::from([("after_ms".into(), "10000".into())])),
+        )
+        .await;
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+        assert!(test_body_file_reads_under(&body_root).is_empty());
+
+        let (page_status, first_page) = response_json(
+            traces_session_transcript_page(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::from([("limit".into(), "20".into())])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page_status, StatusCode::OK);
+        assert_eq!(first_page["turns"].as_array().unwrap().len(), 20);
+        assert_eq!(first_page["turns"][0]["trace_id"], "lazy-trace-000");
+        assert_eq!(first_page["has_more"], true);
+        assert!(first_page["turns"][0].get("req_body_path").is_none());
+        assert!(first_page["turns"][0].get("user").is_none());
+        assert!(test_body_file_reads_under(&body_root).is_empty());
+
+        let cursor = &first_page["next_cursor"];
+        let (_, second_page) = response_json(
+            traces_session_transcript_page(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::from([
+                    ("limit".into(), "20".into()),
+                    (
+                        "after_ms".into(),
+                        cursor["after_ms"].as_i64().unwrap().to_string(),
+                    ),
+                    (
+                        "after_id".into(),
+                        cursor["after_id"].as_str().unwrap().to_string(),
+                    ),
+                ])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second_page["turns"][0]["trace_id"], "lazy-trace-020");
+        assert!(test_body_file_reads_under(&body_root).is_empty());
+
+        let (turn_status, expanded) = response_json(
+            trace_turn(State(state), Path("lazy-trace-000".into())).await,
+        )
+        .await;
+        assert_eq!(turn_status, StatusCode::OK);
+        assert_eq!(expanded["turn"]["user"], "user 0");
+        assert_eq!(expanded["turn"]["assistant"], "assistant 0");
+        assert_eq!(expanded["turn"]["executed_tools"].as_array().unwrap().len(), 1);
+        assert_eq!(expanded["turn"]["executed_tools"][0]["arguments"]["index"], 0);
+        assert_eq!(expanded["turn"]["executed_tools"][0]["result"], "result 0");
+
+        let mut reads = test_body_file_reads_under(&body_root);
+        reads.sort();
+        selected_paths.sort();
+        assert_eq!(reads, selected_paths);
+        assert!(unrelated_paths.iter().all(|path| !reads.contains(path)));
     }
 
     #[tokio::test]

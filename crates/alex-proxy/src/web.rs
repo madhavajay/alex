@@ -75,6 +75,9 @@ mod tests {
         assert!(APP_JS.contains("/metadata`"));
         assert!(APP_JS.contains("async function loadTraceBody"));
         assert!(APP_JS.contains("async function loadTranscript"));
+        assert!(APP_JS.contains("const TURN_PAGE_SIZE=20"));
+        assert!(APP_JS.contains("/transcript/page?"));
+        assert!(!APP_JS.contains("/transcript?limit=100"));
 
         // Fetch boundary: opening detail uses body-free metadata. The only
         // body/transcript request sites are the explicit details-toggle
@@ -99,5 +102,29 @@ mod tests {
         assert!(load_traces.contains("/traces/summaries?"));
         assert!(!load_traces.contains("/body/"));
         assert!(!load_traces.contains("/transcript"));
+
+        // Large-session contract: the transcript loader replaces one bounded
+        // DOM page at a time, while opening one turn is the only path that
+        // reaches the turn-body endpoint.
+        let turn_loader = APP_JS
+            .split("async function loadTranscriptTurn")
+            .nth(1)
+            .unwrap()
+            .split("async function loadTranscriptPage")
+            .next()
+            .unwrap();
+        assert!(turn_loader.contains("/turn`"));
+        let page_loader = APP_JS
+            .split("async function loadTranscriptPage")
+            .nth(1)
+            .unwrap()
+            .split("async function loadTranscript(node)")
+            .next()
+            .unwrap();
+        assert!(page_loader.contains("TURN_PAGE_SIZE"));
+        assert!(page_loader.contains("/transcript/page?"));
+        assert!(page_loader.contains("replaceTranscriptPage"));
+        assert!(!page_loader.contains("/turn`"));
+        assert!(APP_JS.contains("target.replaceChildren()"));
     }
 }
