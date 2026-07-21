@@ -98,7 +98,7 @@ jobs:
           cargo build --release -p alex --bins
           mkdir -p dist
           asset="alex-cli-${version}-linux-x86_64.tar.gz"
-          tar -C target/release -czf "dist/$asset" alex alexandria
+          tar -C target/release -czf "dist/$asset" alex
           sha256sum "dist/$asset" > "dist/$asset.sha256"
       - name: Upload Linux GNU workflow artifact
         uses: actions/upload-artifact@v4
@@ -167,9 +167,9 @@ jobs:
           ./scripts/stamp-version.sh "$version"
           cargo build --release -p alex --bins
           mkdir -p dist/package
-          cp target/release/alex.exe target/release/alexandria.exe dist/package/
+          cp target/release/alex.exe dist/package/
           asset="alex-cli-${version}-windows-x86_64.zip"
-          (cd dist/package && 7z a "../$asset" alex.exe alexandria.exe)
+          (cd dist/package && 7z a "../$asset" alex.exe)
           sha256sum "dist/$asset" > "dist/$asset.sha256"
       - name: Upload Windows workflow artifact
         uses: actions/upload-artifact@v4
@@ -206,9 +206,9 @@ jobs:
           intel_root="$RUNNER_TEMP/alex-cli-x86_64"
           rm -rf "$arm_root" "$intel_root"
           mkdir -p "$arm_root" "$intel_root"
-          cp target/release/alex target/release/alexandria "$arm_root/"
+          cp target/release/alex target/release/alex "$arm_root/"
           cp target/x86_64-apple-darwin/release/alex \
-            target/x86_64-apple-darwin/release/alexandria "$intel_root/"
+            target/x86_64-apple-darwin/release/alex "$intel_root/"
 
       - name: Require CLI signing and notarization secrets
         env:
@@ -247,13 +247,13 @@ jobs:
           set -euo pipefail
           for bin in \
             "$RUNNER_TEMP/alex-cli-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-aarch64/alexandria" \
+            "$RUNNER_TEMP/alex-cli-aarch64/alex" \
             "$RUNNER_TEMP/alex-cli-x86_64/alex" \
-            "$RUNNER_TEMP/alex-cli-x86_64/alexandria"
+            "$RUNNER_TEMP/alex-cli-x86_64/alex"
           do
             case "$(basename "$bin")" in
               alex) identifier="com.madhavajay.alex.cli" ;;
-              alexandria) identifier="com.madhavajay.alex.daemon" ;;
+              alex) identifier="com.madhavajay.alex.daemon" ;;
             esac
             codesign --force --options runtime --timestamp \
               --identifier "$identifier" --sign "$CODESIGN_IDENTITY" "$bin"
@@ -297,8 +297,8 @@ jobs:
           mkdir -p dist/release-assets
           arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
           intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
-          tar -C "$RUNNER_TEMP/alex-cli-aarch64" -czf "dist/release-assets/$arm_asset" alex alexandria
-          tar -C "$RUNNER_TEMP/alex-cli-x86_64" -czf "dist/release-assets/$intel_asset" alex alexandria
+          tar -C "$RUNNER_TEMP/alex-cli-aarch64" -czf "dist/release-assets/$arm_asset" alex
+          tar -C "$RUNNER_TEMP/alex-cli-x86_64" -czf "dist/release-assets/$intel_asset" alex
           shasum -a 256 "dist/release-assets/$arm_asset" > "dist/release-assets/$arm_asset.sha256"
           shasum -a 256 "dist/release-assets/$intel_asset" > "dist/release-assets/$intel_asset.sha256"
 
@@ -315,7 +315,7 @@ jobs:
             *) echo "unsupported macOS runner architecture" >&2; exit 1 ;;
           esac
           "$native_root/alex" --version
-          "$native_root/alexandria" --version
+          "$native_root/alex" --version
 
       - name: Clean up CLI signing keychain
         if: always()
@@ -462,7 +462,7 @@ jobs:
             "$stage/"
           cp scripts/lib/install-common.sh "$stage/"
           chmod +x "$stage/install.sh" "$stage/mock-openai.py" \
-            "$stage/smoke-installed.sh" "$stage/bin/alex" "$stage/bin/alexandria"
+            "$stage/smoke-installed.sh" "$stage/bin/alex" "$stage/bin/alex"
 
       - name: Smoke installed app, routing, trace persistence, and launchd restart
         env:
@@ -484,13 +484,13 @@ jobs:
           ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
         run: |
           set +e
-          service_target="gui/$(id -u)/com.alexandria.daemon"
+          service_target="gui/$(id -u)/com.madhavajay.alex.daemon"
           alex_bin="$ALEX_CI_SMOKE_ROOT/bin/alex"
           if [[ -f "$ALEX_CI_SMOKE_ROOT/service-cleanup-allowed" ]]; then
-            [[ -x "$alex_bin" ]] && ALEXANDRIA_HOME="$ALEX_CI_SMOKE_ROOT/state" \
+            [[ -x "$alex_bin" ]] && ALEX_HOME="$ALEX_CI_SMOKE_ROOT/state" \
               "$alex_bin" service uninstall >/dev/null 2>&1
             launchctl bootout "$service_target" >/dev/null 2>&1
-            rm -f "$HOME/Library/LaunchAgents/com.alexandria.daemon.plist"
+            rm -f "$HOME/Library/LaunchAgents/com.madhavajay.alex.daemon.plist"
           fi
           if [[ -s "$ALEX_CI_SMOKE_ROOT/mock.pid" ]]; then
             mock_pid="$(tr -d '[:space:]' < "$ALEX_CI_SMOKE_ROOT/mock.pid")"
@@ -538,7 +538,7 @@ jobs:
           $extract = 'dist/windows/extracted'
           Expand-Archive -Path $assetPath -DestinationPath $extract -Force
           $alex = Get-ChildItem $extract -Filter alex.exe -Recurse | Select-Object -First 1
-          $alias = Get-ChildItem $extract -Filter alexandria.exe -Recurse | Select-Object -First 1
+          $alias = Get-ChildItem $extract -Filter alex.exe -Recurse | Select-Object -First 1
           if (-not $alex -or -not $alias) { throw 'Windows archive is missing a CLI binary' }
           $alexVersion = (& $alex.FullName --version | Out-String).Trim()
           $aliasVersion = (& $alias.FullName --version | Out-String).Trim()
@@ -957,11 +957,11 @@ jobs:
             -e "s/{{SHA_MAC_ARM}}/${sha_mac_arm}/g" \
             -e "s/{{SHA_MAC_INTEL}}/${sha_mac_intel}/g" \
             -e "s/{{SHA_LINUX}}/${sha_linux}/g" \
-            packaging/homebrew/alex.rb.tmpl > dist/homebrew/alex.rb
+            packaging/homebrew/alex-formula.rb.tmpl > dist/homebrew/alex-formula.rb
           sed \
             -e "s/{{VERSION}}/${version}/g" \
             -e "s/{{SHA_DMG}}/${sha_dmg}/g" \
-            packaging/homebrew/alexandria.rb.tmpl > dist/homebrew/alexandria.rb
+            packaging/homebrew/alex-cask.rb.tmpl > dist/homebrew/alex-cask.rb
 
       - name: Push formula and cask to Homebrew tap
         env:
@@ -977,11 +977,11 @@ jobs:
           cd "$RUNNER_TEMP/homebrew-alex"
           if ! git rev-parse --verify HEAD >/dev/null 2>&1; then git checkout -B main; fi
           mkdir -p Formula Casks
-          cp "$GITHUB_WORKSPACE/dist/homebrew/alex.rb" Formula/alex.rb
-          cp "$GITHUB_WORKSPACE/dist/homebrew/alexandria.rb" Casks/alexandria.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alex-formula.rb" Formula/alex.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alex-cask.rb" Casks/alex.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/alex.rb Casks/alexandria.rb
+          git add Formula/alex.rb Casks/alex.rb
           if git diff --cached --quiet; then
             echo "Formula and cask are already current."
           else

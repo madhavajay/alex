@@ -410,7 +410,7 @@ server errors. The symmetric Claude/OpenAI example can be installed with
 ```
 
 Even with protection enabled, a single request can demand the exact model it
-asked for: send `x-alexandria-no-substitute: 1` to disable both account failover
+asked for: send `x-alex-no-substitute: 1` to disable both account failover
 and cross-provider substitution for that call, so the real model is used and the
 real error (if any) is returned unchanged. This is intended for **benchmark
 suites** that must run against a specific model (e.g. `claude-fable-5`) and must
@@ -420,16 +420,16 @@ never be silently rerouted.
 
 Any harness pointed at Alex can set these per request:
 
-- `x-alexandria-no-substitute: 1` — pin the model: disable failover and
+- `x-alex-no-substitute: 1` — pin the model: disable failover and
   cross-provider substitution, returning the real response or the real error
   (benchmarks).
 - `x-session-id: <id>` — group requests into one session/transcript.
-- `x-alexandria-run-id: <id>` — attach your own external run id for correlation.
-- `x-alexandria-trace-tag`, `x-alexandria-job`, `x-alexandria-task`,
-  `x-alexandria-phase` — tag traces for later filtering and analytics.
-- `x-alexandria-harness`, `x-alexandria-harness-version` — label the calling
+- `x-alex-run-id: <id>` — attach your own external run id for correlation.
+- `x-alex-trace-tag`, `x-alex-job`, `x-alex-task`,
+  `x-alex-phase` — tag traces for later filtering and analytics.
+- `x-alex-harness`, `x-alex-harness-version` — label the calling
   harness in traces.
-- `x-alexandria-simulate-error: STATUS[:kind]` — return a synthetic error with no
+- `x-alex-simulate-error: STATUS[:kind]` — return a synthetic error with no
   upstream call, for testing harness and failover behavior (local/harness-key
   gated).
 
@@ -440,8 +440,8 @@ The V1 beta targets macOS, Ubuntu Linux x86-64, and Windows 11 x86-64 for the co
 Alternative installation methods:
 
 ```bash
-brew install madhavajay/alex/alex               # CLI and daemon
-brew install --cask madhavajay/alex/alexandria  # legacy cask token; installs Alex.app
+brew install madhavajay/alex/alex        # CLI and daemon
+brew install --cask madhavajay/alex/alex # Alex.app
 cargo install alex                              # CLI from crates.io
 ./install.sh --service                          # build this checkout and install its service
 ```

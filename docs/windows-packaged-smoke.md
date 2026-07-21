@@ -20,7 +20,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 Replace the example version with the candidate. The VM user must start with no
 `AlexDaemon` scheduled task, no process on `127.0.0.1:4100`, no
 `%LOCALAPPDATA%\Alex\bin`, no `%USERPROFILE%\.alex`, and no
-`ALEXANDRIA_HOME` override. The script refuses to overwrite any of these.
+`ALEX_HOME` override. The script refuses to overwrite any of these.
 
 The smoke uses a PowerShell/.NET loopback mock as an OpenAI-compatible Exo
 endpoint. It does not require provider credentials and does not contact a real

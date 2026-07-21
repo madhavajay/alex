@@ -49,7 +49,7 @@ Genuine Claude Code detection deliberately requires a complete signature:
 - `x-app: cli`;
 - a non-empty `x-claude-code-session-id`;
 - first `system` block text beginning `x-anthropic-billing-header:`; and
-- if `x-alexandria-harness` is present, every value must identify Claude or
+- if `x-alex-harness` is present, every value must identify Claude or
   Claude Code.
 
 Only that complete signature bypasses Dario. A partial or conflicting signature

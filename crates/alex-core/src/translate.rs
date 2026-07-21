@@ -267,7 +267,7 @@ pub fn anthropic_to_openai_responses(req: &Value) -> Value {
     if let Some(mt) = req["max_tokens"].as_i64() {
         o.insert("max_output_tokens".to_string(), json!(mt));
     }
-    // Pi speaks Anthropic Messages to the Alexandria provider. Adaptive-thinking
+    // Pi speaks Anthropic Messages to the Alex provider. Adaptive-thinking
     // models carry Pi's selected level in output_config.effort; preserve it when
     // translating to the OpenAI Responses API used by Codex.
     if let Some(effort) = req["output_config"]["effort"].as_str() {
@@ -3064,7 +3064,9 @@ mod tests {
     /// never a silent empty 200 (null/empty content and no tool_calls).
     fn assert_usable_openai_chat(out: &Value) {
         let msg = &out["choices"][0]["message"];
-        let has_text = msg["content"].as_str().is_some_and(|s| !s.trim().is_empty());
+        let has_text = msg["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty());
         let has_tool_calls = msg["tool_calls"]
             .as_array()
             .is_some_and(|calls| !calls.is_empty());
@@ -3116,7 +3118,10 @@ mod tests {
         let mut msg = anthropic_normal_fixture();
         let before = msg.clone();
         assert!(neutralize_anthropic_refusal(&mut msg).is_none());
-        assert_eq!(msg, before, "normal completion must be byte-for-byte unchanged");
+        assert_eq!(
+            msg, before,
+            "normal completion must be byte-for-byte unchanged"
+        );
         let out = anthropic_response_to_openai_chat(&msg, "claude-fable-5");
         assert_usable_openai_chat(&out);
         assert_eq!(

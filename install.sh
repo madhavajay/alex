@@ -7,7 +7,7 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [--service] [--upgrade] [--prefix DIR]
 
-  (none)     build --release and install the alex binary (+ alexandria symlink) system-wide
+  (none)     build --release and install the alex binary (+ alex symlink) system-wide
   --service  also install + load the launchd agent (macOS) so it runs at login
   --upgrade  zero-downtime deploy: build + install, start a NEW daemon on the
              same port (SO_REUSEPORT), wait until it is healthy, then SIGTERM
@@ -51,7 +51,6 @@ if [ -z "$PREFIX" ]; then
   fi
 fi
 BIN="$PREFIX/alex"
-ALIAS_BIN="$PREFIX/alexandria"
 
 say() {
   echo "$1"
@@ -75,7 +74,7 @@ is_alex_daemon_pid() {
     NR == 1 {
       binary = $1
       sub(/^.*\//, "", binary)
-      exit !((binary == "alex" || binary == "alexandria") && $2 == "daemon")
+      exit !(binary == "alex" && $2 == "daemon")
     }
     END { if (NR == 0) exit 1 }
   '
@@ -92,10 +91,8 @@ say "◆ build complete — installing to $PREFIX"
 mkdir -p "$PREFIX" 2>/dev/null || true
 if [ -w "$PREFIX" ]; then
   install -m 0755 target/release/alex "$BIN"
-  ln -sf "$BIN" "$ALIAS_BIN"
 else
   sudo install -m 0755 target/release/alex "$BIN"
-  sudo ln -sf "$BIN" "$ALIAS_BIN"
 fi
 say "◆ installed $BIN"
 case ":$PATH:" in
@@ -108,13 +105,8 @@ if ! "$BIN" dario bootstrap; then
   echo "warning: Dario could not be prepared; install Node.js 18+ and npm, pnpm, or Bun, then run: $BIN dario bootstrap" >&2
 fi
 
-if [ -n "${ALEXANDRIA_HOME:-}" ]; then
-  STATE_DIR="$ALEXANDRIA_HOME"
-elif [ -d "$HOME/.alex" ]; then
-  STATE_DIR="$HOME/.alex"
-elif [ -d "$HOME/.alexandria" ]; then
-  # The newly installed binary atomically migrates this directory on launch.
-  STATE_DIR="$HOME/.alexandria"
+if [ -n "${ALEX_HOME:-}" ]; then
+  STATE_DIR="$ALEX_HOME"
 else
   STATE_DIR="$HOME/.alex"
 fi
@@ -131,10 +123,10 @@ fi
 CHECK_HOST=$HOST
 [ "$CHECK_HOST" = "0.0.0.0" ] && CHECK_HOST=127.0.0.1
 
-PLIST_LABEL=com.alexandria.daemon
+PLIST_LABEL=com.madhavajay.alex.daemon
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 
-SYSTEMD_UNIT="$HOME/.config/systemd/user/alexandria.service"
+SYSTEMD_UNIT="$HOME/.config/systemd/user/alex.service"
 SERVICE_RELOADED=0
 
 if [ "$SERVICE" = "1" ]; then
@@ -184,10 +176,10 @@ if [ "$UPGRADE" = "1" ]; then
     launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
     NEW_PID=""
   elif [ "$(uname)" = "Linux" ] && command -v systemctl >/dev/null \
-      && systemctl --user is-active alexandria >/dev/null 2>&1; then
+      && systemctl --user is-active alex >/dev/null 2>&1; then
     echo "daemon is systemd-managed: using systemctl restart (drain happens on stop;"
     echo "expect a short accept gap while the old instance drains)"
-    systemctl --user restart alexandria
+    systemctl --user restart alex
     NEW_PID=""
   else
     say "old daemon pid(s): $OLD_PIDS"

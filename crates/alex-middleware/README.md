@@ -1,7 +1,7 @@
 # alex-middleware
 
 Runtime-neutral middleware policy types and compiled declarative evaluation for
-Alexandria. This crate deliberately does not dispatch HTTP requests, select
+Alex. This crate deliberately does not dispatch HTTP requests, select
 accounts, access credentials, or own retry loops.
 
 The proxy integration follows this sequence for a failed attempt:

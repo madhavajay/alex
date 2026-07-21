@@ -11,7 +11,7 @@ predate this file — see the git history and GitHub releases.
 
 ### Fixed
 - **Standalone macOS CLIs are notarized and independently verified.** The
-  release pipeline gives `alex` and `alexandria` stable signing identifiers,
+  release pipeline gives `alex` and `alex` stable signing identifiers,
   submits both architectures to Apple's notary service, then downloads the
   published archive on a separate clean macOS runner for checksum, code-signing
   and Gatekeeper assessment before the manifest or app release can proceed.
@@ -106,7 +106,7 @@ predate this file — see the git history and GitHub releases.
   known revoked or expired client can be right-clicked and **Approve**d; unknown
   credentials remain visible but cannot be authorized.
 - **OpenAI-compatible model discovery uses the public namespace.** `/v1/models`
-  now advertises proxy aliases as `alex/*`, not the legacy `alexandria/*` form.
+  now advertises proxy aliases as `alex/*`.
 
 ## [0.1.28] - 2026-07-19
 
@@ -338,10 +338,8 @@ the fixes below.
   installer library; ui/ mock zips (5.7MB) removed.
 
 ### In progress (building, not yet in a beta)
-- **`alexandria` → `alex` rename** — project-wide rename with a one-time,
-  no-data-loss upgrade migration (`~/.alexandria` → `~/.alex`,
-  `com.alexandria.daemon` → `com.alex.daemon`, `ALEXANDRIA_*` → `ALEX_*` with
-  legacy fallback). Built; pending live migration test.
+- **Alex naming** — the app, CLI, services, state, headers, and harness
+  artifacts consistently use the Alex name.
 - **Blue-green daemon restart** — launchd socket-activation graceful restart
   with drain + hard-restart fallback (zero dropped connections). Built on both
   platforms; pending live zero-downtime verification.

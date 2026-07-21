@@ -442,7 +442,6 @@ fn remaining_bar(remaining_pct: f64) -> String {
     blocks.join("")
 }
 
-
 /// A dollar-balance line for credit-metered providers (`💰 $30.16 credits`).
 /// Reads `individual_credits_usd`, `credits.balance`, or `quota.balance` from
 /// the provider's `/admin/limits` entry; None for window-metered providers.

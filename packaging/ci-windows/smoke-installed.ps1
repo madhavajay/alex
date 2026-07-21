@@ -303,7 +303,7 @@ if ([string]::IsNullOrWhiteSpace($SmokeRoot)) {
 $SmokeRoot = [IO.Path]::GetFullPath($SmokeRoot)
 $StateDirectory = Join-Path $env:USERPROFILE ".alex"
 $AlexBin = Join-Path $InstallDirectory "alex.exe"
-$LegacyBin = Join-Path $InstallDirectory "alexandria.exe"
+$LegacyBin = Join-Path $InstallDirectory "alex.exe"
 $ReadyFile = Join-Path $SmokeRoot "mock.port"
 $MockLog = Join-Path $SmokeRoot "mock.ndjson"
 $OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -332,7 +332,7 @@ $Result = [ordered]@{
         repository = $Repository
         checksum_verified_by_installer = $false
         alex = $false
-        alexandria = $false
+        alex = $false
     }
     service = [ordered]@{
         manager = "task-scheduler-user"
@@ -404,8 +404,8 @@ try {
         "Install directory already exists at $InstallDirectory. Use a clean VM."
     Assert-Condition (-not (Test-Path -LiteralPath $StateDirectory)) `
         "State directory already exists at $StateDirectory. Use a clean VM."
-    Assert-Condition ([string]::IsNullOrWhiteSpace($env:ALEXANDRIA_HOME)) `
-        "ALEXANDRIA_HOME is already set. Use a clean VM user environment."
+    Assert-Condition ([string]::IsNullOrWhiteSpace($env:ALEX_HOME)) `
+        "ALEX_HOME is already set. Use a clean VM user environment."
     $EvidenceInsideSmokeRoot = $EvidencePath.Equals(
         $SmokeRoot,
         [StringComparison]::OrdinalIgnoreCase
@@ -438,7 +438,7 @@ try {
     Assert-Condition (Test-Path -LiteralPath $AlexBin -PathType Leaf) `
         "Installer did not install alex.exe."
     Assert-Condition (Test-Path -LiteralPath $LegacyBin -PathType Leaf) `
-        "Installer did not install alexandria.exe."
+        "Installer did not install alex.exe."
     $AlexVersion = (& $AlexBin --version | Out-String).Trim()
     $LegacyVersion = (& $LegacyBin --version | Out-String).Trim()
     Assert-Condition ($AlexVersion -eq "alex $Version") `
@@ -447,7 +447,7 @@ try {
         "Compatibility executable reports '$LegacyVersion', expected '$AlexVersion'."
     $Result.package.checksum_verified_by_installer = $true
     $Result.package.alex = $true
-    $Result.package.alexandria = $true
+    $Result.package.alex = $true
     $Checks["release-installer-sha256"] = $true
     $Checks["both-packaged-binaries"] = $true
 
@@ -536,7 +536,7 @@ try {
     } | ConvertTo-Json -Compress -Depth 5
     $Response = Invoke-JsonRequest "POST" "$BaseUrl/v1/chat/completions" @{
         Authorization = "Bearer $LocalKey"
-        "x-alexandria-harness" = $Harness
+        "x-alex-harness" = $Harness
         "x-session-id" = $SessionId
     } $RequestBody
     Assert-Condition ([string]$Response.id -eq "chatcmpl-ci-installed-smoke" -and

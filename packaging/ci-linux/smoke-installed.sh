@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALLER="$REPO_ROOT/install-release.sh"
 OPENAI_MOCK="$REPO_ROOT/packaging/ci-macos/mock-openai.py"
-SERVICE_NAME="alexandria"
-SERVICE_UNIT="$HOME/.config/systemd/user/alexandria.service"
+SERVICE_NAME="alex"
+SERVICE_UNIT="$HOME/.config/systemd/user/alex.service"
 STATE_DIR="$HOME/.alex"
 BASE_URL="http://127.0.0.1:4100"
 SESSION_ID="ci-linux-installed-smoke"
@@ -147,7 +147,7 @@ ALEX_INSTALL_DIR="$INSTALL_DIR" \
   "$INSTALLER"
 
 [[ -x "$ALEX_BIN" ]] || fail "release installer did not install alex"
-[[ -x "$INSTALL_DIR/alexandria" ]] || fail "release installer did not install alexandria"
+[[ -x "$INSTALL_DIR/alex" ]] || fail "release installer did not install alex"
 "$ALEX_BIN" --version | grep -F "$VERSION" >/dev/null \
   || fail "installed binary does not report candidate version $VERSION"
 jq -s -e --arg archive "/$ASSET_NAME" --arg checksum "/$ASSET_NAME.sha256" '
@@ -171,7 +171,7 @@ wait_for_health() {
 wait_for_health || fail "installed systemd daemon did not become healthy"
 
 PATH="$INSTALL_DIR:$PATH" "$ALEX_BIN" status --json > "$SMOKE_ROOT/status-before.json"
-jq -e --arg binary "$INSTALL_DIR/alexandria" '
+jq -e --arg binary "$INSTALL_DIR/alex" '
   .daemon.running == true
   and .daemon.service.managed == true
   and any(.daemon.binaries[]; .path == $binary)
@@ -201,7 +201,7 @@ jq -nc --arg model "exo/$MODEL" '
 curl -fsS --max-time 10 \
   -H "Authorization: Bearer $LOCAL_KEY" \
   -H 'content-type: application/json' \
-  -H 'x-alexandria-harness: clean-machine-ci-linux' \
+  -H 'x-alex-harness: clean-machine-ci-linux' \
   -H "x-session-id: $SESSION_ID" \
   --data-binary @"$SMOKE_ROOT/request.json" \
   "$BASE_URL/v1/chat/completions" > "$SMOKE_ROOT/response.json"

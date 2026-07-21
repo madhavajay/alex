@@ -60,7 +60,7 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
-APP_NAME="${APP_NAME:-AlexandriaBar}"
+APP_NAME="${APP_NAME:-Alex}"
 APP_DISPLAY="Alex"
 BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alex}"
 VERSION="${VERSION:-$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml 2>/dev/null || true)}"
@@ -107,7 +107,7 @@ prepare_import_keychain() {
   local keychain
   if [[ -n "${GITHUB_ACTIONS:-}" || -n "${CI:-}" ]]; then
     KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-$(uuidgen)}"
-    TEMP_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/alexandria-signing.keychain-db"
+    TEMP_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/alex-signing.keychain-db"
     ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain | tr -d '"')"
     security create-keychain -p "$KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN"
     security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN"
@@ -144,7 +144,7 @@ if [[ "$NEEDS_IMPORT" == "true" ]]; then
     exit 1
   fi
   echo "Importing Developer ID certificate from SIGNING_CERTIFICATE_P12_DATA..."
-  TRAP_P12="$(mktemp "${TMPDIR:-/tmp}/alexandria-cert-XXXXXX.p12")"
+  TRAP_P12="$(mktemp "${TMPDIR:-/tmp}/alex-cert-XXXXXX.p12")"
   decode_p12
   IMPORT_KEYCHAIN="$(prepare_import_keychain)"
   security import "$TRAP_P12" -k "$IMPORT_KEYCHAIN" \
@@ -211,7 +211,7 @@ echo "Using bundle identifier: $BUNDLE_ID"
 submit_for_notarization() {
   local artifact="$1"
   local verdict
-  NOTARY_RESULT="$(mktemp "${TMPDIR:-/tmp}/alexandria-notary-XXXXXX.json")"
+  NOTARY_RESULT="$(mktemp "${TMPDIR:-/tmp}/alex-notary-XXXXXX.json")"
   xcrun notarytool submit "$artifact" \
     --apple-id "$APPLE_ID" \
     --password "$APPLE_PASSWORD" \
@@ -292,7 +292,7 @@ fi
 echo "Creating DMG..."
 mkdir -p "$DIST_DIR"
 rm -f "$DMG_PATH"
-DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-dmg-XXXXXX")"
+DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/alex-dmg-XXXXXX")"
 ditto "$APP_PATH" "$DMG_STAGE/$APP_DISPLAY.app"
 ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -volname "Alex" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null

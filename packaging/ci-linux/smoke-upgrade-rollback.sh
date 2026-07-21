@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALLER="$REPO_ROOT/install-release.sh"
 OPENAI_MOCK="$REPO_ROOT/packaging/ci-macos/mock-openai.py"
-SERVICE_NAME="alexandria"
-SERVICE_UNIT="$HOME/.config/systemd/user/alexandria.service"
-STATE_DIR="$HOME/.alexandria"
+SERVICE_NAME="alex"
+SERVICE_UNIT="$HOME/.config/systemd/user/alex.service"
+STATE_DIR="$HOME/.alex"
 BASE_URL="http://127.0.0.1:4100"
 # Keep this aligned with the shared deterministic OpenAI mock. The transition
 # itself is identified by the trace/session labels below, not by inventing a
@@ -181,11 +181,11 @@ install_version() {
     [[ "$version_output" == "alex $version" ]] \
       || fail "$phase did not install Alex $version (reported: $version_output)"
   else
-    # The PR-base binary predates the user-visible Alexandria-to-Alex rename.
+    # The PR-base binary predates the current Alex packaging.
     # A pinned rollback must verify its exact version without rejecting that
     # known legacy executable label.
     [[ "$version_output" == "alex $version" \
-      || "$version_output" == "alexandria $version" ]] \
+      || "$version_output" == "alex $version" ]] \
       || fail "$phase did not install version $version (reported: $version_output)"
   fi
 }
@@ -261,7 +261,7 @@ send_request() {
   curl -fsS --max-time 10 \
     -H "Authorization: Bearer $LOCAL_KEY" \
     -H 'content-type: application/json' \
-    -H 'x-alexandria-harness: upgrade-rollback-ci-linux' \
+    -H 'x-alex-harness: upgrade-rollback-ci-linux' \
     -H "x-session-id: $session" \
     --data-binary @"$SMOKE_ROOT/$prefix-request.json" \
     "$BASE_URL/v1/chat/completions" > "$SMOKE_ROOT/$prefix-response.json"

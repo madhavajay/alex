@@ -109,7 +109,7 @@ jobs:
           cargo build --release -p alex --bins
           mkdir -p dist
           asset="alex-cli-${version}-linux-x86_64.tar.gz"
-          tar -C target/release -czf "dist/$asset" alex alexandria
+          tar -C target/release -czf "dist/$asset" alex
           shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
       - name: Upload to prerelease
         env:
@@ -174,7 +174,7 @@ jobs:
           cargo build --release -p alex --bins
           mkdir -p dist
           asset="alex-cli-${version}-windows-x86_64.zip"
-          7z a "dist/$asset" ./target/release/alex.exe ./target/release/alexandria.exe
+          7z a "dist/$asset" ./target/release/alex.exe
           sha256sum "dist/$asset" > "dist/$asset.sha256"
       - name: Upload to prerelease
         shell: bash
@@ -255,9 +255,9 @@ jobs:
           intel_root="$RUNNER_TEMP/alex-cli-release-x86_64"
           rm -rf "$arm_root" "$intel_root"
           mkdir -p "$arm_root" "$intel_root"
-          cp target/release/alex target/release/alexandria "$arm_root/"
+          cp target/release/alex target/release/alex "$arm_root/"
           cp target/x86_64-apple-darwin/release/alex \
-            target/x86_64-apple-darwin/release/alexandria "$intel_root/"
+            target/x86_64-apple-darwin/release/alex "$intel_root/"
 
       - name: Sign CLI binaries
         if: steps.cli_signing.outputs.available == 'true'
@@ -267,14 +267,14 @@ jobs:
           set -euo pipefail
           for bin in \
             "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-aarch64/alexandria" \
+            "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
             "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-x86_64/alexandria"
+            "$RUNNER_TEMP/alex-cli-release-x86_64/alex"
           do
             codesign --remove-signature "$bin" 2>/dev/null || true
             case "$(basename "$bin")" in
               alex) identifier="com.madhavajay.alex.cli" ;;
-              alexandria) identifier="com.madhavajay.alex.daemon" ;;
+              alex) identifier="com.madhavajay.alex.daemon" ;;
             esac
             codesign --force --options runtime --timestamp \
               --identifier "$identifier" --sign "$CODESIGN_IDENTITY" "$bin"
@@ -295,10 +295,10 @@ jobs:
           rm -rf "$notary_root" "$notary_zip" "$notary_result"
           mkdir -p "$notary_root/aarch64" "$notary_root/x86_64"
           cp "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-aarch64/alexandria" \
+            "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
             "$notary_root/aarch64/"
           cp "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-x86_64/alexandria" \
+            "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
             "$notary_root/x86_64/"
           ditto -c -k --sequesterRsrc "$notary_root" "$notary_zip"
           xcrun notarytool submit "$notary_zip" \
@@ -325,8 +325,8 @@ jobs:
           mkdir -p dist
           arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
           intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
-          tar -C "$RUNNER_TEMP/alex-cli-release-aarch64" -czf "dist/$arm_asset" alex alexandria
-          tar -C "$RUNNER_TEMP/alex-cli-release-x86_64" -czf "dist/$intel_asset" alex alexandria
+          tar -C "$RUNNER_TEMP/alex-cli-release-aarch64" -czf "dist/$arm_asset" alex
+          tar -C "$RUNNER_TEMP/alex-cli-release-x86_64" -czf "dist/$intel_asset" alex
 
           verify_root="$RUNNER_TEMP/alex-cli-archive-verify"
           rm -rf "$verify_root"
@@ -335,9 +335,9 @@ jobs:
           tar -xzf "dist/$intel_asset" -C "$verify_root/x86_64"
           for bin in \
             "$verify_root/aarch64/alex" \
-            "$verify_root/aarch64/alexandria" \
+            "$verify_root/aarch64/alex" \
             "$verify_root/x86_64/alex" \
-            "$verify_root/x86_64/alexandria"
+            "$verify_root/x86_64/alex"
           do
             codesign --verify --strict --verbose=2 "$bin"
           done
@@ -380,7 +380,7 @@ jobs:
             --dir "$root" --pattern "$asset" --pattern "$asset.sha256"
           sed 's#dist/##' "$root/$asset.sha256" | (cd "$root" && shasum -a 256 -c -)
           tar -xzf "$root/$asset" -C "$root/extracted"
-          for bin in "$root/extracted/alex" "$root/extracted/alexandria"; do
+          for bin in "$root/extracted/alex" "$root/extracted/alex"; do
             codesign --verify --strict --verbose=2 "$bin"
             details="$(codesign --display --verbose=4 "$bin" 2>&1)"
             grep -q '^Authority=Developer ID Application:' <<< "$details"
@@ -388,7 +388,7 @@ jobs:
             grep -Eq '^CodeDirectory .*flags=.*runtime' <<< "$details"
             case "$(basename "$bin")" in
               alex) expected_identifier="com.madhavajay.alex.cli" ;;
-              alexandria) expected_identifier="com.madhavajay.alex.daemon" ;;
+              alex) expected_identifier="com.madhavajay.alex.daemon" ;;
             esac
             grep -Fxq "Identifier=$expected_identifier" <<< "$details"
             "$bin" --version

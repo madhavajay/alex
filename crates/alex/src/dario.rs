@@ -616,7 +616,7 @@ pub fn resolve_dario_node_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         return usable_node(path).then(|| path.to_path_buf());
     }
     let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("ALEXANDRIA_NODE_BIN") {
+    if let Some(path) = std::env::var_os("ALEX_NODE_BIN") {
         candidates.push(PathBuf::from(path));
     }
     if let Some(path) = find_on_path("node") {
@@ -1285,20 +1285,20 @@ impl DarioSupervisor {
             .arg(format!("--port={port}"))
             .env("DARIO_API_KEY", &self.settings.api_key)
             .env("DARIO_CLAUDE_BIN", &shims.claude_bin)
-            .env("ALEXANDRIA_DARIO_CAPTURE_DIR", &self.settings.capture_root)
+            .env("ALEX_DARIO_CAPTURE_DIR", &self.settings.capture_root)
             .env(
-                "ALEXANDRIA_DARIO_PROMPT_CACHE_DIR",
+                "ALEX_DARIO_PROMPT_CACHE_DIR",
                 &self.settings.prompt_cache_root,
             )
             .env(
-                "ALEXANDRIA_DARIO_KNOWN_MODELS",
+                "ALEX_DARIO_KNOWN_MODELS",
                 serde_json::to_string(&known_models).expect("catalogue model names serialize"),
             )
             .env(
-                "ALEXANDRIA_DARIO_PROMPT_CACHE_KEYS",
+                "ALEX_DARIO_PROMPT_CACHE_KEYS",
                 prompt_cache_keys_env(&known_models),
             )
-            .env("ALEXANDRIA_DARIO_WORK_DIR", &work_dir)
+            .env("ALEX_DARIO_WORK_DIR", &work_dir)
             .env("NODE_OPTIONS", node_options)
             // The fetch-capture preload is a Node hook. Keeping supervised
             // Dario in Node avoids losing trace capture to Bun auto-relaunch.
@@ -1308,7 +1308,7 @@ impl DarioSupervisor {
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
         if let Some(real) = &self.settings.claude_bin {
-            child_cmd.env("ALEXANDRIA_REAL_CLAUDE_BIN", real);
+            child_cmd.env("ALEX_REAL_CLAUDE_BIN", real);
         }
         let child = child_cmd
             .spawn()
@@ -1852,9 +1852,9 @@ fn reap_action(
 
 fn claude_shim_name() -> &'static str {
     if cfg!(windows) {
-        "claude-alexandria-shim.cmd"
+        "claude-alex-shim.cmd"
     } else {
-        "claude-alexandria-shim"
+        "claude-alex-shim"
     }
 }
 
@@ -1862,9 +1862,9 @@ fn claude_capture_shim() -> String {
     if cfg!(windows) {
         r#"@echo off
 setlocal
-set "REAL=%ALEXANDRIA_REAL_CLAUDE_BIN%"
+set "REAL=%ALEX_REAL_CLAUDE_BIN%"
 if "%REAL%"=="" set "REAL=claude"
-set "MODEL=%ALEXANDRIA_DARIO_CAPTURE_MODEL%"
+set "MODEL=%ALEX_DARIO_CAPTURE_MODEL%"
 set "HAS_MODEL="
 set "PASSTHROUGH="
 for %%A in (%*) do (
@@ -1882,8 +1882,8 @@ if defined MODEL "%REAL%" --model "%MODEL%" %* & exit /b %ERRORLEVEL%
     } else {
         r#"#!/bin/sh
 set -eu
-real="${ALEXANDRIA_REAL_CLAUDE_BIN:-}"
-model="${ALEXANDRIA_DARIO_CAPTURE_MODEL:-}"
+real="${ALEX_REAL_CLAUDE_BIN:-}"
+model="${ALEX_DARIO_CAPTURE_MODEL:-}"
 if [ -z "$real" ]; then
   real="$(command -v claude 2>/dev/null || true)"
 fi
@@ -1923,16 +1923,16 @@ const crypto = require('node:crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { syncBuiltinESMExports } = require('node:module');
 
-const captureDir = process.env.ALEXANDRIA_DARIO_CAPTURE_DIR || '';
-const promptCacheDir = process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_DIR || '';
+const captureDir = process.env.ALEX_DARIO_CAPTURE_DIR || '';
+const promptCacheDir = process.env.ALEX_DARIO_PROMPT_CACHE_DIR || '';
 const promptCacheKeys = (() => {
-  try { return JSON.parse(process.env.ALEXANDRIA_DARIO_PROMPT_CACHE_KEYS || '{}'); } catch { return {}; }
+  try { return JSON.parse(process.env.ALEX_DARIO_PROMPT_CACHE_KEYS || '{}'); } catch { return {}; }
 })();
 // Rust supplies this from alex-store/models.json.  It is intentionally data,
 // not a second hand-maintained list: every catalogue Claude model is eligible
 // for capture and a new model is visible to this generation immediately.
 const knownModels = new Set((() => {
-  try { return JSON.parse(process.env.ALEXANDRIA_DARIO_KNOWN_MODELS || '[]'); } catch { return []; }
+  try { return JSON.parse(process.env.ALEX_DARIO_KNOWN_MODELS || '[]'); } catch { return []; }
 })());
 const idPattern = /^[A-Za-z0-9._-]{1,128}$/;
 const modelPattern = /^[A-Za-z0-9._:[\]-]{1,160}$/;
@@ -1993,7 +1993,7 @@ function writeCapture(id, kind, payload) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, zlib.gzipSync(Buffer.from(JSON.stringify(payload, null, 2), 'utf8')));
   } catch (err) {
-    try { process.stderr.write(`[alexandria] dario capture failed: ${err.message}\n`); } catch {}
+    try { process.stderr.write(`[alex] dario capture failed: ${err.message}\n`); } catch {}
   }
 }
 
@@ -2097,13 +2097,13 @@ function recordPromptCacheUse(model, traceId, status, error) {
   try {
     writeJsonFile(file, entry);
   } catch (err) {
-    try { process.stderr.write(`[alexandria] dario prompt-cache use failed: ${err.message}\n`); } catch {}
+    try { process.stderr.write(`[alex] dario prompt-cache use failed: ${err.message}\n`); } catch {}
   }
   return { entry, file };
 }
 
 function findRealClaude() {
-  if (process.env.ALEXANDRIA_REAL_CLAUDE_BIN) return process.env.ALEXANDRIA_REAL_CLAUDE_BIN;
+  if (process.env.ALEX_REAL_CLAUDE_BIN) return process.env.ALEX_REAL_CLAUDE_BIN;
   const pathEnv = process.env.PATH || '';
   const sep = process.platform === 'win32' ? ';' : ':';
   const names = process.platform === 'win32' ? ['claude.exe', 'claude.cmd', 'claude'] : ['claude'];
@@ -2178,7 +2178,7 @@ async function capturePromptForModel(model, traceId) {
           'anthropic-ratelimit-unified-status': 'allowed',
         });
         res.end([
-          `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_alexandria_capture', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`,
+          `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_alex_capture', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`,
           `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`,
           `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })}\n\n`,
           `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`,
@@ -2197,7 +2197,7 @@ async function capturePromptForModel(model, traceId) {
         ANTHROPIC_BASE_URL: `http://127.0.0.1:${addr.port}`,
         ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-dario-fingerprint-capture',
         CLAUDE_NONINTERACTIVE: '1',
-        ALEXANDRIA_DARIO_CAPTURE_MODEL: model,
+        ALEX_DARIO_CAPTURE_MODEL: model,
       };
       delete env.NODE_OPTIONS;
       delete env.DARIO_CLAUDE_BIN;
@@ -2205,7 +2205,7 @@ async function capturePromptForModel(model, traceId) {
       try {
         child = childProcess.spawn(claudeBin, ['--model', model, '--print', '-p', 'hi'], {
           env,
-          cwd: process.env.ALEXANDRIA_DARIO_WORK_DIR || process.cwd(),
+          cwd: process.env.ALEX_DARIO_WORK_DIR || process.cwd(),
           stdio: ['ignore', 'ignore', 'ignore'],
           windowsHide: true,
           shell: useShell,
@@ -2227,7 +2227,7 @@ async function capturePromptForModel(model, traceId) {
   const entry = {
     key,
     model,
-    source: 'alexandria-claude-live-capture',
+    source: 'alex-claude-live-capture',
     captured_at: now,
     last_used_at: now,
     trace_id: traceId,
@@ -2430,7 +2430,7 @@ fn quarantine_fable_live_cache() {
         return;
     }
     let quarantine = path.with_file_name(format!(
-        "cc-template.live.json.alexandria-quarantine-{}",
+        "cc-template.live.json.alex-quarantine-{}",
         now_ms()
     ));
     match std::fs::rename(&path, &quarantine) {
@@ -2676,16 +2676,16 @@ mod tests {
     #[test]
     fn claude_prompt_capture_uses_private_working_directory() {
         let preload = fetch_capture_preload();
-        assert!(preload.contains("cwd: process.env.ALEXANDRIA_DARIO_WORK_DIR"));
+        assert!(preload.contains("cwd: process.env.ALEX_DARIO_WORK_DIR"));
     }
 
     #[test]
     fn node_options_quotes_spaced_preload_path() {
         let options = node_options_with_require(Path::new(
-            "/Users/alex/Library/Application Support/alexandria/dario-fetch-capture.cjs",
+            "/Users/alex/Library/Application Support/alex/dario-fetch-capture.cjs",
         ));
         assert!(options.ends_with(
-            "--require=\"/Users/alex/Library/Application Support/alexandria/dario-fetch-capture.cjs\""
+            "--require=\"/Users/alex/Library/Application Support/alex/dario-fetch-capture.cjs\""
         ));
     }
 

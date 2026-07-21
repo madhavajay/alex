@@ -25,8 +25,6 @@ REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
 APP_DIR="${ALEX_APP_DIR:-/Applications}"
 APP_NAME="Alex.app"
-LEGACY_APP_STEM="AlexandriaBar"
-LEGACY_APP_NAME="${LEGACY_APP_STEM}.app"
 APP_BUNDLE_ID="${ALEX_APP_BUNDLE_ID:-com.madhavajay.alex}"
 
 say() {
@@ -47,10 +45,10 @@ sha256_file() {
 
 quit_alex_apps() {
   wait_steps="${1:-0}"
-  for app in AlexandriaBar Alex; do
+  for app in Alex; do
     osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 </dev/null || true
   done
-  for process in AlexandriaBar Alex; do
+  for process in Alex; do
     if pgrep -x "$process" >/dev/null 2>&1; then
       printf 'Quitting the running %s...\n' "$process"
       waited=0
@@ -63,20 +61,6 @@ quit_alex_apps() {
       fi
     fi
   done
-}
-
-remove_legacy_app() {
-  app_dir="$1"
-  new_app_name="${2:-Alex.app}"
-  legacy_app_name="${3:-AlexandriaBar.app}"
-  [ -n "$app_dir" ] || return 1
-  [ -e "$app_dir/$new_app_name" ] || return 0
-  [ -e "$app_dir/$legacy_app_name" ] || return 0
-  if [ -w "$app_dir" ]; then
-    rm -rf "$app_dir/$legacy_app_name"
-  else
-    sudo rm -rf "$app_dir/$legacy_app_name"
-  fi
 }
 
 INSTALL_COMMON_MOUNT_POINT=""
@@ -93,13 +77,12 @@ install_app_from_dmg() {
   dmg_path="$1"
   app_name="$2"
   install_dir="$3"
-  legacy_app_name="${4:-AlexandriaBar.app}"
 
   [ -n "$install_dir" ] || {
     printf '%s\n' "The app install directory is empty." >&2
     return 1
   }
-  INSTALL_COMMON_MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-install-XXXXXX")"
+  INSTALL_COMMON_MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alex-install-XXXXXX")"
   hdiutil attach "$dmg_path" -nobrowse -quiet -mountpoint "$INSTALL_COMMON_MOUNT_POINT" </dev/null
 
   if [ ! -d "$INSTALL_COMMON_MOUNT_POINT/$app_name" ]; then
@@ -114,7 +97,6 @@ install_app_from_dmg() {
 
   rm -rf "$install_dir/$app_name"
   ditto "$INSTALL_COMMON_MOUNT_POINT/$app_name" "$install_dir/$app_name"
-  remove_legacy_app "$install_dir" "$app_name" "$legacy_app_name"
   install_common_cleanup_mount
 }
 
@@ -178,7 +160,7 @@ install_cli() {
   tar -xzf "$5/$3" -C "$5"
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$5/alex" "$INSTALL_DIR/alex"
-  install -m 0755 "$5/alexandria" "$INSTALL_DIR/alexandria"
+  install -m 0755 "$5/alex" "$INSTALL_DIR/alex"
 }
 
 # Point launchd at the newly installed binary and (re)start the daemon.
@@ -197,10 +179,10 @@ replace_daemon() {
   # "stuck" on an old version forever. launchd relaunches its own managed daemon
   # after service install, so clearing every running daemon here is safe.
   alex_pattern="^$(printf '%s' "$INSTALL_DIR/alex" | sed 's/[][\\.^$*+?{}|()]/\\&/g')[[:space:]]+daemon([[:space:]]|$)"
-  alexandria_pattern="^$(printf '%s' "$INSTALL_DIR/alexandria" | sed 's/[][\\.^$*+?{}|()]/\\&/g')[[:space:]]+daemon([[:space:]]|$)"
-  if pgrep -f "$alex_pattern" >/dev/null 2>&1 || pgrep -f "$alexandria_pattern" >/dev/null 2>&1; then
+  alex_pattern="^$(printf '%s' "$INSTALL_DIR/alex" | sed 's/[][\\.^$*+?{}|()]/\\&/g')[[:space:]]+daemon([[:space:]]|$)"
+  if pgrep -f "$alex_pattern" >/dev/null 2>&1 || pgrep -f "$alex_pattern" >/dev/null 2>&1; then
     say "Clearing stray daemon processes holding the port..."
-    pkill -f "$alexandria_pattern" >/dev/null 2>&1 || true
+    pkill -f "$alex_pattern" >/dev/null 2>&1 || true
     pkill -f "$alex_pattern" >/dev/null 2>&1 || true
     sleep 1
   fi
@@ -234,7 +216,7 @@ install_app() {
   curl -fsSL "$dmg_url" -o "$2/Alex-beta.dmg" </dev/null
 
   quit_alex_apps 20
-  install_app_from_dmg "$2/Alex-beta.dmg" "$APP_NAME" "$APP_DIR" "$LEGACY_APP_NAME"
+  install_app_from_dmg "$2/Alex-beta.dmg" "$APP_NAME" "$APP_DIR"
 
   say "Installed $APP_NAME to $APP_DIR."
 

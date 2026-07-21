@@ -57,12 +57,6 @@ if [ "$NO_BAR" = "0" ]; then
     sudo rm -rf /Applications/Alex.app
     sudo ditto macos/dist/Alex.app /Applications/Alex.app
   fi
-  remove_legacy_app /Applications
-  # Older local builds installed a second copy here. Remove only the exact
-  # obsolete Alex bundle, and only after /Applications/Alex.app is complete.
-  if [ -e "$HOME/Applications/Alex.app" ]; then
-    rm -rf "$HOME/Applications/Alex.app"
-  fi
   open /Applications/Alex.app
   echo "◆ Alex installed to /Applications and launched"
 fi

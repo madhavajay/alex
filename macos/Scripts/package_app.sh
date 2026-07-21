@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 CONFIGURATION="${CONFIGURATION:-release}"
 IDENTITY="${IDENTITY:--}"
-APP_NAME="AlexandriaBar"
+APP_NAME="Alex"
 APP_DISPLAY="Alex"
 BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alex}"
 VERSION="${VERSION:-0.1.0}"
@@ -109,7 +109,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
-    <key>NSHumanReadableCopyright</key><string>Alexandria</string>
+    <key>NSHumanReadableCopyright</key><string>Alex</string>
     <key>SUFeedURL</key><string>$SPARKLE_FEED_URL_ESCAPED</string>
 $SPARKLE_PUBLIC_ED_KEY_PLIST
     <key>SUEnableAutomaticChecks</key><true/>

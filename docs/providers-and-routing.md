@@ -135,7 +135,7 @@ accounts rather than one upstream credential.
 
 ## Model-to-provider routing
 
-`route_model` first strips a harness namespace (`alex/`, `alexandria/`,
+`route_model` first strips a harness namespace (`alex/`,
 `cove/`, or Claude-compatible `claude-alex/`), then resolves an explicit
 provider prefix.
 
@@ -197,7 +197,7 @@ openai = "gpt-5.6-sol"
 equivalencies select a different provider/model after covered failures;
 capacity/server errors are covered when protection is enabled, and auth is
 covered only with `reroute_on_auth = true`. The request header
-`x-alexandria-no-substitute: 1` disables configured cross-model substitution
+`x-alex-no-substitute: 1` disables configured cross-model substitution
 for that request.
 
 ### Fable → Sol preset contract

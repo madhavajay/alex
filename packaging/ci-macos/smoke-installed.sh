@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERVICE_LABEL="com.alexandria.daemon"
+SERVICE_LABEL="com.madhavajay.alex.daemon"
 SERVICE_TARGET="gui/$(id -u)/$SERVICE_LABEL"
 SERVICE_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
 BASE_URL="http://127.0.0.1:4100"
@@ -42,7 +42,7 @@ cleanup() {
   set +e
   if [[ "$SERVICE_CLEANUP_ALLOWED" -eq 1 ]]; then
     if [[ -x "$ALEX_BIN" ]]; then
-      ALEXANDRIA_HOME="$STATE_DIR" "$ALEX_BIN" service uninstall >/dev/null 2>&1
+      ALEX_HOME="$STATE_DIR" "$ALEX_BIN" service uninstall >/dev/null 2>&1
     fi
     launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1
     rm -f "$SERVICE_PLIST"
@@ -88,9 +88,9 @@ MOCK_PORT="$(tr -d '[:space:]' < "$MOCK_READY")"
 [[ "$MOCK_PORT" =~ ^[0-9]+$ ]] || fail "loopback mock returned an invalid port"
 MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 
-export ALEXANDRIA_HOME="$STATE_DIR"
-export ALEXANDRIA_APP_DEST="$APP_DEST"
-export ALEXANDRIA_BIN_DEST="$BIN_DEST"
+export ALEX_HOME="$STATE_DIR"
+export ALEX_APP_DEST="$APP_DEST"
+export ALEX_BIN_DEST="$BIN_DEST"
 "$SCRIPT_DIR/install.sh" --no-open
 
 [[ -d "$APP_DEST" ]] || fail "installer did not copy Alex.app"
@@ -100,11 +100,11 @@ cmp "$SCRIPT_DIR/bin/alex" "$ALEX_BIN" \
 codesign --verify --deep --strict "$APP_DEST"
 
 PLIST_PROGRAM="$(plutil -extract ProgramArguments.0 raw -o - "$SERVICE_PLIST")"
-PLIST_HOME="$(plutil -extract EnvironmentVariables.ALEXANDRIA_HOME raw -o - "$SERVICE_PLIST")"
+PLIST_HOME="$(plutil -extract EnvironmentVariables.ALEX_HOME raw -o - "$SERVICE_PLIST")"
 [[ "$PLIST_PROGRAM" == "$ALEX_BIN" ]] \
   || fail "launchd is not pinned to the packaged binary: $PLIST_PROGRAM"
 [[ "$PLIST_HOME" == "$STATE_DIR" ]] \
-  || fail "launchd did not retain the isolated Alexandria home"
+  || fail "launchd did not retain the isolated Alex home"
 
 wait_for_health() {
   for ((attempt = 0; attempt < 150; attempt++)); do
@@ -116,7 +116,7 @@ wait_for_health() {
 wait_for_health || fail "installed launchd daemon did not become healthy"
 
 PATH="$BIN_DEST:$PATH" "$ALEX_BIN" status --json > "$SMOKE_ROOT/status-before.json"
-jq -e --arg binary "$BIN_DEST/alexandria" '
+jq -e --arg binary "$BIN_DEST/alex" '
   .daemon.running == true
   and .daemon.service.managed == true
   and any(.daemon.binaries[]; .path == $binary)
@@ -153,7 +153,7 @@ jq -nc --arg model "exo/$MODEL" '
 curl -fsS --max-time 10 \
   -H "Authorization: Bearer $LOCAL_KEY" \
   -H 'content-type: application/json' \
-  -H 'x-alexandria-harness: clean-machine-ci' \
+  -H 'x-alex-harness: clean-machine-ci' \
   -H "x-session-id: $SESSION_ID" \
   --data-binary @"$SMOKE_ROOT/request.json" \
   "$BASE_URL/v1/chat/completions" > "$SMOKE_ROOT/response.json"

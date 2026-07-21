@@ -77,7 +77,7 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/dist/ci-linux"
           mkdir -p "$asset_dir"
           cargo build --release --locked -p alex --bins
-          tar -C target/release -czf "$asset_dir/$asset" alex alexandria
+          tar -C target/release -czf "$asset_dir/$asset" alex
           shasum -a 256 "$asset_dir/$asset" > "$asset_dir/$asset.sha256"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -184,10 +184,10 @@ jobs:
 
           cargo build --release --locked -p alex --bins
           candidate_asset="alex-cli-${candidate_version}-linux-x86_64.tar.gz"
-          tar -C target/release -czf "$assets/$candidate_asset" alex alexandria
+          tar -C target/release -czf "$assets/$candidate_asset" alex
           shasum -a 256 "$assets/$candidate_asset" > "$assets/$candidate_asset.sha256"
           [[ "$(target/release/alex --version)" == "alex $candidate_version" ]]
-          [[ "$(target/release/alexandria --version)" == "alex $candidate_version" ]]
+          [[ "$(target/release/alex --version)" == "alex $candidate_version" ]]
 
           git archive "$BASE_SHA" | tar -x -C "$base_source"
           (
@@ -196,12 +196,12 @@ jobs:
             CARGO_TARGET_DIR="$base_target" cargo build --release --locked -p alex --bins
           )
           base_asset="alex-cli-${base_version}-linux-x86_64.tar.gz"
-          tar -C "$base_target/release" -czf "$assets/$base_asset" alex alexandria
+          tar -C "$base_target/release" -czf "$assets/$base_asset" alex
           shasum -a 256 "$assets/$base_asset" > "$assets/$base_asset.sha256"
-          for binary in alex alexandria; do
+          for binary in alex; do
             reported="$("$base_target/release/$binary" --version)"
             [[ "$reported" == "alex $base_version" \
-              || "$reported" == "alexandria $base_version" ]] || {
+              || "$reported" == "alex $base_version" ]] || {
               echo "legacy base $binary reported unexpected version: $reported" >&2
               exit 1
             }
@@ -277,10 +277,10 @@ jobs:
     runs-on: namespace-profile-mac-medium
     steps:
       - uses: actions/checkout@v4
-      - name: Build AlexandriaBar
+      - name: Build Alex
         working-directory: macos
         run: swift build
-      - name: Test AlexandriaBar
+      - name: Test Alex
         working-directory: macos
         run: swift test
 
@@ -305,7 +305,7 @@ jobs:
       - name: Build release daemon and CLI
         run: cargo build --release --locked -p alex --bins
 
-      - name: Build ad-hoc AlexandriaBar app
+      - name: Build ad-hoc Alex app
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
@@ -323,14 +323,14 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:12}"
-          bundle_name="alexandria-macos-pr-${PR_NUMBER}-${short_sha}"
+          bundle_name="alex-macos-pr-${PR_NUMBER}-${short_sha}"
           stage="$RUNNER_TEMP/$bundle_name"
           output="$GITHUB_WORKSPACE/dist/ci-macos"
 
           rm -rf "$stage" "$output"
           mkdir -p "$stage/bin" "$output"
           ditto macos/dist/Alex.app "$stage/Alex.app"
-          cp target/release/alex target/release/alexandria "$stage/bin/"
+          cp target/release/alex target/release/alex "$stage/bin/"
           cp \
             packaging/ci-macos/install.sh \
             packaging/ci-macos/mock-openai.py \
@@ -343,7 +343,7 @@ jobs:
             "$stage/mock-openai.py" \
             "$stage/smoke-installed.sh" \
             "$stage/bin/alex" \
-            "$stage/bin/alexandria"
+            "$stage/bin/alex"
 
           {
             echo "Alex macOS PR test bundle"
@@ -380,16 +380,16 @@ jobs:
           ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
         run: |
           set +e
-          service_target="gui/$(id -u)/com.alexandria.daemon"
+          service_target="gui/$(id -u)/com.madhavajay.alex.daemon"
           alex_bin="$ALEX_CI_SMOKE_ROOT/bin/alex"
           if [[ -f "$ALEX_CI_SMOKE_ROOT/service-cleanup-allowed" ]]; then
             if [[ -x "$alex_bin" ]]; then
-              ALEXANDRIA_HOME="$ALEX_CI_SMOKE_ROOT/state" \
+              ALEX_HOME="$ALEX_CI_SMOKE_ROOT/state" \
                 "$alex_bin" service uninstall >/dev/null 2>&1
             fi
             launchctl bootout "$service_target" >/dev/null 2>&1
-            rm -f "$HOME/Library/LaunchAgents/com.alexandria.daemon.plist"
-            rm -f /tmp/alexandria.daemon.out.log /tmp/alexandria.daemon.err.log
+            rm -f "$HOME/Library/LaunchAgents/com.madhavajay.alex.daemon.plist"
+            rm -f /tmp/alex.daemon.out.log /tmp/alex.daemon.err.log
           fi
           if [[ -s "$ALEX_CI_SMOKE_ROOT/mock.pid" ]]; then
             mock_pid="$(tr -d '[:space:]' < "$ALEX_CI_SMOKE_ROOT/mock.pid")"

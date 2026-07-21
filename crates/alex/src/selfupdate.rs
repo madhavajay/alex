@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{alexandria_home, detect_service_state, Config, ServiceState};
+use crate::{alex_home, detect_service_state, Config, ServiceState};
 
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/madhavajay/alex/releases/latest/download/manifest.json";
@@ -279,7 +279,10 @@ impl UpdateDecision {
     /// unconfirmable difference are offered — the alternative (staying silent)
     /// is the exact false "up to date" the user rejected.
     pub(crate) fn update_available(self) -> bool {
-        matches!(self, UpdateDecision::Available | UpdateDecision::Unconfirmed)
+        matches!(
+            self,
+            UpdateDecision::Available | UpdateDecision::Unconfirmed
+        )
     }
 }
 
@@ -725,13 +728,13 @@ async fn install_unix(exe: &Path, update: &UpdateCheck) -> Result<()> {
     println!("replacing {}", exe.display());
     std::fs::rename(&extracted_tmp, exe).with_context(|| format!("replacing {}", exe.display()))?;
 
-    let sibling = exe.with_file_name("alexandria");
+    let sibling = exe.with_file_name("alex");
     if sibling.exists() {
         let meta = std::fs::symlink_metadata(&sibling)?;
         if meta.file_type().is_symlink() {
-            println!("leaving alexandria symlink unchanged");
+            println!("leaving alex symlink unchanged");
         } else {
-            let sibling_tmp = dir.join(format!(".alex-update.{pid}.alexandria"));
+            let sibling_tmp = dir.join(format!(".alex-update.{pid}.alex"));
             let _ = std::fs::remove_file(&sibling_tmp);
             std::fs::copy(exe, &sibling_tmp)
                 .with_context(|| format!("preparing {}", sibling.display()))?;
@@ -855,11 +858,11 @@ async fn restart_daemon(config: &Config, exe: &Path, target_version: &str) -> Re
         ServiceState::Systemd { active: true, .. } => {
             println!("daemon is systemd-managed; restarting with systemctl");
             let status = Command::new("systemctl")
-                .args(["--user", "restart", "alexandria"])
+                .args(["--user", "restart", "alex"])
                 .status()
-                .context("running systemctl --user restart alexandria")?;
+                .context("running systemctl --user restart alex")?;
             if !status.success() {
-                anyhow::bail!("systemctl --user restart alexandria failed");
+                anyhow::bail!("systemctl --user restart alex failed");
             }
             // B3: don't trust the exit code alone — confirm the daemon now
             // answering /health is actually the new build.
@@ -867,7 +870,7 @@ async fn restart_daemon(config: &Config, exe: &Path, target_version: &str) -> Re
                 verify_served_version(&client, &health_url, target_version).await?;
                 println!("daemon restarted; verified it is now serving {target_version}");
             } else {
-                anyhow::bail!("systemd restarted alexandria but it did not become healthy in time");
+                anyhow::bail!("systemd restarted alex but it did not become healthy in time");
             }
             Ok(())
         }
@@ -938,7 +941,7 @@ async fn blue_green_restart(config: &Config, exe: &Path, target_version: &str) -
         println!("old daemon pid(s): {}", old_pids.join(" "));
     }
 
-    let log_path = alexandria_home().join("daemon.log");
+    let log_path = alex_home().join("daemon.log");
     let log_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1366,20 +1369,14 @@ mod tests {
     fn decide_update_backstop_never_false_latest() {
         // Identical tag (incl. v-prefix / build metadata) → confirmed latest.
         assert_eq!(decide_update("0.1.28", "0.1.28"), UpdateDecision::UpToDate);
-        assert_eq!(
-            decide_update("v0.1.28", "0.1.28"),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("v0.1.28", "0.1.28"), UpdateDecision::UpToDate);
         assert_eq!(
             decide_update("0.1.28", "0.1.28+build.5"),
             UpdateDecision::UpToDate
         );
 
         // A strictly newer latest → available.
-        assert_eq!(
-            decide_update("0.1.28", "0.1.29"),
-            UpdateDecision::Available
-        );
+        assert_eq!(decide_update("0.1.28", "0.1.29"), UpdateDecision::Available);
         // Row-8 shape: an rc tag is the newest → offered, not a false latest.
         assert_eq!(
             decide_update("0.1.28", "0.1.29-rc.1"),
@@ -1388,10 +1385,7 @@ mod tests {
 
         // Running build strictly newer than the channel head (dev/ahead) →
         // up to date (no newer tag exists), which does not violate the rule.
-        assert_eq!(
-            decide_update("0.1.29", "0.1.28"),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("0.1.29", "0.1.28"), UpdateDecision::UpToDate);
 
         // THE user-trust cases: tags differ but one side is unparseable. Must
         // NOT be UpToDate — offered/flagged instead.
@@ -1442,23 +1436,76 @@ mod tests {
         // Row 4's channel is DERIVED from the (beta) build version per B2 — a
         // beta build must not default to the stable channel.
         let row4_channel = UpdateChannel::default_for_version("0.1.28-beta.2");
-        assert_eq!(row4_channel, UpdateChannel::Beta, "B2: beta build → beta channel");
+        assert_eq!(
+            row4_channel,
+            UpdateChannel::Beta,
+            "B2: beta build → beta channel"
+        );
 
         let rows = [
             // 1: stable build, stable channel → stable update, NOT the beta.
-            Row { current: "0.1.27", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.27",
+                channel: UpdateChannel::Stable,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.29-beta.1",
+                expect_available: true,
+                expect_latest: "0.1.28",
+            },
             // 2: stable build, beta channel → the newer beta.
-            Row { current: "0.1.27", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.29-beta.1", expect_available: true, expect_latest: "0.1.29-beta.1" },
+            Row {
+                current: "0.1.27",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.29-beta.1",
+                expect_available: true,
+                expect_latest: "0.1.29-beta.1",
+            },
             // 3: beta build, beta channel → newer beta.
-            Row { current: "0.1.28-beta.2", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.2",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28-beta.3",
+            },
             // 4: beta build, channel defaulted (→ beta per B2) → newer beta, NOT "up to date".
-            Row { current: "0.1.28-beta.2", channel: row4_channel, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.2",
+                channel: row4_channel,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28-beta.3",
+            },
             // 5: beta build, beta channel, final shipped → roll onto the final (final > its betas).
-            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: true, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.28-beta.3",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: true,
+                expect_latest: "0.1.28",
+            },
             // 6: stable build, stable channel, same version → up to date.
-            Row { current: "0.1.28", channel: UpdateChannel::Stable, latest_stable: "0.1.28", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28" },
+            Row {
+                current: "0.1.28",
+                channel: UpdateChannel::Stable,
+                latest_stable: "0.1.28",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: false,
+                expect_latest: "0.1.28",
+            },
             // 7: beta build, beta channel, same beta → up to date.
-            Row { current: "0.1.28-beta.3", channel: UpdateChannel::Beta, latest_stable: "0.1.27", latest_beta: "0.1.28-beta.3", expect_available: false, expect_latest: "0.1.28-beta.3" },
+            Row {
+                current: "0.1.28-beta.3",
+                channel: UpdateChannel::Beta,
+                latest_stable: "0.1.27",
+                latest_beta: "0.1.28-beta.3",
+                expect_available: false,
+                expect_latest: "0.1.28-beta.3",
+            },
         ];
 
         for (i, row) in rows.iter().enumerate() {
@@ -1494,10 +1541,7 @@ mod tests {
         // returns the stable head, so the decision is "up to date".
         let latest = resolve_latest(UpdateChannel::Stable, "0.1.28", "0.1.29-beta.5");
         assert_eq!(latest, "0.1.28");
-        assert_eq!(
-            decide_update("0.1.28", &latest),
-            UpdateDecision::UpToDate
-        );
+        assert_eq!(decide_update("0.1.28", &latest), UpdateDecision::UpToDate);
 
         // select_release_for_channel filters the same way: stable skips every
         // pre-release even when it is the newest tag present.
@@ -1510,8 +1554,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let (stable_tag, _) =
-            select_release_for_channel(&releases, UpdateChannel::Stable).unwrap();
+        let (stable_tag, _) = select_release_for_channel(&releases, UpdateChannel::Stable).unwrap();
         assert_eq!(stable_tag, "v0.1.28");
         // Beta channel, in contrast, sees the newer beta.
         let (beta_tag, _) = select_release_for_channel(&releases, UpdateChannel::Beta).unwrap();
@@ -1570,11 +1613,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pids_to_reclaim_keeps_only_the_new_daemon() {
-        let listeners = vec![
-            "1001".to_string(),
-            "1002".to_string(),
-            "2000".to_string(),
-        ];
+        let listeners = vec!["1001".to_string(), "1002".to_string(), "2000".to_string()];
         // The new daemon (2000) is spared; the two strays are reclaimed.
         assert_eq!(
             pids_to_reclaim(&listeners, "2000"),

@@ -98,7 +98,7 @@ echo "◆ preparing isolated $VERSION build from $REF"
 git -C "$REPO_ROOT" worktree add --detach "$BUILD_TREE" "$REF" >/dev/null
 
 INSTALL_ARGS=(--prefix "$PREFIX")
-if launchctl print "gui/$(id -u)/com.alexandria.daemon" >/dev/null 2>&1; then
+if launchctl print "gui/$(id -u)/com.madhavajay.alex.daemon" >/dev/null 2>&1; then
   INSTALL_ARGS+=(--upgrade)
 else
   INSTALL_ARGS+=(--service)
@@ -113,12 +113,12 @@ fi
 CLI_VERSION="$($PREFIX/alex --version)"
 APP_VERSION="$(defaults read "/Applications/Alex.app/Contents/Info" CFBundleShortVersionString)"
 PORT=4100
-if [[ -n "${ALEXANDRIA_HOME:-}" ]]; then
-  CONFIG="$ALEXANDRIA_HOME/config.toml"
+if [[ -n "${ALEX_HOME:-}" ]]; then
+  CONFIG="$ALEX_HOME/config.toml"
 elif [[ -f "$HOME/.alex/config.toml" ]]; then
   CONFIG="$HOME/.alex/config.toml"
 else
-  CONFIG="$HOME/.alexandria/config.toml"
+  CONFIG="$HOME/.alex/config.toml"
 fi
 if [[ -f "$CONFIG" ]]; then
   CONFIG_PORT="$(sed -n 's/^port *= *\([0-9]*\)/\1/p' "$CONFIG" | head -1)"

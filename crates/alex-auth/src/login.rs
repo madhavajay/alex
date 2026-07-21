@@ -1102,10 +1102,7 @@ async fn refresh_codex_usage_for_account(vault: &Vault, account: Account) -> Res
 /// pinned to the credential's exact ChatGPT workspace and never sends a model
 /// prompt. Failures are returned per account so one stale credential cannot
 /// prevent the remaining subscriptions from updating.
-pub async fn refresh_due_codex_usage(
-    vault: &Vault,
-    max_age_ms: i64,
-) -> Vec<(String, Result<()>)> {
+pub async fn refresh_due_codex_usage(vault: &Vault, max_age_ms: i64) -> Vec<(String, Result<()>)> {
     let now = now_ms();
     let accounts: Vec<Account> = vault
         .list()
@@ -1809,7 +1806,7 @@ mod tests {
     #[tokio::test]
     async fn named_claude_save_preserves_existing_default_on_disk() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-named-claude-{}-{}",
+            "alex-named-claude-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1859,7 +1856,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_subscription_identity_adds_new_and_replaces_same_login() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-auto-subscription-{}-{}",
+            "alex-auto-subscription-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1902,7 +1899,7 @@ mod tests {
     #[tokio::test]
     async fn unnamed_kimi_upsert_uses_default_id() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-default-kimi-{}-{}",
+            "alex-default-kimi-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1931,7 +1928,7 @@ mod tests {
     #[tokio::test]
     async fn named_codex_save_preserves_existing_default() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-named-codex-{}-{}",
+            "alex-named-codex-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1977,7 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_codex_identity_adds_reauths_and_preserves_workspaces() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-auto-codex-{}-{}",
+            "alex-auto-codex-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -2062,7 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_codex_identity_rejects_unidentified_account_without_mutation() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-auto-codex-missing-{}-{}",
+            "alex-auto-codex-missing-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -2108,12 +2105,10 @@ mod tests {
         });
         assert!(!codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 - 1);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 - 1);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 + 60);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 + 60);
         account.account_meta["codex_limits"]["observed_at_ms"] = json!(now - 300_000);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 

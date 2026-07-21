@@ -30,7 +30,7 @@ completed gzip files. An offline migration can later attach validated LAR
 pointers without deleting or replacing those source paths.
 
 ```text
-<data_dir>/alexandria.sqlite3
+<data_dir>/alex.sqlite3
 <data_dir>/bodies/2026-07-19/
   <trace-id>.request.json.gz
   <trace-id>.upstream-request.json.gz
@@ -68,9 +68,9 @@ contain prompts, source code, tool results, or user-supplied secrets. Treat
 
 The proxy discovers a session from explicit Alex/Claude session headers,
 known request metadata, and format-specific fields such as Codex
-`prompt_cache_key`. A harness tag comes from `x-alexandria-harness` (with a
+`prompt_cache_key`. A harness tag comes from `x-alex-harness` (with a
 user-agent fallback). Run keys can supply a fixed `run_id` and tags; request
-headers can add trace tags and selected `x-alexandria-*` metadata.
+headers can add trace tags and selected `x-alex-*` metadata.
 
 Harness lifecycle hooks post to `/harness-events`. The accepted events are
 `SessionStart`, `SubagentStart`, `SubagentStop`, and `Stop`. Parent/child edges
@@ -185,7 +185,7 @@ curl -H 'x-api-key: <redacted-local-key>' \
 
 | Key kind | Lifetime | Trace capability |
 | --- | --- | --- |
-| `run` | User TTL, default 24h, capped at 7d | Invoke models; trace rows default to the key's `run_id` and tags. An `x-alexandria-run-id` header takes precedence, and request trace tags extend/override same-named key tags. |
+| `run` | User TTL, default 24h, capped at 7d | Invoke models; trace rows default to the key's `run_id` and tags. An `x-alex-run-id` header takes precedence, and request trace tags extend/override same-named key tags. |
 | `harness` | No expiry until revoked | Invoke models and post lifecycle/tool events under its required harness label. |
 | `wrap` | No expiry until revoked | Preflight/post only `/traces/ingest`; cannot invoke models or browse traces. |
 

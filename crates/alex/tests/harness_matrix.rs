@@ -87,7 +87,9 @@ mod kimi_subscription {
     fn import_creds_then_refresh_before_expiry() {
         // `alex auth import kimi` adopts the CLI creds; a routed request after
         // >15min proves proactive refresh via refresh_token (no 401).
-        unimplemented!("TODO: live Kimi provider — import creds, force expiry, assert auto-refresh");
+        unimplemented!(
+            "TODO: live Kimi provider — import creds, force expiry, assert auto-refresh"
+        );
     }
 
     #[test]
@@ -141,8 +143,7 @@ mod harness_interop_live {
         let base =
             std::env::var("ALEX_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:4100".into());
         let key = std::env::var("ALEX_API_KEY").unwrap_or_else(|_| "alx-local".into());
-        let model =
-            std::env::var("ALEX_INTEROP_MODEL").unwrap_or_else(|_| "claude-fable-5".into());
+        let model = std::env::var("ALEX_INTEROP_MODEL").unwrap_or_else(|_| "claude-fable-5".into());
 
         let request = serde_json::json!({
             "model": model,
@@ -190,9 +191,7 @@ mod harness_interop_live {
         let has_text = msg["content"]
             .as_str()
             .is_some_and(|s| !s.trim().is_empty());
-        let has_tool_calls = msg["tool_calls"]
-            .as_array()
-            .is_some_and(|c| !c.is_empty());
+        let has_tool_calls = msg["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
         assert!(
             has_text || has_tool_calls,
             "alex returned an empty/unusable completion (the retry-loop bug): {body}"

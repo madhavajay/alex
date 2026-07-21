@@ -9,11 +9,9 @@ else
 fi
 APP_SOURCE="$SCRIPT_DIR/Alex.app"
 BIN_SOURCE="$SCRIPT_DIR/bin"
-APP_DEST="${ALEXANDRIA_APP_DEST:-/Applications/Alex.app}"
-LEGACY_APP_STEM="AlexandriaBar"
-LEGACY_APP_DEST="$(dirname "$APP_DEST")/${LEGACY_APP_STEM}.app"
-APP_BACKUP="${APP_DEST%.app}.pre-alexandria-ci"
-BIN_DEST="${ALEXANDRIA_BIN_DEST:-$HOME/.local/bin}"
+APP_DEST="${ALEX_APP_DEST:-/Applications/Alex.app}"
+APP_BACKUP="${APP_DEST%.app}.pre-alex-ci"
+BIN_DEST="${ALEX_BIN_DEST:-$HOME/.local/bin}"
 
 usage() {
   cat <<'EOF'
@@ -90,8 +88,8 @@ restore_previous() {
   run_for_applications mv "$APP_BACKUP" "$APP_DEST"
 
   restored=0
-  for name in alex alexandria; do
-    backup="$BIN_DEST/$name.pre-alexandria-ci"
+  for name in alex; do
+    backup="$BIN_DEST/$name.pre-alex-ci"
     if [[ -f "$backup" ]]; then
       mv "$backup" "$BIN_DEST/$name"
       chmod +x "$BIN_DEST/$name"
@@ -114,7 +112,7 @@ install_ci_build() {
     echo "This test bundle is for macOS only." >&2
     exit 1
   fi
-  if [[ ! -d "$APP_SOURCE" || ! -x "$BIN_SOURCE/alex" || ! -x "$BIN_SOURCE/alexandria" ]]; then
+  if [[ ! -d "$APP_SOURCE" || ! -x "$BIN_SOURCE/alex" ]]; then
     echo "The CI bundle is incomplete; keep install.sh beside Alex.app and bin/." >&2
     exit 1
   fi
@@ -128,18 +126,17 @@ install_ci_build() {
     run_for_applications rm -rf "$APP_DEST"
   fi
 
-  for name in alex alexandria; do
-    if [[ -f "$BIN_DEST/$name" && ! -e "$BIN_DEST/$name.pre-alexandria-ci" ]]; then
-      cp -p "$BIN_DEST/$name" "$BIN_DEST/$name.pre-alexandria-ci"
+  for name in alex; do
+    if [[ -f "$BIN_DEST/$name" && ! -e "$BIN_DEST/$name.pre-alex-ci" ]]; then
+      cp -p "$BIN_DEST/$name" "$BIN_DEST/$name.pre-alex-ci"
     fi
   done
 
   run_for_applications ditto "$APP_SOURCE" "$APP_DEST"
-  remove_legacy_app "$(dirname "$APP_DEST")" "$(basename "$APP_DEST")" "$(basename "$LEGACY_APP_DEST")"
   run_for_applications xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
-  cp "$BIN_SOURCE/alex" "$BIN_SOURCE/alexandria" "$BIN_DEST/"
-  chmod +x "$BIN_DEST/alex" "$BIN_DEST/alexandria"
-  xattr -d com.apple.quarantine "$BIN_DEST/alex" "$BIN_DEST/alexandria" 2>/dev/null || true
+  cp "$BIN_SOURCE/alex" "$BIN_DEST/"
+  chmod +x "$BIN_DEST/alex"
+  xattr -d com.apple.quarantine "$BIN_DEST/alex" 2>/dev/null || true
 
   restart_service
   open_app

@@ -46,23 +46,23 @@ alex keys mint --kind wrap --label remote-mac
 On the machine running Amp:
 
 ```bash
-export ALEXANDRIA_TRACE_URL=https://alex.example.net
-export ALEXANDRIA_TRACE_KEY=alxk-...
+export ALEX_TRACE_URL=https://alex.example.net
+export ALEX_TRACE_KEY=alxk-...
 
 alex wrap amp
 ```
 
-For persistent setup, put only the key in a mode-`0600` file and use `--trace-key-file ~/.config/alexandria/wrap.key`. The equivalent flags are `--trace-url` and `--trace-key-file`; the equivalent environment variables are `ALEXANDRIA_TRACE_URL`, `ALEXANDRIA_TRACE_KEY`, and `ALEXANDRIA_TRACE_KEY_FILE`.
+For persistent setup, put only the key in a mode-`0600` file and use `--trace-key-file ~/.config/alex/wrap.key`. The equivalent flags are `--trace-url` and `--trace-key-file`; the equivalent environment variables are `ALEX_TRACE_URL`, `ALEX_TRACE_KEY`, and `ALEX_TRACE_KEY_FILE`.
 
 If preflight or a later upload fails, the wrapper continues capturing locally. After connectivity is restored, replay the run printed by `alex wrap`:
 
 ```bash
 alex traces push --run-id wrap-amp-<timestamp>-<suffix> \
   --trace-url https://alex.example.net \
-  --trace-key-file ~/.config/alexandria/wrap.key
+  --trace-key-file ~/.config/alex/wrap.key
 ```
 
-Plain `http://` is accepted automatically only for loopback. A trusted private-network HTTP endpoint requires `--allow-insecure-http` or `ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP=1`; use HTTPS for internet-facing endpoints. A `kind=wrap` key can only access `GET/POST /traces/ingest`, cannot invoke models or browse/administer traces, and can be disabled centrally with `alex keys revoke <rk-id>`.
+Plain `http://` is accepted automatically only for loopback. A trusted private-network HTTP endpoint requires `--allow-insecure-http` or `ALEX_TRACE_ALLOW_INSECURE_HTTP=1`; use HTTPS for internet-facing endpoints. A `kind=wrap` key can only access `GET/POST /traces/ingest`, cannot invoke models or browse/administer traces, and can be disabled centrally with `alex keys revoke <rk-id>`.
 
 Requires:
 

@@ -68,7 +68,7 @@ mod tests {
         assert!(INDEX.contains("id=\"cliproxyapi-form\""));
         assert!(APP_JS.contains("/admin/auth/cliproxyapi"));
         assert!(APP_JS.contains("async function testCLIProxyAPI"));
-        assert!(APP_JS.contains("x-alexandria-harness':'shared-web-onboarding'"));
+        assert!(APP_JS.contains("x-alex-harness':'shared-web-onboarding'"));
         assert!(APP_JS.contains("/admin/middleware/test"));
         assert!(APP_JS.contains("method:'PUT'"));
         assert!(APP_JS.contains("/traces/summaries?"));

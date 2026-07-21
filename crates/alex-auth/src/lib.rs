@@ -237,7 +237,10 @@ fn credential_rank(account: &Account) -> (bool, i64) {
     let unexpired =
         account.kind != "oauth" || account.expires_at_ms.map(|e| e > now).unwrap_or(true);
     let valid = has_secret && unexpired;
-    let freshness = account.last_refresh_ms.or(account.expires_at_ms).unwrap_or(i64::MIN);
+    let freshness = account
+        .last_refresh_ms
+        .or(account.expires_at_ms)
+        .unwrap_or(i64::MIN);
     (valid, freshness)
 }
 
@@ -911,7 +914,9 @@ impl Vault {
         into_id: &str,
         allow_mismatch: bool,
     ) -> Result<MergeOutcome> {
-        let (from, into) = self.validate_merge(from_id, into_id, allow_mismatch).await?;
+        let (from, into) = self
+            .validate_merge(from_id, into_id, allow_mismatch)
+            .await?;
         let mut survivor = into.clone();
         let adopted = if credential_rank(&from) > credential_rank(&into) {
             survivor.kind = from.kind.clone();
@@ -1044,7 +1049,7 @@ impl Vault {
         };
         if candidates.is_empty() {
             bail!(
-                "no active {} account; run `alexandria auth import`",
+                "no active {} account; run `alex auth import`",
                 provider.as_str()
             );
         }
@@ -1615,7 +1620,11 @@ pub fn detect_import_candidates_in(
 
     let mut found = Vec::new();
     if json(&home.join(".claude/.credentials.json"))
-        .and_then(|v| v["claudeAiOauth"]["accessToken"].as_str().map(str::to_owned))
+        .and_then(|v| {
+            v["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .map(str::to_owned)
+        })
         .is_some_and(|token| !token.is_empty())
     {
         found.push(candidate(
@@ -1664,11 +1673,9 @@ pub fn detect_import_candidates_in(
     if json(&home.join(".grok/auth.json"))
         .and_then(|v| {
             v.as_object().map(|entries| {
-                entries.values().any(|entry| {
-                    entry["key"]
-                        .as_str()
-                        .is_some_and(|token| !token.is_empty())
-                })
+                entries
+                    .values()
+                    .any(|entry| entry["key"].as_str().is_some_and(|token| !token.is_empty()))
             })
         })
         .unwrap_or(false)
@@ -2018,7 +2025,13 @@ struct KimiCredentialFile {
 
 /// Build a Kimi account from an already-parsed credential file. Kept pure so it
 /// can be unit-tested without touching disk or the network. Never logs tokens.
-pub fn kimi_account_from_credentials(access_token: String, refresh_token: Option<String>, expires_at_s: Option<i64>, expires_in_s: Option<i64>, scope: Option<String>) -> Account {
+pub fn kimi_account_from_credentials(
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_s: Option<i64>,
+    expires_in_s: Option<i64>,
+    scope: Option<String>,
+) -> Account {
     let expires_at_ms = expires_at_s
         .map(|s| s * 1000)
         .or_else(|| expires_in_s.map(|s| now_ms() + s * 1000))
@@ -2237,7 +2250,7 @@ pub async fn fetch_amp_account_email(api_key: &str) -> Option<String> {
         .bearer_auth(key)
         .header("accept", "application/json")
         .header("content-type", "application/json")
-        .header("user-agent", "alexandria-amp-auth")
+        .header("user-agent", "alex-amp-auth")
         .json(&json!({"method": "userDisplayBalanceInfo", "params": {}}))
         .send()
         .await
@@ -2560,7 +2573,10 @@ mod tests {
         assert_eq!(account.kind, "oauth");
         assert_eq!(account.id, "kimi-oauth");
         assert_eq!(account.expires_at_ms, Some(expires_at_s * 1000));
-        assert_eq!(account.refresh_token.as_deref(), Some("refresh-token-shape"));
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("refresh-token-shape")
+        );
         assert_eq!(account.account_meta["scope"], json!("kimi-code"));
     }
 
@@ -2600,10 +2616,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "alexandria-auth-{name}-{nanos}-{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("alex-auth-{name}-{nanos}-{}", std::process::id()))
     }
 
     fn api_key_account(id: &str, provider: Provider) -> Account {
@@ -3010,8 +3023,8 @@ mod tests {
         save_openrouter_api_key(
             &vault,
             "or-test-key",
-            Some("https://alexandria.example"),
-            Some("Alexandria"),
+            Some("https://alex.example"),
+            Some("Alex"),
         )
         .await
         .unwrap();
@@ -3024,11 +3037,8 @@ mod tests {
             .unwrap();
         assert_eq!(account.id, "openrouter-api-key");
         assert_eq!(account.api_key.as_deref(), Some("or-test-key"));
-        assert_eq!(
-            account.account_meta["http_referer"],
-            "https://alexandria.example"
-        );
-        assert_eq!(account.account_meta["x_title"], "Alexandria");
+        assert_eq!(account.account_meta["http_referer"], "https://alex.example");
+        assert_eq!(account.account_meta["x_title"], "Alex");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3818,11 +3828,7 @@ mod tests {
             .await
             .is_err());
         vault
-            .record_routing_limits_for_workspace(
-                "openai-api_key-work",
-                "workspace-a",
-                snapshot,
-            )
+            .record_routing_limits_for_workspace("openai-api_key-work", "workspace-a", snapshot)
             .await
             .unwrap();
 

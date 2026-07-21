@@ -973,7 +973,7 @@ pub struct RunKeyRevocationCounts {
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        let db_path = data_dir.join("alexandria.sqlite3");
+        let db_path = data_dir.join("alex.sqlite3");
         let conn =
             Connection::open(&db_path).with_context(|| format!("opening sqlite at {db_path:?}"))?;
         // Migrations and account tombstones share the daemon's WAL database;
@@ -3077,7 +3077,7 @@ impl Store {
     pub fn disk_usage(&self) -> Result<Value> {
         let mut sqlite_bytes = 0u64;
         for suffix in ["", "-wal", "-shm"] {
-            let path = self.data_dir.join(format!("alexandria.sqlite3{suffix}"));
+            let path = self.data_dir.join(format!("alex.sqlite3{suffix}"));
             if let Ok(m) = std::fs::metadata(&path) {
                 sqlite_bytes += m.len();
             }
@@ -3174,10 +3174,8 @@ mod tests {
     use super::*;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "alexandria-store-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("alex-store-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -4587,7 +4585,7 @@ mod tests {
     #[test]
     fn run_keys_table_added_to_existing_db() {
         let dir = tmpdir("run-keys-migrate");
-        let db_path = dir.join("alexandria.sqlite3");
+        let db_path = dir.join("alex.sqlite3");
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -4606,7 +4604,7 @@ mod tests {
     #[test]
     fn migrates_old_schema() {
         let dir = tmpdir("migrate");
-        let db_path = dir.join("alexandria.sqlite3");
+        let db_path = dir.join("alex.sqlite3");
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -4647,7 +4645,7 @@ mod tests {
     #[test]
     fn reasoning_effort_migration_is_idempotent_and_preserves_old_rows() {
         let dir = tmpdir("reasoning-effort-migrate");
-        let db_path = dir.join("alexandria.sqlite3");
+        let db_path = dir.join("alex.sqlite3");
         Connection::open(&db_path)
             .unwrap()
             .execute_batch(
@@ -4691,7 +4689,7 @@ mod tests {
     #[test]
     fn migration_is_idempotent_and_existing_trace_history_stays_readable() {
         let dir = tmpdir("subscription-identity-migrate");
-        let db_path = dir.join("alexandria.sqlite3");
+        let db_path = dir.join("alex.sqlite3");
         // This is the pre-change traces schema as written by the current
         // released binary (all of its then-current trace columns, but no new
         // subscription_identity column).

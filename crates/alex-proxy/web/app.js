@@ -110,8 +110,8 @@ async function testCLIProxyAPI(){
   const model=state.cliproxyapi?.models?.[0];const output=$('#cliproxyapi-test-result');if(!model||!output)return;
   output.innerHTML='<p class="muted">Sending a routed test request…</p>';
   try{
-    const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'authorization':`Bearer ${state.key}`,'content-type':'application/json','x-alexandria-harness':'shared-web-onboarding'},body:JSON.stringify({model:`cliproxyapi/${model}`,stream:false,messages:[{role:'user',content:'Reply with: Alex CLIProxyAPI test received.'}]})});
-    const payload=await response.json().catch(()=>null);const trace=response.headers.get('x-alexandria-trace-id');
+    const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'authorization':`Bearer ${state.key}`,'content-type':'application/json','x-alex-harness':'shared-web-onboarding'},body:JSON.stringify({model:`cliproxyapi/${model}`,stream:false,messages:[{role:'user',content:'Reply with: Alex CLIProxyAPI test received.'}]})});
+    const payload=await response.json().catch(()=>null);const trace=response.headers.get('x-alex-trace-id');
     if(!response.ok)throw new Error(payload?.error?.message||`HTTP ${response.status}`);
     output.innerHTML=`<p class="chip ok">Test request completed</p>${trace?` <button id="cliproxyapi-open-trace" type="button">Open trace ${escapeHtml(trace)}</button>`:''}`;
     const open=$('#cliproxyapi-open-trace');if(open)open.onclick=()=>showTrace(trace);

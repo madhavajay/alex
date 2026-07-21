@@ -208,7 +208,7 @@ pub fn generate_corpus(root: &Path, profile: ScaleProfile) -> Result<(CorpusMani
     let base_file_bytes = per_file_total / spec.trace_count;
     let extra_files = per_file_total % spec.trace_count;
 
-    let database = root.join("alexandria.sqlite3");
+    let database = root.join("alex.sqlite3");
     let mut connection = Connection::open(&database)?;
     connection.execute_batch("PRAGMA synchronous=OFF;")?;
     let transaction = connection.transaction()?;
@@ -816,7 +816,7 @@ fn directory_usage(root: &Path) -> Result<(u64, u64)> {
 fn sqlite_file_bytes(root: &Path) -> Result<u64> {
     let mut total = 0u64;
     for suffix in ["", "-wal", "-shm"] {
-        let path = root.join(format!("alexandria.sqlite3{suffix}"));
+        let path = root.join(format!("alex.sqlite3{suffix}"));
         if let Ok(metadata) = fs::metadata(path) {
             total = total.saturating_add(metadata.len());
         }

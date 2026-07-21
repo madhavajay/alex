@@ -7,9 +7,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
 use crate::{
-    alexandria_home, detect_service_state, installed_binaries, open_vault,
-    resolve_dario_claude_bin, service_managed, service_state_label, status::status_summary, Config,
-    ServiceState,
+    alex_home, detect_service_state, installed_binaries, open_vault, resolve_dario_claude_bin,
+    service_managed, service_state_label, status::status_summary, Config, ServiceState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -296,7 +295,7 @@ fn storage_checks(config: &Config) -> Vec<DoctorCheck> {
         )),
     }
 
-    let database = config.data_dir.join("alexandria.sqlite3");
+    let database = config.data_dir.join("alex.sqlite3");
     if !database.exists() {
         checks.push(check(
             "storage.sqlite",
@@ -430,10 +429,7 @@ fn port_check_from_probe(config: &Config, address: SocketAddr, occupied: bool) -
 pub(crate) async fn diagnose(config: &Config) -> DoctorReport {
     let mut checks = executable_checks();
     checks.push(permission_check(&config.data_dir, true));
-    checks.push(permission_check(
-        &alexandria_home().join("config.toml"),
-        false,
-    ));
+    checks.push(permission_check(&alex_home().join("config.toml"), false));
     checks.extend(storage_checks(config));
 
     let status = status_summary(config).await;

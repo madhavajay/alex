@@ -132,9 +132,9 @@ pub fn is_secret_or_hop_header(name: &str) -> bool {
             | "set-cookie"
             | "chatgpt-account-id"
             | "x-goog-api-key"
-            | "x-alexandria-key"
-            | "x-alexandria-api-key"
-            | "x-alexandria-run-key"
+            | "x-alex-key"
+            | "x-alex-api-key"
+            | "x-alex-run-key"
             | "connection"
             | "keep-alive"
             | "proxy-authenticate"
@@ -156,10 +156,10 @@ pub fn is_reserved_patch_header(name: &str) -> bool {
             name.to_ascii_lowercase().as_str(),
             "host"
                 | "content-length"
-                | "x-alexandria-no-substitute"
-                | "x-alexandria-simulate-error"
-                | "x-alexandria-run-id"
-                | "x-alexandria-body-path"
+                | "x-alex-no-substitute"
+                | "x-alex-simulate-error"
+                | "x-alex-run-id"
+                | "x-alex-body-path"
         )
 }
 
@@ -234,7 +234,7 @@ mod tests {
             "cookie",
             "connection",
             "content-length",
-            "x-alexandria-no-substitute",
+            "x-alex-no-substitute",
         ] {
             assert!(matches!(
                 validate_header_patch(name, None),

@@ -117,7 +117,7 @@ jobs:
           {
             echo "version=${RELEASE_TAG#v}"
             echo "appcast_file=$appcast_file"
-            echo "artifact_name=alexandria-macos-dmg"
+            echo "artifact_name=alex-macos-dmg"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check app signing secrets
@@ -207,7 +207,7 @@ jobs:
         if: ${{ !inputs.build_dmg }}
         uses: actions/download-artifact@v4
         with:
-          name: alexandria-macos-dmg
+          name: alex-macos-dmg
           path: macos/dist
 
       - name: Prepare release metadata
@@ -363,6 +363,6 @@ jobs:
         if: inputs.build_dmg && steps.app_signing.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: alexandria-macos-dmg
+          name: alex-macos-dmg
           path: macos/dist/*.dmg
           overwrite: true

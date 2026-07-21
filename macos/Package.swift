@@ -12,16 +12,16 @@ let packageDependencies: [Package.Dependency] = []
 #endif
 
 var packageTargets: [Target] = [
-    .target(name: "AlexandriaBarCore"),
+    .target(name: "AlexCore"),
 ]
-var testTargetDependencies: [Target.Dependency] = ["AlexandriaBarCore"]
+var testTargetDependencies: [Target.Dependency] = ["AlexCore"]
 
 #if os(macOS)
 packageTargets.append(
     .executableTarget(
-        name: "AlexandriaBar",
+        name: "Alex",
         dependencies: [
-            "AlexandriaBarCore",
+            "AlexCore",
             .product(name: "Sparkle", package: "Sparkle"),
         ],
         resources: [.copy("Resources/logos"), .copy("Resources/onboarding")],
@@ -29,17 +29,17 @@ packageTargets.append(
             .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         ]
     ))
-testTargetDependencies.append("AlexandriaBar")
+testTargetDependencies.append("Alex")
 #endif
 
 packageTargets.append(
     .testTarget(
-        name: "AlexandriaBarCoreTests",
+        name: "AlexCoreTests",
         dependencies: testTargetDependencies
     ))
 
 let package = Package(
-    name: "AlexandriaBar",
+    name: "Alex",
     platforms: supportedPlatforms,
     dependencies: packageDependencies,
     targets: packageTargets

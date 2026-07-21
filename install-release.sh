@@ -26,10 +26,10 @@ sha256_file() {
 }
 
 quit_alex_apps() {
-  for app in AlexandriaBar Alex; do
+  for app in Alex; do
     osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
   done
-  for process in AlexandriaBar Alex; do
+  for process in Alex; do
     if pgrep -x "$process" >/dev/null 2>&1; then
       printf 'Quitting the running %s...\n' "$process"
       pkill -x "$process" >/dev/null 2>&1 || true
@@ -37,29 +37,7 @@ quit_alex_apps() {
   done
 }
 
-remove_legacy_app() {
-  app_dir="$1"
-  new_app_name="${2:-Alex.app}"
-  legacy_app_name="${3:-AlexandriaBar.app}"
-  [ -n "$app_dir" ] || return 1
-  [ -e "$app_dir/$new_app_name" ] || return 0
-  [ -e "$app_dir/$legacy_app_name" ] || return 0
-  if [ -w "$app_dir" ]; then
-    rm -rf "$app_dir/$legacy_app_name"
-  else
-    sudo rm -rf "$app_dir/$legacy_app_name"
-  fi
-}
-
 open_app() {
-  # Open whichever app the cask installed (renamed Alex.app or legacy
-  # AlexandriaBar.app). (thanks @khoaguin, #5)
-  for app in Alex AlexandriaBar; do
-    if [ -e "/Applications/${app}.app" ]; then
-      open -a "$app"
-      return 0
-    fi
-  done
   open -a Alex
 }
 
@@ -73,21 +51,15 @@ install_macos() {
   say "Installing the Alex CLI, daemon, and menu-bar app with Homebrew…"
   quit_alex_apps
   brew install madhavajay/alex/alex
-  # Recover from a broken/renamed cask record before installing. Casks from
-  # before the Alex rename referenced AlexandriaBar.app, which no longer exists,
-  # so brew's upgrade runs that dead uninstall and aborts ("App source
-  # '/Applications/AlexandriaBar.app' is not there"). Clear any stale record,
-  # then force-install the current cask (adopting an Alex.app a direct DMG may
-  # already have dropped).
-  brew uninstall --cask madhavajay/alex/alexandria --force >/dev/null 2>&1 || true
+  # Force-reinstall the cask so a direct DMG install is replaced cleanly.
+  brew uninstall --cask madhavajay/alex/alex --force >/dev/null 2>&1 || true
   brew_prefix="$(brew --prefix)"
   if [ -z "$brew_prefix" ]; then
     say "Homebrew returned an empty prefix; refusing to remove a Caskroom path." >&2
     exit 1
   fi
-  rm -rf "$brew_prefix/Caskroom/alexandria" 2>/dev/null || true
-  brew install --cask --force madhavajay/alex/alexandria
-  remove_legacy_app /Applications
+  rm -rf "$brew_prefix/Caskroom/alex" 2>/dev/null || true
+  brew install --cask --force madhavajay/alex/alex
 
   alex_bin="$(brew --prefix)/bin/alex"
   # A busy daemon (in-flight routed requests) makes `service install` exit 1 and
@@ -156,11 +128,11 @@ install_linux() {
   mkdir -p "$INSTALL_DIR"
   service_was_active=0
   if command -v systemctl >/dev/null 2>&1 \
-    && systemctl --user is-active --quiet alexandria; then
+    && systemctl --user is-active --quiet alex; then
     service_was_active=1
   fi
   install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
-  install -m 0755 "$tmp/alexandria" "$INSTALL_DIR/alexandria"
+  install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
 
   if [ "$NO_SERVICE" = "1" ]; then
     say "Alex is installed; skipped user service registration (ALEX_NO_SERVICE=1)."
@@ -171,8 +143,8 @@ install_linux() {
     # through systemd itself: the just-restored rollback binary may predate
     # Linux support in `alex service restart`.
     if [ "$service_was_active" = "1" ]; then
-      if ! systemctl --user restart alexandria \
-        || ! systemctl --user is-active --quiet alexandria; then
+      if ! systemctl --user restart alex \
+        || ! systemctl --user is-active --quiet alex; then
         say "Alex $version was installed, but the running service could not be replaced." >&2
         exit 1
       fi

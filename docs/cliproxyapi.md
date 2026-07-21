@@ -55,7 +55,7 @@ alex cliproxyapi export \
   --output ./alex-provider.yaml
 ```
 
-`ALEXANDRIA_HARNESS_KEY` is the non-file alternative. Alex deliberately does
+`ALEX_HARNESS_KEY` is the non-file alternative. Alex deliberately does
 not ask for or accept a remote daemon's local/admin key in this workflow.
 
 ## Version and capability negotiation
@@ -65,7 +65,7 @@ targets CLIProxyAPI major v7+ and uses these v7 config capabilities:
 
 - `openai-compatibility` with `prefix`, `headers`, `api-key-entries`, and
   explicit `models`;
-- global `passthrough-headers` so `x-alexandria-trace-id` reaches the original
+- global `passthrough-headers` so `x-alex-trace-id` reaches the original
   client on successful responses; and
 - OpenAI-compatible translation for Chat, Responses, Anthropic Messages,
   streaming, and tool calls.
@@ -83,14 +83,14 @@ headers remain accepted for compatibility.
 
 The generated provider adds only non-secret metadata headers:
 
-- `x-alexandria-harness: cliproxyapi` and the CLIProxyAPI version for trace
+- `x-alex-harness: cliproxyapi` and the CLIProxyAPI version for trace
   provenance;
-- `x-alexandria-integration-schema` and `x-alexandria-capabilities` for the
+- `x-alex-integration-schema` and `x-alex-capabilities` for the
   negotiated contract; and
-- `x-alexandria-route-chain: cliproxyapi` for loop detection.
+- `x-alex-route-chain: cliproxyapi` for loop detection.
 
 Alex records the route chain in trace tags and returns
-`x-alexandria-trace-id`. When Alex calls CLIProxyAPI in the other direction it
+`x-alex-trace-id`. When Alex calls CLIProxyAPI in the other direction it
 adds its parent trace ID and an `alex` route-chain hop. A request marked as
 originating from CLIProxyAPI that tries to select a `cliproxyapi/*` model is
 rejected with HTTP 508 before any upstream connection is made.
@@ -98,7 +98,7 @@ rejected with HTTP 508 before any upstream connection is made.
 Provider 401, 429, and 5xx statuses and structured JSON bodies are preserved
 through the reverse path. Current CLIProxyAPI v7 OpenAI-compatible execution
 does not attach upstream response headers to non-2xx errors, so `Retry-After`
-and `x-alexandria-trace-id` do not survive that second hop on error responses.
+and `x-alex-trace-id` do not survive that second hop on error responses.
 This is a CLIProxyAPI boundary limitation; Alex still emits both headers.
 WebSocket Responses, Gemini ingress, and image endpoints are not part of the
 reverse v1 contract.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Alexandria test suite (TODO.md section 11): ./test.sh [unit|wire|harness|cliproxyapi|dario|all] [flags]
+# Alex test suite (TODO.md section 11): ./test.sh [unit|wire|harness|cliproxyapi|dario|all] [flags]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alex/config.toml}"
-PROMPT="Reply with exactly: alexandria-test-ok"
+CONFIG_FILE="${ALEX_CONFIG:-$HOME/.alex/config.toml}"
+PROMPT="Reply with exactly: alex-test-ok"
 
 TIERS=""
 ONLY=""
@@ -39,7 +39,7 @@ Flags:
   --jobs N                max parallel cells (default: CPU count; harness capped at 4)
   --json                  machine-readable report on stdout
   --timeout N             per-cell seconds (default: 120 wire / 600 harness)
-  --host H, --port N      daemon overrides (default: ~/.alexandria/config.toml)
+  --host H, --port N      daemon overrides (default: ~/.alex/config.toml)
   --base URL              point the whole suite at a (possibly remote) proxy,
                           e.g. http://192.168.1.150:4100 for the Mac's daemon;
                           uses the already-running daemon, does not start one
@@ -313,7 +313,7 @@ W7|openai-chat|/v1/chat/completions|claude-haiku-4-5|anthropic|anthropic|subscri
 W8|openai-responses|/v1/responses|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|1|claude-haiku-4-5|0
 W9|openai-chat|/v1/chat/completions|grok-code-fast-1|xai|openai-|subscription|xai|0|0|grok-code-fast-1|0
 W10|anthropic|/v1/messages|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|1
-W11a|openai-chat|/v1/chat/completions|alexandria/gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
+W11a|openai-chat|/v1/chat/completions|alex/gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
 W11b|anthropic|/v1/messages|haiku-4.5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|0
 W12|gemini|/v1beta/models/gpt-5.6-luna:generateContent|gpt-5.6-luna|openai|openai-|subscription|openai|0|1|gpt-5.6-luna|0
 W13|gemini|/v1beta/models/gpt-5.6-luna:streamGenerateContent?alt=sse|gpt-5.6-luna|openai|openai-|subscription|openai|1|1|gpt-5.6-luna|0
@@ -743,7 +743,7 @@ run_dario_cc_direct_cell() {
   if ! command -v claude >/dev/null 2>&1; then write_result DARIO-CC-DIRECT SKIP 0 "claude is not on host PATH"; return 0; fi
   if ! dario_active; then write_result DARIO-CC-DIRECT SKIP 0 "dario unavailable"; return 0; fi
   local t0 t1 marker all selected sess msg
-  t0=$(now_ms); marker="alexandria-dario-cc-$t0-$$"
+  t0=$(now_ms); marker="alex-dario-cc-$t0-$$"
   ANTHROPIC_BASE_URL="$BASE" ANTHROPIC_API_KEY="$KEY" claude --model claude-haiku-4-5 -p "$marker" >"$TMP/dario-cc.out" 2>"$TMP/dario-cc.err" || { t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "claude failed: $(tail -c 180 "$TMP/dario-cc.err")"; return 0; }
   all="$TMP/dario-cc.all.json"; selected="$TMP/dario-cc.traces.json"
   curl -sS --max-time 10 -H "x-api-key: $KEY" -o "$all" "$BASE/admin/traces?limit=200" 2>/dev/null || true

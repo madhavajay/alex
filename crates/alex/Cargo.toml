@@ -11,10 +11,6 @@ readme = "../../README.md"
 name = "alex"
 path = "src/main.rs"
 
-[[bin]]
-name = "alexandria"
-path = "src/main.rs"
-
 [dependencies]
 alex-core = { workspace = true }
 alex-auth = { workspace = true }

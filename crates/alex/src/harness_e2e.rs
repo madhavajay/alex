@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui;
 
-const DEFAULT_PROMPT: &str = "Reply with the single line: alexandria-e2e-ok";
+const DEFAULT_PROMPT: &str = "Reply with the single line: alex-e2e-ok";
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_DOCKER_IMAGE: &str = "node:22-bookworm-slim";
 const CATALOG_JSON: &str = include_str!(concat!(
@@ -306,7 +306,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
     let prompt = opts.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
     let started_ms = now_ms();
     let nonce: u32 = rand::Rng::gen(&mut rand::thread_rng());
-    let session_id = format!("alexandria-e2e-{}-{started_ms}-{nonce:08x}", canonical_name);
+    let session_id = format!("alex-e2e-{}-{started_ms}-{nonce:08x}", canonical_name);
     let session_dir = opts.data_dir.join("harness-e2e").join(&session_id);
     let work_dir = session_dir.join("work");
     std::fs::create_dir_all(&work_dir)?;
@@ -346,11 +346,11 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         "-w".to_string(),
         "/workspace".to_string(),
         "-e".to_string(),
-        format!("ALEXANDRIA_E2E_PROMPT={prompt}"),
+        format!("ALEX_E2E_PROMPT={prompt}"),
         "-e".to_string(),
-        format!("ALEXANDRIA_E2E_MODEL={model}"),
+        format!("ALEX_E2E_MODEL={model}"),
         "-e".to_string(),
-        format!("ALEXANDRIA_E2E_SESSION={session_id}"),
+        format!("ALEX_E2E_SESSION={session_id}"),
     ];
     if let Some(t) = &tarball {
         let parent = t
@@ -363,7 +363,7 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         command.push("-v".to_string());
         command.push(format!("{}:/pkg:ro", parent.display()));
         command.push("-e".to_string());
-        command.push(format!("ALEXANDRIA_E2E_TARBALL=/pkg/{name}"));
+        command.push(format!("ALEX_E2E_TARBALL=/pkg/{name}"));
     }
     command.extend(docker_env(
         spec.kind,
@@ -545,7 +545,7 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
                 // version-specific user-agent string.
                 (
                     "ANTHROPIC_CUSTOM_HEADERS",
-                    "x-alexandria-harness: claude".to_string(),
+                    "x-alex-harness: claude".to_string(),
                 ),
                 ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
@@ -559,7 +559,7 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
             for (key, value) in [
                 ("OPENAI_BASE_URL", openai_base.clone()),
                 ("OPENAI_API_KEY", local_key.to_string()),
-                ("CODEX_HOME", "/tmp/alexandria-codex-home".to_string()),
+                ("CODEX_HOME", "/tmp/alex-codex-home".to_string()),
             ] {
                 env.push("-e".to_string());
                 env.push(format!("{key}={value}"));
@@ -595,41 +595,41 @@ fn docker_script(kind: HarnessKind, model: &str) -> Result<String> {
     let script = match kind {
         HarnessKind::Claude => format!(
             r#"set -euo pipefail
-mkdir -p /workspace /out/logs /tmp/alexandria-claude-config
-npm install -g "$ALEXANDRIA_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
+mkdir -p /workspace /out/logs /tmp/alex-claude-config
+npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 claude --version > /out/logs/version.txt 2>&1
-export CLAUDE_CONFIG_DIR=/tmp/alexandria-claude-config
-claude --verbose --output-format=stream-json --print -- "$ALEXANDRIA_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
+export CLAUDE_CONFIG_DIR=/tmp/alex-claude-config
+claude --verbose --output-format=stream-json --print -- "$ALEX_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
         HarnessKind::Codex => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs "$CODEX_HOME"
-npm install -g "$ALEXANDRIA_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
+npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 codex --version > /out/logs/version.txt 2>&1 || true
 cat > "$CODEX_HOME/auth.json" <<EOF
 {{"OPENAI_API_KEY":"$OPENAI_API_KEY"}}
 EOF
 cat > "$CODEX_HOME/config.toml" <<EOF
-model_provider = "alexandria"
+model_provider = "alex"
 
-[model_providers.alexandria]
+[model_providers.alex]
 name = "Alex Proxy"
 base_url = "$OPENAI_BASE_URL"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
-http_headers = {{ x-alexandria-harness = "codex" }}
+http_headers = {{ x-alex-harness = "codex" }}
 EOF
-codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model {escaped_model} --json -- "$ALEXANDRIA_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
+codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model {escaped_model} --json -- "$ALEX_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
         HarnessKind::Grok => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs
-if [ -n "${{ALEXANDRIA_E2E_TARBALL:-}}" ]; then
-  npm install -g "$ALEXANDRIA_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
+if [ -n "${{ALEX_E2E_TARBALL:-}}" ]; then
+  npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 else
   apt-get update -qq > /out/logs/apt.log 2>&1
   apt-get install -y -qq curl ca-certificates >> /out/logs/apt.log 2>&1
@@ -639,30 +639,30 @@ export PATH="$HOME/.grok/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
 GROK_CLI="$(command -v agent || command -v grok || true)"
 test -n "$GROK_CLI"
 "$GROK_CLI" --version > /out/logs/version.txt 2>&1 || true
-"$GROK_CLI" -p "$ALEXANDRIA_E2E_PROMPT" --model {escaped_model} --output-format streaming-json --permission-mode bypassPermissions > /out/harness.stdout.log 2> /out/harness.stderr.log
+"$GROK_CLI" -p "$ALEX_E2E_PROMPT" --model {escaped_model} --output-format streaming-json --permission-mode bypassPermissions > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
         HarnessKind::Kimi => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs "$HOME/.kimi-code"
-npm install -g "$ALEXANDRIA_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
+npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 kimi --version > /out/logs/version.txt 2>&1 || true
 cat > "$HOME/.kimi-code/config.toml" <<EOF
-default_model = "alex/$ALEXANDRIA_E2E_MODEL"
+default_model = "alex/$ALEX_E2E_MODEL"
 
-[providers.alexandria]
+[providers.alex]
 type = "openai"
 api_key = "$OPENAI_API_KEY"
 base_url = "$OPENAI_BASE_URL"
-custom_headers = {{ "x-alexandria-harness" = "kimi", "x-session-id" = "$ALEXANDRIA_E2E_SESSION" }}
+custom_headers = {{ "x-alex-harness" = "kimi", "x-session-id" = "$ALEX_E2E_SESSION" }}
 
-[models."alex/$ALEXANDRIA_E2E_MODEL"]
-provider = "alexandria"
-model = "alex/$ALEXANDRIA_E2E_MODEL"
+[models."alex/$ALEX_E2E_MODEL"]
+provider = "alex"
+model = "alex/$ALEX_E2E_MODEL"
 max_context_size = 200000
-display_name = "alex/$ALEXANDRIA_E2E_MODEL"
+display_name = "alex/$ALEX_E2E_MODEL"
 EOF
-kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log
+kimi -m "alex/$ALEX_E2E_MODEL" -p "$ALEX_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
     };
@@ -977,20 +977,20 @@ mod tests {
     fn kimi_script_contains_openai_provider_config() {
         let script = docker_script(HarnessKind::Kimi, "claude-fable-5").unwrap();
         assert!(script.contains(
-            r#"[providers.alexandria]
+            r#"[providers.alex]
 type = "openai"
 api_key = "$OPENAI_API_KEY"
 base_url = "$OPENAI_BASE_URL"
-custom_headers = { "x-alexandria-harness" = "kimi", "x-session-id" = "$ALEXANDRIA_E2E_SESSION" }"#
+custom_headers = { "x-alex-harness" = "kimi", "x-session-id" = "$ALEX_E2E_SESSION" }"#
         ));
         assert!(script.contains(
-            r#"[models."alex/$ALEXANDRIA_E2E_MODEL"]
-provider = "alexandria"
-model = "alex/$ALEXANDRIA_E2E_MODEL"
+            r#"[models."alex/$ALEX_E2E_MODEL"]
+provider = "alex"
+model = "alex/$ALEX_E2E_MODEL"
 max_context_size = 200000
-display_name = "alex/$ALEXANDRIA_E2E_MODEL""#
+display_name = "alex/$ALEX_E2E_MODEL""#
         ));
-        assert!(script.contains(r#"default_model = "alex/$ALEXANDRIA_E2E_MODEL""#));
+        assert!(script.contains(r#"default_model = "alex/$ALEX_E2E_MODEL""#));
     }
 
     #[test]
@@ -999,7 +999,7 @@ display_name = "alex/$ALEXANDRIA_E2E_MODEL""#
         // kimi 0.27.0 rejects -y/--auto combined with -p; prompt mode runs
         // tools non-interactively on its own.
         assert!(script.contains(
-            r#"kimi -m "alex/$ALEXANDRIA_E2E_MODEL" -p "$ALEXANDRIA_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log"#
+            r#"kimi -m "alex/$ALEX_E2E_MODEL" -p "$ALEX_E2E_PROMPT" --output-format stream-json > /out/harness.stdout.log 2> /out/harness.stderr.log"#
         ));
     }
 

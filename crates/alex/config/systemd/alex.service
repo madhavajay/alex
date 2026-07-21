@@ -1,0 +1,22 @@
+[Unit]
+Description=Alex LLM proxy daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/alex daemon
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info,alex=debug
+NoNewPrivileges=true
+ProtectSystem=full
+# A fresh Linux user may not have used npm yet. The leading "-" keeps the
+# optional cache path writable when present without making service startup
+# fail when the directory does not exist.
+ReadWritePaths=%h/.alex -%h/.npm
+PrivateTmp=true
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target

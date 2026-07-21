@@ -4,7 +4,7 @@ This archive contains the exact pull-request build of:
 
 - `Alex.app`, ad-hoc signed with the production bundle identifier;
 - the release-mode `alex` daemon/CLI; and
-- the equivalent `alexandria` CLI binary.
+- the equivalent `alex` CLI binary.
 
 It is intentionally **not Developer ID signed or notarized**. It contains no
 credentials, account files, or developer-machine configuration.

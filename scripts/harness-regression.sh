@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Real harness -> Alexandria Docker regression lane.  It never gives a
+# Real harness -> Alex Docker regression lane.  It never gives a
 # container the local/admin key: each cell mints and later revokes one scoped
 # harness key whose run_id is used for all host-side assertions.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alex/config.toml}"
+CONFIG_FILE="${ALEX_CONFIG:-$HOME/.alex/config.toml}"
 ONLY="${ALEX_INTEGRATION_ONLY:-}"
 TIMEOUT="${ALEX_INTEGRATION_TIMEOUT:-600}"
 HOST="${ALEX_INTEGRATION_HOST:-}"
@@ -146,7 +146,7 @@ optional_cell() {
 
 # Native fixture images are deliberately supplied by the environment rather
 # than embedded here: their CLIs and commercial credentials are optional.
-# Each image must contain an Alexandria-generated config/plugin and the command
+# Each image must contain an Alex-generated config/plugin and the command
 # must run a single deterministic task using the injected proxy variables.
 run_fixture() {
   local id=$1 harness=$2 provider=$3 model=$4 image_var=$5 command_var=$6 check=$7
@@ -161,7 +161,7 @@ run_fixture() {
   run_id="hreg-$id-$(now_ms)-$RANDOM"
   key_id=$(mint_key "$harness" "$run_id") || { result "$id" SKIP 'daemon cannot mint scoped harness key'; return 0; }
   docker run --rm --add-host host.docker.internal:host-gateway \
-    -e "ALEXANDRIA_BASE_URL=http://host.docker.internal:$PORT" -e "ALEXANDRIA_RUN_ID=$run_id" -e "ALEXANDRIA_HARNESS=$harness" \
+    -e "ALEX_BASE_URL=http://host.docker.internal:$PORT" -e "ALEX_RUN_ID=$run_id" -e "ALEX_HARNESS=$harness" \
     -e "OPENAI_BASE_URL=http://host.docker.internal:$PORT/v1" -e "OPENAI_API_BASE=http://host.docker.internal:$PORT/v1" -e "OPENAI_API_KEY=$(cat "$TMP/run.key")" \
     -e "ANTHROPIC_BASE_URL=http://host.docker.internal:$PORT" -e "ANTHROPIC_API_KEY=$(cat "$TMP/run.key")" \
     -e "GOOGLE_GEMINI_BASE_URL=http://host.docker.internal:$PORT" -e "GOOGLE_GENAI_API_VERSION=v1beta" \
@@ -218,7 +218,7 @@ main() {
   run_fixture I10D gemini gemini "${ALEX_INTEGRATION_GEMINI_TOOL_MODEL:-gemini-3-pro}" ALEX_INTEGRATION_GEMINI_TOOL_IMAGE ALEX_INTEGRATION_GEMINI_TOOL_COMMAND tools
   run_fixture I4 codex openai gpt-5.6-luna ALEX_INTEGRATION_CODEX_SUBAGENT_IMAGE ALEX_INTEGRATION_CODEX_SUBAGENT_COMMAND lineage
   # The command must invoke `pi --print --no-session '…'` from the parent Pi
-  # process. The child inherits ALEXANDRIA_SESSION_ID from its parent.
+  # process. The child inherits ALEX_SESSION_ID from its parent.
   run_fixture I9 pi openai gpt-5.6-luna ALEX_INTEGRATION_PI_IMAGE ALEX_INTEGRATION_PI_SUBAGENT_COMMAND lineage
   optional_cell I5A 'Amp wrap fixture unavailable (requires logged-in Amp CLI)'
   optional_cell I5B 'Cursor Agent wrap fixture unavailable (requires logged-in agent CLI)'

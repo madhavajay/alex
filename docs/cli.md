@@ -1,6 +1,6 @@
 # `alex` command reference
 
-`alex` and `alexandria` are identical binaries. Examples use `alex`. With no
+`alex` and `alex` are identical binaries. Examples use `alex`. With no
 subcommand and an interactive terminal, the binary opens the TUI; with
 non-terminal stdout it errors and asks for an explicit command.
 
@@ -165,7 +165,7 @@ alex cliproxyapi export \
 
 Repeat `--model` to export only selected `alex/*` models. For a remote Alex,
 provide an existing scoped key through `--key-file` or
-`ALEXANDRIA_HARNESS_KEY`; the remote local/admin key is never requested. The
+`ALEX_HARNESS_KEY`; the remote local/admin key is never requested. The
 generated file contains the scoped credential and must be merged privately
 into CLIProxyAPI's `config.yaml`. See [CLIProxyAPI integration](cliproxyapi.md).
 

@@ -627,10 +627,9 @@ impl LoginManager {
             user_code: Some(start.user_code.clone()),
             verification_uri: Some(start.verification_uri.clone()),
             verification_uri_complete: Some(
-                start
-                    .verification_uri_complete
-                    .clone()
-                    .unwrap_or_else(|| format!("{}?user_code={}", start.verification_uri, start.user_code)),
+                start.verification_uri_complete.clone().unwrap_or_else(|| {
+                    format!("{}?user_code={}", start.verification_uri, start.user_code)
+                }),
             ),
             created_ms: now_ms(),
             expires_at_ms: now_ms() + start.expires_in * 1000,
@@ -771,7 +770,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-sessions-{name}-{nanos}-{}",
+            "alex-sessions-{name}-{nanos}-{}",
             std::process::id()
         ));
         let vault = Arc::new(Vault::open(dir.clone()).unwrap());
@@ -832,8 +831,7 @@ mod tests {
             .unwrap();
         assert_eq!(snap["state"], "pending");
         assert_eq!(
-            snap["verification_uri_complete"],
-            snap["authorize_url"],
+            snap["verification_uri_complete"], snap["authorize_url"],
             "notification callers always receive one actionable URL field"
         );
         std::fs::remove_dir_all(&dir).ok();

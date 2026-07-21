@@ -504,7 +504,7 @@ fn build_launch_plan(
     let mut args = match target {
         "pi" => vec![
             OsString::from("--provider"),
-            OsString::from("alexandria"),
+            OsString::from("alex"),
             OsString::from("--model"),
             OsString::from(&model.model),
         ],
@@ -644,7 +644,7 @@ fn target_model_ids(target: &str, config_dir: &Path) -> Vec<String> {
 
 fn alex_model_id(model: &str) -> String {
     let model = model.trim();
-    let bare = ["alex/", "alexandria/", "cove/", "claude-alex/"]
+    let bare = ["alex/", "cove/", "claude-alex/"]
         .iter()
         .find_map(|prefix| model.strip_prefix(prefix))
         .unwrap_or(model);
@@ -656,7 +656,7 @@ fn target_default_model(target: &str, config_dir: &Path, models: &[String]) -> O
         "pi" => std::fs::read_to_string(config_dir.join("settings.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .filter(|settings| settings["defaultProvider"].as_str() == Some("alexandria"))
+            .filter(|settings| settings["defaultProvider"].as_str() == Some("alex"))
             .and_then(|settings| settings["defaultModel"].as_str().map(String::from)),
         "claude" => std::fs::read_to_string(config_dir.join(harness_connect::CLAUDE_PROFILE_FILE))
             .ok()
@@ -1161,7 +1161,7 @@ fn render_pi_session(
         "id": model_entry_id,
         "parentId": Value::Null,
         "timestamp": timestamp,
-        "provider": "alexandria",
+        "provider": "alex",
         "modelId": model,
     }));
     let thinking_entry_id = ids.entry();
@@ -1299,7 +1299,7 @@ fn flush_pi_message(
             "role":"assistant",
             "content":content,
             "api":"anthropic-messages",
-            "provider":"alexandria",
+            "provider":"alex",
             "model":model,
             "usage":pi_zero_usage(),
             "stopReason":if tool_use { "toolUse" } else { "stop" },
@@ -1769,7 +1769,7 @@ fn render_codex_session(
             "cli_version":format.cli_version,
             "source":"cli",
             "thread_source":"user",
-            "model_provider":"alexandria",
+            "model_provider":"alex",
             "history_mode":format.history_mode,
         }
     })];
@@ -2407,7 +2407,7 @@ mod tests {
     );
 
     const CODEX_REAL_SHAPE_FIXTURE: &str = concat!(
-        r#"{"timestamp":"2026-07-20T01:02:03.000Z","type":"session_meta","payload":{"session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","timestamp":"2026-07-20T01:02:03.000Z","cwd":"/fixture/project","originator":"codex-tui","cli_version":"0.144.6","source":"cli","thread_source":"user","model_provider":"alexandria","history_mode":"legacy"}}"#,
+        r#"{"timestamp":"2026-07-20T01:02:03.000Z","type":"session_meta","payload":{"session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","timestamp":"2026-07-20T01:02:03.000Z","cwd":"/fixture/project","originator":"codex-tui","cli_version":"0.144.6","source":"cli","thread_source":"user","model_provider":"alex","history_mode":"legacy"}}"#,
         "\n",
         r#"{"timestamp":"2026-07-20T01:02:03.001Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect it"}]}}"#,
         "\n",
@@ -2543,7 +2543,7 @@ mod tests {
             lines[1],
             json!({
                 "type":"model_change", "id":"66660001", "parentId":null,
-                "timestamp":timestamp, "provider":"alexandria", "modelId":"alex/gpt-5.6-sol"
+                "timestamp":timestamp, "provider":"alex", "modelId":"alex/gpt-5.6-sol"
             })
         );
         assert_eq!(lines[2]["type"], "thinking_level_change");
@@ -2681,7 +2681,7 @@ mod tests {
         std::fs::write(
             config_dir.join("models.json"),
             json!({
-                "providers": {"alexandria": {"models": [
+                "providers": {"alex": {"models": [
                     {"id":"alex/claude-sonnet-5"},
                     {"id":"alex/gpt-5.6-sol"}
                 ]}}
@@ -2691,7 +2691,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             config_dir.join("settings.json"),
-            json!({"defaultProvider":"alexandria", "defaultModel":"gpt-5.6-sol"}).to_string(),
+            json!({"defaultProvider":"alex", "defaultModel":"gpt-5.6-sol"}).to_string(),
         )
         .unwrap();
         let source = ResumeSource {
@@ -2763,7 +2763,7 @@ mod tests {
                 "\"payload\":{\"session_id\":\"future\",\"id\":\"future\",",
                 "\"timestamp\":\"2026-07-20T00:00:00.000Z\",\"cwd\":\"/fixture\",",
                 "\"originator\":\"codex-tui\",\"cli_version\":\"99.0.0\",",
-                "\"source\":\"cli\",\"model_provider\":\"alexandria\",",
+                "\"source\":\"cli\",\"model_provider\":\"alex\",",
                 "\"history_mode\":\"signed-v99\"}}\n"
             ),
         )

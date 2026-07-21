@@ -209,11 +209,11 @@ pub fn render_reverse_config(
              prefix: {provider}\n\
              base-url: {base}\n\
              headers:\n\
-               X-Alexandria-Harness: {harness}\n\
-               X-Alexandria-Harness-Version: {harness_version}\n\
-               X-Alexandria-Integration-Schema: {schema}\n\
-               X-Alexandria-Capabilities: {capabilities}\n\
-               X-Alexandria-Route-Chain: {route_chain}\n\
+               X-Alex-Harness: {harness}\n\
+               X-Alex-Harness-Version: {harness_version}\n\
+               X-Alex-Integration-Schema: {schema}\n\
+               X-Alex-Capabilities: {capabilities}\n\
+               X-Alex-Route-Chain: {route_chain}\n\
              api-key-entries:\n\
                - api-key: {key}\n\
              models:\n",
@@ -357,7 +357,7 @@ pub async fn export_reverse_config(
     } else {
         let admin_base = options
             .admin_base
-            .context("a remote Alex export requires --key-file or ALEXANDRIA_HARNESS_KEY")?;
+            .context("a remote Alex export requires --key-file or ALEX_HARNESS_KEY")?;
         let admin_key = options
             .admin_key
             .context("local Alex admin key is unavailable")?;
@@ -454,7 +454,7 @@ mod tests {
         assert!(rendered.contains("name: \"alex/gpt-5\""));
         assert!(rendered.contains("alias: \"gpt-5\""));
         assert!(!rendered.contains("alias: \"alex/gpt-5\""));
-        assert!(rendered.contains("X-Alexandria-Route-Chain: \"cliproxyapi\""));
+        assert!(rendered.contains("X-Alex-Route-Chain: \"cliproxyapi\""));
         assert!(rendered.contains(alex_proxy::CLIPROXYAPI_REVERSE_SCHEMA));
     }
 

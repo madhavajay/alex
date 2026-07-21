@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const PROVIDER = "alexandria";
+const PROVIDER = "alex";
 const STATE_ENTRY = "pam-mode-state";
 const DEFAULT_MODE: ModeName = "medium";
 const SETTINGS_PATH = fileURLToPath(new URL("./settings.json", import.meta.url));

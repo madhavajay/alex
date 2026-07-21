@@ -117,11 +117,11 @@ openai-compatibility:
     base-url: "http://$HOST_FROM_CONTAINER:$ALEX_PORT/v1"
     disable-cooling: true
     headers:
-      X-Alexandria-Harness: "cliproxyapi"
-      X-Alexandria-Harness-Version: "v7.2.92"
-      X-Alexandria-Integration-Schema: "alex.cliproxyapi.reverse/v1"
-      X-Alexandria-Capabilities: "openai-chat,openai-responses,anthropic-messages,streaming,tool-calls,structured-errors,trace-correlation"
-      X-Alexandria-Route-Chain: "cliproxyapi"
+      X-Alex-Harness: "cliproxyapi"
+      X-Alex-Harness-Version: "v7.2.92"
+      X-Alex-Integration-Schema: "alex.cliproxyapi.reverse/v1"
+      X-Alex-Capabilities: "openai-chat,openai-responses,anthropic-messages,streaming,tool-calls,structured-errors,trace-correlation"
+      X-Alex-Route-Chain: "cliproxyapi"
     api-key-entries:
       - api-key: "$HARNESS_KEY"
     models:
@@ -183,8 +183,8 @@ request() {
 
 assert_trace_header() {
   local id=$1
-  grep -Eiq '^x-alexandria-trace-id:' "$RESPONSES/$id.headers" \
-    || fail "$id is missing x-alexandria-trace-id"
+  grep -Eiq '^x-alex-trace-id:' "$RESPONSES/$id.headers" \
+    || fail "$id is missing x-alex-trace-id"
 }
 
 assert_no_header() {
@@ -241,7 +241,7 @@ log "testing Harness -> CLIProxyAPI -> Alex -> provider"
 run_success_matrix a2 "http://127.0.0.1:$CPA_PORT" "$TMP/cpa.headers" "alex"
 run_error_matrix a2 "http://127.0.0.1:$CPA_PORT" "$TMP/cpa.headers" "alex"
 assert_no_header a2-rate retry-after
-assert_no_header a2-rate x-alexandria-trace-id
+assert_no_header a2-rate x-alex-trace-id
 
 request cpa-bad-key "http://127.0.0.1:$CPA_PORT" "$TMP/bad.headers" /v1/chat/completions \
   '{"model":"alex/echo","messages":[{"role":"user","content":"test"}]}' 401
@@ -251,10 +251,10 @@ request alex-bad-key "http://127.0.0.1:$ALEX_PORT" "$TMP/bad.headers" /v1/chat/c
 curl -fsS --max-time 2 "http://127.0.0.1:$PROVIDER_PORT/fixture/stats" > "$RESPONSES/stats-before-loop.body"
 request loop-guard "http://127.0.0.1:$ALEX_PORT" "$TMP/alex.headers" /v1/chat/completions \
   '{"model":"cliproxyapi/cpa/echo","messages":[{"role":"user","content":"test"}]}' 508 \
-  -H 'x-alexandria-harness: cliproxyapi' \
-  -H 'x-alexandria-route-chain: cliproxyapi' \
-  -H 'x-alexandria-integration-schema: alex.cliproxyapi.reverse/v1' \
-  -H 'x-alexandria-capabilities: openai-chat'
+  -H 'x-alex-harness: cliproxyapi' \
+  -H 'x-alex-route-chain: cliproxyapi' \
+  -H 'x-alex-integration-schema: alex.cliproxyapi.reverse/v1' \
+  -H 'x-alex-capabilities: openai-chat'
 curl -fsS --max-time 2 "http://127.0.0.1:$PROVIDER_PORT/fixture/stats" > "$RESPONSES/stats-after-loop.body"
 python3 "$ROOT/scripts/cliproxyapi-v1-assert.py" stats "$RESPONSES/stats-before-loop.body" 14
 python3 "$ROOT/scripts/cliproxyapi-v1-assert.py" stats "$RESPONSES/stats-after-loop.body" 14

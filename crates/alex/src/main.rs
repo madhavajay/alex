@@ -15,8 +15,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-mod commands;
 mod cliproxyapi;
+mod commands;
 mod dario;
 mod doctor;
 mod harness_connect;
@@ -719,15 +719,15 @@ enum WrapCommand {
 
 #[derive(clap::Args, Clone, Default)]
 struct RemoteTraceArgs {
-    /// Central Alex base URL for trace upload (env: ALEXANDRIA_TRACE_URL)
+    /// Central Alex base URL for trace upload (env: ALEX_TRACE_URL)
     #[arg(long, alias = "alex-url")]
     trace_url: Option<String>,
     /// Correlate this wrap session under a caller-supplied run id instead of a
-    /// generated one (env: ALEXANDRIA_RUN_ID). Lets an orchestrator pre-register
+    /// generated one (env: ALEX_RUN_ID). Lets an orchestrator pre-register
     /// the run and skip scraping the announced id.
     #[arg(long)]
     run_id: Option<String>,
-    /// File containing a wrap key (env alternatives: ALEXANDRIA_TRACE_KEY[_FILE])
+    /// File containing a wrap key (env alternatives: ALEX_TRACE_KEY[_FILE])
     #[arg(long)]
     trace_key_file: Option<PathBuf>,
     /// Permit plaintext HTTP to a non-loopback trace destination
@@ -1438,7 +1438,7 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         // irreproducible. `None` is surfaced as a prompt-cache health issue.
         return path.is_file().then(|| path.to_path_buf());
     }
-    if let Some(path) = std::env::var_os("ALEXANDRIA_REAL_CLAUDE_BIN") {
+    if let Some(path) = std::env::var_os("ALEX_REAL_CLAUDE_BIN") {
         candidates.push(PathBuf::from(path));
     }
     if let Some(path) = std::env::var_os("PATH") {
@@ -1721,7 +1721,7 @@ fn random_key(prefix: &str) -> String {
 }
 
 fn save_config(config: &Config) -> Result<()> {
-    let path = alexandria_home().join("config.toml");
+    let path = alex_home().join("config.toml");
     save_config_at(config, &path)
 }
 
@@ -1759,7 +1759,7 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// read-modify-write helper so a persist always starts from the authoritative
 /// on-disk state rather than a possibly-stale in-memory snapshot.
 fn read_config_from_disk() -> Result<Config> {
-    let path = alexandria_home().join("config.toml");
+    let path = alex_home().join("config.toml");
     if !path.exists() {
         // No file yet (first run / tests that never saved): fall back to the
         // normal loader, which creates a default config.toml.
@@ -1819,109 +1819,15 @@ fn set_daemon_host(config: &mut Config, address: &str) -> Result<bool> {
 }
 
 const ALEX_HOME_DIR: &str = ".alex";
-const LEGACY_ALEX_HOME_DIR: &str = ".alexandria";
-const HOME_MIGRATION_MARKER: &str = ".migrated-from-alexandria-v1";
 
-fn alexandria_home() -> PathBuf {
-    if let Some(path) = std::env::var_os("ALEXANDRIA_HOME") {
-        return PathBuf::from(path);
-    }
-    let platform_home = dirs::home_dir().expect("no home dir");
-    migrate_default_alex_home(&platform_home)
-}
-
-fn path_entry_exists(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
-}
-
-#[cfg(unix)]
-fn create_legacy_home_alias(current: &Path, legacy: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(current, legacy)
-}
-
-#[cfg(windows)]
-fn create_legacy_home_alias(current: &Path, legacy: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(current, legacy)
-}
-
-/// Move the old default state directory exactly once. A rename keeps the
-/// migration atomic and a compatibility link lets older Alex binaries keep
-/// using the same state after an upgrade/rollback. Explicit ALEXANDRIA_HOME
-/// values bypass this function entirely.
-fn migrate_default_alex_home(platform_home: &Path) -> PathBuf {
-    let current = platform_home.join(ALEX_HOME_DIR);
-    let legacy = platform_home.join(LEGACY_ALEX_HOME_DIR);
-
-    if path_entry_exists(&current) {
-        if current.join(HOME_MIGRATION_MARKER).exists() && !path_entry_exists(&legacy) {
-            if let Err(error) = create_legacy_home_alias(&current, &legacy) {
-                eprintln!(
-                    "warning: migrated Alex state to {} but could not create the legacy {} alias: {error}",
-                    current.display(),
-                    legacy.display()
-                );
-            }
-        }
-        return current;
-    }
-    if !path_entry_exists(&legacy) {
-        return current;
-    }
-    let Ok(metadata) = std::fs::symlink_metadata(&legacy) else {
-        return current;
-    };
-    if !metadata.file_type().is_dir() {
-        eprintln!(
-            "warning: {} is not a state directory; leaving it untouched and using {}",
-            legacy.display(),
-            current.display()
-        );
-        return current;
-    }
-
-    // The marker allows the next launch to finish creating the compatibility
-    // alias if this process exits between the rename and symlink operations.
-    if let Err(error) = std::fs::write(legacy.join(HOME_MIGRATION_MARKER), b"v1\n") {
-        if path_entry_exists(&current) {
-            return current;
-        }
-        eprintln!(
-            "warning: could not prepare Alex state migration from {}: {error}; continuing with the legacy directory",
-            legacy.display()
-        );
-        return legacy;
-    }
-    if let Err(error) = std::fs::rename(&legacy, &current) {
-        if path_entry_exists(&current) {
-            return current;
-        }
-        eprintln!(
-            "warning: could not migrate Alex state from {} to {}: {error}; continuing with the legacy directory",
-            legacy.display(),
-            current.display()
-        );
-        return legacy;
-    }
-    if let Err(error) = create_legacy_home_alias(&current, &legacy) {
-        eprintln!(
-            "warning: migrated Alex state to {} but could not create the legacy {} alias: {error}",
-            current.display(),
-            legacy.display()
-        );
-    }
-    current
-}
-
-fn migrate_default_data_dir(config: &mut Config, selected_home: &Path, platform_home: &Path) {
-    let current = platform_home.join(ALEX_HOME_DIR);
-    let legacy = platform_home.join(LEGACY_ALEX_HOME_DIR);
-    if selected_home == current && config.data_dir == legacy {
-        config.data_dir = current;
-    }
+fn alex_home() -> PathBuf {
+    std::env::var_os("ALEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().expect("no home dir").join(ALEX_HOME_DIR))
 }
 
 fn load_or_create_config() -> Result<(Config, bool)> {
-    let home = alexandria_home();
+    let home = alex_home();
     std::fs::create_dir_all(&home)?;
     #[cfg(unix)]
     {
@@ -1934,11 +1840,6 @@ fn load_or_create_config() -> Result<(Config, bool)> {
         let mut config: Config =
             toml::from_str(&raw).with_context(|| format!("parsing {path:?}"))?;
         config.heal();
-        if std::env::var_os("ALEXANDRIA_HOME").is_none() {
-            if let Some(platform_home) = dirs::home_dir() {
-                migrate_default_data_dir(&mut config, &home, &platform_home);
-            }
-        }
         let upgraded = toml::to_string_pretty(&config)?;
         if upgraded != raw {
             std::fs::write(&path, upgraded)?;
@@ -3154,11 +3055,11 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             return axum::Json(plan).into_response();
         }
         let config_path = match name.as_str() {
-            "claude" => config_dir.join("alexandria-settings.json"),
+            "claude" => config_dir.join("alex-settings.json"),
             "codex" => config_dir.join("config.toml"),
             "grok" => config_dir.join("config.toml"),
             "kimi" => config_dir.join("config.toml"),
-            "amp" => config_dir.join("plugins").join("alexandria.ts"),
+            "amp" => config_dir.join("plugins").join("alex.ts"),
             _ => config_dir.join("models.json"),
         };
         let previous_models = match name.as_str() {
@@ -3495,7 +3396,7 @@ fn parse_bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 async fn bind_daemon_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
-    bind_daemon_listener_named(host, port, "alexandria-primary").await
+    bind_daemon_listener_named(host, port, "alex-primary").await
 }
 
 async fn bind_daemon_listener_named(
@@ -3528,7 +3429,7 @@ async fn bind_daemon_listener_named(
 #[cfg(target_os = "macos")]
 fn launchd_socket_activation_requested() -> bool {
     cfg!(target_os = "macos")
-        && std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION").as_deref()
+        && std::env::var_os("ALEX_LAUNCHD_SOCKET_ACTIVATION").as_deref()
             == Some(std::ffi::OsStr::new("1"))
 }
 
@@ -3619,7 +3520,7 @@ async fn main() -> Result<()> {
         }
     };
     let default_filter = match &command {
-        Command::Daemon { .. } => "info,alexandria=debug",
+        Command::Daemon { .. } => "info,alex=debug",
         _ => "warn",
     };
     tracing_subscriber::fmt()
@@ -3644,8 +3545,8 @@ async fn main() -> Result<()> {
     {
         let supplied_key = key
             .clone()
-            .or_else(|| std::env::var("ALEXANDRIA_HARNESS_KEY").ok());
-        let remote_url = url.clone().or_else(|| std::env::var("ALEXANDRIA_URL").ok());
+            .or_else(|| std::env::var("ALEX_HARNESS_KEY").ok());
+        let remote_url = url.clone().or_else(|| std::env::var("ALEX_URL").ok());
         let cliproxyapi = harness
             .as_deref()
             .is_some_and(|name| matches!(name, "cliproxyapi" | "cliproxy" | "cpa"));
@@ -3654,7 +3555,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .context("a pre-minted harness key requires a harness name")?;
             let url = remote_url.as_deref().context(
-                "a pre-minted harness key requires --url or ALEXANDRIA_URL; this avoids reading local Alex config",
+                "a pre-minted harness key requires --url or ALEX_URL; this avoids reading local Alex config",
             )?;
             harness_connect::connect_with_preminted_key(
                 harness,
@@ -3863,7 +3764,7 @@ async fn main() -> Result<()> {
                 &state,
                 Arc::new(reset::DaemonResetHandler::new(
                     daemon_config.clone(),
-                    alexandria_home().join("config.toml"),
+                    alex_home().join("config.toml"),
                 )),
             );
             {
@@ -4046,7 +3947,7 @@ async fn main() -> Result<()> {
             }
             let local_listener = if requires_explicit_loopback_listener(&bound_host) {
                 Some(
-                    bind_daemon_listener_named("127.0.0.1", port, "alexandria-local")
+                    bind_daemon_listener_named("127.0.0.1", port, "alex-local")
                         .await
                         .with_context(|| {
                             format!(
@@ -4653,21 +4554,17 @@ async fn main() -> Result<()> {
                     .as_deref()
                     .map(cliproxyapi::read_private_key_file)
                     .transpose()?;
-                let key_from_env = std::env::var("ALEXANDRIA_HARNESS_KEY").ok();
-                let existing_key = key_from_file
-                    .as_deref()
-                    .or(key_from_env.as_deref());
+                let key_from_env = std::env::var("ALEX_HARNESS_KEY").ok();
+                let existing_key = key_from_file.as_deref().or(key_from_env.as_deref());
                 let target_is_local = cliproxyapi::normalize_alex_api_base(&alex_api_base)?
                     == cliproxyapi::normalize_alex_api_base(&local_api_base)?;
                 if existing_key.is_none() && !target_is_local {
-                    anyhow::bail!(
-                        "a remote Alex export requires --key-file or ALEXANDRIA_HARNESS_KEY"
-                    );
+                    anyhow::bail!("a remote Alex export requires --key-file or ALEX_HARNESS_KEY");
                 }
                 let admin_base = target_is_local.then(|| config.base_url());
                 let admin_key = target_is_local.then_some(config.local_key.as_str());
-                let result = cliproxyapi::export_reverse_config(
-                    cliproxyapi::ReverseExportOptions {
+                let result =
+                    cliproxyapi::export_reverse_config(cliproxyapi::ReverseExportOptions {
                         output: &output,
                         alex_api_base: &alex_api_base,
                         existing_key,
@@ -4675,9 +4572,8 @@ async fn main() -> Result<()> {
                         admin_key,
                         requested_models: &models,
                         cliproxyapi_version: cliproxyapi_version.as_deref(),
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 if json {
                     println!(
                         "{}",
@@ -4708,8 +4604,8 @@ async fn main() -> Result<()> {
                     "minimum_cliproxyapi_major": alex_proxy::CLIPROXYAPI_MINIMUM_MAJOR,
                     "capabilities": alex_proxy::CLIPROXYAPI_REVERSE_CAPABILITIES,
                     "protocols": ["openai-chat", "openai-responses", "anthropic-messages"],
-                    "correlation_response_header": "x-alexandria-trace-id",
-                    "route_chain_header": "x-alexandria-route-chain",
+                    "correlation_response_header": "x-alex-trace-id",
+                    "route_chain_header": "x-alex-route-chain",
                 });
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5494,7 +5390,7 @@ async fn main() -> Result<()> {
             let store = Store::open(config.data_dir.clone())?;
             let plan = reset::execute(
                 &config,
-                &alexandria_home().join("config.toml"),
+                &alex_home().join("config.toml"),
                 &vault,
                 &store,
                 selection,
@@ -5704,7 +5600,7 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
     let base_url = args
         .trace_url
         .clone()
-        .or_else(|| std::env::var("ALEXANDRIA_TRACE_URL").ok())
+        .or_else(|| std::env::var("ALEX_TRACE_URL").ok())
         .map(|value| value.trim_end_matches('/').to_string());
     let key = if let Some(path) = &args.trace_key_file {
         Some(
@@ -5713,9 +5609,9 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
                 .trim()
                 .to_string(),
         )
-    } else if let Ok(value) = std::env::var("ALEXANDRIA_TRACE_KEY") {
+    } else if let Ok(value) = std::env::var("ALEX_TRACE_KEY") {
         Some(value.trim().to_string())
-    } else if let Ok(path) = std::env::var("ALEXANDRIA_TRACE_KEY_FILE") {
+    } else if let Ok(path) = std::env::var("ALEX_TRACE_KEY_FILE") {
         Some(
             std::fs::read_to_string(&path)
                 .with_context(|| format!("read trace key file {path}"))?
@@ -5731,14 +5627,12 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
             .map(|value| !value.is_empty())
             .unwrap_or(false)
         {
-            anyhow::bail!(
-                "ALEXANDRIA_TRACE_KEY was set without --trace-url / ALEXANDRIA_TRACE_URL"
-            );
+            anyhow::bail!("ALEX_TRACE_KEY was set without --trace-url / ALEX_TRACE_URL");
         }
         return Ok(None);
     };
     let key = key.filter(|value| !value.is_empty()).with_context(|| {
-        "remote trace upload requires --trace-key-file, ALEXANDRIA_TRACE_KEY, or ALEXANDRIA_TRACE_KEY_FILE"
+        "remote trace upload requires --trace-key-file, ALEX_TRACE_KEY, or ALEX_TRACE_KEY_FILE"
     })?;
     if !key.starts_with("alxk-") {
         anyhow::bail!("remote trace credential is not an Alex key (expected alxk-...)");
@@ -5755,8 +5649,7 @@ fn resolve_remote_trace_config(args: &RemoteTraceArgs) -> Result<Option<RemoteTr
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false)
     });
-    let allow_insecure =
-        args.allow_insecure_http || truthy_env("ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP");
+    let allow_insecure = args.allow_insecure_http || truthy_env("ALEX_TRACE_ALLOW_INSECURE_HTTP");
     if url.scheme() == "http" && !loopback && !allow_insecure {
         anyhow::bail!(
             "refusing plaintext remote trace upload to {base_url}; use HTTPS or --allow-insecure-http on a trusted private network"
@@ -5908,7 +5801,7 @@ async fn wrap_run_cmd(
     let external_run_id = remote_trace
         .run_id
         .clone()
-        .or_else(|| std::env::var("ALEXANDRIA_RUN_ID").ok())
+        .or_else(|| std::env::var("ALEX_RUN_ID").ok())
         .map(|run_id| {
             if valid_wrap_run_id(&run_id) {
                 Ok(run_id)
@@ -6466,13 +6359,18 @@ impl AmpWsTraceState {
             routed_model: Some(model),
             method: Some("WEBSOCKET".into()),
             path: Some("/actors/gateway/threadActor/websocket/".into()),
-            status: Some(if error.as_deref().is_some_and(|message| message.contains("401")) {
-                401
-            } else if error.is_some() {
-                500
-            } else {
-                200
-            }),
+            status: Some(
+                if error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("401"))
+                {
+                    401
+                } else if error.is_some() {
+                    500
+                } else {
+                    200
+                },
+            ),
             streamed: Some(true),
             usage,
             cost_usd,
@@ -6480,16 +6378,22 @@ impl AmpWsTraceState {
             req_body_path: req_path,
             upstream_req_body_path: None,
             resp_body_path: resp_path,
-            req_headers_json: Some(serde_json::json!({
-                "x-alexandria-wrap": "amp",
-                "x-alexandria-run-id": self.run_id,
-                "x-alexandria-trace-tag": "harness=amp,wrap=amp,source=alex-wrap-ws,stream=dialogue"
-            }).to_string()),
-            resp_headers_json: Some(serde_json::json!({
-                "x-alexandria-wrap": "amp",
-                "x-alexandria-source": "websocket",
-                "content-type": "application/json"
-            }).to_string()),
+            req_headers_json: Some(
+                serde_json::json!({
+                    "x-alex-wrap": "amp",
+                    "x-alex-run-id": self.run_id,
+                    "x-alex-trace-tag": "harness=amp,wrap=amp,source=alex-wrap-ws,stream=dialogue"
+                })
+                .to_string(),
+            ),
+            resp_headers_json: Some(
+                serde_json::json!({
+                    "x-alex-wrap": "amp",
+                    "x-alex-source": "websocket",
+                    "content-type": "application/json"
+                })
+                .to_string(),
+            ),
             error,
             error_kind: None,
             error_code: None,
@@ -7001,7 +6905,7 @@ fn agent_trace_bodies_for_model(
     let resp = serde_json::json!({
         "id": transcript_id,
         "model": model,
-        "_alexandria": {"assistant_blocks": turn.assistant_blocks},
+        "_alex": {"assistant_blocks": turn.assistant_blocks},
         "choices": [{
             "index": 0,
             "message": message,
@@ -7280,8 +7184,8 @@ fn reconcile_agent_turn(
         req_body_path: req_path,
         upstream_req_body_path: None,
         resp_body_path: resp_path,
-        req_headers_json: Some(serde_json::json!({"x-alexandria-wrap":"agent","x-alexandria-run-id":run_id}).to_string()),
-        resp_headers_json: Some(serde_json::json!({"x-alexandria-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
+        req_headers_json: Some(serde_json::json!({"x-alex-wrap":"agent","x-alex-run-id":run_id}).to_string()),
+        resp_headers_json: Some(serde_json::json!({"x-alex-source":"cursor-agent-transcript","content-type":"application/json"}).to_string()),
         error: None,
         error_kind: None,
         error_code: None,
@@ -7481,7 +7385,7 @@ async fn traces_push_cmd(
     remote_args: &RemoteTraceArgs,
 ) -> Result<()> {
     let remote = resolve_remote_trace_config(remote_args)?
-        .context("traces push requires --trace-url / ALEXANDRIA_TRACE_URL")?;
+        .context("traces push requires --trace-url / ALEX_TRACE_URL")?;
     preflight_remote_trace(&remote).await?;
     let store = Store::open(config.data_dir.clone())?;
     let trace_ids = store.run_trace_ids(run_id)?;
@@ -7855,9 +7759,7 @@ async fn daemon_get(
         .query(params)
         .send()
         .await
-        .with_context(|| {
-            format!("could not reach the Alex daemon at {base} — is it running?")
-        })?;
+        .with_context(|| format!("could not reach the Alex daemon at {base} — is it running?"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -8591,10 +8493,7 @@ fn traces_path_cmd(config: &Config, run_id: &str) -> Result<()> {
         std::process::exit(1);
     }
     println!("data_dir: {}", store.data_dir.display());
-    println!(
-        "sqlite: {}",
-        store.data_dir.join("alexandria.sqlite3").display()
-    );
+    println!("sqlite: {}", store.data_dir.join("alex.sqlite3").display());
     for artifact in store.run_artifacts(run_id)? {
         if let Some(p) = artifact["path"].as_str() {
             println!("{p}");
@@ -8732,9 +8631,10 @@ async fn daemon_send(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    let resp = req.send().await.with_context(|| {
-        format!("could not reach the Alex daemon at {base} — is it running?")
-    })?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("could not reach the Alex daemon at {base} — is it running?"))?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
     Ok((status, body))
@@ -8801,8 +8701,8 @@ async fn keys_mint_cmd(
     println!();
     if kind == "wrap" {
         println!("{}", ui::dim("shown once — configure the remote wrapper:"));
-        println!("export ALEXANDRIA_TRACE_URL={}", config.base_url());
-        println!("export ALEXANDRIA_TRACE_KEY={key}");
+        println!("export ALEX_TRACE_URL={}", config.base_url());
+        println!("export ALEX_TRACE_KEY={key}");
     } else {
         println!(
             "{}",
@@ -8939,9 +8839,7 @@ fn fmt_reset(v: &serde_json::Value) -> String {
 fn print_limits(snap: &serde_json::Value) {
     let providers = snap["providers"].as_array().cloned().unwrap_or_default();
     if providers.is_empty() {
-        println!(
-            "no limit data yet — send some traffic through the proxy (or run `alex ping`)"
-        );
+        println!("no limit data yet — send some traffic through the proxy (or run `alex ping`)");
         return;
     }
     println!("{}", ui::section("subscription limits"));
@@ -9515,11 +9413,11 @@ async fn run_pings(
 
 const LAUNCHD_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/config/launchd/com.alexandria.daemon.plist"
+    "/config/launchd/com.madhavajay.alex.daemon.plist"
 ));
 const SYSTEMD_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/config/systemd/alexandria.service"
+    "/config/systemd/alex.service"
 ));
 const WINDOWS_TASK_NAME: &str = "AlexDaemon";
 
@@ -9540,7 +9438,9 @@ fn run_windows_service_script(
     if let Some(executable) = executable {
         command.env("ALEX_SERVICE_EXE", executable);
     }
-    command.output().context("running Windows Task Scheduler command")
+    command
+        .output()
+        .context("running Windows Task Scheduler command")
 }
 
 fn windows_service_error(action: &str, output: &std::process::Output) -> anyhow::Error {
@@ -9561,7 +9461,7 @@ fn windows_task_executable_path(path: &Path) -> PathBuf {
     }
 }
 
-const LAUNCHD_LABEL: &str = "com.alexandria.daemon";
+const LAUNCHD_LABEL: &str = "com.madhavajay.alex.daemon";
 const LAUNCHD_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const LAUNCHD_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -9681,9 +9581,9 @@ fn render_launchd_sockets(config: &Config) -> Result<String> {
             config.port,
         ))
     };
-    let mut entries = vec![socket("alexandria-primary", &config.host)?];
+    let mut entries = vec![socket("alex-primary", &config.host)?];
     if requires_explicit_loopback_listener(&config.host) {
-        entries.push(socket("alexandria-local", "127.0.0.1")?);
+        entries.push(socket("alex-local", "127.0.0.1")?);
     }
     Ok(format!(
         "  <key>Sockets</key>\n  <dict>\n{}\n  </dict>",
@@ -9701,16 +9601,13 @@ fn render_launchd_plist(
     let service_home = service_home
         .map(|path| {
             format!(
-                "    <key>ALEXANDRIA_HOME</key>\n    <string>{}</string>",
+                "    <key>ALEX_HOME</key>\n    <string>{}</string>",
                 xml_escape(&path.to_string_lossy())
             )
         })
         .unwrap_or_default();
     Ok(LAUNCHD_TEMPLATE
-        .replace(
-            "/usr/local/bin/alexandria",
-            &xml_escape(&exe.to_string_lossy()),
-        )
+        .replace("/usr/local/bin/alex", &xml_escape(&exe.to_string_lossy()))
         .replace(
             "__ALEX_LAUNCHD_PATH__",
             &xml_escape(&render_launchd_path(inherited_path, known_dirs)),
@@ -9746,8 +9643,8 @@ fn daemon_pids_to_evict(discovered: &[u32], own_pid: u32, service_pid: u32) -> V
 #[cfg(unix)]
 fn daemon_process_pids() -> Vec<u32> {
     // Match any installed/dev path whose executable basename is `alex` or
-    // `alexandria` and whose first argument is the daemon subcommand.
-    let pattern = r"(^|.*/)(alex|alexandria)[[:space:]]+daemon([[:space:]]|$)";
+    // `alex` and whose first argument is the daemon subcommand.
+    let pattern = r"(^|.*/)alex[[:space:]]+daemon([[:space:]]|$)";
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", pattern])
         .output()
@@ -9775,14 +9672,7 @@ fn managed_service_pid() -> Option<u32> {
 #[cfg(target_os = "linux")]
 fn managed_service_pid() -> Option<u32> {
     let output = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "--property",
-            "MainPID",
-            "--value",
-            "alexandria",
-        ])
+        .args(["--user", "show", "--property", "MainPID", "--value", "alex"])
         .output()
         .ok()?;
     output
@@ -9870,7 +9760,7 @@ fn service_install(config: &Config) -> Result<()> {
         std::fs::create_dir_all(dst.parent().unwrap())?;
         let mut launchctl = SystemLaunchctl::new();
         let loaded = launchctl.is_loaded()?;
-        let service_home = std::env::var_os("ALEXANDRIA_HOME").map(PathBuf::from);
+        let service_home = std::env::var_os("ALEX_HOME").map(PathBuf::from);
         let plist = render_launchd_plist(
             &exe,
             &std::env::var("PATH").unwrap_or_default(),
@@ -9896,7 +9786,7 @@ fn service_install(config: &Config) -> Result<()> {
     } else if cfg!(target_os = "linux") {
         let dst = dirs::home_dir()
             .context("no home dir")?
-            .join(".config/systemd/user/alexandria.service");
+            .join(".config/systemd/user/alex.service");
         std::fs::create_dir_all(dst.parent().unwrap())?;
         let unit: String = SYSTEMD_TEMPLATE
             .lines()
@@ -9912,7 +9802,7 @@ fn service_install(config: &Config) -> Result<()> {
         std::fs::write(&dst, unit + "\n")?;
         for args in [
             vec!["--user", "daemon-reload"],
-            vec!["--user", "enable", "--now", "alexandria"],
+            vec!["--user", "enable", "--now", "alex"],
         ] {
             let out = std::process::Command::new("systemctl")
                 .args(&args)
@@ -10006,12 +9896,12 @@ async fn service_restart(config: &Config, force: bool) -> Result<()> {
             eprintln!("note: --force is a launchd compatibility flag; systemd restart is already a hard service restart");
         }
         let output = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "alexandria"])
+            .args(["--user", "restart", "alex"])
             .output()
             .context("restarting the systemd user service")?;
         if !output.status.success() {
             bail!(
-                "systemctl --user restart alexandria failed: {}",
+                "systemctl --user restart alex failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -10053,9 +9943,7 @@ async fn service_restart(config: &Config, force: bool) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (config, force);
-        anyhow::bail!(
-            "service restart is not available on this OS; use `alex daemon --background`"
-        )
+        anyhow::bail!("service restart is not available on this OS; use `alex daemon --background`")
     }
 }
 
@@ -10170,11 +10058,7 @@ fn drain_timeout_from(value: Option<&str>) -> std::time::Duration {
 }
 
 fn drain_timeout() -> std::time::Duration {
-    drain_timeout_from(
-        std::env::var("ALEXANDRIA_DRAIN_TIMEOUT_SECONDS")
-            .ok()
-            .as_deref(),
-    )
+    drain_timeout_from(std::env::var("ALEX_DRAIN_TIMEOUT_SECONDS").ok().as_deref())
 }
 
 fn graceful_or_hard_restart(
@@ -10273,8 +10157,8 @@ async fn wait_for_process_exit(
 /// a refused connection.  Every error deliberately invokes the old hard
 /// kickstart as the always-up fallback.
 pub(crate) async fn restart_launchd_daemon(config: &Config, force: bool) -> Result<()> {
-    let opted_out = std::env::var_os("ALEXANDRIA_GRACEFUL_RESTART").as_deref()
-        == Some(std::ffi::OsStr::new("0"));
+    let opted_out =
+        std::env::var_os("ALEX_GRACEFUL_RESTART").as_deref() == Some(std::ffi::OsStr::new("0"));
     if force || opted_out {
         eprintln!("using requested hard launchd restart");
         return launchd_hard_restart();
@@ -10316,7 +10200,7 @@ fn service_uninstall() -> Result<()> {
     if cfg!(target_os = "macos") {
         let dst = dirs::home_dir()
             .context("no home dir")?
-            .join("Library/LaunchAgents/com.alexandria.daemon.plist");
+            .join("Library/LaunchAgents/com.madhavajay.alex.daemon.plist");
         let uid = current_uid();
         let _ = std::process::Command::new("launchctl")
             .args(["bootout", &format!("gui/{uid}")])
@@ -10328,11 +10212,11 @@ fn service_uninstall() -> Result<()> {
         println!("launchd service removed");
     } else if cfg!(target_os = "linux") {
         let _ = std::process::Command::new("systemctl")
-            .args(["--user", "disable", "--now", "alexandria"])
+            .args(["--user", "disable", "--now", "alex"])
             .output();
         let dst = dirs::home_dir()
             .context("no home dir")?
-            .join(".config/systemd/user/alexandria.service");
+            .join(".config/systemd/user/alex.service");
         if dst.exists() {
             std::fs::remove_file(&dst)?;
         }
@@ -10369,9 +10253,7 @@ fn service_state_label(state: &ServiceState) -> String {
         ServiceState::LaunchdNotLoaded => {
             "launchd: installed but not loaded → alex service install".into()
         }
-        ServiceState::LaunchdNotInstalled => {
-            "launchd: not installed → alex service install".into()
-        }
+        ServiceState::LaunchdNotInstalled => "launchd: not installed → alex service install".into(),
         ServiceState::Systemd {
             enabled: true,
             active: true,
@@ -10381,18 +10263,16 @@ fn service_state_label(state: &ServiceState) -> String {
             enabled: true,
             active: false,
             ..
-        } => "systemd: enabled but not active → systemctl --user start alexandria".into(),
+        } => "systemd: enabled but not active → systemctl --user start alex".into(),
         ServiceState::Systemd {
             enabled: false,
             active: true,
             ..
-        } => "systemd: active but not enabled → systemctl --user enable alexandria".into(),
+        } => "systemd: active but not enabled → systemctl --user enable alex".into(),
         ServiceState::Systemd {
             unit_present: true, ..
-        } => "systemd: installed but disabled → systemctl --user enable --now alexandria".into(),
-        ServiceState::Systemd { .. } => {
-            "systemd: not installed → alex service install".into()
-        }
+        } => "systemd: installed but disabled → systemctl --user enable --now alex".into(),
+        ServiceState::Systemd { .. } => "systemd: not installed → alex service install".into(),
         ServiceState::SystemdMissing => "systemd: systemctl not found".into(),
         ServiceState::WindowsTask {
             installed: true,
@@ -10441,7 +10321,7 @@ fn detect_service_state_macos() -> ServiceState {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     if let Ok(o) = std::process::Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/com.alexandria.daemon")])
+        .args(["print", &format!("gui/{uid}/com.madhavajay.alex.daemon")])
         .output()
     {
         if o.status.success() {
@@ -10451,7 +10331,7 @@ fn detect_service_state_macos() -> ServiceState {
         }
     }
     let plist = dirs::home_dir()
-        .map(|h| h.join("Library/LaunchAgents/com.alexandria.daemon.plist"))
+        .map(|h| h.join("Library/LaunchAgents/com.madhavajay.alex.daemon.plist"))
         .filter(|p| p.exists());
     if plist.is_some() {
         ServiceState::LaunchdNotLoaded
@@ -10464,7 +10344,7 @@ fn detect_service_state_macos() -> ServiceState {
 fn detect_service_state_linux() -> ServiceState {
     let run = |arg: &str| {
         std::process::Command::new("systemctl")
-            .args(["--user", arg, "alexandria"])
+            .args(["--user", arg, "alex"])
             .output()
     };
     match run("is-enabled") {
@@ -10475,7 +10355,7 @@ fn detect_service_state_linux() -> ServiceState {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             let unit_present = dirs::home_dir()
-                .map(|h| h.join(".config/systemd/user/alexandria.service").exists())
+                .map(|h| h.join(".config/systemd/user/alex.service").exists())
                 .unwrap_or(false);
             ServiceState::Systemd {
                 enabled,
@@ -10509,11 +10389,11 @@ fn detect_service_state_windows() -> ServiceState {
 fn installed_binaries() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|d| d.join("alexandria")));
+        candidates.extend(std::env::split_paths(&path).map(|d| d.join("alex")));
     }
-    candidates.push(PathBuf::from("/usr/local/bin/alexandria"));
+    candidates.push(PathBuf::from("/usr/local/bin/alex"));
     if let Some(h) = dirs::home_dir() {
-        candidates.push(h.join(".local").join("bin").join("alexandria"));
+        candidates.push(h.join(".local").join("bin").join("alex"));
     }
     let mut found: Vec<PathBuf> = Vec::new();
     for c in candidates {
@@ -10537,7 +10417,7 @@ fn parse_dario_update_notice(raw: &str) -> Option<String> {
 }
 
 fn print_dario_update_notice() {
-    let path = alexandria_home().join("dario").join("update-state.json");
+    let path = alex_home().join("dario").join("update-state.json");
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
@@ -10607,7 +10487,7 @@ async fn daemon_background(
         );
         return Ok(());
     }
-    let log_path = alexandria_home().join("daemon.log");
+    let log_path = alex_home().join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -10653,7 +10533,7 @@ async fn daemon_background(
     std::process::exit(1);
 }
 
-const UP_STATE_FILE: &str = "alexandria-up-state.json";
+const UP_STATE_FILE: &str = "alex-up-state.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpStepPlan {
@@ -10745,10 +10625,7 @@ fn current_desktop_platform() -> DesktopPlatform {
     }
 }
 
-fn browser_command_for(
-    platform: DesktopPlatform,
-    url: &str,
-) -> Result<(OsString, Vec<OsString>)> {
+fn browser_command_for(platform: DesktopPlatform, url: &str) -> Result<(OsString, Vec<OsString>)> {
     let url = OsString::from(url);
     match platform {
         DesktopPlatform::Macos => Ok(("open".into(), vec![url])),
@@ -10759,9 +10636,9 @@ fn browser_command_for(
             "cmd".into(),
             vec!["/C".into(), "start".into(), "".into(), url],
         )),
-        DesktopPlatform::Unsupported => bail!(
-            "automatic browser launch is unsupported on this OS; use `alex web --no-open`"
-        ),
+        DesktopPlatform::Unsupported => {
+            bail!("automatic browser launch is unsupported on this OS; use `alex web --no-open`")
+        }
     }
 }
 
@@ -10902,7 +10779,7 @@ async fn up_cmd(
     let mut launch_args = if harness == "pi" {
         vec![
             OsString::from("--provider"),
-            OsString::from("alexandria"),
+            OsString::from("alex"),
             OsString::from("--model"),
             OsString::from(model),
         ]
@@ -11149,10 +11026,13 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
         println!(
             "  {} {}",
             ui::pad_right("", 10),
-            ui::dim("unit: ~/.config/systemd/user/alexandria.service")
+            ui::dim("unit: ~/.config/systemd/user/alex.service")
         );
     }
-    if let ServiceState::WindowsTask { installed: true, .. } = service {
+    if let ServiceState::WindowsTask {
+        installed: true, ..
+    } = service
+    {
         println!(
             "  {} {}",
             ui::pad_right("", 10),
@@ -11335,9 +11215,7 @@ mod tests {
     #[test]
     fn doctor_cli_parses_human_and_json_modes() {
         assert!(matches!(
-            Cli::try_parse_from(["alex", "doctor"])
-                .unwrap()
-                .command,
+            Cli::try_parse_from(["alex", "doctor"]).unwrap().command,
             Some(Command::Doctor { json: false })
         ));
         assert!(matches!(
@@ -11967,15 +11845,12 @@ continue = true
         assert_eq!(tool_calls.len(), 6);
         assert_eq!(tool_calls[0]["function"]["name"], "Shell");
         assert_eq!(
-            response["_alexandria"]["assistant_blocks"][0]["text"],
+            response["_alex"]["assistant_blocks"][0]["text"],
             "Checking the workspace."
         );
+        assert_eq!(response["_alex"]["assistant_blocks"][1]["name"], "Shell");
         assert_eq!(
-            response["_alexandria"]["assistant_blocks"][1]["name"],
-            "Shell"
-        );
-        assert_eq!(
-            response["_alexandria"]["assistant_blocks"][7]["text"],
+            response["_alex"]["assistant_blocks"][7]["text"],
             "Here is the final answer."
         );
         let arguments: serde_json::Value =
@@ -12074,7 +11949,7 @@ continue = true
             "Checking."
         );
         assert_eq!(
-            first_response["_alexandria"]["assistant_blocks"]
+            first_response["_alex"]["assistant_blocks"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -12125,7 +12000,7 @@ continue = true
         );
         assert_eq!(response["choices"][0]["finish_reason"], "stop");
         assert_eq!(
-            response["_alexandria"]["assistant_blocks"]
+            response["_alex"]["assistant_blocks"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -12167,10 +12042,10 @@ continue = true
     fn remote_trace_config_supports_env_key_files_and_https_guard() {
         let _guard = ENV_LOCK.lock().unwrap();
         for name in [
-            "ALEXANDRIA_TRACE_URL",
-            "ALEXANDRIA_TRACE_KEY",
-            "ALEXANDRIA_TRACE_KEY_FILE",
-            "ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP",
+            "ALEX_TRACE_URL",
+            "ALEX_TRACE_KEY",
+            "ALEX_TRACE_KEY_FILE",
+            "ALEX_TRACE_ALLOW_INSECURE_HTTP",
         ] {
             std::env::remove_var(name);
         }
@@ -12178,15 +12053,15 @@ continue = true
             .unwrap()
             .is_none());
 
-        std::env::set_var("ALEXANDRIA_TRACE_URL", "http://10.0.0.8:4100/");
-        std::env::set_var("ALEXANDRIA_TRACE_KEY", "alxk-env-key");
+        std::env::set_var("ALEX_TRACE_URL", "http://10.0.0.8:4100/");
+        std::env::set_var("ALEX_TRACE_KEY", "alxk-env-key");
         let error = match resolve_remote_trace_config(&RemoteTraceArgs::default()) {
             Err(error) => error,
             Ok(_) => panic!("plaintext remote URL should be rejected"),
         };
         assert!(error.to_string().contains("refusing plaintext"));
 
-        std::env::set_var("ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("ALEX_TRACE_ALLOW_INSECURE_HTTP", "true");
         let config = resolve_remote_trace_config(&RemoteTraceArgs::default())
             .unwrap()
             .unwrap();
@@ -12207,10 +12082,10 @@ continue = true
         assert_eq!(config.key, "alxk-file-key");
 
         for name in [
-            "ALEXANDRIA_TRACE_URL",
-            "ALEXANDRIA_TRACE_KEY",
-            "ALEXANDRIA_TRACE_KEY_FILE",
-            "ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP",
+            "ALEX_TRACE_URL",
+            "ALEX_TRACE_KEY",
+            "ALEX_TRACE_KEY_FILE",
+            "ALEX_TRACE_ALLOW_INSECURE_HTTP",
         ] {
             std::env::remove_var(name);
         }
@@ -12932,12 +12807,12 @@ continue = true
         let home = tmpdir("dario-runtime-resolver");
         let old_home = std::env::var_os("HOME");
         let old_path = std::env::var_os("PATH");
-        let old_node = std::env::var_os("ALEXANDRIA_NODE_BIN");
-        let old_claude = std::env::var_os("ALEXANDRIA_REAL_CLAUDE_BIN");
+        let old_node = std::env::var_os("ALEX_NODE_BIN");
+        let old_claude = std::env::var_os("ALEX_REAL_CLAUDE_BIN");
         std::env::set_var("HOME", &home);
         std::env::set_var("PATH", "/definitely/no/node");
-        std::env::remove_var("ALEXANDRIA_NODE_BIN");
-        std::env::remove_var("ALEXANDRIA_REAL_CLAUDE_BIN");
+        std::env::remove_var("ALEX_NODE_BIN");
+        std::env::remove_var("ALEX_REAL_CLAUDE_BIN");
 
         let mise = home.join(".local/share/mise/installs/node");
         let node20 = mise.join("20.1.0/bin/node");
@@ -12980,12 +12855,12 @@ continue = true
             None => std::env::remove_var("PATH"),
         }
         match old_node {
-            Some(value) => std::env::set_var("ALEXANDRIA_NODE_BIN", value),
-            None => std::env::remove_var("ALEXANDRIA_NODE_BIN"),
+            Some(value) => std::env::set_var("ALEX_NODE_BIN", value),
+            None => std::env::remove_var("ALEX_NODE_BIN"),
         }
         match old_claude {
-            Some(value) => std::env::set_var("ALEXANDRIA_REAL_CLAUDE_BIN", value),
-            None => std::env::remove_var("ALEXANDRIA_REAL_CLAUDE_BIN"),
+            Some(value) => std::env::set_var("ALEX_REAL_CLAUDE_BIN", value),
+            None => std::env::remove_var("ALEX_REAL_CLAUDE_BIN"),
         }
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -13147,11 +13022,7 @@ continue = true
         let executable = PathBuf::from("installation root")
             .join("Alex Beta")
             .join("alex executable");
-        let command = background_daemon_command(
-            &executable,
-            Some("127.0.0.1"),
-            Some(41_000),
-        );
+        let command = background_daemon_command(&executable, Some("127.0.0.1"), Some(41_000));
         assert_eq!(command.get_program(), executable.as_os_str());
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -13182,10 +13053,10 @@ continue = true
     fn systemd_unit_allows_a_fresh_user_without_an_npm_directory() {
         assert!(SYSTEMD_TEMPLATE
             .lines()
-            .any(|line| line == "ReadWritePaths=%h/.alex -%h/.alexandria -%h/.npm"));
+            .any(|line| line == "ReadWritePaths=%h/.alex -%h/.npm"));
         assert!(!SYSTEMD_TEMPLATE
             .lines()
-            .any(|line| line == "ReadWritePaths=%h/.alex %h/.alexandria %h/.npm"));
+            .any(|line| line == "ReadWritePaths=%h/.alex %h/.npm"));
     }
 
     #[tokio::test]
@@ -13254,7 +13125,7 @@ continue = true
     async fn admin_reset_is_authenticated_and_returns_the_shared_dry_run_plan() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("admin-reset");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.data_dir = home.clone();
         save_config(&config).unwrap();
@@ -13281,7 +13152,7 @@ continue = true
             Some(serde_json::json!({"traces": true, "dry_run": true})),
         )
         .await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["dry_run"], true);
         assert_eq!(body["selected"], serde_json::json!(["traces"]));
@@ -13291,7 +13162,7 @@ continue = true
     #[test]
     fn launchctl_pid_parsing() {
         let out =
-            "com.alexandria.daemon = {\n\tactive count = 1\n\tpid = 96513\n\tstate = running\n}";
+            "com.madhavajay.alex.daemon = {\n\tactive count = 1\n\tpid = 96513\n\tstate = running\n}";
         assert_eq!(parse_launchctl_pid(out), Some(96513));
         assert_eq!(parse_launchctl_pid("state = running"), None);
         assert_eq!(parse_launchctl_pid(""), None);
@@ -13324,16 +13195,16 @@ continue = true
         )
         .unwrap();
         assert!(plist.contains("/Users/alex/bin/alex&amp;ria"));
-        assert!(plist.contains("alexandria-primary"));
+        assert!(plist.contains("alex-primary"));
         assert!(plist.contains("<string>127.0.0.1</string>"));
         assert!(plist.contains("<string>4321</string>"));
-        assert!(plist.contains("<key>ALEXANDRIA_HOME</key>"));
+        assert!(plist.contains("<key>ALEX_HOME</key>"));
         assert!(plist.contains("<string>/tmp/alex&amp;smoke</string>"));
         assert!(!plist.contains("__ALEX_LAUNCHD_HOME__"));
     }
 
     #[test]
-    fn launchd_plist_omits_unset_alexandria_home() {
+    fn launchd_plist_omits_unset_alex_home() {
         let config = test_config(tmpdir("launchd-default-home"));
         let plist = render_launchd_plist(
             Path::new("/Users/alex/bin/alex"),
@@ -13343,7 +13214,7 @@ continue = true
             None,
         )
         .unwrap();
-        assert!(!plist.contains("<key>ALEXANDRIA_HOME</key>"));
+        assert!(!plist.contains("<key>ALEX_HOME</key>"));
         assert!(!plist.contains("__ALEX_LAUNCHD_HOME__"));
     }
 
@@ -13398,72 +13269,12 @@ continue = true
     }
 
     #[test]
-    fn fresh_default_home_uses_alex_name() {
-        let platform_home = tmpdir("fresh-default-home");
-        assert_eq!(
-            migrate_default_alex_home(&platform_home),
-            platform_home.join(".alex")
-        );
-        assert!(!platform_home.join(".alexandria").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_default_home_is_moved_once_and_keeps_a_compatibility_alias() {
-        let platform_home = tmpdir("legacy-default-home");
-        let legacy = platform_home.join(".alexandria");
-        let current = platform_home.join(".alex");
-        std::fs::create_dir(&legacy).unwrap();
-        std::fs::write(legacy.join("config.toml"), "port = 4100\n").unwrap();
-
-        assert_eq!(migrate_default_alex_home(&platform_home), current);
-        assert_eq!(
-            std::fs::read_to_string(current.join("config.toml")).unwrap(),
-            "port = 4100\n"
-        );
-        assert!(std::fs::symlink_metadata(&legacy)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(migrate_default_alex_home(&platform_home), current);
-    }
-
-    #[test]
-    fn existing_alex_home_never_merges_or_removes_legacy_state() {
-        let platform_home = tmpdir("two-default-homes");
-        let legacy = platform_home.join(".alexandria");
-        let current = platform_home.join(".alex");
-        std::fs::create_dir(&legacy).unwrap();
-        std::fs::create_dir(&current).unwrap();
-        std::fs::write(legacy.join("legacy-only"), "keep").unwrap();
-        std::fs::write(current.join("current-only"), "use").unwrap();
-
-        assert_eq!(migrate_default_alex_home(&platform_home), current);
-        assert!(legacy.join("legacy-only").exists());
-        assert!(current.join("current-only").exists());
-    }
-
-    #[test]
-    fn explicit_alexandria_home_remains_authoritative() {
+    fn explicit_alex_home_remains_authoritative() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let explicit = tmpdir("explicit-alexandria-home");
-        std::env::set_var("ALEXANDRIA_HOME", &explicit);
-        assert_eq!(alexandria_home(), explicit);
-        std::env::remove_var("ALEXANDRIA_HOME");
-    }
-
-    #[test]
-    fn migrated_default_data_dir_tracks_the_new_home_but_custom_paths_survive() {
-        let platform_home = tmpdir("data-dir-migration");
-        let current = platform_home.join(".alex");
-        let mut config = test_config(platform_home.join(".alexandria"));
-        migrate_default_data_dir(&mut config, &current, &platform_home);
-        assert_eq!(config.data_dir, current);
-
-        let custom = platform_home.join("custom-state");
-        config.data_dir = custom.clone();
-        migrate_default_data_dir(&mut config, &current, &platform_home);
-        assert_eq!(config.data_dir, custom);
+        let explicit = tmpdir("explicit-alex-home");
+        std::env::set_var("ALEX_HOME", &explicit);
+        assert_eq!(alex_home(), explicit);
+        std::env::remove_var("ALEX_HOME");
     }
 
     #[cfg(windows)]
@@ -13492,7 +13303,7 @@ continue = true
     #[test]
     fn config_toml_roundtrip_with_native_paths() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         let config = Config {
             host: "127.0.0.1".into(),
             port: 4100,
@@ -13644,7 +13455,7 @@ local_key = "alx-test"
     fn protection_policy_persister_writes_config_toml() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("protection-policy-persist");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
         save_config(&config.lock().unwrap()).unwrap();
         let persister = ConfigProtectionPolicyPersister {
@@ -13662,7 +13473,7 @@ local_key = "alx-test"
         };
         alex_proxy::ProtectionPolicyPersister::persist(&persister, &policy).unwrap();
         let (saved, fresh) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert!(!fresh);
         assert!(saved.protection.enabled);
         assert_eq!(saved.protection.retries, 2);
@@ -13676,7 +13487,7 @@ local_key = "alx-test"
     fn notification_config_persister_writes_channels_and_old_toml_without_token_parses() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("notification-config-persist");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let config = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
         save_config(&config.lock().unwrap()).unwrap();
         let persister = ConfigNotificationPersister {
@@ -13710,7 +13521,7 @@ local_key = "alx-test"
         assert!(!raw.contains("token"));
         let parsed: Config = toml::from_str(&raw).unwrap();
         assert!(parsed.notifications[0].token.is_none());
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
     }
 
     fn telegram_channel(id: &str, token: &str) -> alex_proxy::notify::NotificationSettings {
@@ -13734,7 +13545,7 @@ local_key = "alx-test"
     fn setting_update_channel_preserves_telegram_token() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("channel-vs-notification");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         // Make the beta status probe fail fast (dead local port) so the
         // controller's cosmetic update check never touches the real network.
         std::env::set_var("ALEX_UPDATE_RELEASES_URL", "http://127.0.0.1:1/none");
@@ -13770,7 +13581,7 @@ local_key = "alx-test"
         // 3) Reload config.toml from disk: BOTH sections must be present.
         let (reloaded, _) = load_or_create_config().unwrap();
         std::env::remove_var("ALEX_UPDATE_RELEASES_URL");
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(reloaded.update_channel, "beta");
         assert_eq!(
             reloaded.notifications.len(),
@@ -13792,7 +13603,7 @@ local_key = "alx-test"
     fn writer_with_separate_config_handle_does_not_drop_notifications() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("separate-handles");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
 
         // Two independent handles — exactly the divergence that caused the bug.
@@ -13821,7 +13632,7 @@ local_key = "alx-test"
         .unwrap();
 
         let (reloaded, _) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(reloaded.exo_url, "http://exo.local");
         assert_eq!(
             reloaded.notifications.len(),
@@ -13842,7 +13653,7 @@ local_key = "alx-test"
     fn openrouter_exposed_survives_unrelated_config_write() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("openrouter-exposed-persist");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
 
         // Persist a curated exposure list.
@@ -13872,7 +13683,7 @@ local_key = "alx-test"
         .unwrap();
 
         let (reloaded, _) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(
             reloaded.openrouter_exposed_models,
             vec![
@@ -13935,7 +13746,7 @@ local_key = "alx-test"
     fn restart_reloads_persisted_notifications_into_dispatcher() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("restart-reload-notifications");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
 
         // Persist a channel to disk (as a prior session would have).
         let shared = Arc::new(std::sync::Mutex::new(test_config(home.clone())));
@@ -13952,7 +13763,7 @@ local_key = "alx-test"
         // Simulate a restart: load config fresh and feed it to a new dispatcher
         // exactly as the daemon startup does.
         let (reloaded, _) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         let state = test_state("restart-reload-notifications-state");
         alex_proxy::set_notifications(&state, reloaded.notification_settings());
 
@@ -13970,7 +13781,7 @@ local_key = "alx-test"
     fn save_load_preserves_harness_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("config-home");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "pi".into(),
@@ -13981,7 +13792,7 @@ local_key = "alx-test"
         );
         save_config(&config).unwrap();
         let (loaded, fresh) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert!(!fresh);
         let override_ = loaded.harness_overrides.get("pi").unwrap();
         assert_eq!(
@@ -14000,7 +13811,7 @@ local_key = "alx-test"
         let home = tmpdir("fresh-daemon-config");
         let config_path = home.join("config.toml");
         assert!(!config_path.exists());
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
 
         let (created, fresh) = load_or_create_config().unwrap();
         assert!(fresh);
@@ -14020,7 +13831,7 @@ local_key = "alx-test"
         }
 
         let (reused, fresh) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert!(!fresh);
         assert_eq!(reused.local_key, created.local_key);
     }
@@ -14029,7 +13840,7 @@ local_key = "alx-test"
     fn daemon_host_setting_persists_wildcard_and_rejects_non_ip_values() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("config-host");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         save_config(&config).unwrap();
 
@@ -14044,14 +13855,14 @@ local_key = "alx-test"
             .unwrap_err()
             .to_string()
             .contains("IPv4 or IPv6"));
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn harness_router_lists_and_rejects_unsupported_connect() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("router-list");
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
         let app = harness_admin_router(test_state("router-list-state"));
 
@@ -14079,7 +13890,7 @@ local_key = "alx-test"
 
         let (status, body) =
             router_json(app, Method::POST, "/admin/harnesses/gemini/connect", None).await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]
             .as_str()
@@ -14111,7 +13922,7 @@ local_key = "alx-test"
         let binary = fake_executable(&bin_dir, "claude", "echo claude 1.0.0");
         let config_dir = home.join("claude-config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         save_config(&test_config(home.clone())).unwrap();
         let app = harness_admin_router(test_state("router-override-state"));
 
@@ -14141,7 +13952,7 @@ local_key = "alx-test"
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["override"]["binary"], serde_json::Value::Null);
         let (loaded, _) = load_or_create_config().unwrap();
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert!(!loaded.harness_overrides.contains_key("claude"));
     }
 
@@ -14154,7 +13965,7 @@ local_key = "alx-test"
         let binary = fake_executable(&bin_dir, "pi", "echo pi 0.80.0");
         let config_dir = home.join("pi-agent");
         assert!(!config_dir.exists());
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "pi".into(),
@@ -14184,7 +13995,7 @@ local_key = "alx-test"
         assert!(plan.iter().any(|s| s["detail"]
             .as_str()
             .unwrap_or("")
-            .contains("add provider 'alexandria'")));
+            .contains("add provider 'alex'")));
         assert!(plan
             .iter()
             .any(|s| s["detail"].as_str() == Some("mint harness key")));
@@ -14206,17 +14017,15 @@ local_key = "alx-test"
         assert!(body["base_url"].as_str().is_some());
         assert!(body["added"].as_array().unwrap().len() > 0);
         assert_eq!(body["removed"].as_array().unwrap().len(), 0);
-        let extension_path = config_dir.join("extensions/alexandria-session.ts");
+        let extension_path = config_dir.join("extensions/alex-session.ts");
         assert!(extension_path.exists());
         let extension = std::fs::read_to_string(extension_path).unwrap();
-        assert!(extension.contains("ctx.model.provider !== \"alexandria\""));
+        assert!(extension.contains("ctx.model.provider !== \"alex\""));
         assert!(extension.contains("ctx.sessionManager.getSessionId()"));
         let models: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
-        assert!(models["providers"]["alexandria"].is_object());
-        let generated = models["providers"]["alexandria"]["models"]
-            .as_array()
-            .unwrap();
+        assert!(models["providers"]["alex"].is_object());
+        let generated = models["providers"]["alex"]["models"].as_array().unwrap();
         let written_ids: Vec<&str> = generated.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(written_ids.iter().all(|id| id.starts_with("alex/")));
         assert!(written_ids
@@ -14237,7 +14046,7 @@ local_key = "alx-test"
         assert_eq!(sol["maxTokens"], 128000);
         assert_eq!(sol["thinkingLevelMap"]["minimal"], "low");
         assert_eq!(sol["compat"]["forceAdaptiveThinking"], true);
-        let saved_key = models["providers"]["alexandria"]["apiKey"]
+        let saved_key = models["providers"]["alex"]["apiKey"]
             .as_str()
             .unwrap()
             .to_string();
@@ -14289,9 +14098,7 @@ local_key = "alx-test"
         let refreshed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
         assert_eq!(
-            refreshed["providers"]["alexandria"]["apiKey"]
-                .as_str()
-                .unwrap(),
+            refreshed["providers"]["alex"]["apiKey"].as_str().unwrap(),
             saved_key
         );
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
@@ -14328,7 +14135,7 @@ local_key = "alx-test"
             None,
         )
         .await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]
             .as_str()
@@ -14345,7 +14152,7 @@ local_key = "alx-test"
         let binary = fake_executable(&bin_dir, "kimi", "echo kimi 0.27.0");
         let config_dir = home.join("kimi-code");
         std::fs::create_dir_all(&config_dir).unwrap();
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "kimi".into(),
@@ -14394,7 +14201,7 @@ local_key = "alx-test"
             None,
         )
         .await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::OK);
         assert!(body["key_id"].as_str().unwrap().starts_with("rk-"));
         assert!(body["models_total"].as_u64().unwrap() > 0);
@@ -14410,7 +14217,6 @@ local_key = "alx-test"
         assert!(added.contains(&"alex/kimi/k3"), "added models: {added:?}");
         let written = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
         assert!(written.contains("[providers.alex]"));
-        assert!(!written.contains("[providers.alexandria]"));
         assert!(written.contains("alex/kimi/k3"));
         assert!(state
             .store
@@ -14431,7 +14237,7 @@ local_key = "alx-test"
         std::fs::create_dir_all(&config_dir).unwrap();
         let normal_settings = "{\"theme\":\"dark\"}\n";
         std::fs::write(config_dir.join("settings.json"), normal_settings).unwrap();
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "claude".into(),
@@ -14473,7 +14279,7 @@ local_key = "alx-test"
         assert!(body["path"]
             .as_str()
             .unwrap()
-            .ends_with("alexandria-settings.json"));
+            .ends_with("alex-settings.json"));
         assert!(body["description"]
             .as_str()
             .unwrap()
@@ -14483,7 +14289,7 @@ local_key = "alx-test"
             normal_settings
         );
         let profile: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(config_dir.join("alexandria-settings.json")).unwrap(),
+            &std::fs::read_to_string(config_dir.join("alex-settings.json")).unwrap(),
         )
         .unwrap();
         assert!(profile["model"]
@@ -14494,9 +14300,7 @@ local_key = "alx-test"
             profile["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
             "1"
         );
-        assert!(config_dir
-            .join("alexandria-original-settings.json")
-            .exists());
+        assert!(config_dir.join("alex-original-settings.json").exists());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 1);
 
         let (status, body) = router_json(
@@ -14506,17 +14310,15 @@ local_key = "alx-test"
             None,
         )
         .await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["was_connected"], true);
-        assert!(!config_dir.join("alexandria-settings.json").exists());
+        assert!(!config_dir.join("alex-settings.json").exists());
         assert_eq!(
             std::fs::read_to_string(config_dir.join("settings.json")).unwrap(),
             normal_settings
         );
-        assert!(config_dir
-            .join("alexandria-original-settings.json")
-            .exists());
+        assert!(config_dir.join("alex-original-settings.json").exists());
         assert_eq!(state.store.list_run_keys(false).unwrap().len(), 0);
     }
 
@@ -14529,7 +14331,7 @@ local_key = "alx-test"
         let binary = fake_executable(&bin_dir, "amp", "echo 0.0.1784018462-g51e7e3");
         let config_dir = home.join("amp-home");
         std::fs::create_dir_all(&config_dir).unwrap();
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "amp".into(),
@@ -14568,11 +14370,8 @@ local_key = "alx-test"
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["key"], "minted");
         assert_eq!(body["models_total"], 0);
-        assert!(body["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("plugins/alexandria.ts"));
-        let plugin_path = config_dir.join("plugins/alexandria.ts");
+        assert!(body["path"].as_str().unwrap().ends_with("plugins/alex.ts"));
+        let plugin_path = config_dir.join("plugins/alex.ts");
         let plugin = std::fs::read_to_string(&plugin_path).unwrap();
         assert!(plugin.contains("Generated by Alex for Amp"));
         assert!(plugin.contains("amp.on('tool.call'"));
@@ -14598,7 +14397,7 @@ local_key = "alx-test"
 
         let (status, body) =
             router_json(app, Method::POST, "/admin/harnesses/amp/disconnect", None).await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["was_connected"], true);
         assert_eq!(body["revoked"], 1);
@@ -14628,7 +14427,7 @@ fi"#,
             "model = \"gpt-5.5\"\nmodel_provider = \"openai\"\n",
         )
         .unwrap();
-        std::env::set_var("ALEXANDRIA_HOME", &home);
+        std::env::set_var("ALEX_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
             "codex".into(),
@@ -14677,16 +14476,16 @@ fi"#,
         assert!(body["path"].as_str().unwrap().ends_with("config.toml"));
         assert!(body["models_total"].as_u64().unwrap() > 2);
         assert!(harness_connect::codex_config_connected(&config_dir).unwrap());
-        assert!(config_dir.join("alexandria-models.json").exists());
-        assert!(config_dir.join("alexandria-openai-models.json").exists());
+        assert!(config_dir.join("alex-models.json").exists());
+        assert!(config_dir.join("alex-openai-models.json").exists());
         assert!(config_dir.join("openai.config.toml").exists());
         assert!(config_dir.join("alex.config.toml").exists());
-        assert!(config_dir.join("alexandria-original-config.toml").exists());
-        assert!(config_dir.join("alexandria-session-hook.sh").exists());
+        assert!(config_dir.join("alex-original-config.toml").exists());
+        assert!(config_dir.join("alex-session-hook.sh").exists());
         let connected = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
         assert!(connected.contains("model = \"alex/gpt-5.5\""));
         let catalog: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(config_dir.join("alexandria-models.json")).unwrap(),
+            &std::fs::read_to_string(config_dir.join("alex-models.json")).unwrap(),
         )
         .unwrap();
         let slugs = catalog["models"]
@@ -14735,16 +14534,16 @@ fi"#,
 
         let (status, body) =
             router_json(app, Method::POST, "/admin/harnesses/codex/disconnect", None).await;
-        std::env::remove_var("ALEXANDRIA_HOME");
+        std::env::remove_var("ALEX_HOME");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["was_connected"], true);
         assert_eq!(body["revoked"], 1);
         let restored = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
         assert!(restored.contains("model_provider = \"openai\""));
-        assert!(!restored.contains("[model_providers.alexandria]"));
+        assert!(!restored.contains("[model_providers.alex]"));
         assert!(!config_dir.join("openai.config.toml").exists());
         assert!(!config_dir.join("alex.config.toml").exists());
-        assert!(config_dir.join("alexandria-original-config.toml").exists());
+        assert!(config_dir.join("alex-original-config.toml").exists());
     }
 
     #[test]
@@ -14757,8 +14556,9 @@ fi"#,
             service_state_label(&ServiceState::LaunchdLoaded { pid: None }),
             "launchd: installed + loaded"
         );
-        assert!(service_state_label(&ServiceState::LaunchdNotLoaded)
-            .contains("alex service install"));
+        assert!(
+            service_state_label(&ServiceState::LaunchdNotLoaded).contains("alex service install")
+        );
         assert!(service_state_label(&ServiceState::LaunchdNotInstalled)
             .contains("alex service install"));
         assert_eq!(

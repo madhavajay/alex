@@ -43,7 +43,7 @@ impl MatchState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvaluationControl {
     /// Suppresses account/model retry and reroute decisions. The proxy should set
-    /// this from its authenticated `x-alexandria-no-substitute` handling.
+    /// this from its authenticated `x-alex-no-substitute` handling.
     pub no_substitute: bool,
 }
 

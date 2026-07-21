@@ -1,6 +1,6 @@
 # Alex architecture
 
-Alex (`alex` and `alexandria` are two names for the same binary) is a local
+Alex (`alex` and `alex` are two names for the same binary) is a local
 credential vault, HTTP model gateway, account router, and trace recorder. It
 accepts several model API dialects, chooses an upstream provider and account,
 injects the upstream credential, translates formats when necessary, and stores
@@ -100,7 +100,7 @@ operator reads those traces through the local-key-gated API.
 
 ## Local state
 
-The state root defaults to `~/.alex`; `ALEXANDRIA_HOME` changes the config
+The state root defaults to `~/.alex`; `ALEX_HOME` changes the config
 root, and a custom `data_dir` can place runtime data elsewhere.
 
 ```text
@@ -109,7 +109,7 @@ root, and a custom `data_dir` can place runtime data elsewhere.
   accounts/                   one JSON file per vault account
     removed-accounts/         non-secret account tombstones
     .routing-policies         persisted account selection/reserve policies
-  alexandria.sqlite3[-wal|-shm]
+  alex.sqlite3[-wal|-shm]
   bodies/YYYY-MM-DD/          live gzipped trace and tool payloads
   lar/legacy-v1.lar           migrated immutable trace-body records
   lar/legacy-v1.import.json   resumable migration checkpoint (while incomplete)

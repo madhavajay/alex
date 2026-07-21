@@ -51,9 +51,8 @@ try {
 
     Expand-Archive -Path $archive -DestinationPath $expanded -Force
     $alexSource = Get-ChildItem -Path $expanded -Filter "alex.exe" -File -Recurse | Select-Object -First 1
-    $legacySource = Get-ChildItem -Path $expanded -Filter "alexandria.exe" -File -Recurse | Select-Object -First 1
-    if ($null -eq $alexSource -or $null -eq $legacySource) {
-        throw "The release archive does not contain both alex.exe and its compatibility executable."
+    if ($null -eq $alexSource) {
+        throw "The release archive does not contain alex.exe."
     }
 
     $existing = Join-Path $InstallDirectory "alex.exe"
@@ -64,7 +63,6 @@ try {
     Write-Step "installing Alex to $InstallDirectory"
     New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
     Copy-Item -LiteralPath $alexSource.FullName -Destination (Join-Path $InstallDirectory "alex.exe") -Force
-    Copy-Item -LiteralPath $legacySource.FullName -Destination (Join-Path $InstallDirectory "alexandria.exe") -Force
 
     if (-not $NoPath) {
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")

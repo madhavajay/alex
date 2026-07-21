@@ -66,7 +66,7 @@ pub const CLIPROXYAPI_REVERSE_CAPABILITIES: &[&str] = &[
     "structured-errors",
     "trace-correlation",
 ];
-const ALEX_ROUTE_CHAIN_HEADER: &str = "x-alexandria-route-chain";
+const ALEX_ROUTE_CHAIN_HEADER: &str = "x-alex-route-chain";
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -128,7 +128,7 @@ pub trait ExoConfigPersister: Send + Sync {
     fn persist(&self, config: &ExoConfig) -> std::result::Result<(), String>;
 }
 
-/// The curated OpenRouter models Alexandria advertises. OpenRouter's full
+/// The curated OpenRouter models Alex advertises. OpenRouter's full
 /// catalog is hundreds of models; publishing all of them makes every connected
 /// harness's picker unusable, so exposure is user-curated. Absent config means a
 /// fresh install and defaults to a short list of examples (see
@@ -1274,8 +1274,8 @@ fn cliproxyapi_loop_model(id: &str) -> bool {
     [
         "alex/",
         "alex:",
-        "alexandria/",
-        "alexandria:",
+        "alex/",
+        "alex:",
         "cove/",
         "claude-alex/",
         "cliproxyapi/",
@@ -1466,7 +1466,7 @@ pub fn sort_model_ids(ids: &mut [String]) {
 }
 
 /// Model identifiers exposed by enabled Exo models, including the explicit
-/// provider prefix and Alexandria's convenient local alias.
+/// provider prefix and Alex's convenient local alias.
 pub fn exo_catalog_models(state: &AppState) -> Vec<String> {
     state
         .exo
@@ -1481,7 +1481,7 @@ pub fn exo_catalog_models(state: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Kimi Code models Alexandria routes to `https://api.kimi.com/coding/v1`.
+/// Kimi Code models Alex routes to `https://api.kimi.com/coding/v1`.
 /// Advertised in `/v1/models` only when a Kimi account is present, so a harness
 /// pointed at Alex can select `kimi/k3` etc. from its model picker.
 pub const KIMI_CATALOG_MODELS: &[&str] = &[
@@ -1544,7 +1544,7 @@ fn kimi_reset_epoch_s(raw: &Value) -> Option<i64> {
 }
 
 /// Convert one Kimi usage row (`{limit, used, remaining, name|title, reset_at}`)
-/// into an Alexandria rate-window entry. Mirrors the kimi CLI's `toUsageRow`.
+/// into an Alex rate-window entry. Mirrors the kimi CLI's `toUsageRow`.
 ///
 /// The window's display name is emitted under the shared `window` key (not
 /// `label`) so the menu's `LimitWindow` decodes it and draws a progress bar,
@@ -2083,7 +2083,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/connect", get(connect_info))
         .route("/v1/models", get(models))
-        .route("/v1/alex/capabilities", get(cliproxyapi_reverse_capabilities))
+        .route(
+            "/v1/alex/capabilities",
+            get(cliproxyapi_reverse_capabilities),
+        )
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/responses", post(openai_responses))
@@ -3491,7 +3494,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "in_flight_requests": in_flight_requests(&state),
         "uptime_s": (now_ms() - state.started_ms) / 1000,
         "dario": state.dario.as_ref().and_then(|dario| dario.active()).is_some(),
-        "launchd_socket_activation": std::env::var_os("ALEXANDRIA_LAUNCHD_SOCKET_ACTIVATION")
+        "launchd_socket_activation": std::env::var_os("ALEX_LAUNCHD_SOCKET_ACTIVATION")
             .as_deref() == Some(std::ffi::OsStr::new("1")),
     }))
 }
@@ -3840,7 +3843,7 @@ async fn admin_openrouter_exposed_update(
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // Dynamic provider catalogs refresh only on an explicit model-list
-    // request; Alexandria has no catalog refresh worker.
+    // request; Alex has no catalog refresh worker.
     refresh_openrouter_models(&state).await;
     refresh_cliproxyapi_models(&state).await;
     let mut ids = state.store.pricing_models();
@@ -3857,7 +3860,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
     // and de-duplicating so both blocks share one order.
     sort_model_ids(&mut ids);
     let claude_gateway = headers
-        .get_all("x-alexandria-harness")
+        .get_all("x-alex-harness")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| {
@@ -3901,7 +3904,7 @@ async fn cliproxyapi_reverse_capabilities() -> impl IntoResponse {
                 "minimum_cliproxyapi_major": CLIPROXYAPI_MINIMUM_MAJOR,
                 "protocols": ["openai-chat", "openai-responses", "anthropic-messages"],
                 "capabilities": CLIPROXYAPI_REVERSE_CAPABILITIES,
-                "correlation_response_header": "x-alexandria-trace-id",
+                "correlation_response_header": "x-alex-trace-id",
                 "route_chain_header": ALEX_ROUTE_CHAIN_HEADER,
             }
         }
@@ -4256,7 +4259,7 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 .header("authorization", format!("Bearer {token}"))
                 .header("accept", "application/json")
                 .header("content-type", "application/json")
-                .header("user-agent", "alexandria-amp-usage")
+                .header("user-agent", "alex-amp-usage")
                 .json(&body)
                 .timeout(Duration::from_secs(15))
                 .send()
@@ -5488,14 +5491,18 @@ async fn traces_summaries(
     let limit = match q.get("limit") {
         Some(raw) => match raw.parse::<usize>() {
             Ok(limit) if limit > 0 => limit.min(WEB_TRACE_PAGE_MAX),
-            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+            _ => {
+                return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer")
+            }
         },
         None => WEB_TRACE_PAGE_DEFAULT,
     };
     let before_ms = match q.get("before_ms") {
         Some(raw) => match raw.parse::<i64>() {
             Ok(value) => Some(value),
-            Err(_) => return error_response(StatusCode::BAD_REQUEST, "before_ms must be an integer"),
+            Err(_) => {
+                return error_response(StatusCode::BAD_REQUEST, "before_ms must be an integer")
+            }
         },
         None => None,
     };
@@ -5503,7 +5510,10 @@ async fn traces_summaries(
     if before_id.is_some() && before_ms.is_none() {
         return error_response(StatusCode::BAD_REQUEST, "before_id requires before_ms");
     }
-    if before_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 200) {
+    if before_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > 200)
+    {
         return error_response(StatusCode::BAD_REQUEST, "before_id is invalid");
     }
 
@@ -5772,7 +5782,7 @@ fn json_arguments(value: &Value) -> Option<String> {
 
 /// Reconstruct display-only assistant blocks from a stored raw SSE body. A
 /// single JSON response is accepted too because OpenAI-compatible passthroughs
-/// can store either shape without Alexandria's normalized metadata.
+/// can store either shape without Alex's normalized metadata.
 fn reassemble_sse_assistant_blocks(body: &str) -> Vec<Value> {
     let mut payloads = sse_json_payloads(body);
     if payloads.is_empty() {
@@ -5938,7 +5948,7 @@ fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
     };
     let mut tool_calls = 0usize;
     let blocks: Vec<Value> = response
-        .pointer("/_alexandria/assistant_blocks")
+        .pointer("/_alex/assistant_blocks")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -6387,14 +6397,18 @@ async fn traces_session_transcript_page(
     let limit = match query.get("limit") {
         Some(raw) => match raw.parse::<usize>() {
             Ok(limit) if limit > 0 => limit.min(TRANSCRIPT_PAGE_MAX),
-            _ => return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+            _ => {
+                return error_response(StatusCode::BAD_REQUEST, "limit must be a positive integer")
+            }
         },
         None => TRANSCRIPT_PAGE_DEFAULT,
     };
     let after_ms = match query.get("after_ms") {
         Some(raw) => match raw.parse::<i64>() {
             Ok(value) => Some(value),
-            Err(_) => return error_response(StatusCode::BAD_REQUEST, "after_ms must be an integer"),
+            Err(_) => {
+                return error_response(StatusCode::BAD_REQUEST, "after_ms must be an integer")
+            }
         },
         None => None,
     };
@@ -6471,7 +6485,10 @@ async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let tools = match state.store.trace_tool_calls(&id) {
-        Ok(tools) => tools.into_iter().map(expanded_turn_tool).collect::<Vec<_>>(),
+        Ok(tools) => tools
+            .into_iter()
+            .map(expanded_turn_tool)
+            .collect::<Vec<_>>(),
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let mut turn = transcript_turn(&state.store, &row);
@@ -6595,7 +6612,7 @@ async fn trace_body(
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", content_type)
-                        .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
+                        .header("x-alex-body-path", path.as_deref().unwrap_or(""))
                         .body(Body::from(text))
                         .unwrap_or_else(|e| {
                             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
@@ -6630,7 +6647,7 @@ async fn trace_body(
                 .status(StatusCode::OK)
                 .header("content-type", ct)
                 .header("x-alex-body-source", stored.source.as_str())
-                .header("x-alexandria-body-path", stored.locator)
+                .header("x-alex-body-path", stored.locator)
                 .body(Body::from(text))
                 .unwrap_or_else(|e| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
@@ -7921,7 +7938,7 @@ pub async fn ping_provider(
         "x-api-key",
         HeaderValue::from_str(&state.local_key.read().unwrap()).expect("key header"),
     );
-    headers.insert("user-agent", HeaderValue::from_static("alexandria-ping"));
+    headers.insert("user-agent", HeaderValue::from_static("alex-ping"));
     let resp = proxy(
         state.clone(),
         format,
@@ -8471,7 +8488,7 @@ fn is_genuine_claude_code_request(format: ClientFormat, headers: &HeaderMap, bod
         return false;
     }
 
-    for harness in headers.get_all("x-alexandria-harness").iter() {
+    for harness in headers.get_all("x-alex-harness").iter() {
         let Ok(harness) = harness.to_str() else {
             return false;
         };
@@ -9494,7 +9511,7 @@ mod trace_api_tests {
             trace_harness(&headers).as_deref(),
             Some("Anthropic/JS 0.91.1")
         );
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("pi"));
         assert_eq!(trace_harness(&headers).as_deref(), Some("pi"));
     }
 
@@ -9831,7 +9848,7 @@ mod trace_api_tests {
     #[test]
     fn transcript_assistant_blocks_preserve_text_tool_text_order() {
         let response = json!({
-            "_alexandria": {"assistant_blocks": [
+            "_alex": {"assistant_blocks": [
                 {"type": "text", "text": "Listing the workspace."},
                 {"type": "tool_call", "id": "call-1", "name": "Shell", "arguments": "{\"command\":\"ls\"}"},
                 {"type": "text", "text": "Here are the files."},
@@ -10419,7 +10436,7 @@ async fn admin_run_keys_create(
         Ok(()) => {
             let exports = if kind == "wrap" {
                 format!(
-                    "export ALEXANDRIA_TRACE_URL={}\nexport ALEXANDRIA_TRACE_KEY={}\n",
+                    "export ALEX_TRACE_URL={}\nexport ALEX_TRACE_KEY={}\n",
                     state.base_url.trim_end_matches('/'),
                     key
                 )
@@ -11186,7 +11203,7 @@ fn session_from_metadata(body_json: &Value) -> Option<String> {
 
 fn trace_harness(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("x-alexandria-harness")
+        .get("x-alex-harness")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -11200,21 +11217,21 @@ fn trace_harness(headers: &HeaderMap) -> Option<String> {
 }
 
 const METADATA_HEADERS: &[(&str, &str)] = &[
-    ("x-alexandria-harness", "harness"),
-    ("x-alexandria-harness-version", "harness_version"),
-    ("x-alexandria-task", "task"),
-    ("x-alexandria-model", "model"),
-    ("x-alexandria-job", "job"),
-    ("x-alexandria-phase", "phase"),
-    ("x-alexandria-kind", "kind"),
-    ("x-alexandria-integration-schema", "integration_schema"),
-    ("x-alexandria-capabilities", "capabilities"),
+    ("x-alex-harness", "harness"),
+    ("x-alex-harness-version", "harness_version"),
+    ("x-alex-task", "task"),
+    ("x-alex-model", "model"),
+    ("x-alex-job", "job"),
+    ("x-alex-phase", "phase"),
+    ("x-alex-kind", "kind"),
+    ("x-alex-integration-schema", "integration_schema"),
+    ("x-alex-capabilities", "capabilities"),
     (ALEX_ROUTE_CHAIN_HEADER, "route_chain"),
 ];
 
 fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
     let values: Vec<&str> = headers
-        .get_all("x-alexandria-trace-tag")
+        .get_all("x-alex-trace-tag")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .collect();
@@ -11249,7 +11266,7 @@ fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
 
 fn no_substitute(headers: &HeaderMap) -> bool {
     headers
-        .get("x-alexandria-no-substitute")
+        .get("x-alex-no-substitute")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim() == "1")
 }
@@ -11285,14 +11302,14 @@ fn validate_cliproxyapi_reverse_contract(
     format: ClientFormat,
 ) -> std::result::Result<(), String> {
     let cliproxyapi = headers
-        .get("x-alexandria-harness")
+        .get("x-alex-harness")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("cliproxyapi"));
     if !cliproxyapi {
         return Ok(());
     }
     let Some(schema) = headers
-        .get("x-alexandria-integration-schema")
+        .get("x-alex-integration-schema")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -11313,7 +11330,7 @@ fn validate_cliproxyapi_reverse_contract(
         ClientFormat::GeminiGenerate => "gemini",
     };
     let declared = headers
-        .get_all("x-alexandria-capabilities")
+        .get_all("x-alex-capabilities")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
@@ -11470,7 +11487,7 @@ fn alex_error_trace_response(
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .header("x-alexandria-trace-id", trace_id)
+        .header("x-alex-trace-id", trace_id)
         .body(Body::from(response_body))
         .unwrap_or_else(|error| {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
@@ -11646,7 +11663,7 @@ fn middleware_attempt_context(
         harness: alex_middleware::HarnessView {
             name: trace.harness.clone(),
             version: headers
-                .get("x-alexandria-harness-version")
+                .get("x-alex-harness-version")
                 .and_then(|value| value.to_str().ok())
                 .map(String::from),
         },
@@ -12080,7 +12097,7 @@ async fn proxy(
         harness: trace_harness(&headers),
         req_headers_json: Some(redacted_headers(&headers)),
         run_id: headers
-            .get("x-alexandria-run-id")
+            .get("x-alex-run-id")
             .and_then(|v| v.to_str().ok())
             .map(String::from)
             .or_else(|| run_key.as_ref().and_then(|k| k.run_id.clone())),
@@ -12222,7 +12239,9 @@ async fn proxy(
     }
     let substitution_disabled = no_substitute(&headers);
     let requested_route = route_model(&requested_model);
-    let requested_provider = requested_route.0.unwrap_or_else(|| format.default_provider());
+    let requested_provider = requested_route
+        .0
+        .unwrap_or_else(|| format.default_provider());
     let route_lease_resolution = if substitution_disabled {
         MiddlewareLeaseResolution::default()
     } else {
@@ -12246,7 +12265,7 @@ async fn proxy(
         .unwrap_or(requested_route);
     // `alex/<model>` is the local alias published for an enabled Exo model.
     // An explicit `exo/<model>` must also be enabled; this prevents an
-    // arbitrary caller from using Alexandria as an unintended LAN proxy.
+    // arbitrary caller from using Alex as an unintended LAN proxy.
     let provider = match routed_provider {
         Some(Provider::Exo) if !exo_model_enabled(&state, &routed_model) => {
             trace.requested_model = Some(requested_model);
@@ -12311,7 +12330,7 @@ async fn proxy(
             None,
             Some(mode),
         )))
-    } else if let Some(value) = headers.get("x-alexandria-simulate-error") {
+    } else if let Some(value) = headers.get("x-alex-simulate-error") {
         value.to_str().ok().map(|value| {
             parse_simulated_error(value).map(|(status, kind)| (status, kind, None, None, None))
         })
@@ -12330,13 +12349,13 @@ async fn proxy(
     };
     let mut injected_attempt: Option<(u16, Vec<u8>)> = None;
     if let Some(simulation) = simulation {
-        if headers.get("x-alexandria-simulate-error").is_some()
+        if headers.get("x-alex-simulate-error").is_some()
             && !local_key_request
             && run_key.as_ref().map_or(true, |key| key.kind != "harness")
         {
             return error_response(
                 StatusCode::FORBIDDEN,
-                "x-alexandria-simulate-error requires a local or harness run key",
+                "x-alex-simulate-error requires a local or harness run key",
             );
         }
         let (status, kind, injected_body, fixture_name, pause_mode) = match simulation {
@@ -12513,8 +12532,7 @@ async fn proxy(
                                     target,
                                     current_provider,
                                     &current_model,
-                                )
-                            {
+                                ) {
                                 let selected = state
                                     .vault
                                     .account_for_excluding(
@@ -12627,10 +12645,10 @@ async fn proxy(
             let mut response = Response::builder()
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
                 .header("content-type", "application/json")
-                .header("x-alexandria-trace-id", &trace_id);
+                .header("x-alex-trace-id", &trace_id);
             if let Some(mode) = pause_mode {
                 response = response.header(
-                    "x-alexandria-paused",
+                    "x-alex-paused",
                     format!("{}:{}", provider.as_str(), mode.as_str()),
                 );
             }
@@ -12781,7 +12799,7 @@ async fn proxy(
                     up_headers.insert(ALEX_ROUTE_CHAIN_HEADER, value);
                 }
                 if let Ok(value) = HeaderValue::from_str(&trace_id) {
-                    up_headers.insert("x-alexandria-parent-trace-id", value);
+                    up_headers.insert("x-alex-parent-trace-id", value);
                 }
             }
             for (k, v) in &plan.extra_headers {
@@ -12797,7 +12815,7 @@ async fn proxy(
                     axum::http::Response::builder()
                         .status(status)
                         .header("content-type", "application/json")
-                        .header("x-alexandria-injected", "true")
+                        .header("x-alex-injected", "true")
                         .body(body)
                         .map(reqwest::Response::from)
                         .map_err(|error| format!("could not construct injected response: {error}"))
@@ -13272,7 +13290,7 @@ async fn proxy(
             return Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
-                .header("x-alexandria-trace-id", &trace_id)
+                .header("x-alex-trace-id", &trace_id)
                 .body(Body::from(buf))
                 .unwrap_or_else(|e| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
@@ -13408,7 +13426,7 @@ async fn proxy(
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", out_ct)
-            .header("x-alexandria-trace-id", &trace_id)
+            .header("x-alex-trace-id", &trace_id)
             .body(Body::from(out_body))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
@@ -13448,10 +13466,8 @@ async fn proxy(
                     trace.error_class = Some(ErrorClass::Server.as_str().into());
                     (
                         StatusCode::BAD_GATEWAY,
-                        serde_json::to_vec(
-                            &json!({"error": {"type": "alex", "message": msg}}),
-                        )
-                        .unwrap_or_default(),
+                        serde_json::to_vec(&json!({"error": {"type": "alex", "message": msg}}))
+                            .unwrap_or_default(),
                     )
                 }
             }
@@ -13478,7 +13494,7 @@ async fn proxy(
         return Response::builder()
             .status(out_status)
             .header("content-type", "application/json")
-            .header("x-alexandria-trace-id", &trace_id)
+            .header("x-alex-trace-id", &trace_id)
             .body(Body::from(out_body))
             .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
     }
@@ -13603,7 +13619,7 @@ async fn proxy(
         }
         response = response.header(k, v);
     }
-    response = response.header("x-alexandria-trace-id", &trace_id);
+    response = response.header("x-alex-trace-id", &trace_id);
     response
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
@@ -14086,9 +14102,9 @@ fn parse_simulated_error(value: &str) -> Result<(u16, String), String> {
     let (status, kind) = value.trim().split_once(':').unwrap_or((value.trim(), ""));
     let status: u16 = status
         .parse()
-        .map_err(|_| "x-alexandria-simulate-error must be STATUS or STATUS:kind".to_string())?;
+        .map_err(|_| "x-alex-simulate-error must be STATUS or STATUS:kind".to_string())?;
     if !(400..600).contains(&status) {
-        return Err("x-alexandria-simulate-error status must be 400-599".into());
+        return Err("x-alex-simulate-error status must be 400-599".into());
     }
     let kind = if kind.trim().is_empty() {
         format!("http_status_{status}")
@@ -15988,7 +16004,10 @@ mod tests {
         let contract = fable_acceptance_contract();
         let cases = contract["cases"].as_array().unwrap();
         assert_eq!(contract["schema_version"], 1);
-        assert_eq!(contract["preset_id"], alex_middleware::FABLE_TO_SOL_EXAMPLE_ID);
+        assert_eq!(
+            contract["preset_id"],
+            alex_middleware::FABLE_TO_SOL_EXAMPLE_ID
+        );
         assert_eq!(cases.len(), 4);
         assert_eq!(
             cases
@@ -16146,7 +16165,7 @@ mod tests {
             {"id": "openai/gpt-5"},
             {"id": "cliproxyapi/gpt-loop"},
             {"id": "alex/claude-loop"},
-            {"id": "alexandria:gpt-loop"},
+            {"id": "alex:gpt-loop"},
             {"id": "../escape"},
             {"id": "gpt-4o"}
         ]}));
@@ -16155,14 +16174,15 @@ mod tests {
 
     #[tokio::test]
     async fn cliproxyapi_reverse_capability_contract_is_versioned() {
-        let (_, body) = response_json(cliproxyapi_reverse_capabilities().await.into_response()).await;
+        let (_, body) =
+            response_json(cliproxyapi_reverse_capabilities().await.into_response()).await;
         let reverse = &body["integrations"]["cliproxyapi_reverse"];
         assert_eq!(reverse["schema"], CLIPROXYAPI_REVERSE_SCHEMA);
         assert_eq!(
             reverse["minimum_cliproxyapi_major"],
             CLIPROXYAPI_MINIMUM_MAJOR
         );
-        assert_eq!(reverse["correlation_response_header"], "x-alexandria-trace-id");
+        assert_eq!(reverse["correlation_response_header"], "x-alex-trace-id");
         assert!(reverse["capabilities"]
             .as_array()
             .unwrap()
@@ -16173,26 +16193,22 @@ mod tests {
     #[test]
     fn cliproxyapi_reverse_runtime_negotiates_schema_and_protocol() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_static("cliproxyapi"),
-        );
+        headers.insert("x-alex-harness", HeaderValue::from_static("cliproxyapi"));
         assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_ok());
         headers.insert(
-            "x-alexandria-integration-schema",
+            "x-alex-integration-schema",
             HeaderValue::from_static(CLIPROXYAPI_REVERSE_SCHEMA),
         );
         headers.insert(
-            "x-alexandria-capabilities",
+            "x-alex-capabilities",
             HeaderValue::from_static("openai-chat,streaming"),
         );
         assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_ok());
         assert!(
-            validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiResponses)
-                .is_err()
+            validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiResponses).is_err()
         );
         headers.insert(
-            "x-alexandria-integration-schema",
+            "x-alex-integration-schema",
             HeaderValue::from_static("alex.cliproxyapi.reverse/v2"),
         );
         assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_err());
@@ -16252,7 +16268,8 @@ mod tests {
             cliproxyapi_catalog_models(&state).await,
             vec!["cliproxyapi/gpt-4o", "cliproxyapi/openai/gpt-5"]
         );
-        let (status, public_view) = response_json(admin_cliproxyapi(State(state.clone())).await).await;
+        let (status, public_view) =
+            response_json(admin_cliproxyapi(State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(public_view["connected"], true);
         assert!(!public_view.to_string().contains("probe-secret"));
@@ -16271,7 +16288,7 @@ mod tests {
                     let captured = chat_capture.clone();
                     async move {
                         assert_eq!(headers[ALEX_ROUTE_CHAIN_HEADER], "alex");
-                        assert!(!headers["x-alexandria-parent-trace-id"].is_empty());
+                        assert!(!headers["x-alex-parent-trace-id"].is_empty());
                         captured.lock().unwrap().push((
                             "chat".into(),
                             headers["authorization"].to_str().unwrap().into(),
@@ -16291,7 +16308,7 @@ mod tests {
                     let captured = responses_capture.clone();
                     async move {
                         assert_eq!(headers[ALEX_ROUTE_CHAIN_HEADER], "alex");
-                        assert!(!headers["x-alexandria-parent-trace-id"].is_empty());
+                        assert!(!headers["x-alex-parent-trace-id"].is_empty());
                         captured.lock().unwrap().push((
                             "responses".into(),
                             headers["authorization"].to_str().unwrap().into(),
@@ -16333,7 +16350,7 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
-            let trace_id = response.headers()["x-alexandria-trace-id"]
+            let trace_id = response.headers()["x-alex-trace-id"]
                 .to_str()
                 .unwrap()
                 .to_string();
@@ -16473,23 +16490,16 @@ mod tests {
         server.abort();
     }
 
-    async fn reverse_hop_forward(
-        alex_base: String,
-        path: &'static str,
-        body: Bytes,
-    ) -> Response {
+    async fn reverse_hop_forward(alex_base: String, path: &'static str, body: Bytes) -> Response {
         let response = reqwest::Client::new()
             .post(format!("{alex_base}{path}"))
             .bearer_auth("reverse-harness-key")
             .header("content-type", "application/json")
-            .header("x-alexandria-harness", "cliproxyapi")
-            .header("x-alexandria-harness-version", "v7-test")
+            .header("x-alex-harness", "cliproxyapi")
+            .header("x-alex-harness-version", "v7-test")
+            .header("x-alex-integration-schema", CLIPROXYAPI_REVERSE_SCHEMA)
             .header(
-                "x-alexandria-integration-schema",
-                CLIPROXYAPI_REVERSE_SCHEMA,
-            )
-            .header(
-                "x-alexandria-capabilities",
+                "x-alex-capabilities",
                 CLIPROXYAPI_REVERSE_CAPABILITIES.join(","),
             )
             .header(ALEX_ROUTE_CHAIN_HEADER, "cliproxyapi")
@@ -16510,8 +16520,8 @@ mod tests {
             }
         }
         if status.is_success() {
-            if let Some(value) = headers.get("x-alexandria-trace-id") {
-                builder = builder.header("x-alexandria-trace-id", value);
+            if let Some(value) = headers.get("x-alex-trace-id") {
+                builder = builder.header("x-alex-trace-id", value);
             }
         }
         builder.body(Body::from(bytes)).unwrap()
@@ -16525,9 +16535,7 @@ mod tests {
         std::net::SocketAddr,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream_listener.local_addr().unwrap();
         let upstream_server =
             tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
@@ -16558,9 +16566,7 @@ mod tests {
             )
             .unwrap();
 
-        let alex_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let alex_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let alex_address = alex_listener.local_addr().unwrap();
         let alex_router = router(state.clone());
         let alex_server = tokio::spawn(async move {
@@ -16595,9 +16601,7 @@ mod tests {
                     reverse_hop_forward(messages_base.clone(), "/v1/messages", body)
                 }),
             );
-        let reverse_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let reverse_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let reverse_address = reverse_listener.local_addr().unwrap();
         let reverse_server =
             tokio::spawn(async move { axum::serve(reverse_listener, reverse_hop).await.unwrap() });
@@ -16669,9 +16673,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            assert!(response.headers().contains_key("x-alexandria-trace-id"));
+            assert!(response.headers().contains_key("x-alex-trace-id"));
             let body: Value = response.json().await.unwrap();
-            assert!(body.pointer(pointer).and_then(Value::as_str).is_some(), "{body}");
+            assert!(
+                body.pointer(pointer).and_then(Value::as_str).is_some(),
+                "{body}"
+            );
         }
         let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
         assert_eq!(traces.len(), 3);
@@ -16751,7 +16758,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!response.headers().contains_key("retry-after"));
-        assert!(!response.headers().contains_key("x-alexandria-trace-id"));
+        assert!(!response.headers().contains_key("x-alex-trace-id"));
         assert_eq!(
             response.json::<Value>().await.unwrap(),
             json!({"error": {"type": "rate_limit_error", "code": "reverse_limit", "message": "try later"}})
@@ -16768,17 +16775,19 @@ mod tests {
             .await
             .unwrap();
         let mut headers = local_proxy_headers();
-        headers.insert(ALEX_ROUTE_CHAIN_HEADER, HeaderValue::from_static("cliproxyapi"));
         headers.insert(
-            "x-alexandria-harness",
+            ALEX_ROUTE_CHAIN_HEADER,
             HeaderValue::from_static("cliproxyapi"),
         );
+        headers.insert("x-alex-harness", HeaderValue::from_static("cliproxyapi"));
         let response = proxy(
             state.clone(),
             ClientFormat::OpenaiChat,
             "/v1/chat/completions",
             headers,
-            Bytes::from_static(br#"{"model":"cliproxyapi/gpt-loop","messages":[{"role":"user","content":"hi"}]}"#),
+            Bytes::from_static(
+                br#"{"model":"cliproxyapi/gpt-loop","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
             None,
         )
         .await;
@@ -16988,7 +16997,7 @@ mod tests {
         // The Claude gateway path advertises one flat block (no alex/*
         // duplicates), so the whole list must be alphabetical end to end.
         let mut headers = HeaderMap::new();
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
         let ids = model_ids(models(State(state), headers).await.into_response()).await;
         assert!(!ids.is_empty());
         assert!(
@@ -16998,13 +17007,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_model_catalog_uses_alex_not_alexandria_namespace() {
+    async fn openai_model_catalog_uses_alex_not_alex_namespace() {
         let state = test_state("models-alex-namespace");
         let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
         assert!(ids.iter().any(|id| id.starts_with("alex/")));
         assert!(
-            ids.iter().all(|id| !id.starts_with("alexandria/")),
-            "legacy alexandria/* ids leaked into /v1/models: {ids:?}"
+            ids.iter().all(|id| !id.starts_with("alex/")),
+            "legacy alex/* ids leaked into /v1/models: {ids:?}"
         );
     }
 
@@ -17162,7 +17171,7 @@ mod tests {
     fn smoke_trace_id(response: &reqwest::Response) -> String {
         response
             .headers()
-            .get("x-alexandria-trace-id")
+            .get("x-alex-trace-id")
             .and_then(|value| value.to_str().ok())
             .expect("routed response must expose its trace id")
             .to_string()
@@ -17238,9 +17247,7 @@ mod tests {
                 }
             }),
         );
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_server = tokio::spawn(async move {
             axum::serve(upstream_listener, upstream).await.unwrap();
@@ -17273,15 +17280,12 @@ mod tests {
             state
         };
         let serve = |state: Arc<AppState>| async move {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 axum::serve(
                     listener,
-                    router(state)
-                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
                 )
                 .await
                 .unwrap();
@@ -17362,7 +17366,7 @@ mod tests {
         let routed_response = client
             .post(format!("{base}/v1/chat/completions"))
             .header("x-api-key", "alx-local")
-            .header("x-alexandria-harness", "platform-smoke")
+            .header("x-alex-harness", "platform-smoke")
             .json(&json!({
                 "model": "alex/smoke/model",
                 "stream": false,
@@ -17380,7 +17384,7 @@ mod tests {
         let stream_response = client
             .post(format!("{base}/v1/chat/completions"))
             .header("x-api-key", "alx-local")
-            .header("x-alexandria-harness", "platform-smoke")
+            .header("x-alex-harness", "platform-smoke")
             .json(&json!({
                 "model": "alex/smoke/stream",
                 "stream": true,
@@ -17426,7 +17430,7 @@ mod tests {
         let rerouted_response = client
             .post(format!("{base}/v1/chat/completions"))
             .header("x-api-key", "alx-local")
-            .header("x-alexandria-harness", "platform-smoke")
+            .header("x-alex-harness", "platform-smoke")
             .json(&json!({
                 "model": "openai/smoke/fail",
                 "stream": false,
@@ -17439,17 +17443,17 @@ mod tests {
             .unwrap();
         let reroute_trace_id = smoke_trace_id(&rerouted_response);
         let rerouted: Value = rerouted_response.json().await.unwrap();
-        assert_eq!(
-            rerouted["choices"][0]["message"]["content"],
-            "fallback ok"
-        );
+        assert_eq!(rerouted["choices"][0]["message"]["content"], "fallback ok");
 
         let stream_trace = wait_for_smoke_trace(&client, &base, &stream_trace_id).await;
         assert_eq!(stream_trace["trace"]["streamed"], 1);
         assert_eq!(stream_trace["trace"]["routed_model"], "smoke/stream");
         let reroute_trace = wait_for_smoke_trace(&client, &base, &reroute_trace_id).await;
         assert_eq!(reroute_trace["trace"]["substituted"], true);
-        assert_eq!(reroute_trace["trace"]["original_model"], "openai/smoke/fail");
+        assert_eq!(
+            reroute_trace["trace"]["original_model"],
+            "openai/smoke/fail"
+        );
         assert_eq!(reroute_trace["trace"]["served_model"], "smoke/fallback");
         assert_eq!(reroute_trace["trace"]["upstream_provider"], "exo");
         assert_eq!(
@@ -17475,7 +17479,12 @@ mod tests {
         assert_eq!(attempts[1]["status"], 200);
         assert_eq!(
             *received_models.lock().await,
-            vec!["smoke/model", "smoke/stream", "smoke/fail", "smoke/fallback"]
+            vec![
+                "smoke/model",
+                "smoke/stream",
+                "smoke/fail",
+                "smoke/fallback"
+            ]
         );
 
         let summaries: Value = client
@@ -17550,18 +17559,16 @@ mod tests {
             .await
             .unwrap();
         assert!(recovered_stream.contains("smoke_weather"));
-        let recovered_reroute = wait_for_smoke_trace(
-            &client,
-            &restarted_base,
-            &reroute_trace_id,
-        )
-        .await;
+        let recovered_reroute =
+            wait_for_smoke_trace(&client, &restarted_base, &reroute_trace_id).await;
         assert_eq!(recovered_reroute["trace"]["served_model"], "smoke/fallback");
-        assert!(recovered_reroute["trace"]["attempts"][0]["middleware_decisions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["rule_id"] == middleware_id && record["state"] == "matched"));
+        assert!(
+            recovered_reroute["trace"]["attempts"][0]["middleware_decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["rule_id"] == middleware_id && record["state"] == "matched")
+        );
         let recovered_middleware: Value = client
             .get(format!("{restarted_base}/admin/middleware"))
             .header("x-api-key", "alx-local")
@@ -17670,11 +17677,8 @@ mod tests {
             response_json(trace_metadata(State(state.clone()), Path("c".into())).await).await;
         assert_eq!(metadata_status, StatusCode::OK);
         assert_eq!(metadata["trace"]["req_body_path"], "secret-c.json.gz");
-        let body_response = trace_body(
-            State(state.clone()),
-            Path(("c".into(), "request".into())),
-        )
-        .await;
+        let body_response =
+            trace_body(State(state.clone()), Path(("c".into(), "request".into()))).await;
         assert_eq!(body_response.status(), StatusCode::NOT_FOUND);
 
         let cursor = first["next_cursor"].clone();
@@ -17777,7 +17781,11 @@ mod tests {
             let id = format!("lazy-tool-{index}");
             let arguments_path = state
                 .store
-                .write_body(&id, "args.json", format!(r#"{{"index":{index}}}"#).as_bytes())
+                .write_body(
+                    &id,
+                    "args.json",
+                    format!(r#"{{"index":{index}}}"#).as_bytes(),
+                )
                 .unwrap();
             let result_path = state
                 .store
@@ -17868,15 +17876,19 @@ mod tests {
         assert_eq!(second_page["turns"][0]["trace_id"], "lazy-trace-020");
         assert!(test_body_file_reads_under(&body_root).is_empty());
 
-        let (turn_status, expanded) = response_json(
-            trace_turn(State(state), Path("lazy-trace-000".into())).await,
-        )
-        .await;
+        let (turn_status, expanded) =
+            response_json(trace_turn(State(state), Path("lazy-trace-000".into())).await).await;
         assert_eq!(turn_status, StatusCode::OK);
         assert_eq!(expanded["turn"]["user"], "user 0");
         assert_eq!(expanded["turn"]["assistant"], "assistant 0");
-        assert_eq!(expanded["turn"]["executed_tools"].as_array().unwrap().len(), 1);
-        assert_eq!(expanded["turn"]["executed_tools"][0]["arguments"]["index"], 0);
+        assert_eq!(
+            expanded["turn"]["executed_tools"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            expanded["turn"]["executed_tools"][0]["arguments"]["index"],
+            0
+        );
         assert_eq!(expanded["turn"]["executed_tools"][0]["result"], "result 0");
 
         let mut reads = test_body_file_reads_under(&body_root);
@@ -18487,8 +18499,8 @@ mod tests {
             expires_at_ms: None,
             last_refresh_ms: None,
             account_meta: json!({
-                "http_referer": "https://alexandria.example",
-                "x_title": "Alexandria",
+                "http_referer": "https://alex.example",
+                "x_title": "Alex",
             }),
             cooldown_until_ms: None,
             status: "active".into(),
@@ -18590,7 +18602,7 @@ mod tests {
         ));
 
         let mut explicit_other_harness = headers;
-        explicit_other_harness.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        explicit_other_harness.insert("x-alex-harness", HeaderValue::from_static("pi"));
         assert!(!is_genuine_claude_code_request(
             ClientFormat::AnthropicMessages,
             &explicit_other_harness,
@@ -18598,11 +18610,8 @@ mod tests {
         ));
 
         let (mut conflicting_harness, body) = claude_code_request();
-        conflicting_harness.append(
-            "x-alexandria-harness",
-            HeaderValue::from_static("claude-code"),
-        );
-        conflicting_harness.append("x-alexandria-harness", HeaderValue::from_static("codex"));
+        conflicting_harness.append("x-alex-harness", HeaderValue::from_static("claude-code"));
+        conflicting_harness.append("x-alex-harness", HeaderValue::from_static("codex"));
         assert!(!is_genuine_claude_code_request(
             ClientFormat::AnthropicMessages,
             &conflicting_harness,
@@ -18610,10 +18619,7 @@ mod tests {
         ));
 
         let (mut malformed_harness, body) = claude_code_request();
-        malformed_harness.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_bytes(b"\x80").unwrap(),
-        );
+        malformed_harness.insert("x-alex-harness", HeaderValue::from_bytes(b"\x80").unwrap());
         assert!(!is_genuine_claude_code_request(
             ClientFormat::AnthropicMessages,
             &malformed_harness,
@@ -18649,7 +18655,7 @@ mod tests {
         assert!(direct.extra_headers.is_empty());
 
         let mut harness_headers = HeaderMap::new();
-        harness_headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        harness_headers.insert("x-alex-harness", HeaderValue::from_static("pi"));
         let mut dario_body = request;
         let dario = plan_upstream(
             &state,
@@ -18894,7 +18900,7 @@ mod tests {
         client_headers.insert("content-length", HeaderValue::from_static("999"));
         client_headers.insert("connection", HeaderValue::from_static("close"));
         client_headers.insert("accept-encoding", HeaderValue::from_static("br"));
-        client_headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        client_headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
         client_headers.insert("x-dario-capture-id", HeaderValue::from_static("spoofed"));
 
         let direct = upstream_headers(&anthropic_account(), &client_headers, true).unwrap();
@@ -18907,7 +18913,7 @@ mod tests {
         assert!(direct.get("content-length").is_none());
         assert!(direct.get("connection").is_none());
         assert_eq!(direct["accept-encoding"], "identity");
-        assert!(direct.get("x-alexandria-harness").is_none());
+        assert!(direct.get("x-alex-harness").is_none());
         assert!(direct.get("x-dario-capture-id").is_none());
 
         let non_claude = upstream_headers(&anthropic_account(), &client_headers, false).unwrap();
@@ -18936,8 +18942,8 @@ mod tests {
 
         let headers = upstream_headers(&openrouter_account(), &client_headers, false).unwrap();
         assert_eq!(headers["authorization"], "Bearer openrouter-secret");
-        assert_eq!(headers["http-referer"], "https://alexandria.example");
-        assert_eq!(headers["x-title"], "Alexandria");
+        assert_eq!(headers["http-referer"], "https://alex.example");
+        assert_eq!(headers["x-title"], "Alex");
         assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("user-agent").is_none());
         assert_ne!(headers["authorization"], "Bearer caller-secret");
@@ -19844,7 +19850,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("401:authentication_error"),
         );
         let response = proxy(
@@ -19924,8 +19930,8 @@ mod tests {
             .header("x-api-key", "alx-local")
             .json(&json!({
                 "key": "or-secret",
-                "http_referer": " https://alexandria.example ",
-                "x_title": " Alexandria "
+                "http_referer": " https://alex.example ",
+                "x_title": " Alex "
             }))
             .send()
             .await
@@ -19941,11 +19947,8 @@ mod tests {
             .account_for(Provider::Openrouter, false)
             .await
             .unwrap();
-        assert_eq!(
-            account.account_meta["http_referer"],
-            "https://alexandria.example"
-        );
-        assert_eq!(account.account_meta["x_title"], "Alexandria");
+        assert_eq!(account.account_meta["http_referer"], "https://alex.example");
+        assert_eq!(account.account_meta["x_title"], "Alex");
 
         let named: Value = client
             .post(&endpoint)
@@ -20308,7 +20311,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("codex"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("codex"));
         let body = Bytes::from_static(
             br#"{"model":"alex/gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}"#,
         );
@@ -20322,7 +20325,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response.headers().contains_key("x-alexandria-trace-id"));
+        assert!(response.headers().contains_key("x-alex-trace-id"));
 
         let sessions = state.store.sessions(None, 10).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -20475,7 +20478,7 @@ mod tests {
     async fn claude_gateway_model_catalog_uses_discoverable_alex_aliases() {
         let state = test_state("claude-gateway-models");
         let mut headers = HeaderMap::new();
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
         let (status, body) =
             response_json(models(State(state), headers).await.into_response()).await;
         assert_eq!(status, StatusCode::OK);
@@ -20744,7 +20747,7 @@ mod tests {
         assert!(created["exports"]
             .as_str()
             .unwrap()
-            .contains("ALEXANDRIA_TRACE_KEY"));
+            .contains("ALEX_TRACE_KEY"));
         assert!(!created["exports"]
             .as_str()
             .unwrap()
@@ -20992,7 +20995,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("429:rate_limit_error"),
         );
         let response = proxy(
@@ -21107,10 +21110,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            response.headers()["x-alexandria-paused"],
-            "openai:logged_out"
-        );
+        assert_eq!(response.headers()["x-alex-paused"], "openai:logged_out");
         let (_, body) = response_json(response).await;
         assert_eq!(body["error"]["type"], "provider_paused");
         let event = tokio::time::timeout(Duration::from_secs(2), async {
@@ -21147,7 +21147,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         if no_substitute {
-            headers.insert("x-alexandria-no-substitute", HeaderValue::from_static("1"));
+            headers.insert("x-alex-no-substitute", HeaderValue::from_static("1"));
         }
         proxy(
             state,
@@ -21186,7 +21186,7 @@ mod tests {
             .unwrap();
         let response = paused_down_request(state.clone(), false).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["x-alexandria-paused"], "openai:down");
+        assert_eq!(response.headers()["x-alex-paused"], "openai:down");
         let trace = state
             .store
             .search_traces(&TraceFilter::default())
@@ -21383,7 +21383,7 @@ mod tests {
                 "x-session-id",
                 HeaderValue::from_static("session-fable-sol"),
             );
-            headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+            headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
             proxy(
                 state.clone(),
                 ClientFormat::AnthropicMessages,
@@ -21539,7 +21539,7 @@ mod tests {
             "x-session-id",
             HeaderValue::from_static("session-fable-nonmatch"),
         );
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
         let (status, body) = response_json(
             proxy(
                 state.clone(),
@@ -21615,7 +21615,7 @@ mod tests {
             "x-session-id",
             HeaderValue::from_static("session-fable-no-sol"),
         );
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
         let (status, body) = response_json(
             proxy(
                 state.clone(),
@@ -21788,8 +21788,7 @@ mod tests {
         assert_eq!(enabled_status, StatusCode::OK, "{enabled}");
         assert_eq!(enabled["rule"]["enabled"], true);
 
-        let (live_status, live) =
-            response_json(admin_middleware(State(state.clone())).await).await;
+        let (live_status, live) = response_json(admin_middleware(State(state.clone())).await).await;
         assert_eq!(live_status, StatusCode::OK);
         assert!(live["rules"]
             .as_array()
@@ -21837,8 +21836,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Fable failed with a selected overload or availability error"));
-        let (_, after_dry_run) =
-            response_json(admin_middleware(State(state.clone())).await).await;
+        let (_, after_dry_run) = response_json(admin_middleware(State(state.clone())).await).await;
         assert!(after_dry_run["rules"]
             .as_array()
             .unwrap()
@@ -21879,7 +21877,7 @@ mod tests {
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert("x-session-id", HeaderValue::from_static("session-lab"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("429:rate_limit_error"),
         );
         let response = proxy(
@@ -21928,7 +21926,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("401:authentication_error"),
         );
         let response = proxy(
@@ -21980,7 +21978,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("429:rate_limit_error"),
         );
         let response = proxy(
@@ -22008,11 +22006,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("429:rate_limit_error"),
         );
         if no_substitute {
-            headers.insert("x-alexandria-no-substitute", HeaderValue::from_static("1"));
+            headers.insert("x-alex-no-substitute", HeaderValue::from_static("1"));
         }
         proxy(
             state,
@@ -22168,7 +22166,7 @@ mod tests {
             HeaderValue::from_str(created["key"].as_str().unwrap()).unwrap(),
         );
         headers.insert(
-            "x-alexandria-simulate-error",
+            "x-alex-simulate-error",
             HeaderValue::from_static("429:rate_limit_error"),
         );
         let response = proxy(
@@ -24098,7 +24096,7 @@ mod tests {
         state.vault.upsert(anthropic_account()).await.unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("pi"));
 
         let response = proxy(
             state.clone(),
@@ -24160,7 +24158,7 @@ mod tests {
         state.vault.upsert(anthropic_account()).await.unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
-        headers.insert("x-alexandria-harness", HeaderValue::from_static("pi"));
+        headers.insert("x-alex-harness", HeaderValue::from_static("pi"));
 
         let response = proxy(
             state.clone(),

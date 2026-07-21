@@ -11,7 +11,7 @@ CONTAINER_ROOT="$CONTAINER_HOME/alex-installed-linux"
 CONTAINER_PAYLOAD="/opt/alex-ci"
 CONTAINER_RESULT="$CONTAINER_PAYLOAD/output/installed-smoke.json"
 IMAGE_TAG="alex-linux-systemd-smoke:ubuntu-24.04"
-SERVICE_NAME="alexandria"
+SERVICE_NAME="alex"
 
 fail() {
   echo "Linux systemd container: $*" >&2

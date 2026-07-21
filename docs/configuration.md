@@ -1,11 +1,9 @@
 # Configuration and local state
 
-The main configuration file is `~/.alex/config.toml`. Existing
-`~/.alexandria` state is moved atomically on first launch and retained as a
-compatibility alias. Set
-`ALEXANDRIA_HOME` to move that root. `data_dir` then controls the SQLite,
+The main configuration file is `~/.alex/config.toml`. Set `ALEX_HOME` to move
+that root. `data_dir` then controls the SQLite,
 account, body, Dario, fixture, and wrap state root; on a fresh install it is the
-same directory as `ALEXANDRIA_HOME`.
+same directory as `ALEX_HOME`.
 
 The loader creates the directory and config on first use. On Unix it writes
 `config.toml` mode `0600`. The file contains administrative and notification
@@ -18,7 +16,7 @@ Values that are generated per installation are redacted here:
 ```toml
 host = "127.0.0.1"
 port = 4100
-data_dir = "/home/example/.alexandria"
+data_dir = "/home/example/.alex"
 local_key = "<redacted-alx-key>"
 heartbeat_minutes = 15
 reauth_check_minutes = 5
@@ -222,24 +220,24 @@ launchd, and Dario-child variables are omitted.
 
 | Variable | Used by |
 | --- | --- |
-| `ALEXANDRIA_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
-| `ALEXANDRIA_URL` | Remote `alex connect`/`alex up` base URL. |
-| `ALEXANDRIA_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
-| `ALEXANDRIA_RUN_ID` | Caller-selected wrap run ID. |
-| `ALEXANDRIA_TRACE_URL` | Central daemon for wrapped trace upload. |
-| `ALEXANDRIA_TRACE_KEY` | Inline `kind=wrap` upload key. Prefer a protected file for persistence. |
-| `ALEXANDRIA_TRACE_KEY_FILE` | File containing the wrap upload key. |
-| `ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP` | Truthy value permits non-loopback plaintext trace upload. |
-| `ALEXANDRIA_NODE_BIN` | Dario Node runtime discovery override. Persist `dario_node_path` for services. |
-| `ALEXANDRIA_REAL_CLAUDE_BIN` | Real Claude executable discovery override. Persist `dario_claude_bin` for services. |
-| `ALEXANDRIA_DRAIN_TIMEOUT_SECONDS` | Graceful service-restart drain timeout. |
-| `ALEXANDRIA_GRACEFUL_RESTART` | Set to `0` to opt out of graceful restart behavior. |
+| `ALEX_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
+| `ALEX_URL` | Remote `alex connect`/`alex up` base URL. |
+| `ALEX_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
+| `ALEX_RUN_ID` | Caller-selected wrap run ID. |
+| `ALEX_TRACE_URL` | Central daemon for wrapped trace upload. |
+| `ALEX_TRACE_KEY` | Inline `kind=wrap` upload key. Prefer a protected file for persistence. |
+| `ALEX_TRACE_KEY_FILE` | File containing the wrap upload key. |
+| `ALEX_TRACE_ALLOW_INSECURE_HTTP` | Truthy value permits non-loopback plaintext trace upload. |
+| `ALEX_NODE_BIN` | Dario Node runtime discovery override. Persist `dario_node_path` for services. |
+| `ALEX_REAL_CLAUDE_BIN` | Real Claude executable discovery override. Persist `dario_claude_bin` for services. |
+| `ALEX_DRAIN_TIMEOUT_SECONDS` | Graceful service-restart drain timeout. |
+| `ALEX_GRACEFUL_RESTART` | Set to `0` to opt out of graceful restart behavior. |
 | `GEMINI_API_KEY` | Fallback input for `alex auth gemini-key`. |
 | `OPENROUTER_API_KEY` | Fallback input for `alex auth openrouter-key`. |
 | `AMP_API_KEY` | Fallback input for `alex auth amp-key` and wrap credential resolution. |
 | `GOOGLE_CLOUD_PROJECT` | Gemini Code Assist project override before stored/discovered project. |
 | `KIMI_CODE_HOME` | Native Kimi credential root for import. |
-| `RUST_LOG` | Standard tracing filter; daemon default is `info,alexandria=debug`, other commands default to `warn`. |
+| `RUST_LOG` | Standard tracing filter; daemon default is `info,alex=debug`, other commands default to `warn`. |
 
 `alex credentials` prints the common client variables (`ANTHROPIC_BASE_URL`,
 `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, and matching key-bearing exports)
@@ -251,13 +249,13 @@ instead of hard-coding a bind wildcard as a client URL.
 Paths below are relative to `data_dir` unless stated otherwise:
 
 ```text
-~/.alex/config.toml               main config (always under ALEXANDRIA_HOME)
+~/.alex/config.toml               main config (always under ALEX_HOME)
 <data_dir>/accounts/*.json        active vault accounts, mode 0600 writes
 <data_dir>/accounts/removed-accounts/*.json
 <data_dir>/accounts/.routing-policies
-<data_dir>/alexandria.sqlite3     trace/pricing/key/lineage store
-<data_dir>/alexandria.sqlite3-wal
-<data_dir>/alexandria.sqlite3-shm
+<data_dir>/alex.sqlite3     trace/pricing/key/lineage store
+<data_dir>/alex.sqlite3-wal
+<data_dir>/alex.sqlite3-shm
 <data_dir>/bodies/YYYY-MM-DD/*.gz
 <data_dir>/dario/                 packages, generations, logs, update state
 <data_dir>/dario-prompt-cache/*.json
