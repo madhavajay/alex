@@ -43,6 +43,8 @@ jobs:
             $errors | Format-List | Out-String | Write-Error
             exit 1
           }
+      - name: Platform path and service lifecycle contract
+        run: cargo test -p alex platform_path_and_service_lifecycle_contracts -- --nocapture
       - run: cargo test --workspace
       - run: cargo package -p alex-core
 

@@ -46,6 +46,8 @@ The Middleware view reads `GET /admin/middleware` and `GET /admin/fixtures`. Tog
 
 ## Deterministic smoke foundation
 
-CI runs the cross-platform `deterministic_platform_smoke` test with local TCP listeners and a mock OpenAI-compatible Exo upstream. It checks daemon health, the shared UI, one routed request, bounded trace listing, trace opening, and persistence after the daemon/store is reopened. No provider credential or public network is involved.
+CI runs the cross-platform `deterministic_platform_smoke` test with local TCP listeners and mock OpenAI-compatible OpenAI/Exo routes. It checks daemon health, the shared UI, a basic request, a streamed and reassembled tool call, an OpenAI-to-Exo middleware reroute with recorded decisions/provenance, bounded trace listing, and persistence of traces, streamed bodies, and the rule after the daemon/store is reopened. No provider credential or public network is involved.
+
+The same macOS, Linux, and Windows matrix also runs pure browser-launch and background-daemon lifecycle contracts. These prove URLs, executable paths containing spaces, and daemon arguments stay OS-native and shell-free without installing or mutating a real platform service. Windows remains advisory until its separate service lifecycle and existing Windows-only failures are fixed.
 
 Provider OAuth itself remains a short manual/live smoke because public CI cannot safely hold subscription credentials.

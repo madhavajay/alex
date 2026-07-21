@@ -16093,27 +16093,100 @@ mod tests {
         server.abort();
     }
 
-    /// Cross-platform V1 smoke foundation. It uses only loopback TCP, a mock
-    /// OpenAI-compatible upstream, and a temporary data root, so the exact same
-    /// scenario is safe on macOS, Linux, and Windows CI runners.
+    async fn wait_for_smoke_trace(client: &reqwest::Client, base: &str, trace_id: &str) -> Value {
+        for _ in 0..100 {
+            if let Ok(response) = client
+                .get(format!("{base}/traces/{trace_id}/metadata"))
+                .header("x-api-key", "alx-local")
+                .send()
+                .await
+            {
+                if response.status().is_success() {
+                    return response.json().await.unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("trace {trace_id} was not committed within the smoke-test deadline");
+    }
+
+    fn smoke_trace_id(response: &reqwest::Response) -> String {
+        response
+            .headers()
+            .get("x-alexandria-trace-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("routed response must expose its trace id")
+            .to_string()
+    }
+
+    /// Cross-platform V1 smoke foundation. It uses only loopback TCP, mock
+    /// OpenAI-compatible routes, and a temporary data root, so the exact same
+    /// scenario is safe on macOS, Linux, and Windows CI runners. Alongside the
+    /// basic route it proves streamed tool-call usability, declarative
+    /// middleware rerouting/provenance, and durable recovery after restart.
     #[tokio::test]
     async fn deterministic_platform_smoke_daemon_route_trace_and_restart_recovery() {
         use axum::routing::post;
 
+        let received_models = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let captured_models = received_models.clone();
         let upstream = Router::new().route(
             "/v1/chat/completions",
-            post(|axum::Json(body): axum::Json<Value>| async move {
-                assert_eq!(body["model"], "smoke/model");
-                axum::Json(json!({
-                    "id": "mock-completion",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "mock ok"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                }))
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let captured_models = captured_models.clone();
+                async move {
+                    let model = body["model"].as_str().unwrap_or_default().to_string();
+                    captured_models.lock().await.push(model.clone());
+                    match model.as_str() {
+                        "smoke/stream" => {
+                            assert_eq!(body["stream"], true);
+                            let chunks = [
+                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
+                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
+                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
+                            ];
+                            let mut sse = chunks
+                                .into_iter()
+                                .map(|chunk| format!("data: {chunk}\n\n"))
+                                .collect::<String>();
+                            sse.push_str("data: [DONE]\n\n");
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(Body::from(sse))
+                                .unwrap()
+                        }
+                        "smoke/fail" => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}})),
+                        )
+                            .into_response(),
+                        "smoke/fallback" => axum::Json(json!({
+                            "id": "mock-fallback",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "fallback ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                        }))
+                        .into_response(),
+                        "smoke/model" => axum::Json(json!({
+                            "id": "mock-completion",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "mock ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                        }))
+                        .into_response(),
+                        other => panic!("unexpected smoke model {other}"),
+                    }
+                }
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -16140,9 +16213,14 @@ mod tests {
                 &state,
                 ExoConfig {
                     url: format!("http://{upstream_addr}"),
-                    enabled_models: vec!["smoke/model".into()],
+                    enabled_models: vec![
+                        "smoke/model".into(),
+                        "smoke/stream".into(),
+                        "smoke/fallback".into(),
+                    ],
                 },
             );
+            set_upstream_base_override(&state, Provider::Openai, format!("http://{upstream_addr}"));
             state
         };
         let serve = |state: Arc<AppState>| async move {
@@ -16164,6 +16242,48 @@ mod tests {
 
         let client = reqwest::Client::new();
         let state = build();
+        state
+            .vault
+            .upsert(test_api_account("platform-smoke-openai", Provider::Openai))
+            .await
+            .unwrap();
+        let middleware_id = "smoke.openai-to-exo";
+        state
+            .middleware
+            .write()
+            .unwrap()
+            .create_rule(alex_middleware::RuleSpecV1 {
+                id: middleware_id.into(),
+                name: "Deterministic platform reroute".into(),
+                description: Some("Local smoke rule from OpenAI to Exo.".into()),
+                enabled: true,
+                priority: 1_000,
+                hook: alex_middleware::HookPoint::AttemptResult,
+                capabilities: vec![alex_middleware::Capability::RouteOverride],
+                when: alex_middleware::MatchConditionsV1 {
+                    current_models: vec!["smoke/fail".into()],
+                    providers: vec!["openai".into()],
+                    status: vec![alex_middleware::StatusMatcherSpec::Exact(503)],
+                    ..Default::default()
+                },
+                expression: None,
+                action: alex_middleware::ActionSpecV1 {
+                    reroute: Some(alex_middleware::RerouteActionSpecV1 {
+                        model: Some("smoke/fallback".into()),
+                        equivalent_class: None,
+                        providers: vec!["exo".into()],
+                        provider_mode: alex_middleware::ProviderModeV1::Only,
+                        scope: alex_middleware::RouteScopeKindV1::Request,
+                        ttl_seconds: None,
+                        notice: None,
+                        reason: "deterministic platform reroute".into(),
+                        max_attempts: None,
+                        required_capabilities: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
         let (address, server) = serve(state.clone()).await;
         let base = format!("http://{address}");
 
@@ -16190,7 +16310,7 @@ mod tests {
             .unwrap();
         assert!(ui.contains("ALEX LOCAL CONTROL PLANE"));
 
-        let routed: Value = client
+        let routed_response = client
             .post(format!("{base}/v1/chat/completions"))
             .header("x-api-key", "alx-local")
             .header("x-alexandria-harness", "platform-smoke")
@@ -16203,14 +16323,114 @@ mod tests {
             .await
             .unwrap()
             .error_for_status()
-            .unwrap()
-            .json()
-            .await
             .unwrap();
+        let basic_trace_id = smoke_trace_id(&routed_response);
+        let routed: Value = routed_response.json().await.unwrap();
         assert_eq!(routed["choices"][0]["message"]["content"], "mock ok");
 
+        let stream_response = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("x-api-key", "alx-local")
+            .header("x-alexandria-harness", "platform-smoke")
+            .json(&json!({
+                "model": "alex/smoke/stream",
+                "stream": true,
+                "messages": [{"role": "user", "content": "call the weather tool"}],
+                "tools": [{"type":"function","function":{"name":"smoke_weather","parameters":{"type":"object"}}}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let stream_trace_id = smoke_trace_id(&stream_response);
+        assert_eq!(
+            stream_response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next(),
+            Some("text/event-stream")
+        );
+        let stream_body = stream_response.text().await.unwrap();
+        let stream_final = alex_core::translate::parse_openai_chat_sse_final(&stream_body)
+            .expect("streamed OpenAI chunks must reassemble into a usable completion");
+        assert_eq!(stream_final["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            stream_final["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "smoke_weather"
+        );
+        assert_eq!(
+            stream_final["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Brisbane"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                stream_final["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()["city"],
+            "Brisbane"
+        );
+
+        let rerouted_response = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("x-api-key", "alx-local")
+            .header("x-alexandria-harness", "platform-smoke")
+            .json(&json!({
+                "model": "openai/smoke/fail",
+                "stream": false,
+                "messages": [{"role": "user", "content": "exercise middleware"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let reroute_trace_id = smoke_trace_id(&rerouted_response);
+        let rerouted: Value = rerouted_response.json().await.unwrap();
+        assert_eq!(
+            rerouted["choices"][0]["message"]["content"],
+            "fallback ok"
+        );
+
+        let stream_trace = wait_for_smoke_trace(&client, &base, &stream_trace_id).await;
+        assert_eq!(stream_trace["trace"]["streamed"], 1);
+        assert_eq!(stream_trace["trace"]["routed_model"], "smoke/stream");
+        let reroute_trace = wait_for_smoke_trace(&client, &base, &reroute_trace_id).await;
+        assert_eq!(reroute_trace["trace"]["substituted"], true);
+        assert_eq!(reroute_trace["trace"]["original_model"], "openai/smoke/fail");
+        assert_eq!(reroute_trace["trace"]["served_model"], "smoke/fallback");
+        assert_eq!(reroute_trace["trace"]["upstream_provider"], "exo");
+        assert_eq!(
+            reroute_trace["trace"]["substitution_reason"],
+            "deterministic platform reroute"
+        );
+        let attempts = reroute_trace["trace"]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["provider"], "openai");
+        assert_eq!(attempts[0]["model"], "smoke/fail");
+        assert_eq!(attempts[0]["status"], 503);
+        assert!(attempts[0]["middleware_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["rule_id"] == middleware_id
+                    && record["state"] == "matched"
+                    && record["action"] == "reroute"
+            }));
+        assert_eq!(attempts[1]["provider"], "exo");
+        assert_eq!(attempts[1]["model"], "smoke/fallback");
+        assert_eq!(attempts[1]["status"], 200);
+        assert_eq!(
+            *received_models.lock().await,
+            vec!["smoke/model", "smoke/stream", "smoke/fail", "smoke/fallback"]
+        );
+
         let summaries: Value = client
-            .get(format!("{base}/traces/summaries?limit=1"))
+            .get(format!("{base}/traces/summaries?limit=3"))
             .header("x-api-key", "alx-local")
             .send()
             .await
@@ -16220,29 +16440,24 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(summaries["limit"], 1);
-        assert_eq!(summaries["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(summaries["limit"], 3);
+        assert_eq!(summaries["traces"].as_array().unwrap().len(), 3);
         assert!(summaries["traces"][0].get("req_body_path").is_none());
-        let trace_id = summaries["traces"][0]["id"].as_str().unwrap().to_string();
-        let opened: Value = client
-            .get(format!("{base}/traces/{trace_id}"))
-            .header("x-api-key", "alx-local")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(opened["trace"]["id"], trace_id);
+        for trace_id in [&basic_trace_id, &stream_trace_id, &reroute_trace_id] {
+            assert!(summaries["traces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|trace| trace["id"] == trace_id.as_str()));
+        }
 
         server.abort();
         let _ = server.await;
         drop(state);
 
-        // Reopen the same durable roots behind a fresh daemon state. The trace
-        // summary and individual trace must survive the restart boundary.
+        // Reopen the same durable roots behind a fresh daemon state. All trace
+        // kinds, the streamed body, middleware provenance, and the installed
+        // rule must survive the restart boundary.
         let restarted_state = build();
         let (restarted_address, restarted_server) = serve(restarted_state).await;
         let restarted_base = format!("http://{restarted_address}");
@@ -16257,19 +16472,63 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(recovered["traces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|trace| trace["id"] == trace_id));
-        client
-            .get(format!("{restarted_base}/traces/{trace_id}"))
+        for trace_id in [&basic_trace_id, &stream_trace_id, &reroute_trace_id] {
+            assert!(recovered["traces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|trace| trace["id"] == trace_id.as_str()));
+            client
+                .get(format!("{restarted_base}/traces/{trace_id}/metadata"))
+                .header("x-api-key", "alx-local")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        let recovered_stream = client
+            .get(format!(
+                "{restarted_base}/traces/{stream_trace_id}/body/response"
+            ))
             .header("x-api-key", "alx-local")
             .send()
             .await
             .unwrap()
             .error_for_status()
+            .unwrap()
+            .text()
+            .await
             .unwrap();
+        assert!(recovered_stream.contains("smoke_weather"));
+        let recovered_reroute = wait_for_smoke_trace(
+            &client,
+            &restarted_base,
+            &reroute_trace_id,
+        )
+        .await;
+        assert_eq!(recovered_reroute["trace"]["served_model"], "smoke/fallback");
+        assert!(recovered_reroute["trace"]["attempts"][0]["middleware_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["rule_id"] == middleware_id && record["state"] == "matched"));
+        let recovered_middleware: Value = client
+            .get(format!("{restarted_base}/admin/middleware"))
+            .header("x-api-key", "alx-local")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(recovered_middleware["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == middleware_id && rule["enabled"] == true));
 
         restarted_server.abort();
         upstream_server.abort();

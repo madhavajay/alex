@@ -10327,6 +10327,25 @@ async fn fetch_json(
     Some((status, value))
 }
 
+/// Build the detached daemon command without serializing it through a shell.
+/// Keeping the executable and each option as an OS-native argument is the
+/// shared lifecycle contract for paths containing spaces on every platform.
+fn background_daemon_command(
+    executable: &Path,
+    host_arg: Option<&str>,
+    port_arg: Option<u16>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.arg("daemon");
+    if let Some(host) = host_arg {
+        command.arg("--host").arg(host);
+    }
+    if let Some(port) = port_arg {
+        command.arg("--port").arg(port.to_string());
+    }
+    command
+}
+
 async fn daemon_background(
     host: &str,
     port: u16,
@@ -10360,14 +10379,8 @@ async fn daemon_background(
         .create(true)
         .append(true)
         .open(&log_path)?;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("daemon");
-    if let Some(h) = host_arg {
-        cmd.args(["--host", &h]);
-    }
-    if let Some(p) = port_arg {
-        cmd.args(["--port", &p.to_string()]);
-    }
+    let executable = std::env::current_exe()?;
+    let mut cmd = background_daemon_command(&executable, host_arg.as_deref(), port_arg);
     cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -12851,6 +12864,45 @@ continue = true
             ]
         );
         assert!(browser_command_for(DesktopPlatform::Unsupported, url).is_err());
+    }
+
+    #[test]
+    fn platform_path_and_service_lifecycle_contracts_are_process_safe() {
+        // This deliberately resembles installed paths on all three desktop
+        // platforms. Command never invokes a shell, so spaces remain part of
+        // the executable instead of splitting into lifecycle arguments.
+        let executable = PathBuf::from("installation root")
+            .join("Alex Beta")
+            .join("alex executable");
+        let command = background_daemon_command(
+            &executable,
+            Some("127.0.0.1"),
+            Some(41_000),
+        );
+        assert_eq!(command.get_program(), executable.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["daemon", "--host", "127.0.0.1", "--port", "41000"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>()
+        );
+
+        // Service ownership is an abstract lifecycle state contract. It runs
+        // identically in CI without touching launchd, systemd, or a future
+        // Windows service implementation.
+        assert!(service_managed(&ServiceState::LaunchdLoaded { pid: None }));
+        assert!(service_managed(&ServiceState::Systemd {
+            enabled: true,
+            active: true,
+            unit_present: true,
+        }));
+        assert!(!service_managed(&ServiceState::Systemd {
+            enabled: true,
+            active: false,
+            unit_present: true,
+        }));
+        assert!(!service_managed(&ServiceState::Unsupported));
     }
 
     #[tokio::test]
