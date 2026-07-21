@@ -19,6 +19,7 @@ for dialect conversion.
 | Grok / xAI | Grok OAuth subscription | Anthropic Messages or OpenAI Chat | Upstream is OpenAI-chat-compatible. Responses and Gemini ingress return `501 Not Implemented` for this provider. |
 | Kimi Code | Imported or device-flow OAuth | Anthropic Messages or OpenAI Chat | Routes to Kimi's coding Chat Completions endpoint. Responses and Gemini ingress are not implemented. |
 | OpenRouter | API key plus optional HTTP-Referer/X-Title attribution | Anthropic Messages or OpenAI Chat | Model IDs are `openrouter/<vendor>/<model>`. Only the configured curated subset is advertised to harnesses. |
+| CLIProxyAPI | User-managed URL and bearer credential | Anthropic Messages, OpenAI Chat, or OpenAI Responses | Upstream models use `cliproxyapi/<model>`. The reverse CLIProxyAPI → Alex arrangement is generated with `alex cliproxyapi export`. |
 | Amp | Amp access token/API key | None | Billing and reverse-wrap capture only. `alex wrap amp` handles the product protocol; `/v1` routing returns `501`. |
 | Exo | No vault account; configured local URL and dummy bearer auth | Anthropic Messages or OpenAI Chat | Local OpenAI-chat-compatible provider, enabled per model with `exo_enabled_models`. |
 

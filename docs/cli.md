@@ -149,6 +149,26 @@ saves or replaces the connection. Use HTTPS for remote servers; plain HTTP is
 accepted only for loopback addresses. Discovered models are exposed through
 Alex as `cliproxyapi/<upstream-model-id>`.
 
+## `cliproxyapi`
+
+Manage the reverse CLIProxyAPI → Alex arrangement. `export` probes
+`/v1/alex/capabilities`, reads Alex's model catalog, mints a dedicated scoped
+harness key for a local daemon, and creates (without overwriting) a mode-`0600`
+CLIProxyAPI v7 config fragment:
+
+```bash
+alex cliproxyapi capabilities
+alex cliproxyapi export \
+  --output ./alex-provider.yaml \
+  --cliproxyapi-version v7.4.1
+```
+
+Repeat `--model` to export only selected `alex/*` models. For a remote Alex,
+provide an existing scoped key through `--key-file` or
+`ALEXANDRIA_HARNESS_KEY`; the remote local/admin key is never requested. The
+generated file contains the scoped credential and must be merged privately
+into CLIProxyAPI's `config.yaml`. See [CLIProxyAPI integration](cliproxyapi.md).
+
 ## `tool-capture`
 
 Show or set explicit per-harness tool-capture consent. State is `on` or `off`;

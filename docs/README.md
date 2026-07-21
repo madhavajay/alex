@@ -14,6 +14,7 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | [API and formats](api-and-formats.md) | Model ingress, control/trace routes, the four API dialects, Anthropic-pivot translation, SSE, usage, and cost. |
 | [Configuration](configuration.md) | Full `config.toml` key/default reference, environment variables, and on-disk layout. |
 | [Dario](dario.md) | Dario routing modes, three-block prompt rewrite, header handling, generations, health, and fallback behavior. |
+| [CLIProxyAPI integration](cliproxyapi.md) | Both routing directions, safe reverse config export, version/capability negotiation, correlation, and loop prevention. |
 | [Traces](traces.md) | Trace rows and gzip bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
 | [Shared web UI](web-ui.md) | Cross-platform local status/onboarding/trace preview, bounded pagination, launch and smoke-test behavior. |
 

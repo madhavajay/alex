@@ -55,6 +55,18 @@ const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TRACE_BODY_RESPONSE_LIMIT: u64 = 64 * 1024 * 1024;
+pub const CLIPROXYAPI_REVERSE_SCHEMA: &str = "alex.cliproxyapi.reverse/v1";
+pub const CLIPROXYAPI_MINIMUM_MAJOR: u64 = 7;
+pub const CLIPROXYAPI_REVERSE_CAPABILITIES: &[&str] = &[
+    "openai-chat",
+    "openai-responses",
+    "anthropic-messages",
+    "streaming",
+    "tool-calls",
+    "structured-errors",
+    "trace-correlation",
+];
+const ALEX_ROUTE_CHAIN_HEADER: &str = "x-alexandria-route-chain";
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -2037,6 +2049,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/connect", get(connect_info))
         .route("/v1/models", get(models))
+        .route("/v1/alex/capabilities", get(cliproxyapi_reverse_capabilities))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/responses", post(openai_responses))
@@ -3833,6 +3846,23 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         })
         .collect();
     axum::Json(json!({"object": "list", "data": data}))
+}
+
+async fn cliproxyapi_reverse_capabilities() -> impl IntoResponse {
+    axum::Json(json!({
+        "object": "alex.capabilities",
+        "alex_version": env!("CARGO_PKG_VERSION"),
+        "integrations": {
+            "cliproxyapi_reverse": {
+                "schema": CLIPROXYAPI_REVERSE_SCHEMA,
+                "minimum_cliproxyapi_major": CLIPROXYAPI_MINIMUM_MAJOR,
+                "protocols": ["openai-chat", "openai-responses", "anthropic-messages"],
+                "capabilities": CLIPROXYAPI_REVERSE_CAPABILITIES,
+                "correlation_response_header": "x-alexandria-trace-id",
+                "route_chain_header": ALEX_ROUTE_CHAIN_HEADER,
+            }
+        }
+    }))
 }
 
 async fn admin_analytics(
@@ -11124,6 +11154,9 @@ const METADATA_HEADERS: &[(&str, &str)] = &[
     ("x-alexandria-job", "job"),
     ("x-alexandria-phase", "phase"),
     ("x-alexandria-kind", "kind"),
+    ("x-alexandria-integration-schema", "integration_schema"),
+    ("x-alexandria-capabilities", "capabilities"),
+    (ALEX_ROUTE_CHAIN_HEADER, "route_chain"),
 ];
 
 fn trace_tags_json(headers: &HeaderMap) -> Option<String> {
@@ -11166,6 +11199,78 @@ fn no_substitute(headers: &HeaderMap) -> bool {
         .get("x-alexandria-no-substitute")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim() == "1")
+}
+
+fn route_chain_contains(headers: &HeaderMap, hop: &str) -> bool {
+    headers
+        .get_all(ALEX_ROUTE_CHAIN_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case(hop))
+}
+
+fn upstream_route_chain(headers: &HeaderMap, next_hop: &str) -> String {
+    let mut hops = headers
+        .get_all(ALEX_ROUTE_CHAIN_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .take(8)
+        .collect::<Vec<_>>();
+    if !hops.iter().any(|hop| hop.eq_ignore_ascii_case(next_hop)) {
+        hops.push(next_hop.to_string());
+    }
+    hops.join(",")
+}
+
+fn validate_cliproxyapi_reverse_contract(
+    headers: &HeaderMap,
+    format: ClientFormat,
+) -> std::result::Result<(), String> {
+    let cliproxyapi = headers
+        .get("x-alexandria-harness")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("cliproxyapi"));
+    if !cliproxyapi {
+        return Ok(());
+    }
+    let Some(schema) = headers
+        .get("x-alexandria-integration-schema")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        // Compatibility: reverse configurations generated before the v1
+        // handshake remain valid. New exporters always negotiate explicitly.
+        return Ok(());
+    };
+    if schema != CLIPROXYAPI_REVERSE_SCHEMA {
+        return Err(format!(
+            "unsupported CLIProxyAPI reverse schema '{schema}'; expected {CLIPROXYAPI_REVERSE_SCHEMA}"
+        ));
+    }
+    let required = match format {
+        ClientFormat::OpenaiChat => "openai-chat",
+        ClientFormat::OpenaiResponses => "openai-responses",
+        ClientFormat::AnthropicMessages => "anthropic-messages",
+        ClientFormat::GeminiGenerate => "gemini",
+    };
+    let declared = headers
+        .get_all("x-alexandria-capabilities")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case(required));
+    if !declared {
+        return Err(format!(
+            "CLIProxyAPI reverse client did not declare required capability '{required}'"
+        ));
+    }
+    Ok(())
 }
 
 fn policy_covers(class: ErrorClass, policy: &ProtectionPolicy) -> bool {
@@ -11832,6 +11937,18 @@ async fn proxy(
         ..Default::default()
     };
 
+    if let Err(message) = validate_cliproxyapi_reverse_contract(&headers, format) {
+        return alex_error_trace_response(
+            &state,
+            trace,
+            &body,
+            StatusCode::UPGRADE_REQUIRED,
+            &message,
+            "integration_capability",
+            "unavailable",
+        );
+    }
+
     let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -11994,6 +12111,18 @@ async fn proxy(
     trace.routed_model = Some(routed_model.clone());
     trace.upstream_provider = Some(provider.as_str().into());
     trace.streamed = Some(body_json["stream"].as_bool().unwrap_or(false));
+    if provider == Provider::Cliproxyapi && route_chain_contains(&headers, "cliproxyapi") {
+        trace.tags = merge_trace_note(trace.tags.take(), "route_loop", "cliproxyapi");
+        return alex_error_trace_response(
+            &state,
+            trace,
+            &body,
+            StatusCode::LOOP_DETECTED,
+            "refusing to route a CLIProxyAPI-originated request back to CLIProxyAPI",
+            "routing_loop",
+            "unavailable",
+        );
+    }
     if let Some(lease) = &active_route_lease {
         trace.substituted = true;
         trace.original_model = Some(requested_model.clone());
@@ -12427,6 +12556,15 @@ async fn proxy(
                     return error_response(status, &msg);
                 }
             };
+            if current_provider == Provider::Cliproxyapi {
+                let route_chain = upstream_route_chain(&headers, "alex");
+                if let Ok(value) = HeaderValue::from_str(&route_chain) {
+                    up_headers.insert(ALEX_ROUTE_CHAIN_HEADER, value);
+                }
+                if let Ok(value) = HeaderValue::from_str(&trace_id) {
+                    up_headers.insert("x-alexandria-parent-trace-id", value);
+                }
+            }
             for (k, v) in &plan.extra_headers {
                 if let (Ok(name), Ok(value)) = (
                     reqwest::header::HeaderName::from_bytes(k.as_bytes()),
@@ -15632,6 +15770,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cliproxyapi_reverse_capability_contract_is_versioned() {
+        let (_, body) = response_json(cliproxyapi_reverse_capabilities().await.into_response()).await;
+        let reverse = &body["integrations"]["cliproxyapi_reverse"];
+        assert_eq!(reverse["schema"], CLIPROXYAPI_REVERSE_SCHEMA);
+        assert_eq!(
+            reverse["minimum_cliproxyapi_major"],
+            CLIPROXYAPI_MINIMUM_MAJOR
+        );
+        assert_eq!(reverse["correlation_response_header"], "x-alexandria-trace-id");
+        assert!(reverse["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "tool-calls"));
+    }
+
+    #[test]
+    fn cliproxyapi_reverse_runtime_negotiates_schema_and_protocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("cliproxyapi"),
+        );
+        assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_ok());
+        headers.insert(
+            "x-alexandria-integration-schema",
+            HeaderValue::from_static(CLIPROXYAPI_REVERSE_SCHEMA),
+        );
+        headers.insert(
+            "x-alexandria-capabilities",
+            HeaderValue::from_static("openai-chat,streaming"),
+        );
+        assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_ok());
+        assert!(
+            validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiResponses)
+                .is_err()
+        );
+        headers.insert(
+            "x-alexandria-integration-schema",
+            HeaderValue::from_static("alex.cliproxyapi.reverse/v2"),
+        );
+        assert!(validate_cliproxyapi_reverse_contract(&headers, ClientFormat::OpenaiChat).is_err());
+    }
+
+    #[tokio::test]
     async fn cliproxyapi_probe_and_admin_save_use_bearer_and_filtered_catalog() {
         let seen_auth = Arc::new(std::sync::Mutex::new(None::<String>));
         let seen_auth2 = seen_auth.clone();
@@ -15703,6 +15886,8 @@ mod tests {
                 post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
                     let captured = chat_capture.clone();
                     async move {
+                        assert_eq!(headers[ALEX_ROUTE_CHAIN_HEADER], "alex");
+                        assert!(!headers["x-alexandria-parent-trace-id"].is_empty());
                         captured.lock().unwrap().push((
                             "chat".into(),
                             headers["authorization"].to_str().unwrap().into(),
@@ -15721,6 +15906,8 @@ mod tests {
                 post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
                     let captured = responses_capture.clone();
                     async move {
+                        assert_eq!(headers[ALEX_ROUTE_CHAIN_HEADER], "alex");
+                        assert!(!headers["x-alexandria-parent-trace-id"].is_empty());
                         captured.lock().unwrap().push((
                             "responses".into(),
                             headers["authorization"].to_str().unwrap().into(),
@@ -15900,6 +16087,323 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    async fn reverse_hop_forward(
+        alex_base: String,
+        path: &'static str,
+        body: Bytes,
+    ) -> Response {
+        let response = reqwest::Client::new()
+            .post(format!("{alex_base}{path}"))
+            .bearer_auth("reverse-harness-key")
+            .header("content-type", "application/json")
+            .header("x-alexandria-harness", "cliproxyapi")
+            .header("x-alexandria-harness-version", "v7-test")
+            .header(
+                "x-alexandria-integration-schema",
+                CLIPROXYAPI_REVERSE_SCHEMA,
+            )
+            .header(
+                "x-alexandria-capabilities",
+                CLIPROXYAPI_REVERSE_CAPABILITIES.join(","),
+            )
+            .header(ALEX_ROUTE_CHAIN_HEADER, "cliproxyapi")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.unwrap();
+        let mut builder = Response::builder().status(status);
+        // Match CLIProxyAPI v7's OpenAI compatibility executor: successful
+        // upstream headers are passed through when configured, while non-2xx
+        // status and valid JSON bodies survive but error headers do not.
+        for name in ["content-type"] {
+            if let Some(value) = headers.get(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        if status.is_success() {
+            if let Some(value) = headers.get("x-alexandria-trace-id") {
+                builder = builder.header("x-alexandria-trace-id", value);
+            }
+        }
+        builder.body(Body::from(bytes)).unwrap()
+    }
+
+    async fn reverse_test_stack(
+        name: &str,
+        upstream: Router,
+    ) -> (
+        Arc<AppState>,
+        std::net::SocketAddr,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let state = test_state(name);
+        state
+            .vault
+            .upsert(test_api_account("openai-reverse", Provider::Openai))
+            .await
+            .unwrap();
+        set_upstream_base_override(
+            &state,
+            Provider::Openai,
+            format!("http://{upstream_address}"),
+        );
+        let key_hash = key_hash_hex("reverse-harness-key");
+        state
+            .store
+            .insert_run_key(
+                "rk-reverse",
+                &key_hash,
+                "harness",
+                None,
+                Some(r#"{"integration":"cliproxyapi-reverse"}"#),
+                Some("cliproxyapi"),
+                now_ms(),
+                None,
+            )
+            .unwrap();
+
+        let alex_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let alex_address = alex_listener.local_addr().unwrap();
+        let alex_router = router(state.clone());
+        let alex_server = tokio::spawn(async move {
+            axum::serve(
+                alex_listener,
+                alex_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let alex_base = format!("http://{alex_address}");
+        let chat_base = alex_base.clone();
+        let responses_base = alex_base.clone();
+        let messages_base = alex_base;
+        let reverse_hop = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |body: Bytes| {
+                    reverse_hop_forward(chat_base.clone(), "/v1/chat/completions", body)
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move |body: Bytes| {
+                    reverse_hop_forward(responses_base.clone(), "/v1/responses", body)
+                }),
+            )
+            .route(
+                "/v1/messages",
+                post(move |body: Bytes| {
+                    reverse_hop_forward(messages_base.clone(), "/v1/messages", body)
+                }),
+            );
+        let reverse_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let reverse_address = reverse_listener.local_addr().unwrap();
+        let reverse_server =
+            tokio::spawn(async move { axum::serve(reverse_listener, reverse_hop).await.unwrap() });
+        (
+            state,
+            reverse_address,
+            vec![upstream_server, alex_server, reverse_server],
+        )
+    }
+
+    fn stop_test_stack(servers: Vec<tokio::task::JoinHandle<()>>) {
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_reverse_two_hop_supports_chat_responses_and_anthropic() {
+        let upstream = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer secret-openai-reverse");
+                    assert_eq!(body["model"], "gpt-reverse");
+                    axum::Json(json!({
+                        "id": "chat-reverse", "object": "chat.completion", "model": "gpt-reverse",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "chat through alex"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+                    }))
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer secret-openai-reverse");
+                    assert_eq!(body["model"], "gpt-reverse");
+                    axum::Json(json!({
+                        "id": "resp-reverse", "object": "response", "status": "completed", "model": "gpt-reverse",
+                        "output": [{"id": "msg-reverse", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "responses through alex", "annotations": []}]}],
+                        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+                    }))
+                }),
+            );
+        let (state, address, servers) =
+            reverse_test_stack("cliproxyapi-reverse-protocols", upstream).await;
+        let client = reqwest::Client::new();
+        let cases = [
+            (
+                "/v1/chat/completions",
+                json!({"model": "alex/gpt-reverse", "stream": false, "messages": [{"role": "user", "content": "hi"}]}),
+                "/choices/0/message/content",
+            ),
+            (
+                "/v1/responses",
+                json!({"model": "alex/gpt-reverse", "stream": false, "input": "hi"}),
+                "/output/0/content/0/text",
+            ),
+            (
+                "/v1/messages",
+                json!({"model": "alex/gpt-reverse", "stream": false, "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
+                "/content/0/text",
+            ),
+        ];
+        for (path, body, pointer) in cases {
+            let response = client
+                .post(format!("http://{address}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("x-alexandria-trace-id"));
+            let body: Value = response.json().await.unwrap();
+            assert!(body.pointer(pointer).and_then(Value::as_str).is_some(), "{body}");
+        }
+        let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(traces.len(), 3);
+        assert!(traces.iter().all(|trace| trace["harness"] == "cliproxyapi"));
+        assert!(traces.iter().all(|trace| {
+            trace["tags_json"]
+                .as_str()
+                .and_then(|tags| serde_json::from_str::<Value>(tags).ok())
+                .is_some_and(|tags| tags["route_chain"] == "cliproxyapi")
+        }));
+        stop_test_stack(servers);
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_reverse_two_hop_streams_anthropic_tool_calls() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["model"], "gpt-reverse");
+                assert_eq!(body["tools"][0]["name"], "shell");
+                axum::Json(json!({
+                    "id": "resp-tool", "object": "response", "status": "completed", "model": "gpt-reverse",
+                    "output": [{"id": "call-1", "type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{\"command\":\"pwd\"}"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+                }))
+            }),
+        );
+        let (_state, address, servers) =
+            reverse_test_stack("cliproxyapi-reverse-tools", upstream).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/messages"))
+            .json(&json!({
+                "model": "alex/gpt-reverse", "stream": true, "max_tokens": 64,
+                "messages": [{"role": "user", "content": "show cwd"}],
+                "tools": [{"name": "shell", "description": "run a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let text = response.text().await.unwrap();
+        let message = alex_core::translate::parse_anthropic_sse_to_message(&text).unwrap();
+        let tool = message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(tool["name"], "shell");
+        assert_eq!(tool["input"]["command"], "pwd");
+        stop_test_stack(servers);
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_reverse_two_hop_preserves_structured_errors() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "23")
+                    .body(Body::from(
+                        json!({"error": {"type": "rate_limit_error", "code": "reverse_limit", "message": "try later"}}).to_string(),
+                    ))
+                    .unwrap()
+            }),
+        );
+        let (_state, address, servers) =
+            reverse_test_stack("cliproxyapi-reverse-error", upstream).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&json!({"model": "alex/gpt-reverse", "stream": false, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key("retry-after"));
+        assert!(!response.headers().contains_key("x-alexandria-trace-id"));
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error": {"type": "rate_limit_error", "code": "reverse_limit", "message": "try later"}})
+        );
+        stop_test_stack(servers);
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_route_chain_blocks_a_reverse_loop() {
+        let state = test_state("cliproxyapi-reverse-loop");
+        state
+            .vault
+            .upsert(test_api_account("cliproxy-loop", Provider::Cliproxyapi))
+            .await
+            .unwrap();
+        let mut headers = local_proxy_headers();
+        headers.insert(ALEX_ROUTE_CHAIN_HEADER, HeaderValue::from_static("cliproxyapi"));
+        headers.insert(
+            "x-alexandria-harness",
+            HeaderValue::from_static("cliproxyapi"),
+        );
+        let response = proxy(
+            state.clone(),
+            ClientFormat::OpenaiChat,
+            "/v1/chat/completions",
+            headers,
+            Bytes::from_static(br#"{"model":"cliproxyapi/gpt-loop","messages":[{"role":"user","content":"hi"}]}"#),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+        let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["error_kind"], "alex_routing_loop");
+        let tags: Value = serde_json::from_str(traces[0]["tags_json"].as_str().unwrap()).unwrap();
+        assert_eq!(tags["route_loop"], "cliproxyapi");
     }
 
     #[derive(Default)]

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 mod commands;
+mod cliproxyapi;
 mod dario;
 mod doctor;
 mod harness_connect;
@@ -128,6 +129,11 @@ enum Command {
     Dario {
         #[command(subcommand)]
         command: DarioCommand,
+    },
+    /// Export a safe CLIProxyAPI v7 provider configuration targeting Alex
+    Cliproxyapi {
+        #[command(subcommand)]
+        command: CliproxyapiCommand,
     },
     /// Inspect configured notification channels or send a synthetic test alert
     Notify {
@@ -386,6 +392,35 @@ enum ServiceCommand {
 enum ConfigCommand {
     /// Set the daemon bind IP (`127.0.0.1` for local only, `0.0.0.0` for LAN + local)
     Host { address: String },
+}
+
+#[derive(Subcommand)]
+enum CliproxyapiCommand {
+    /// Write a private CLIProxyAPI v7 config fragment that routes alex/* models to Alex
+    Export {
+        /// New file to create; existing files are never overwritten
+        #[arg(long)]
+        output: PathBuf,
+        /// Alex API root; defaults to the configured local daemon
+        #[arg(long)]
+        url: Option<String>,
+        /// Existing scoped Alex key file; otherwise a dedicated local harness key is minted
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Restrict the exported catalog; repeatable, with or without the alex/ prefix
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Installed CLIProxyAPI version, checked against Alex's advertised minimum
+        #[arg(long)]
+        cliproxyapi_version: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the reverse-integration schema and required CLIProxyAPI capabilities
+    Capabilities {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -4509,6 +4544,91 @@ async fn main() -> Result<()> {
                 harness_connect::connect_cmd(&config, harness, config_dir, json).await?;
             }
         }
+        Command::Cliproxyapi { command } => match command {
+            CliproxyapiCommand::Export {
+                output,
+                url,
+                key_file,
+                models,
+                cliproxyapi_version,
+                json,
+            } => {
+                let local_api_base = format!("{}/v1", config.base_url().trim_end_matches('/'));
+                let alex_api_base = url.unwrap_or_else(|| local_api_base.clone());
+                let key_from_file = key_file
+                    .as_deref()
+                    .map(cliproxyapi::read_private_key_file)
+                    .transpose()?;
+                let key_from_env = std::env::var("ALEXANDRIA_HARNESS_KEY").ok();
+                let existing_key = key_from_file
+                    .as_deref()
+                    .or(key_from_env.as_deref());
+                let target_is_local = cliproxyapi::normalize_alex_api_base(&alex_api_base)?
+                    == cliproxyapi::normalize_alex_api_base(&local_api_base)?;
+                if existing_key.is_none() && !target_is_local {
+                    anyhow::bail!(
+                        "a remote Alex export requires --key-file or ALEXANDRIA_HARNESS_KEY"
+                    );
+                }
+                let admin_base = target_is_local.then(|| config.base_url());
+                let admin_key = target_is_local.then_some(config.local_key.as_str());
+                let result = cliproxyapi::export_reverse_config(
+                    cliproxyapi::ReverseExportOptions {
+                        output: &output,
+                        alex_api_base: &alex_api_base,
+                        existing_key,
+                        admin_base: admin_base.as_deref(),
+                        admin_key,
+                        requested_models: &models,
+                        cliproxyapi_version: cliproxyapi_version.as_deref(),
+                    },
+                )
+                .await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "output": result.output,
+                            "models": result.model_count,
+                            "key_id": result.key_id,
+                            "schema": result.schema,
+                            "alex_api_base": result.alex_api_base,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{} wrote private CLIProxyAPI config {} ({} models, schema {})",
+                        ui::green(ui::dot()),
+                        result.output.display(),
+                        result.model_count,
+                        result.schema
+                    );
+                    println!(
+                        "Merge it into CLIProxyAPI config.yaml, then restart or reload CLIProxyAPI."
+                    );
+                }
+            }
+            CliproxyapiCommand::Capabilities { json } => {
+                let value = serde_json::json!({
+                    "schema": alex_proxy::CLIPROXYAPI_REVERSE_SCHEMA,
+                    "minimum_cliproxyapi_major": alex_proxy::CLIPROXYAPI_MINIMUM_MAJOR,
+                    "capabilities": alex_proxy::CLIPROXYAPI_REVERSE_CAPABILITIES,
+                    "protocols": ["openai-chat", "openai-responses", "anthropic-messages"],
+                    "correlation_response_header": "x-alexandria-trace-id",
+                    "route_chain_header": "x-alexandria-route-chain",
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("schema: {}", alex_proxy::CLIPROXYAPI_REVERSE_SCHEMA);
+                    println!("CLIProxyAPI: v{}+", alex_proxy::CLIPROXYAPI_MINIMUM_MAJOR);
+                    println!(
+                        "capabilities: {}",
+                        alex_proxy::CLIPROXYAPI_REVERSE_CAPABILITIES.join(", ")
+                    );
+                }
+            }
+        },
         Command::ToolCapture {
             harness,
             state,
@@ -11113,6 +11233,46 @@ mod tests {
                 .command,
             Some(Command::Doctor { json: true })
         ));
+    }
+
+    #[test]
+    fn cliproxyapi_reverse_export_cli_parses_safe_inputs() {
+        let cli = Cli::try_parse_from([
+            "alex",
+            "cliproxyapi",
+            "export",
+            "--output",
+            "alex-provider.yaml",
+            "--key-file",
+            "alex.key",
+            "--model",
+            "gpt-5",
+            "--model",
+            "alex/claude-opus-4-8",
+            "--cliproxyapi-version",
+            "v7.4.1",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Cliproxyapi {
+                command:
+                    CliproxyapiCommand::Export {
+                        output,
+                        key_file: Some(key_file),
+                        models,
+                        cliproxyapi_version: Some(version),
+                        json: true,
+                        ..
+                    },
+            } => {
+                assert_eq!(output, PathBuf::from("alex-provider.yaml"));
+                assert_eq!(key_file, PathBuf::from("alex.key"));
+                assert_eq!(models, vec!["gpt-5", "alex/claude-opus-4-8"]);
+                assert_eq!(version, "v7.4.1");
+            }
+            _ => panic!("unexpected CLIProxyAPI reverse export parse"),
+        }
     }
 
     #[test]
