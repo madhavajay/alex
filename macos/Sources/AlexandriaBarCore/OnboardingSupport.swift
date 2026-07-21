@@ -134,7 +134,7 @@ public enum OnboardingSupport {
         case "openrouter": ["alex/openrouter/anthropic/claude-sonnet-4"]
         case "cliproxyapi": ["alex/cliproxyapi/gpt-4o"]
         case "exo": ["alex/exo/local-model"]
-        case "amp": ["alex/claude-sonnet-4"]
+        case "amp": []
         default: ["alex/claude-sonnet-4", "alex/gpt-5"]
         }
     }
@@ -142,7 +142,8 @@ public enum OnboardingSupport {
     public static func models(_ ids: [String], for provider: String?) -> [String] {
         let prefix: String?
         switch provider?.lowercased() {
-        case "anthropic", "amp": prefix = "alex/claude-"
+        case "anthropic": prefix = "alex/claude-"
+        case "amp": return []
         case "openai": prefix = "alex/gpt-"
         case "gemini": prefix = "alex/gemini-"
         case "xai": prefix = "alex/grok-"
@@ -174,7 +175,10 @@ public enum OnboardingSupport {
     }
 
     public static func harnessInstallDescription(_ harness: String) -> String {
-        "Alex will add its local endpoint, scoped credential, and exposed model list to \(HarnessCatalog.displayName(harness))."
+        if harness.lowercased() == "amp" {
+            return "Alex will install capture metadata and a scoped lifecycle credential for Amp. Amp keeps its native models and runs through `alex wrap amp`."
+        }
+        return "Alex will add its local endpoint, scoped credential, and exposed model list to \(HarnessCatalog.displayName(harness))."
     }
 
     public static func testCommand(harness: String?, model: String) -> String {

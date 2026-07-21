@@ -53,8 +53,8 @@ async function loadAccounts(){
   $('#accounts').innerHTML=accounts.length?accounts.map(account=>`<div class="card"><span class="muted">${escapeHtml(account.provider)}</span><strong>${escapeHtml(account.email||account.label||account.name)}</strong><small>${escapeHtml(account.health||account.status||'configured')}</small></div>`).join(''):'<div class="card"><strong>No provider connected</strong><span class="muted">Pick one below to begin.</span></div>';
   const connected=new Map();
   for(const account of accounts)connected.set(account.provider,(connected.get(account.provider)||0)+1);
-  const providers=[['claude','Anthropic','oauth'],['codex','OpenAI','oauth'],['gemini','Google','oauth'],['grok','xAI','oauth'],['kimi','Moonshot','oauth'],['amp','Amp','oauth'],['cliproxyapi','CLIProxyAPI','form']];
-  $('#providers').innerHTML=providers.map(([id,label,mode])=>`<button data-provider="${id}" data-provider-mode="${mode}"><strong>${label}</strong><span>${connected.get(id)||connected.get(id==='claude'?'anthropic':id==='codex'?'openai':id==='grok'?'xai':id)||0} connected · ${mode==='form'?'configure':'add another'}</span></button>`).join('');
+  const providers=[['claude','Anthropic','oauth'],['codex','OpenAI','oauth'],['gemini','Google','oauth'],['grok','xAI','oauth'],['kimi','Moonshot','oauth'],['amp','Amp (wrap + billing)','import'],['cliproxyapi','CLIProxyAPI','form']];
+  $('#providers').innerHTML=providers.map(([id,label,mode])=>`<button data-provider="${id}" data-provider-mode="${mode}"><strong>${label}</strong><span>${connected.get(id)||connected.get(id==='claude'?'anthropic':id==='codex'?'openai':id==='grok'?'xai':id)||0} connected · ${mode==='form'?'configure':mode==='import'?'import CLI key':'add another'}</span></button>`).join('');
   document.querySelectorAll('[data-provider]').forEach(button=>button.onclick=()=>button.dataset.providerMode==='form'?showProviderForm(button.dataset.provider):startLogin(button.dataset.provider));
 }
 

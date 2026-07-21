@@ -53,7 +53,7 @@ public enum DaemonController {
 
     public static func run(args: [String], timeout: TimeInterval = 120) async -> CommandResult {
         guard let bin = findBinary() else {
-            return CommandResult(exitCode: 127, stdout: "", stderr: "alexandria binary not found")
+            return CommandResult(exitCode: 127, stdout: "", stderr: "Alex CLI binary not found")
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: bin)
@@ -90,7 +90,7 @@ public enum DaemonController {
         onLine: @escaping @Sendable (String) -> Void
     ) async -> CommandResult {
         guard let bin = findBinary() else {
-            let msg = "alexandria binary not found"
+            let msg = "Alex CLI binary not found"
             onLine(msg)
             return CommandResult(exitCode: 127, stdout: "", stderr: msg)
         }

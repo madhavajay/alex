@@ -969,7 +969,7 @@ async fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Resu
         .get(OPENAI_USAGE_URL)
         .bearer_auth(access_token)
         .header("accept", "application/json")
-        .header("user-agent", "Alexandria");
+        .header("user-agent", concat!("Alex/", env!("CARGO_PKG_VERSION")));
     if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
         request = request.header("chatgpt-account-id", account_id);
     }

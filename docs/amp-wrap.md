@@ -4,7 +4,7 @@ Self-contained harness capture for the Sourcegraph Amp CLI. Lives in `crates/ale
 
 ## Goal
 
-Point Amp at a local reverse wrap (`AMP_URL` / `amp.url`) so management REST **and** actor WebSocket traffic can be captured and (later) rerouted — without Docker MITM and without polluting `alex-proxy`.
+Point Amp at a local reverse wrap (`AMP_URL` / `amp.url`) so management REST **and** actor WebSocket traffic can be captured without Docker MITM and without polluting `alex-proxy`. Amp model rerouting is not supported.
 
 ## Quick use
 

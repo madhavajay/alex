@@ -1,5 +1,5 @@
 #!/bin/sh
-# Alexandria one-liner bootstrap. Keep this POSIX sh and ASCII-only so it is
+# Alex one-liner bootstrap. Keep this POSIX sh and ASCII-only so it is
 # safe to pipe directly into /bin/sh on a fresh Linux or macOS machine.
 set -eu
 
@@ -33,17 +33,17 @@ platform() {
       case "$(uname -m)" in
         x86_64|amd64) printf '%s\n' 'linux-x86_64' ;;
         aarch64|arm64) printf '%s\n' 'linux-aarch64' ;;
-        *) say "No static Alexandria binary for Linux $(uname -m)." >&2; exit 1 ;;
+        *) say "No static Alex CLI binary for Linux $(uname -m)." >&2; exit 1 ;;
       esac
       ;;
     Darwin)
       case "$(uname -m)" in
         arm64) printf '%s\n' 'macos-aarch64' ;;
         x86_64) printf '%s\n' 'macos-x86_64' ;;
-        *) say "No static Alexandria binary for macOS $(uname -m)." >&2; exit 1 ;;
+        *) say "No static Alex CLI binary for macOS $(uname -m)." >&2; exit 1 ;;
       esac
       ;;
-    *) say "Alexandria bootstrap supports Linux and macOS." >&2; exit 1 ;;
+    *) say "The Alex bootstrap supports Linux and macOS." >&2; exit 1 ;;
   esac
 }
 
@@ -59,7 +59,7 @@ release_tag() {
 install_alex() {
   tag="$(release_tag)"
   if [ -z "$tag" ]; then
-    say "Could not resolve the latest Alexandria release." >&2
+    say "Could not resolve the latest Alex release." >&2
     exit 1
   fi
   triple="$(platform)"

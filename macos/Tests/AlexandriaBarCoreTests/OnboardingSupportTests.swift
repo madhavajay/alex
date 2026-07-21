@@ -93,5 +93,17 @@ struct OnboardingSupportTests {
             ["claude-sonnet-4", "alex/gpt-5", "alex/claude-opus-4"],
             for: "anthropic") == ["alex/claude-sonnet-4", "alex/claude-opus-4"])
         #expect(OnboardingSupport.fallbackModels(for: "openai").allSatisfy { $0.hasPrefix("alex/gpt-") })
+        #expect(OnboardingSupport.models(["alex/claude-sonnet-4"], for: "amp").isEmpty)
+        #expect(OnboardingSupport.fallbackModels(for: "amp").isEmpty)
+    }
+
+    @Test func ampInstallCopyDescribesWrapInsteadOfModelRouting() {
+        let amp = OnboardingSupport.harnessInstallDescription("amp")
+        #expect(amp.contains("alex wrap amp"))
+        #expect(amp.contains("native models"))
+        #expect(!amp.contains("exposed model list"))
+
+        let pi = OnboardingSupport.harnessInstallDescription("pi")
+        #expect(pi.contains("exposed model list"))
     }
 }

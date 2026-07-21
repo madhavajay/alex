@@ -432,9 +432,9 @@ enum DarioCommand {
     },
     /// Route non-Claude-Code Anthropic requests through Dario
     Enable,
-    /// Keep Dario ready but route Anthropic requests directly
+    /// Store legacy `direct` mode; only genuine Claude Code routes directly
     Disable,
-    /// Route through Dario automatically when an active Claude subscription is available
+    /// Store compatibility `auto` mode; eligible non-Claude-Code requests use Dario
     Auto,
     /// Show generations and their states
     Status,
@@ -4331,7 +4331,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                     println!(
-                        "{} saved {id} — use models such as openrouter/anthropic/claude-3.5-sonnet",
+                        "{} saved {id} — use models such as openrouter/google/gemma-4-26b-a4b-it:free",
                         ui::green(ui::dot())
                     );
                 }

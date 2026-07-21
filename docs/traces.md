@@ -1,8 +1,10 @@
 # Traces, transcripts, and scoped capture
 
-Every model request creates a metadata record and, where available, gzip body
-artifacts. The same store accepts normalized reverse-wrap traces, harness
-lifecycle events, and consented tool execution events.
+Every model request creates a metadata record and, where available, body
+artifacts. Live capture writes gzip; migrated trace bodies gain LAR pointers.
+Readers prefer bounded LAR reads and fall back to preserved gzip sources. The
+same store accepts normalized reverse-wrap traces, harness lifecycle events,
+and consented tool execution events.
 
 The local TUI (`alex` or `alex tui`) is the terminal Trace Browser. The daemon
 also exposes the JSON/NDJSON API used by UI clients and automation.
@@ -18,13 +20,14 @@ The SQLite `traces` row is the searchable index. Important field groups are:
 | Result | status, streamed, latency, error kind/code/class, injection/fixture markers |
 | Usage | input, cached input, cache creation, output, reasoning tokens, computed cost, billing bucket |
 | Retry/protection | substituted, original/served account, substitution reason, JSON attempt list |
-| Dario | `via_dario`, generation ID, and `dario_fallback` in tags when a direct fallback occurred |
-| Artifacts | client request, translated upstream request, response body paths, redacted request/response header JSON |
+| Dario | `via_dario`, generation ID, and failed-closed setup or transport errors in the normal error fields; `dario_fallback` is legacy-only |
+| Artifacts | client request, translated upstream request, and response body paths plus optional LAR pointers; redacted request/response header JSON |
 
 `finalize_trace` writes the client request unconditionally. It writes a separate
 upstream request only when its bytes differ, and writes the response when one
-exists. The row is inserted after artifact writes, so paths refer to completed
-gzip files.
+exists. The row is inserted after live artifact writes, so paths refer to
+completed gzip files. An offline migration can later attach validated LAR
+pointers without deleting or replacing those source paths.
 
 ```text
 <data_dir>/alexandria.sqlite3
@@ -34,11 +37,20 @@ gzip files.
   <trace-id>.response.body.gz
   <tool-id>.tool-args.json.gz
   <tool-id>.tool-result.json.gz
+<data_dir>/lar/
+  legacy-v1.lar
+  legacy-v1.import.json       # present only while a migration is incomplete
 ```
 
 Writes use a same-directory temporary file, gzip it, sync it, then rename it to
 the final path. This prevents a trace row from pointing at a partially written
 artifact after the normal write succeeds.
+
+`alex traces migrate-lar [--max-entries N]` imports authoritative SQLite body
+references into `lar/legacy-v1.lar`. The archive and resumable checkpoint are
+synced before all selected SQLite pointers switch in one transaction. Original
+gzip paths and files remain available for fallback and rollback. See
+[LAR V1](lar-v1.md) for the exact migration and bounded-read contract.
 
 ## Redaction boundary
 
@@ -202,8 +214,9 @@ alex traces du --json
 alex traces prune --older-than 30d --dry-run
 ```
 
-Export rows are ordered by request time. `--bodies` inlines all available gzip
-artifacts as base64 and can produce sensitive, large files.
+Export rows are ordered by request time. `--bodies` uses the unified body
+resolver (bounded LAR first, preserved gzip fallback) and inlines available
+artifacts as base64, which can produce sensitive, large files.
 
 Body retention defaults to 30 days. Row retention defaults to `0` (unlimited).
 `alex traces prune` removes old bodies/headers by default; `--rows` also deletes

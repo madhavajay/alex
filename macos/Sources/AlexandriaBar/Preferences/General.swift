@@ -235,7 +235,7 @@ struct GeneralPreferencesPane: View {
 
         SectionLabel(text: "Daemon")
             .settingsSectionSpacing()
-        SettingRow(label: "Binary path", hint: "Blank = auto-discover the alexandria binary") {
+        SettingRow(label: "Binary path", hint: "Blank = auto-discover the Alex CLI") {
             TextField("auto", text: $binaryPath)
                 .settingsField()
         }

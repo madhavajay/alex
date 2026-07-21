@@ -3838,10 +3838,10 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
                     "id": format!("claude-alex/{m}"),
                     "display_name": format!("alex/{m}"),
                     "object": "model",
-                    "owned_by": "alexandria",
+                    "owned_by": "alex",
                 })
             } else {
-                json!({"id": m, "object": "model", "owned_by": "alexandria"})
+                json!({"id": m, "object": "model", "owned_by": "alex"})
             }
         })
         .collect();
@@ -4297,7 +4297,7 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
                 .header("content-type", "application/grpc-web+proto")
                 .header("x-grpc-web", "1")
                 .header("x-user-agent", "connect-es/2.1.1")
-                .header("user-agent", "Alexandria")
+                .header("user-agent", concat!("Alex/", env!("CARGO_PKG_VERSION")))
                 .body(GROK_CREDITS_REQUEST_BODY.to_vec())
                 .timeout(Duration::from_secs(15))
                 .send()
@@ -16908,6 +16908,20 @@ mod tests {
         assert!(
             ids.iter().all(|id| !id.starts_with("alexandria/")),
             "legacy alexandria/* ids leaked into /v1/models: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_model_catalog_uses_alex_owner_metadata() {
+        let state = test_state("models-alex-owner");
+        let (status, body) =
+            response_json(models(State(state), HeaderMap::new()).await.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["data"].as_array().expect("model list");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row["owned_by"] == "alex"),
+            "legacy owner metadata leaked into /v1/models: {rows:?}"
         );
     }
 

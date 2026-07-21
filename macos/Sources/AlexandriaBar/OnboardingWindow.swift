@@ -32,7 +32,7 @@ final class OnboardingModel {
     static let currentVersion = "1"
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
-        "Credentials for any app", "Never lose a login", "Keep your agents running",
+        "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
         "Beyond single provider", "PAM — Experimental",
     ]
 
@@ -809,10 +809,10 @@ struct OnboardingView: View {
                     .frame(maxWidth: .infinity, maxHeight: 220)
                     .clipShape(RoundedRectangle(cornerRadius: AlexTheme.Radius.lg))
             }
-            Text("One local daemon that speaks every provider's API and converts between all of them.")
+            Text("One local daemon exposing four client APIs and routing each request through supported provider and model paths.")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(AlexTheme.Colors.foreground)
-            Text("Alex lets you manage and combine your token providers in novel ways — and use them from any harness or application.")
+            Text("Alex lets you manage and combine your token providers — and use them from compatible connected harnesses and API clients.")
                 .font(.system(size: 13))
                 .foregroundStyle(AlexTheme.Colors.textSecondary)
         }
@@ -1166,7 +1166,7 @@ struct OnboardingView: View {
 
     private var credentials: some View {
         VStack(alignment: .leading, spacing: 14) {
-            intro("Credentials for any app", "Settings → Credentials can mint scoped, model-only keys for any application.")
+            intro("Credentials for compatible apps", "Settings → Credentials can mint scoped, model-only keys for compatible API clients.")
             VStack(alignment: .leading, spacing: 7) {
                 Text("APIs your app can speak")
                     .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
@@ -1179,7 +1179,7 @@ struct OnboardingView: View {
                 Text("Models you reach through them")
                     .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 76), spacing: 7)], spacing: 7) {
-                    ForEach(["Claude", "GPT/Codex", "Gemini", "Grok", "Kimi", "OpenRouter", "Exo", "Amp"], id: \.self) { name in
+                    ForEach(["Claude", "GPT/Codex", "Gemini", "Grok", "Kimi", "OpenRouter", "Exo", "CLIProxyAPI"], id: \.self) { name in
                         Text(name)
                             .font(.system(size: 11, weight: .medium))
                             .padding(.horizontal, 9).padding(.vertical, 5)
@@ -1187,7 +1187,7 @@ struct OnboardingView: View {
                             .overlay(Capsule().strokeBorder(AlexTheme.Colors.primary.opacity(0.25)))
                     }
                 }
-                Text("Your app speaks one of these formats — Alex routes it to any provider's models.")
+                Text("Your app speaks one of these formats — Alex routes supported client and provider combinations and reports unsupported pairs explicitly.")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(AlexTheme.Colors.foreground)
             }.padding(14).cardStyle()
             credentialsDemo
@@ -1259,7 +1259,7 @@ struct OnboardingView: View {
             .padding(14).cardStyle()
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Mint a real one-hour key to try Alex from any OpenAI-compatible app.")
+                Text("Mint a real one-hour key to try Alex from an OpenAI-compatible app.")
                     .font(.system(size: 12)).foregroundStyle(AlexTheme.Colors.textSecondary)
                 PillButton(
                     title: "Mint onboarding key", variant: .solidAccent, systemImage: "key",
@@ -1277,7 +1277,7 @@ struct OnboardingView: View {
     private var notifications: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "paperplane.circle.fill").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.primary)
-            intro("Never lose a login", "Alex detects when your credentials need re-authenticating and can message you to refresh them — or simply switch models for you.")
+            intro("Never lose a login", "Alex detects when credentials need re-authenticating and can message you to refresh them. Enabled middleware can reroute eligible failures.")
             statusCard(icon: "text.bubble", tint: AlexTheme.Colors.success, text: "/status shows subscriptions, usage, and ping health wherever you are.")
         }
     }
@@ -1285,7 +1285,7 @@ struct OnboardingView: View {
     private var failover: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.success)
-            intro("Keep your agents running", "Settings → Failover lets you pair models that can take over for each other.")
+            intro("Keep your agents running", "Settings → Middleware lets you enable or edit rules that can move eligible work between models.")
             VStack(alignment: .leading, spacing: 9) {
                 failoverPair("alex/claude-fable-5", "alex/gpt-5.6-sol")
                 failoverPair("alex/gpt-5.6-sol", "alex/claude-fable-5")
@@ -1293,7 +1293,7 @@ struct OnboardingView: View {
             .padding(14).cardStyle()
             statusCard(
                 icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary,
-                text: "capacity errors, logouts, or guardrail refusals move work to the other model automatically.")
+                text: "When enabled, middleware can reroute selected capacity and server failures. Authentication and refusal reroutes require explicit rules.")
         }
     }
 

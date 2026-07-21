@@ -383,7 +383,7 @@ struct DarioView: View {
             Label("What is Dario?", systemImage: "questionmark.circle")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(AlexTheme.Colors.foreground)
-            Text("Dario mode — an always-prepared generational supervisor for the @askalf/dario Anthropic upstream with health probes, automatic updates, and rolling restarts; routing remains an explicit toggle.")
+            Text("Dario is the supervised Anthropic path for non-Claude-Code clients, with health probes, automatic updates, and rolling restarts. Genuine Claude Code remains direct.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

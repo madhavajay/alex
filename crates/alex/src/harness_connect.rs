@@ -891,7 +891,7 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
         println!("models: {}", summary.models.len());
         println!("session extension: {}", summary.extension_path.display());
         println!();
-        println!("pi --provider alexandria --model claude-opus-4-8");
+        println!("pi --model alex/claude-opus-4-8");
         println!("or pick via /model inside pi — changes hot-reload");
     }
     Ok(())
@@ -2895,11 +2895,7 @@ export default function (amp: PluginAPI) {
     }, true)
   })
 
-  amp.registerCommand('alexandria-status', {
-    title: 'Status',
-    category: 'Alex',
-    description: 'Check lifecycle reporting and show the current Amp thread ID',
-  }, async (ctx) => {
+  const statusCommand = async (ctx) => {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 1000)
     try {
@@ -2913,7 +2909,18 @@ export default function (amp: PluginAPI) {
     } finally {
       clearTimeout(timeout)
     }
-  })
+  }
+  const statusCommandOptions = {
+    title: 'Status',
+    category: 'Alex',
+    description: 'Check lifecycle reporting and show the current Amp thread ID',
+  }
+  amp.registerCommand('alex-status', statusCommandOptions, statusCommand)
+  // Keep the old command as a compatibility alias for existing Amp installs.
+  amp.registerCommand('alexandria-status', {
+    ...statusCommandOptions,
+    title: 'Status (legacy alias)',
+  }, statusCommand)
 }
 "#;
 
@@ -5917,7 +5924,9 @@ mod tests {
             assert!(source.contains(&format!("amp.on('{event}'")));
         }
         assert!(source.contains("return { action: 'allow' }"));
+        assert!(source.contains("alex-status"));
         assert!(source.contains("alexandria-status"));
+        assert!(source.contains("Status (legacy alias)"));
         assert!(source.contains("hook_event_name: 'SubagentStart'"));
         assert!(source.contains("hook_event_name: 'SubagentStop'"));
         assert!(source.contains("http://127.0.0.1:4100/harness-events"));

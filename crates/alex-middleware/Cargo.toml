@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Runtime-neutral declarative middleware policy engine for Alexandria"
+description = "Runtime-neutral declarative middleware policy engine for Alex"
 
 [dependencies]
 aho-corasick = "1"

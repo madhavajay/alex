@@ -1888,7 +1888,7 @@ if [ -z "$real" ]; then
   real="$(command -v claude 2>/dev/null || true)"
 fi
 if [ -z "$real" ]; then
-  echo "alexandria dario claude shim: claude not found" >&2
+  echo "Alex Dario Claude shim: Claude Code executable not found" >&2
   exit 127
 fi
 has_model=0

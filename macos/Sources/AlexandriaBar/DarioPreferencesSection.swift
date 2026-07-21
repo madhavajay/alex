@@ -222,16 +222,11 @@ struct DarioPreferencesSection: View {
     private var health: DarioHealthEvaluation { DarioHealth.evaluate(status) }
 
     private func routingLine(_ status: DarioAdminStatus) -> String {
-        let mode = store.config?.anthropicUpstream ?? "direct"
-        let enabled = status.routeEnabled ?? (mode == "dario")
-        let effective = enabled ? "dario" : "direct"
-        let reason: String
-        switch mode {
-        case "auto": reason = enabled ? "auto route enabled" : "auto route inactive"
-        case "dario": reason = enabled ? "explicitly enabled" : "route disabled by daemon"
-        default: reason = enabled ? "enabled by daemon" : "direct mode selected"
-        }
-        return "routing: \(effective) — \(mode): \(reason)"
+        let storedMode = store.config?.anthropicUpstream ?? "auto"
+        let effective = status.routeEnabled == true
+            ? "Dario for non-Claude-Code"
+            : "Dario required but unavailable"
+        return "effective: \(effective) · stored mode: \(storedMode) (compatibility)"
     }
 
     private func activeGeneration(in status: DarioAdminStatus) -> DarioGenerationDetail? {

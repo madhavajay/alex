@@ -26,7 +26,8 @@ The installer verifies the release archive's SHA-256 checksum, installs under `%
 This preview includes:
 
 - daemon and account status;
-- existing-account display and OAuth onboarding for Claude, Codex, Gemini, Grok, Kimi, and Amp;
+- existing-account display and OAuth onboarding for Claude, Codex, Gemini, Grok, and Kimi;
+- Amp CLI/API-key import for wrap capture and billing status;
 - OpenRouter key and Exo endpoint setup;
 - a middleware browser for built-in and user rules, including readable conditions/actions, live enable/disable, and fixture dry-runs;
 - cursor-paginated trace summaries (25 at a time, maximum 100 per request);
