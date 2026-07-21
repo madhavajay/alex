@@ -8967,6 +8967,10 @@ enum ServiceState {
         unit_present: bool,
     },
     SystemdMissing,
+    WindowsTask {
+        installed: bool,
+        running: bool,
+    },
     Unsupported,
 }
 
@@ -9159,6 +9163,45 @@ const SYSTEMD_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/config/systemd/alexandria.service"
 ));
+const WINDOWS_TASK_NAME: &str = "AlexDaemon";
+
+fn run_windows_service_script(
+    script: &str,
+    executable: Option<&Path>,
+) -> Result<std::process::Output> {
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
+    if let Some(executable) = executable {
+        command.env("ALEX_SERVICE_EXE", executable);
+    }
+    command.output().context("running Windows Task Scheduler command")
+}
+
+fn windows_service_error(action: &str, output: &std::process::Output) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Windows Task Scheduler {action} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn windows_task_executable_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
 
 const LAUNCHD_LABEL: &str = "com.alexandria.daemon";
 const LAUNCHD_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -9516,8 +9559,28 @@ fn service_install(config: &Config) -> Result<()> {
             "  {}",
             ui::dim("tip: loginctl enable-linger $USER keeps it running after logout")
         );
+    } else if cfg!(target_os = "windows") {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $action=New-ScheduledTaskAction -Execute $env:ALEX_SERVICE_EXE -Argument 'daemon'; \
+             $trigger=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; \
+             Register-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -Action $action -Trigger $trigger \
+               -Description 'Alex local AI daemon' -RunLevel Limited -Force | Out-Null; \
+             Start-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}'"
+        );
+        let task_executable = windows_task_executable_path(&exe);
+        let output = run_windows_service_script(&script, Some(&task_executable))?;
+        if !output.status.success() {
+            return Err(windows_service_error("install", &output));
+        }
+        println!(
+            "{} {}",
+            ui::gold(ui::diamond()),
+            ui::bold("Windows user task installed and started")
+        );
+        println!("  {}", ui::dim(WINDOWS_TASK_NAME));
     } else {
-        anyhow::bail!("service install supports macOS (launchd) and Linux (systemd) only");
+        anyhow::bail!("service install is not supported on this operating system");
     }
     evict_co_bound_daemons_after_install();
     println!("  {}", service_state_label(&detect_service_state()));
@@ -9585,7 +9648,32 @@ async fn service_restart(config: &Config, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if force {
+            eprintln!("note: --force is a launchd compatibility flag; Task Scheduler restart already stops the current task");
+        }
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $task=Get-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -ErrorAction Stop; \
+             if ($task.State -eq 'Running') {{ Stop-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' }}; \
+             Start-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}'"
+        );
+        let output = run_windows_service_script(&script, None)?;
+        if !output.status.success() {
+            return Err(windows_service_error("restart", &output));
+        }
+        if !wait_for_local_health(config).await? {
+            bail!(
+                "Windows user task restarted but the daemon did not become healthy at {}",
+                config.base_url()
+            );
+        }
+        println!("Windows user task restarted");
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (config, force);
         anyhow::bail!(
@@ -9875,8 +9963,22 @@ fn service_uninstall() -> Result<()> {
             .args(["--user", "daemon-reload"])
             .output();
         println!("systemd user service removed");
+    } else if cfg!(target_os = "windows") {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $task=Get-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -ErrorAction SilentlyContinue; \
+             if ($null -ne $task) {{ \
+               if ($task.State -eq 'Running') {{ Stop-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' }}; \
+               Unregister-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -Confirm:$false \
+             }}"
+        );
+        let output = run_windows_service_script(&script, None)?;
+        if !output.status.success() {
+            return Err(windows_service_error("uninstall", &output));
+        }
+        println!("Windows user task removed");
     } else {
-        anyhow::bail!("service uninstall supports macOS and Linux only");
+        anyhow::bail!("service uninstall is not supported on this operating system");
     }
     Ok(())
 }
@@ -9915,6 +10017,17 @@ fn service_state_label(state: &ServiceState) -> String {
             "systemd: not installed → alex service install".into()
         }
         ServiceState::SystemdMissing => "systemd: systemctl not found".into(),
+        ServiceState::WindowsTask {
+            installed: true,
+            running: true,
+        } => "Task Scheduler: installed + running".into(),
+        ServiceState::WindowsTask {
+            installed: true,
+            running: false,
+        } => "Task Scheduler: installed but stopped → alex service restart".into(),
+        ServiceState::WindowsTask {
+            installed: false, ..
+        } => "Task Scheduler: not installed → alex service install".into(),
         ServiceState::Unsupported => "service management: unsupported OS".into(),
     }
 }
@@ -9922,7 +10035,12 @@ fn service_state_label(state: &ServiceState) -> String {
 fn service_managed(state: &ServiceState) -> bool {
     matches!(
         state,
-        ServiceState::LaunchdLoaded { .. } | ServiceState::Systemd { active: true, .. }
+        ServiceState::LaunchdLoaded { .. }
+            | ServiceState::Systemd { active: true, .. }
+            | ServiceState::WindowsTask {
+                installed: true,
+                running: true,
+            }
     )
 }
 
@@ -9931,6 +10049,8 @@ fn detect_service_state() -> ServiceState {
     return detect_service_state_macos();
     #[cfg(target_os = "linux")]
     return detect_service_state_linux();
+    #[cfg(target_os = "windows")]
+    return detect_service_state_windows();
     #[allow(unreachable_code)]
     ServiceState::Unsupported
 }
@@ -9986,6 +10106,26 @@ fn detect_service_state_linux() -> ServiceState {
                 unit_present,
             }
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn detect_service_state_windows() -> ServiceState {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         (Get-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -ErrorAction Stop).State.ToString()"
+    );
+    match run_windows_service_script(&script, None) {
+        Ok(output) if output.status.success() => ServiceState::WindowsTask {
+            installed: true,
+            running: String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .eq_ignore_ascii_case("running"),
+        },
+        _ => ServiceState::WindowsTask {
+            installed: false,
+            running: false,
+        },
     }
 }
 
@@ -10603,6 +10743,9 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             ServiceState::LaunchdNotLoaded
             | ServiceState::Systemd {
                 unit_present: true, ..
+            }
+            | ServiceState::WindowsTask {
+                installed: true, ..
             } => ui::yellow(ui::dot()),
             _ => ui::dim(ui::circle()),
         }
@@ -10617,6 +10760,13 @@ async fn run_status(config: &Config, json: bool) -> Result<()> {
             "  {} {}",
             ui::pad_right("", 10),
             ui::dim("unit: ~/.config/systemd/user/alexandria.service")
+        );
+    }
+    if let ServiceState::WindowsTask { installed: true, .. } = service {
+        println!(
+            "  {} {}",
+            ui::pad_right("", 10),
+            ui::dim(&format!("task: {WINDOWS_TASK_NAME}"))
         );
     }
     match health {
@@ -14015,7 +14165,38 @@ fi"#,
         })
         .contains("not installed"));
         assert!(service_state_label(&ServiceState::SystemdMissing).contains("not found"));
+        assert!(service_state_label(&ServiceState::WindowsTask {
+            installed: true,
+            running: true,
+        })
+        .contains("running"));
+        assert!(service_state_label(&ServiceState::WindowsTask {
+            installed: true,
+            running: false,
+        })
+        .contains("alex service restart"));
+        assert!(service_state_label(&ServiceState::WindowsTask {
+            installed: false,
+            running: false,
+        })
+        .contains("alex service install"));
         assert!(service_state_label(&ServiceState::Unsupported).contains("unsupported OS"));
+    }
+
+    #[test]
+    fn windows_task_paths_remove_verbatim_prefixes_without_changing_normal_paths() {
+        assert_eq!(
+            windows_task_executable_path(Path::new(r"\\?\C:\Users\alex\bin\alex.exe")),
+            PathBuf::from(r"C:\Users\alex\bin\alex.exe")
+        );
+        assert_eq!(
+            windows_task_executable_path(Path::new(r"\\?\UNC\server\share\alex.exe")),
+            PathBuf::from(r"\\server\share\alex.exe")
+        );
+        assert_eq!(
+            windows_task_executable_path(Path::new(r"C:\Alex\alex.exe")),
+            PathBuf::from(r"C:\Alex\alex.exe")
+        );
     }
 
     #[test]
@@ -14034,6 +14215,18 @@ fi"#,
             unit_present: true
         }));
         assert!(!service_managed(&ServiceState::SystemdMissing));
+        assert!(service_managed(&ServiceState::WindowsTask {
+            installed: true,
+            running: true,
+        }));
+        assert!(!service_managed(&ServiceState::WindowsTask {
+            installed: true,
+            running: false,
+        }));
+        assert!(!service_managed(&ServiceState::WindowsTask {
+            installed: false,
+            running: false,
+        }));
         assert!(!service_managed(&ServiceState::Unsupported));
     }
 

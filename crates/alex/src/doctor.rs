@@ -362,6 +362,9 @@ fn service_check(service: &ServiceState, daemon_up: bool) -> DoctorCheck {
         ServiceState::Unsupported => {
             "start Alex with `alex daemon` and keep that process running on this platform"
         }
+        ServiceState::WindowsTask {
+            installed: true, ..
+        } => "run `alex service restart` to start the installed Windows user task",
         _ => "run `alex service install` to install and start the user service",
     };
     check(

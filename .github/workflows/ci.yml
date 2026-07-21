@@ -28,6 +28,21 @@ jobs:
         run: cargo test -p alex-proxy deterministic_platform_smoke -- --nocapture
       - name: Platform browser-launch contract
         run: cargo test -p alex browser_launch_commands_are_platform_specific -- --nocapture
+      - name: Parse Windows release installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install-release.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
       - run: cargo test --workspace
       - run: cargo package -p alex-core
 

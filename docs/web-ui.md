@@ -14,6 +14,15 @@ alex web --no-open
 
 `alex web` starts a background daemon if the configured local daemon is not already healthy. The URL always uses loopback even when Alex also listens on a LAN or VPN interface. The page obtains its administrative credential from the loopback-only `/connect` bootstrap endpoint; it does not put the credential in a URL, HTML asset, or browser storage.
 
+On Windows 11, install the signed release and its per-user Task Scheduler service from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/madhavajay/alex/main/install-release.ps1 | iex
+alex web
+```
+
+The installer verifies the release archive's SHA-256 checksum, installs under `%LOCALAPPDATA%\Alex\bin`, adds that directory to the user `PATH`, and runs `alex service install`. Use `alex service restart` and `alex service uninstall` for the same lifecycle exposed on macOS and Linux.
+
 This preview includes:
 
 - daemon, account, and middleware status;
@@ -22,7 +31,7 @@ This preview includes:
 - cursor-paginated trace summaries (25 at a time, maximum 100 per request);
 - lazy opening of one trace's metadata. Request and response bodies remain separate, on-demand endpoints.
 
-The menu-bar app, Launch at Login, and native notifications remain macOS-only. Linux uses the systemd user service (`alex service install`, `alex service restart`). Windows service installation is not yet supported; run `alex daemon --background` or let `alex web` start the foreground executable in the background. The CI Windows job remains advisory while that lifecycle path is completed.
+The menu-bar app and native notifications remain macOS-only. Linux uses the systemd user service; Windows uses a per-user Task Scheduler entry. Both are managed with `alex service install`, `alex service restart`, and `alex service uninstall`. The CI Windows job remains advisory until a clean Windows 11 runner has exercised install, restart, routing, and trace inspection end to end.
 
 ## HTTP surface
 
