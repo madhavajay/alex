@@ -1170,6 +1170,9 @@ impl Vault {
             (Provider::Openrouter, _) => Err(anyhow!(
                 "openrouter accounts use a long-lived API key; re-run `alex auth openrouter-key`"
             )),
+            (Provider::Cliproxyapi, _) => Err(anyhow!(
+                "CLIProxyAPI accounts use a long-lived API key; reconnect the integration"
+            )),
             (Provider::Exo, _) => Err(anyhow!("exo is configured locally and has no account to refresh")),
             (Provider::Kimi, Some(rt)) => self.refresh_kimi(&rt).await,
             (Provider::Amp, _) => Err(anyhow!(
@@ -1259,6 +1262,7 @@ impl Vault {
                 let _ = import_amp(self).await;
             }
             Provider::Openrouter => {}
+            Provider::Cliproxyapi => {}
             Provider::Exo => {}
             Provider::Kimi => {
                 let _ = import_kimi(self).await;
@@ -2165,6 +2169,60 @@ pub async fn remove_openrouter_api_key(vault: &Vault) -> Result<bool> {
     vault.remove("openrouter-api-key").await
 }
 
+/// Save or replace the single CLIProxyAPI integration. The caller is
+/// responsible for probing and normalizing the endpoint first; keeping that
+/// network validation in the proxy crate lets the CLI and admin API share the
+/// exact same capability check without teaching the vault about HTTP.
+pub async fn save_cliproxyapi_account(
+    vault: &Vault,
+    api_base: &str,
+    credential: &str,
+    models: &[String],
+) -> Result<String> {
+    let api_base = api_base.trim();
+    if api_base.is_empty() {
+        bail!("empty CLIProxyAPI URL");
+    }
+    let credential = credential.trim();
+    if credential.is_empty() {
+        bail!("empty CLIProxyAPI credential");
+    }
+    let id = "cliproxyapi-default";
+    let existing = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == id);
+    let account = Account {
+        id: id.into(),
+        provider: Provider::Cliproxyapi,
+        kind: "api_key".into(),
+        name: "default".into(),
+        description: Some(api_base.to_string()),
+        paused: existing.as_ref().is_some_and(|account| account.paused),
+        label: Some("CLIProxyAPI".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(credential.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: json!({
+            "api_base": api_base,
+            "models": models,
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: existing.and_then(|account| account.path),
+    };
+    vault.upsert(account).await?;
+    Ok(id.into())
+}
+
+pub async fn remove_cliproxyapi_account(vault: &Vault) -> Result<bool> {
+    vault.remove("cliproxyapi-default").await
+}
+
 async fn import_grok(vault: &Vault) -> ImportOutcome {
     let mut outcome = ImportOutcome {
         source: "grok".into(),
@@ -2793,6 +2851,45 @@ mod tests {
                 .find(|account| account.id == personal)
                 .and_then(|account| account.api_key.as_deref()),
             Some("or-personal-fresh")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_account_save_replaces_url_key_and_catalog() {
+        let dir = temp_dir("cliproxyapi-account");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let id = save_cliproxyapi_account(
+            &vault,
+            "http://127.0.0.1:8317/v1",
+            "first-key",
+            &["gpt-4o".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(id, "cliproxyapi-default");
+        let replaced = save_cliproxyapi_account(
+            &vault,
+            "https://proxy.example/v1",
+            "second-key",
+            &["claude-sonnet".into(), "gpt-5".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced, id);
+        assert_eq!(vault.list().await.len(), 1);
+
+        drop(vault);
+        let reopened = Vault::open(dir.clone()).unwrap();
+        let account = reopened
+            .account_for(Provider::Cliproxyapi, false)
+            .await
+            .unwrap();
+        assert_eq!(account.api_key.as_deref(), Some("second-key"));
+        assert_eq!(account.account_meta["api_base"], "https://proxy.example/v1");
+        assert_eq!(
+            account.account_meta["models"],
+            json!(["claude-sonnet", "gpt-5"])
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

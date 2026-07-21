@@ -78,17 +78,17 @@ enum Command {
     },
     /// Print env exports for pointing harnesses at the daemon
     Env,
-    /// Connect an installed AI harness to this daemon
+    /// Connect an installed AI harness, or a CLIProxyAPI upstream, to this daemon
     Connect {
-        /// Harness name; omit to show detection status
+        /// Harness name; use `cliproxyapi` with --url and --key for an upstream
         harness: Option<String>,
         /// Override the harness config dir
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        /// Alex daemon base URL (env: ALEXANDRIA_URL)
+        /// Alex daemon URL, or CLIProxyAPI upstream URL for the cliproxyapi target
         #[arg(long)]
         url: Option<String>,
-        /// Pre-minted harness key (env: ALEXANDRIA_HARNESS_KEY)
+        /// Pre-minted harness key, or CLIProxyAPI bearer credential
         #[arg(long)]
         key: Option<String>,
         /// Cosmetic ID for a pre-minted key
@@ -926,9 +926,7 @@ enum TracesCommand {
         force: bool,
     },
     /// Restore missing trace history and captured bodies from a backup (offline)
-    Import {
-        path: PathBuf,
-    },
+    Import { path: PathBuf },
     /// List legacy orphan groups, or attach one group after explicit confirmation (offline)
     Reattach {
         /// The old, now-unresolvable account id shown by the listing
@@ -1820,6 +1818,7 @@ fn open_vault(config: &Config) -> Result<Vault> {
             "gemini" | "google" => alex_core::Provider::Gemini,
             "amp" | "ampcode" => alex_core::Provider::Amp,
             "openrouter" | "or" => alex_core::Provider::Openrouter,
+            "cliproxyapi" | "cliproxy" | "cpa" => alex_core::Provider::Cliproxyapi,
             "kimi" | "kimi-code" => alex_core::Provider::Kimi,
             _ => continue,
         };
@@ -1890,9 +1889,78 @@ fn provider_from_cli(s: &str) -> Result<alex_core::Provider> {
         "gemini" | "google" => alex_core::Provider::Gemini,
         "amp" | "ampcode" => alex_core::Provider::Amp,
         "openrouter" | "or" => alex_core::Provider::Openrouter,
+        "cliproxyapi" | "cliproxy" | "cpa" => alex_core::Provider::Cliproxyapi,
         "kimi" | "kimi-code" => alex_core::Provider::Kimi,
         other => anyhow::bail!("unknown provider '{other}'"),
     })
+}
+
+async fn connect_cliproxyapi(config: &Config, url: &str, key: &str, json: bool) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("building CLIProxyAPI probe client")?;
+
+    // Prefer the running daemon so its in-memory vault and model catalog are
+    // updated immediately. A stopped daemon falls back to the same vault file;
+    // it will load the integration normally on its next start.
+    let admin = client
+        .post(format!("{}/admin/auth/cliproxyapi", config.base_url()))
+        .header("x-api-key", &config.local_key)
+        .json(&serde_json::json!({"url": url, "credential": key}))
+        .send()
+        .await;
+    if let Ok(response) = admin {
+        let status = response.status();
+        let body = response.bytes().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "CLIProxyAPI connect failed (HTTP {}): {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .context("daemon returned invalid CLIProxyAPI connect JSON")?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            let count = value["models"].as_array().map_or(0, Vec::len);
+            println!(
+                "{} connected CLIProxyAPI at {} — {count} models ready",
+                ui::green(ui::dot()),
+                value["url"].as_str().unwrap_or(url)
+            );
+        }
+        return Ok(());
+    }
+
+    let probe = alex_proxy::probe_cliproxyapi(&client, url, key)
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("HTTP {}: {message}", status.as_u16()))?;
+    let vault = open_vault(config)?;
+    let id =
+        alex_auth::save_cliproxyapi_account(&vault, &probe.api_base, key, &probe.models).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "saved": id,
+                "url": probe.api_base,
+                "models": probe.models,
+                "daemon_running": false,
+            }))?
+        );
+    } else {
+        println!(
+            "{} saved {id} at {} — {} models ready (start or restart Alex to route them)",
+            ui::green(ui::dot()),
+            probe.api_base,
+            probe.models.len()
+        );
+    }
+    Ok(())
 }
 
 struct DarioGlue {
@@ -2634,7 +2702,9 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         // reconnect. Mirror the daemon `/v1/models` handler: refresh the
         // OpenRouter catalog and fold in only the user-curated exposed subset.
         alex_proxy::refresh_openrouter_models(state).await;
+        alex_proxy::refresh_cliproxyapi_models(state).await;
         ids.extend(alex_proxy::openrouter_exposed_catalog(state));
+        ids.extend(alex_proxy::cliproxyapi_catalog_models(state).await);
         ids.extend(alex_proxy::exo_catalog_models(state));
         ids.extend(alex_proxy::kimi_catalog_models(state).await);
         for (alias, _) in alex_core::model_aliases() {
@@ -3439,7 +3509,10 @@ async fn main() -> Result<()> {
             .clone()
             .or_else(|| std::env::var("ALEXANDRIA_HARNESS_KEY").ok());
         let remote_url = url.clone().or_else(|| std::env::var("ALEXANDRIA_URL").ok());
-        if let Some(key) = supplied_key.as_deref() {
+        let cliproxyapi = harness
+            .as_deref()
+            .is_some_and(|name| matches!(name, "cliproxyapi" | "cliproxy" | "cpa"));
+        if let Some(key) = supplied_key.as_deref().filter(|_| !cliproxyapi) {
             let harness = harness
                 .as_deref()
                 .context("a pre-minted harness key requires a harness name")?;
@@ -3822,7 +3895,9 @@ async fn main() -> Result<()> {
             )
             .await?;
             if let Some(reason) = fallback_reason {
-                eprintln!("\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}");
+                eprintln!(
+                    "\nWARNING: Alex could not bind its configured address {host}:{port}: {reason}"
+                );
                 eprintln!("WARNING: Falling back to loopback (127.0.0.1) so the daemon remains available locally.");
                 eprintln!("WARNING: The configured address was left unchanged; choose an available interface and restart to expose it again.\n");
             }
@@ -4393,13 +4468,29 @@ async fn main() -> Result<()> {
         Command::Connect {
             harness,
             config_dir,
-            url: _,
-            key: _,
+            url,
+            key,
             key_id: _,
             tool_capture: _,
             json,
         } => {
-            harness_connect::connect_cmd(&config, harness, config_dir, json).await?;
+            if harness
+                .as_deref()
+                .is_some_and(|name| matches!(name, "cliproxyapi" | "cliproxy" | "cpa"))
+            {
+                if config_dir.is_some() {
+                    anyhow::bail!("--config-dir applies to harnesses, not CLIProxyAPI");
+                }
+                let url = url
+                    .or_else(|| std::env::var("CLIPROXYAPI_URL").ok())
+                    .context("CLIProxyAPI requires --url or CLIPROXYAPI_URL")?;
+                let key = key
+                    .or_else(|| std::env::var("CLIPROXYAPI_API_KEY").ok())
+                    .context("CLIProxyAPI requires --key or CLIPROXYAPI_API_KEY")?;
+                connect_cliproxyapi(&config, &url, &key, json).await?;
+            } else {
+                harness_connect::connect_cmd(&config, harness, config_dir, json).await?;
+            }
         }
         Command::ToolCapture {
             harness,
@@ -4444,6 +4535,7 @@ async fn main() -> Result<()> {
                                 | alex_core::Provider::Xai
                                 | alex_core::Provider::Gemini
                                 | alex_core::Provider::Openrouter
+                                | alex_core::Provider::Cliproxyapi
                                 | alex_core::Provider::Kimi
                         )
                         && !seen.contains(&a.provider)
@@ -5312,9 +5404,7 @@ fn ensure_wrap_launcher_connected(harness: &str, config_dir: &Path) -> Result<()
         _ => unreachable!("wrap launchers are only defined for Claude and Codex"),
     };
     if !connected {
-        anyhow::bail!(
-            "{harness} is not connected to Alex; run `alex connect {harness}` first"
-        );
+        anyhow::bail!("{harness} is not connected to Alex; run `alex connect {harness}` first");
     }
     Ok(())
 }
@@ -7989,7 +8079,10 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
             destination.display()
         );
     }
-    let parent = destination.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     let store = Store::open(config.data_dir.clone())?;
@@ -8042,7 +8135,10 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
         let encoder = archive.into_inner()?;
         let file = encoder.finish()?;
         file.sync_all()?;
-        Ok((body_files.len(), std::fs::metadata(&temporary_archive)?.len()))
+        Ok((
+            body_files.len(),
+            std::fs::metadata(&temporary_archive)?.len(),
+        ))
     })();
 
     let _ = std::fs::remove_dir_all(&staging);
@@ -8053,9 +8149,8 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
             return Err(error);
         }
     };
-    std::fs::rename(&temporary_archive, destination).with_context(|| {
-        format!("moving completed archive to {}", destination.display())
-    })?;
+    std::fs::rename(&temporary_archive, destination)
+        .with_context(|| format!("moving completed archive to {}", destination.display()))?;
     println!(
         "exported {} traces, {} tool calls, {} heartbeats, {} session forks, {} body files to {} ({})",
         rows.traces.len(),
@@ -8071,7 +8166,9 @@ fn traces_backup_export_cmd(config: &Config, destination: &Path, force: bool) ->
 
 fn safe_trace_archive_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
-        && path.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn read_trace_jsonl(path: &Path, label: &str) -> Result<Vec<serde_json::Value>> {
@@ -8112,10 +8209,13 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             if !safe_trace_archive_path(&path) || !seen.insert(path.clone()) {
                 bail!("invalid or duplicate archive path {}", path.display());
             }
-            let root = path.components().next().and_then(|component| match component {
-                std::path::Component::Normal(value) => value.to_str(),
-                _ => None,
-            });
+            let root = path
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    std::path::Component::Normal(value) => value.to_str(),
+                    _ => None,
+                });
             let known_root_file = matches!(
                 path.to_str(),
                 Some(
@@ -8156,10 +8256,9 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
                 bail!("trace backup is missing {required}");
             }
         }
-        let manifest: TraceBackupManifest = serde_json::from_reader(std::fs::File::open(
-            staging.join("manifest.json"),
-        )?)
-        .context("invalid trace backup manifest")?;
+        let manifest: TraceBackupManifest =
+            serde_json::from_reader(std::fs::File::open(staging.join("manifest.json"))?)
+                .context("invalid trace backup manifest")?;
         if manifest.format != TRACE_BACKUP_FORMAT
             || !(1..=TRACE_BACKUP_VERSION).contains(&manifest.version)
         {
@@ -8177,10 +8276,7 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             tool_calls: read_trace_jsonl(&staging.join("tool_calls.jsonl"), "tool_calls.jsonl")?,
             heartbeats: read_trace_jsonl(&staging.join("heartbeats.jsonl"), "heartbeats.jsonl")?,
             session_forks: if manifest.version >= 2 {
-                read_trace_jsonl(
-                    &staging.join("session_forks.jsonl"),
-                    "session_forks.jsonl",
-                )?
+                read_trace_jsonl(&staging.join("session_forks.jsonl"), "session_forks.jsonl")?
             } else {
                 Vec::new()
             },
@@ -8201,9 +8297,8 @@ fn traces_backup_import_cmd(config: &Config, source: &Path) -> Result<()> {
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(&staged, &destination).with_context(|| {
-                format!("restoring body file {}", destination.display())
-            })?;
+            std::fs::copy(&staged, &destination)
+                .with_context(|| format!("restoring body file {}", destination.display()))?;
             bodies_imported += 1;
         }
         Ok((counts, bodies_imported, bodies_skipped))
@@ -9100,6 +9195,7 @@ async fn run_pings(
         alex_core::Provider::Xai => models.xai.clone(),
         alex_core::Provider::Gemini => models.gemini.clone(),
         alex_core::Provider::Openrouter => models.openrouter.clone(),
+        alex_core::Provider::Cliproxyapi => "catalog-selected".to_string(),
         alex_core::Provider::Exo => "exo-local".to_string(),
         alex_core::Provider::Amp => "amp".to_string(),
         alex_core::Provider::Kimi => models.kimi.clone(),
@@ -11174,13 +11270,7 @@ mod tests {
             "trace-id",
         ])
         .is_err());
-        assert!(Cli::try_parse_from([
-            "alex",
-            "middleware",
-            "test",
-            "fable-to-sol",
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["alex", "middleware", "test", "fable-to-sol",]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["alex", "middleware", "leases"])
                 .unwrap()
@@ -12332,8 +12422,14 @@ continue = true
 
         traces_backup_import_cmd(&config, &archive).unwrap();
         let counts = store.reset_counts().unwrap();
-        assert_eq!((counts.traces, counts.heartbeats, counts.body_files), (2, 1, 3));
-        assert_eq!(store.session_tool_calls("archive-session").unwrap().len(), 1);
+        assert_eq!(
+            (counts.traces, counts.heartbeats, counts.body_files),
+            (2, 1, 3)
+        );
+        assert_eq!(
+            store.session_tool_calls("archive-session").unwrap().len(),
+            1
+        );
         let sessions = store.sessions(None, 0).unwrap();
         let source = sessions
             .iter()
@@ -12362,7 +12458,10 @@ continue = true
 
         traces_backup_import_cmd(&config, &archive).unwrap();
         let repeated = store.reset_counts().unwrap();
-        assert_eq!((repeated.traces, repeated.heartbeats, repeated.body_files), (2, 1, 3));
+        assert_eq!(
+            (repeated.traces, repeated.heartbeats, repeated.body_files),
+            (2, 1, 3)
+        );
         let _ = std::fs::remove_file(&archive);
     }
 
@@ -12425,14 +12524,8 @@ continue = true
 
     #[test]
     fn trace_backup_cli_surface_and_junk_archive_validation() {
-        let export = Cli::try_parse_from([
-            "alex",
-            "traces",
-            "export",
-            "backup.tar.gz",
-            "--force",
-        ])
-        .unwrap();
+        let export =
+            Cli::try_parse_from(["alex", "traces", "export", "backup.tar.gz", "--force"]).unwrap();
         match export.command {
             Some(Command::Traces {
                 command: Some(TracesCommand::Export { path, force }),
@@ -12461,7 +12554,14 @@ continue = true
             error_chain.contains("archive") || error_chain.contains("gzip"),
             "unexpected error: {error:#}"
         );
-        assert_eq!(Store::open(data_dir).unwrap().reset_counts().unwrap().traces, 0);
+        assert_eq!(
+            Store::open(data_dir)
+                .unwrap()
+                .reset_counts()
+                .unwrap()
+                .traces,
+            0
+        );
     }
 
     #[cfg(unix)]

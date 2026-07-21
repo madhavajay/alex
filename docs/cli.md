@@ -128,8 +128,8 @@ Detect or configure one installed harness to use Alex.
 | --- | --- |
 | `[HARNESS]` | Omit to show detection status. |
 | `--config-dir <PATH>` | Override the native harness config directory. |
-| `--url <URL>` | Remote daemon URL; environment alternative `ALEXANDRIA_URL`. |
-| `--key <KEY>` | Pre-minted harness key; environment alternative `ALEXANDRIA_HARNESS_KEY`. Requires harness and remote URL. |
+| `--url <URL>` | Remote daemon URL, or the upstream URL for `cliproxyapi`; environment alternatives are provider-specific. |
+| `--key <KEY>` | Pre-minted harness key, or the `cliproxyapi` bearer credential; environment alternatives are provider-specific. |
 | `--key-id <ID>` | Cosmetic ID recorded for a pre-minted key. |
 | `--tool-capture` | Install tool-execution hooks during this connection. |
 | `--json` | Machine-readable status/result. |
@@ -137,10 +137,17 @@ Detect or configure one installed harness to use Alex.
 ```bash
 alex connect codex --tool-capture
 alex connect pi --url https://alex.example.invalid --key '<redacted>' --key-id rk-abcd1234
+alex connect cliproxyapi --url http://127.0.0.1:8317/v1 --key '<redacted>'
 ```
 
 The fully remote pre-minted form is handled before local config loading, so it
 does not create `~/.alexandria/config.toml` in a worker/container.
+
+`cliproxyapi` is a provider connection rather than a harness connection. Alex
+probes the upstream `/v1/models` endpoint with the bearer credential before it
+saves or replaces the connection. Use HTTPS for remote servers; plain HTTP is
+accepted only for loopback addresses. Discovered models are exposed through
+Alex as `cliproxyapi/<upstream-model-id>`.
 
 ## `tool-capture`
 

@@ -31,6 +31,9 @@ pub enum Provider {
     Gemini,
     Xai,
     Openrouter,
+    /// A user-managed CLIProxyAPI instance exposed as an OpenAI-compatible
+    /// upstream. Kept distinct so traces preserve the integration boundary.
+    Cliproxyapi,
     Exo,
     /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
     Amp,
@@ -47,6 +50,7 @@ impl Provider {
             Provider::Gemini => "gemini",
             Provider::Xai => "xai",
             Provider::Openrouter => "openrouter",
+            Provider::Cliproxyapi => "cliproxyapi",
             Provider::Exo => "exo",
             Provider::Amp => "amp",
             Provider::Kimi => "kimi",
@@ -60,6 +64,7 @@ impl Provider {
             "gemini" | "google" => Some(Provider::Gemini),
             "xai" | "grok" => Some(Provider::Xai),
             "openrouter" | "or" => Some(Provider::Openrouter),
+            "cliproxyapi" | "cliproxy" | "cpa" => Some(Provider::Cliproxyapi),
             "exo" => Some(Provider::Exo),
             "amp" | "ampcode" => Some(Provider::Amp),
             "kimi" | "kimi-code" | "moonshot" => Some(Provider::Kimi),
@@ -104,6 +109,8 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok:", Provider::Xai),
     ("xai:", Provider::Xai),
     ("openrouter:", Provider::Openrouter),
+    ("cliproxyapi:", Provider::Cliproxyapi),
+    ("cliproxy:", Provider::Cliproxyapi),
     ("exo:", Provider::Exo),
     ("kimi:", Provider::Kimi),
     ("claude/", Provider::Anthropic),
@@ -116,6 +123,8 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok/", Provider::Xai),
     ("xai/", Provider::Xai),
     ("openrouter/", Provider::Openrouter),
+    ("cliproxyapi/", Provider::Cliproxyapi),
+    ("cliproxy/", Provider::Cliproxyapi),
     ("exo/", Provider::Exo),
     ("kimi/", Provider::Kimi),
 ];
@@ -216,6 +225,7 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
         Provider::Xai => serde_json::json!({ "windows": [] }),
         Provider::Gemini
         | Provider::Openrouter
+        | Provider::Cliproxyapi
         | Provider::Exo
         | Provider::Amp
         | Provider::Kimi => Value::Null,
@@ -615,6 +625,14 @@ mod tests {
         assert_eq!(route_model("google/gemini-3-pro").0, Some(Provider::Gemini));
         assert_eq!(route_model("grok/grok-4").0, Some(Provider::Xai));
         assert_eq!(route_model("xai/grok-4").0, Some(Provider::Xai));
+        assert_eq!(
+            route_model("cliproxyapi/openai/gpt-4o"),
+            (Some(Provider::Cliproxyapi), "openai/gpt-4o".to_string())
+        );
+        assert_eq!(
+            route_model("cliproxy/gpt-5"),
+            (Some(Provider::Cliproxyapi), "gpt-5".to_string())
+        );
         assert_eq!(
             route_model("exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
             (

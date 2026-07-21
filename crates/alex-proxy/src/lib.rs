@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-mod plugins;
 mod middleware;
+mod plugins;
 pub use plugins::{PluginManager, PluginManifest};
 pub mod notify;
 mod web;
@@ -423,6 +423,7 @@ fn routing_limits_from_headers(
             Provider::Xai => name.starts_with("x-ratelimit-"),
             Provider::Gemini
             | Provider::Openrouter
+            | Provider::Cliproxyapi
             | Provider::Exo
             | Provider::Amp
             | Provider::Kimi => false,
@@ -1014,10 +1015,8 @@ pub fn build_state_with_substitution(
         .expect("reqwest client");
     let (reset_abort, _) = tokio::sync::watch::channel(0u64);
     let middleware_root = store.data_dir.join("middleware");
-    let middleware = middleware::MiddlewareRuntime::load(
-        middleware_root.clone(),
-        substitution.clone(),
-    );
+    let middleware =
+        middleware::MiddlewareRuntime::load(middleware_root.clone(), substitution.clone());
     let middleware_leases = middleware::load_leases(&middleware_root)
         .into_iter()
         .map(|lease| (lease.id.clone(), lease))
@@ -1213,6 +1212,206 @@ pub fn openrouter_exposed_catalog(state: &AppState) -> Vec<String> {
         .unwrap_or_default();
     sort_model_ids(&mut ids);
     ids
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CliproxyapiProbe {
+    pub api_base: String,
+    pub models: Vec<String>,
+}
+
+/// Validate and canonicalize a CLIProxyAPI API root. Credentials may only be
+/// sent over HTTPS, except to a loopback HTTP service. The endpoint is an API
+/// root rather than an arbitrary URL: an omitted path becomes `/v1`, while a
+/// reverse-proxy prefix is accepted only when it also terminates in `/v1`.
+pub fn normalize_cliproxyapi_url(input: &str) -> std::result::Result<String, String> {
+    let mut url = reqwest::Url::parse(input.trim())
+        .map_err(|error| format!("invalid CLIProxyAPI URL: {error}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("CLIProxyAPI URL must not contain credentials".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("CLIProxyAPI URL must not contain a query or fragment".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "CLIProxyAPI URL must include a host".to_string())?;
+    if url.scheme() != "https" {
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if url.scheme() != "http" || !loopback {
+            return Err("CLIProxyAPI URL must use HTTPS (loopback HTTP is allowed)".into());
+        }
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        url.set_path("/v1");
+    } else if !path.ends_with("/v1") {
+        return Err("CLIProxyAPI URL path must end in /v1".into());
+    } else {
+        url.set_path(&path);
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn cliproxyapi_loop_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    [
+        "alex/",
+        "alex:",
+        "alexandria/",
+        "alexandria:",
+        "cove/",
+        "claude-alex/",
+        "cliproxyapi/",
+        "cliproxyapi:",
+        "cliproxy/",
+        "cliproxy:",
+    ]
+    .iter()
+    .any(|prefix| id.starts_with(prefix))
+}
+
+pub fn parse_cliproxyapi_models(payload: &Value) -> Vec<String> {
+    let mut models: Vec<String> = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| is_valid_openrouter_id(id) && !cliproxyapi_loop_model(id))
+        .map(String::from)
+        .collect();
+    sort_model_ids(&mut models);
+    models.dedup();
+    models.truncate(1_000);
+    models
+}
+
+pub async fn probe_cliproxyapi(
+    client: &reqwest::Client,
+    input_url: &str,
+    credential: &str,
+) -> std::result::Result<CliproxyapiProbe, (StatusCode, String)> {
+    let api_base = normalize_cliproxyapi_url(input_url)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let credential = credential.trim();
+    if credential.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "CLIProxyAPI credential must not be empty".into(),
+        ));
+    }
+    let response = client
+        .get(format!("{api_base}/models"))
+        .bearer_auth(credential)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("CLIProxyAPI /v1/models probe failed: {error}"),
+            )
+        })?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("CLIProxyAPI /v1/models response could not be read: {error}"),
+        )
+    })?;
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&bytes);
+        let detail: String = detail.chars().take(500).collect();
+        return Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!(
+                "CLIProxyAPI /v1/models rejected the credential (HTTP {}): {}",
+                status.as_u16(),
+                detail.replace(['\r', '\n'], " ")
+            ),
+        ));
+    }
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("CLIProxyAPI /v1/models returned invalid JSON: {error}"),
+        )
+    })?;
+    let models = parse_cliproxyapi_models(&payload);
+    if models.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "CLIProxyAPI /v1/models did not return any safe non-Alex models".into(),
+        ));
+    }
+    Ok(CliproxyapiProbe { api_base, models })
+}
+
+fn cliproxyapi_bare_models(account: &Account) -> Vec<String> {
+    let mut models: Vec<String> = account
+        .account_meta
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|id| is_valid_openrouter_id(id) && !cliproxyapi_loop_model(id))
+        .map(String::from)
+        .collect();
+    sort_model_ids(&mut models);
+    models.dedup();
+    models
+}
+
+pub async fn cliproxyapi_catalog_models(state: &AppState) -> Vec<String> {
+    let mut models: Vec<String> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| {
+            account.provider == Provider::Cliproxyapi
+                && account.status == "active"
+                && !account.paused
+        })
+        .flat_map(|account| cliproxyapi_bare_models(&account))
+        .map(|id| format!("cliproxyapi/{id}"))
+        .collect();
+    sort_model_ids(&mut models);
+    models.dedup();
+    models
+}
+
+pub async fn refresh_cliproxyapi_models(state: &AppState) {
+    let Ok(account) = state.vault.account_for(Provider::Cliproxyapi, false).await else {
+        return;
+    };
+    let Some(api_base) = account.account_meta.get("api_base").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(credential) = account.api_key.as_deref() else {
+        return;
+    };
+    match probe_cliproxyapi(&state.http, api_base, credential).await {
+        Ok(probe) if probe.models != cliproxyapi_bare_models(&account) => {
+            if let Err(error) = state
+                .vault
+                .set_account_meta(&account.id, "models", json!(probe.models))
+                .await
+            {
+                tracing::warn!(%error, "could not persist refreshed CLIProxyAPI model catalog");
+            }
+        }
+        Ok(_) => {}
+        Err((status, error)) => {
+            tracing::debug!(status = status.as_u16(), %error, "CLIProxyAPI model refresh failed; retaining cached catalog");
+        }
+    }
 }
 
 /// Normalize a raw curated exposure list: trim, drop empties/oversized/invalid
@@ -1682,8 +1881,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/admin/middleware/rules/{id}",
-            axum::routing::put(admin_middleware_rule_replace)
-                .delete(admin_middleware_rule_delete),
+            axum::routing::put(admin_middleware_rule_replace).delete(admin_middleware_rule_delete),
         )
         .route("/admin/middleware/test", post(admin_middleware_test))
         .route("/admin/middleware/leases", get(admin_middleware_leases))
@@ -1709,6 +1907,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/auth/openrouter-key",
             post(admin_auth_openrouter_key),
         )
+        .route("/admin/auth/cliproxyapi", post(admin_auth_cliproxyapi))
+        .route("/admin/cliproxyapi", get(admin_cliproxyapi))
         .route("/admin/health", get(admin_health))
         .route("/admin/exo", get(admin_exo).put(admin_exo_update))
         .route("/admin/exo/status", get(admin_exo_status))
@@ -2903,6 +3103,91 @@ async fn admin_auth_openrouter_key(
     }
 }
 
+async fn admin_auth_cliproxyapi(
+    State(state): State<Arc<AppState>>,
+    body: axum::Json<Value>,
+) -> Response {
+    let remove = match body.0.get("remove") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return error_response(StatusCode::BAD_REQUEST, "'remove' must be boolean"),
+        },
+        None => false,
+    };
+    if remove {
+        if body.0.get("url").is_some() || body.0.get("key").is_some() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "'remove' cannot be combined with URL or credential configuration",
+            );
+        }
+        return match alex_auth::remove_cliproxyapi_account(&state.vault).await {
+            Ok(removed) => axum::Json(json!({
+                "removed": removed.then_some("cliproxyapi-default")
+            }))
+            .into_response(),
+            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+    }
+
+    let Some(url) = body.0.get("url").and_then(Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'url'");
+    };
+    let credential_value = body.0.get("credential").or_else(|| body.0.get("key"));
+    let Some(credential) = credential_value.and_then(Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing 'credential'");
+    };
+    let probe = match probe_cliproxyapi(&state.http, url, credential).await {
+        Ok(probe) => probe,
+        Err((status, message)) => return error_response(status, &message),
+    };
+    match alex_auth::save_cliproxyapi_account(
+        &state.vault,
+        &probe.api_base,
+        credential,
+        &probe.models,
+    )
+    .await
+    {
+        Ok(id) => axum::Json(json!({
+            "saved": id,
+            "url": probe.api_base,
+            "models": probe.models,
+            "capabilities": {
+                "openai_chat": true,
+                "openai_responses": true,
+                "anthropic_translation": true,
+                "streaming": true,
+                "tool_calls": true,
+            }
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn admin_cliproxyapi(State(state): State<Arc<AppState>>) -> Response {
+    refresh_cliproxyapi_models(&state).await;
+    let account = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.provider == Provider::Cliproxyapi);
+    let Some(account) = account else {
+        return axum::Json(json!({"connected": false, "models": []})).into_response();
+    };
+    axum::Json(json!({
+        "connected": account.status == "active" && !account.paused,
+        "account_id": account.id,
+        "url": account.account_meta.get("api_base").and_then(Value::as_str),
+        "models": cliproxyapi_bare_models(&account),
+        "paused": account.paused,
+        "status": account.status,
+    }))
+    .into_response()
+}
+
 async fn admin_auth_login_start(
     State(state): State<Arc<AppState>>,
     body: axum::Json<Value>,
@@ -3492,12 +3777,14 @@ async fn admin_openrouter_exposed_update(
 }
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    // OpenRouter is the sole dynamic provider catalog. Refresh only on an
-    // explicit model-list request; Alexandria has no catalog refresh worker.
+    // Dynamic provider catalogs refresh only on an explicit model-list
+    // request; Alexandria has no catalog refresh worker.
     refresh_openrouter_models(&state).await;
+    refresh_cliproxyapi_models(&state).await;
     let mut ids = state.store.pricing_models();
     // OpenRouter exposes only the user-curated subset, never its full catalog.
     ids.extend(openrouter_exposed_catalog(&state));
+    ids.extend(cliproxyapi_catalog_models(&state).await);
     ids.extend(exo_catalog_models(&state));
     ids.extend(kimi_catalog_models(&state).await);
     for (alias, _) in alex_core::model_aliases() {
@@ -5767,9 +6054,10 @@ fn transcript_inherited_turns(row: &Value) -> Vec<Value> {
     let history = &entries[..current_index];
     let genuine_prior_history = history.iter().any(|entry| {
         matches!(entry.role, "assistant" | "tool")
-            || entry.content.iter().any(|block| {
-                matches!(block["type"].as_str(), Some("tool_call" | "tool_result"))
-            })
+            || entry
+                .content
+                .iter()
+                .any(|block| matches!(block["type"].as_str(), Some("tool_call" | "tool_result")))
     });
     if !genuine_prior_history {
         return Vec::new();
@@ -6189,12 +6477,13 @@ async fn traces_run_artifacts(
     }
 }
 
-const PAUSEABLE_PROVIDERS: [Provider; 8] = [
+const PAUSEABLE_PROVIDERS: [Provider; 9] = [
     Provider::Anthropic,
     Provider::Openai,
     Provider::Gemini,
     Provider::Xai,
     Provider::Openrouter,
+    Provider::Cliproxyapi,
     Provider::Exo,
     Provider::Amp,
     Provider::Kimi,
@@ -6949,10 +7238,7 @@ async fn admin_middleware_test(
                 .unwrap_or("unknown")
                 .into(),
             status: trace["status"].as_u64().unwrap_or(500) as u16,
-            error_kind: trace["error_kind"]
-                .as_str()
-                .unwrap_or("http_status")
-                .into(),
+            error_kind: trace["error_kind"].as_str().unwrap_or("http_status").into(),
             body,
             direction: Direction::UpstreamToClient,
             created_ms: now_ms(),
@@ -7216,6 +7502,38 @@ pub async fn ping_provider(
                 "messages": [{"role": "user", "content": prompt}],
             }),
         ),
+        Provider::Cliproxyapi => {
+            let account = state.vault.account_for(Provider::Cliproxyapi, false).await;
+            let Ok(account) = account else {
+                return PingResult {
+                    provider: "cliproxyapi",
+                    account_id: None,
+                    ok: false,
+                    status: None,
+                    latency_ms: now_ms() - start,
+                    message: "no active CLIProxyAPI account".into(),
+                };
+            };
+            let Some(model) = cliproxyapi_bare_models(&account).into_iter().next() else {
+                return PingResult {
+                    provider: "cliproxyapi",
+                    account_id: Some(account.id),
+                    ok: false,
+                    status: None,
+                    latency_ms: now_ms() - start,
+                    message: "CLIProxyAPI catalog is empty; reconnect it".into(),
+                };
+            };
+            (
+                ClientFormat::OpenaiChat,
+                "/v1/chat/completions",
+                json!({
+                    "model": format!("cliproxyapi/{model}"),
+                    "stream": false,
+                    "messages": [{"role": "user", "content": prompt}],
+                }),
+            )
+        }
         Provider::Exo => match exo_model_payload(state).await {
             Ok(payload) => {
                 return PingResult {
@@ -7440,6 +7758,7 @@ pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<P
                         | Provider::Xai
                         | Provider::Gemini
                         | Provider::Openrouter
+                        | Provider::Cliproxyapi
                         | Provider::Amp
                         | Provider::Kimi
                 )
@@ -8483,6 +8802,94 @@ async fn plan_upstream(
                 )),
             }
         }
+        Provider::Cliproxyapi => {
+            let account = state
+                .vault
+                .account_for_excluding(provider, false, excluded_accounts)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let raw_base = account
+                .account_meta
+                .get("api_base")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "CLIProxyAPI account has no API base URL".to_string(),
+                    )
+                })?;
+            let api_base = normalize_cliproxyapi_url(raw_base)
+                .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+            match format {
+                ClientFormat::OpenaiChat => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{api_base}/chat/completions"),
+                        account,
+                        connection_account: None,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                        dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
+                    })
+                }
+                ClientFormat::OpenaiResponses => {
+                    body_json["model"] = json!(routed_model);
+                    let body =
+                        serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{api_base}/responses"),
+                        account,
+                        connection_account: None,
+                        body,
+                        upstream_format: "openai-responses",
+                        destream: false,
+                        respond_as: None,
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                        dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
+                    })
+                }
+                ClientFormat::AnthropicMessages => {
+                    let mut converted = translate::anthropic_to_openai_chat(body_json);
+                    converted["model"] = json!(routed_model);
+                    converted["stream"] = json!(client_stream);
+                    let body = serde_json::to_vec(&converted)
+                        .unwrap_or_else(|_| original_body.to_vec());
+                    Ok(UpstreamPlan {
+                        url: format!("{api_base}/chat/completions"),
+                        account,
+                        connection_account: None,
+                        body,
+                        upstream_format: "openai-chat",
+                        destream: false,
+                        respond_as: Some(RespondAs::Anthropic),
+                        client_stream,
+                        extra_headers: vec![],
+                        dario_guard: None,
+                        dario_fallback_reason: None,
+                        via_dario: false,
+                        dario_generation: None,
+                    })
+                }
+                ClientFormat::GeminiGenerate => Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "CLIProxyAPI currently accepts OpenAI chat/responses and Anthropic message clients"
+                        .to_string(),
+                )),
+            }
+        }
         Provider::Openrouter => {
             let account = state
                 .vault
@@ -9431,6 +9838,17 @@ fn upstream_headers(
         }
         (Provider::Openrouter, _) => {
             h.extend(openrouter_auth_headers(account)?);
+        }
+        (Provider::Cliproxyapi, _) => {
+            let key = account.api_key.as_deref().ok_or((
+                StatusCode::BAD_GATEWAY,
+                "CLIProxyAPI account has no credential".to_string(),
+            ))?;
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+            );
         }
         (Provider::Exo, _) => {
             h.insert("authorization", HeaderValue::from_static("Bearer x"));
@@ -10650,11 +11068,7 @@ fn alex_error_trace_response(
         trace.tags = merge_trace_note(trace.tags.take(), key, value);
     }
     if let Some(fingerprint) = trace.key_fingerprint.clone() {
-        trace.tags = merge_trace_note(
-            trace.tags.take(),
-            "credential_fingerprint",
-            &fingerprint,
-        );
+        trace.tags = merge_trace_note(trace.tags.take(), "credential_fingerprint", &fingerprint);
     }
 
     let response_body = serde_json::to_vec(&json!({
@@ -10901,16 +11315,12 @@ fn middleware_target_route(
             Some((provider, routed.1))
         }
         alex_middleware::RouteTarget::Equivalent { class, providers } => {
-            let targets = state
-                .middleware
-                .read()
-                .ok()?
-                .equivalent_targets(class);
+            let targets = state.middleware.read().ok()?.equivalent_targets(class);
             let find_named = |names: &[String]| {
                 names.iter().find_map(|preferred| {
-                    targets.iter().find(|(provider, _)| {
-                        provider.eq_ignore_ascii_case(preferred)
-                    })
+                    targets
+                        .iter()
+                        .find(|(provider, _)| provider.eq_ignore_ascii_case(preferred))
                 })
             };
             let selected = match providers {
@@ -10919,16 +11329,17 @@ fn middleware_target_route(
                 alex_middleware::ProviderConstraint::Prefer(preferred) => {
                     find_named(preferred).or_else(|| targets.first())
                 }
-                alex_middleware::ProviderConstraint::Exclude(excluded) => targets.iter().find(
-                    |(provider, _)| {
+                alex_middleware::ProviderConstraint::Exclude(excluded) => {
+                    targets.iter().find(|(provider, _)| {
                         !excluded
                             .iter()
                             .any(|value| value.eq_ignore_ascii_case(provider))
-                    },
-                ),
+                    })
+                }
             }?;
             let provider = Provider::from_str_loose(&selected.0)?;
-            (crate::canonical_model_alias(&selected.1) != crate::canonical_model_alias(current_model)
+            (crate::canonical_model_alias(&selected.1)
+                != crate::canonical_model_alias(current_model)
                 || provider != current_provider)
                 .then(|| (provider, selected.1.clone()))
         }
@@ -10994,7 +11405,8 @@ fn commit_middleware_route_lease(
     let Some((target, ttl_seconds, source_middleware_id, reason)) = pending else {
         return;
     };
-    let (Some(session_id), Some(harness)) = (trace.session_id.clone(), trace.harness.clone()) else {
+    let (Some(session_id), Some(harness)) = (trace.session_id.clone(), trace.harness.clone())
+    else {
         return;
     };
     let now = now_ms();
@@ -11057,12 +11469,8 @@ fn prepend_response_notice(response: &mut Value, target: RespondAs, notice: &str
         }
         RespondAs::OpenaiResponses => {
             if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
-                if let Some(message) = output
-                    .iter_mut()
-                    .find(|item| item["type"] == "message")
-                {
-                    if let Some(content) =
-                        message.get_mut("content").and_then(Value::as_array_mut)
+                if let Some(message) = output.iter_mut().find(|item| item["type"] == "message") {
+                    if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut)
                     {
                         content.insert(0, json!({"type": "output_text", "text": text}));
                     }
@@ -11109,13 +11517,8 @@ async fn proxy(
             let fingerprint: String = key_hash.chars().take(16).collect();
             match run_key_entry(&state, &key_hash) {
                 Some(entry) if entry.kind == "wrap" => {
-                    let trace = rejected_client_trace(
-                        &headers,
-                        format,
-                        path,
-                        peer,
-                        Some(fingerprint),
-                    );
+                    let trace =
+                        rejected_client_trace(&headers, format, path, peer, Some(fingerprint));
                     return alex_error_trace_response(
                         &state,
                         trace,
@@ -11124,7 +11527,7 @@ async fn proxy(
                         "wrap keys may only post to /traces/ingest",
                         "key_scope",
                         "unavailable",
-                    )
+                    );
                 }
                 Some(entry) => {
                     if let Err(e) = state.store.touch_run_key(&key_hash, now_ms()) {
@@ -11145,13 +11548,8 @@ async fn proxy(
                     } else {
                         "bad or missing local key (x-api-key / Authorization: Bearer)"
                     };
-                    let trace = rejected_client_trace(
-                        &headers,
-                        format,
-                        path,
-                        peer,
-                        Some(fingerprint),
-                    );
+                    let trace =
+                        rejected_client_trace(&headers, format, path, peer, Some(fingerprint));
                     return alex_error_trace_response(
                         &state,
                         trace,
@@ -11160,7 +11558,7 @@ async fn proxy(
                         message,
                         "auth",
                         if known { "pending" } else { "unavailable" },
-                    )
+                    );
                 }
             }
         }
@@ -11174,7 +11572,7 @@ async fn proxy(
                 "bad or missing local key (x-api-key / Authorization: Bearer)",
                 "auth",
                 "unavailable",
-            )
+            );
         }
     };
 
@@ -11318,7 +11716,9 @@ async fn proxy(
     }
     let substitution_disabled = no_substitute(&headers);
     let requested_route = route_model(&requested_model);
-    let requested_provider = requested_route.0.unwrap_or_else(|| format.default_provider());
+    let requested_provider = requested_route
+        .0
+        .unwrap_or_else(|| format.default_provider());
     let active_route_lease = (!substitution_disabled)
         .then(|| {
             active_middleware_route_lease(
@@ -11332,12 +11732,7 @@ async fn proxy(
     let (routed_provider, routed_model) = active_route_lease
         .as_ref()
         .and_then(|lease| {
-            middleware_target_route(
-                &state,
-                &lease.target,
-                requested_provider,
-                &requested_model,
-            )
+            middleware_target_route(&state, &lease.target, requested_provider, &requested_model)
         })
         .map(|(provider, model)| (Some(provider), model))
         .unwrap_or(requested_route);
@@ -11465,13 +11860,11 @@ async fn proxy(
                 emit_reauth_notification_for_account(&state, &account);
             }
         }
-        let response_body = injected_body
-            .unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
+        let response_body =
+            injected_body.unwrap_or_else(|| simulated_error_body(format, status, &kind, &message));
         let dispatch_injected = fixture_name.is_some()
             && state.vault.list_cached().into_iter().any(|account| {
-                account.provider == provider
-                    && account.status == "active"
-                    && !account.paused
+                account.provider == provider && account.status == "active" && !account.paused
             });
         if dispatch_injected {
             injected_attempt = Some((status, response_body));
@@ -11515,11 +11908,7 @@ async fn proxy(
                         .await;
                     let next = state
                         .vault
-                        .account_for_excluding(
-                            current_provider,
-                            prefer_oauth,
-                            &attempted_accounts,
-                        )
+                        .account_for_excluding(current_provider, prefer_oauth, &attempted_accounts)
                         .await
                         .ok()
                         .or_else(|| {
@@ -11581,9 +11970,7 @@ async fn proxy(
                     }));
                     let (selected, retry_same_route) = match &evaluation.decision {
                         alex_middleware::AttemptDecision::RetrySameRoute { .. } => (
-                            next.map(|account| {
-                                (current_provider, current_model.clone(), account)
-                            }),
+                            next.map(|account| (current_provider, current_model.clone(), account)),
                             true,
                         ),
                         alex_middleware::AttemptDecision::Reroute { target, .. } => {
@@ -11593,8 +11980,7 @@ async fn proxy(
                                     target,
                                     current_provider,
                                     &current_model,
-                                )
-                            {
+                                ) {
                                 state
                                     .vault
                                     .account_for_excluding(
@@ -11667,9 +12053,11 @@ async fn proxy(
                     format!("{}:{}", provider.as_str(), mode.as_str()),
                 );
             }
-            return response.body(Body::from(response_body)).unwrap_or_else(|e| {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-            });
+            return response
+                .body(Body::from(response_body))
+                .unwrap_or_else(|e| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                });
         }
     }
     let Some(in_flight) = InFlight::new(
@@ -11721,12 +12109,7 @@ async fn proxy(
     let mut current_provider = provider;
     let mut current_model = routed_model.clone();
     let mut pending_notice: Option<String> = None;
-    let mut pending_route_lease: Option<(
-        alex_middleware::RouteTarget,
-        u64,
-        String,
-        String,
-    )> = None;
+    let mut pending_route_lease: Option<(alex_middleware::RouteTarget, u64, String, String)> = None;
     let mut plan = match plan_upstream(
         &state,
         format,
@@ -11927,8 +12310,7 @@ async fn proxy(
                     .read()
                     .map(|policy| policy.clone())
                     .unwrap_or_default();
-                if (reroutable_error_class(error_class)
-                    || policy_covers(error_class, &protection))
+                if (reroutable_error_class(error_class) || policy_covers(error_class, &protection))
                     && !substitution_disabled
                 {
                     let retry_after_s = resp
@@ -12059,10 +12441,7 @@ async fn proxy(
                     .middleware
                     .read()
                     .map(|runtime| {
-                        runtime.evaluate(
-                            &context,
-                            substitution_disabled || !retry_allowed,
-                        )
+                        runtime.evaluate(&context, substitution_disabled || !retry_allowed)
                     })
                     .unwrap_or_default();
                 if let Ok(mut runtime) = state.middleware.write() {
@@ -12076,10 +12455,7 @@ async fn proxy(
                         "body_truncated".into(),
                         json!(context.outcome.body.truncated),
                     );
-                    record.insert(
-                        "middleware_decisions".into(),
-                        json!(evaluation.records),
-                    );
+                    record.insert("middleware_decisions".into(), json!(evaluation.records));
                 }
                 let source_rule = matched_terminal_rule(&evaluation);
                 let max_attempts = state
@@ -12087,9 +12463,7 @@ async fn proxy(
                     .read()
                     .map(|runtime| runtime.settings.max_attempts as usize)
                     .unwrap_or(3);
-                if attempt_records.len() >= max_attempts
-                    && evaluation.decision.is_terminal()
-                {
+                if attempt_records.len() >= max_attempts && evaluation.decision.is_terminal() {
                     tracing::warn!(max_attempts, "middleware attempt budget exhausted");
                     upstream_resp = Some(resp);
                     break 'accounts;
@@ -12098,7 +12472,12 @@ async fn proxy(
                 let next_route = match &evaluation.decision {
                     alex_middleware::AttemptDecision::RetrySameRoute { reason, .. } => {
                         same_route_plan.map(|next_plan| {
-                            (current_provider, current_model.clone(), next_plan, reason.clone())
+                            (
+                                current_provider,
+                                current_model.clone(),
+                                next_plan,
+                                reason.clone(),
+                            )
                         })
                     }
                     alex_middleware::AttemptDecision::Reroute {
@@ -12107,14 +12486,12 @@ async fn proxy(
                         notice,
                         reason,
                     } => {
-                        if let Some((provider, model)) =
-                            middleware_target_route(
-                                &state,
-                                target,
-                                current_provider,
-                                &current_model,
-                            )
-                        {
+                        if let Some((provider, model)) = middleware_target_route(
+                            &state,
+                            target,
+                            current_provider,
+                            &current_model,
+                        ) {
                             let mut retry_body_json = original_body_json.clone();
                             let next_plan = plan_upstream(
                                 &state,
@@ -12136,7 +12513,8 @@ async fn proxy(
                             });
                             next_plan.map(|next_plan| {
                                 pending_notice = notice.as_ref().map(|notice| notice.text.clone());
-                                if let alex_middleware::RouteScope::Session { ttl_seconds } = scope {
+                                if let alex_middleware::RouteScope::Session { ttl_seconds } = scope
+                                {
                                     if context.session.has_stable_id()
                                         && context.route.requested.capabilities.portable_history
                                     {
@@ -12995,7 +13373,9 @@ async fn inspect_response_prefix(
                 replay_chunks.push(chunk);
             }
             Some(Err(error)) => {
-                return Err(format!("upstream body read failed during inspection: {error}"));
+                return Err(format!(
+                    "upstream body read failed during inspection: {error}"
+                ));
             }
             None => {
                 ended = true;
@@ -13006,12 +13386,9 @@ async fn inspect_response_prefix(
 
     let truncated = inspected.len() > limit || (!ended && inspected.len() == target);
     inspected.truncate(limit);
-    let replay = futures_util::stream::iter(
-        replay_chunks
-            .into_iter()
-            .map(Ok::<Bytes, reqwest::Error>),
-    )
-    .chain(stream);
+    let replay =
+        futures_util::stream::iter(replay_chunks.into_iter().map(Ok::<Bytes, reqwest::Error>))
+            .chain(stream);
     let mut rebuilt = axum::http::Response::builder()
         .status(status)
         .version(version)
@@ -14260,8 +14637,7 @@ mod tests {
         let paste = reauth_link_body(Some("paste"), "work", "https://auth.test", false);
         assert!(paste.contains("After approving, paste the code#state here."));
         let device = reauth_link_body(Some("device"), "work", "https://auth.test", false);
-        assert!(device
-            .contains("Alex is waiting for authorization and will finish automatically."));
+        assert!(device.contains("Alex is waiting for authorization and will finish automatically."));
         assert!(!device.contains("code#state"));
     }
 
@@ -14972,6 +15348,325 @@ mod tests {
             "http://127.0.0.1:4100".into(),
             Duration::from_secs(15 * 60),
         )
+    }
+
+    fn local_proxy_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers
+    }
+
+    async fn save_test_cliproxyapi(state: &AppState, address: std::net::SocketAddr) {
+        alex_auth::save_cliproxyapi_account(
+            &state.vault,
+            &format!("http://{address}/v1"),
+            "cliproxy-secret",
+            &["gpt-4o".into(), "tool-model".into()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn cliproxyapi_url_and_model_catalog_are_strict_and_loop_safe() {
+        assert_eq!(
+            normalize_cliproxyapi_url("http://127.0.0.1:8317").unwrap(),
+            "http://127.0.0.1:8317/v1"
+        );
+        assert_eq!(
+            normalize_cliproxyapi_url("https://proxy.example/team/v1/").unwrap(),
+            "https://proxy.example/team/v1"
+        );
+        for rejected in [
+            "http://proxy.example/v1",
+            "https://user:secret@proxy.example/v1",
+            "https://proxy.example/v1?token=secret",
+            "https://proxy.example/api",
+        ] {
+            assert!(normalize_cliproxyapi_url(rejected).is_err(), "{rejected}");
+        }
+
+        let models = parse_cliproxyapi_models(&json!({"data": [
+            {"id": "gpt-4o"},
+            {"id": "openai/gpt-5"},
+            {"id": "cliproxyapi/gpt-loop"},
+            {"id": "alex/claude-loop"},
+            {"id": "alexandria:gpt-loop"},
+            {"id": "../escape"},
+            {"id": "gpt-4o"}
+        ]}));
+        assert_eq!(models, vec!["gpt-4o", "openai/gpt-5"]);
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_probe_and_admin_save_use_bearer_and_filtered_catalog() {
+        let seen_auth = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_auth2 = seen_auth.clone();
+        let upstream = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen_auth = seen_auth2.clone();
+                async move {
+                    *seen_auth.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(String::from);
+                    axum::Json(json!({"object": "list", "data": [
+                        {"id": "gpt-4o"},
+                        {"id": "openai/gpt-5"},
+                        {"id": "alex/gpt-loop"},
+                        {"id": "cliproxyapi/double-prefix"}
+                    ]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = test_state("cliproxyapi-admin-save");
+        let response = admin_auth_cliproxyapi(
+            State(state.clone()),
+            axum::Json(json!({
+                "url": format!("http://{address}"),
+                "credential": "probe-secret"
+            })),
+        )
+        .await;
+        let (status, saved) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["saved"], "cliproxyapi-default");
+        assert_eq!(saved["url"], format!("http://{address}/v1"));
+        assert_eq!(saved["models"], json!(["gpt-4o", "openai/gpt-5"]));
+        assert_eq!(
+            seen_auth.lock().unwrap().as_deref(),
+            Some("Bearer probe-secret")
+        );
+        let account = state
+            .vault
+            .account_for(Provider::Cliproxyapi, false)
+            .await
+            .unwrap();
+        assert_eq!(account.api_key.as_deref(), Some("probe-secret"));
+        assert_eq!(
+            cliproxyapi_catalog_models(&state).await,
+            vec!["cliproxyapi/gpt-4o", "cliproxyapi/openai/gpt-5"]
+        );
+        let (status, public_view) = response_json(admin_cliproxyapi(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(public_view["connected"], true);
+        assert!(!public_view.to_string().contains("probe-secret"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_routes_chat_and_responses_without_double_prefix_and_traces_provenance() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<(String, String, Value)>::new()));
+        let chat_capture = captured.clone();
+        let responses_capture = captured.clone();
+        let upstream = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = chat_capture.clone();
+                    async move {
+                        captured.lock().unwrap().push((
+                            "chat".into(),
+                            headers["authorization"].to_str().unwrap().into(),
+                            body.clone(),
+                        ));
+                        axum::Json(json!({
+                            "id": "chat-1", "object": "chat.completion", "model": body["model"],
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "chat ok"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = responses_capture.clone();
+                    async move {
+                        captured.lock().unwrap().push((
+                            "responses".into(),
+                            headers["authorization"].to_str().unwrap().into(),
+                            body.clone(),
+                        ));
+                        axum::Json(json!({
+                            "id": "resp-1", "object": "response", "status": "completed", "model": body["model"],
+                            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "responses ok"}]}],
+                            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = test_state("cliproxyapi-openai-wire");
+        save_test_cliproxyapi(&state, address).await;
+        for (format, path, body) in [
+            (
+                ClientFormat::OpenaiChat,
+                "/v1/chat/completions",
+                json!({"model": "cliproxyapi/gpt-4o", "stream": false, "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                ClientFormat::OpenaiResponses,
+                "/v1/responses",
+                json!({"model": "cliproxyapi/openai/gpt-5", "stream": false, "input": "hi"}),
+            ),
+        ] {
+            let response = proxy(
+                state.clone(),
+                format,
+                path,
+                local_proxy_headers(),
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let trace_id = response.headers()["x-alexandria-trace-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let trace = state.store.get_trace(&trace_id).unwrap().unwrap();
+            assert_eq!(trace["upstream_provider"], "cliproxyapi");
+            assert_eq!(trace["account_id"], "cliproxyapi-default");
+            assert!(!trace["routed_model"]
+                .as_str()
+                .unwrap()
+                .starts_with("cliproxyapi/"));
+        }
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.1 == "Bearer cliproxy-secret"));
+        assert_eq!(requests[0].2["model"], "gpt-4o");
+        assert_eq!(requests[1].2["model"], "openai/gpt-5");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_translates_streaming_tool_call_to_anthropic() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer cliproxy-secret");
+                assert_eq!(body["model"], "tool-model");
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["tools"][0]["function"]["name"], "shell");
+                let sse = concat!(
+                    "data: {\"id\":\"chat-tool\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chat-tool\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"pwd\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chat-tool\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let state = test_state("cliproxyapi-anthropic-tools");
+        save_test_cliproxyapi(&state, address).await;
+        let request = json!({
+            "model": "cliproxyapi/tool-model",
+            "stream": true,
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "show cwd"}],
+            "tools": [{"name": "shell", "description": "run command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
+        });
+        let response = proxy(
+            state,
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            local_proxy_headers(),
+            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let message = alex_core::translate::parse_anthropic_sse_to_message(&text).unwrap();
+        let tool = message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("translated Anthropic tool_use block");
+        assert_eq!(tool["name"], "shell");
+        assert_eq!(tool["input"]["command"], "pwd");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_preserves_structured_upstream_errors() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let status = body["model"]
+                    .as_str()
+                    .and_then(|model| model.strip_prefix("error-"))
+                    .and_then(|status| status.parse::<u16>().ok())
+                    .unwrap();
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "17")
+                    .body(Body::from(
+                        json!({"error": {"type": "upstream_error", "code": format!("E{status}"), "message": format!("upstream {status}")}}).to_string(),
+                    ))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        for status in [401u16, 429, 503] {
+            let state = test_state(&format!("cliproxyapi-error-{status}"));
+            save_test_cliproxyapi(&state, address).await;
+            let body = json!({
+                "model": format!("cliproxyapi/error-{status}"),
+                "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let response = proxy(
+                state,
+                ClientFormat::OpenaiChat,
+                "/v1/chat/completions",
+                local_proxy_headers(),
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["retry-after"], "17");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({"error": {"type": "upstream_error", "code": format!("E{status}"), "message": format!("upstream {status}")}})
+            );
+        }
+        server.abort();
     }
 
     #[derive(Default)]
@@ -17552,9 +18247,11 @@ mod tests {
 
         let cached_accounts = state.vault.list_cached();
         assert!(
-            cached_accounts.iter().any(|account| account.provider == Provider::Anthropic
-                && account.status == "active"
-                && !account.paused),
+            cached_accounts
+                .iter()
+                .any(|account| account.provider == Provider::Anthropic
+                    && account.status == "active"
+                    && !account.paused),
             "test Anthropic account disappeared before simulated policy check: {cached_accounts:?}"
         );
 
@@ -18025,10 +18722,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
-        headers.insert(
-            "x-alexandria-harness",
-            HeaderValue::from_static("codex"),
-        );
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("codex"));
         let body = Bytes::from_static(
             br#"{"model":"alex/gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}"#,
         );
@@ -18049,10 +18743,7 @@ mod tests {
         assert_eq!(sessions[0]["tags"]["alex_error"], "true");
         assert_eq!(sessions[0]["tags"]["alex_error_kind"], "auth");
         assert_eq!(sessions[0]["tags"]["approval_state"], "pending");
-        assert_eq!(
-            sessions[0]["tags"]["credential_fingerprint"],
-            fingerprint
-        );
+        assert_eq!(sessions[0]["tags"]["credential_fingerprint"], fingerprint);
 
         let (status, approved) = response_json(
             admin_alex_error_approve(State(state.clone()), Path(fingerprint.clone())).await,
@@ -18089,10 +18780,7 @@ mod tests {
 
         for (method, path) in [
             ("POST", "/admin/run-keys/revoke-all"),
-            (
-                "POST",
-                "/admin/alex-errors/0123456789abcdef/approve",
-            ),
+            ("POST", "/admin/alex-errors/0123456789abcdef/approve"),
             ("DELETE", "/admin/run-keys/revoked"),
         ] {
             let request = axum::http::Request::builder()
@@ -19026,11 +19714,7 @@ mod tests {
             .upsert(test_api_account("openai-sol", Provider::Openai))
             .await
             .unwrap();
-        set_upstream_base_override(
-            &state,
-            Provider::Anthropic,
-            format!("http://{address}"),
-        );
+        set_upstream_base_override(&state, Provider::Anthropic, format!("http://{address}"));
         set_upstream_base_override(&state, Provider::Openai, format!("http://{address}"));
         let fixture_root = tmpdir("middleware-fable-sol-fixtures");
         set_fixture_dir(&state, fixture_root.join("fixtures"));
@@ -19057,7 +19741,10 @@ mod tests {
         let request = || {
             let mut headers = HeaderMap::new();
             headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
-            headers.insert("x-session-id", HeaderValue::from_static("session-fable-sol"));
+            headers.insert(
+                "x-session-id",
+                HeaderValue::from_static("session-fable-sol"),
+            );
             headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
             proxy(
                 state.clone(),
@@ -19138,12 +19825,7 @@ mod tests {
             providers: alex_middleware::ProviderConstraint::Only(vec!["openai".into()]),
         };
         assert_eq!(
-            middleware_target_route(
-                &state,
-                &target,
-                Provider::Anthropic,
-                "claude-fable-5",
-            ),
+            middleware_target_route(&state, &target, Provider::Anthropic, "claude-fable-5",),
             Some((Provider::Openai, "gpt-5.6-sol".into()))
         );
 
@@ -19152,12 +19834,7 @@ mod tests {
             providers: alex_middleware::ProviderConstraint::Exclude(vec!["openai".into()]),
         };
         assert_eq!(
-            middleware_target_route(
-                &state,
-                &excluded,
-                Provider::Anthropic,
-                "claude-fable-5",
-            ),
+            middleware_target_route(&state, &excluded, Provider::Anthropic, "claude-fable-5",),
             None
         );
     }
@@ -19300,11 +19977,9 @@ mod tests {
             .iter()
             .any(|candidate| candidate["id"] == rule.id && candidate["enabled"] == false));
 
-        let deleted = admin_middleware_rule_delete(
-            State(state.clone()),
-            Path("custom.fable-to-sol".into()),
-        )
-        .await;
+        let deleted =
+            admin_middleware_rule_delete(State(state.clone()), Path("custom.fable-to-sol".into()))
+                .await;
         assert_eq!(deleted.status(), StatusCode::OK);
         let (_, final_status) = response_json(admin_middleware(State(state)).await).await;
         assert!(!final_status["rules"]
@@ -19738,10 +20413,9 @@ mod tests {
                 .body(reqwest::Body::from(KIMI_QUOTA_EXHAUSTED_BODY))
                 .unwrap(),
         );
-        let (rebuilt, class) =
-            classify_upstream_response("kimi", "openai-chat", upstream)
-                .await
-                .unwrap();
+        let (rebuilt, class) = classify_upstream_response("kimi", "openai-chat", upstream)
+            .await
+            .unwrap();
         assert_eq!(class, ErrorClass::Capacity);
         assert!(reroutable_error_class(class));
         assert_eq!(
@@ -20243,9 +20917,10 @@ mod tests {
             "url": "http://127.0.0.1:1/send",
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], true);
 
@@ -20255,9 +20930,10 @@ mod tests {
             "url": "http://127.0.0.1:1/send",
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], true);
 
@@ -20268,9 +20944,10 @@ mod tests {
             "allow_commands": false,
         }))
         .unwrap();
-        let (status, body) =
-            response_json(admin_notifications_save(State(state.clone()), axum::Json(request)).await)
-                .await;
+        let (status, body) = response_json(
+            admin_notifications_save(State(state.clone()), axum::Json(request)).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channel"]["allow_commands"], false);
     }
@@ -21166,7 +21843,10 @@ mod tests {
         let count = received.lock().unwrap().len();
         sink.abort();
         token_server.abort();
-        assert_eq!(count, 0, "a recovered one-off refresh failure must stay silent");
+        assert_eq!(
+            count, 0,
+            "a recovered one-off refresh failure must stay silent"
+        );
         assert!(
             !needs_reauth_flag(&state, "openai-oauth-transient-recovery").await,
             "a successful retry must clear the transient failure state"

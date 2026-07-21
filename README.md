@@ -201,6 +201,7 @@ Alex holds the credential, refreshes it, and routes traffic for each provider be
 | Moonshot (Kimi) | Kimi subscription | ✅ Supported |
 | OpenRouter | API key | ✅ Supported |
 | Exo | Local / LAN cluster (no auth) | ✅ Supported |
+| CLIProxyAPI | URL + bearer credential | ✅ Supported (upstream) |
 | Amp | Amp CLI credentials | ✅ Supported |
 | Hugging Face | — | ⏳ Coming soon |
 | Meta (Llama) | — | ⏳ Coming soon |
