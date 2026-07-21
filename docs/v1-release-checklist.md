@@ -110,8 +110,10 @@ a tag or changes the source worktree.
   **Start Onboarding**.
 - [ ] Verify onboarding can move backward/forward and freely change harness,
   provider, existing account, or new account without stale test state.
-- [ ] Verify non-Claude-Code Anthropic traffic always uses Dario, while Claude
-  Code may route directly, including Pi to `alex/claude-opus-4-8`.
+- [x] Non-Claude-Code Anthropic traffic is forced through Dario while genuine
+  Claude Code may route directly (routing regression tests plus live beta.12
+  Pi → `alex/claude-opus-4-8` trace
+  `e780d4cc-884a-4473-a4eb-9a678f0f1691`, `via_dario: true`).
 - [ ] Verify fresh installs create missing daemon/harness configuration files
   instead of blocking onboarding.
 - [ ] Build, install, and record the final `0.1.29-beta.N` candidate.
@@ -121,7 +123,9 @@ a tag or changes the source worktree.
 
 ## Current checkpoint
 
-- Candidate: `0.1.29-beta.12` (planned; not yet cut)
+- Installed checkpoint: `0.1.29-beta.12` at `4420271` (CLI, Alex.app,
+  launchd service path, daemon health, Dario, and live Pi → Opus route
+  verified; this is not yet the final release candidate).
 - Branch: `v1/integration`
 - Draft PR: <https://github.com/madhavajay/alex/pull/26>
 - Combined local gates: Rust workspace and all targets pass; Swift passes 298

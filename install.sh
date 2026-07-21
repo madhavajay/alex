@@ -146,18 +146,17 @@ if [ "$UPGRADE" = "1" ]; then
     fi
     OLD_PIDS="${OLD_PIDS}${OLD_PIDS:+ }$pid"
   done
-  if [ -z "$OLD_PIDS" ]; then
+  if [ "$SERVICE_RELOADED" = "1" ]; then
+    echo "daemon is launchd-managed and was already reloaded with the installed binary"
+    NEW_PID=""
+  elif [ -z "$OLD_PIDS" ]; then
     say "no running daemon found; starting fresh"
     nohup "$BIN" daemon >> "$HOME/.alexandria/daemon.log" 2>&1 &
     NEW_PID=$!
   elif [ "$(uname)" = "Darwin" ] && launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
-    if [ "$SERVICE_RELOADED" = "1" ]; then
-      echo "daemon is launchd-managed and was already reloaded with the installed binary"
-    else
-      echo "daemon is launchd-managed: using kickstart (drain happens before restart;"
-      echo "expect a short accept gap while the old instance drains)"
-      launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
-    fi
+    echo "daemon is launchd-managed: using kickstart (drain happens before restart;"
+    echo "expect a short accept gap while the old instance drains)"
+    launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
     NEW_PID=""
   elif [ "$(uname)" = "Linux" ] && command -v systemctl >/dev/null \
       && systemctl --user is-active alexandria >/dev/null 2>&1; then
