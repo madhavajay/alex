@@ -41,6 +41,96 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  linux-installed-smoke:
+    name: Linux x86-64 installed release smoke
+    if: github.event_name == 'pull_request'
+    runs-on: namespace-profile-linux-medium
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-installed-smoke
+
+      - name: Assert clean Ubuntu x86-64 runner
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == "Linux" ]]
+          [[ "$(uname -m)" == "x86_64" ]]
+          . /etc/os-release
+          [[ "$ID" == "ubuntu" ]]
+          systemctl --user show-environment >/dev/null
+
+      - name: Build release-format candidate archive and checksum
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          asset_dir="$GITHUB_WORKSPACE/dist/ci-linux/assets"
+          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+
+          rm -rf "$GITHUB_WORKSPACE/dist/ci-linux"
+          mkdir -p "$asset_dir"
+          cargo build --release --locked -p alex --bins
+          tar -C target/release -czf "$asset_dir/$asset" alex alexandria
+          shasum -a 256 "$asset_dir/$asset" > "$asset_dir/$asset.sha256"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke public installer, routing, trace persistence, and systemd restart
+        env:
+          ALEX_CI_LINUX_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-linux
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux/installed-smoke.json
+          ALEX_CI_LINUX_VERSION: ${{ steps.package.outputs.version }}
+          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux/assets
+        run: packaging/ci-linux/smoke-installed.sh
+
+      - name: Clean installed smoke service and files
+        if: always()
+        env:
+          ALEX_CI_LINUX_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-linux
+        run: |
+          set +e
+          alex_bin="$ALEX_CI_LINUX_SMOKE_ROOT/bin/alex"
+          if [[ -f "$ALEX_CI_LINUX_SMOKE_ROOT/service-cleanup-allowed" ]]; then
+            if [[ -x "$alex_bin" ]]; then
+              "$alex_bin" service uninstall >/dev/null 2>&1
+            fi
+            systemctl --user disable --now alexandria >/dev/null 2>&1
+            rm -f "$HOME/.config/systemd/user/alexandria.service"
+            systemctl --user daemon-reload >/dev/null 2>&1
+            systemctl --user reset-failed alexandria >/dev/null 2>&1
+            rm -rf "$HOME/.alexandria"
+          fi
+          for pid_file in mock.pid assets.pid; do
+            if [[ -s "$ALEX_CI_LINUX_SMOKE_ROOT/$pid_file" ]]; then
+              pid="$(tr -d '[:space:]' < "$ALEX_CI_LINUX_SMOKE_ROOT/$pid_file")"
+              if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                kill "$pid" >/dev/null 2>&1
+              fi
+            fi
+          done
+          if systemctl --user is-active --quiet alexandria \
+            || [[ -e "$HOME/.config/systemd/user/alexandria.service" ]] \
+            || [[ -e "$HOME/.alexandria" ]]; then
+            echo "systemd cleanup failed; preserving $ALEX_CI_LINUX_SMOKE_ROOT" >&2
+            exit 1
+          fi
+          rm -rf "$ALEX_CI_LINUX_SMOKE_ROOT"
+
+      - name: Upload Linux candidate and smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86-64-installed-smoke
+          path: dist/ci-linux/
+          if-no-files-found: error
+          retention-days: 14
+
   rust:
     strategy:
       fail-fast: false

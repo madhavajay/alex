@@ -3,6 +3,11 @@ set -eu
 
 REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
+# Optional pinned/mirror inputs keep CI and managed offline installs on the
+# exact same checksum-verifying path as the public latest-release installer.
+VERSION_OVERRIDE="${ALEX_VERSION:-}"
+ASSET_BASE_OVERRIDE="${ALEX_ASSET_BASE_URL:-}"
+NO_SERVICE="${ALEX_NO_SERVICE:-0}"
 
 say() {
   printf '%s\n' "$*"
@@ -108,16 +113,31 @@ install_linux() {
       ;;
   esac
 
-  latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
-  tag="${latest_url##*/}"
-  version="${tag#v}"
-  if [ -z "$version" ] || [ "$version" = "$latest_url" ]; then
-    say "Could not determine the latest Alex release." >&2
-    exit 1
+  if [ -n "$VERSION_OVERRIDE" ]; then
+    version="$VERSION_OVERRIDE"
+    tag="v$version"
+  else
+    latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+    tag="${latest_url##*/}"
+    version="${tag#v}"
+    if [ -z "$version" ] || [ "$version" = "$latest_url" ]; then
+      say "Could not determine the latest Alex release." >&2
+      exit 1
+    fi
   fi
+  case "$version" in
+    *[!0-9A-Za-z.+-]*|'')
+      say "Invalid Alex version '$version'." >&2
+      exit 1
+      ;;
+  esac
 
   asset="alex-cli-$version-$platform.tar.gz"
-  base="https://github.com/$REPO/releases/download/$tag"
+  if [ -n "$ASSET_BASE_OVERRIDE" ]; then
+    base="${ASSET_BASE_OVERRIDE%/}"
+  else
+    base="https://github.com/$REPO/releases/download/$tag"
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alex-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -137,7 +157,9 @@ install_linux() {
   install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
   install -m 0755 "$tmp/alexandria" "$INSTALL_DIR/alexandria"
 
-  if "$INSTALL_DIR/alex" service install; then
+  if [ "$NO_SERVICE" = "1" ]; then
+    say "Alex is installed; skipped user service registration (ALEX_NO_SERVICE=1)."
+  elif "$INSTALL_DIR/alex" service install; then
     say "Alex is installed and its user service is running."
   else
     say "Alex is installed, but the user service could not be registered."
