@@ -19,6 +19,16 @@ Each local beta checkpoint follows the same order:
    cannot prove.
 7. Record pass/fail evidence here before starting the next checkpoint.
 
+On macOS the repeatable local checkpoint command is:
+
+```bash
+./scripts/install-local-beta.sh 0.1.29-beta.N --ref v1/integration
+```
+
+It stamps and builds in a disposable Git worktree, installs the CLI/daemon and
+app with the same version, verifies both installed versions, and never creates
+a tag or changes the source worktree.
+
 ## Public walkthrough and measurement
 
 - [x] Three deterministic walkthroughs have pause, play, step, reset, rule
