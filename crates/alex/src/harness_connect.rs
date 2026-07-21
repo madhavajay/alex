@@ -494,11 +494,7 @@ pub(crate) async fn connect_with_preminted_key(
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         (spec.config_dir)(&home)
     });
-    if !config_dir.is_dir() {
-        std::fs::create_dir_all(&config_dir).with_context(|| {
-            format!("create {harness} config directory {}", config_dir.display())
-        })?;
-    }
+    ensure_harness_config_dir(harness, &config_dir)?;
 
     let base_url = base_url.trim_end_matches('/').to_string();
     if base_url.is_empty() {
@@ -536,6 +532,18 @@ pub(crate) async fn connect_with_preminted_key(
         println!("config: {}", summary.config_path.display());
     }
     Ok(())
+}
+
+/// Harnesses can be installed before their first interactive launch. Onboarding
+/// owns the Alex-managed files it writes, so a missing config directory is a
+/// first-run condition to bootstrap rather than an instruction to leave the
+/// wizard and run the harness manually.
+pub(crate) fn ensure_harness_config_dir(harness: &str, config_dir: &Path) -> Result<()> {
+    if config_dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("create {harness} config directory {}", config_dir.display()))
 }
 
 fn write_preminted_connection(
@@ -837,12 +845,7 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
     }
 
     let config_dir = resolve_config_dir(config, pi_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "pi config dir does not exist at {}; run pi once first (it creates ~/.pi/agent), or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("pi", &config_dir)?;
 
     if !daemon_health(config).await {
         bail!(
@@ -964,12 +967,7 @@ async fn connect_claude(
         .as_ref()
         .context("claude is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, claude_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "claude config dir does not exist at {}; run claude once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("claude", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
             "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
@@ -1042,12 +1040,7 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
         .binary
         .context("codex is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, codex_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "codex config dir does not exist at {}; run codex once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("codex", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
             "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
@@ -1125,12 +1118,7 @@ async fn connect_grok(config: &Config, config_dir: Option<PathBuf>, json_out: bo
         .as_ref()
         .context("grok is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, grok_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "grok config dir does not exist at {}; run grok once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("grok", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
             "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
@@ -1198,12 +1186,7 @@ async fn connect_kimi(config: &Config, config_dir: Option<PathBuf>, json_out: bo
         "kimi is not installed or not on PATH; install it with `npm install -g @moonshot-ai/kimi-code`",
     )?;
     let config_dir = resolve_config_dir(config, kimi_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "kimi config dir does not exist at {}; run kimi once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("kimi", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
             "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
@@ -1271,12 +1254,7 @@ async fn connect_amp(config: &Config, config_dir: Option<PathBuf>, json_out: boo
         .as_ref()
         .context("amp is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, amp_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "amp config dir does not exist at {}; run amp once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("amp", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
             "could not reach the Alex daemon at {}; start it with `alex daemon --background`",

@@ -928,8 +928,7 @@ private struct ResetSettingsSheet: View {
                 // Any deliberate reset returns the app to the guided setup.
                 // Clear completion as well as opening it now, so closing the
                 // window cannot suppress onboarding on the next launch.
-                UserDefaults.standard.removeObject(
-                    forKey: OnboardingModel.completedDefaultsKey)
+                OnboardingLaunchPolicy.clearCompletion()
                 onResetCompleted()
             } catch {
                 guard operationID == id else { return }

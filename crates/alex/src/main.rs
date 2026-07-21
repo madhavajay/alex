@@ -2861,14 +2861,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             );
         }
         let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
-        if !config_dir.is_dir() {
-            return error(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "{name} config dir does not exist at {}",
-                    config_dir.display()
-                ),
-            );
+        if let Err(e) = harness_connect::ensure_harness_config_dir(&name, &config_dir) {
+            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
         let models = state_models(&state).await;
         let codex_catalog = if name == "codex" {
@@ -3125,14 +3119,8 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
             Err(e) => return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
-        if !config_dir.is_dir() {
-            return error(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "{name} config dir does not exist at {}",
-                    config_dir.display()
-                ),
-            );
+        if let Err(e) = harness_connect::ensure_harness_config_dir(&name, &config_dir) {
+            return error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
         let existing_key = match name.as_str() {
             "claude" => harness_connect::read_claude_api_key(&config_dir),
@@ -13835,6 +13823,37 @@ local_key = "alx-test"
     }
 
     #[test]
+    fn first_run_creates_and_reuses_private_daemon_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("fresh-daemon-config");
+        let config_path = home.join("config.toml");
+        assert!(!config_path.exists());
+        std::env::set_var("ALEXANDRIA_HOME", &home);
+
+        let (created, fresh) = load_or_create_config().unwrap();
+        assert!(fresh);
+        assert!(config_path.is_file());
+        assert!(created.local_key.starts_with("alx-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let (reused, fresh) = load_or_create_config().unwrap();
+        std::env::remove_var("ALEXANDRIA_HOME");
+        assert!(!fresh);
+        assert_eq!(reused.local_key, created.local_key);
+    }
+
+    #[test]
     fn daemon_host_setting_persists_wildcard_and_rejects_non_ip_values() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tmpdir("config-host");
@@ -13962,7 +13981,7 @@ local_key = "alx-test"
         let bin_dir = tmpdir("router-connect-bin");
         let binary = fake_executable(&bin_dir, "pi", "echo pi 0.80.0");
         let config_dir = home.join("pi-agent");
-        std::fs::create_dir_all(&config_dir).unwrap();
+        assert!(!config_dir.exists());
         std::env::set_var("ALEXANDRIA_HOME", &home);
         let mut config = test_config(home.clone());
         config.harness_overrides.insert(
@@ -13987,6 +14006,7 @@ local_key = "alx-test"
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert!(config_dir.is_dir());
         let plan = body["plan"].as_array().unwrap();
         assert!(!plan.is_empty());
         assert!(plan.iter().any(|s| s["detail"]

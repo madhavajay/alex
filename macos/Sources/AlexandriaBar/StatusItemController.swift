@@ -58,21 +58,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     func showOnboardingIfNeeded() {
-        // Never onboarded on this Mac → show it.
-        if UserDefaults.standard.object(
-            forKey: OnboardingModel.completedDefaultsKey) == nil {
-            showOnboarding()
-            return
-        }
-        // Otherwise, a live daemon with zero provider accounts means a fresh or
-        // just-reset install (the completed flag lives in macOS UserDefaults,
-        // not in ~/.alexandria, so it survives a data-dir wipe). Re-onboard —
-        // but only once per launch, so closing the wizard doesn't re-pop it.
-        guard !onboardingShownThisLaunch,
-            store.daemonUp,
-            ProviderPresentation.hasNoAccounts(store.accounts)
-        else { return }
-        showOnboarding()
+        // The completion flag lives outside ~/.alexandria and survives a data
+        // wipe, so a live zero-account daemon must also re-enter onboarding.
+        let shouldPresent = OnboardingLaunchPolicy.shouldAutoPresent(
+            hasCompletionRecord: UserDefaults.standard.object(
+                forKey: OnboardingModel.completedDefaultsKey) != nil,
+            daemonUp: store.daemonUp,
+            hasProviderAccounts: !ProviderPresentation.hasNoAccounts(store.accounts),
+            shownThisLaunch: onboardingShownThisLaunch)
+        if shouldPresent { showOnboarding() }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -139,8 +133,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Keep recovery discoverable even when the user dismissed the automatic
     /// wizard. This sits immediately under the header on a zero-account daemon.
     private func buildStartOnboarding() {
-        guard store.daemonUp,
-            ProviderPresentation.hasNoAccounts(store.accounts)
+        guard OnboardingLaunchPolicy.shouldOfferStart(
+            daemonUp: store.daemonUp,
+            hasProviderAccounts: !ProviderPresentation.hasNoAccounts(store.accounts))
         else { return }
         addAction("Start Onboarding", symbol: "sparkles") { [weak self] in
             self?.showOnboarding()

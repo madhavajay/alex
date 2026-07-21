@@ -14,6 +14,7 @@ let packageDependencies: [Package.Dependency] = []
 var packageTargets: [Target] = [
     .target(name: "AlexandriaBarCore"),
 ]
+var testTargetDependencies: [Target.Dependency] = ["AlexandriaBarCore"]
 
 #if os(macOS)
 packageTargets.append(
@@ -28,12 +29,13 @@ packageTargets.append(
             .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         ]
     ))
+testTargetDependencies.append("AlexandriaBar")
 #endif
 
 packageTargets.append(
     .testTarget(
         name: "AlexandriaBarCoreTests",
-        dependencies: ["AlexandriaBarCore"]
+        dependencies: testTargetDependencies
     ))
 
 let package = Package(

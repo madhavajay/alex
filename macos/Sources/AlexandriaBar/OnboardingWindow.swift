@@ -28,7 +28,7 @@ final class OnboardingModel {
         let detail: String
     }
 
-    static let completedDefaultsKey = "onboardingCompletedVersion"
+    static let completedDefaultsKey = OnboardingLaunchPolicy.completedDefaultsKey
     static let currentVersion = "1"
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
@@ -617,9 +617,10 @@ final class OnboardingModel {
             traceEnteredMs = Int64(Date().timeIntervalSince1970 * 1_000)
         }
         traceCheckRunning = true
+        traceState = .working("Checking for a new matching request…")
         Task {
             let found = await pollForTrace()
-            if !found, !traceState.isTerminal {
+            if !found {
                 traceState = .working(
                     "No new matching request yet — run the command, then check again.")
             }
