@@ -11,9 +11,24 @@ import {
   withCampaignParameters
 } from "../src/analytics-schema.js";
 import { build } from "./build.mjs";
+import { verifyDeploymentOnce, waitForDeployment } from "./verify-live.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const siteRoot = path.resolve(scriptDir, "..");
+const repoRoot = path.resolve(siteRoot, "..");
+
+function cssBlock(source, marker) {
+  const markerIndex = source.indexOf(marker);
+  assert.notEqual(markerIndex, -1, `missing CSS block: ${marker}`);
+  const openingBrace = source.indexOf("{", markerIndex);
+  let depth = 0;
+  for (let index = openingBrace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(openingBrace + 1, index);
+  }
+  assert.fail(`unterminated CSS block: ${marker}`);
+}
 
 test("build is deterministic and generated from the proxy fixture", async () => {
   const first = await build();
@@ -60,6 +75,29 @@ test("built HTML has a useful static fallback and accessible controls", async ()
   assert.match(html, /example\.fable-overload-to-sol/);
   assert.match(html, /aria-live="polite"/);
   assert.doesNotMatch(html, /<!-- BUILD:/);
+});
+
+test("no-JavaScript rendering keeps content and hides only inert controls", async () => {
+  await build();
+  const [html, css] = await Promise.all([
+    readFile(path.join(siteRoot, "dist/index.html"), "utf8"),
+    readFile(path.join(siteRoot, "dist/styles.css"), "utf8")
+  ]);
+
+  assert.doesNotMatch(html, /<script[^>]*>[^<]*js-ready/);
+  assert.match(html, /<noscript>[\s\S]*Every routing step, trace summary, and outbound action remains available/);
+  assert.equal((html.match(/data-demo-step/g) ?? []).length, 16);
+  assert.equal((html.match(/class="trace-panel"/g) ?? []).length, 3);
+  assert.equal((html.match(/data-demo-action=/g) ?? []).length, 3);
+  assert.match(css, /\.demo-controls\s*\{[^}]*display:\s*none/);
+  assert.match(css, /\.js-ready \.demo-controls\s*\{[^}]*display:\s*flex/);
+
+  const opacityRules = [...css.matchAll(/([^{}]+)\{([^{}]*opacity:[^{}]*)\}/g)]
+    .filter(([, selector]) => selector.includes(".demo-step"));
+  assert(opacityRules.length > 0);
+  for (const [rule, selector] of opacityRules) {
+    assert(selector.includes(".js-ready"), `static fallback must not be dimmed by ${rule.trim()}`);
+  }
 });
 
 test("analytics schema exposes the full privacy-safe funnel", () => {
@@ -136,10 +174,21 @@ test("campaign attribution is allowlisted and outbound links opt in", async () =
   for (const link of outboundLinks) assert.match(link, /data-campaign-link/);
 });
 
-test("motion and mobile fallbacks are explicit", async () => {
+test("reduced-motion and mobile layouts disable movement and collapse wide grids", async () => {
   const css = await readFile(path.join(siteRoot, "src/styles.css"), "utf8");
-  assert.match(css, /prefers-reduced-motion: reduce/);
-  assert.match(css, /@media \(max-width: 760px\)/);
+  const reducedMotion = cssBlock(css, "@media (prefers-reduced-motion: reduce)");
+  assert.match(reducedMotion, /scroll-behavior:\s*auto/);
+  assert.match(reducedMotion, /transition:\s*none\s*!important/);
+  assert.match(reducedMotion, /animation:\s*none\s*!important/);
+  assert.match(reducedMotion, /\.js-ready \.demo-step\.is-active\s*\{[^}]*transform:\s*none/);
+
+  const mobile = cssBlock(css, "@media (max-width: 760px)");
+  assert.match(mobile, /\.demo-head, \.demo-grid, \.interest\s*\{[^}]*grid-template-columns:\s*1fr/);
+  assert.match(mobile, /\.trace-panel\s*\{[^}]*border-left:\s*0[^}]*border-top:/);
+  assert.match(mobile, /\.demo-controls\s*\{[^}]*width:\s*100%/);
+  assert.match(mobile, /\.install-command\s*\{[^}]*flex-direction:\s*column/);
+  assert.match(mobile, /\.demo-next\s*\{[^}]*flex-direction:\s*column/);
+  assert.match(css, /\.trace-row strong\s*\{[^}]*overflow-wrap:\s*anywhere/);
 });
 
 test("each walkthrough has isolated controls and completion analytics", async () => {
@@ -148,4 +197,67 @@ test("each walkthrough has isolated controls and completion analytics", async ()
   assert.match(source, /demo\.querySelectorAll\("\[data-demo-step\]"\)/);
   assert.match(source, /captureEvent\("demo_completed"/);
   assert.match(source, /captureEvent\("demo_action_clicked"/);
+});
+
+test("live deployment verifier checks every manifest hash and campaign query", async () => {
+  await build();
+  const manifestPath = path.join(siteRoot, "dist/build-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const requests = [];
+  const distFetch = async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    const relativePath = decodeURIComponent(url.pathname.replace(/^\/alex\//, ""));
+    try {
+      return new Response(await readFile(path.join(siteRoot, "dist", relativePath)), { status: 200 });
+    } catch {
+      return new Response("missing", { status: 404 });
+    }
+  };
+
+  const exact = await verifyDeploymentOnce(
+    "https://madhavajay.github.io/alex/?utm_source=test&utm_campaign=v1",
+    manifestPath,
+    distFetch
+  );
+  assert.deepEqual(exact, { ok: true, checked: Object.keys(manifest).length, mismatches: [] });
+  assert.equal(requests.length, Object.keys(manifest).length);
+  for (const request of requests) {
+    assert.equal(request.searchParams.get("utm_source"), "test");
+    assert.equal(request.searchParams.get("utm_campaign"), "v1");
+    assert.match(request.searchParams.get("alex_deploy"), /^[a-f0-9]{12}$/);
+  }
+
+  let calls = 0;
+  const staleThenCurrent = async (input) => {
+    calls += 1;
+    if (calls <= Object.keys(manifest).length) return new Response("stale", { status: 200 });
+    return distFetch(input);
+  };
+  const recovered = await waitForDeployment("https://madhavajay.github.io/alex/", manifestPath, {
+    timeoutMs: 5_000,
+    intervalMs: 0,
+    fetchImpl: staleThenCurrent
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.attempts, 2);
+});
+
+test("Pages workflow builds the locked site, preserves appcasts, and verifies the live artifact", async () => {
+  const [workflow, appcastWorkflow] = await Promise.all([
+    readFile(path.join(repoRoot, ".github/workflows/pages.yml"), "utf8"),
+    readFile(path.join(repoRoot, ".github/workflows/dmg-appcast.yml"), "utf8")
+  ]);
+  assert.match(workflow, /branches:\s*\[main\]/);
+  assert.match(workflow, /npm ci --ignore-scripts/);
+  assert.match(workflow, /run:\s*npm test/);
+  assert.match(workflow, /run:\s*npm run build/);
+  assert.match(workflow, /name:\s*alex-public-site-\$\{\{ github\.sha \}\}/);
+  assert.match(workflow, /ref:\s*gh-pages/);
+  assert.match(workflow, /--exclude='appcast\.xml'/);
+  assert.match(workflow, /--exclude='appcast-beta\.xml'/);
+  assert.match(workflow, /node source\/site\/scripts\/verify-live\.mjs "\$SITE_URL" built\/build-manifest\.json 240/);
+  assert.match(workflow, /SITE_URL:\s*https:\/\/madhavajay\.github\.io\/alex\/\?utm_source=github&utm_campaign=v1-deploy/);
+  assert.match(workflow, /group:\s*gh-pages-deploy/);
+  assert.match(appcastWorkflow, /group:\s*gh-pages-deploy/);
 });

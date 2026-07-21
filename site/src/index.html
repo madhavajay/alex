@@ -7,7 +7,6 @@
   <meta name="theme-color" content="#080c14">
   <title>Alex — your subscriptions, one resilient model team</title>
   <link rel="stylesheet" href="./styles.css">
-  <script>document.documentElement.classList.add('js-ready')</script>
   <script type="module" src="./app.js"></script>
 </head>
 <body>
@@ -37,6 +36,9 @@
         <h2 id="walkthroughs-title">Route it. Rescue it. Ask again.</h2>
         <p>Each replay is synthetic, contains no visitor data, and is checked against the implementation during the site build.</p>
       </div>
+      <noscript>
+        <p class="no-js-note"><strong>JavaScript is off.</strong> Every routing step, trace summary, and outbound action remains available. Playback controls and anonymous engagement measurement are disabled.</p>
+      </noscript>
 
       <article class="demo-card" data-demo="use-it-anywhere">
         <div class="demo-head">
@@ -110,9 +112,6 @@
           <p>This readable rule is checked against the same Rust built-in and deterministic fixture used by Alex.</p>
           <pre><code><!-- BUILD:RULE_SOURCE --></code></pre>
         </details>
-        <noscript>
-          <p class="privacy-note" style="padding: 0 2rem 1rem"><strong>JavaScript is off.</strong> Every routing step and the complete rule remain available above; only automatic playback and anonymous engagement measurement are disabled.</p>
-        </noscript>
         <div class="demo-next">
           <span>Install the built-in preset and replay its fixture.</span>
           <a class="button primary" data-demo-action="middleware_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/providers-and-routing.md#fable--sol-preset-contract">Open middleware docs</a>

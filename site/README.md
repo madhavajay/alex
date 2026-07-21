@@ -34,4 +34,6 @@ event payload.
 On `main`, it deploys the exact build artifact to the existing `gh-pages`
 branch. The deploy shares the `gh-pages-deploy` concurrency group with the
 release appcast workflow and explicitly preserves `appcast.xml` and
-`appcast-beta.xml`.
+`appcast-beta.xml`. After the push, `scripts/verify-live.mjs` waits for Pages
+to serve every file with the SHA-256 recorded in the build manifest. The live
+check includes allowlisted campaign parameters in its requests.

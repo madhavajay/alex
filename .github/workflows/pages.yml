@@ -50,13 +50,20 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: write
     concurrency:
       group: gh-pages-deploy
       cancel-in-progress: false
     steps:
+      - name: Check out the deployment verifier
+        uses: actions/checkout@v4
+        with:
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Check out the existing Pages branch
         uses: actions/checkout@v4
         with:
@@ -89,3 +96,7 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git commit -m "site: deploy ${SOURCE_SHA}"
           git push origin HEAD:gh-pages
+      - name: Verify the live Pages artifact
+        env:
+          SITE_URL: https://madhavajay.github.io/alex/?utm_source=github&utm_campaign=v1-deploy
+        run: node source/site/scripts/verify-live.mjs "$SITE_URL" built/build-manifest.json 240

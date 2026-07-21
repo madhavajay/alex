@@ -95,7 +95,11 @@ button:disabled { cursor: default; opacity: .7; }
 .demo-head { display: grid; grid-template-columns: 1fr auto; gap: 1.25rem; align-items: end; padding: clamp(1.2rem, 3vw, 2rem); border-bottom: 1px solid var(--line); }
 .demo-head h2 { margin: .2rem 0; font-size: clamp(1.5rem, 4vw, 2.35rem); }
 .demo-head p { margin: 0; color: var(--muted); }
-.demo-controls { display: flex; flex-wrap: wrap; gap: .5rem; }
+.demo-controls { display: none; flex-wrap: wrap; gap: .5rem; }
+.js-ready .demo-controls { display: flex; }
+
+.no-js-note { margin: 0 0 1.4rem; padding: 1rem 1.2rem; border: 1px solid var(--line); border-radius: .9rem; background: rgba(20, 27, 40, .72); color: var(--muted); }
+.no-js-note strong { color: var(--ink); }
 
 .progress-track { height: 3px; background: #202b3e; }
 .progress-track::after { content: ""; display: block; width: var(--demo-progress); height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .35s ease; }
@@ -118,7 +122,7 @@ progress { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-p
 .trace-panel { border-left: 1px solid var(--line); padding: 1.4rem; background: rgba(4, 8, 16, .4); }
 .trace-panel h3 { margin-top: 0; font-size: 1rem; }
 .trace-row { display: flex; justify-content: space-between; gap: 1rem; padding: .7rem 0; border-bottom: 1px solid var(--line); color: var(--muted); }
-.trace-row strong { color: var(--ink); text-align: right; }
+.trace-row strong { min-width: 0; color: var(--ink); overflow-wrap: anywhere; text-align: right; }
 .status-fail { color: var(--red) !important; }
 .status-good { color: var(--green) !important; }
 
