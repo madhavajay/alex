@@ -80,7 +80,8 @@ a tag or changes the source worktree.
   `64044200-49f9-48c4-b118-e95e018631f3`, replaces daemon PID `206` with
   `290`, reads the same trace/body after restart, and removes the isolated
   service/container (PR run `29798681461`).
-- [ ] Run the equivalent packaged smoke manually on Windows 11 x86-64.
+- [ ] Run the equivalent packaged smoke manually on Windows 11 x86-64 using
+  the offline-provider procedure in `docs/windows-packaged-smoke.md`.
 
 ## Fable to Sol middleware preset
 
