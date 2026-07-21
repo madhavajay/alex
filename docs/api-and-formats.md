@@ -135,11 +135,11 @@ related routes; it is not an alternate URL scheme.
 | Area | Important routes |
 | --- | --- |
 | Trace search/browser | `GET /admin/traces`, `GET /traces/search`, `GET /traces/accounts`, `GET /traces/sessions`, `GET /traces/sessions/{session_id}/transcript` |
-| Trace records/bodies | `GET/DELETE /traces/{id}`, `GET /traces/{id}/reply.md`, `GET /traces/{id}/body/{request|upstream-request|response|dario-upstream-request|dario-upstream-response}`, `GET /tools/{id}/body/{args|result}` |
+| Trace records/bodies | `GET/DELETE /traces/{id}`, body-free `GET /traces/{id}/metadata`, `GET /traces/{id}/reply.md`, `GET /traces/{id}/body/{request|upstream-request|response|dario-upstream-request|dario-upstream-response}`, `GET /tools/{id}/body/{args|result}` |
 | Export and runs | `GET /traces/export.ndjson`, `GET /traces/runs/{run_id}`, `/events`, `/export.ndjson`, and `/artifacts` |
 | Accounts/providers | `/admin/accounts`, `/admin/accounts/analytics`, `/admin/accounts/merge`, `/admin/providers`, provider pause/resume, `/admin/routing/{provider}` |
 | Credentials/auth | `/admin/auth/import`, `/admin/auth/login/*`, reauth endpoints, Gemini/OpenRouter key endpoints, `/admin/vault/export`, `/admin/credentials` |
-| Resilience/testing | `/admin/protection`, `/admin/fixtures`, `/admin/sessions/{session_id}/inject`, `/injections` |
+| Resilience/testing | `/admin/protection`, `/admin/middleware`, `/admin/middleware/rules/*`, `/admin/middleware/test`, `/admin/fixtures`, `/admin/sessions/{session_id}/inject`, `/injections` |
 | Operations | `/admin/health`, `/admin/analytics`, `/admin/limits`, `/admin/storage`, `/admin/storage/prune`, `/admin/reset`, `/admin/update`, `/admin/update/channel` |
 | Dario and local providers | `/admin/dario`, `/admin/dario/ping`, prompt-cache routes, `/admin/exo`, `/admin/exo/status`, `/admin/exo/models` |
 | Catalog/notifications | `/admin/openrouter/catalog`, `/admin/openrouter/exposed`, `/admin/notifications` and validation/test/discovery routes |

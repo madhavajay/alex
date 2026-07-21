@@ -61,9 +61,39 @@ mod tests {
         assert!(csp.contains("script-src 'self'"));
         assert!(!csp.contains("unsafe-inline"));
         assert!(INDEX.contains("id=\"onboarding-view\""));
+        assert!(INDEX.contains("id=\"middleware-view\""));
         assert!(INDEX.contains("id=\"traces-view\""));
         assert!(!INDEX.contains("https://cdn"));
         assert!(APP_JS.contains("/admin/auth/login/complete"));
+        assert!(APP_JS.contains("/admin/middleware/test"));
+        assert!(APP_JS.contains("method:'PUT'"));
         assert!(APP_JS.contains("/traces/summaries?"));
+        assert!(APP_JS.contains("/metadata`"));
+        assert!(APP_JS.contains("async function loadTraceBody"));
+        assert!(APP_JS.contains("async function loadTranscript"));
+
+        // Fetch boundary: opening detail uses body-free metadata. The only
+        // body/transcript request sites are the explicit details-toggle
+        // loaders, so summary and metadata loading can never bulk-fetch them.
+        let open_trace = APP_JS
+            .split("async function openTrace")
+            .nth(1)
+            .unwrap()
+            .split("async function loadTraceBody")
+            .next()
+            .unwrap();
+        assert!(open_trace.contains("/metadata"));
+        assert!(!open_trace.contains("/body/"));
+        assert!(!open_trace.contains("/transcript"));
+        let load_traces = APP_JS
+            .split("async function loadTraces")
+            .nth(1)
+            .unwrap()
+            .split("function facts")
+            .next()
+            .unwrap();
+        assert!(load_traces.contains("/traces/summaries?"));
+        assert!(!load_traces.contains("/body/"));
+        assert!(!load_traces.contains("/transcript"));
     }
 }

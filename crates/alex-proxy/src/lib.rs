@@ -1778,6 +1778,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/traces/sessions/{session_id}/transcript",
             get(traces_session_transcript),
         )
+        .route("/traces/{id}/metadata", get(trace_metadata))
         .route("/traces/{id}", get(trace_get).delete(trace_delete))
         .route("/traces/{id}/reply.md", get(trace_reply_md))
         .route("/traces/{id}/body/{kind}", get(trace_body))
@@ -5098,7 +5099,6 @@ fn trace_summary(row: &Value) -> Value {
         "input_tokens": row["input_tokens"],
         "output_tokens": row["output_tokens"],
         "substituted": row["substituted"],
-        "middleware_decisions": row["middleware_decisions"],
     })
 }
 
@@ -5995,6 +5995,17 @@ async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Metadata-only trace detail for web clients. Unlike `trace_get`, this does
+/// not open request, response, Dario capture, or transcript body files. Those
+/// bytes have explicit lazy endpoints and must remain user initiated.
+async fn trace_metadata(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.store.get_trace(&id) {
+        Ok(Some(row)) => axum::Json(json!({"trace": row})).into_response(),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -15564,6 +15575,19 @@ mod tests {
         assert_eq!(first["has_more"], true);
         assert!(first["traces"][0].get("req_body_path").is_none());
 
+        // Metadata detail is also body-free: the deliberately nonexistent,
+        // invalid gzip path is returned as provenance but never opened.
+        let (metadata_status, metadata) =
+            response_json(trace_metadata(State(state.clone()), Path("c".into())).await).await;
+        assert_eq!(metadata_status, StatusCode::OK);
+        assert_eq!(metadata["trace"]["req_body_path"], "secret-c.json.gz");
+        let body_response = trace_body(
+            State(state.clone()),
+            Path(("c".into(), "request".into())),
+        )
+        .await;
+        assert_eq!(body_response.status(), StatusCode::NOT_FOUND);
+
         let cursor = first["next_cursor"].clone();
         let (_, second) = response_json(
             traces_summaries(
@@ -19208,7 +19232,45 @@ mod tests {
         .await;
         assert_eq!(created_status, StatusCode::CREATED, "{created}");
         assert_eq!(created["rule"]["id"], rule.id);
+        assert_eq!(created["rule"]["enabled"], false);
         assert!(created["generation"].as_str().is_some());
+
+        let mut enabled_rule = rule.clone();
+        enabled_rule.enabled = true;
+        let (enabled_status, enabled) = response_json(
+            admin_middleware_rule_replace(
+                State(state.clone()),
+                Path(rule.id.clone()),
+                axum::Json(enabled_rule),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(enabled_status, StatusCode::OK, "{enabled}");
+        assert_eq!(enabled["rule"]["enabled"], true);
+
+        let (live_status, live) =
+            response_json(admin_middleware(State(state.clone())).await).await;
+        assert_eq!(live_status, StatusCode::OK);
+        assert!(live["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["id"] == rule.id && candidate["enabled"] == true));
+
+        // Disable again, then prove a fixture dry-run still evaluates this
+        // single rule without enabling it in the live runtime.
+        let (disabled_status, disabled) = response_json(
+            admin_middleware_rule_replace(
+                State(state.clone()),
+                Path(rule.id.clone()),
+                axum::Json(rule.clone()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(disabled_status, StatusCode::OK, "{disabled}");
+        assert_eq!(disabled["rule"]["enabled"], false);
 
         let (dry_status, dry) = response_json(
             admin_middleware_test(
@@ -19230,6 +19292,13 @@ mod tests {
             .unwrap()
             .iter()
             .any(|record| record["rule_id"] == rule.id));
+        let (_, after_dry_run) =
+            response_json(admin_middleware(State(state.clone())).await).await;
+        assert!(after_dry_run["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["id"] == rule.id && candidate["enabled"] == false));
 
         let deleted = admin_middleware_rule_delete(
             State(state.clone()),

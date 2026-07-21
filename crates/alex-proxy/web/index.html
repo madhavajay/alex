@@ -18,6 +18,7 @@
   <nav aria-label="Primary">
     <button data-view="status" aria-current="page">Status</button>
     <button data-view="onboarding">Onboarding</button>
+    <button data-view="middleware">Middleware</button>
     <button data-view="traces">Traces</button>
   </nav>
   <main>
@@ -48,11 +49,29 @@
       </details>
     </section>
 
+    <section id="middleware-view" data-panel hidden>
+      <div class="section-heading">
+        <div><h2>Middleware</h2><p class="lede">Inspect active rules, change their live state, and test a rule against a saved fixture.</p></div>
+        <button id="refresh-middleware">Refresh</button>
+      </div>
+      <div id="middleware-summary" class="cards" aria-live="polite"></div>
+      <div id="middleware-errors" class="flow error-panel" hidden role="alert"></div>
+      <div id="middleware-rules" class="rule-list" aria-live="polite"></div>
+    </section>
+
     <section id="traces-view" data-panel hidden>
       <div class="section-heading">
         <div><h2>Trace summaries</h2><p class="lede">Bodies load only when you open an individual trace.</p></div>
         <button id="refresh-traces">Refresh</button>
       </div>
+      <form id="trace-filters" class="filter-grid">
+        <label>Model <input name="model" autocomplete="off" placeholder="gpt or claude"></label>
+        <label>Provider <input name="provider" autocomplete="off" placeholder="openai"></label>
+        <label>Harness <input name="harness" autocomplete="off" placeholder="codex"></label>
+        <label>Status <input name="status" inputmode="numeric" pattern="[0-9]*" placeholder="429"></label>
+        <label class="check-label"><input name="errors" type="checkbox"> Errors only</label>
+        <div class="filter-actions"><button type="submit">Apply filters</button><button type="reset">Clear</button></div>
+      </form>
       <div id="trace-list" class="trace-list" aria-live="polite"></div>
       <button id="more-traces" hidden>Load older traces</button>
       <article id="trace-detail" hidden></article>
