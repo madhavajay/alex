@@ -48,6 +48,8 @@ pub enum LarError {
     Conflict { trace_id: String, body_kind: String },
     #[error("body {trace_id}/{body_kind} was not found")]
     NotFound { trace_id: String, body_kind: String },
+    #[error("fixture export refused unsafe body: {0}")]
+    UnsafeFixture(String),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -761,7 +763,7 @@ pub fn export_sanitized_fixture(
     for key in selections {
         let metadata = reader.metadata(&key.trace_id, &key.body_kind)?;
         let body = reader.read_body(&key.trace_id, &key.body_kind, max_body_bytes)?;
-        let (sanitized, changed) = sanitize_body(&body);
+        let (sanitized, changed) = sanitize_body(&body)?;
         writer.append_reader_with_sanitized(
             &key.trace_id,
             &key.body_kind,
@@ -778,18 +780,82 @@ pub fn export_sanitized_fixture(
     Ok(report)
 }
 
-pub fn sanitize_body(body: &[u8]) -> (Vec<u8>, bool) {
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return (body.to_vec(), false);
+pub fn sanitize_body(body: &[u8]) -> Result<(Vec<u8>, bool)> {
+    let (output, changed) = if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
+        let changed = sanitize_json(&mut value);
+        (serde_json::to_vec(&value)?, changed)
+    } else if let Some(result) = sanitize_sse(body)? {
+        result
+    } else {
+        return Err(LarError::UnsafeFixture(
+            "body is neither JSON nor strictly framed JSON SSE".into(),
+        ));
     };
-    let changed = sanitize_json(&mut value);
-    if !changed {
-        return (body.to_vec(), false);
+    if contains_secret_pattern(&output) {
+        return Err(LarError::UnsafeFixture(
+            "a credential-like value remains after structured redaction".into(),
+        ));
     }
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => (bytes, true),
-        Err(_) => (body.to_vec(), false),
+    Ok((output, changed))
+}
+
+fn sanitize_sse(body: &[u8]) -> Result<Option<(Vec<u8>, bool)>> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Ok(None);
+    };
+    let mut output = String::with_capacity(text.len());
+    let mut saw_data = false;
+    let mut changed = false;
+    for line_with_end in text.split_inclusive('\n') {
+        let has_newline = line_with_end.ends_with('\n');
+        let line = line_with_end
+            .strip_suffix('\n')
+            .unwrap_or(line_with_end)
+            .strip_suffix('\r')
+            .unwrap_or_else(|| line_with_end.strip_suffix('\n').unwrap_or(line_with_end));
+        if let Some(payload) = line.strip_prefix("data:") {
+            saw_data = true;
+            let payload = payload.trim_start();
+            if payload == "[DONE]" {
+                output.push_str("data: [DONE]");
+            } else {
+                let mut value: Value = serde_json::from_str(payload).map_err(|_| {
+                    LarError::UnsafeFixture("SSE data field is not a JSON object".into())
+                })?;
+                changed |= sanitize_json(&mut value);
+                output.push_str("data: ");
+                output.push_str(&serde_json::to_string(&value)?);
+            }
+        } else if line.is_empty()
+            || line.starts_with(':')
+            || line.starts_with("event:")
+            || line.starts_with("id:")
+            || line.starts_with("retry:")
+        {
+            output.push_str(line);
+        } else {
+            return Ok(None);
+        }
+        if has_newline {
+            output.push('\n');
+        }
     }
+    Ok(saw_data.then(|| (output.into_bytes(), changed)))
+}
+
+fn contains_secret_pattern(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    [
+        "bearer ",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "ghp_",
+        "github_pat_",
+        "-----begin private key-----",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
 }
 
 fn sanitize_json(value: &mut Value) -> bool {
@@ -803,6 +869,11 @@ fn sanitize_json(value: &mut Value) -> bool {
         "cookie",
         "set-cookie",
         "x-api-key",
+        "x-goog-api-key",
+        "proxy-authorization",
+        "client_secret",
+        "password",
+        "secret",
     ];
     match value {
         Value::Object(map) => {
@@ -1574,6 +1645,27 @@ mod tests {
     }
 
     #[test]
+    fn fixture_sanitizer_redacts_json_sse_and_rejects_opaque_secrets() {
+        let sse = b"event: message\ndata: {\"type\":\"delta\",\"client_secret\":\"hidden\"}\n\ndata: [DONE]\n";
+        let (sanitized, changed) = sanitize_body(sse).unwrap();
+        let sanitized = String::from_utf8(sanitized).unwrap();
+        assert!(changed);
+        assert!(sanitized.contains("[REDACTED]"));
+        assert!(!sanitized.contains("hidden"));
+
+        let opaque = b"raw provider frame with Authorization: Bearer top-secret";
+        assert!(matches!(
+            sanitize_body(opaque),
+            Err(LarError::UnsafeFixture(_))
+        ));
+        let embedded = br#"{"message":"copy sk-live-secret into the tool"}"#;
+        assert!(matches!(
+            sanitize_body(embedded),
+            Err(LarError::UnsafeFixture(_))
+        ));
+    }
+
+    #[test]
     fn large_footer_index_remains_lazy_and_random_accessible() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.lar");
@@ -1592,5 +1684,25 @@ mod tests {
         assert_eq!(reader.read_body("trace-54321", "request", 1).unwrap(), b"");
         assert_eq!(reader.list(10_000, 25).unwrap().len(), 25);
         assert_eq!(reader.resident_index_bytes(), 0);
+    }
+
+    #[test]
+    fn oversized_recovery_index_is_rejected_before_allocation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversized-index.lar");
+        let mut file = File::create(&path).unwrap();
+        write_file_header(&mut file).unwrap();
+        file.write_all(&encode_footer(
+            Footer {
+                index_offset: FILE_HEADER_LEN,
+                index_count: MAX_INDEX_ENTRIES + 1,
+                records_end: FILE_HEADER_LEN,
+            },
+            0,
+        ))
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(matches!(ArchiveReader::open(path), Err(LarError::Limit(_))));
     }
 }

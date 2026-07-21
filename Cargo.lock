@@ -192,12 +192,14 @@ name = "alex-store"
 version = "0.1.25"
 dependencies = [
  "alex-core",
+ "alex-lar",
  "anyhow",
  "chrono",
  "flate2",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 

@@ -22,7 +22,7 @@ use alex_core::{
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
     TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
-use alex_store::{KnownAccount, Store, ToolCallRecord, TraceFilter};
+use alex_store::{KnownAccount, Store, ToolCallRecord, TraceBodyKind, TraceFilter};
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -54,6 +54,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+const TRACE_BODY_RESPONSE_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -4828,29 +4829,9 @@ async fn admin_traces(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
-    // Keep the small `/admin/traces` fixture endpoint useful to harness
-    // certification: a scoped run key gives every request a unique run id.
-    // `list_traces` predates run keys, so delegate only run-id queries to the
-    // richer filter API while retaining its established response shape.
-    if q.contains_key("run_id")
-        || q.contains_key("error_class")
-        || q.contains_key("errors")
-        || q.contains_key("key_fingerprint")
-    {
-        let mut filter = filter_from_query(&q);
-        filter.limit = limit;
-        return match state.store.search_traces(&filter) {
-            Ok(rows) => {
-                axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
-            }
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        };
-    }
-    match state.store.list_traces(
-        limit,
-        q.get("session").map(|s| s.as_str()),
-        q.get("model").map(|s| s.as_str()),
-    ) {
+    let mut filter = filter_from_query(&q);
+    filter.limit = limit;
+    match state.store.search_traces(&filter) {
         Ok(rows) => {
             axum::Json(json!({"traces": trace_rows_with_display_fields(rows)})).into_response()
         }
@@ -5024,7 +5005,12 @@ async fn admin_fixture_save(
             Ok(None) => return error_response(StatusCode::NOT_FOUND, "source trace not found"),
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        let bytes = match row["resp_body_path"].as_str().and_then(read_gz_file) {
+        let bytes = match stored_trace_body(
+            &state.store,
+            &row,
+            TraceBodyKind::Response,
+            TRACE_BODY_RESPONSE_LIMIT,
+        ) {
             Some(body) => body,
             None => {
                 return error_response(
@@ -5262,6 +5248,7 @@ fn filter_from_query(q: &HashMap<String, String>) -> TraceFilter {
         key_fingerprint: q.get("key_fingerprint").cloned(),
         reasoning_effort: q.get("effort").cloned(),
         limit: q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200),
+        offset: q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0),
     }
 }
 
@@ -5279,26 +5266,26 @@ fn read_gz_file(path: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn inline_row_bodies(row: &mut Value) {
+fn inline_row_bodies(store: &Store, row: &mut Value) {
     use base64::Engine;
-    for (path_key, out_key) in [
-        ("req_body_path", "req_body_b64"),
-        ("upstream_req_body_path", "upstream_req_body_b64"),
-        ("resp_body_path", "resp_body_b64"),
+    for (kind, out_key) in [
+        (TraceBodyKind::Request, "req_body_b64"),
+        (TraceBodyKind::UpstreamRequest, "upstream_req_body_b64"),
+        (TraceBodyKind::Response, "resp_body_b64"),
     ] {
-        let Some(buf) = row[path_key].as_str().and_then(read_gz_file) else {
+        let Some(buf) = stored_trace_body(store, row, kind, TRACE_BODY_RESPONSE_LIMIT) else {
             continue;
         };
         row[out_key] = json!(base64::engine::general_purpose::STANDARD.encode(&buf));
     }
 }
 
-fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
+fn ndjson_response(store: &Store, mut rows: Vec<Value>, inline_bodies: bool) -> Response {
     rows.sort_by_key(|r| r["ts_request_ms"].as_i64().unwrap_or(0));
     let mut out = String::new();
     for mut row in rows {
         if inline_bodies {
-            inline_row_bodies(&mut row);
+            inline_row_bodies(store, &mut row);
         }
         out.push_str(&serde_json::to_string(&row).unwrap_or_default());
         out.push('\n');
@@ -5312,16 +5299,14 @@ fn ndjson_response(mut rows: Vec<Value>, inline_bodies: bool) -> Response {
 
 const TEXT_SCAN_CAP: usize = 300;
 
-fn trace_matches_text(row: &Value, needle: &str) -> bool {
-    for key in ["req_body_path", "resp_body_path"] {
-        if let Some(path) = row.get(key).and_then(|v| v.as_str()) {
-            if let Some(bytes) = read_gz_file(path) {
-                if String::from_utf8_lossy(&bytes)
-                    .to_lowercase()
-                    .contains(needle)
-                {
-                    return true;
-                }
+fn trace_matches_text(store: &Store, row: &Value, needle: &str) -> bool {
+    for kind in [TraceBodyKind::Request, TraceBodyKind::Response] {
+        if let Some(bytes) = stored_trace_body(store, row, kind, TRACE_BODY_RESPONSE_LIMIT) {
+            if String::from_utf8_lossy(&bytes)
+                .to_lowercase()
+                .contains(needle)
+            {
+                return true;
             }
         }
     }
@@ -5345,9 +5330,10 @@ async fn traces_search(
         Ok(rows) => match text {
             Some(needle) => {
                 let scanned = rows.len();
+                let store = state.store.clone();
                 let rows = tokio::task::spawn_blocking(move || {
                     rows.into_iter()
-                        .filter(|r| trace_matches_text(r, &needle))
+                        .filter(|r| trace_matches_text(&store, r, &needle))
                         .collect::<Vec<_>>()
                 })
                 .await
@@ -5462,7 +5448,7 @@ async fn traces_export(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     match state.store.search_traces(&filter_from_query(&q)) {
-        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
+        Ok(rows) => ndjson_response(&state.store, rows, wants_bodies(&q)),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -5483,6 +5469,59 @@ fn read_gz_json(path: Option<&str>) -> Option<Value> {
 fn read_gz_text(path: Option<&str>) -> Option<String> {
     let buf = path.and_then(read_gz_file)?;
     Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+fn stored_trace_body(
+    store: &Store,
+    row: &Value,
+    kind: TraceBodyKind,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
+    let trace_id = row["id"].as_str()?;
+    match store.read_trace_body(trace_id, kind, max_bytes) {
+        Ok(Some(body)) => Some(body.bytes),
+        Ok(None) => {
+            // Unit fixtures and defensive callers may provide a detached row
+            // that has not been inserted into this store. Production trace
+            // handlers always resolve the authoritative SQLite row above.
+            let path = match kind {
+                TraceBodyKind::Request => row["req_body_path"].as_str(),
+                TraceBodyKind::UpstreamRequest => row["upstream_req_body_path"].as_str(),
+                TraceBodyKind::Response => row["resp_body_path"].as_str(),
+            }?;
+            read_gz_file(path).filter(|bytes| bytes.len() as u64 <= max_bytes)
+        }
+        Err(error) => {
+            tracing::warn!(
+                trace_id,
+                body_kind = kind.as_str(),
+                "trace body read failed: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+fn stored_trace_json(store: &Store, row: &Value, kind: TraceBodyKind) -> Option<Value> {
+    serde_json::from_slice(&stored_trace_body(
+        store,
+        row,
+        kind,
+        TRACE_BODY_RESPONSE_LIMIT,
+    )?)
+    .ok()
+}
+
+fn stored_trace_text(store: &Store, row: &Value, kind: TraceBodyKind) -> Option<String> {
+    Some(
+        String::from_utf8_lossy(&stored_trace_body(
+            store,
+            row,
+            kind,
+            TRACE_BODY_RESPONSE_LIMIT,
+        )?)
+        .into_owned(),
+    )
 }
 
 fn body_date_dir_name(name: &str) -> bool {
@@ -5836,14 +5875,14 @@ fn transcript_assistant_blocks(resp_text: &str) -> Vec<Value> {
     }
 }
 
-fn transcript_turn(row: &Value) -> Value {
+fn transcript_turn(store: &Store, row: &Value) -> Value {
     use alex_core::translate;
-    let user = read_gz_json(row["req_body_path"].as_str())
+    let user = stored_trace_json(store, row, TraceBodyKind::Request)
         .and_then(|req| {
             translate::last_user_text(row["client_format"].as_str().unwrap_or(""), &req)
         })
         .map(|s| truncate_chars(s, 8000));
-    let resp_text = read_gz_text(row["resp_body_path"].as_str());
+    let resp_text = stored_trace_text(store, row, TraceBodyKind::Response);
     let fmt = row["upstream_format"]
         .as_str()
         .or(row["client_format"].as_str())
@@ -6029,14 +6068,14 @@ fn inherited_entry_turn(row: &Value, index: usize, entry: &alex_core::ResumeEntr
 /// The final user/tool entry remains on the real trace turn, where it is
 /// paired with that trace's response. A plain first request (system + one
 /// user message) therefore produces no synthetic entries.
-fn transcript_inherited_turns(row: &Value) -> Vec<Value> {
+fn transcript_inherited_turns(store: &Store, row: &Value) -> Vec<Value> {
     let Some(format) = row["client_format"]
         .as_str()
         .and_then(transcript_request_format)
     else {
         return Vec::new();
     };
-    let Some(request) = read_gz_json(row["req_body_path"].as_str()) else {
+    let Some(request) = stored_trace_json(store, row, TraceBodyKind::Request) else {
         return Vec::new();
     };
     let entries = alex_core::request_entries(format, &request);
@@ -6133,28 +6172,33 @@ fn openai_responses_user_history_signature(request: &Value) -> Option<String> {
         .flatten()
 }
 
-fn codex_user_history_signature(row: &Value) -> Option<String> {
+fn codex_user_history_signature(store: &Store, row: &Value) -> Option<String> {
     if row["harness"].as_str() != Some("codex")
         || row["client_format"].as_str() != Some("openai-responses")
     {
         return None;
     }
-    openai_responses_user_history_signature(&read_gz_json(row["req_body_path"].as_str())?)
+    openai_responses_user_history_signature(&stored_trace_json(store, row, TraceBodyKind::Request)?)
 }
 
-fn build_session_transcript(rows: &[Value], tools: &[Value], limit: usize) -> Vec<Value> {
+fn build_session_transcript(
+    store: &Store,
+    rows: &[Value],
+    tools: &[Value],
+    limit: usize,
+) -> Vec<Value> {
     let mut previous_codex_user_history: Option<String> = None;
     let mut turns = Vec::new();
     for (index, row) in rows.iter().take(limit).enumerate() {
         if index == 0 {
-            turns.extend(transcript_inherited_turns(row));
+            turns.extend(transcript_inherited_turns(store, row));
         }
-        let signature = codex_user_history_signature(row);
+        let signature = codex_user_history_signature(store, row);
         let replayed_user = signature.is_some() && signature == previous_codex_user_history;
         if signature.is_some() {
             previous_codex_user_history = signature;
         }
-        let mut turn = transcript_turn(row);
+        let mut turn = transcript_turn(store, row);
         // Pi emits a tool start after the model response that requested it
         // and before the next provider request. Associate by explicit
         // trace_id when available, otherwise by that session-local time
@@ -6202,7 +6246,7 @@ async fn traces_session_transcript(
         Ok(rows) => rows,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let turns = build_session_transcript(&rows, &tools, limit);
+    let turns = build_session_transcript(&state.store, &rows, &tools, limit);
     let tab_counts = transcript_tab_counts(&turns);
     axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
         .into_response()
@@ -6268,7 +6312,7 @@ fn trace_extras(req: &Value) -> Value {
 async fn trace_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.store.get_trace(&id) {
         Ok(Some(row)) => {
-            let mut extras = read_gz_json(row["req_body_path"].as_str())
+            let mut extras = stored_trace_json(&state.store, &row, TraceBodyKind::Request)
                 .map(|req| trace_extras(&req))
                 .unwrap_or_else(|| json!({}));
             if let Some(summary) = dario_capture_summary(&state, &row) {
@@ -6306,12 +6350,35 @@ async fn trace_body(
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let path = match kind.as_str() {
-        "request" => row["req_body_path"].as_str().map(String::from),
-        "upstream-request" => row["upstream_req_body_path"].as_str().map(String::from),
-        "response" => row["resp_body_path"].as_str().map(String::from),
+    let standard_kind = match kind.as_str() {
+        "request" => Some(TraceBodyKind::Request),
+        "upstream-request" => Some(TraceBodyKind::UpstreamRequest),
+        "response" => Some(TraceBodyKind::Response),
         "dario-upstream-request" | "dario-upstream-response" => {
-            find_dario_capture_path(&state, &row, &kind)
+            let path = find_dario_capture_path(&state, &row, &kind);
+            return match read_gz_text(path.as_deref()) {
+                Some(text) => {
+                    let content_type = if text.trim_start().starts_with('{')
+                        || text.trim_start().starts_with('[')
+                    {
+                        "application/json; charset=utf-8"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", content_type)
+                        .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
+                        .body(Body::from(text))
+                        .unwrap_or_else(|e| {
+                            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                        })
+                }
+                None => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("no {kind} body stored for trace '{id}'"),
+                ),
+            };
         }
         _ => {
             return error_response(
@@ -6320,8 +6387,13 @@ async fn trace_body(
             )
         }
     };
-    match read_gz_text(path.as_deref()) {
-        Some(text) => {
+    match state.store.read_trace_body(
+        &id,
+        standard_kind.expect("standard trace body kind"),
+        TRACE_BODY_RESPONSE_LIMIT,
+    ) {
+        Ok(Some(stored)) => {
+            let text = String::from_utf8_lossy(&stored.bytes).into_owned();
             let ct = if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
                 "application/json; charset=utf-8"
             } else {
@@ -6330,16 +6402,24 @@ async fn trace_body(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", ct)
-                .header("x-alexandria-body-path", path.as_deref().unwrap_or(""))
+                .header("x-alex-body-source", stored.source.as_str())
+                .header("x-alexandria-body-path", stored.locator)
                 .body(Body::from(text))
                 .unwrap_or_else(|e| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
                 })
         }
-        None => error_response(
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             &format!("no {kind} body stored for trace '{id}'"),
         ),
+        Err(error)
+            if error.to_string().contains("read limit")
+                || error.to_string().contains("requested maximum") =>
+        {
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, &error.to_string())
+        }
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -6383,7 +6463,7 @@ async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<Strin
         .as_str()
         .or(row["client_format"].as_str())
         .unwrap_or("");
-    let reply = read_gz_text(row["resp_body_path"].as_str())
+    let reply = stored_trace_text(&state.store, &row, TraceBodyKind::Response)
         .and_then(|text| translate::assistant_reply_text(fmt, &text));
     match reply {
         Some(md) => Response::builder()
@@ -6457,7 +6537,7 @@ async fn traces_run_export(
         ..Default::default()
     };
     match state.store.search_traces(&filter) {
-        Ok(rows) => ndjson_response(rows, wants_bodies(&q)),
+        Ok(rows) => ndjson_response(&state.store, rows, wants_bodies(&q)),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -9260,6 +9340,12 @@ mod trace_api_tests {
 
     #[test]
     fn transcript_turn_missing_bodies_are_null() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-proxy-missing-transcript-{}",
+            std::process::id()
+        ));
+        let _cleanup = RemoveTestDir(dir.clone());
+        let store = Store::open(dir.join("store")).unwrap();
         let row = json!({
             "id": "t1", "ts_request_ms": 1, "ts_response_ms": 2,
             "routed_model": "m", "status": 200,
@@ -9269,7 +9355,7 @@ mod trace_api_tests {
             "req_body_path": "/nonexistent/x.gz", "resp_body_path": null,
             "client_format": "anthropic", "upstream_format": "anthropic",
         });
-        let turn = transcript_turn(&row);
+        let turn = transcript_turn(&store, &row);
         assert_eq!(turn["trace_id"], "t1");
         assert_eq!(turn["user"], serde_json::Value::Null);
         assert_eq!(turn["assistant"], serde_json::Value::Null);
@@ -9315,7 +9401,7 @@ mod trace_api_tests {
             include_str!("../tests/fixtures/transcript/fork_first_request.json"),
         );
 
-        let turns = build_session_transcript(&[row], &[], 500);
+        let turns = build_session_transcript(&store, &[row], &[], 500);
         assert_eq!(turns.len(), 5);
         assert_eq!(turns[0]["user"], "Inspect the failing test.");
         assert_eq!(turns[0]["inherited"], true);
@@ -9346,7 +9432,7 @@ mod trace_api_tests {
             include_str!("../tests/fixtures/transcript/normal_first_request.json"),
         );
 
-        let turns = build_session_transcript(&[row], &[], 500);
+        let turns = build_session_transcript(&store, &[row], &[], 500);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0]["user"], "Start a new task.");
         assert!(turns[0].get("inherited").is_none());
@@ -9421,7 +9507,7 @@ mod trace_api_tests {
             "{dialect}: translate::assistant_tool_calls did not return {expected_tool}: {direct_calls:?}"
         );
 
-        let turn = transcript_turn(&row);
+        let turn = transcript_turn(&store, &row);
         assert!(
             turn["user"]
                 .as_str()
@@ -16349,6 +16435,30 @@ mod tests {
         assert_eq!(body["traces"][0]["id"], "trace-for-key");
     }
 
+    #[tokio::test]
+    async fn admin_traces_supports_bounded_offset_pages() {
+        let state = test_state("admin-traces-pagination");
+        for index in 0..12 {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: format!("paged-{index:02}"),
+                    ts_request_ms: index,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut query = HashMap::new();
+        query.insert("limit".into(), "5".into());
+        query.insert("offset".into(), "5".into());
+        let (status, body) = response_json(admin_traces(State(state), Query(query)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["traces"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0]["id"], "paged-06");
+        assert_eq!(rows[4]["id"], "paged-02");
+    }
+
     #[test]
     fn dario_health_state_follows_credentials_generation_and_probe() {
         assert_eq!(
@@ -19234,6 +19344,46 @@ mod tests {
         assert!(read_gz_text(row["resp_body_path"].as_str())
             .unwrap()
             .contains("final answer"));
+    }
+
+    #[tokio::test]
+    async fn trace_body_endpoint_reads_validated_lar_pointer() {
+        let state = test_state("lar-trace-body-endpoint");
+        let request_path = state
+            .store
+            .write_body("lar-endpoint", "request.json", br#"{"hello":"lar"}"#)
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "lar-endpoint".into(),
+                ts_request_ms: now_ms(),
+                req_body_path: Some(request_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let report = state
+            .store
+            .migrate_legacy_trace_bodies_to_lar(None)
+            .unwrap();
+        assert!(report.validated);
+        assert_eq!(report.pointers_switched, 1);
+        assert!(std::path::Path::new(&request_path).is_file());
+
+        let response = trace_body(
+            State(state),
+            Path(("lar-endpoint".into(), "request".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-alex-body-source"],
+            HeaderValue::from_static("lar")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], br#"{"hello":"lar"}"#);
     }
 
     #[tokio::test]

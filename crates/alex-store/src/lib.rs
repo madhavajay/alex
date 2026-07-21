@@ -1,17 +1,19 @@
 #![recursion_limit = "256"]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use alex_core::{route_model, Pricing, Provider, TraceRecord};
+use alex_lar::{import_legacy, ArchiveReader, ImportOptions, LegacyBodyRef};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 static BODY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -119,6 +121,9 @@ CREATE TABLE IF NOT EXISTS traces (
   req_body_path     TEXT,
   upstream_req_body_path TEXT,
   resp_body_path    TEXT,
+  req_body_lar      TEXT,
+  upstream_req_body_lar TEXT,
+  resp_body_lar     TEXT,
   req_headers_json  TEXT,
   resp_headers_json TEXT,
   error             TEXT,
@@ -285,25 +290,83 @@ const TRACE_COLS: &str =
      original_account_id, served_account_id,
      upstream_format, req_body_path, upstream_req_body_path, req_headers_json, resp_headers_json,
      account_id, run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
-     method, path, subscription_identity, via_dario, dario_generation";
+     method, path, subscription_identity, via_dario, dario_generation,
+     req_body_lar, upstream_req_body_lar, resp_body_lar";
 
 const BACKUP_TRACE_COLS: &[&str] = &[
-    "id", "ts_request_ms", "ts_response_ms", "session_id", "harness", "client_format",
-    "upstream_provider", "upstream_format", "requested_model", "routed_model", "method", "path",
-    "status", "streamed", "input_tokens", "cached_input_tokens", "cache_creation_tokens",
-    "output_tokens", "reasoning_tokens", "cost_usd", "billing_bucket", "req_body_path",
-    "upstream_req_body_path", "resp_body_path", "req_headers_json", "resp_headers_json", "error",
-    "error_kind", "error_code", "error_class", "substituted", "original_model", "served_model",
-    "substitution_reason", "attempts", "injected", "fixture_name", "original_account_id",
-    "served_account_id", "account_id", "run_id", "tags_json", "client_ip", "key_fingerprint",
-    "reasoning_effort", "thinking_budget", "subscription_identity", "via_dario", "dario_generation",
+    "id",
+    "ts_request_ms",
+    "ts_response_ms",
+    "session_id",
+    "harness",
+    "client_format",
+    "upstream_provider",
+    "upstream_format",
+    "requested_model",
+    "routed_model",
+    "method",
+    "path",
+    "status",
+    "streamed",
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cost_usd",
+    "billing_bucket",
+    "req_body_path",
+    "upstream_req_body_path",
+    "resp_body_path",
+    "req_headers_json",
+    "resp_headers_json",
+    "error",
+    "error_kind",
+    "error_code",
+    "error_class",
+    "substituted",
+    "original_model",
+    "served_model",
+    "substitution_reason",
+    "attempts",
+    "injected",
+    "fixture_name",
+    "original_account_id",
+    "served_account_id",
+    "account_id",
+    "run_id",
+    "tags_json",
+    "client_ip",
+    "key_fingerprint",
+    "reasoning_effort",
+    "thinking_budget",
+    "subscription_identity",
+    "via_dario",
+    "dario_generation",
 ];
 const BACKUP_TOOL_CALL_COLS: &[&str] = &[
-    "id", "harness", "session_id", "turn_id", "tool_call_id", "trace_id", "tool_name",
-    "ts_start_ms", "ts_end_ms", "is_error", "exit_status", "args_body_path", "result_body_path",
+    "id",
+    "harness",
+    "session_id",
+    "turn_id",
+    "tool_call_id",
+    "trace_id",
+    "tool_name",
+    "ts_start_ms",
+    "ts_end_ms",
+    "is_error",
+    "exit_status",
+    "args_body_path",
+    "result_body_path",
 ];
 const BACKUP_HEARTBEAT_COLS: &[&str] = &[
-    "ts_ms", "provider", "account_id", "ok", "status", "latency_ms", "message",
+    "ts_ms",
+    "provider",
+    "account_id",
+    "ok",
+    "status",
+    "latency_ms",
+    "message",
 ];
 const BACKUP_SESSION_FORK_COLS: &[&str] = &[
     "target_harness",
@@ -357,8 +420,16 @@ fn sqlite_row_json(row: &rusqlite::Row<'_>, columns: &[&str]) -> rusqlite::Resul
     Ok(Value::Object(object))
 }
 
-fn export_table_rows(conn: &Connection, table: &str, columns: &[&str], order: &str) -> Result<Vec<Value>> {
-    let sql = format!("SELECT {} FROM {table} ORDER BY {order}", columns.join(", "));
+fn export_table_rows(
+    conn: &Connection,
+    table: &str,
+    columns: &[&str],
+    order: &str,
+) -> Result<Vec<Value>> {
+    let sql = format!(
+        "SELECT {} FROM {table} ORDER BY {order}",
+        columns.join(", ")
+    );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([], |row| sqlite_row_json(row, columns))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -391,7 +462,11 @@ fn restored_body_path(data_dir: &Path, value: &mut Value) {
     *value = Value::String(data_dir.join(path).to_string_lossy().into_owned());
 }
 
-fn checked_sql_values(row: &Value, table: &str, columns: &[&str]) -> Result<Vec<rusqlite::types::Value>> {
+fn checked_sql_values(
+    row: &Value,
+    table: &str,
+    columns: &[&str],
+) -> Result<Vec<rusqlite::types::Value>> {
     use rusqlite::types::Value as SqlValue;
 
     let object = row
@@ -413,12 +488,13 @@ fn checked_sql_values(row: &Value, table: &str, columns: &[&str]) -> Result<Vec<
                     } else if let Some(value) = value.as_u64() {
                         i64::try_from(value)
                             .map(SqlValue::Integer)
-                            .with_context(|| format!("{table}.{column} is outside SQLite's integer range"))
+                            .with_context(|| {
+                                format!("{table}.{column} is outside SQLite's integer range")
+                            })
                     } else {
-                        value
-                            .as_f64()
-                            .map(SqlValue::Real)
-                            .with_context(|| format!("{table}.{column} is not a finite JSON number"))
+                        value.as_f64().map(SqlValue::Real).with_context(|| {
+                            format!("{table}.{column} is not a finite JSON number")
+                        })
                     }
                 }
                 Value::String(value) => Ok(SqlValue::Text(value.clone())),
@@ -483,6 +559,9 @@ fn trace_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "subscription_identity": r.get::<_, Option<String>>(46)?,
         "via_dario": r.get::<_, i64>(47)? != 0,
         "dario_generation": r.get::<_, Option<String>>(48)?,
+        "req_body_lar": r.get::<_, Option<String>>(49)?,
+        "upstream_req_body_lar": r.get::<_, Option<String>>(50)?,
+        "resp_body_lar": r.get::<_, Option<String>>(51)?,
         "latency_ms": ts_response_ms.map(|t| t - ts_request_ms),
     }))
 }
@@ -524,6 +603,7 @@ fn account_json_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 
 const DEFAULT_SEARCH_LIMIT: usize = 200;
 const MAX_SEARCH_LIMIT: usize = 5000;
+const MAX_SEARCH_OFFSET: usize = 1_000_000;
 
 fn effective_limit(limit: usize) -> usize {
     if limit == 0 {
@@ -556,6 +636,9 @@ fn migrate_traces(conn: &Connection) -> Result<()> {
         "attempts TEXT",
         "original_account_id TEXT",
         "served_account_id TEXT",
+        "req_body_lar TEXT",
+        "upstream_req_body_lar TEXT",
+        "resp_body_lar TEXT",
     ] {
         if let Err(e) = conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {col}")) {
             if !e.to_string().contains("duplicate column name") {
@@ -633,6 +716,62 @@ pub struct TraceFilter {
     pub key_fingerprint: Option<String>,
     pub reasoning_effort: Option<String>,
     pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceBodyKind {
+    Request,
+    UpstreamRequest,
+    Response,
+}
+
+impl TraceBodyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::UpstreamRequest => "upstream-request",
+            Self::Response => "response",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredBodySource {
+    Lar,
+    Legacy,
+    LegacyFallback,
+}
+
+impl StoredBodySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lar => "lar",
+            Self::Legacy => "legacy-gzip",
+            Self::LegacyFallback => "legacy-gzip-fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBody {
+    pub bytes: Vec<u8>,
+    pub source: StoredBodySource,
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LarMigrationReport {
+    pub archive: String,
+    pub candidates: u64,
+    pub missing_originals: u64,
+    pub imported: u64,
+    pub already_present: u64,
+    pub next_index: usize,
+    pub pointers_switched: u64,
+    pub complete: bool,
+    pub validated: bool,
+    pub originals_preserved: bool,
 }
 
 /// Normalized harness tool activity. Payload bytes live in `bodies/`, just as
@@ -690,6 +829,7 @@ impl Default for TraceFilter {
             key_fingerprint: None,
             reasoning_effort: None,
             limit: DEFAULT_SEARCH_LIMIT,
+            offset: 0,
         }
     }
 }
@@ -726,6 +866,72 @@ fn date_dir_name(name: &str) -> bool {
 pub struct Store {
     conn: Mutex<Connection>,
     pub data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LarMigrationCandidate {
+    trace_id: String,
+    kind: TraceBodyKind,
+    legacy_column: &'static str,
+    lar_column: &'static str,
+    path: PathBuf,
+}
+
+type TraceBodyReferences = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn read_gzip_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut decoder = flate2::read::GzDecoder::new(file).take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "legacy body {} exceeds the {max_bytes}-byte read limit",
+            path.display()
+        );
+    }
+    Ok(Some(bytes))
+}
+
+fn gzip_sha256(path: &Path, max_bytes: u64) -> Result<Option<String>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            anyhow::bail!("legacy body exceeds the {max_bytes}-byte validation limit");
+        }
+        digest.update(&buffer[..read]);
+    }
+    let bytes = digest.finalize();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(Some(output))
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -831,7 +1037,8 @@ impl Store {
             Ok((files, bytes))
         }
 
-        let (body_files, body_bytes) = body_usage(&self.data_dir.join("bodies"))?;
+        let (legacy_body_files, legacy_body_bytes) = body_usage(&self.data_dir.join("bodies"))?;
+        let (lar_files, lar_bytes) = body_usage(&self.data_dir.join("lar"))?;
         let (dario_prompt_cache_files, dario_prompt_cache_bytes) =
             body_usage(&self.data_dir.join("dario-prompt-cache"))?;
         let conn = self.conn.lock().unwrap();
@@ -847,8 +1054,8 @@ impl Store {
                 |r| r.get(0),
             )?,
             pricing: count("pricing")?,
-            body_files,
-            body_bytes,
+            body_files: legacy_body_files + lar_files,
+            body_bytes: legacy_body_bytes + lar_bytes,
             dario_prompt_cache_files,
             dario_prompt_cache_bytes,
         })
@@ -900,6 +1107,11 @@ impl Store {
         if bodies.exists() {
             std::fs::remove_dir_all(&bodies)
                 .with_context(|| format!("removing captured bodies at {}", bodies.display()))?;
+        }
+        let lar = self.data_dir.join("lar");
+        if lar.exists() {
+            std::fs::remove_dir_all(&lar)
+                .with_context(|| format!("removing LAR archives at {}", lar.display()))?;
         }
         conn.execute_batch(
             "DELETE FROM session_forks;
@@ -1056,10 +1268,8 @@ impl Store {
             if exists {
                 counts.heartbeats_skipped += 1;
             } else {
-                transaction.execute(
-                    &heartbeat_insert,
-                    rusqlite::params_from_iter(values.iter()),
-                )?;
+                transaction
+                    .execute(&heartbeat_insert, rusqlite::params_from_iter(values.iter()))?;
                 counts.heartbeats_imported += 1;
             }
         }
@@ -1098,17 +1308,43 @@ impl Store {
         // Some older remote/wrap clients deserialize a TraceRecord without
         // the new field and later update the same trace id. INSERT OR REPLACE
         // must not erase an identity that was already recorded.
+        let existing = conn
+            .query_row(
+                "SELECT subscription_identity, req_body_lar, upstream_req_body_lar, resp_body_lar
+                 FROM traces WHERE id=?1",
+                [&t.id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
         let subscription_identity = match &t.subscription_identity {
             Some(identity) => Some(identity.clone()),
-            None => conn
-                .query_row(
-                    "SELECT subscription_identity FROM traces WHERE id=?1",
-                    [&t.id],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten(),
+            None => existing.as_ref().and_then(|row| row.0.clone()),
         };
+        let req_body_lar = self.retained_lar_pointer(
+            &t.id,
+            TraceBodyKind::Request,
+            t.req_body_path.as_deref(),
+            existing.as_ref().and_then(|row| row.1.as_deref()),
+        );
+        let upstream_req_body_lar = self.retained_lar_pointer(
+            &t.id,
+            TraceBodyKind::UpstreamRequest,
+            t.upstream_req_body_path.as_deref(),
+            existing.as_ref().and_then(|row| row.2.as_deref()),
+        );
+        let resp_body_lar = self.retained_lar_pointer(
+            &t.id,
+            TraceBodyKind::Response,
+            t.resp_body_path.as_deref(),
+            existing.as_ref().and_then(|row| row.3.as_deref()),
+        );
         conn.execute(
             r#"INSERT OR REPLACE INTO traces (
                 id, ts_request_ms, ts_response_ms, session_id, harness, client_format,
@@ -1122,8 +1358,9 @@ impl Store {
                 substituted, original_model, served_model, substitution_reason, attempts, injected, fixture_name,
                 original_account_id, served_account_id,
                 run_id, tags_json, client_ip, key_fingerprint, reasoning_effort, thinking_budget,
-                subscription_identity, via_dario, dario_generation
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49)"#,
+                subscription_identity, via_dario, dario_generation,
+                req_body_lar, upstream_req_body_lar, resp_body_lar
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52)"#,
             params![
                 t.id,
                 t.ts_request_ms,
@@ -1174,6 +1411,9 @@ impl Store {
                 subscription_identity,
                 t.via_dario as i64,
                 t.dario_generation,
+                req_body_lar,
+                upstream_req_body_lar,
+                resp_body_lar,
             ],
         )?;
         Ok(())
@@ -1445,8 +1685,9 @@ impl Store {
             sql.push_str(" AND reasoning_effort = ?");
             args.push(e.clone());
         }
-        sql.push_str(" ORDER BY ts_request_ms DESC, id DESC LIMIT ?");
+        sql.push_str(" ORDER BY ts_request_ms DESC, id DESC LIMIT ? OFFSET ?");
         args.push(effective_limit(f.limit).to_string());
+        args.push(f.offset.min(MAX_SEARCH_OFFSET).to_string());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), trace_row_json)?;
         let mut rows: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
@@ -1812,6 +2053,312 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Resolve one trace body through its validated LAR pointer, falling back
+    /// to the preserved legacy gzip only when the archive cannot be read.
+    /// Both paths enforce the caller's byte limit before returning data.
+    pub fn read_trace_body(
+        &self,
+        id: &str,
+        kind: TraceBodyKind,
+        max_bytes: u64,
+    ) -> Result<Option<StoredBody>> {
+        let row: Option<TraceBodyReferences> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT req_body_lar, upstream_req_body_lar, resp_body_lar,
+                        req_body_path, upstream_req_body_path, resp_body_path
+                 FROM traces WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((req_lar, upstream_lar, resp_lar, req_path, upstream_path, resp_path)) = row
+        else {
+            return Ok(None);
+        };
+        let (lar_pointer, legacy_path) = match kind {
+            TraceBodyKind::Request => (req_lar, req_path),
+            TraceBodyKind::UpstreamRequest => (upstream_lar, upstream_path),
+            TraceBodyKind::Response => (resp_lar, resp_path),
+        };
+
+        let mut lar_error = None;
+        if let Some(pointer) = lar_pointer {
+            match self.resolve_lar_pointer(&pointer).and_then(|archive_path| {
+                let mut archive = ArchiveReader::open(&archive_path)?;
+                let bytes = archive.read_body(id, kind.as_str(), max_bytes)?;
+                Ok((archive_path, bytes))
+            }) {
+                Ok((archive_path, bytes)) => {
+                    return Ok(Some(StoredBody {
+                        bytes,
+                        source: StoredBodySource::Lar,
+                        locator: archive_path.to_string_lossy().into_owned(),
+                    }));
+                }
+                Err(error) => lar_error = Some(error),
+            }
+        }
+
+        if let Some(path) = legacy_path {
+            if let Some(bytes) = read_gzip_bounded(Path::new(&path), max_bytes)? {
+                if let Some(error) = &lar_error {
+                    tracing::warn!(
+                        trace_id = id,
+                        body_kind = kind.as_str(),
+                        "LAR body read failed; using preserved legacy body: {error:#}"
+                    );
+                }
+                return Ok(Some(StoredBody {
+                    bytes,
+                    source: if lar_error.is_some() {
+                        StoredBodySource::LegacyFallback
+                    } else {
+                        StoredBodySource::Legacy
+                    },
+                    locator: path,
+                }));
+            }
+        }
+        if let Some(error) = lar_error {
+            return Err(error.context(format!(
+                "reading LAR body {}/{} and no legacy fallback was available",
+                id,
+                kind.as_str()
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Import authoritative SQLite body references with resumable checkpoints
+    /// and attach LAR pointers only after the complete selected batch validates.
+    /// Legacy paths and files are deliberately preserved.
+    pub fn migrate_legacy_trace_bodies_to_lar(
+        &self,
+        max_entries_this_run: Option<usize>,
+    ) -> Result<LarMigrationReport> {
+        let lar_dir = self.data_dir.join("lar");
+        std::fs::create_dir_all(&lar_dir)?;
+        let archive_path = lar_dir.join("legacy-v1.lar");
+        let checkpoint_path = lar_dir.join("legacy-v1.import.json");
+        let pointer = self.lar_pointer_for_archive(&archive_path)?;
+        let candidates = self.lar_migration_candidates()?;
+        let mut report = LarMigrationReport {
+            archive: archive_path.to_string_lossy().into_owned(),
+            candidates: candidates.len() as u64,
+            originals_preserved: true,
+            ..LarMigrationReport::default()
+        };
+        if candidates.is_empty() {
+            let _ = std::fs::remove_file(checkpoint_path);
+            report.complete = true;
+            report.validated = true;
+            return Ok(report);
+        }
+
+        let mut refs = Vec::with_capacity(candidates.len());
+        let mut existing_candidates = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !candidate.path.is_file() {
+                report.missing_originals += 1;
+                continue;
+            }
+            refs.push(LegacyBodyRef {
+                trace_id: candidate.trace_id.clone(),
+                body_kind: candidate.kind.as_str().to_string(),
+                path: candidate.path.clone(),
+            });
+            existing_candidates.push(candidate);
+        }
+        if refs.is_empty() {
+            report.complete = false;
+            return Ok(report);
+        }
+        let imported = import_legacy(
+            &refs,
+            &archive_path,
+            &checkpoint_path,
+            ImportOptions {
+                max_entries_this_run,
+                ..ImportOptions::default()
+            },
+        )?;
+        report.imported = imported.imported;
+        report.already_present = imported.already_present;
+        report.next_index = imported.next_index;
+        report.complete = imported.complete && report.missing_originals == 0;
+        report.validated = imported.validated;
+        if !imported.complete || !imported.validated {
+            return Ok(report);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        for candidate in &existing_candidates {
+            let sql = format!(
+                "UPDATE traces SET {}=?1 WHERE id=?2 AND {}=?3 AND {} IS NULL",
+                candidate.lar_column, candidate.legacy_column, candidate.lar_column
+            );
+            let changed = transaction.execute(
+                &sql,
+                params![
+                    pointer,
+                    candidate.trace_id,
+                    candidate.path.to_string_lossy()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!(
+                    "trace {}/{} changed during offline LAR migration; no pointers were switched",
+                    candidate.trace_id,
+                    candidate.kind.as_str()
+                );
+            }
+            report.pointers_switched += 1;
+        }
+        transaction.commit()?;
+        let _ = std::fs::remove_file(&checkpoint_path);
+        Ok(report)
+    }
+
+    fn lar_migration_candidates(&self) -> Result<Vec<LarMigrationCandidate>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT id, req_body_path, upstream_req_body_path, resp_body_path
+             FROM traces
+             WHERE (req_body_path IS NOT NULL AND req_body_lar IS NULL)
+                OR (upstream_req_body_path IS NOT NULL AND upstream_req_body_lar IS NULL)
+                OR (resp_body_path IS NOT NULL AND resp_body_lar IS NULL)
+             ORDER BY ts_request_ms, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (trace_id, request, upstream, response) = row?;
+            for (kind, legacy_column, lar_column, path) in [
+                (
+                    TraceBodyKind::Request,
+                    "req_body_path",
+                    "req_body_lar",
+                    request,
+                ),
+                (
+                    TraceBodyKind::UpstreamRequest,
+                    "upstream_req_body_path",
+                    "upstream_req_body_lar",
+                    upstream,
+                ),
+                (
+                    TraceBodyKind::Response,
+                    "resp_body_path",
+                    "resp_body_lar",
+                    response,
+                ),
+            ] {
+                if let Some(path) = path {
+                    candidates.push(LarMigrationCandidate {
+                        trace_id: trace_id.clone(),
+                        kind,
+                        legacy_column,
+                        lar_column,
+                        path: PathBuf::from(path),
+                    });
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn lar_pointer_for_archive(&self, archive: &Path) -> Result<String> {
+        let relative = archive
+            .strip_prefix(&self.data_dir)
+            .context("LAR archive must be inside the Alex data directory")?;
+        if !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            anyhow::bail!("LAR archive pointer is not a safe relative path");
+        }
+        Ok(relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"))
+    }
+
+    fn resolve_lar_pointer(&self, pointer: &str) -> Result<PathBuf> {
+        let relative = Path::new(pointer);
+        if relative.is_absolute()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            || relative.components().next() != Some(Component::Normal("lar".as_ref()))
+        {
+            anyhow::bail!("unsafe LAR archive pointer '{pointer}'");
+        }
+        let archive = self.data_dir.join(relative);
+        let archive_canonical = archive
+            .canonicalize()
+            .with_context(|| format!("resolving LAR archive {}", archive.display()))?;
+        let lar_root = self.data_dir.join("lar").canonicalize()?;
+        if !archive_canonical.starts_with(&lar_root) {
+            anyhow::bail!("LAR archive pointer escapes the data directory");
+        }
+        Ok(archive_canonical)
+    }
+
+    fn retained_lar_pointer(
+        &self,
+        trace_id: &str,
+        kind: TraceBodyKind,
+        current_legacy_path: Option<&str>,
+        pointer: Option<&str>,
+    ) -> Option<String> {
+        let pointer = pointer?;
+        let Some(path) = current_legacy_path else {
+            // A metadata-only refresh may omit bodies. The immutable archive
+            // remains the only body reference after INSERT OR REPLACE.
+            return Some(pointer.to_string());
+        };
+        let matches = (|| -> Result<bool> {
+            let archive_path = self.resolve_lar_pointer(pointer)?;
+            let mut archive = ArchiveReader::open(archive_path)?;
+            let archived = archive.metadata(trace_id, kind.as_str())?;
+            Ok(gzip_sha256(Path::new(path), 512 * 1024 * 1024)?
+                .is_some_and(|digest| digest == archived.sha256))
+        })();
+        match matches {
+            Ok(true) => Some(pointer.to_string()),
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(
+                    trace_id,
+                    body_kind = kind.as_str(),
+                    "clearing stale LAR pointer during trace refresh: {error:#}"
+                );
+                None
+            }
+        }
     }
 
     pub fn delete_trace(&self, id: &str) -> Result<Vec<String>> {
@@ -2288,10 +2835,7 @@ impl Store {
             )?;
             let collected = stmt
                 .query_map(params![fingerprint], |result| {
-                    Ok((
-                        result.get::<_, String>(0)?,
-                        result.get::<_, String>(1)?,
-                    ))
+                    Ok((result.get::<_, String>(0)?, result.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             collected
@@ -2400,7 +2944,9 @@ impl Store {
                 "SELECT id, req_body_path, upstream_req_body_path, resp_body_path
                  FROM traces WHERE ts_request_ms < ?1
                    AND (req_body_path IS NOT NULL OR upstream_req_body_path IS NOT NULL
-                        OR resp_body_path IS NOT NULL OR req_headers_json IS NOT NULL
+                        OR resp_body_path IS NOT NULL OR req_body_lar IS NOT NULL
+                        OR upstream_req_body_lar IS NOT NULL OR resp_body_lar IS NOT NULL
+                        OR req_headers_json IS NOT NULL
                         OR resp_headers_json IS NOT NULL)",
             )?;
             let rows = stmt
@@ -2427,7 +2973,9 @@ impl Store {
                 let conn = self.conn.lock().unwrap();
                 conn.execute(
                     "UPDATE traces SET req_body_path = NULL, upstream_req_body_path = NULL,
-                            resp_body_path = NULL, req_headers_json = NULL, resp_headers_json = NULL
+                            resp_body_path = NULL, req_body_lar = NULL,
+                            upstream_req_body_lar = NULL, resp_body_lar = NULL,
+                            req_headers_json = NULL, resp_headers_json = NULL
                      WHERE id = ?1",
                     params![id],
                 )?;
@@ -3234,10 +3782,12 @@ mod tests {
         assert_eq!(imported.heartbeats_imported, 1);
         assert_eq!(store.reset_counts().unwrap().traces, 1);
         assert_eq!(store.reset_counts().unwrap().heartbeats, 1);
-        assert!(store.get_trace("backup-trace").unwrap().unwrap()["req_body_path"]
-            .as_str()
-            .unwrap()
-            .starts_with(dir.to_string_lossy().as_ref()));
+        assert!(
+            store.get_trace("backup-trace").unwrap().unwrap()["req_body_path"]
+                .as_str()
+                .unwrap()
+                .starts_with(dir.to_string_lossy().as_ref())
+        );
 
         let repeated = store.import_trace_backup_rows(&backup).unwrap();
         assert_eq!(repeated.traces_skipped, 1);
@@ -3248,8 +3798,12 @@ mod tests {
     #[test]
     fn trace_backup_import_skips_existing_rows_and_keeps_newer_history() {
         let source = Store::open(tmpdir("trace-backup-source")).unwrap();
-        source.insert_trace(&trace("existing", 1_000, None)).unwrap();
-        source.insert_trace(&trace("from-backup", 2_000, None)).unwrap();
+        source
+            .insert_trace(&trace("existing", 1_000, None))
+            .unwrap();
+        source
+            .insert_trace(&trace("from-backup", 2_000, None))
+            .unwrap();
         source
             .upsert_tool_call(&ToolCallRecord {
                 id: "existing-tool".into(),
@@ -3273,7 +3827,9 @@ mod tests {
         let mut existing = trace("existing", 9_000, None);
         existing.routed_model = Some("newer-model".into());
         destination.insert_trace(&existing).unwrap();
-        destination.insert_trace(&trace("newer", 10_000, None)).unwrap();
+        destination
+            .insert_trace(&trace("newer", 10_000, None))
+            .unwrap();
         destination
             .upsert_tool_call(&ToolCallRecord {
                 id: "existing-tool".into(),
@@ -3306,6 +3862,182 @@ mod tests {
             destination.session_tool_calls("session").unwrap()[0]["tool_name"],
             "new-name"
         );
+    }
+
+    #[test]
+    fn lar_migration_is_resumable_authoritative_and_dual_read() {
+        let dir = tmpdir("lar-migration");
+        let store = Store::open(dir.clone()).unwrap();
+        let request_path = store
+            .write_body("lar-trace", "request.json", br#"{"prompt":"hello"}"#)
+            .unwrap();
+        let response_path = store
+            .write_body("lar-trace", "response.body", br#"{"answer":"world"}"#)
+            .unwrap();
+        let orphan = store
+            .write_body("not-in-sqlite", "request.json", b"orphan")
+            .unwrap();
+        let mut row = trace("lar-trace", 1_000, None);
+        row.req_body_path = Some(request_path.clone());
+        row.resp_body_path = Some(response_path.clone());
+        store.insert_trace(&row).unwrap();
+
+        let first = store.migrate_legacy_trace_bodies_to_lar(Some(1)).unwrap();
+        assert_eq!(first.candidates, 2);
+        assert_eq!(first.imported, 1);
+        assert!(!first.complete);
+        let before_switch = store.get_trace("lar-trace").unwrap().unwrap();
+        assert!(before_switch["req_body_lar"].is_null());
+        assert!(before_switch["resp_body_lar"].is_null());
+        assert_eq!(
+            store
+                .read_trace_body("lar-trace", TraceBodyKind::Request, 1024)
+                .unwrap()
+                .unwrap()
+                .source,
+            StoredBodySource::Legacy
+        );
+
+        let second = store.migrate_legacy_trace_bodies_to_lar(None).unwrap();
+        assert!(second.complete && second.validated && second.originals_preserved);
+        assert_eq!(second.imported, 1);
+        assert_eq!(second.pointers_switched, 2);
+        assert!(Path::new(&request_path).is_file());
+        assert!(Path::new(&response_path).is_file());
+        assert!(Path::new(&orphan).is_file());
+
+        let migrated = store.get_trace("lar-trace").unwrap().unwrap();
+        assert_eq!(migrated["req_body_lar"], "lar/legacy-v1.lar");
+        assert_eq!(migrated["resp_body_lar"], "lar/legacy-v1.lar");
+        let body = store
+            .read_trace_body("lar-trace", TraceBodyKind::Response, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.source, StoredBodySource::Lar);
+        assert_eq!(body.bytes, br#"{"answer":"world"}"#);
+        let archive = dir.join("lar/legacy-v1.lar");
+        assert_eq!(ArchiveReader::open(&archive).unwrap().len(), 2);
+
+        // A later trace refresh must not erase already validated pointers.
+        store.insert_trace(&row).unwrap();
+        assert_eq!(
+            store.get_trace("lar-trace").unwrap().unwrap()["req_body_lar"],
+            "lar/legacy-v1.lar"
+        );
+
+        // If a mutable remote trace replaces a body under the same filename,
+        // INSERT OR REPLACE must clear that one stale immutable pointer.
+        store
+            .write_body("lar-trace", "request.json", br#"{"prompt":"changed"}"#)
+            .unwrap();
+        store.insert_trace(&row).unwrap();
+        let changed = store.get_trace("lar-trace").unwrap().unwrap();
+        assert!(changed["req_body_lar"].is_null());
+        assert_eq!(changed["resp_body_lar"], "lar/legacy-v1.lar");
+
+        // A broken archive degrades to the preserved original rather than
+        // making the trace unreadable.
+        std::fs::write(&archive, b"broken").unwrap();
+        let fallback = store
+            .read_trace_body("lar-trace", TraceBodyKind::Response, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.source, StoredBodySource::LegacyFallback);
+        assert_eq!(fallback.bytes, br#"{"answer":"world"}"#);
+    }
+
+    #[test]
+    fn lar_pointer_switch_rolls_back_as_one_transaction_and_can_resume() {
+        let store = Store::open(tmpdir("lar-pointer-transaction")).unwrap();
+        for (id, timestamp) in [("tx-a", 1_000), ("tx-b", 2_000)] {
+            let path = store
+                .write_body(id, "request.json", format!(r#"{{"id":"{id}"}}"#).as_bytes())
+                .unwrap();
+            let mut row = trace(id, timestamp, None);
+            row.req_body_path = Some(path);
+            store.insert_trace(&row).unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER block_second_lar_pointer
+                 BEFORE UPDATE OF req_body_lar ON traces
+                 WHEN NEW.id = 'tx-b'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'deliberate pointer switch failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = store.migrate_legacy_trace_bodies_to_lar(None).unwrap_err();
+        assert!(error.to_string().contains("pointer switch failure"));
+        for id in ["tx-a", "tx-b"] {
+            assert!(store.get_trace(id).unwrap().unwrap()["req_body_lar"].is_null());
+        }
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER block_second_lar_pointer;")
+            .unwrap();
+        let resumed = store.migrate_legacy_trace_bodies_to_lar(None).unwrap();
+        assert!(resumed.complete && resumed.validated);
+        assert_eq!(resumed.next_index, 2);
+        assert_eq!(resumed.pointers_switched, 2);
+        for id in ["tx-a", "tx-b"] {
+            assert_eq!(
+                store.get_trace(id).unwrap().unwrap()["req_body_lar"],
+                "lar/legacy-v1.lar"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_body_reader_enforces_limits_for_legacy_rows() {
+        let store = Store::open(tmpdir("lar-body-limit")).unwrap();
+        let path = store
+            .write_body("bounded", "request.json", b"0123456789")
+            .unwrap();
+        let mut row = trace("bounded", 1_000, None);
+        row.req_body_path = Some(path);
+        store.insert_trace(&row).unwrap();
+        let error = store
+            .read_trace_body("bounded", TraceBodyKind::Request, 5)
+            .unwrap_err();
+        assert!(error.to_string().contains("5-byte read limit"));
+    }
+
+    #[test]
+    fn trace_summary_pages_are_offsettable_and_hard_capped() {
+        let store = Store::open(tmpdir("trace-summary-pages")).unwrap();
+        for index in 0..5_100 {
+            store
+                .insert_trace(&trace(&format!("page-{index:04}"), index, None))
+                .unwrap();
+        }
+        let first = store
+            .search_traces(&TraceFilter {
+                limit: usize::MAX,
+                ..TraceFilter::default()
+            })
+            .unwrap();
+        assert_eq!(first.len(), MAX_SEARCH_LIMIT);
+        assert_eq!(first[0]["id"], "page-5099");
+        let second = store
+            .search_traces(&TraceFilter {
+                limit: 200,
+                offset: MAX_SEARCH_LIMIT,
+                ..TraceFilter::default()
+            })
+            .unwrap();
+        assert_eq!(second.len(), 100);
+        assert_eq!(second[0]["id"], "page-0099");
+        assert!(first
+            .iter()
+            .all(|row| !second.iter().any(|other| other["id"] == row["id"])));
     }
 
     #[test]
@@ -3617,8 +4349,7 @@ mod tests {
         rejected.session_id = Some("alex-error-auth-0123456789abcdef".into());
         rejected.key_fingerprint = Some("0123456789abcdef".into());
         rejected.tags = Some(
-            r#"{"alex_error":"true","alex_error_kind":"auth","approval_state":"pending"}"#
-                .into(),
+            r#"{"alex_error":"true","alex_error_kind":"auth","approval_state":"pending"}"#.into(),
         );
         store.insert_trace(&rejected).unwrap();
 
@@ -3638,7 +4369,9 @@ mod tests {
             .approve_run_key_fingerprint("ffffffffffffffff")
             .unwrap()
             .is_none());
-        assert!(store.approve_run_key_fingerprint("not-a-fingerprint").is_err());
+        assert!(store
+            .approve_run_key_fingerprint("not-a-fingerprint")
+            .is_err());
     }
 
     #[test]
@@ -3987,10 +4720,26 @@ mod tests {
         store.insert_trace(&failover).unwrap();
         // Heartbeats on both accounts.
         store
-            .insert_heartbeat(1_000, "anthropic", Some("anthropic-oauth"), true, Some(200), 5, "ok")
+            .insert_heartbeat(
+                1_000,
+                "anthropic",
+                Some("anthropic-oauth"),
+                true,
+                Some(200),
+                5,
+                "ok",
+            )
             .unwrap();
         store
-            .insert_heartbeat(2_000, "anthropic", Some("anthropic-oauth-2"), true, Some(200), 6, "ok")
+            .insert_heartbeat(
+                2_000,
+                "anthropic",
+                Some("anthropic-oauth-2"),
+                true,
+                Some(200),
+                6,
+                "ok",
+            )
             .unwrap();
 
         let before = store.account_analytics(0, 60_000).unwrap();

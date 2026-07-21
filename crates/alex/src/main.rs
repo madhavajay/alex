@@ -927,6 +927,14 @@ enum TracesCommand {
     },
     /// Restore missing trace history and captured bodies from a backup (offline)
     Import { path: PathBuf },
+    /// Migrate authoritative SQLite trace body paths into LAR (offline, resumable)
+    MigrateLar {
+        /// Process at most this many body references, then leave a resumable checkpoint
+        #[arg(long)]
+        max_entries: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
     /// List legacy orphan groups, or attach one group after explicit confirmation (offline)
     Reattach {
         /// The old, now-unresolvable account id shown by the listing
@@ -1024,6 +1032,9 @@ struct TraceFilterArgs {
     key_fingerprint: Option<String>,
     #[arg(long)]
     limit: Option<usize>,
+    /// Skip this many matching trace summaries (bounded by the daemon)
+    #[arg(long)]
+    offset: Option<usize>,
 }
 
 impl TraceFilterArgs {
@@ -1054,6 +1065,9 @@ impl TraceFilterArgs {
         }
         if let Some(l) = self.limit {
             params.push(("limit", l.to_string()));
+        }
+        if let Some(offset) = self.offset {
+            params.push(("offset", offset.to_string()));
         }
         params
     }
@@ -4373,6 +4387,9 @@ async fn main() -> Result<()> {
             }
             Some(TracesCommand::Import { path }) => {
                 traces_backup_import_cmd(&config, &path)?;
+            }
+            Some(TracesCommand::MigrateLar { max_entries, json }) => {
+                traces_migrate_lar_cmd(&config, max_entries, json)?;
             }
             Some(TracesCommand::Reattach {
                 orphan_account_id,
@@ -7908,6 +7925,37 @@ async fn traces_search_cmd(config: &Config, filter: &TraceFilterArgs, json: bool
         println!("no matching traces");
     } else {
         render_traces_table(&rows);
+    }
+    Ok(())
+}
+
+fn traces_migrate_lar_cmd(
+    config: &Config,
+    max_entries: Option<usize>,
+    json_output: bool,
+) -> Result<()> {
+    let store = Store::open(config.data_dir.clone())?;
+    let report = store.migrate_legacy_trace_bodies_to_lar(max_entries)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.candidates == 0 {
+        println!("no unmigrated trace body references");
+    } else if report.validated {
+        println!(
+            "validated {} body references and atomically switched {} SQLite pointers to {} (originals preserved)",
+            report.next_index, report.pointers_switched, report.archive
+        );
+        if report.missing_originals > 0 {
+            println!(
+                "{} referenced legacy files were missing and remain unmigrated",
+                report.missing_originals
+            );
+        }
+    } else {
+        println!(
+            "migrated {}/{} body references to {}; rerun the same command to resume",
+            report.next_index, report.candidates, report.archive
+        );
     }
     Ok(())
 }
@@ -12541,6 +12589,25 @@ continue = true
             import.command,
             Some(Command::Traces {
                 command: Some(TracesCommand::Import { .. }),
+                ..
+            })
+        ));
+        let migrate = Cli::try_parse_from([
+            "alex",
+            "traces",
+            "migrate-lar",
+            "--max-entries",
+            "25",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            migrate.command,
+            Some(Command::Traces {
+                command: Some(TracesCommand::MigrateLar {
+                    max_entries: Some(25),
+                    json: true,
+                }),
                 ..
             })
         ));
