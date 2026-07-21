@@ -49,8 +49,10 @@ a tag or changes the source worktree.
 - [x] Existing gzip bodies remain readable while resumable atomic migration
   moves validated pointers to LAR.
 - [x] Interrupted append recovery and bounded body reads have regression tests.
-- [ ] Pass the reproducible 55,000-trace/~9.4-GB benchmark and publish memory,
-  initial-render, search, and individual-turn budgets.
+- [x] Reproducible 55,000-trace/9.4-GB benchmark passes with 65.1 MB peak
+  RSS, 14.747 ms trace-summary p95, 1.943 ms filtered-search p95, 0.864 ms
+  random-body-read p95, and 4.022 ms one-turn-open p95
+  (`docs/benchmarks/lar-v1-full-macos-m2-max.json`).
 - [x] Export, sanitize, reopen, and replay the release fixture end to end
   (`alex-lar-scale fixture`; structural redaction and archive verification).
 - [ ] Manually open and search a real archive at current production scale.

@@ -92,6 +92,16 @@ Anthropic Fable failure and OpenAI Sol reroute decision remain replayable:
 CI runs both the small scale gate and this fixture path and uploads their
 machine-readable reports.
 
+## Published V1 result
+
+The V1 release-gate run is checked in as
+[`benchmarks/lar-v1-full-macos-m2-max.json`](benchmarks/lar-v1-full-macos-m2-max.json).
+It passed the full 55,000-trace, 110,000-record, 9.4-GB logical corpus on
+macOS aarch64 with 65.1 MB peak RSS. Its p95 measurements were 14.747 ms for a
+trace-summary page, 342.611 ms for the deliberately all-session aggregate,
+1.943 ms for filtered search, 0.864 ms for an indexed body read, and 4.022 ms
+to open one turn with both bodies.
+
 ## Interpretation limits
 
 - Random body reads are warm-cache measurements. Portable cold-cache eviction
