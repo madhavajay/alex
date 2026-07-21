@@ -547,6 +547,14 @@ public struct AlexandriaClient: Sendable {
         return try JSONDecoder().decode(ImportOutcomes.self, from: data).outcomes
     }
 
+    /// Read-only discovery for onboarding. Imports remain a separate, explicit
+    /// `authImport` call after the user confirms selected candidates.
+    public func credentialImportCandidates() async throws -> CredentialImportCandidatesResponse {
+        try await get(
+            "admin/auth/import-candidates",
+            as: CredentialImportCandidatesResponse.self)
+    }
+
     public func harnessSnapshot(refresh: Bool = false) async throws -> HarnessesResponse? {
         do {
             let query = refresh ? [URLQueryItem(name: "refresh", value: "1")] : []

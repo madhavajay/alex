@@ -304,6 +304,23 @@ impl LoginManager {
         removed_session || removed_worker.is_some()
     }
 
+    /// Cancel and forget every pending provider authorization. Reset All uses
+    /// this so a browser/device flow started before reset cannot repopulate the
+    /// freshly emptied vault afterward.
+    pub async fn clear(&self) {
+        let workers = self
+            .workers
+            .lock()
+            .await
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.abort();
+        }
+        self.sessions.lock().await.clear();
+    }
+
     pub async fn complete(&self, vault: Arc<Vault>, login_id: &str, input: &str) -> Result<Value> {
         let session = self
             .sessions

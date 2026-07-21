@@ -3,7 +3,7 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite struct ResetTests {
-    @Test func appSettingsResetClearsAppAndUIKeysButPreservesUpdateChannel() {
+    @Test func appSettingsResetClearsAppUIAndOnboardingButPreservesUpdateChannel() {
         let suite = "AlexandriaBarCoreTests.ResetTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -17,6 +17,8 @@ import Testing
         for key in AppSettingsReset.keys {
             #expect(defaults.object(forKey: key) == nil)
         }
+        #expect(defaults.object(
+            forKey: OnboardingLaunchPolicy.completedDefaultsKey) == nil)
         #expect(defaults.string(forKey: UpdateChannelSetting.defaultsKey) == "value")
     }
 }

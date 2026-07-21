@@ -1729,6 +1729,36 @@ pub fn set_notifications(state: &Arc<AppState>, mut settings: notify::Notificati
     }
 }
 
+/// Remove notification/Telegram runtime state and persisted activity during a
+/// settings reset. The retired log is disabled so detached work cannot
+/// recreate the activity file after reset returns.
+pub async fn reset_auth_sessions(state: &Arc<AppState>) {
+    state.logins.clear().await;
+    *state.reauth_logins.lock().await = ReauthLoginTracker::default();
+}
+
+pub fn reset_notification_state(state: &Arc<AppState>) -> Result<()> {
+    let previous_log = state
+        .notifications
+        .read()
+        .map(|dispatcher| dispatcher.message_log())
+        .unwrap_or_default();
+    previous_log.disable_and_clear()?;
+    let fresh_log = notify::NotificationMessageLog::load(Some(
+        state.store.data_dir.join("notification-messages.json"),
+    ));
+    let settings = notify::NotificationSettings::default();
+    let dispatcher =
+        notify::NotificationDispatcher::from_settings_with_log(settings.clone(), fresh_log);
+    if let Ok(mut notifications) = state.notifications.write() {
+        *notifications = dispatcher;
+    }
+    if let Ok(mut current) = state.notification_settings.write() {
+        *current = settings;
+    }
+    Ok(())
+}
+
 /// Installs the daemon-owned config persistence hook for runtime notification
 /// channel updates.
 pub fn set_notification_config_persister(
@@ -1968,6 +1998,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(admin_dario_prompt_cache_delete),
         )
         .route("/admin/auth/import", post(admin_auth_import))
+        .route(
+            "/admin/auth/import-candidates",
+            get(admin_auth_import_candidates),
+        )
         .route("/admin/vault/export", post(admin_vault_export))
         .route("/admin/credentials", get(admin_credentials))
         .route("/admin/auth/login/start", post(admin_auth_login_start))
@@ -2785,6 +2819,15 @@ async fn admin_auth_import(
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
+}
+
+async fn admin_auth_import_candidates() -> Response {
+    let candidates = alex_auth::detect_import_candidates();
+    axum::Json(json!({
+        "candidates": candidates,
+        "requires_confirmation": true,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -16008,6 +16051,58 @@ mod tests {
             "http://127.0.0.1:4100".into(),
             Duration::from_secs(15 * 60),
         )
+    }
+
+    #[tokio::test]
+    async fn notification_reset_clears_runtime_activity_and_retires_old_log() {
+        let state = test_state("notification-reset");
+        set_notifications(
+            &state,
+            notify::NotificationSettings {
+                channels: vec![notify::NotificationChannelConfig {
+                    id: Some("telegram".into()),
+                    url: "http://127.0.0.1:1/send".into(),
+                    allow_commands: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let old_log = state.notifications.read().unwrap().message_log();
+        old_log.record(1, "in", Some("telegram"), "command", true, None, "/status");
+        let activity_path = state.store.data_dir.join("notification-messages.json");
+        assert!(activity_path.exists());
+        let login = state
+            .logins
+            .start(state.vault.clone(), "claude", "pending-reset")
+            .await
+            .unwrap();
+        let login_id = login["login_id"].as_str().unwrap().to_string();
+        assert!(state.logins.status(&login_id).await.is_some());
+
+        reset_auth_sessions(&state).await;
+        reset_notification_state(&state).unwrap();
+
+        assert!(state
+            .notification_settings
+            .read()
+            .unwrap()
+            .channels
+            .is_empty());
+        assert!(state
+            .notifications
+            .read()
+            .unwrap()
+            .recent_messages(10)
+            .is_empty());
+        assert!(!activity_path.exists());
+        old_log.record(2, "out", Some("telegram"), "alert", true, None, "late work");
+        assert!(old_log.recent(10).is_empty());
+        assert!(state.logins.status(&login_id).await.is_none());
+        assert!(
+            !activity_path.exists(),
+            "detached work from the retired dispatcher must not recreate activity"
+        );
     }
 
     fn local_proxy_headers() -> HeaderMap {

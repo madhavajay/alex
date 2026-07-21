@@ -158,6 +158,7 @@ public enum AppSettingsReset {
         "InspectorRespBodyOpen",
         "InspectorDarioReqBodyOpen",
         "InspectorDarioRespBodyOpen",
+        OnboardingLaunchPolicy.completedDefaultsKey,
     ]
 
     public static let preservedKeys = [UpdateChannelSetting.defaultsKey]

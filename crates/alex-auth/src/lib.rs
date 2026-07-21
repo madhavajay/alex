@@ -1573,6 +1573,190 @@ pub struct ImportOutcome {
     pub note: Option<String>,
 }
 
+/// Non-secret metadata about credentials owned by another CLI. Detecting a
+/// candidate is deliberately read-only: callers must ask the user before
+/// invoking `import_all` for its `source`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportCandidate {
+    pub source: String,
+    pub provider: String,
+    pub label: String,
+    pub kind: String,
+    pub source_path: String,
+    pub requires_confirmation: bool,
+}
+
+/// Detect file-backed CLI credentials without copying, refreshing, or deleting
+/// them. The explicit home argument keeps onboarding discovery isolated and
+/// testable; the Kimi override mirrors `KIMI_CODE_HOME`.
+pub fn detect_import_candidates_in(
+    home: &Path,
+    kimi_home_override: Option<&Path>,
+) -> Vec<ImportCandidate> {
+    fn json(path: &Path) -> Option<Value> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+    fn candidate(
+        source: &str,
+        provider: &str,
+        label: &str,
+        kind: &str,
+        source_path: &str,
+    ) -> ImportCandidate {
+        ImportCandidate {
+            source: source.into(),
+            provider: provider.into(),
+            label: label.into(),
+            kind: kind.into(),
+            source_path: source_path.into(),
+            requires_confirmation: true,
+        }
+    }
+
+    let mut found = Vec::new();
+    if json(&home.join(".claude/.credentials.json"))
+        .and_then(|v| v["claudeAiOauth"]["accessToken"].as_str().map(str::to_owned))
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "claude",
+            "anthropic",
+            "Claude Code",
+            "oauth",
+            "~/.claude/.credentials.json",
+        ));
+    }
+    if let Some(value) = json(&home.join(".codex/auth.json")) {
+        let oauth = value["tokens"]["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty());
+        let api_key = value["OPENAI_API_KEY"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty());
+        if oauth || api_key {
+            found.push(candidate(
+                "codex",
+                "openai",
+                "Codex",
+                if oauth && api_key {
+                    "oauth+api_key"
+                } else if oauth {
+                    "oauth"
+                } else {
+                    "api_key"
+                },
+                "~/.codex/auth.json",
+            ));
+        }
+    }
+    if json(&home.join(".gemini/oauth_creds.json"))
+        .and_then(|v| v["access_token"].as_str().map(str::to_owned))
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "gemini",
+            "gemini",
+            "Gemini CLI",
+            "oauth",
+            "~/.gemini/oauth_creds.json",
+        ));
+    }
+    if json(&home.join(".grok/auth.json"))
+        .and_then(|v| {
+            v.as_object().map(|entries| {
+                entries.values().any(|entry| {
+                    entry["key"]
+                        .as_str()
+                        .is_some_and(|token| !token.is_empty())
+                })
+            })
+        })
+        .unwrap_or(false)
+    {
+        found.push(candidate(
+            "grok",
+            "xai",
+            "Grok",
+            "oauth",
+            "~/.grok/auth.json",
+        ));
+    }
+    if json(&home.join(".local/share/amp/secrets.json"))
+        .and_then(|v| {
+            v.as_object().map(|entries| {
+                entries.iter().any(|(key, value)| {
+                    key.starts_with("apiKey@")
+                        && value.as_str().is_some_and(|token| !token.is_empty())
+                })
+            })
+        })
+        .unwrap_or(false)
+    {
+        found.push(candidate(
+            "amp",
+            "amp",
+            "Amp",
+            "api_key",
+            "~/.local/share/amp/secrets.json",
+        ));
+    }
+    let kimi_root = kimi_home_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".kimi-code"));
+    if json(&kimi_root.join("credentials/kimi-code.json"))
+        .and_then(|v| v["access_token"].as_str().map(str::to_owned))
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "kimi",
+            "kimi",
+            "Kimi Code",
+            "oauth",
+            if kimi_home_override.is_some() {
+                "$KIMI_CODE_HOME/credentials/kimi-code.json"
+            } else {
+                "~/.kimi-code/credentials/kimi-code.json"
+            },
+        ));
+    }
+    found
+}
+
+pub fn detect_import_candidates() -> Vec<ImportCandidate> {
+    let home = home();
+    let kimi_override = std::env::var_os("KIMI_CODE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut candidates = detect_import_candidates_in(&home, kimi_override.as_deref());
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.source == "claude")
+    {
+        let has_keychain_oauth = claude_keychain()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| {
+                value["claudeAiOauth"]["accessToken"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .is_some_and(|token| !token.is_empty());
+        if has_keychain_oauth {
+            candidates.insert(
+                0,
+                ImportCandidate {
+                    source: "claude".into(),
+                    provider: "anthropic".into(),
+                    label: "Claude Code".into(),
+                    kind: "oauth".into(),
+                    source_path: "macOS Keychain: Claude Code-credentials".into(),
+                    requires_confirmation: true,
+                },
+            );
+        }
+    }
+    candidates
+}
+
 pub async fn import_all(vault: &Vault, source: &str) -> Result<Vec<ImportOutcome>> {
     let mut outcomes = Vec::new();
     if source == "all" || source == "claude" {
@@ -3654,5 +3838,89 @@ mod tests {
         );
         assert_eq!(account.account_meta["routing_limits"]["plan"], "plus");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credential_detection_is_read_only_secret_free_and_requires_confirmation() {
+        let home = temp_dir("import-candidates");
+        let files = [
+            (
+                ".claude/.credentials.json",
+                r#"{"claudeAiOauth":{"accessToken":"claude-secret"}}"#,
+            ),
+            (
+                ".codex/auth.json",
+                r#"{"tokens":{"access_token":"codex-secret"}}"#,
+            ),
+            (
+                ".gemini/oauth_creds.json",
+                r#"{"access_token":"gemini-secret"}"#,
+            ),
+            (".grok/auth.json", r#"{"primary":{"key":"grok-secret"}}"#),
+            (
+                ".local/share/amp/secrets.json",
+                r#"{"apiKey@https://ampcode.com/":"amp-secret"}"#,
+            ),
+            (
+                ".kimi-code/credentials/kimi-code.json",
+                r#"{"access_token":"kimi-secret"}"#,
+            ),
+        ];
+        for (relative, contents) in files {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let before = files
+            .iter()
+            .map(|(relative, _)| std::fs::read(home.join(relative)).unwrap())
+            .collect::<Vec<_>>();
+
+        let candidates = detect_import_candidates_in(&home, None);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.source.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "gemini", "grok", "amp", "kimi"]
+        );
+        assert!(candidates.iter().all(|item| item.requires_confirmation));
+        let encoded = serde_json::to_string(&candidates).unwrap();
+        for secret in [
+            "claude-secret",
+            "codex-secret",
+            "gemini-secret",
+            "grok-secret",
+            "amp-secret",
+            "kimi-secret",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let after = files
+            .iter()
+            .map(|(relative, _)| std::fs::read(home.join(relative)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "detection must not mutate source credentials"
+        );
+        assert!(
+            !home.join("accounts").exists(),
+            "detection must not create an Alex vault"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn malformed_or_empty_external_credentials_are_not_candidates() {
+        let home = temp_dir("invalid-import-candidates");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), r#"{"tokens":{}}"#).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/amp")).unwrap();
+        std::fs::write(home.join(".local/share/amp/secrets.json"), "not json").unwrap();
+
+        assert!(detect_import_candidates_in(&home, None).is_empty());
+        std::fs::remove_dir_all(&home).ok();
     }
 }

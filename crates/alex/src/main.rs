@@ -3759,7 +3759,13 @@ async fn main() -> Result<()> {
                     config: config.clone(),
                 }),
             );
-            alex_proxy::set_reset_handler(&state, Arc::new(reset::DaemonResetHandler));
+            alex_proxy::set_reset_handler(
+                &state,
+                Arc::new(reset::DaemonResetHandler::new(
+                    daemon_config.clone(),
+                    alexandria_home().join("config.toml"),
+                )),
+            );
             {
                 let quota_vault = state.vault.clone();
                 tokio::spawn(async move {
@@ -13160,7 +13166,13 @@ continue = true
             config.base_url(),
             config.upstream_stream_idle_timeout(),
         );
-        alex_proxy::set_reset_handler(&state, Arc::new(reset::DaemonResetHandler));
+        alex_proxy::set_reset_handler(
+            &state,
+            Arc::new(reset::DaemonResetHandler::new(
+                Arc::new(std::sync::Mutex::new(config.clone())),
+                home.join("config.toml"),
+            )),
+        );
         let app = alex_proxy::router(state);
         let (status, body) = router_json(
             app,

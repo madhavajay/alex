@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ pub struct NotificationMessage {
 pub struct NotificationMessageLog {
     entries: Arc<Mutex<VecDeque<NotificationMessage>>>,
     path: Arc<Option<PathBuf>>,
+    disabled: Arc<AtomicBool>,
 }
 
 impl NotificationMessageLog {
@@ -49,6 +51,7 @@ impl NotificationMessageLog {
         Self {
             entries: Arc::new(Mutex::new(entries)),
             path: Arc::new(path),
+            disabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -62,10 +65,16 @@ impl NotificationMessageLog {
         error: Option<&str>,
         summary: &str,
     ) {
+        if self.disabled.load(Ordering::SeqCst) {
+            return;
+        }
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.disabled.load(Ordering::SeqCst) {
+            return;
+        }
         entries.push_back(NotificationMessage {
             ts,
             direction: direction.to_string(),
@@ -102,6 +111,27 @@ impl NotificationMessageLog {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    /// Permanently retires this log and removes its persisted activity. This
+    /// prevents already-spawned notification work from recreating activity
+    /// after Reset All has completed.
+    pub fn disable_and_clear(&self) -> Result<()> {
+        self.disabled.store(true, Ordering::SeqCst);
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        if let Some(path) = self.path.as_ref() {
+            for candidate in [path.clone(), path.with_extension("json.tmp")] {
+                match std::fs::remove_file(&candidate) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
     }
 }
 

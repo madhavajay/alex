@@ -6,6 +6,30 @@ import Testing
 @testable import AlexandriaBarCore
 
 @Suite(.serialized) struct HarnessClientTests {
+    @Test func credentialCandidateDiscoveryIsReadOnlyGet() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/auth/import-candidates")
+            #expect(request.httpMethod == "GET")
+            #expect(request.httpBody == nil)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let payload = #"{"candidates":[{"source":"codex","provider":"openai","label":"Codex","kind":"oauth","source_path":"~/.codex/auth.json","requires_confirmation":true}],"requires_confirmation":true}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexandriaClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let result = try await client.credentialImportCandidates()
+        #expect(result.requiresConfirmation)
+        #expect(result.candidates.first?.source == "codex")
+        #expect(result.candidates.first?.requiresConfirmation == true)
+    }
+
     @Test func alexErrorApprovalUsesFingerprintEndpoint() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/alex-errors/0123456789abcdef/approve")

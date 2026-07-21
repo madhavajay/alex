@@ -1094,6 +1094,34 @@ public struct ImportOutcome: Codable, Sendable {
     public let note: String?
 }
 
+public struct CredentialImportCandidatesResponse: Codable, Sendable, Equatable {
+    public let candidates: [CredentialImportCandidate]
+    public let requiresConfirmation: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case candidates
+        case requiresConfirmation = "requires_confirmation"
+    }
+}
+
+/// Secret-free, read-only discovery metadata. Selecting one is only consent to
+/// a later explicit import; decoding this model never changes provider state.
+public struct CredentialImportCandidate: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { source }
+    public let source: String
+    public let provider: String
+    public let label: String
+    public let kind: String
+    public let sourcePath: String
+    public let requiresConfirmation: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case source, provider, label, kind
+        case sourcePath = "source_path"
+        case requiresConfirmation = "requires_confirmation"
+    }
+}
+
 public struct ExoConfig: Codable, Sendable, Equatable {
     public var url: String
     public var enabledModels: [String]
