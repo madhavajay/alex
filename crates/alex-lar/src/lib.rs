@@ -1357,6 +1357,11 @@ fn write_state_atomic(path: &Path, state: &ImportState) -> Result<()> {
         file.flush()?;
         file.get_ref().sync_all()?;
         fs::rename(&temp, path)?;
+        // Unix lets us fsync the containing directory so the rename itself is
+        // durable. Windows does not allow opening a directory as a regular
+        // File (ERROR_ACCESS_DENIED); the synced file plus MoveFileEx-backed
+        // rename is the strongest portable sequence exposed by std.
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
         }
