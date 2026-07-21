@@ -13100,10 +13100,19 @@ continue = true
 
     #[cfg(windows)]
     #[test]
-    fn windows_reports_service_unsupported() {
-        assert!(matches!(detect_service_state(), ServiceState::Unsupported));
-        assert!(service_install(&test_config(tmpdir("windows-service"))).is_err());
-        assert!(!service_managed(&ServiceState::Unsupported));
+    fn windows_reports_task_scheduler_service_state() {
+        assert!(matches!(
+            detect_service_state(),
+            ServiceState::WindowsTask { .. }
+        ));
+        assert!(service_managed(&ServiceState::WindowsTask {
+            installed: true,
+            running: true,
+        }));
+        assert!(!service_managed(&ServiceState::WindowsTask {
+            installed: false,
+            running: false,
+        }));
     }
 
     #[test]

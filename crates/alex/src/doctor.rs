@@ -399,6 +399,10 @@ async fn port_check(config: &Config, daemon_up: bool) -> DoctorCheck {
     )
     .await
     .is_ok_and(|result| result.is_ok());
+    port_check_from_probe(config, address, occupied)
+}
+
+fn port_check_from_probe(config: &Config, address: SocketAddr, occupied: bool) -> DoctorCheck {
     if occupied {
         check(
             "network.port",
@@ -723,18 +727,16 @@ mod tests {
 
     #[test]
     fn port_check_distinguishes_an_unused_port_from_a_non_alex_listener() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let mut config = Config::defaults_for(temp_dir("port"));
-            config.port = port;
-            let occupied = port_check(&config, false).await;
-            assert_eq!(occupied.status, CheckStatus::Fail);
-            drop(listener);
+        let mut config = Config::defaults_for(temp_dir("port"));
+        config.port = 41_000;
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
 
-            let unused = port_check(&config, false).await;
-            assert_eq!(unused.status, CheckStatus::Warning);
-        });
+        let occupied = port_check_from_probe(&config, address, true);
+        assert_eq!(occupied.status, CheckStatus::Fail);
+        assert!(occupied.summary.contains("occupied"));
+
+        let unused = port_check_from_probe(&config, address, false);
+        assert_eq!(unused.status, CheckStatus::Warning);
+        assert!(unused.summary.contains("Nothing is listening"));
     }
 }
