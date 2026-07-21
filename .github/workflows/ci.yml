@@ -64,7 +64,7 @@ jobs:
           [[ "$(uname -m)" == "x86_64" ]]
           . /etc/os-release
           [[ "$ID" == "ubuntu" ]]
-          systemctl --user show-environment >/dev/null
+          docker info >/dev/null
 
       - name: Build release-format candidate archive and checksum
         id: package
@@ -83,44 +83,23 @@ jobs:
 
       - name: Smoke public installer, routing, trace persistence, and systemd restart
         env:
-          ALEX_CI_LINUX_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-linux
           ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux/installed-smoke.json
           ALEX_CI_LINUX_VERSION: ${{ steps.package.outputs.version }}
           ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux/assets
-        run: packaging/ci-linux/smoke-installed.sh
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: packaging/ci-linux/run-systemd-container.sh
 
-      - name: Clean installed smoke service and files
+      - name: Clean installed smoke container
         if: always()
         env:
-          ALEX_CI_LINUX_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-linux
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set +e
-          alex_bin="$ALEX_CI_LINUX_SMOKE_ROOT/bin/alex"
-          if [[ -f "$ALEX_CI_LINUX_SMOKE_ROOT/service-cleanup-allowed" ]]; then
-            if [[ -x "$alex_bin" ]]; then
-              "$alex_bin" service uninstall >/dev/null 2>&1
-            fi
-            systemctl --user disable --now alexandria >/dev/null 2>&1
-            rm -f "$HOME/.config/systemd/user/alexandria.service"
-            systemctl --user daemon-reload >/dev/null 2>&1
-            systemctl --user reset-failed alexandria >/dev/null 2>&1
-            rm -rf "$HOME/.alexandria"
-          fi
-          for pid_file in mock.pid assets.pid; do
-            if [[ -s "$ALEX_CI_LINUX_SMOKE_ROOT/$pid_file" ]]; then
-              pid="$(tr -d '[:space:]' < "$ALEX_CI_LINUX_SMOKE_ROOT/$pid_file")"
-              if [[ "$pid" =~ ^[0-9]+$ ]]; then
-                kill "$pid" >/dev/null 2>&1
-              fi
-            fi
-          done
-          if systemctl --user is-active --quiet alexandria \
-            || [[ -e "$HOME/.config/systemd/user/alexandria.service" ]] \
-            || [[ -e "$HOME/.alexandria" ]]; then
-            echo "systemd cleanup failed; preserving $ALEX_CI_LINUX_SMOKE_ROOT" >&2
+          docker rm --force "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1
+          if docker container inspect "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "container cleanup failed: $ALEX_CI_LINUX_CONTAINER_NAME" >&2
             exit 1
           fi
-          rm -rf "$ALEX_CI_LINUX_SMOKE_ROOT"
 
       - name: Upload Linux candidate and smoke evidence
         if: always()

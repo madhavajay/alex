@@ -1,0 +1,23 @@
+# Pin the official Ubuntu 24.04 linux/amd64 manifest so the installed-release
+# gate cannot silently move to another distribution snapshot or architecture.
+FROM docker.io/library/ubuntu@sha256:52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        dbus-user-session \
+        jq \
+        python3 \
+        systemd \
+        systemd-sysv \
+        tar \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1001 --shell /bin/bash alex-smoke
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
