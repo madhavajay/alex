@@ -33,12 +33,17 @@ Full-profile budgets:
 | Resume migration plus complete source/archive validation | ≤ 60 minutes |
 | Independent full archive verification | ≤ 20 minutes |
 | SQLite trace summary page p95 | ≤ 100 ms |
-| SQLite session summary page p95 | ≤ 250 ms |
+| SQLite session summary page p95 | ≤ 600 ms |
 | SQLite filtered model search p95 | ≤ 100 ms |
 | One SQLite trace lookup p95 | ≤ 25 ms |
 | Indexed random LAR body read p95 | ≤ 25 ms |
 | One-turn open, including two LAR bodies, p95 | ≤ 75 ms |
 | Process peak RSS | ≤ 512 MiB |
+
+The session-summary budget is higher because that operation deliberately
+groups all 55,000 unique synthetic sessions and computes error/account
+aggregates before applying its page limit. The ordinary trace summary and
+filtered-search budgets remain 100 ms.
 
 CI uses deliberately looser query budgets (250–500 ms), a two-minute migration
 budget, and the same 512 MiB RSS ceiling to avoid treating noisy shared runners

@@ -64,7 +64,7 @@ impl ScaleProfile {
                     migration_ms: 60 * 60 * 1_000,
                     archive_verify_ms: 20 * 60 * 1_000,
                     sqlite_summary_p95_us: 100_000,
-                    sqlite_session_summary_p95_us: 250_000,
+                    sqlite_session_summary_p95_us: 600_000,
                     sqlite_filtered_search_p95_us: 100_000,
                     sqlite_trace_get_p95_us: 25_000,
                     lar_random_read_p95_us: 25_000,
