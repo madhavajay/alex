@@ -167,9 +167,12 @@ install_linux() {
   elif "$INSTALL_DIR/alex" service install; then
     # `systemctl enable --now` starts a fresh service but deliberately does not
     # restart one that is already active. An upgrade or pinned rollback must
-    # replace that running process as well as the on-disk executable.
+    # replace that running process as well as the on-disk executable. Restart
+    # through systemd itself: the just-restored rollback binary may predate
+    # Linux support in `alex service restart`.
     if [ "$service_was_active" = "1" ]; then
-      if ! "$INSTALL_DIR/alex" service restart; then
+      if ! systemctl --user restart alexandria \
+        || ! systemctl --user is-active --quiet alexandria; then
         say "Alex $version was installed, but the running service could not be replaced." >&2
         exit 1
       fi
