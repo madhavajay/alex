@@ -22,6 +22,20 @@ replaces, clears quarantine from this ad-hoc build, installs the CLI under
 `~/.local/bin`, registers/restarts Alex's launchd user service, and opens
 the app. Existing data under `~/.alexandria` is left untouched.
 
+Automation can copy the same bundle without opening the app or registering a
+service:
+
+```bash
+./install.sh --no-open --no-service
+```
+
+The PR workflow itself uses `--no-open` but keeps service registration enabled.
+On its clean ephemeral macOS runner it routes a request to the bundled
+loopback-only mock, reads the resulting trace, performs a real launchd hard
+restart, and confirms the same trace and response body remain readable. The
+gate creates no provider account and uses no provider credential or external
+provider endpoint.
+
 The app uses the same bundle identifier as production, so only one
 `Alex.app` should be running. macOS may request an administrator
 password when replacing `/Applications/Alex.app`.

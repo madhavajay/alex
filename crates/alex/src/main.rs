@@ -9602,7 +9602,16 @@ fn render_launchd_plist(
     inherited_path: &str,
     known_dirs: &[PathBuf],
     config: &Config,
+    service_home: Option<&Path>,
 ) -> Result<String> {
+    let service_home = service_home
+        .map(|path| {
+            format!(
+                "    <key>ALEXANDRIA_HOME</key>\n    <string>{}</string>",
+                xml_escape(&path.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
     Ok(LAUNCHD_TEMPLATE
         .replace(
             "/usr/local/bin/alexandria",
@@ -9612,6 +9621,7 @@ fn render_launchd_plist(
             "__ALEX_LAUNCHD_PATH__",
             &xml_escape(&render_launchd_path(inherited_path, known_dirs)),
         )
+        .replace("__ALEX_LAUNCHD_HOME__", &service_home)
         .replace("__ALEX_LAUNCHD_SOCKETS__", &render_launchd_sockets(config)?))
 }
 
@@ -9766,11 +9776,13 @@ fn service_install(config: &Config) -> Result<()> {
         std::fs::create_dir_all(dst.parent().unwrap())?;
         let mut launchctl = SystemLaunchctl::new();
         let loaded = launchctl.is_loaded()?;
+        let service_home = std::env::var_os("ALEXANDRIA_HOME").map(PathBuf::from);
         let plist = render_launchd_plist(
             &exe,
             &std::env::var("PATH").unwrap_or_default(),
             &known_launchd_path_dirs(&exe),
             config,
+            service_home.as_deref(),
         )?;
         std::fs::write(&dst, plist)?;
         if loaded {
@@ -13198,12 +13210,31 @@ continue = true
                 PathBuf::from("/custom/bin"),
             ],
             &config,
+            Some(Path::new("/tmp/alex&smoke")),
         )
         .unwrap();
         assert!(plist.contains("/Users/alex/bin/alex&amp;ria"));
         assert!(plist.contains("alexandria-primary"));
         assert!(plist.contains("<string>127.0.0.1</string>"));
         assert!(plist.contains("<string>4321</string>"));
+        assert!(plist.contains("<key>ALEXANDRIA_HOME</key>"));
+        assert!(plist.contains("<string>/tmp/alex&amp;smoke</string>"));
+        assert!(!plist.contains("__ALEX_LAUNCHD_HOME__"));
+    }
+
+    #[test]
+    fn launchd_plist_omits_unset_alexandria_home() {
+        let config = test_config(tmpdir("launchd-default-home"));
+        let plist = render_launchd_plist(
+            Path::new("/Users/alex/bin/alex"),
+            "/usr/bin",
+            &[],
+            &config,
+            None,
+        )
+        .unwrap();
+        assert!(!plist.contains("<key>ALEXANDRIA_HOME</key>"));
+        assert!(!plist.contains("__ALEX_LAUNCHD_HOME__"));
     }
 
     #[tokio::test]

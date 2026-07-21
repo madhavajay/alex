@@ -134,9 +134,19 @@ jobs:
           mkdir -p "$stage/bin" "$output"
           ditto macos/dist/Alex.app "$stage/Alex.app"
           cp target/release/alex target/release/alexandria "$stage/bin/"
-          cp packaging/ci-macos/install.sh packaging/ci-macos/README.md "$stage/"
+          cp \
+            packaging/ci-macos/install.sh \
+            packaging/ci-macos/mock-openai.py \
+            packaging/ci-macos/smoke-installed.sh \
+            packaging/ci-macos/README.md \
+            "$stage/"
           cp scripts/lib/install-common.sh "$stage/"
-          chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
+          chmod +x \
+            "$stage/install.sh" \
+            "$stage/mock-openai.py" \
+            "$stage/smoke-installed.sh" \
+            "$stage/bin/alex" \
+            "$stage/bin/alexandria"
 
           {
             echo "Alex macOS PR test bundle"
@@ -154,7 +164,52 @@ jobs:
             "$bundle_name.tar.gz" "$bundle_name" > "$output/HOW_TO_INSTALL.txt"
           echo "artifact_name=$bundle_name" >> "$GITHUB_OUTPUT"
 
+      - name: Smoke packaged install, routing, trace persistence, and launchd restart
+        env:
+          BUNDLE_NAME: ${{ steps.bundle.outputs.artifact_name }}
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+          ALEX_CI_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-macos/installed-smoke.json
+        run: |
+          set -euo pipefail
+          extract_root="$RUNNER_TEMP/alex-installed-smoke-package"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          tar -C "$extract_root" -xzf "dist/ci-macos/$BUNDLE_NAME.tar.gz"
+          "$extract_root/$BUNDLE_NAME/smoke-installed.sh"
+
+      - name: Clean installed smoke service and files
+        if: always()
+        env:
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+        run: |
+          set +e
+          service_target="gui/$(id -u)/com.alexandria.daemon"
+          alex_bin="$ALEX_CI_SMOKE_ROOT/bin/alex"
+          if [[ -f "$ALEX_CI_SMOKE_ROOT/service-cleanup-allowed" ]]; then
+            if [[ -x "$alex_bin" ]]; then
+              ALEXANDRIA_HOME="$ALEX_CI_SMOKE_ROOT/state" \
+                "$alex_bin" service uninstall >/dev/null 2>&1
+            fi
+            launchctl bootout "$service_target" >/dev/null 2>&1
+            rm -f "$HOME/Library/LaunchAgents/com.alexandria.daemon.plist"
+            rm -f /tmp/alexandria.daemon.out.log /tmp/alexandria.daemon.err.log
+          fi
+          if [[ -s "$ALEX_CI_SMOKE_ROOT/mock.pid" ]]; then
+            mock_pid="$(tr -d '[:space:]' < "$ALEX_CI_SMOKE_ROOT/mock.pid")"
+            if [[ "$mock_pid" =~ ^[0-9]+$ ]]; then
+              kill "$mock_pid" >/dev/null 2>&1
+            fi
+          fi
+          rm -rf \
+            "$ALEX_CI_SMOKE_ROOT" \
+            "$RUNNER_TEMP/alex-installed-smoke-package"
+          if launchctl print "$service_target" >/dev/null 2>&1; then
+            echo "launchd cleanup failed: $service_target is still loaded" >&2
+            exit 1
+          fi
+
       - name: Upload macOS test bundle
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.bundle.outputs.artifact_name }}

@@ -17,13 +17,43 @@ BIN_DEST="${ALEXANDRIA_BIN_DEST:-$HOME/.local/bin}"
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--restore]
+Usage: ./install.sh [--restore] [--no-open] [--no-service]
 
 With no option, installs this CI build, registers/restarts the user daemon,
 and opens Alex. --restore puts back the app and binaries saved by
 the first CI install.
+
+--no-open       Do not launch the menu app after install or restore.
+--no-service    Do not install/restart the user daemon after copying files.
 EOF
 }
+
+ACTION="install"
+OPEN_APP=1
+MANAGE_SERVICE=1
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --restore)
+      ACTION="restore"
+      ;;
+    --no-open)
+      OPEN_APP=0
+      ;;
+    --no-service)
+      MANAGE_SERVICE=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 run_for_applications() {
   if [[ -w "$(dirname "$APP_DEST")" ]]; then
@@ -34,7 +64,19 @@ run_for_applications() {
 }
 
 restart_service() {
-  "$BIN_DEST/alex" service install
+  if [[ "$MANAGE_SERVICE" -eq 1 ]]; then
+    "$BIN_DEST/alex" service install
+  else
+    echo "Skipped daemon registration (--no-service)."
+  fi
+}
+
+open_app() {
+  if [[ "$OPEN_APP" -eq 1 ]]; then
+    open "$APP_DEST"
+  else
+    echo "Skipped app launch (--no-open)."
+  fi
 }
 
 restore_previous() {
@@ -63,7 +105,7 @@ restore_previous() {
   fi
 
   restart_service
-  open "$APP_DEST"
+  open_app
   echo "Restored the pre-CI Alex app and daemon."
 }
 
@@ -100,7 +142,7 @@ install_ci_build() {
   xattr -d com.apple.quarantine "$BIN_DEST/alex" "$BIN_DEST/alexandria" 2>/dev/null || true
 
   restart_service
-  open "$APP_DEST"
+  open_app
 
   echo
   "$BIN_DEST/alex" --version
@@ -110,9 +152,7 @@ install_ci_build() {
   echo "Run '$SCRIPT_DIR/install.sh --restore' to switch back to the saved build."
 }
 
-case "${1:-}" in
-  "") install_ci_build ;;
-  --restore) restore_previous ;;
-  -h|--help) usage ;;
-  *) usage >&2; exit 2 ;;
+case "$ACTION" in
+  install) install_ci_build ;;
+  restore) restore_previous ;;
 esac
