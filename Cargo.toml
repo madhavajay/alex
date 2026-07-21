@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/alex-lar",
+  "crates/alex-lar-scale",
   "crates/alex-middleware",
   "crates/alex-core",
   "crates/alex-auth",

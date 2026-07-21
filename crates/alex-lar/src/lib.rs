@@ -574,6 +574,10 @@ pub struct ImportOptions {
     pub max_body_bytes: u64,
     /// Primarily useful for controlled batches and deterministic resume tests.
     pub max_entries_this_run: Option<usize>,
+    /// Sync the archive and atomically advance the checkpoint after this many
+    /// bodies. A crash can replay at most this batch; archive key
+    /// idempotency makes that replay safe.
+    pub checkpoint_every: usize,
 }
 
 impl Default for ImportOptions {
@@ -581,6 +585,7 @@ impl Default for ImportOptions {
         Self {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_entries_this_run: None,
+            checkpoint_every: 128,
         }
     }
 }
@@ -642,6 +647,8 @@ pub fn import_legacy(
         .max_entries_this_run
         .map(|limit| refs.len().min(state.next_index.saturating_add(limit)))
         .unwrap_or(refs.len());
+    let start_index = state.next_index;
+    let checkpoint_every = options.checkpoint_every.max(1);
     for (index, reference) in refs.iter().enumerate().take(end).skip(state.next_index) {
         let file = File::open(&reference.path)?;
         let outcome = writer.append_reader(
@@ -650,13 +657,21 @@ pub fn import_legacy(
             GzDecoder::new(BufReader::new(file)),
             Vec::new(),
         )?;
-        writer.sync()?;
         match outcome {
             AppendOutcome::Appended => report.imported += 1,
             AppendOutcome::AlreadyPresent => report.already_present += 1,
         }
         state.next_index = index + 1;
         report.next_index = state.next_index;
+        if (state.next_index - start_index).is_multiple_of(checkpoint_every) {
+            writer.sync()?;
+            write_state_atomic(checkpoint_path, &state)?;
+        }
+    }
+    if state.next_index > start_index
+        && !(state.next_index - start_index).is_multiple_of(checkpoint_every)
+    {
+        writer.sync()?;
         write_state_atomic(checkpoint_path, &state)?;
     }
     writer.finish()?;

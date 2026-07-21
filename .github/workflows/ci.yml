@@ -9,6 +9,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lar-scale:
+    name: LAR deterministic scale gate
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lar-scale
+      - name: Run bounded CI scale profile
+        run: |
+          cargo run --release --locked -p alex-lar-scale -- run \
+            --profile ci \
+            --root "$RUNNER_TEMP/alex-lar-ci" \
+            --output "$RUNNER_TEMP/alex-lar-ci-result.json"
+      - name: Generate and verify sanitized Fable to Sol fixture
+        run: |
+          cargo run --release --locked -p alex-lar-scale -- fixture-fable-sol \
+            --vector crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json \
+            --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json \
+            --output "$RUNNER_TEMP/fable-to-sol.lar" \
+            --report "$RUNNER_TEMP/fable-to-sol-result.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lar-scale-results
+          path: |
+            ${{ runner.temp }}/alex-lar-ci-result.json
+            ${{ runner.temp }}/fable-to-sol-result.json
+            ${{ runner.temp }}/fable-to-sol.lar
+          if-no-files-found: error
+          retention-days: 14
+
   rust:
     strategy:
       fail-fast: false

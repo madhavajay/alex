@@ -1,0 +1,30 @@
+[package]
+name = "alex-lar-scale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reproducible synthetic scale verifier for Alex LAR"
+publish = false
+
+[dependencies]
+alex-lar = { workspace = true }
+alex-store = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+flate2 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

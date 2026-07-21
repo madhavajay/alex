@@ -15,7 +15,9 @@ conversation-deduplication format.
   is rejected; only an incomplete trailing record is discarded when the next
   writer opens the archive.
 - Resumable import of Alex's existing `bodies/**/*.gz` files. Checkpoints are
-  atomically replaced only after the corresponding archive record is synced.
+  atomically replaced only after the corresponding archive batch is synced;
+  a crash can replay the bounded batch, and immutable archive keys make that
+  replay idempotent. The default batch is 128 bodies and is configurable.
   Repeated or resumed imports compare hashes and do not duplicate records.
   Source gzip files are opened read-only and validation completes before the
   checkpoint is marked complete. The importer never deletes originals.
@@ -26,6 +28,10 @@ conversation-deduplication format.
   LAR file and its bodies can be replayed through the same random-read API.
 - `alex-lar inspect`, `read`, `verify`, `import-bodies`, and `export-fixture`
   commands.
+- A public alex-lar-scale gate with deterministic 64-trace CI and
+  55,000-trace/9.4-GB full profiles, machine-readable budgets/results, bounded
+  RSS checks, migration-resume proof, and sanitized Fable→Sol fixture
+  generation. See [lar-scale.md](lar-scale.md).
 
 The fixed-width on-disk index is capped at one million body records per file.
 Recovery memory is therefore bounded even for an unclosed file; normal reads
@@ -96,8 +102,9 @@ The offline path proves sync-before-pointer ordering without taking that risk.
   clients still need to request and render pages.
 - HAR conversion. V1 replay fixtures are LAR files; HAR remains a later
   interoperability feature.
-- Corpus compression targets and cold-cache latency benchmarks against the
-  private 9.4 GB capture.
+- Representative compression targets and privileged cold-cache latency
+  measurements. The public 9.4-GB synthetic scale gate is implemented, but its
+  repetitive payload is intentionally not used to claim real-corpus ratios.
 
 Run `cargo test -p alex-lar` for interrupted-write, corruption, random-access,
 resumable-import, sanitized-replay, and 55,000-record lazy-index coverage.

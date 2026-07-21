@@ -43,6 +43,8 @@ enum Command {
         checkpoint: Option<PathBuf>,
         #[arg(long)]
         max_entries: Option<usize>,
+        #[arg(long, default_value_t = 128)]
+        checkpoint_every: usize,
     },
     ExportFixture {
         source: PathBuf,
@@ -96,6 +98,7 @@ fn main() -> Result<()> {
             archive,
             checkpoint,
             max_entries,
+            checkpoint_every,
         } => {
             let refs = discover_legacy_bodies(&bodies)?;
             let checkpoint =
@@ -106,6 +109,7 @@ fn main() -> Result<()> {
                 checkpoint,
                 ImportOptions {
                     max_entries_this_run: max_entries,
+                    checkpoint_every,
                     ..ImportOptions::default()
                 },
             )?;
