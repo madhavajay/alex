@@ -165,6 +165,7 @@ service_pid() {
 install_version() {
   local phase="$1"
   local version="$2"
+  local version_output
   if ! ALEX_VERSION="$version" \
     ALEX_ASSET_BASE_URL="$ASSET_URL" \
     ALEX_INSTALL_DIR="$INSTALL_DIR" \
@@ -172,8 +173,18 @@ install_version() {
     cat "$SMOKE_ROOT/install-$phase.log" >&2
     fail "$phase installer failed for Alex $version"
   fi
-  [[ "$($ALEX_BIN --version)" == "alex $version" ]] \
-    || fail "$phase did not install Alex $version"
+  version_output="$($ALEX_BIN --version)"
+  if [[ "$phase" == "candidate" ]]; then
+    [[ "$version_output" == "alex $version" ]] \
+      || fail "$phase did not install Alex $version (reported: $version_output)"
+  else
+    # The PR-base binary predates the user-visible Alexandria-to-Alex rename.
+    # A pinned rollback must verify its exact version without rejecting that
+    # known legacy executable label.
+    [[ "$version_output" == "alex $version" \
+      || "$version_output" == "alexandria $version" ]] \
+      || fail "$phase did not install version $version (reported: $version_output)"
+  fi
 }
 
 assert_service_version() {

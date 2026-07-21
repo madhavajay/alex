@@ -198,8 +198,14 @@ jobs:
           base_asset="alex-cli-${base_version}-linux-x86_64.tar.gz"
           tar -C "$base_target/release" -czf "$assets/$base_asset" alex alexandria
           shasum -a 256 "$assets/$base_asset" > "$assets/$base_asset.sha256"
-          [[ "$("$base_target/release/alex" --version)" == "alex $base_version" ]]
-          [[ "$("$base_target/release/alexandria" --version)" == "alex $base_version" ]]
+          for binary in alex alexandria; do
+            reported="$("$base_target/release/$binary" --version)"
+            [[ "$reported" == "alex $base_version" \
+              || "$reported" == "alexandria $base_version" ]] || {
+              echo "legacy base $binary reported unexpected version: $reported" >&2
+              exit 1
+            }
+          done
 
           {
             echo "base_version=$base_version"
@@ -209,6 +215,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install A, upgrade to B, and explicitly roll back to A
+        id: smoke
         env:
           ALEX_CI_LINUX_SMOKE_MODE: upgrade-rollback
           ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux-upgrade/upgrade-rollback.json
@@ -233,7 +240,7 @@ jobs:
           fi
 
       - name: Upload upgrade/rollback evidence only
-        if: always()
+        if: steps.smoke.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: linux-x86-64-upgrade-rollback-evidence
