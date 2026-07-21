@@ -12,6 +12,8 @@ PATTERNS = [
     ("cli", "aarch64-apple-darwin", "alex-cli-*-macos-aarch64.tar.gz"),
     ("cli", "x86_64-apple-darwin", "alex-cli-*-macos-x86_64.tar.gz"),
     ("cli", "x86_64-unknown-linux-gnu", "alex-cli-*-linux-x86_64.tar.gz"),
+    ("cli", "x86_64-unknown-linux-musl", "alex-x86_64-unknown-linux-musl"),
+    ("cli", "aarch64-unknown-linux-musl", "alex-aarch64-unknown-linux-musl"),
     ("cli", "x86_64-pc-windows-msvc", "alex-cli-*-windows-x86_64.zip"),
     ("app", "darwin-universal", "Alex-*.dmg"),
 ]
@@ -21,6 +23,8 @@ PLATFORM_ORDER = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
     "darwin-universal",
 )
@@ -28,7 +32,7 @@ PLATFORM_ORDER = (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate the Alexandria release manifest.json from release assets."
+        description="Generate the Alex release manifest.json from release assets."
     )
     parser.add_argument("--tag", required=True, help="Release tag, for example v0.1.17")
     parser.add_argument("--repo", default="madhavajay/alex", help="GitHub repo owner/name")

@@ -30,4 +30,5 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | Doc | What it covers |
 | --- | --- |
 | [Signed macOS build](build-signed.md) | `build-signed.sh`, Developer ID signing, notarization, and release-workflow secrets. |
+| [Stable releases](releasing.md) | Artifact-first stable release gates, protected Windows approval, draft promotion, and resumability. |
 | [Credential plan](credentials-plan.md) | Credential-vault design/roadmap context; open implementation work remains tracked in `TODO.md`. |
