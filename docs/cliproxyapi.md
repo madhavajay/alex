@@ -102,3 +102,50 @@ and `x-alexandria-trace-id` do not survive that second hop on error responses.
 This is a CLIProxyAPI boundary limitation; Alex still emits both headers.
 WebSocket Responses, Gemini ingress, and image endpoints are not part of the
 reverse v1 contract.
+
+## Pinned Docker compatibility matrix
+
+The reproducible local gate uses the multi-architecture CLIProxyAPI image
+`eceasy/cli-proxy-api:v7.2.92` pinned to manifest digest
+`sha256:af18f6fb364bfb7b482a1ca6c6c85fd7df2c0d6a3a497ebb82c337ac2216dc41`.
+It was verified on 2026-07-21. Run it directly or through the test driver:
+
+```bash
+./scripts/cliproxyapi-v1-integration.sh
+./test.sh cliproxyapi
+```
+
+The fixture starts the real pinned CLIProxyAPI container, a real Alex router,
+and a deterministic OpenAI-compatible provider. It never reads the user's Alex
+config or vault. Host and published ports are loopback-only; one-time
+credentials live in a mode-`0700` temporary directory; curl reads credentials
+from mode-`0600` header files; CLIProxyAPI request logging and the Docker log
+driver are disabled. Set `ALEX_CPA_FIXTURE_KEEP=1` only when local debugging
+requires retaining those private artifacts.
+
+| CLIProxyAPI version | Pinned image digest | Published platforms | Local gate |
+|---|---|---|---|
+| v7.2.92 | `sha256:af18f6fb364bfb7b482a1ca6c6c85fd7df2c0d6a3a497ebb82c337ac2216dc41` | `linux/amd64`, `linux/arm64` | Pass in both arrangements |
+
+| Arrangement | Chat | Responses | Anthropic Messages | Streaming tool call | 401 / 429 / 503 | Correlation | Loop result |
+|---|---|---|---|---|---|---|---|
+| Harness → Alex → CLIProxyAPI → provider | Pass | Pass | Pass | Pass (`shell({"command":"pwd"})`) | Status and JSON body pass | Alex trace header reaches harness | Explicit reverse loop is HTTP 508 |
+| Harness → CLIProxyAPI → Alex → provider | Pass | Pass | Pass | Pass (`shell({"command":"pwd"})`) | Status and JSON body pass | Alex trace header reaches harness on success | Explicit reverse loop is HTTP 508 |
+
+The gate also verifies bad harness/API keys return 401, the deliberate loop
+does not reach the provider, and the two complete matrices produce exactly 14
+provider calls—one per intended request, with no hidden retry or translation
+cycle. `request-retry: 0` makes that count deterministic.
+
+The pinned real binary confirms the same error-header boundary described
+above: in either arrangement the provider's `Retry-After` is lost when the
+response crosses CLIProxyAPI's OpenAI-compatible executor. In the reverse
+arrangement CLIProxyAPI also drops Alex's trace header on non-2xx responses.
+The fixture asserts both absences, rather than weakening the contract around
+status and structured JSON-body preservation.
+
+This matrix is evidence for v7.2.92, not a claim about every v7 release. The
+exporter negotiates major v7+ because the required config schema is public, but
+new CLIProxyAPI versions should be added to the matrix only after running the
+same digest-pinned fixture. WebSocket Responses, Gemini ingress, and image
+endpoints remain outside V1 and are not exercised here.

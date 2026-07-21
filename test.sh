@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Alexandria test suite (TODO.md section 11): ./test.sh [unit|wire|harness|dario|all] [flags]
+# Alexandria test suite (TODO.md section 11): ./test.sh [unit|wire|harness|cliproxyapi|dario|all] [flags]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +28,12 @@ Tiers (default: unit wire):
   unit      cargo test --workspace
   wire      curl-level matrix through the proxy (W1..W12), all cells parallel
   harness   Docker harness matrix (H1..H7), parallel
+  cliproxyapi pinned real CLIProxyAPI v7 Docker matrix, both proxy directions
   dario     dario supervisor cells (SKIP cleanly when /admin/dario is absent)
-  all       unit + wire + harness + dario
+  all       unit + wire + harness + cliproxyapi + dario
 
 Flags:
-  --only W1,H2,...        run only these cell ids (UNIT, W*, H*, DARIO; W11 matches W11a+W11b)
+  --only W1,H2,...        run only these cell ids (UNIT, W*, H*, CLIPROXYAPI, DARIO; W11 matches W11a+W11b)
   --provider P            anthropic|openai|xai - only cells needing provider P
   --harness H             claude|codex|grok-build|kimi - only these harness cells
   --jobs N                max parallel cells (default: CPU count; harness capped at 4)
@@ -62,7 +63,7 @@ need_val() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    unit|wire|harness|dario|all) TIERS="$TIERS $1" ;;
+    unit|wire|harness|cliproxyapi|dario|all) TIERS="$TIERS $1" ;;
     --only)        need_val "$@"; ONLY=$2; shift ;;
     --only=*)      ONLY=${1#*=} ;;
     --provider)    need_val "$@"; PROVIDER_FILTER=$2; shift ;;
@@ -93,7 +94,7 @@ done
 if [ -z "$TIERS" ]; then
   TIERS="unit wire"
 fi
-case " $TIERS " in *" all "*) TIERS="unit wire harness dario" ;; esac
+case " $TIERS " in *" all "*) TIERS="unit wire harness cliproxyapi dario" ;; esac
 
 has_tier() {
   case " $TIERS " in *" $1 "*) return 0 ;; esac
@@ -846,8 +847,27 @@ run_unit_tier() {
   fi
 }
 
+run_cliproxyapi_tier() {
+  in_only CLIPROXYAPI || return 0
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    write_result CLIPROXYAPI SKIP 0 "docker unavailable"
+    return 0
+  fi
+  log "== cliproxyapi: pinned v7 Docker compatibility matrix =="
+  local t0 t1 rc=0
+  t0=$(now_ms)
+  (cd "$ROOT" && ./scripts/cliproxyapi-v1-integration.sh) >&2 || rc=$?
+  t1=$(now_ms)
+  if [ "$rc" -eq 0 ]; then
+    write_result CLIPROXYAPI PASS "$((t1 - t0))" "CLIProxyAPI v7.2.92 both directions"
+  else
+    write_result CLIPROXYAPI FAIL "$((t1 - t0))" "Docker fixture exited $rc"
+  fi
+}
+
 main() {
   if has_tier unit; then run_unit_tier; fi
+  if has_tier cliproxyapi; then run_cliproxyapi_tier; fi
   : > "$TMP/wire.cells"
   : > "$TMP/harness.cells"
   if has_tier wire; then select_wire; fi

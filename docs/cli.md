@@ -169,6 +169,10 @@ provide an existing scoped key through `--key-file` or
 generated file contains the scoped credential and must be merged privately
 into CLIProxyAPI's `config.yaml`. See [CLIProxyAPI integration](cliproxyapi.md).
 
+Run `./test.sh cliproxyapi` (or
+`./scripts/cliproxyapi-v1-integration.sh` directly) for the pinned real-binary
+compatibility gate.
+
 ## `tool-capture`
 
 Show or set explicit per-harness tool-capture consent. State is `on` or `off`;
