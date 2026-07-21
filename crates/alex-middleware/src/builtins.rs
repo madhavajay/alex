@@ -401,6 +401,37 @@ mod tests {
     }
 
     #[test]
+    fn fable_server_error_without_verified_signal_does_not_match() {
+        let engine = CompiledRuleSetV1::compile(RuleSetV1 {
+            api_version: 1,
+            rules: vec![fable_to_sol_rule()],
+        })
+        .unwrap();
+        let mut context = fable_context(true);
+        let text = r#"{"type":"error","error":{"type":"api_error","message":"A request validation subsystem failed"}}"#;
+        context.outcome.status = 500;
+        context.outcome.body = BodyView {
+            content_type: Some("application/json".into()),
+            size_bytes: Some(text.len() as u64),
+            text: Some(text.into()),
+            json: serde_json::from_str(text).ok(),
+            truncated: false,
+            inspected_bytes: text.len(),
+        };
+        context.outcome.error = Some(ErrorInfo {
+            class: ErrorClass::Server,
+            kind: Some("api_error".into()),
+            code: None,
+            message: Some("A request validation subsystem failed".into()),
+        });
+
+        let result = engine.evaluate_attempt(&context);
+        assert_eq!(result.decision, crate::AttemptDecision::Continue);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].state, crate::MatchState::NotMatched);
+    }
+
+    #[test]
     fn no_substitute_suppresses_fable_reroute() {
         let engine = CompiledRuleSetV1::compile(RuleSetV1 {
             api_version: 1,

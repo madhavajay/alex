@@ -200,5 +200,31 @@ covered only with `reroute_on_auth = true`. The request header
 `x-alexandria-no-substitute: 1` disables configured cross-model substitution
 for that request.
 
+### Fable → Sol preset contract
+
+The readable built-in `example.fable-overload-to-sol` matches only selected
+Anthropic Fable capacity/server responses whose bounded body contains a
+verified overload or availability signal. When an eligible OpenAI account can
+serve `gpt-5.6-sol`, Alex retries there and creates a 24-hour session lease only
+after the fallback succeeds. Requests covered by the active lease explain why
+the session remains on its fallback. Once the lease expires, the next request
+returns to the requested Fable route and records that return in the trace.
+
+A server response without one of the selected body signals is returned
+unchanged. If the rule matches but no eligible OpenAI account can serve Sol,
+Alex also returns the original response and records that the requested reroute
+could not execute. Trace middleware records include the readable rule name and
+an explanation; the Trace Browser shows this alongside the routing explanation.
+This does not claim detection of silent quality changes without a provider
+signal.
+
+The deterministic acceptance contract is
+`crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-acceptance.json`. It
+contains exactly four cases: overload reroute plus lease, recovery after lease
+expiry, a non-matching error, and an unavailable fallback account. Its overload
+case reuses `fable-to-sol-vector.json`, the scenario source consumed by the
+public-site build, so the product test and animation share the same provider,
+model, fixture, and next-turn expectations.
+
 Next: [Configuration](configuration.md) · [API and formats](api-and-formats.md)
 · [Traces](traces.md)

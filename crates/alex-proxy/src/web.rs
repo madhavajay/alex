@@ -75,6 +75,8 @@ mod tests {
         assert!(APP_JS.contains("/metadata`"));
         assert!(APP_JS.contains("async function loadTraceBody"));
         assert!(APP_JS.contains("async function loadTranscript"));
+        assert!(APP_JS.contains("record.explanation"));
+        assert!(APP_JS.contains("Routing explanation"));
         assert!(APP_JS.contains("const TURN_PAGE_SIZE=20"));
         assert!(APP_JS.contains("/transcript/page?"));
         assert!(!APP_JS.contains("/transcript?limit=100"));

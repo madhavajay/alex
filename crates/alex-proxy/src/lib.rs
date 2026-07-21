@@ -4922,6 +4922,13 @@ fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
             r#"{"type":"error","error":{"type":"overloaded_error","message":"Fable subscription is unavailable; please retry shortly"}}"#,
         ),
         (
+            "anthropic-fable-nonmatching-500",
+            "anthropic",
+            500,
+            "api_error",
+            r#"{"type":"error","error":{"type":"api_error","message":"A request validation subsystem failed"}}"#,
+        ),
+        (
             "kimi-quota-exhausted-403",
             "kimi",
             403,
@@ -7530,6 +7537,7 @@ async fn admin_middleware_test(
     };
     let inspection = engine.inspection_plan(&context);
     let evaluation = engine.evaluate_attempt(&context);
+    let records = middleware_records_for_trace(&state, &evaluation);
     let body_inspection_required = rule.when.needs_body()
         || rule
             .expression
@@ -7541,7 +7549,7 @@ async fn admin_middleware_test(
         "body_inspection_required": body_inspection_required,
         "inspection": inspection,
         "decision": evaluation.decision,
-        "records": evaluation.records,
+        "records": records,
         "response_patches": evaluation.response_patches,
     }))
     .into_response()
@@ -11696,42 +11704,145 @@ fn matched_terminal_rule(evaluation: &alex_middleware::EvaluationResult) -> Opti
         .map(|record| record.rule_id.clone())
 }
 
-fn active_middleware_route_lease(
+fn middleware_decision_reason(decision: &alex_middleware::AttemptDecision) -> Option<&str> {
+    match decision {
+        alex_middleware::AttemptDecision::Continue => None,
+        alex_middleware::AttemptDecision::ReturnOriginal { reason }
+        | alex_middleware::AttemptDecision::RetrySameRoute { reason, .. }
+        | alex_middleware::AttemptDecision::Reroute { reason, .. } => Some(reason),
+    }
+}
+
+fn middleware_rule_name(state: &AppState, rule_id: &str) -> String {
+    state
+        .middleware
+        .read()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .rules()
+                .iter()
+                .find(|rule| rule.id == rule_id)
+                .map(|rule| rule.name.clone())
+        })
+        .unwrap_or_else(|| rule_id.to_string())
+}
+
+fn middleware_records_for_trace(
+    state: &AppState,
+    evaluation: &alex_middleware::EvaluationResult,
+) -> Vec<Value> {
+    let terminal_rule = matched_terminal_rule(evaluation);
+    let terminal_reason = middleware_decision_reason(&evaluation.decision);
+    evaluation
+        .records
+        .iter()
+        .map(|record| {
+            let rule_name = middleware_rule_name(state, &record.rule_id);
+            let explanation = if record.suppressed {
+                format!(
+                    "{rule_name} matched, but routing changes were disabled for this request"
+                )
+            } else {
+                match record.state {
+                    alex_middleware::MatchState::Matched
+                        if terminal_rule.as_deref() == Some(record.rule_id.as_str()) =>
+                    {
+                        terminal_reason
+                            .map(|reason| format!("{rule_name} matched: {reason}"))
+                            .unwrap_or_else(|| format!("{rule_name} matched"))
+                    }
+                    alex_middleware::MatchState::Matched => {
+                        format!("{rule_name} matched and allowed evaluation to continue")
+                    }
+                    alex_middleware::MatchState::NotMatched => format!(
+                        "{rule_name} did not match this attempt, so Alex kept the original route and response"
+                    ),
+                    alex_middleware::MatchState::NeedsBody => format!(
+                        "{rule_name} needs the bounded error body before it can decide"
+                    ),
+                }
+            };
+            let mut value = json!(record);
+            value["rule_name"] = json!(rule_name);
+            value["explanation"] = json!(explanation);
+            value
+        })
+        .collect()
+}
+
+fn set_middleware_execution_explanation(
+    attempts: &mut [Value],
+    rule_id: &str,
+    executed: bool,
+    explanation: String,
+) {
+    let Some(records) = attempts
+        .last_mut()
+        .and_then(|attempt| attempt["middleware_decisions"].as_array_mut())
+    else {
+        return;
+    };
+    let Some(record) = records
+        .iter_mut()
+        .find(|record| record["rule_id"] == rule_id)
+    else {
+        return;
+    };
+    record["executed"] = json!(executed);
+    record["explanation"] = json!(explanation);
+}
+
+#[derive(Default)]
+struct MiddlewareLeaseResolution {
+    active: Option<middleware::MiddlewareRouteLease>,
+    expired: Option<middleware::MiddlewareRouteLease>,
+}
+
+fn middleware_route_lease_resolution(
     state: &AppState,
     harness: Option<&str>,
     session_id: Option<&str>,
     requested_model: &str,
-) -> Option<middleware::MiddlewareRouteLease> {
-    let session_id = session_id?;
+) -> MiddlewareLeaseResolution {
+    let Some(session_id) = session_id else {
+        return MiddlewareLeaseResolution::default();
+    };
     let harness = harness.unwrap_or("unknown");
     let now = now_ms();
     let mut changed = false;
-    let matched = {
+    let (active, expired) = {
         let mut leases = state
             .middleware_leases
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = leases.len();
-        leases.retain(|_, lease| lease.expires_ms > now);
-        changed |= before != leases.len();
-        let lease = leases.values_mut().find(|lease| {
+        let matches_request = |lease: &middleware::MiddlewareRouteLease| {
             lease.harness == harness
                 && lease.session_id == session_id
                 && canonical_model_alias(&lease.original_model)
                     == canonical_model_alias(requested_model)
-        });
-        lease.map(|lease| {
+        };
+        let expired = leases
+            .values()
+            .find(|lease| matches_request(lease) && lease.expires_ms <= now)
+            .cloned();
+        let before = leases.len();
+        leases.retain(|_, lease| lease.expires_ms > now);
+        changed |= before != leases.len();
+        let active = leases.values_mut().find(|lease| matches_request(lease));
+        let active = active.map(|lease| {
             lease.last_used_ms = now;
             changed = true;
             lease.clone()
-        })
+        });
+        (active, expired)
     };
     if changed {
         if let Err(error) = persist_middleware_leases_state(state) {
             tracing::warn!(%error, "could not persist middleware lease use");
         }
     }
-    matched
+    MiddlewareLeaseResolution { active, expired }
 }
 
 fn commit_middleware_route_lease(
@@ -12066,19 +12177,21 @@ async fn proxy(
     }
     let substitution_disabled = no_substitute(&headers);
     let requested_route = route_model(&requested_model);
-    let requested_provider = requested_route
-        .0
-        .unwrap_or_else(|| format.default_provider());
-    let active_route_lease = (!substitution_disabled)
-        .then(|| {
-            active_middleware_route_lease(
-                &state,
-                trace.harness.as_deref(),
-                trace.session_id.as_deref(),
-                &requested_model,
-            )
-        })
-        .flatten();
+    let requested_provider = requested_route.0.unwrap_or_else(|| format.default_provider());
+    let route_lease_resolution = if substitution_disabled {
+        MiddlewareLeaseResolution::default()
+    } else {
+        middleware_route_lease_resolution(
+            &state,
+            trace.harness.as_deref(),
+            trace.session_id.as_deref(),
+            &requested_model,
+        )
+    };
+    let MiddlewareLeaseResolution {
+        active: active_route_lease,
+        expired: expired_route_lease,
+    } = route_lease_resolution;
     let (routed_provider, routed_model) = active_route_lease
         .as_ref()
         .and_then(|lease| {
@@ -12126,8 +12239,20 @@ async fn proxy(
     if let Some(lease) = &active_route_lease {
         trace.substituted = true;
         trace.original_model = Some(requested_model.clone());
-        trace.substitution_reason = Some(format!("session route lease {}", lease.id));
+        trace.substitution_reason = Some(format!(
+            "Session remains on its fallback because {} matched earlier: {}; lease expires at {}",
+            middleware_rule_name(&state, &lease.source_middleware_id),
+            lease.reason,
+            lease.expires_ms,
+        ));
         trace.tags = merge_trace_note(trace.tags.take(), "middleware_lease_applied", &lease.id);
+    } else if let Some(lease) = &expired_route_lease {
+        trace.substitution_reason = Some(format!(
+            "The {} lease expired, so Alex returned this request to its requested model {}",
+            middleware_rule_name(&state, &lease.source_middleware_id),
+            requested_model,
+        ));
+        trace.tags = merge_trace_note(trace.tags.take(), "middleware_lease_expired", &lease.id);
     }
     let paused_mode = paused_provider_mode(&state, provider);
     // A provider pause has precedence over a one-shot fixture: it represents
@@ -12328,8 +12453,9 @@ async fn proxy(
                         "provider": current_provider.as_str(),
                         "model": current_model,
                         "status": status,
-                        "middleware_decisions": evaluation.records,
+                        "middleware_decisions": middleware_records_for_trace(&state, &evaluation),
                     }));
+                    let source_rule = matched_terminal_rule(&evaluation);
                     let (selected, retry_same_route) = match &evaluation.decision {
                         alex_middleware::AttemptDecision::RetrySameRoute { .. } => (
                             next.map(|account| (current_provider, current_model.clone(), account)),
@@ -12342,8 +12468,9 @@ async fn proxy(
                                     target,
                                     current_provider,
                                     &current_model,
-                                ) {
-                                state
+                                )
+                            {
+                                let selected = state
                                     .vault
                                     .account_for_excluding(
                                         target_provider,
@@ -12360,8 +12487,41 @@ async fn proxy(
                                         })
                                     })
                                     .filter(|account| retry_account_eligible(&state, account))
-                                    .map(|account| (target_provider, target_model, account))
+                                    .map(|account| {
+                                        (target_provider, target_model.clone(), account)
+                                    });
+                                if selected.is_none() {
+                                    if let Some(rule_id) = source_rule.as_deref() {
+                                        let explanation = format!(
+                                            "{} matched, but no eligible {} account could serve {}; Alex returned the original response",
+                                            middleware_rule_name(&state, rule_id),
+                                            target_provider.as_str(),
+                                            target_model,
+                                        );
+                                        set_middleware_execution_explanation(
+                                            &mut attempts,
+                                            rule_id,
+                                            false,
+                                            explanation.clone(),
+                                        );
+                                        trace.substitution_reason = Some(explanation);
+                                    }
+                                }
+                                selected
                             } else {
+                                if let Some(rule_id) = source_rule.as_deref() {
+                                    let explanation = format!(
+                                        "{} matched, but its fallback route could not be resolved; Alex returned the original response",
+                                        middleware_rule_name(&state, rule_id),
+                                    );
+                                    set_middleware_execution_explanation(
+                                        &mut attempts,
+                                        rule_id,
+                                        false,
+                                        explanation.clone(),
+                                    );
+                                    trace.substitution_reason = Some(explanation);
+                                }
                                 None
                             };
                             (selected, false)
@@ -12373,6 +12533,20 @@ async fn proxy(
                     else {
                         break;
                     };
+                    if let Some(rule_id) = source_rule.as_deref() {
+                        set_middleware_execution_explanation(
+                            &mut attempts,
+                            rule_id,
+                            true,
+                            format!(
+                                "{} matched; Alex selected {}/{} using fallback account {}",
+                                middleware_rule_name(&state, rule_id),
+                                selected_provider.as_str(),
+                                selected_model,
+                                selected_account.id,
+                            ),
+                        );
+                    }
                     trace.substituted = true;
                     trace
                         .original_model
@@ -12826,7 +13000,10 @@ async fn proxy(
                         "body_truncated".into(),
                         json!(context.outcome.body.truncated),
                     );
-                    record.insert("middleware_decisions".into(), json!(evaluation.records));
+                    record.insert(
+                        "middleware_decisions".into(),
+                        json!(middleware_records_for_trace(&state, &evaluation)),
+                    );
                 }
                 let source_rule = matched_terminal_rule(&evaluation);
                 let max_attempts = state
@@ -12882,6 +13059,23 @@ async fn proxy(
                                 !attempted_accounts.contains(&candidate.account.id)
                                     && retry_account_eligible(&state, &candidate.account)
                             });
+                            if next_plan.is_none() {
+                                if let Some(rule_id) = source_rule.as_deref() {
+                                    let explanation = format!(
+                                        "{} matched, but no eligible {} account could serve {}; Alex returned the original response",
+                                        middleware_rule_name(&state, rule_id),
+                                        provider.as_str(),
+                                        model,
+                                    );
+                                    set_middleware_execution_explanation(
+                                        &mut attempt_records,
+                                        rule_id,
+                                        false,
+                                        explanation.clone(),
+                                    );
+                                    trace.substitution_reason = Some(explanation);
+                                }
+                            }
                             next_plan.map(|next_plan| {
                                 pending_notice = notice.as_ref().map(|notice| notice.text.clone());
                                 if let alex_middleware::RouteScope::Session { ttl_seconds } = scope
@@ -12900,6 +13094,19 @@ async fn proxy(
                                 (provider, model, next_plan, reason.clone())
                             })
                         } else {
+                            if let Some(rule_id) = source_rule.as_deref() {
+                                let explanation = format!(
+                                    "{} matched, but its fallback route could not be resolved; Alex returned the original response",
+                                    middleware_rule_name(&state, rule_id),
+                                );
+                                set_middleware_execution_explanation(
+                                    &mut attempt_records,
+                                    rule_id,
+                                    false,
+                                    explanation.clone(),
+                                );
+                                trace.substitution_reason = Some(explanation);
+                            }
                             None
                         }
                     }
@@ -12908,6 +13115,20 @@ async fn proxy(
                 };
 
                 if let Some((next_provider, next_model, next_plan, reason)) = next_route {
+                    if let Some(rule_id) = source_rule.as_deref() {
+                        set_middleware_execution_explanation(
+                            &mut attempt_records,
+                            rule_id,
+                            true,
+                            format!(
+                                "{} matched: {reason}; Alex selected {}/{} using fallback account {}",
+                                middleware_rule_name(&state, rule_id),
+                                next_provider.as_str(),
+                                next_model,
+                                next_plan.account.id,
+                            ),
+                        );
+                    }
                     trace.substituted = true;
                     trace
                         .original_model
@@ -15686,6 +15907,72 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn fable_acceptance_contract() -> Value {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/middleware/fable-to-sol-acceptance.json"
+        ))
+        .unwrap()
+    }
+
+    fn fable_acceptance_case<'a>(contract: &'a Value, id: &str) -> &'a Value {
+        contract["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["id"] == id)
+            .unwrap_or_else(|| panic!("missing Fable acceptance case {id}"))
+    }
+
+    fn enable_fable_to_sol_preset(state: &AppState) {
+        let mut runtime = state.middleware.write().unwrap();
+        let mut rule = runtime
+            .rules()
+            .iter()
+            .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .unwrap()
+            .clone();
+        rule.enabled = true;
+        let id = rule.id.clone();
+        runtime.replace_rule(&id, rule).unwrap();
+    }
+
+    #[test]
+    fn fable_acceptance_contract_has_exactly_four_cases_and_reuses_site_vector() {
+        let contract = fable_acceptance_contract();
+        let cases = contract["cases"].as_array().unwrap();
+        assert_eq!(contract["schema_version"], 1);
+        assert_eq!(contract["preset_id"], alex_middleware::FABLE_TO_SOL_EXAMPLE_ID);
+        assert_eq!(cases.len(), 4);
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "overload-reroute-and-lease",
+                "recovery-returns-after-lease-expiry",
+                "non-matching-error-is-returned",
+                "unavailable-fallback-account-returns-original",
+            ]
+        );
+
+        let site_vector: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/middleware/fable-to-sol-vector.json"
+        ))
+        .unwrap();
+        let overload = fable_acceptance_case(&contract, "overload-reroute-and-lease");
+        assert_eq!(contract["shared_site_scenario"], "fable-to-sol-vector.json");
+        assert_eq!(overload["failure_fixture"], site_vector["failure_fixture"]);
+        assert_eq!(
+            overload["expected"]["provider"],
+            site_vector["expected_attempts"][1]["provider"]
+        );
+        assert_eq!(
+            overload["expected"]["model"],
+            site_vector["expected_attempts"][1]["model"]
+        );
     }
 
     fn test_state(name: &str) -> Arc<AppState> {
@@ -20879,26 +21166,49 @@ mod tests {
 
     #[tokio::test]
     async fn fable_fixture_reroutes_to_sol_then_session_lease_skips_anthropic() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let acceptance = fable_acceptance_contract();
+        let overload_case = fable_acceptance_case(&acceptance, "overload-reroute-and-lease");
+        let recovery_case =
+            fable_acceptance_case(&acceptance, "recovery-returns-after-lease-expiry");
 
         let anthropic_requests = Arc::new(AtomicUsize::new(0));
         let openai_requests = Arc::new(AtomicUsize::new(0));
+        let anthropic_recovered = Arc::new(AtomicBool::new(false));
         let anthropic_seen = anthropic_requests.clone();
+        let recovered = anthropic_recovered.clone();
         let openai_seen = openai_requests.clone();
         let upstream = Router::new()
             .route(
                 "/v1/messages",
                 post(move || {
                     let seen = anthropic_seen.clone();
+                    let recovered = recovered.clone();
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(json!({
+                        if recovered.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "id": "msg_fable_recovered",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": "claude-fable-5",
+                                    "content": [{"type": "text", "text": "Fable recovered"}],
+                                    "stop_reason": "end_turn",
+                                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(json!({
                                 "type": "error",
                                 "error": {"type": "overloaded_error", "message": "unexpected Anthropic request"}
-                            })),
-                        )
+                                })),
+                            )
+                        }
                     }
                 }),
             )
@@ -20946,18 +21256,7 @@ mod tests {
         set_upstream_base_override(&state, Provider::Openai, format!("http://{address}"));
         let fixture_root = tmpdir("middleware-fable-sol-fixtures");
         set_fixture_dir(&state, fixture_root.join("fixtures"));
-        {
-            let mut runtime = state.middleware.write().unwrap();
-            let mut rule = runtime
-                .rules()
-                .iter()
-                .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
-                .unwrap()
-                .clone();
-            rule.enabled = true;
-            let id = rule.id.clone();
-            runtime.replace_rule(&id, rule).unwrap();
-        }
+        enable_fable_to_sol_preset(&state);
         let injected = admin_session_inject(
             State(state.clone()),
             Path("session-fable-sol".into()),
@@ -21026,12 +21325,236 @@ mod tests {
         assert_eq!(attempts[1]["provider"], "openai");
         assert_eq!(attempts[1]["status"], 200);
         assert_eq!(attempts[1]["middleware_decisions"], json!([]));
-        assert!(attempts[0]["middleware_decisions"]
+        let decision = attempts[0]["middleware_decisions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID));
+            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .unwrap();
+        assert_eq!(decision["executed"], true);
+        assert!(decision["explanation"].as_str().unwrap().contains(
+            overload_case["expected"]["explanation_contains"]
+                .as_str()
+                .unwrap()
+        ));
+        assert!(first_trace["substitution_reason"]
+            .as_str()
+            .unwrap()
+            .contains(
+                overload_case["expected"]["explanation_contains"]
+                    .as_str()
+                    .unwrap()
+            ));
+
+        {
+            let mut leases = state.middleware_leases.lock().unwrap();
+            for lease in leases.values_mut() {
+                lease.expires_ms = now_ms() - 1;
+            }
+        }
+        anthropic_recovered.store(true, Ordering::SeqCst);
+        let (recovered_status, recovered_body) = response_json(request().await).await;
+        assert_eq!(recovered_status, StatusCode::OK, "{recovered_body}");
+        assert_eq!(recovered_body["model"], "claude-fable-5");
+        assert_eq!(recovered_body["content"][0]["text"], "Fable recovered");
+        assert_eq!(openai_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(anthropic_requests.load(Ordering::SeqCst), 1);
+        assert!(middleware_leases_snapshot(&state).is_empty());
+
+        let recovered_trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|trace| {
+                trace["substitution_reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("lease expired"))
+            })
+            .expect("trace explaining the expired lease return");
+        assert_eq!(
+            recovered_trace["upstream_provider"],
+            recovery_case["expected"]["provider"]
+        );
+        assert_eq!(
+            recovered_trace["routed_model"],
+            recovery_case["expected"]["model"]
+        );
+        assert_eq!(
+            recovered_trace["status"],
+            recovery_case["expected"]["status"]
+        );
+        assert_eq!(recovered_trace["substituted"], false);
+        assert!(recovered_trace["substitution_reason"]
+            .as_str()
+            .unwrap()
+            .contains(
+                recovery_case["expected"]["explanation_contains"]
+                    .as_str()
+                    .unwrap()
+            ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn fable_nonmatching_error_returns_original_with_trace_explanation() {
+        let acceptance = fable_acceptance_contract();
+        let case = fable_acceptance_case(&acceptance, "non-matching-error-is-returned");
+        let state = test_state("middleware-fable-nonmatch");
+        state
+            .vault
+            .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
+            .await
+            .unwrap();
+        state
+            .vault
+            .upsert(test_api_account("openai-sol", Provider::Openai))
+            .await
+            .unwrap();
+        set_fixture_dir(&state, tmpdir("middleware-fable-nonmatch-fixtures"));
+        enable_fable_to_sol_preset(&state);
+        let fixture = case["failure_fixture"].as_str().unwrap();
+        let injected = admin_session_inject(
+            State(state.clone()),
+            Path("session-fable-nonmatch".into()),
+            axum::Json(json!({"fixture": fixture})),
+        )
+        .await;
+        assert_eq!(injected.status(), StatusCode::CREATED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-session-id",
+            HeaderValue::from_static("session-fable-nonmatch"),
+        );
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        let (status, body) = response_json(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"test non-match"}]}"#,
+                ),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            case["expected"]["status"].as_u64().unwrap() as u16
+        );
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(middleware_leases_snapshot(&state).is_empty());
+
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|trace| trace["fixture_name"] == fixture)
+            .unwrap();
+        assert_eq!(trace["upstream_provider"], case["expected"]["provider"]);
+        assert_eq!(trace["routed_model"], case["expected"]["model"]);
+        assert_eq!(trace["substituted"], false);
+        let attempts = trace["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        let decision = attempts[0]["middleware_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .unwrap();
+        assert_eq!(decision["state"], "not_matched");
+        assert!(decision["executed"].is_null());
+        assert!(decision["explanation"]
+            .as_str()
+            .unwrap()
+            .contains(case["expected"]["explanation_contains"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fable_match_without_sol_account_returns_original_with_trace_explanation() {
+        let acceptance = fable_acceptance_contract();
+        let case =
+            fable_acceptance_case(&acceptance, "unavailable-fallback-account-returns-original");
+        let state = test_state("middleware-fable-no-sol-account");
+        state
+            .vault
+            .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
+            .await
+            .unwrap();
+        set_fixture_dir(&state, tmpdir("middleware-fable-no-sol-fixtures"));
+        enable_fable_to_sol_preset(&state);
+        let fixture = case["failure_fixture"].as_str().unwrap();
+        let injected = admin_session_inject(
+            State(state.clone()),
+            Path("session-fable-no-sol".into()),
+            axum::Json(json!({"fixture": fixture})),
+        )
+        .await;
+        assert_eq!(injected.status(), StatusCode::CREATED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+        headers.insert(
+            "x-session-id",
+            HeaderValue::from_static("session-fable-no-sol"),
+        );
+        headers.insert("x-alexandria-harness", HeaderValue::from_static("claude"));
+        let (status, body) = response_json(
+            proxy(
+                state.clone(),
+                ClientFormat::AnthropicMessages,
+                "/v1/messages",
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"test unavailable fallback"}]}"#,
+                ),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            case["expected"]["status"].as_u64().unwrap() as u16
+        );
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert!(middleware_leases_snapshot(&state).is_empty());
+
+        let trace = state
+            .store
+            .search_traces(&TraceFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|trace| trace["fixture_name"] == fixture)
+            .unwrap();
+        assert_eq!(trace["upstream_provider"], case["expected"]["provider"]);
+        assert_eq!(trace["routed_model"], case["expected"]["model"]);
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["substitution_reason"]
+            .as_str()
+            .unwrap()
+            .contains(case["expected"]["explanation_contains"].as_str().unwrap()));
+        let attempts = trace["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        let decision = attempts[0]["middleware_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .unwrap();
+        assert_eq!(decision["state"], "matched");
+        assert_eq!(decision["action"], "reroute");
+        assert_eq!(decision["executed"], false);
+        assert!(decision["explanation"]
+            .as_str()
+            .unwrap()
+            .contains(case["expected"]["explanation_contains"].as_str().unwrap()));
     }
 
     #[test]
@@ -21192,11 +21715,17 @@ mod tests {
         .await;
         assert_eq!(dry_status, StatusCode::OK, "{dry}");
         assert_eq!(dry["decision"]["decision"], "reroute");
-        assert!(dry["records"]
+        let dry_record = dry["records"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|record| record["rule_id"] == rule.id));
+            .find(|record| record["rule_id"] == rule.id)
+            .unwrap();
+        assert_eq!(dry_record["rule_name"], rule.name);
+        assert!(dry_record["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("Fable failed with a selected overload or availability error"));
         let (_, after_dry_run) =
             response_json(admin_middleware(State(state.clone())).await).await;
         assert!(after_dry_run["rules"]

@@ -230,7 +230,7 @@ function facts(items){return `<dl class="facts">${items.map(([label,value])=>`<d
 function middlewareRecords(attempt){
   const records=parseList(attempt.middleware_decisions);
   if(!records.length)return '<p class="muted">No middleware decisions recorded.</p>';
-  return `<ul class="decision-list">${records.map(record=>`<li><code>${escapeHtml(record.rule_id||'unknown rule')}</code><span class="chip ${record.state==='matched'?'ok':''}">${escapeHtml(record.state||'unknown')}</span>${record.action?`<span>${escapeHtml(record.action)}</span>`:''}${record.suppressed?'<span class="error-text">suppressed</span>':''}</li>`).join('')}</ul>`;
+  return `<ul class="decision-list">${records.map(record=>`<li><code>${escapeHtml(record.rule_name||record.rule_id||'unknown rule')}</code><span class="chip ${record.state==='matched'?'ok':''}">${escapeHtml(record.state||'unknown')}</span>${record.action?`<span>${escapeHtml(record.action)}</span>`:''}${record.suppressed?'<span class="error-text">suppressed</span>':''}${record.explanation?`<span>${escapeHtml(record.explanation)}</span>`:''}</li>`).join('')}</ul>`;
 }
 
 function renderAttempt(attempt,index){
@@ -251,7 +251,7 @@ function renderTraceDetail(id,data){
   const detail=$('#trace-detail');detail.hidden=false;
   detail.innerHTML=`<div class="section-heading"><div><h3>Trace ${escapeHtml(id)}</h3><span class="muted">${escapeHtml(formatTime(trace.ts_request_ms))}</span></div><button id="close-detail">Close</button></div>
     <h4>Summary</h4>${facts([['Status',trace.status],['Latency',trace.latency_ms!==null&&trace.latency_ms!==undefined?`${trace.latency_ms} ms`:null],['Input tokens',trace.input_tokens],['Output tokens',trace.output_tokens],['Error',trace.error||trace.error_kind],['Session',trace.session_id],['Run',trace.run_id]])}
-    <h4>Provenance</h4>${facts([['Harness',trace.harness],['Client format',trace.client_format],['Provider',trace.upstream_provider],['Upstream format',trace.upstream_format],['Requested model',trace.requested_model],['Routed model',trace.routed_model],['Original model',trace.original_model],['Served model',trace.served_model],['Account',trace.account_id],['Original account',trace.original_account_id],['Served account',trace.served_account_id],['Via Dario',trace.via_dario],['Dario generation',trace.dario_generation],['Substitution reason',trace.substitution_reason]])}
+    <h4>Provenance</h4>${facts([['Harness',trace.harness],['Client format',trace.client_format],['Provider',trace.upstream_provider],['Upstream format',trace.upstream_format],['Requested model',trace.requested_model],['Routed model',trace.routed_model],['Original model',trace.original_model],['Served model',trace.served_model],['Account',trace.account_id],['Original account',trace.original_account_id],['Served account',trace.served_account_id],['Via Dario',trace.via_dario],['Dario generation',trace.dario_generation],['Routing explanation',trace.substitution_reason]])}
     <h4>Attempts and middleware</h4><div class="attempt-list">${attempts.length?attempts.map(renderAttempt).join(''):'<p class="muted">No attempt records stored.</p>'}</div>
     <h4>Stored bodies</h4><div class="lazy-list">${bodyDetails(trace)}</div>
     ${trace.session_id?`<h4>Session</h4><details class="lazy-data" data-transcript="${escapeHtml(trace.session_id)}"><summary>Conversation turns</summary><div>Open to load session turns.</div></details>`:''}`;
