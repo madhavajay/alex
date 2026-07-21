@@ -15,10 +15,6 @@ jobs:
       matrix:
         os: [namespace-profile-linux-medium, namespace-profile-mac-medium, namespace-profile-windows-medium]
     runs-on: ${{ matrix.os }}
-    # Windows is pre-release ("coming soon"): keep its job for signal, but do
-    # not let it fail the workflow (or the README badge) until it ships.
-    # Known failure: Vault::open in the dario test fixtures, os error 87.
-    continue-on-error: ${{ matrix.os == 'namespace-profile-windows-medium' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
