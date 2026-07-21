@@ -731,6 +731,25 @@ final class OnboardingModel {
     }
 }
 
+enum OnboardingUILayout {
+    static let windowWidth: CGFloat = 760
+    static let contentHorizontalPadding: CGFloat = 30
+    static let providerTileMinimumWidth: CGFloat = 205
+    static let compatibleAppChipMinimumWidth: CGFloat = 108
+
+    static var contentWidth: CGFloat {
+        windowWidth - (contentHorizontalPadding * 2)
+    }
+
+    static func adaptiveColumnCount(
+        availableWidth: CGFloat,
+        minimumWidth: CGFloat,
+        spacing: CGFloat
+    ) -> Int {
+        max(1, Int((availableWidth + spacing) / (minimumWidth + spacing)))
+    }
+}
+
 struct OnboardingView: View {
     @Bindable var model: OnboardingModel
 
@@ -742,7 +761,7 @@ struct OnboardingView: View {
                 ScrollView {
                     Color.clear.frame(height: 0).id("onboarding-step-top")
                     stepContent
-                        .padding(30)
+                        .padding(OnboardingUILayout.contentHorizontalPadding)
                         .frame(maxWidth: .infinity, minHeight: 410, alignment: .topLeading)
                 }
                 .onChange(of: model.step) { _, _ in scrollToStepTop(proxy) }
@@ -752,7 +771,7 @@ struct OnboardingView: View {
             Divider().overlay(AlexTheme.Colors.cardBorder)
             footer
         }
-        .frame(width: 760, height: 560)
+        .frame(width: OnboardingUILayout.windowWidth, height: 560)
         .background(AlexTheme.Colors.background)
         .focusable()
         .onMoveCommand { direction in
@@ -822,7 +841,12 @@ struct OnboardingView: View {
     private var providerPicker: some View {
         VStack(alignment: .leading, spacing: 16) {
             intro("Connect a real provider", "Choose a provider and complete its secure authentication here. You can skip for now at any point.")
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
+            LazyVGrid(
+                columns: [GridItem(
+                    .adaptive(minimum: OnboardingUILayout.providerTileMinimumWidth),
+                    spacing: 10)],
+                spacing: 10
+            ) {
                 ForEach(ProviderInfo.supportedProviders, id: \.self) { provider in
                     let connectedCount = model.accounts(for: provider).count
                     choiceButton(
@@ -853,18 +877,6 @@ struct OnboardingView: View {
                 exoOnboarding
                 operation(model.providerState)
             } else if let authModel = model.authModel {
-                HStack(spacing: 10) {
-                    Text("Authenticating \(ProviderInfo.displayName(authModel.provider))")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(AlexTheme.Colors.textSecondary)
-                    Spacer()
-                    PillButton(
-                        title: "Change provider", variant: .bordered,
-                        systemImage: "arrow.left.arrow.right"
-                    ) { model.clearProviderSelection() }
-                }
-                .padding(10)
-                .cardStyle()
                 AuthFlowView(model: authModel, close: {}, embedded: true)
                     .padding(.top, 4)
                     .cardStyle()
@@ -1179,11 +1191,19 @@ struct OnboardingView: View {
             VStack(alignment: .leading, spacing: 9) {
                 Text("Models you reach through them")
                     .font(AlexTheme.Fonts.metaMono).foregroundStyle(AlexTheme.Colors.textTertiary)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 76), spacing: 7)], spacing: 7) {
+                LazyVGrid(
+                    columns: [GridItem(
+                        .adaptive(minimum: OnboardingUILayout.compatibleAppChipMinimumWidth),
+                        spacing: 7)],
+                    spacing: 7
+                ) {
                     ForEach(["Claude", "GPT/Codex", "Gemini", "Grok", "Kimi", "OpenRouter", "Exo", "CLIProxyAPI"], id: \.self) { name in
                         Text(name)
                             .font(.system(size: 11, weight: .medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.9)
                             .padding(.horizontal, 9).padding(.vertical, 5)
+                            .frame(maxWidth: .infinity)
                             .background(Capsule().fill(AlexTheme.Colors.primary.opacity(0.10)))
                             .overlay(Capsule().strokeBorder(AlexTheme.Colors.primary.opacity(0.25)))
                     }
@@ -1430,7 +1450,17 @@ struct OnboardingView: View {
         Button(action: action) {
             HStack(spacing: 10) {
                 HarnessIconView(harness: icon, tags: nil, size: 28, showsFallback: true)
-                VStack(alignment: .leading, spacing: 2) { Text(title).font(.system(size: 13, weight: .semibold)); Text(subtitle).font(AlexTheme.Fonts.metaLabel).foregroundStyle(AlexTheme.Colors.textTertiary) }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.9)
+                    Text(subtitle)
+                        .font(AlexTheme.Fonts.metaLabel)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .lineLimit(1)
+                }
+                .layoutPriority(1)
                 Spacer()
                 if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(AlexTheme.Colors.primary) }
             }.padding(12).background(RoundedRectangle(cornerRadius: AlexTheme.Radius.md).fill(selected ? AlexTheme.Colors.primary.opacity(0.10) : AlexTheme.Colors.card)).overlay(RoundedRectangle(cornerRadius: AlexTheme.Radius.md).strokeBorder(selected ? AlexTheme.Colors.primary.opacity(0.45) : AlexTheme.Colors.cardBorder))

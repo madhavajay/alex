@@ -98,6 +98,46 @@ import Testing
         #expect(model.traceState == .idle)
     }
 
+    @Test func providerTilesCanSwitchProviderWhileAuthorizationContentIsVisible() {
+        let model = makeModel()
+        model.selectedProvider = "gemini"
+        model.authModel = AuthFlowModel(
+            provider: "gemini", accountName: nil, autoIdentity: true,
+            store: model.store)
+        model.providerState = .working("Waiting for authorization…")
+        model.traceState = .failure("stale request")
+
+        model.chooseProvider("openrouter")
+
+        #expect(model.selectedProvider == "openrouter")
+        #expect(model.authModel == nil)
+        #expect(model.addingProviderAccount)
+        #expect(model.providerState == .idle)
+        #expect(model.traceState == .idle)
+    }
+
+    @Test func supportedOnboardingWidthUsesThreeProviderColumnsAndRoomyChips() {
+        #expect(OnboardingUILayout.contentWidth == 700)
+        #expect(OnboardingUILayout.adaptiveColumnCount(
+            availableWidth: OnboardingUILayout.contentWidth,
+            minimumWidth: OnboardingUILayout.providerTileMinimumWidth,
+            spacing: 10) == 3)
+        #expect(OnboardingUILayout.adaptiveColumnCount(
+            availableWidth: OnboardingUILayout.contentWidth,
+            minimumWidth: OnboardingUILayout.compatibleAppChipMinimumWidth,
+            spacing: 7) == 6)
+    }
+
+    @Test func settingsResetClosesSettingsBeforeLaunchingOnboarding() {
+        var events: [String] = []
+
+        SettingsResetOnboardingTransition.perform(
+            closeSettings: { events.append("close settings") },
+            launchOnboarding: { events.append("launch onboarding") })
+
+        #expect(events == ["close settings", "launch onboarding"])
+    }
+
     @Test func checkForRequestActivelyRechecksAfterAStaleFailure() async {
         let model = makeModel()
         model.selectedHarness = "kimi"

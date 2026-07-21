@@ -38,6 +38,17 @@ final class PreferencesViewState {
     var section = PreferencesSection.general
 }
 
+@MainActor
+enum SettingsResetOnboardingTransition {
+    static func perform(
+        closeSettings: () -> Void,
+        launchOnboarding: () -> Void
+    ) {
+        closeSettings()
+        launchOnboarding()
+    }
+}
+
 struct PreferencesView: View {
     @Bindable var state: PreferencesViewState
     let store: SnapshotStore
@@ -251,7 +262,12 @@ final class PreferencesWindowController {
                 onOpenDario: onOpenDario,
                 onOpenTraceBrowser: onOpenTraceBrowser,
                 onRunOnboarding: onRunOnboarding,
-                onResetCompleted: onResetCompleted))
+                onResetCompleted: { [weak self] in
+                    guard let self else { return }
+                    SettingsResetOnboardingTransition.perform(
+                        closeSettings: { self.window?.close() },
+                        launchOnboarding: self.onResetCompleted)
+                }))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI Settings"
             // Sidebar-hosted traffic lights per the Create Settings mock
