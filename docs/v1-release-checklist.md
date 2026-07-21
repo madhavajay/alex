@@ -105,6 +105,15 @@ a tag or changes the source worktree.
 - [x] Track the documented CLIProxyAPI v7 limitation: non-2xx status and JSON
   survive the second hop, but upstream error headers do not.
 
+## Second-model / oracle path
+
+- [x] The bundled, opt-in Pam package exposes a mode-specific `pam_oracle`
+  tool that uses configured `alex/*` models without changing the primary agent
+  model; the public walkthrough uses its deterministic oracle-lineage vector.
+- [ ] Through the installed beta, invoke Pam with distinct agent and oracle
+  models backed by two connected subscriptions, then inspect both answers and
+  their session lineage in the Trace Browser.
+
 ## Stable activation baseline
 
 - [x] `alex connect pi` is used in Alex and PAM documentation.
