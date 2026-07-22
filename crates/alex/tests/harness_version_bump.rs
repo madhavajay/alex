@@ -1,3 +1,6 @@
+// The bump script is bash; Windows cannot exec .sh files directly.
+#![cfg(unix)]
+
 use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
