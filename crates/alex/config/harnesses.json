@@ -79,6 +79,7 @@
       "proxy_mode": "anthropic-native-or-codex-bridge",
       "source": {
         "mode": "package artifact from local source",
+        "package": "@anthropic-ai/claude-code",
         "env": "CLAUDE_CODE_REPO",
         "default_path": "repos/claude-code"
       },
@@ -88,10 +89,12 @@
       "aliases": [],
       "default_model": "gpt-5.5",
       "model_env": ["CODEX_MODEL"],
+      "default_version": "0.145.0",
       "proxy_supported": true,
       "proxy_mode": "openai-native",
       "source": {
         "mode": "registered source checkout",
+        "package": "@openai/codex",
         "env": "CODEX_REPO",
         "default_path": "repos/codex"
       }
@@ -107,6 +110,7 @@
       "proxy_mode": "openai-compatible",
       "source": {
         "mode": "package artifact from local source",
+        "package": "@earendil-works/pi-coding-agent",
         "env": "PI_REPO",
         "default_path": "repos/pi"
       }
@@ -127,6 +131,7 @@
       "proxy_mode": "openai-compatible",
       "source": {
         "mode": "registered source checkout",
+        "package": "@oh-my-pi/pi-coding-agent",
         "env": "OH_MY_PI_REPO",
         "default_path": "repos/oh-my-pi"
       },
@@ -162,10 +167,12 @@
       "aliases": ["kimi"],
       "default_model": "openai/gpt-5.5",
       "model_env": ["KIMI_CODE_MODEL"],
+      "default_version": "0.29.0",
       "proxy_supported": true,
       "proxy_mode": "openai-compatible",
       "source": {
         "mode": "mounted local source",
+        "package": "@moonshot-ai/kimi-code",
         "env": "KIMI_CODE_REPO",
         "default_path": "repos/kimi-code"
       }

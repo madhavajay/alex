@@ -81,6 +81,14 @@ struct CatalogHarness {
     proxy_mode: Option<String>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    source: Option<CatalogSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogSource {
+    #[serde(default)]
+    package: Option<String>,
 }
 
 #[derive(Debug)]
@@ -171,9 +179,15 @@ pub fn list_harnesses(data_dir: &Path) -> Result<Vec<HarnessListRow>> {
         .iter()
         .map(|(name, h)| {
             let runner = runnable_by_name(name).is_some();
-            let default_package = runnable_by_name(name)
-                .and_then(|r| r.default_package)
-                .map(String::from);
+            let default_package = h
+                .source
+                .as_ref()
+                .and_then(|source| source.package.clone())
+                .or_else(|| {
+                    runnable_by_name(name)
+                        .and_then(|r| r.default_package)
+                        .map(String::from)
+                });
             let default_version = h
                 .default_version
                 .clone()
@@ -485,10 +499,11 @@ fn package_and_version_for_target(target: &str, version: Option<&str>) -> Result
             ))
         }
     };
-    let runnable = runnable_by_name(&canonical)
-        .ok_or_else(|| anyhow!("{canonical} has no default npm package mapping"))?;
-    let package = runnable
-        .default_package
+    let package = h
+        .source
+        .as_ref()
+        .and_then(|source| source.package.as_deref())
+        .or_else(|| runnable_by_name(&canonical).and_then(|r| r.default_package))
         .ok_or_else(|| anyhow!("{canonical} has no default npm package mapping"))?;
     let version = version
         .filter(|v| !v.trim().is_empty())

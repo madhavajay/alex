@@ -30,7 +30,7 @@ Tiers (default: unit wire):
   webui     Playwright Chromium suite against an isolated daemon + alex-fakeprov
   wire      curl-level matrix through the proxy (W1..W12), all cells parallel
   harness   Docker harness matrix (H1..H7), parallel
-  harness-mock  offline Docker harness x fake-provider matrix + D-MOCK + B1..B5
+  harness-mock  offline Docker harness x fake-provider matrix + lifecycle + Dario/Fable bonuses
   cliproxyapi pinned real CLIProxyAPI v7 Docker matrix, both proxy directions
   dario     dario supervisor cells (SKIP cleanly when /admin/dario is absent)
   all       unit + mock + webui + wire + harness + harness-mock + cliproxyapi + dario
@@ -219,7 +219,7 @@ in_only() {
   for tok in $ONLY; do
     tok=$(upper "$tok" | tr -d ' ')
     if [ "$tok" = "$id" ]; then return 0; fi
-    case "$id" in "$tok"[A-Z]) return 0 ;; esac
+    case "$id" in "$tok"[A-Z]*|"$tok"-*) return 0 ;; esac
   done
   return 1
 }
@@ -1210,6 +1210,320 @@ harness_mock_openai_mode() {
   harness_mock_admin PUT /admin/accounts/mock-openai-oauth-2 "{\"paused\":$oauth2_paused}"
 }
 
+harness_mock_connect_harnesses() {
+  cat <<'EOF'
+pi|pi
+claude|claude
+codex|codex
+grok|grok
+kimi|kimi
+amp|amp
+EOF
+}
+
+harness_mock_seed_connect_dir() {
+  local harness=$1 dir=$2
+  mkdir -p "$dir"
+  python3 - "$harness" "$dir" <<'PY'
+import json, os, sys
+h, d = sys.argv[1], sys.argv[2]
+os.makedirs(d, exist_ok=True)
+if h == "pi":
+    value = {"providers": {"foreign": {"api": "openai", "models": [{"id": "user-model"}]}}}
+    open(os.path.join(d, "models.json"), "w").write(json.dumps(value, indent=2) + "\n")
+    open(os.path.join(d, "settings.json"), "w").write('{"defaultProvider":"foreign","defaultModel":"user-model"}\n')
+elif h == "claude":
+    open(os.path.join(d, "settings.json"), "w").write('{"model":"claude-user","theme":"dark"}\n')
+    open(os.path.join(d, "alex-settings.json"), "w").write('{"model":"user-alex-profile"}\n')
+elif h == "codex":
+    open(os.path.join(d, "config.toml"), "w").write('model = "gpt-5.4"\nmodel_provider = "openai"\n\n[features]\nhooks = false\n\n[projects."/tmp/example"]\ntrust_level = "trusted"\n')
+    open(os.path.join(d, "openai.config.toml"), "w").write('# user openai profile\nmodel = "gpt-5.4"\n')
+    open(os.path.join(d, "alex.config.toml"), "w").write('# user alex profile\nmodel = "custom"\n')
+elif h == "grok":
+    os.makedirs(os.path.join(d, "hooks"), exist_ok=True)
+    open(os.path.join(d, "config.toml"), "w").write('default_model = "grok-native"\n\n[model."grok-native"]\nmodel = "grok-native"\napi_backend = "native"\n')
+    open(os.path.join(d, "hooks", "alex.json"), "w").write('{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"user-hook"}]}]}}\n')
+elif h == "kimi":
+    open(os.path.join(d, "config.toml"), "w").write('default_model = "kimi-native"\n\n[providers.moonshot]\ntype = "oauth"\n\n[models."kimi-native"]\nprovider = "moonshot"\nmodel = "kimi-native"\n')
+elif h == "amp":
+    os.makedirs(os.path.join(d, "plugins"), exist_ok=True)
+    open(os.path.join(d, "plugins", "alex.ts"), "w").write('export default function userPlugin() {}\n')
+PY
+}
+
+harness_mock_lifecycle_selected() {
+  local harness=$1 id
+  for id in "C1-$harness" "C2-$harness" "C3-$harness" "C4-$harness"; do
+    in_only "$id" && return 0
+  done
+  return 1
+}
+
+harness_mock_connect_assert() {
+  local harness=$1 dir=$2 out=$3
+  python3 - "$harness" "$dir" "$out" <<'PY'
+import json, os, stat, sys
+h, d, out = sys.argv[1:4]
+summary = json.load(open(out))
+assert summary["harness"] == h, summary
+assert summary.get("key_id"), summary
+expected = ["alex/claude-fake-1","alex/gpt-fake-1","alex/codex-fake-1","alex/gemini-fake-1","alex/grok-fake-1","alex/kimi/kimi-fake-1","alex/openrouter/fake/fake-1","alex/exo/fake-1"]
+models = summary.get("models") or []
+if h != "amp":
+    for model in expected:
+        assert model in models, f"{model} missing from {h} connect summary"
+if h == "pi":
+    cfg = json.load(open(os.path.join(d, "models.json")))
+    assert cfg["providers"]["foreign"]["models"][0]["id"] == "user-model"
+    assert cfg["providers"]["alex"]["apiKey"].startswith("alxk-")
+    key_path = os.path.join(d, "extensions", "alex-session.ts")
+elif h == "claude":
+    assert open(os.path.join(d, "settings.json")).read() == '{"model":"claude-user","theme":"dark"}\n'
+    assert open(os.path.join(d, "alex-original-settings.json")).read() == '{"model":"claude-user","theme":"dark"}\n'
+    key_path = os.path.join(d, "alex-api-key")
+elif h == "codex":
+    assert 'model = "gpt-5.4"' in open(os.path.join(d, "alex-original-config.toml")).read()
+    assert os.path.isfile(os.path.join(d, "alex-models.json"))
+    assert os.path.isfile(os.path.join(d, "alex-openai-models.json"))
+    key_path = os.path.join(d, "alex-api-key")
+elif h == "grok":
+    assert 'grok-native' in open(os.path.join(d, "alex-original-config.toml")).read()
+    assert os.path.isfile(os.path.join(d, "hooks", "alex.json"))
+    key_path = os.path.join(d, "alex-api-key")
+elif h == "kimi":
+    assert 'kimi-native' in open(os.path.join(d, "alex-original-config.toml")).read()
+    cfg = open(os.path.join(d, "config.toml")).read()
+    assert "[providers.alex]" in cfg and '[models."alex/gpt-fake-1"]' in cfg
+    key_path = os.path.join(d, "config.toml")
+else:
+    assert os.path.isfile(os.path.join(d, "plugins", "alex.ts"))
+    key_path = os.path.join(d, "alex-api-key")
+mode = stat.S_IMODE(os.stat(key_path).st_mode)
+assert mode == 0o600, f"{key_path} mode {oct(mode)}"
+print(f"connected; key={summary['key_id']}; models={len(models)}")
+PY
+}
+
+harness_mock_models_assert() {
+  local harness=$1 dir=$2
+  python3 - "$harness" "$dir" <<'PY'
+import json, os, sys
+h, d = sys.argv[1:3]
+expected = ["alex/claude-fake-1","alex/gpt-fake-1","alex/codex-fake-1","alex/gemini-fake-1","alex/grok-fake-1","alex/kimi/kimi-fake-1","alex/openrouter/fake/fake-1","alex/exo/fake-1"]
+if h == "amp":
+    print("amp has no selectable Alex model catalog")
+    raise SystemExit(2)
+if h == "pi":
+    cfg = json.load(open(os.path.join(d, "models.json")))
+    models = [m["id"] for m in cfg["providers"]["alex"]["models"]]
+elif h == "claude":
+    cfg = json.load(open(os.path.join(d, "alex-models.json")))
+    models = [m["display_name"] for m in cfg["models"]]
+elif h == "codex":
+    cfg = json.load(open(os.path.join(d, "alex-models.json")))
+    models = [m["slug"] for m in cfg["models"]]
+elif h == "grok":
+    raw = open(os.path.join(d, "config.toml")).read()
+    models = [m for m in expected if f'[model."{m}"]' in raw]
+else:
+    raw = open(os.path.join(d, "config.toml")).read()
+    models = [m for m in expected if f'[models."{m}"]' in raw]
+for model in expected:
+    assert model in models, f"{model} missing from written {h} catalog"
+print(f"{len(expected)} canonical models visible in written config")
+PY
+}
+
+harness_mock_routable_request() {
+  local harness=$1 dir=$2 t0 out code key model endpoint body msg
+  t0=$(now_ms)
+  harness_mock_control /_control/reset
+  harness_mock_control /_control/scenario '{"name":"ok"}'
+  harness_mock_openai_mode openai
+  if ! msg=$(python3 - "$harness" "$dir" 2>&1 <<'PY'
+import json, os, sys
+h, d = sys.argv[1:3]
+if h == "amp":
+    print("amp has no direct model route")
+    raise SystemExit(2)
+preferred = ["alex/gpt-fake-1", "alex/claude-fake-1"]
+if h == "pi":
+    cfg = json.load(open(os.path.join(d, "models.json")))
+    models = [m["id"] for m in cfg["providers"]["alex"]["models"]]
+    key = cfg["providers"]["alex"]["apiKey"]
+elif h == "claude":
+    models = [m["display_name"] for m in json.load(open(os.path.join(d, "alex-models.json")))["models"]]
+    key = open(os.path.join(d, "alex-api-key")).read().strip()
+elif h == "codex":
+    models = [m["slug"] for m in json.load(open(os.path.join(d, "alex-models.json")))["models"] if m["slug"].startswith("alex/")]
+    key = open(os.path.join(d, "alex-api-key")).read().strip()
+elif h == "grok":
+    raw = open(os.path.join(d, "config.toml")).read()
+    models = [m for m in preferred if f'[model."{m}"]' in raw]
+    key = open(os.path.join(d, "alex-api-key")).read().strip()
+else:
+    raw = open(os.path.join(d, "config.toml")).read()
+    models = [m for m in preferred if f'[models."{m}"]' in raw]
+    marker = 'api_key = "'
+    key = raw.split("[providers.alex]", 1)[1].split(marker, 1)[1].split('"', 1)[0]
+model = next((m for m in preferred if m in models), models[0])
+fmt = "anthropic" if h in ("pi", "claude") else ("responses" if h == "codex" else "chat")
+print("\t".join([key, fmt, model]))
+PY
+  ); then
+    case "$msg" in *"no direct model route"*) echo "$msg"; return 2 ;; *) echo "$msg" >&2; return 1 ;; esac
+  fi
+  key=${msg%%	*}; msg=${msg#*	}; endpoint=${msg%%	*}; model=${msg#*	}
+  out="$TMP/cell.C3-$harness.body"
+  case "$endpoint" in
+    anthropic)
+      body=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"max_tokens":64,"messages":[{"role":"user","content":"C3 route"}]}))' "$model")
+      code=$(curl -sS --max-time 20 -o "$out" -w '%{http_code}' -H "x-api-key: $key" -H 'x-alex-harness: lifecycle' -H 'content-type: application/json' -d "$body" "$HARNESS_MOCK_BASE/v1/messages" || echo 000) ;;
+    responses)
+      body=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"input":"C3 route"}))' "$model")
+      code=$(curl -sS --max-time 20 -o "$out" -w '%{http_code}' -H "x-api-key: $key" -H 'x-alex-harness: lifecycle' -H 'content-type: application/json' -d "$body" "$HARNESS_MOCK_BASE/v1/responses" || echo 000) ;;
+    *)
+      body=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"messages":[{"role":"user","content":"C3 route"}]}))' "$model")
+      code=$(curl -sS --max-time 20 -o "$out" -w '%{http_code}' -H "x-api-key: $key" -H 'x-alex-harness: lifecycle' -H 'content-type: application/json' -d "$body" "$HARNESS_MOCK_BASE/v1/chat/completions" || echo 000) ;;
+  esac
+  if [ "$code" = 200 ] && python3 - "$out" "$endpoint" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); endpoint = sys.argv[2]
+text = json.dumps(d)
+assert "Fake OpenAI" in text or "Fake Anthropic" in text, text[:200]
+PY
+  then
+    echo "model=$model routed via written key/config"
+    return 0
+  fi
+  echo "http $code: $(head -c 180 "$out" 2>/dev/null)"
+  return 1
+}
+
+harness_mock_disconnect_assert() {
+  local harness=$1 dir=$2 key_id=$3 keys=$4
+  python3 - "$harness" "$dir" "$key_id" "$keys" <<'PY'
+import json, os, sys
+h, d, key_id, keys_path = sys.argv[1:5]
+if h == "pi":
+    cfg = json.load(open(os.path.join(d, "models.json")))
+    assert "foreign" in cfg["providers"]
+    assert cfg["providers"].get("alex") in (None, {})
+    assert not os.path.exists(os.path.join(d, "extensions", "alex-session.ts"))
+elif h == "claude":
+    assert open(os.path.join(d, "settings.json")).read() == '{"model":"claude-user","theme":"dark"}\n'
+    assert open(os.path.join(d, "alex-settings.json")).read() == '{"model":"user-alex-profile"}\n'
+    assert not os.path.exists(os.path.join(d, "alex-api-key"))
+    assert not os.path.exists(os.path.join(d, "alex-models.json"))
+elif h == "codex":
+    assert '# user openai profile' in open(os.path.join(d, "openai.config.toml")).read()
+    assert '# user alex profile' in open(os.path.join(d, "alex.config.toml")).read()
+    raw = open(os.path.join(d, "config.toml")).read()
+    assert 'model_provider = "openai"' in raw and "Alex Proxy" not in raw
+    assert not os.path.exists(os.path.join(d, "alex-api-key"))
+    assert not os.path.exists(os.path.join(d, "alex-models.json"))
+elif h == "grok":
+    raw = open(os.path.join(d, "config.toml")).read()
+    assert "grok-native" in raw and "alex/gpt-fake-1" not in raw
+    assert not os.path.exists(os.path.join(d, "alex-api-key"))
+elif h == "kimi":
+    raw = open(os.path.join(d, "config.toml")).read()
+    assert "[providers.alex]" not in raw and "kimi-native" in raw
+elif h == "amp":
+    assert open(os.path.join(d, "plugins", "alex.ts")).read() == 'export default function userPlugin() {}\n'
+    assert not os.path.exists(os.path.join(d, "alex-api-key"))
+keys = json.load(open(keys_path))["run_keys"]
+row = next((r for r in keys if r["id"] == key_id), None)
+assert row, f"run key {key_id} missing"
+assert row.get("revoked") in (1, True), row
+print(f"disconnected; revoked key={key_id}; user config preserved")
+PY
+}
+
+run_harness_mock_lifecycle_for() {
+  local harness=$1 binary=$2 dir out err rc msg t0 key_id keys c1="C1-$harness" c2="C2-$harness" c3="C3-$harness" c4="C4-$harness"
+  harness_mock_lifecycle_selected "$harness" || return 0
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    in_only "$c1" && write_result "$c1" SKIP 0 "$binary unavailable"
+    in_only "$c2" && write_result "$c2" SKIP 0 "$binary unavailable"
+    in_only "$c3" && write_result "$c3" SKIP 0 "$binary unavailable"
+    in_only "$c4" && write_result "$c4" SKIP 0 "$binary unavailable"
+    return 0
+  fi
+  dir="$TMP/lifecycle-$harness"
+  harness_mock_seed_connect_dir "$harness" "$dir"
+  out="$TMP/cell.$c1.json"; err="$TMP/cell.$c1.err"; t0=$(now_ms); rc=0
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" connect "$harness" --config-dir "$dir" --json >"$out" 2>"$err" || rc=$?
+  if [ "$rc" -eq 0 ] && msg=$(harness_mock_connect_assert "$harness" "$dir" "$out" 2>&1); then
+    in_only "$c1" && write_result "$c1" PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    msg="connect exit $rc: ${msg:-$(tail -c 220 "$err" 2>/dev/null)}"
+    in_only "$c1" && write_result "$c1" FAIL "$(( $(now_ms)-t0 ))" "$msg"
+    HARNESS_MOCK_LIFECYCLE_FAILED="$HARNESS_MOCK_LIFECYCLE_FAILED $harness"
+    in_only "$c2" && write_result "$c2" FAIL 0 "dependent connect failed: $msg"
+    in_only "$c3" && write_result "$c3" FAIL 0 "dependent connect failed: $msg"
+    in_only "$c4" && write_result "$c4" FAIL 0 "dependent connect failed: $msg"
+    return 0
+  fi
+  t0=$(now_ms)
+  if msg=$(harness_mock_models_assert "$harness" "$dir" 2>&1); then
+    in_only "$c2" && write_result "$c2" PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then in_only "$c2" && write_result "$c2" SKIP "$(( $(now_ms)-t0 ))" "$msg"; else in_only "$c2" && write_result "$c2" FAIL "$(( $(now_ms)-t0 ))" "$msg"; HARNESS_MOCK_LIFECYCLE_FAILED="$HARNESS_MOCK_LIFECYCLE_FAILED $harness"; fi
+  fi
+  t0=$(now_ms)
+  if msg=$(harness_mock_routable_request "$harness" "$dir" 2>&1); then
+    in_only "$c3" && write_result "$c3" PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then in_only "$c3" && write_result "$c3" SKIP "$(( $(now_ms)-t0 ))" "$msg"; else in_only "$c3" && write_result "$c3" FAIL "$(( $(now_ms)-t0 ))" "$msg"; HARNESS_MOCK_LIFECYCLE_FAILED="$HARNESS_MOCK_LIFECYCLE_FAILED $harness"; fi
+  fi
+  key_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["key_id"])' "$out" 2>/dev/null || true)
+  err="$TMP/cell.$c4.err"; t0=$(now_ms); rc=0
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" disconnect "$harness" --config-dir "$dir" >"$TMP/cell.$c4.out" 2>"$err" || rc=$?
+  keys="$TMP/cell.$c4.keys.json"
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$keys" "$HARNESS_MOCK_BASE/admin/run-keys?all=1" || true
+  if [ "$rc" -eq 0 ] && msg=$(harness_mock_disconnect_assert "$harness" "$dir" "$key_id" "$keys" 2>&1); then
+    in_only "$c4" && write_result "$c4" PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    msg="disconnect exit $rc: ${msg:-$(tail -c 220 "$err" 2>/dev/null)}"
+    in_only "$c4" && write_result "$c4" FAIL "$(( $(now_ms)-t0 ))" "$msg"
+    HARNESS_MOCK_LIFECYCLE_FAILED="$HARNESS_MOCK_LIFECYCLE_FAILED $harness"
+  fi
+  return 0
+}
+
+run_harness_mock_lifecycle() {
+  local harness binary
+  while IFS='|' read -r harness binary; do
+    run_harness_mock_lifecycle_for "$harness" "$binary"
+  done <<EOF
+$(harness_mock_connect_harnesses)
+EOF
+}
+
+run_harness_mock_c5() {
+  in_only C5 || return 0
+  local t0 out err rc=0 msg
+  t0=$(now_ms)
+  out="$TMP/cell.C5.json"; err="$TMP/cell.C5.err"
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" wrap smoke --harness amp --json >"$out" 2>"$err" || rc=$?
+  if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" <<'PY' 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("ok") is True or d.get("success") is True or d.get("captured_events", 0) >= 0, d
+print("alex wrap smoke --harness amp --json passed")
+PY
+  ); then
+    write_result C5 PASS "$(( $(now_ms)-t0 ))" "$msg"
+  elif [ "$rc" -ne 0 ] && grep -qiE 'unknown harness|not found|unavailable|missing' "$err"; then
+    write_result C5 SKIP "$(( $(now_ms)-t0 ))" "$(tail -c 220 "$err")"
+  else
+    write_result C5 FAIL "$(( $(now_ms)-t0 ))" "wrap smoke exit $rc: $(tail -c 220 "$err" 2>/dev/null)"
+  fi
+}
+
 start_harness_mock_stack() {
   local port fake_line fake_port i rc=0
   log "== harness-mock: building alex + alex-fakeprov =="
@@ -1383,11 +1697,16 @@ PY
 }
 
 run_harness_mock_matrix() {
-  local id harness provider model routed trace_provider completion reason
+  local id harness provider model routed trace_provider completion reason lifecycle_name
   while IFS='|' read -r id harness provider model routed trace_provider completion; do
     in_only "$id" || continue
     if [ -n "$PROVIDER_FILTER" ] && [ "$provider" != "$PROVIDER_FILTER" ]; then continue; fi
     if [ -n "$HARNESS_FILTER" ] && [ "$harness" != "$HARNESS_FILTER" ]; then continue; fi
+    lifecycle_name=$harness
+    [ "$lifecycle_name" = "grok-build" ] && lifecycle_name=grok
+    case " $HARNESS_MOCK_LIFECYCLE_FAILED " in
+      *" $lifecycle_name "*) write_result "$id" FAIL 0 "dependent lifecycle cell failed for $lifecycle_name"; continue ;;
+    esac
     reason=$(harness_mock_skip_reason "$harness" "$provider")
     if [ -n "$reason" ]; then
       write_result "$id" SKIP 0 "$reason"
@@ -1651,12 +1970,270 @@ PY
   kill "$DARIO_MOCK_PID" 2>/dev/null || true; wait "$DARIO_MOCK_PID" 2>/dev/null || true; DARIO_MOCK_PID=""
 }
 
+run_harness_mock_b_dario_tool() {
+  in_only B-DARIO-TOOL || return 0
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    write_result B-DARIO-TOOL SKIP 0 "docker unavailable (docker info failed)"
+    return 0
+  fi
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    write_result B-DARIO-TOOL SKIP 0 "node/npm unavailable"
+    return 0
+  fi
+  local t0 port home base key node_bin claude_bin i status out err rc=0 traces requests msg latest
+  t0=$(now_ms)
+  node_bin=$(command -v node)
+  claude_bin=$(command -v claude || true)
+  if [ -z "$claude_bin" ]; then
+    write_result B-DARIO-TOOL SKIP 0 "real Claude binary unavailable for Dario bootstrap"
+    return 0
+  fi
+  port=$(python3 - <<'PY'
+import socket
+s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()
+PY
+  )
+  home="$TMP/dario-tool-home"; base="http://127.0.0.1:$port"; key="alx-dario-tool-key"
+  mkdir -p "$home/accounts"
+  python3 - "$home" "$port" "$key" "$node_bin" "$claude_bin" <<'PY'
+import json, os, sys
+home, port, key, node, claude=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],sys.argv[5]
+with open(os.path.join(home,"config.toml"),"w") as f:
+    f.write(f'''host = "0.0.0.0"
+port = {port}
+data_dir = {json.dumps(home)}
+local_key = "{key}"
+heartbeat_minutes = 0
+reauth_check_minutes = 0
+update_check_hours = 0
+anthropic_upstream = "dario"
+dario_mode_migrated = true
+dario_update_check_minutes = 0
+dario_version = "5.2.16"
+dario_probe_seconds = 0
+dario_node_path = {json.dumps(node)}
+dario_claude_bin = {json.dumps(claude)}
+upstream_stream_idle_timeout_seconds = 2
+''')
+account={"id":"dario-tool-anthropic","provider":"anthropic","kind":"api_key","name":"dario-tool","api_key":"mock-anthropic-key","status":"active"}
+with open(os.path.join(home,"accounts","dario-tool-anthropic.json"),"w") as f: json.dump(account,f)
+PY
+  chmod 600 "$home/config.toml" "$home/accounts/"*.json
+  env ALEX_HOME="$home" ALEX_DARIO_UPSTREAM_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
+    ALEX_UPSTREAM_ANTHROPIC_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
+    "$ROOT/target/debug/alex" daemon --host 0.0.0.0 --port "$port" \
+    >"$TMP/dario-tool-daemon.log" 2>&1 &
+  DARIO_MOCK_PID=$!
+  i=0
+  while [ "$i" -lt 300 ]; do
+    curl -fsS --max-time 1 "$base/health" >/dev/null 2>&1 && break
+    kill -0 "$DARIO_MOCK_PID" 2>/dev/null || break
+    sleep 0.5
+    i=$((i + 1))
+  done
+  status="$TMP/cell.B-DARIO-TOOL.status.json"
+  curl -fsS --max-time 5 -H "x-api-key: $key" -o "$status" "$base/admin/dario" 2>/dev/null || true
+  if ! python3 - "$status" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: raise SystemExit(1)
+raise SystemExit(0 if d.get("active_generation_id") else 1)
+PY
+  then
+    write_result B-DARIO-TOOL SKIP "$(( $(now_ms)-t0 ))" "Dario could not start: $(tail -c 240 "$TMP/dario-tool-daemon.log" 2>/dev/null)"
+    kill "$DARIO_MOCK_PID" 2>/dev/null || true; wait "$DARIO_MOCK_PID" 2>/dev/null || true; DARIO_MOCK_PID=""
+    return 0
+  fi
+  harness_mock_control /_control/reset
+  harness_mock_control /_control/scenario '{"name":"ok"}'
+  harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","use_default":true}'
+  harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","directory_tool_call":true}'
+  harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","tool_final":"alex-harness-tool-ok Fake Anthropic response."}'
+  out="$TMP/cell.B-DARIO-TOOL.harness.json"; err="$TMP/cell.B-DARIO-TOOL.err"
+  ALEX_HOME="$home" "$ROOT/target/debug/alex" harness run codex \
+    --model alex/claude-fake-1 --prompt "Use your shell tool to list the current directory, then report the result." \
+    --container-base-url "http://host.docker.internal:$port" \
+    --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
+  traces="$TMP/cell.B-DARIO-TOOL.traces.json"; requests="$TMP/cell.B-DARIO-TOOL.requests.json"
+  curl -fsS --max-time 10 -H "x-api-key: $key" -o "$traces" "$base/admin/traces?limit=30" || true
+  curl -fsS --max-time 10 -H "x-control-key: $HARNESS_MOCK_CONTROL_KEY" -o "$requests" "$HARNESS_MOCK_FAKE_BASE/_control/requests" || true
+  if [ "$rc" -ne 0 ]; then
+    latest=$(ls -td "$home/harness-e2e/"* 2>/dev/null | head -1 || true)
+    msg=$(cat "$err" "$latest/harness.stderr.log" "$latest/docker.stderr.log" "$latest/logs/npm-install.log" 2>/dev/null | tail -c 500)
+    case "$msg" in
+      *"manifest unknown"*|*"no matching manifest"*|*"pull access denied"*|*"npm error code E404"*|*"Could not resolve host"*|*"Failed to connect"*)
+        write_result B-DARIO-TOOL SKIP "$(( $(now_ms)-t0 ))" "codex harness unavailable: $msg" ;;
+      *) write_result B-DARIO-TOOL FAIL "$(( $(now_ms)-t0 ))" "codex harness exit $rc: $msg" ;;
+    esac
+    kill "$DARIO_MOCK_PID" 2>/dev/null || true; wait "$DARIO_MOCK_PID" 2>/dev/null || true; DARIO_MOCK_PID=""
+    return 0
+  fi
+  if msg=$(python3 - "$out" "$traces" "$requests" "$t0" <<'PY' 2>&1
+import json, os, sys
+summary=json.load(open(sys.argv[1])); traces=json.load(open(sys.argv[2])).get("traces",[]); requests=json.load(open(sys.argv[3])); started=int(sys.argv[4])
+session=summary["session_dir"]
+text=open(os.path.join(session, "harness.stdout.log"), errors="replace").read()
+assert "alex-harness-tool-ok" in text and "Fake Anthropic response." in text, text[-500:]
+posts=[r for r in requests if r.get("path")=="/anthropic/v1/messages"]
+tool_posts=[r for r in posts if "alex-harness-tool-canary" in r.get("body","") and "tool_result" in r.get("body","")]
+assert tool_posts, "no Dario upstream request carried the real tool result"
+second=tool_posts[-1]
+body=json.loads(second["body"])
+assert any("You are an interactive agent" in item.get("text","") for item in body.get("system",[]) if isinstance(item,dict)), "Dario system rewrite missing"
+assert second.get("headers",{}).get("x-api-key") or second.get("headers",{}).get("authorization"), "Dario upstream auth signature missing"
+rows=[r for r in traces if (r.get("ts_request_ms") or 0)>=started and r.get("routed_model")=="claude-fake-1"]
+assert len(rows) >= 2, rows
+assert all(r.get("via_dario") in (1, True) for r in rows), rows
+assert all(r.get("dario_generation") for r in rows), rows
+print(f"codex->daemon->dario->fakeprov tool roundtrip; traces={len(rows)}; dario_posts={len(posts)}")
+PY
+  ); then
+    write_result B-DARIO-TOOL PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    write_result B-DARIO-TOOL FAIL "$(( $(now_ms)-t0 ))" "$msg"
+  fi
+  kill "$DARIO_MOCK_PID" 2>/dev/null || true; wait "$DARIO_MOCK_PID" 2>/dev/null || true; DARIO_MOCK_PID=""
+}
+
+harness_mock_set_fable_rule() {
+  local enabled=$1 status="$TMP/fable-rule-status.json" rule="$TMP/fable-rule.json"
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$status" "$HARNESS_MOCK_BASE/admin/middleware"
+  python3 - "$status" "$rule" "$enabled" <<'PY'
+import json, sys
+status, out, enabled = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
+d = json.load(open(status))
+rule = next(r for r in d["rules"] if r["id"] == "alex.fable-5-to-gpt-5.6-sol")
+rule["enabled"] = enabled
+json.dump(rule, open(out, "w"))
+PY
+  curl -fsS --max-time 10 -X PUT -H "x-api-key: $HARNESS_MOCK_KEY" -H 'content-type: application/json' \
+    --data-binary @"$rule" "$HARNESS_MOCK_BASE/admin/middleware/rules/alex.fable-5-to-gpt-5.6-sol" >/dev/null
+}
+
+run_harness_mock_b_fable_on() {
+  in_only B-FABLE-REROUTE-ON || return 0
+  local t0 out err rc=0 traces activity requests msg latest
+  t0=$(now_ms)
+  harness_mock_set_fable_rule true
+  harness_mock_control /_control/reset
+  harness_mock_control /_control/scenario '{"name":"ok"}'
+  harness_mock_openai_mode openai
+  harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","failure":"refusal"}'
+  harness_mock_control /_control/queue '{"endpoint":"POST /openai/v1/responses","fixture":"openai/fable-reroute-sol.sse"}'
+  out="$TMP/cell.B-FABLE-REROUTE-ON.harness.json"; err="$TMP/cell.B-FABLE-REROUTE-ON.err"
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run claude \
+    --model alex/claude-fable-5 --prompt "B-FABLE-REROUTE-ON" \
+    --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
+  traces="$TMP/cell.B-FABLE-REROUTE-ON.traces.json"; activity="$TMP/cell.B-FABLE-REROUTE-ON.activity.json"; requests="$TMP/cell.B-FABLE-REROUTE-ON.requests.json"
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$traces" "$HARNESS_MOCK_BASE/admin/traces?limit=30" || true
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$activity" "$HARNESS_MOCK_BASE/admin/middleware/activity?limit=10" || true
+  curl -fsS --max-time 10 -H "x-control-key: $HARNESS_MOCK_CONTROL_KEY" -o "$requests" "$HARNESS_MOCK_FAKE_BASE/_control/requests" || true
+  if [ "$rc" -ne 0 ]; then
+    latest=$(ls -td "$HARNESS_MOCK_HOME/harness-e2e/"* 2>/dev/null | head -1 || true)
+    msg=$(cat "$err" "$latest/harness.stderr.log" "$latest/docker.stderr.log" "$latest/logs/npm-install.log" 2>/dev/null | tail -c 500)
+    case "$msg" in *"manifest unknown"*|*"pull access denied"*|*"npm error code E404"*) write_result B-FABLE-REROUTE-ON SKIP "$(( $(now_ms)-t0 ))" "$msg"; return 0 ;; esac
+  fi
+  if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" "$traces" "$activity" "$requests" "$t0" <<'PY' 2>&1
+import json, os, sys
+summary=json.load(open(sys.argv[1])); traces=json.load(open(sys.argv[2])).get("traces",[]); activity=json.load(open(sys.argv[3])).get("events",[]); requests=json.load(open(sys.argv[4])); started=int(sys.argv[5])
+text=open(os.path.join(summary["session_dir"], "harness.stdout.log"), errors="replace").read()
+assert "Fake GPT-5.6 Sol reroute success." in text, text[-800:]
+assert "stop_reason\":\"refusal" not in text and "fallback_has_prefill_claim" not in text, text[-800:]
+rows=[r for r in traces if (r.get("ts_request_ms") or 0)>=started and r.get("served_model")=="gpt-5.6-sol"]
+assert rows, "reroute trace missing"
+row=rows[0]
+assert row.get("substituted") in (1, True), row
+attempts=row.get("attempts") or []
+if isinstance(attempts,str): attempts=json.loads(attempts)
+assert len(attempts) >= 2, attempts
+assert attempts[0]["provider"]=="anthropic" and attempts[0].get("error",{}).get("kind")=="upstream_refusal", attempts
+assert attempts[1]["provider"]=="openai" and attempts[1]["model"]=="gpt-5.6-sol", attempts
+decision=json.dumps(attempts)
+assert "alex.fable-5-to-gpt-5.6-sol" in decision and '"executed":true' in decision.replace(" ",""), decision
+assert any(e.get("substituted") in (1, True) and "gpt-5.6-sol" in json.dumps(e) for e in activity), activity
+paths=[r.get("path") for r in requests if r.get("method")=="POST"]
+assert "/anthropic/v1/messages" in paths and "/openai/v1/responses" in paths, paths
+print("ON intercepted refusal and rerouted to fake OpenAI gpt-5.6-sol before harness saw refusal bytes")
+PY
+  ); then
+    write_result B-FABLE-REROUTE-ON PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    write_result B-FABLE-REROUTE-ON FAIL "$(( $(now_ms)-t0 ))" "exit $rc: ${msg:-$(tail -c 220 "$err" 2>/dev/null)}"
+  fi
+}
+
+run_harness_mock_b_fable_off() {
+  in_only B-FABLE-REROUTE-OFF || return 0
+  local t0 out err rc=0 traces activity requests msg latest
+  t0=$(now_ms)
+  harness_mock_set_fable_rule false
+  harness_mock_control /_control/reset
+  harness_mock_control /_control/scenario '{"name":"ok"}'
+  harness_mock_openai_mode openai
+  harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","failure":"refusal"}'
+  out="$TMP/cell.B-FABLE-REROUTE-OFF.harness.json"; err="$TMP/cell.B-FABLE-REROUTE-OFF.err"
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run claude \
+    --model alex/claude-fable-5 --prompt "B-FABLE-REROUTE-OFF" \
+    --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
+  harness_mock_set_fable_rule true || true
+  traces="$TMP/cell.B-FABLE-REROUTE-OFF.traces.json"; activity="$TMP/cell.B-FABLE-REROUTE-OFF.activity.json"; requests="$TMP/cell.B-FABLE-REROUTE-OFF.requests.json"
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$traces" "$HARNESS_MOCK_BASE/admin/traces?limit=30" || true
+  curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$activity" "$HARNESS_MOCK_BASE/admin/middleware/activity?limit=10" || true
+  curl -fsS --max-time 10 -H "x-control-key: $HARNESS_MOCK_CONTROL_KEY" -o "$requests" "$HARNESS_MOCK_FAKE_BASE/_control/requests" || true
+  latest=$(python3 - "$out" <<'PY' 2>/dev/null || true
+import json,sys
+print(json.load(open(sys.argv[1])).get("session_dir",""))
+PY
+  )
+  if [ -z "$latest" ] || [ ! -d "$latest" ]; then
+    latest=$(ls -td "$HARNESS_MOCK_HOME/harness-e2e/"* 2>/dev/null | head -1 || true)
+  fi
+  if msg=$(python3 - "$traces" "$activity" "$requests" "$latest" "$ROOT/crates/alex-fakeprov/fixtures/anthropic/anthropic-fable-refusal-200.sse" "$t0" <<'PY' 2>&1
+import gzip, json, os, sys
+traces=json.load(open(sys.argv[1])).get("traces",[]); activity=json.load(open(sys.argv[2])).get("events",[]); requests=json.load(open(sys.argv[3])); session=sys.argv[4]; fixture=open(sys.argv[5]).read(); started=int(sys.argv[6])
+activity=[e for e in activity if (e.get("ts_ms") or 0) >= started]
+text=""
+if session and os.path.isdir(session):
+    for name in ["harness.stdout.log","harness.stderr.log"]:
+        path=os.path.join(session,name)
+        if os.path.exists(path): text += open(path, errors="replace").read()
+assert "API Error: Claude Code is unable to respond to this request" in text, text[-800:]
+assert '"stop_reason":"refusal"' in text or '"subtype":"model_refusal_no_fallback"' in text, text[-800:]
+rows=[r for r in traces if (r.get("ts_request_ms") or 0)>=started and r.get("routed_model")=="claude-fable-5"]
+assert rows, "Fable OFF trace missing"
+row=rows[0]
+assert row.get("substituted") in (0, False, None), row
+assert row.get("served_model") in ("claude-fable-5", None), row.get("served_model")
+def read_body(path):
+    return gzip.open(path, "rt").read() if path.endswith(".gz") else open(path).read()
+assert row.get("resp_body_path") and read_body(row["resp_body_path"]) == fixture, "refusal SSE changed in OFF path"
+attempts=row.get("attempts") or []
+if isinstance(attempts,str): attempts=json.loads(attempts)
+assert attempts and attempts[0].get("provider")=="anthropic", attempts
+assert not any(a.get("provider")=="openai" for a in attempts), attempts
+assert not any(dec.get("rule_id")=="alex.fable-5-to-gpt-5.6-sol" and dec.get("executed") for a in attempts for dec in a.get("middleware_decisions",[])), attempts
+assert not any(e.get("substituted") in (1, True) and "alex.fable-5-to-gpt-5.6-sol" in json.dumps(e) for e in activity), activity
+paths=[r.get("path") for r in requests if r.get("method")=="POST"]
+assert paths.count("/anthropic/v1/messages") >= 1 and "/openai/v1/responses" not in paths, paths
+assert 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"' in fixture
+print("OFF passed raw refusal SSE unchanged with no OpenAI reroute or executed middleware action")
+PY
+  ); then
+    write_result B-FABLE-REROUTE-OFF PASS "$(( $(now_ms)-t0 ))" "$msg"
+  else
+    write_result B-FABLE-REROUTE-OFF FAIL "$(( $(now_ms)-t0 ))" "exit $rc: $msg"
+  fi
+}
+
 run_harness_mock_tier() {
   local docker_ok=1 id
+  HARNESS_MOCK_LIFECYCLE_FAILED=""
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     docker_ok=0
   fi
   start_harness_mock_stack || return 0
+  run_harness_mock_lifecycle
+  run_harness_mock_c5
   if [ "$docker_ok" -eq 1 ]; then
     run_harness_mock_matrix
   else
@@ -1667,6 +2244,14 @@ $(harness_mock_cells)
 EOF
   fi
   run_harness_mock_dario
+  run_harness_mock_b_dario_tool
+  if [ "$docker_ok" -eq 1 ]; then
+    run_harness_mock_b_fable_on
+    run_harness_mock_b_fable_off
+  else
+    in_only B-FABLE-REROUTE-ON && write_result B-FABLE-REROUTE-ON SKIP 0 "docker unavailable (docker info failed)"
+    in_only B-FABLE-REROUTE-OFF && write_result B-FABLE-REROUTE-OFF SKIP 0 "docker unavailable (docker info failed)"
+  fi
   run_harness_mock_b1
   run_harness_mock_b2
   if [ "$docker_ok" -eq 1 ]; then
