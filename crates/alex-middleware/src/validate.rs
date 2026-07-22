@@ -221,6 +221,7 @@ fn validate_conditions(
         ("current_models", &conditions.current_models),
         ("model_aliases", &conditions.model_aliases),
         ("equivalence_classes", &conditions.equivalence_classes),
+        ("efforts", &conditions.efforts),
         ("providers", &conditions.providers),
         ("exclude_providers", &conditions.exclude_providers),
         ("error_kinds", &conditions.error_kinds),
@@ -550,6 +551,19 @@ fn validate_action(
                 "reroute requires exactly one of model or equivalent_class",
             ));
         }
+        if reroute.effort.as_deref().is_some_and(|effort| {
+            effort.is_empty()
+                || effort.len() > 32
+                || !effort
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        }) {
+            errors.push(ValidationError::new(
+                ValidationErrorCode::InvalidRouteTarget,
+                format!("{path}.then.reroute.effort"),
+                "replacement effort must be a short effort/thinking-level name",
+            ));
+        }
         if reroute.provider_mode != ProviderModeV1::Any && reroute.providers.is_empty() {
             errors.push(ValidationError::new(
                 ValidationErrorCode::InvalidProviderConstraint,
@@ -826,6 +840,7 @@ mod tests {
                     scope: RouteScopeKindV1::Request,
                     ttl_seconds: None,
                     notice: None,
+                    effort: None,
                     reason: "test".into(),
                     max_attempts: Some(3),
                     required_capabilities: Default::default(),

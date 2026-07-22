@@ -8,27 +8,25 @@ use crate::{
 /// the same public rule schema used by the Middleware Wizard.
 pub const FABLE_TO_SOL_ID: &str = "alex.fable-5-to-gpt-5.6-sol";
 
-/// If Anthropic cannot serve Fable 5 because of capacity or a provider error,
-/// retry this request with GPT-5.6 Sol through OpenAI.
+/// If Anthropic returns its documented Fable overload signal, retry this
+/// request with high-effort GPT-5.6 Sol through OpenAI.
 pub fn fable_to_sol_rule() -> RuleSpecV1 {
     RuleSpecV1 {
         id: FABLE_TO_SOL_ID.into(),
         name: "Fable 5 → GPT-5.6 Sol".into(),
         description: Some(
-            "If Fable 5 fails with a capacity or provider error, retry with GPT-5.6 Sol.".into(),
+            "On Anthropic HTTP 529 overloaded_error, retry with high-effort GPT-5.6 Sol.".into(),
         ),
         enabled: true,
         priority: 100,
         hook: HookPoint::AttemptResult,
-        capabilities: vec![Capability::RouteOverride],
+        capabilities: vec![Capability::AttemptReadErrorBody, Capability::RouteOverride],
         when: MatchConditionsV1 {
             models: vec!["claude-fable-5".into()],
             providers: vec!["anthropic".into()],
-            status: vec![
-                StatusMatcherSpec::Exact(429),
-                StatusMatcherSpec::RangeOrClass("500-599".into()),
-            ],
-            error_classes: vec![ErrorClass::Capacity, ErrorClass::Server],
+            status: vec![StatusMatcherSpec::Exact(529)],
+            error_classes: vec![ErrorClass::Capacity],
+            body_contains_any: vec!["overloaded_error".into()],
             ..Default::default()
         },
         expression: None,
@@ -41,7 +39,9 @@ pub fn fable_to_sol_rule() -> RuleSpecV1 {
                 scope: RouteScopeKindV1::Request,
                 ttl_seconds: None,
                 notice: None,
-                reason: "Fable 5 failed; retrying with GPT-5.6 Sol".into(),
+                effort: Some("high".into()),
+                reason: "Fable 5 returned Anthropic's overloaded_error; retrying with GPT-5.6 Sol"
+                    .into(),
                 max_attempts: Some(3),
                 required_capabilities: Default::default(),
             }),
@@ -65,6 +65,8 @@ mod tests {
         ModelCapabilities, ModelRef, ProviderConstraint, ProviderView, RouteScope, RouteTarget,
         RouteView, SafeHeaders, SessionIdSource, SessionView,
     };
+
+    use serde_json::json;
 
     use super::*;
 
@@ -116,7 +118,18 @@ mod tests {
             outcome: AttemptOutcome {
                 status,
                 headers: SafeHeaders::default(),
-                body: BodyView::default(),
+                body: BodyView {
+                    content_type: Some("application/json".into()),
+                    size_bytes: Some(92),
+                    text: Some(if error_class == ErrorClass::Capacity {
+                        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.into()
+                    } else {
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid"}}"#.into()
+                    }),
+                    json: None,
+                    truncated: false,
+                    inspected_bytes: 92,
+                },
                 error: Some(ErrorInfo {
                     class: error_class,
                     kind: None,
@@ -144,8 +157,13 @@ mod tests {
     fn fable_capacity_failure_reroutes_to_sol_for_this_request() {
         let engine = CompiledRuleSetV1::compile(default_builtin_rule_set()).unwrap();
         let context = fable_context(ErrorClass::Capacity, 529);
-        let plan = engine.inspection_plan(&context);
-        assert!(!plan.needs_body);
+        let mut head = context.clone();
+        head.outcome.body = BodyView {
+            content_type: Some("application/json".into()),
+            ..Default::default()
+        };
+        let plan = engine.inspection_plan(&head);
+        assert!(plan.needs_body);
 
         let result = engine.evaluate_attempt(&context);
         assert_eq!(result.records[0].rule_id, FABLE_TO_SOL_ID);
@@ -158,7 +176,8 @@ mod tests {
                 },
                 scope: RouteScope::Request,
                 notice: None,
-                reason: "Fable 5 failed; retrying with GPT-5.6 Sol".into(),
+                reason: "Fable 5 returned Anthropic's overloaded_error; retrying with GPT-5.6 Sol"
+                    .into(),
             }
         );
     }
@@ -171,10 +190,33 @@ mod tests {
     }
 
     #[test]
+    fn optional_effort_condition_matches_the_incoming_request() {
+        let mut rule = fable_to_sol_rule();
+        rule.when.efforts = vec!["high".into()];
+        let engine = CompiledRuleSetV1::compile(RuleSetV1 {
+            api_version: API_VERSION_V1,
+            rules: vec![rule],
+        })
+        .unwrap();
+        let mut context = fable_context(ErrorClass::Capacity, 529);
+        context.request.body.json = Some(json!({"output_config": {"effort": "high"}}));
+        assert!(matches!(
+            engine.evaluate_attempt(&context).decision,
+            crate::AttemptDecision::Reroute { .. }
+        ));
+
+        context.request.body.json = Some(json!({"output_config": {"effort": "low"}}));
+        assert_eq!(
+            engine.evaluate_attempt(&context).decision,
+            crate::AttemptDecision::Continue
+        );
+    }
+
+    #[test]
     fn no_substitute_suppresses_fable_reroute() {
         let engine = CompiledRuleSetV1::compile(default_builtin_rule_set()).unwrap();
         let result = engine.evaluate_attempt_with(
-            &fable_context(ErrorClass::Server, 500),
+            &fable_context(ErrorClass::Capacity, 529),
             EvaluationControl {
                 no_substitute: true,
             },

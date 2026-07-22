@@ -570,6 +570,7 @@ struct CompiledConditions {
     current_models: StringSet,
     model_aliases: StringSet,
     equivalence_classes: StringSet,
+    efforts: StringSet,
     providers: StringSet,
     exclude_providers: StringSet,
     status: Vec<(u16, u16)>,
@@ -612,6 +613,7 @@ impl CompiledConditions {
             current_models: StringSet::compile(&spec.current_models),
             model_aliases: StringSet::compile(&spec.model_aliases),
             equivalence_classes: StringSet::compile(&spec.equivalence_classes),
+            efforts: StringSet::compile(&spec.efforts),
             providers: StringSet::compile(&spec.providers),
             exclude_providers: StringSet::compile(&spec.exclude_providers),
             status: spec.status.iter().filter_map(parse_status).collect(),
@@ -693,6 +695,7 @@ impl CompiledConditions {
                         .chain(route.requested.equivalence_classes.iter())
                         .any(|class| self.equivalence_classes.matches(class))
                 }))
+            || !self.efforts.matches_optional(request_effort(request))
             || (!self.providers.is_empty()
                 && !route.is_some_and(|route| self.providers.matches(&route.provider.id)))
             || (!self.exclude_providers.is_empty()
@@ -783,6 +786,20 @@ impl CompiledConditions {
         }
         MatchState::Matched
     }
+}
+
+fn request_effort(request: &crate::ClientRequestView) -> Option<&str> {
+    let body = request.body.json.as_ref()?;
+    [
+        "/output_config/effort",
+        "/reasoning/effort",
+        "/reasoning_effort",
+        "/thinking/effort",
+        "/generationConfig/thinkingConfig/thinkingLevel",
+        "/generation_config/thinking_config/thinking_level",
+    ]
+    .into_iter()
+    .find_map(|pointer| body.pointer(pointer).and_then(serde_json::Value::as_str))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1151,6 +1168,7 @@ mod tests {
                     scope: RouteScopeKindV1::Request,
                     ttl_seconds: None,
                     notice: None,
+                    effort: None,
                     reason: id.into(),
                     max_attempts: None,
                     required_capabilities: Default::default(),

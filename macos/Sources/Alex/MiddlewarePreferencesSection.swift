@@ -581,7 +581,9 @@ struct MiddlewarePreferencesSection: View {
     private func test(_ rule: MiddlewareRuleSpecV1) async {
         guard let client = client() else { return report("No daemon configuration", error: true) }
         do {
-            let result = try await client.testMiddleware(.init(middlewareId: rule.id))
+            let result = try await client.testMiddleware(.init(
+                middlewareId: rule.id,
+                fixtureName: "anthropic-fable-unavailable-529"))
             report(result.summary ?? (result.matched ? "Test matched" : "Test did not match"), error: false)
         } catch is CancellationError {
         } catch { report("Test failed: \(error.localizedDescription)", error: true) }
@@ -661,7 +663,7 @@ private enum BuiltInMiddlewarePolicy: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String { "Fable 5 → GPT-5.6 Sol" }
     var summary: String {
-        "If Fable 5 hits a capacity or provider failure, retry this request with GPT-5.6 Sol."
+        "On Anthropic HTTP 529 overloaded_error, retry this request with high-effort GPT-5.6 Sol."
     }
     var icon: String { "arrow.right.circle" }
     var defaultEnabled: Bool { true }

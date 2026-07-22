@@ -11964,6 +11964,43 @@ fn client_respond_as(format: ClientFormat) -> RespondAs {
     }
 }
 
+fn apply_reasoning_effort(format: ClientFormat, body: &mut Value, effort: &str) {
+    match format {
+        ClientFormat::AnthropicMessages => {
+            if !body["output_config"].is_object() {
+                body["output_config"] = json!({});
+            }
+            body["output_config"]["effort"] = json!(effort);
+        }
+        ClientFormat::OpenaiResponses => {
+            if !body["reasoning"].is_object() {
+                body["reasoning"] = json!({});
+            }
+            body["reasoning"]["effort"] = json!(effort);
+        }
+        ClientFormat::OpenaiChat => {
+            body["reasoning_effort"] = json!(effort);
+        }
+        ClientFormat::GeminiGenerate => {
+            if !body["generationConfig"].is_object() {
+                body["generationConfig"] = json!({});
+            }
+            if !body["generationConfig"]["thinkingConfig"].is_object() {
+                body["generationConfig"]["thinkingConfig"] = json!({});
+            }
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!(effort);
+        }
+    }
+}
+
+fn middleware_rule_reroute_effort(state: &AppState, rule_id: &str) -> Option<String> {
+    state
+        .middleware
+        .read()
+        .ok()
+        .and_then(|runtime| runtime.reroute_effort(rule_id))
+}
+
 fn middleware_notice_model_name(model: &str) -> &str {
     match canonical_model_alias(model) {
         "claude-fable-5" => "fable-5",
@@ -12720,6 +12757,12 @@ async fn proxy(
         .allow_mid_thread_failover;
 
     let original_body_json = body_json.clone();
+    if let Some(effort) = active_route_lease
+        .as_ref()
+        .and_then(|lease| middleware_rule_reroute_effort(&state, &lease.source_middleware_id))
+    {
+        apply_reasoning_effort(format, &mut body_json, &effort);
+    }
     let mut attempted_accounts = HashSet::new();
     let mut attempt_records = Vec::<Value>::new();
     let mut current_provider = provider;
@@ -13121,6 +13164,12 @@ async fn proxy(
                             &current_model,
                         ) {
                             let mut retry_body_json = original_body_json.clone();
+                            if let Some(effort) = source_rule
+                                .as_deref()
+                                .and_then(|rule_id| middleware_rule_reroute_effort(&state, rule_id))
+                            {
+                                apply_reasoning_effort(format, &mut retry_body_json, &effort);
+                            }
                             let next_plan = plan_upstream(
                                 &state,
                                 format,
@@ -13924,7 +13973,7 @@ fn classify_error_with_message(
     {
         return ErrorClass::Auth;
     }
-    if status == Some(429)
+    if matches!(status, Some(429 | 529))
         || matches!(
             kind.as_str(),
             "rate_limit_error" | "overloaded_error" | "insufficient_quota" | "quota_exceeded"
@@ -15994,6 +16043,24 @@ mod tests {
     }
 
     #[test]
+    fn middleware_replacement_effort_maps_to_each_client_format() {
+        let cases = [
+            (ClientFormat::AnthropicMessages, "/output_config/effort"),
+            (ClientFormat::OpenaiResponses, "/reasoning/effort"),
+            (ClientFormat::OpenaiChat, "/reasoning_effort"),
+            (
+                ClientFormat::GeminiGenerate,
+                "/generationConfig/thinkingConfig/thinkingLevel",
+            ),
+        ];
+        for (format, pointer) in cases {
+            let mut body = json!({});
+            apply_reasoning_effort(format, &mut body, "high");
+            assert_eq!(body.pointer(pointer), Some(&json!("high")));
+        }
+    }
+
+    #[test]
     fn middleware_notice_expands_model_templates() {
         assert_eq!(
             render_middleware_notice(
@@ -17356,6 +17423,7 @@ mod tests {
                         scope: alex_middleware::RouteScopeKindV1::Request,
                         ttl_seconds: None,
                         notice: None,
+                        effort: None,
                         reason: "deterministic platform reroute".into(),
                         max_attempts: None,
                         required_capabilities: Default::default(),
@@ -21340,6 +21408,7 @@ mod tests {
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
                         assert_eq!(request["model"], "gpt-5.6-sol");
+                        assert_eq!(request["reasoning"]["effort"], "high");
                         axum::Json(json!({
                             "id": "resp_sol_middleware",
                             "object": "response",
@@ -21629,7 +21698,7 @@ mod tests {
         .await;
         assert_eq!(validation_status, StatusCode::OK);
         assert_eq!(validation["valid"], true);
-        assert_eq!(validation["body_inspection_required"], false);
+        assert_eq!(validation["body_inspection_required"], true);
 
         let (created_status, created) = response_json(
             admin_middleware_rule_create(State(state.clone()), axum::Json(rule.clone())).await,
@@ -21701,7 +21770,7 @@ mod tests {
         assert!(dry_record["explanation"]
             .as_str()
             .unwrap()
-            .contains("Fable 5 failed; retrying with GPT-5.6 Sol"));
+            .contains("Fable 5 returned Anthropic's overloaded_error; retrying with GPT-5.6 Sol"));
         let (_, after_dry_run) = response_json(admin_middleware(State(state.clone())).await).await;
         assert!(after_dry_run["rules"]
             .as_array()
@@ -21817,7 +21886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protection_equivalency_accepts_short_model_aliases_for_capacity_failover() {
+    async fn legacy_protection_alias_does_not_broaden_the_guarded_fable_fallback() {
         let state = test_state("protection-short-model-alias");
         set_protection_policy(
             &state,
@@ -21862,10 +21931,10 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true);
-        assert_eq!(trace["substitution_reason"], "capacity");
-        assert_eq!(trace["original_model"], "claude-fable-5");
-        assert_eq!(trace["served_model"], "gpt-5.6-sol");
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["substitution_reason"].is_null());
+        assert!(trace["original_model"].is_null());
+        assert!(trace["served_model"].is_null());
     }
 
     async fn simulated_capacity_request(state: Arc<AppState>, no_substitute: bool) -> Response {
@@ -22105,6 +22174,7 @@ mod tests {
                 Some("rate_limit_error"),
                 ErrorClass::Capacity,
             ),
+            ("anthropic", Some(529), None, ErrorClass::Capacity),
             (
                 "gemini",
                 Some(400),

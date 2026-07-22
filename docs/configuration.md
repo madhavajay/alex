@@ -149,37 +149,17 @@ that sidecar is loaded first; any provider also present in
 `config.toml`'s `account_policy` map is then replaced by the config policy. See
 [Providers and routing](providers-and-routing.md).
 
-## Substitution and protection
+## Middleware
 
-```toml
-[substitution]
-enabled = true
+Middleware settings and editable rule overrides are stored in
+`~/.alex/middleware/rules.toml`. Alex ships one enabled rule for the documented
+Anthropic Fable overload signal: `claude-fable-5` HTTP `529`
+`overloaded_error` → OpenAI `gpt-5.6-sol` at high effort. Configure it in
+Settings → Middleware rather than editing `config.toml`.
 
-[substitution.fallbacks]
-"claude-fable-5" = ["openai/gpt-5.6-sol"]
-
-[protection]
-enabled = true
-reroute_on_auth = false
-retries = 1
-auto_return = true
-
-[protection.equivalencies.claude-fable-5]
-openai = "gpt-5.6-sol"
-```
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `substitution.enabled` | `false` | Enable ordered, explicit cross-model fallbacks. |
-| `substitution.fallbacks.<model>` | absent | Array of provider-prefixed fallback model IDs. |
-| `protection.enabled` | `false` | Enable retry/equivalency protection. |
-| `protection.reroute_on_auth` | `false` | Allow equivalency rerouting for auth-class errors. |
-| `protection.retries` | `1` | Protection retry count. |
-| `protection.auto_return` | `true` | Persisted protection behavior flag exposed by admin controls. |
-| `protection.equivalencies.<model>.<provider>` | absent | Equivalent model ID for a different provider. |
-
-`alex protection preset anthropic-openai` writes the current Fable/Sol
-equivalencies but intentionally does not turn `protection.enabled` on.
+The Middleware Wizard can optionally match the incoming effort/thinking level,
+set replacement effort, choose request or session scope, and add a templated
+harness notice.
 
 ## Notifications
 

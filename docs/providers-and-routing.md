@@ -175,15 +175,20 @@ not used for retries.
 ## Fable 5 → GPT-5.6 Sol fallback
 
 Alex ships one default middleware rule: `alex.fable-5-to-gpt-5.6-sol`.
-When an Anthropic Fable 5 request receives a capacity or provider/server
-failure (`429` or `5xx`), Alex retries that request with `gpt-5.6-sol` through
-OpenAI. The fallback is request-scoped, so the next request starts on Fable 5
-again. The request header `x-alex-no-substitute: 1` disables the reroute for
-that request.
+When an Anthropic Fable 5 request receives HTTP `529` and its bounded error
+body contains Anthropic's documented `overloaded_error` type, Alex retries that
+request with high-effort `gpt-5.6-sol` through OpenAI. The fallback is
+request-scoped, so the next request starts on Fable 5 again. The request header
+`x-alex-no-substitute: 1` disables the reroute for that request.
 
-The rule is editable in Settings → Middleware using the Middleware Wizard. If
-“Tell the harness” is enabled, notice text can use `{from_model}` and
-`{to_model}` placeholders.
+The starter fixture reproduces that documented envelope but is synthetic; it
+is not presented as a captured production Fable failure. The rule is editable
+in Settings → Middleware using the Middleware Wizard. Optional match and
+replacement effort levels are represented by `when.efforts` and
+`then.reroute.effort`. Request scope retries only the failed call; session
+scope creates a time-bounded lease after success so later calls in the same
+stable session use the replacement route. If “Tell the harness” is enabled,
+notice text can use `{from_model}` and `{to_model}` placeholders.
 
 If no eligible OpenAI account can serve Sol, Alex returns the original response
 and records why the reroute could not execute. Trace middleware records include

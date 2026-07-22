@@ -20,6 +20,7 @@ struct MiddlewareWizard: View {
 
     private let harnesses = ["claude", "codex", "pi", "amp", "gemini", "opencode"]
     private let providers = ProviderInfo.supportedProviders
+    private let efforts = ["low", "medium", "high", "xhigh", "max"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -164,15 +165,27 @@ struct MiddlewareWizard: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            wizardGroup("Requested model") {
-                TextField("Enter a model, e.g. fable-5", text: $draft.modelPattern)
-                    .textFieldStyle(.roundedBorder)
-            }
-
             wizardGroup("Current provider") {
                 providerPicker(selected: sourceProviders, includesAny: true) { provider in
                     draft.sourceProvider = provider ?? ""
                 }
+            }
+
+            wizardGroup("Requested model") {
+                TextField("Enter a model, e.g. claude-fable-5", text: $draft.modelPattern)
+                    .textFieldStyle(.roundedBorder)
+                Text("An ID without * is an exact match; use * only when you want a wildcard.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+            }
+
+            wizardGroup("Effort / thinking (optional)") {
+                effortPicker(
+                    selection: $draft.sourceEffort,
+                    emptyLabel: "Any incoming effort")
+                Text("When selected, the rule runs only when the request declares this effort level.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
             }
 
             if draft.hook == .attemptResult {
@@ -230,19 +243,6 @@ struct MiddlewareWizard: View {
             }
 
             if draft.action != .retrySame {
-                wizardGroup(draft.action == .routeExact ? "Target model" : "Equivalence class") {
-                    if draft.action == .routeExact {
-                        TextField("Enter a target model, e.g. gpt-5.6-sol", text: $draft.targetModel)
-                            .textFieldStyle(.roundedBorder)
-                    } else {
-                        TextField("claude-fable-5", text: $draft.equivalenceClass)
-                            .textFieldStyle(.roundedBorder)
-                        Text("Use a source-model key configured by the Model Equivalence Failover policy.")
-                            .font(.system(size: 10))
-                            .foregroundStyle(AlexTheme.Colors.textTertiary)
-                    }
-                }
-
                 wizardGroup("Provider choice") {
                     Picker("Provider choice", selection: $draft.providerMode) {
                         Text("Any available").tag(MiddlewareProviderMode.any)
@@ -258,6 +258,28 @@ struct MiddlewareWizard: View {
                     }
                 }
 
+                wizardGroup(draft.action == .routeExact ? "Target model" : "Equivalence class") {
+                    if draft.action == .routeExact {
+                        TextField("Enter a target model, e.g. gpt-5.6-sol", text: $draft.targetModel)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        TextField("claude-fable-5", text: $draft.equivalenceClass)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Enter a configured equivalence-class key.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    }
+                }
+
+                wizardGroup("Replacement effort / thinking (optional)") {
+                    effortPicker(
+                        selection: $draft.targetEffort,
+                        emptyLabel: "Keep the incoming effort")
+                    Text("When selected, Alex applies this effort level to the replacement request.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+
                 wizardGroup("Apply") {
                     Picker("Apply", selection: $draft.scope) {
                         Text("This request only").tag(MiddlewareRouteScope.request)
@@ -265,6 +287,12 @@ struct MiddlewareWizard: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
+                    Text(draft.scope == .request
+                        ? "Only the failed request is retried on the replacement model. The next turn starts on the requested model again."
+                        : "After a successful fallback, later requests with the same stable session go directly to the replacement model until the route lease expires.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if draft.scope == .session {
                         Toggle("Require a stable, portable session before pinning", isOn: $draft.stableSessionRequired)
                             .toggleStyle(.checkbox)
@@ -298,21 +326,18 @@ struct MiddlewareWizard: View {
                 }
             }
 
-            DisclosureGroup("Advanced") {
+            wizardGroup("Priority") {
                 HStack {
-                    Text("Priority")
                     Stepper(value: $draft.priority, in: 0...10_000) {
                         Text("\(draft.priority)").font(AlexTheme.Fonts.metaMono)
                     }
                     .frame(width: 120)
-                    Spacer()
-                    Text("Higher priority runs first.")
+                    Text("Higher-priority rules run first.")
                         .font(.system(size: 10))
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    Spacer()
                 }
-                .padding(.top, 6)
             }
-            .font(.system(size: 11, weight: .medium))
         }
     }
 
@@ -521,6 +546,20 @@ struct MiddlewareWizard: View {
                 chip(value[keyPath: title], selected: selected.contains(value)) { action(value) }
             }
         }
+    }
+
+    private func effortPicker(
+        selection: Binding<String>,
+        emptyLabel: String
+    ) -> some View {
+        Picker("Effort / thinking", selection: selection) {
+            Text(emptyLabel).tag("")
+            ForEach(efforts, id: \.self) { effort in
+                Text(effort == "xhigh" ? "Extra high" : effort.capitalized).tag(effort)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: 260, alignment: .leading)
     }
 
     private func providerPicker(

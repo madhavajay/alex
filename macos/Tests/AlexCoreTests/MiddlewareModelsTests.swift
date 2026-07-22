@@ -12,14 +12,15 @@ import Testing
         #expect(rule.enabled)
         #expect(rule.priority == 100)
         #expect(rule.hook == .attemptResult)
-        #expect(rule.capabilities == ["route.override"])
+        #expect(rule.capabilities == ["attempt.read_error_body", "route.override"])
         #expect(rule.expression == nil)
         #expect(rule.when.harnessNames == nil)
         #expect(rule.when.models == ["claude-fable-5"])
+        #expect(rule.when.efforts == nil)
         #expect(rule.when.providers == ["anthropic"])
-        #expect(rule.when.status == [.exact(429), .pattern("500-599")])
-        #expect(rule.when.errorClasses == ["capacity", "server"])
-        #expect(rule.when.bodyContainsAny == nil)
+        #expect(rule.when.status == [.exact(529)])
+        #expect(rule.when.errorClasses == ["capacity"])
+        #expect(rule.when.bodyContainsAny == ["overloaded_error"])
         #expect(rule.when.stableSession == nil)
         #expect(rule.then.retrySameRoute == nil)
         #expect(rule.then.reroute?.model == "gpt-5.6-sol")
@@ -28,11 +29,12 @@ import Testing
         #expect(rule.then.reroute?.scope == .request)
         #expect(rule.then.reroute?.ttlSeconds == nil)
         #expect(rule.then.reroute?.notice == nil)
+        #expect(rule.then.reroute?.effort == "high")
         #expect(rule.then.reroute?.maxAttempts == 3)
         #expect(rule.then.reroute?.requiredCapabilities.portableHistory == false)
     }
 
-    @Test func fableRuleEncodesSnakeCaseAndHeterogeneousStatuses() throws {
+    @Test func fableRuleEncodesGuardrailAndReplacementEffort() throws {
         let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
             id: "fable-overload-to-sol")
         let data = try JSONEncoder().encode(rule)
@@ -44,14 +46,25 @@ import Testing
         #expect(json["api_version"] == nil)
         #expect(json["built_in"] == nil)
         #expect(match["harness_names"] == nil)
-        #expect(match["body_contains_any"] == nil)
+        #expect(match["body_contains_any"] as? [String] == ["overloaded_error"])
         #expect(match["models"] as? [String] == ["claude-fable-5"])
         let statuses = try #require(match["status"] as? [Any])
-        #expect(statuses[0] as? Int == 429)
-        #expect(statuses[1] as? String == "500-599")
+        #expect(statuses.count == 1)
+        #expect(statuses[0] as? Int == 529)
         #expect(reroute["ttl_seconds"] == nil)
         #expect(reroute["scope"] as? String == "request")
         #expect(reroute["provider_mode"] as? String == "only")
+        #expect(reroute["effort"] as? String == "high")
+    }
+
+    @Test func dryRunResponseDerivesMatchAndSummaryFromDaemonRecords() throws {
+        let json = #"{"decision":{"decision":"reroute"},"records":[{"state":"matched","explanation":"Fable fallback matched"}],"valid":true}"#
+        let response = try JSONDecoder().decode(
+            MiddlewareTestResponse.self, from: Data(json.utf8))
+
+        #expect(response.matched)
+        #expect(response.summary == "Fable fallback matched")
+        #expect(response.proposedAction == "reroute")
     }
 
     @Test func middlewareStatusDecodingUsesBetaSafeDefaults() throws {
@@ -99,7 +112,7 @@ import Testing
             Issue.record("Expected an any expression")
             return
         }
-        #expect(alternatives.count == 2)
+        #expect(alternatives.count == 3)
     }
 
     @Test func ruleRoundTripsDaemonStatusMetadata() throws {
@@ -143,16 +156,26 @@ import Testing
         }
     }
 
-    @Test func builtInRuleProjectsBackToFriendlyWizardValues() throws {
+    @Test func builtInRuleProjectsBackToExactWizardValues() throws {
         let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
             id: "alex.fable-5-to-gpt-5.6-sol")
         let draft = MiddlewareWizardDraft(rule: rule)
 
-        #expect(draft.modelPattern == "fable-5")
+        #expect(draft.modelPattern == "claude-fable-5")
         #expect(draft.sourceProvider == "anthropic")
+        #expect(draft.sourceEffort.isEmpty)
+        #expect(draft.bodyPhrases == ["overloaded_error"])
         #expect(draft.targetModel == "gpt-5.6-sol")
+        #expect(draft.targetEffort == "high")
         #expect(draft.targetProviders == ["openai"])
         #expect(draft.notice == MiddlewareWizardDraft.defaultNoticeTemplate)
+    }
+
+    @Test func sourceEffortBecomesAnOptionalMatchCondition() throws {
+        var draft = MiddlewareWizardDraft.fableToSolExample
+        draft.sourceEffort = "high"
+        let rule = try draft.makeRule(id: "fable-high-only")
+        #expect(rule.when.efforts == ["high"])
     }
 
     @Test func checkedNoticeUsesModelTemplates() throws {

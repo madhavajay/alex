@@ -132,6 +132,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
     public var harnessNames: [String]?
     public var harnessVersions: [String]?
     public var models: [String]?
+    public var efforts: [String]?
     public var providers: [String]?
     public var status: [MiddlewareStatusMatcher]?
     public var errorClasses: [String]?
@@ -142,6 +143,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         harnessNames: [String]? = nil,
         harnessVersions: [String]? = nil,
         models: [String]? = nil,
+        efforts: [String]? = nil,
         providers: [String]? = nil,
         status: [MiddlewareStatusMatcher]? = nil,
         errorClasses: [String]? = nil,
@@ -151,6 +153,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         self.harnessNames = harnessNames
         self.harnessVersions = harnessVersions
         self.models = models
+        self.efforts = efforts
         self.providers = providers
         self.status = status
         self.errorClasses = errorClasses
@@ -159,7 +162,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case models, providers, status
+        case models, efforts, providers, status
         case harnessNames = "harness_names"
         case harnessVersions = "harness_versions"
         case errorClasses = "error_classes"
@@ -168,7 +171,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
     }
 
     public var isEmpty: Bool {
-        let lists = [harnessNames, models, providers, errorClasses, bodyContainsAny]
+        let lists = [harnessNames, models, efforts, providers, errorClasses, bodyContainsAny]
         return lists.allSatisfy { $0?.isEmpty != false }
             && status?.isEmpty != false
             && harnessVersions?.isEmpty != false
@@ -276,6 +279,7 @@ public struct MiddlewareRerouteAction: Codable, Sendable, Equatable {
     public var scope: MiddlewareRouteScope
     public var ttlSeconds: Int?
     public var notice: String?
+    public var effort: String?
     public var reason: String
     public var maxAttempts: Int?
     public var requiredCapabilities: MiddlewareModelCapabilityRequirements
@@ -288,6 +292,7 @@ public struct MiddlewareRerouteAction: Codable, Sendable, Equatable {
         scope: MiddlewareRouteScope = .request,
         ttlSeconds: Int? = nil,
         notice: String? = nil,
+        effort: String? = nil,
         reason: String = "Matched middleware rule",
         maxAttempts: Int? = nil,
         requiredCapabilities: MiddlewareModelCapabilityRequirements = .init()
@@ -299,13 +304,14 @@ public struct MiddlewareRerouteAction: Codable, Sendable, Equatable {
         self.scope = scope
         self.ttlSeconds = ttlSeconds
         self.notice = notice
+        self.effort = effort
         self.reason = reason
         self.maxAttempts = maxAttempts
         self.requiredCapabilities = requiredCapabilities
     }
 
     enum CodingKeys: String, CodingKey {
-        case model, providers, scope, notice, reason
+        case model, providers, scope, notice, effort, reason
         case equivalenceClass = "equivalent_class"
         case providerMode = "provider_mode"
         case ttlSeconds = "ttl_seconds"
@@ -322,6 +328,7 @@ public struct MiddlewareRerouteAction: Codable, Sendable, Equatable {
         scope = try values.decodeIfPresent(MiddlewareRouteScope.self, forKey: .scope) ?? .request
         ttlSeconds = try values.decodeIfPresent(Int.self, forKey: .ttlSeconds)
         notice = try values.decodeIfPresent(String.self, forKey: .notice)
+        effort = try values.decodeIfPresent(String.self, forKey: .effort)
         reason = try values.decodeIfPresent(String.self, forKey: .reason) ?? "Matched middleware rule"
         maxAttempts = try values.decodeIfPresent(Int.self, forKey: .maxAttempts)
         requiredCapabilities = try values.decodeIfPresent(
@@ -728,7 +735,7 @@ public struct MiddlewareTestRequest: Codable, Sendable, Equatable {
     }
 }
 
-public struct MiddlewareTestResponse: Codable, Sendable, Equatable {
+public struct MiddlewareTestResponse: Decodable, Sendable, Equatable {
     public var matched: Bool
     public var summary: String?
     public var predicates: [String]
@@ -750,16 +757,30 @@ public struct MiddlewareTestResponse: Codable, Sendable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case matched, summary, predicates, warnings
+        case matched, summary, predicates, warnings, records, decision
         case proposedAction = "proposed_action"
+    }
+
+    private struct DryRunRecord: Decodable {
+        var state: String
+        var explanation: String?
+    }
+
+    private struct DryRunDecision: Decodable {
+        var decision: String
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        matched = try values.decodeIfPresent(Bool.self, forKey: .matched) ?? false
+        let records = try values.decodeIfPresent([DryRunRecord].self, forKey: .records) ?? []
+        let matchedRecord = records.first { $0.state == "matched" }
+        matched = try values.decodeIfPresent(Bool.self, forKey: .matched) ?? (matchedRecord != nil)
         summary = try values.decodeIfPresent(String.self, forKey: .summary)
+            ?? matchedRecord?.explanation
+            ?? records.first?.explanation
         predicates = try values.decodeIfPresent([String].self, forKey: .predicates) ?? []
         proposedAction = try values.decodeIfPresent(String.self, forKey: .proposedAction)
+            ?? values.decodeIfPresent(DryRunDecision.self, forKey: .decision)?.decision
         warnings = try values.decodeIfPresent([String].self, forKey: .warnings) ?? []
     }
 }
@@ -802,6 +823,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     public var harnessVersion: String
     public var modelPattern: String
     public var sourceProvider: String
+    public var sourceEffort: String
     public var hook: MiddlewareHookPoint
     public var errorKinds: Set<MiddlewareWizardErrorKind>
     public var statusText: String
@@ -809,6 +831,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     public var conditionMode: MiddlewareConditionMode
     public var action: MiddlewareWizardAction
     public var targetModel: String
+    public var targetEffort: String
     public var equivalenceClass: String
     public var providerMode: MiddlewareProviderMode
     public var targetProviders: [String]
@@ -826,6 +849,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         harnessVersion: String = "",
         modelPattern: String = "",
         sourceProvider: String = "",
+        sourceEffort: String = "",
         hook: MiddlewareHookPoint = .attemptResult,
         errorKinds: Set<MiddlewareWizardErrorKind> = [.capacity, .server],
         statusText: String = "429, 500-599",
@@ -833,6 +857,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         conditionMode: MiddlewareConditionMode = .all,
         action: MiddlewareWizardAction = .routeExact,
         targetModel: String = "",
+        targetEffort: String = "",
         equivalenceClass: String = "",
         providerMode: MiddlewareProviderMode = .only,
         targetProviders: [String] = [],
@@ -849,6 +874,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         self.harnessVersion = harnessVersion
         self.modelPattern = modelPattern
         self.sourceProvider = sourceProvider
+        self.sourceEffort = sourceEffort
         self.hook = hook
         self.errorKinds = errorKinds
         self.statusText = statusText
@@ -856,6 +882,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         self.conditionMode = conditionMode
         self.action = action
         self.targetModel = targetModel
+        self.targetEffort = targetEffort
         self.equivalenceClass = equivalenceClass
         self.providerMode = providerMode
         self.targetProviders = targetProviders
@@ -870,15 +897,17 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     public static var fableToSolExample: MiddlewareWizardDraft {
         .init(
             name: "Fable 5 → GPT-5.6 Sol",
-            description: "If Fable 5 fails with a capacity or provider error, retry with GPT-5.6 Sol.",
-            modelPattern: "fable-5",
+            description: "On Anthropic HTTP 529 overloaded_error, retry with high-effort GPT-5.6 Sol.",
+            modelPattern: "claude-fable-5",
             sourceProvider: "anthropic",
             hook: .attemptResult,
-            errorKinds: [.capacity, .server],
-            statusText: "429, 500-599",
+            errorKinds: [.capacity],
+            statusText: "529",
+            bodyPhrasesText: "overloaded_error",
             conditionMode: .all,
             action: .routeExact,
             targetModel: "gpt-5.6-sol",
+            targetEffort: "high",
             providerMode: .only,
             targetProviders: ["openai"],
             scope: .request,
@@ -902,6 +931,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             harnessVersion: (rule.when.harnessVersions ?? []).joined(separator: ", "),
             modelPattern: Self.displayModelPatterns(rule.when.models ?? []).joined(separator: ", "),
             sourceProvider: (rule.when.providers ?? []).joined(separator: ", "),
+            sourceEffort: (rule.when.efforts ?? []).first ?? "",
             hook: rule.hook,
             errorKinds: selectedErrors,
             statusText: (rule.when.status ?? []).map(\.displayValue).joined(separator: ", "),
@@ -910,6 +940,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             action: rule.then.retrySameRoute != nil
                 ? .retrySame : (reroute?.equivalenceClass == nil ? .routeExact : .routeEquivalent),
             targetModel: reroute?.model ?? "",
+            targetEffort: reroute?.effort ?? "",
             equivalenceClass: reroute?.equivalenceClass ?? "",
             providerMode: reroute?.providerMode ?? .any,
             targetProviders: reroute?.providers ?? [],
@@ -975,6 +1006,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             harnessNames: nilIfEmpty(harnesses),
             harnessVersions: nilIfEmpty(commaSeparated(harnessVersion)),
             models: nilIfEmpty(Self.ruleModelPatterns(commaSeparated(modelPattern))),
+            efforts: nilIfEmpty(trimmed(sourceEffort)).map { [$0] },
             providers: nilIfEmpty(commaSeparated(sourceProvider)),
             status: conditionMode == .all ? nilIfEmpty(statusMatchers) : nil,
             errorClasses: conditionMode == .all ? nilIfEmpty(errorClasses) : nil,
@@ -1011,6 +1043,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
                 scope: scope,
                 ttlSeconds: scope == .session ? ttlSeconds : nil,
                 notice: includeNotice ? trimmed(notice) : nil,
+                effort: nilIfEmpty(trimmed(targetEffort)),
                 reason: "Matched \(trimmed(name))",
                 maxAttempts: 3,
                 requiredCapabilities: .init(portableHistory: usesSessionScope)))
@@ -1057,8 +1090,12 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         case .routeEquivalent:
             result = "route within the \(trimmed(equivalenceClass)) equivalence class"
         }
+        let sourceEffortSummary = trimmed(sourceEffort).isEmpty
+            ? "" : " at \(trimmed(sourceEffort)) effort"
+        let targetEffortSummary = trimmed(targetEffort).isEmpty || action == .retrySame
+            ? "" : " at \(trimmed(targetEffort)) effort"
         let persistence = usesSessionScope ? " and keep it for the session" : ""
-        return "When \(harness) requests \(model) through \(provider) and Alex sees \(condition), \(result)\(persistence)."
+        return "When \(harness) requests \(model)\(sourceEffortSummary) through \(provider) and Alex sees \(condition), \(result)\(targetEffortSummary)\(persistence)."
     }
 
     public var bodyPhrases: [String] {
@@ -1087,6 +1124,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             && trimmed(harnessVersion).isEmpty
             && commaSeparated(modelPattern).isEmpty
             && trimmed(sourceProvider).isEmpty
+            && trimmed(sourceEffort).isEmpty
             && errorKinds.isEmpty
             && statusMatchers.isEmpty
             && bodyPhrases.isEmpty
@@ -1124,12 +1162,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     }
 
     private static func displayModelPatterns(_ values: [String]) -> [String] {
-        unique(values.map { value in
-            switch value.lowercased() {
-            case "claude-fable-5": "fable-5"
-            default: value
-            }
-        })
+        unique(values)
     }
 
     private static func unique(_ values: [String]) -> [String] {

@@ -60,6 +60,8 @@ pub struct MatchConditionsV1 {
     pub current_models: Vec<String>,
     pub model_aliases: Vec<String>,
     pub equivalence_classes: Vec<String>,
+    /// Optional reasoning effort/thinking level on the incoming request.
+    pub efforts: Vec<String>,
     pub providers: Vec<String>,
     pub exclude_providers: Vec<String>,
     pub status: Vec<StatusMatcherSpec>,
@@ -228,6 +230,9 @@ pub struct RerouteActionSpecV1 {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub notice: Option<String>,
+    /// Optional reasoning effort/thinking level to apply to the replacement request.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub reason: String,
     #[serde(default)]

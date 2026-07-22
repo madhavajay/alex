@@ -52,10 +52,11 @@ function validateSources(vector, failure, rule, builtinSource) {
     rule.name,
     rule.when.models[0],
     rule.when.providers[0],
-    String(rule.when.status[0]),
-    rule.when.status[1],
+    ...rule.when.status.map(String),
+    ...rule.when.body_contains_any,
     rule.then.reroute.model,
     rule.then.reroute.providers[0],
+    rule.then.reroute.effort,
     rule.then.reroute.reason
   ];
   for (const literal of requiredRustLiterals) {
@@ -64,9 +65,9 @@ function validateSources(vector, failure, rule, builtinSource) {
 
   const requiredRustStructure = [
     "HookPoint::AttemptResult",
+    "Capability::AttemptReadErrorBody",
     "Capability::RouteOverride",
     "ErrorClass::Capacity",
-    "ErrorClass::Server",
     "ProviderModeV1::Only",
     "RouteScopeKindV1::Request",
     "max_attempts: Some(3)"
@@ -76,10 +77,11 @@ function validateSources(vector, failure, rule, builtinSource) {
   }
 
   assert(rule.hook === "attempt_result", "rule hook must be attempt_result");
-  assert(rule.capabilities.join(",") === "route.override", "rule capabilities must match the built-in");
-  assert(rule.when.error_classes.join(",") === "capacity,server", "error classes must match the built-in");
+  assert(rule.capabilities.join(",") === "attempt.read_error_body,route.override", "rule capabilities must match the built-in");
+  assert(rule.when.error_classes.join(",") === "capacity", "error classes must match the built-in");
   assert(rule.then.reroute.provider_mode === "only", "provider mode must remain only");
   assert(rule.then.reroute.scope === "request", "reroute must remain request-scoped");
+  assert(rule.then.reroute.effort === "high", "replacement effort must remain high");
   assert(rule.then.reroute.max_attempts === 3, "attempt guard must match the built-in");
 }
 

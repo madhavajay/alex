@@ -234,6 +234,14 @@ impl MiddlewareRuntime {
         &self.rules
     }
 
+    pub(crate) fn reroute_effort(&self, rule_id: &str) -> Option<String> {
+        self.rules
+            .iter()
+            .find(|rule| rule.id == rule_id)
+            .and_then(|rule| rule.action.reroute.as_ref())
+            .and_then(|reroute| reroute.effort.clone())
+    }
+
     pub(crate) fn validate_rule(&self, rule: RuleSpecV1) -> Vec<ValidationError> {
         let set = RuleSetV1 {
             api_version: API_VERSION_V1,
