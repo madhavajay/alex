@@ -130,6 +130,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alex-fakeprov"
+version = "0.1.25"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "alex-lar"
 version = "0.1.25"
 dependencies = [

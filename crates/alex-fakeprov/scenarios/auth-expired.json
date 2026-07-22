@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "POST /v1/messages": [{"status": 401, "body": {"type": "error", "error": {"type": "authentication_error", "message": "expired OAuth token"}}, "repeat": true}],
+    "POST /v1/chat/completions": [{"status": 401, "body": {"error": {"type": "authentication_error", "code": "invalid_api_key", "message": "Incorrect API key provided"}}, "repeat": true}],
+    "POST /v1/responses": [{"status": 401, "body": {"error": {"type": "authentication_error", "code": "invalid_api_key", "message": "Incorrect API key provided"}}, "repeat": true}],
+    "POST /backend-api/codex/responses": [{"status": 401, "body": {"error": {"type": "authentication_error", "message": "token expired"}}, "repeat": true}]
+  }
+}

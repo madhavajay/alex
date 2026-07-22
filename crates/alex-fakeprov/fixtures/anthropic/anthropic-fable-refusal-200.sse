@@ -1,0 +1,9 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-fable-5","type":"message","role":"assistant","content":[],"stop_reason":null}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"bio","explanation":null,"fallback_credit_token":null,"fallback_has_prefill_claim":true}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
