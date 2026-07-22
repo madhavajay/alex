@@ -5,12 +5,6 @@
 </p>
 
 <p align="center">
-  <a href="https://madhavajay.github.io/alex/">
-    <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/demo.jpg" alt="Alex live demo page with Cove replay player" width="100%">
-  </a>
-</p>
-
-<p align="center">
   <a href="https://crates.io/crates/alex"><img src="https://img.shields.io/crates/v/alex.svg" alt="crates.io"></a>
   <a href="https://github.com/madhavajay/alex/actions/workflows/ci.yml"><img src="https://github.com/madhavajay/alex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported"></a>
@@ -19,6 +13,16 @@
 </p>
 
 <h2 align="center">Your tokens, your traces, your choice!</h2>
+
+<p align="center">
+  <a href="https://madhavajay.github.io/alex/"><strong>Click here to see a DEMO</strong></a>
+</p>
+
+<p align="center">
+  <a href="https://madhavajay.github.io/alex/">
+    <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/demo.jpg" alt="Alex live demo page with Cove replay player" width="100%">
+  </a>
+</p>
 
 ## e2e Harness ↔️ Provider Traces
 

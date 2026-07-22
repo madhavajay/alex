@@ -18,7 +18,8 @@ test("landing page contains the requested sections and links", async () => {
   assert.match(html, /Sick of Fable refusing\?/);
   assert.match(html, /Claude with Fable 5 \+ Alex Middleware/);
   assert.match(html, /class="tab-brand-mark"/);
-  assert.match(html, /assets\/images\/alex-icon\.png/);
+  assert.match(html, /assets\/images\/alex-icon-small\.png/);
+  assert.match(html, /styles\.css\?v=20260722-small-icons/);
   assert.match(html, /class="tab-cta"[^>]*>Get Alex<\/a>/);
   assert.match(html, /How does it work\?/);
   assert.match(html, /configure multiple token providers/);
