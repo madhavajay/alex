@@ -64,9 +64,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
-  echo "refusing to build a checkpoint from a dirty worktree" >&2
-  echo "commit or remove pending changes, then retry" >&2
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no)" ]]; then
+  echo "refusing to build a checkpoint from tracked worktree changes" >&2
+  echo "commit or remove pending tracked changes, then retry" >&2
   exit 1
 fi
 git -C "$REPO_ROOT" rev-parse --verify "${REF}^{commit}" >/dev/null
