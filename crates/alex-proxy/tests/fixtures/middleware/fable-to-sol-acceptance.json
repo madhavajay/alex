@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "preset_id": "example.fable-overload-to-sol",
+  "preset_id": "alex.fable-5-to-gpt-5.6-sol",
   "shared_site_scenario": "fable-to-sol-vector.json",
   "cases": [
     {
-      "id": "overload-reroute-and-lease",
+      "id": "fable-failure-reroutes-request",
       "failure_fixture": "anthropic-fable-unavailable-529",
       "accounts": ["anthropic", "openai"],
       "expected": {
@@ -12,34 +12,20 @@
         "provider": "openai",
         "model": "gpt-5.6-sol",
         "status": 200,
-        "lease": "active",
-        "explanation_contains": "Fable failed with a selected overload or availability error"
+        "lease": "none",
+        "explanation_contains": "Fable 5 failed; retrying with GPT-5.6 Sol"
       }
     },
     {
-      "id": "recovery-returns-after-lease-expiry",
-      "setup": "expire the session lease after Anthropic recovers",
+      "id": "next-request-returns-to-fable",
+      "setup": "send another request after the request-scoped fallback",
       "accounts": ["anthropic", "openai"],
       "expected": {
-        "decision": "return_requested_route",
+        "decision": "requested_route",
         "provider": "anthropic",
         "model": "claude-fable-5",
         "status": 200,
-        "lease": "expired",
-        "explanation_contains": "lease expired, so Alex returned this request"
-      }
-    },
-    {
-      "id": "non-matching-error-is-returned",
-      "failure_fixture": "anthropic-fable-nonmatching-500",
-      "accounts": ["anthropic", "openai"],
-      "expected": {
-        "decision": "continue",
-        "provider": "anthropic",
-        "model": "claude-fable-5",
-        "status": 500,
-        "lease": "none",
-        "explanation_contains": "did not match this attempt"
+        "lease": "none"
       }
     },
     {

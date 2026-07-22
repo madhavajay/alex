@@ -44,58 +44,43 @@ function validateSources(vector, failure, rule, builtinSource) {
   assert(vector.expected_attempts[0].status === failure.status, "first status must come from failure fixture");
   assert(vector.expected_attempts[0].provider === failure.provider, "first provider must come from failure fixture");
   assert(vector.expected_decision.target.model === rule.then.reroute.model, "decision model must match rule");
-  assert(vector.expected_decision.scope.ttl_seconds === rule.then.reroute.ttl_seconds, "session TTL must match rule");
+  assert(vector.expected_decision.scope.scope === rule.then.reroute.scope, "fallback scope must match rule");
   assert(rule.then.reroute.providers.includes(vector.expected_attempts[1].provider), "successful provider must be allowed by rule");
 
   const requiredRustLiterals = [
     rule.id,
     rule.name,
     rule.when.models[0],
-    rule.when.models[1],
     rule.when.providers[0],
     String(rule.when.status[0]),
     rule.when.status[1],
-    ...rule.when.body_contains_any,
     rule.then.reroute.model,
     rule.then.reroute.providers[0],
-    String(rule.then.reroute.ttl_seconds),
-    rule.then.reroute.notice,
     rule.then.reroute.reason
   ];
   for (const literal of requiredRustLiterals) {
-    const rustSpelling = literal === "86400" ? "86_400" : literal;
-    assert(builtinSource.includes(rustSpelling), `Rust built-in is missing ${literal}`);
+    assert(builtinSource.includes(literal), `Rust built-in is missing ${literal}`);
   }
 
   const requiredRustStructure = [
     "HookPoint::AttemptResult",
-    "Capability::AttemptReadErrorBody",
     "Capability::RouteOverride",
-    "Capability::SessionPin",
-    "Capability::ResponsePrependText",
     "ErrorClass::Capacity",
     "ErrorClass::Server",
     "ProviderModeV1::Only",
-    "RouteScopeKindV1::Session",
-    "max_attempts: Some(3)",
-    "portable_history: true"
+    "RouteScopeKindV1::Request",
+    "max_attempts: Some(3)"
   ];
   for (const fragment of requiredRustStructure) {
     assert(builtinSource.includes(fragment), `Rust built-in is missing ${fragment}`);
   }
 
   assert(rule.hook === "attempt_result", "rule hook must be attempt_result");
-  assert(rule.capabilities.join(",") === [
-    "attempt.read_error_body",
-    "route.override",
-    "session.pin",
-    "response.prepend_text"
-  ].join(","), "rule capabilities must match the built-in");
+  assert(rule.capabilities.join(",") === "route.override", "rule capabilities must match the built-in");
   assert(rule.when.error_classes.join(",") === "capacity,server", "error classes must match the built-in");
   assert(rule.then.reroute.provider_mode === "only", "provider mode must remain only");
-  assert(rule.then.reroute.scope === "session", "reroute must remain session-scoped");
+  assert(rule.then.reroute.scope === "request", "reroute must remain request-scoped");
   assert(rule.then.reroute.max_attempts === 3, "attempt guard must match the built-in");
-  assert(rule.then.reroute.required_capabilities.portable_history === true, "portable history must remain required");
 }
 
 function validateSourceCheckedScenario(vector, sourceFiles) {
@@ -120,7 +105,7 @@ function buildScenario(vector, failure, rule, hashes) {
   return {
     schema_version: 1,
     id: "fable-to-sol-overload",
-    title: "Fable 5 is full. The session keeps moving.",
+    title: "Fable 5 fails. This request keeps moving.",
     description: vector.description,
     source: {
       vector: path.relative(repoRoot, vectorPath),
@@ -143,7 +128,7 @@ function buildScenario(vector, failure, rule, hashes) {
       },
       {
         id: "capacity-signal",
-        label: "Fable returns a verified capacity signal",
+        label: "Fable returns a capacity signal",
         detail: `HTTP ${failure.status} · ${errorBody.error.type}`,
         kind: "signal"
       },
@@ -161,8 +146,8 @@ function buildScenario(vector, failure, rule, hashes) {
       },
       {
         id: "trace",
-        label: "The session is pinned and the trace explains why",
-        detail: `${rule.then.reroute.ttl_seconds / 3600} hour pin · next turn skips Anthropic`,
+        label: "The trace explains the request fallback",
+        detail: "The next request starts on Fable 5 again",
         kind: "success"
       }
     ],

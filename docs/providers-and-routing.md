@@ -172,59 +172,27 @@ are not ordinary account-failover triggers. A retry account must be ready and
 not reserve-blocked; the selector's degraded "soonest cooldown" escape hatch is
 not used for retries.
 
-## Cross-model fallback and protection
+## Fable 5 → GPT-5.6 Sol fallback
 
-Same-model account failover is independent of these opt-in layers:
+Alex ships one default middleware rule: `alex.fable-5-to-gpt-5.6-sol`.
+When an Anthropic Fable 5 request receives a capacity or provider/server
+failure (`429` or `5xx`), Alex retries that request with `gpt-5.6-sol` through
+OpenAI. The fallback is request-scoped, so the next request starts on Fable 5
+again. The request header `x-alex-no-substitute: 1` disables the reroute for
+that request.
 
-```toml
-[substitution]
-enabled = true
+The rule is editable in Settings → Middleware using the Middleware Wizard. If
+“Tell the harness” is enabled, notice text can use `{from_model}` and
+`{to_model}` placeholders.
 
-[substitution.fallbacks]
-"claude-fable-5" = ["openai/gpt-5.6-sol"]
-
-[protection]
-enabled = true
-reroute_on_auth = false
-retries = 1
-auto_return = true
-
-[protection.equivalencies.claude-fable-5]
-openai = "gpt-5.6-sol"
-```
-
-`substitution.fallbacks` is an ordered explicit model list. Protection
-equivalencies select a different provider/model after covered failures;
-capacity/server errors are covered when protection is enabled, and auth is
-covered only with `reroute_on_auth = true`. The request header
-`x-alex-no-substitute: 1` disables configured cross-model substitution
-for that request.
-
-### Fable → Sol preset contract
-
-The readable built-in `example.fable-overload-to-sol` matches only selected
-Anthropic Fable capacity/server responses whose bounded body contains a
-verified overload or availability signal. When an eligible OpenAI account can
-serve `gpt-5.6-sol`, Alex retries there and creates a 24-hour session lease only
-after the fallback succeeds. Requests covered by the active lease explain why
-the session remains on its fallback. Once the lease expires, the next request
-returns to the requested Fable route and records that return in the trace.
-
-A server response without one of the selected body signals is returned
-unchanged. If the rule matches but no eligible OpenAI account can serve Sol,
-Alex also returns the original response and records that the requested reroute
-could not execute. Trace middleware records include the readable rule name and
-an explanation; the Trace Browser shows this alongside the routing explanation.
-This does not claim detection of silent quality changes without a provider
-signal.
+If no eligible OpenAI account can serve Sol, Alex returns the original response
+and records why the reroute could not execute. Trace middleware records include
+the readable rule name and execution explanation.
 
 The deterministic acceptance contract is
 `crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-acceptance.json`. It
-contains exactly four cases: overload reroute plus lease, recovery after lease
-expiry, a non-matching error, and an unavailable fallback account. Its overload
-case reuses `fable-to-sol-vector.json`, the scenario source consumed by the
-public-site build, so the product test and animation share the same provider,
-model, fixture, and next-turn expectations.
+covers the request-scoped reroute, the next request returning to Fable, and an
+unavailable fallback account.
 
 Next: [Configuration](configuration.md) · [API and formats](api-and-formats.md)
 · [Traces](traces.md)

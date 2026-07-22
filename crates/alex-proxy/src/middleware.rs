@@ -4,12 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alex_middleware::{
-    account_failover_rule, auth_failover_rule, fable_to_sol_rule, model_equivalence_failover_rule,
-    ordered_model_fallback_rules, ActionSpecV1, AttemptResultContext, CompiledRuleSetV1,
-    ErrorClass, EvaluationControl, EvaluationResult, HookPoint, MatchConditionsV1,
-    ModelFallbackTarget, ProviderModeV1, RerouteActionSpecV1, RouteScopeKindV1, RuleSetV1,
-    RuleSpecV1, StatusMatcherSpec, ValidationError, ValidationErrorCode, ValidationOptions,
-    API_VERSION_V1,
+    fable_to_sol_rule, AttemptResultContext, CompiledRuleSetV1, EvaluationControl,
+    EvaluationResult, ProviderModeV1, RuleSetV1, RuleSpecV1, ValidationError, ValidationErrorCode,
+    ValidationOptions, API_VERSION_V1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -510,7 +507,17 @@ fn validation_messages(errors: &[ValidationError]) -> Vec<String> {
 }
 
 fn is_builtin_id(id: &str) -> bool {
-    id.starts_with("alex.") || id == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID
+    id == alex_middleware::FABLE_TO_SOL_ID
+}
+
+fn is_retired_builtin_id(id: &str) -> bool {
+    id == "alex.account-failover"
+        || id == "alex.auth-failover"
+        || id == "alex.model-equivalence-failover"
+        || id.starts_with("alex.model-equivalence-failover.")
+        || id == "alex.model-fallbacks"
+        || id.starts_with("alex.model-fallbacks.")
+        || id == "example.fable-overload-to-sol"
 }
 
 fn merge_by_id(defaults: Vec<RuleSpecV1>, overrides: &[RuleSpecV1]) -> Vec<RuleSpecV1> {
@@ -519,165 +526,19 @@ fn merge_by_id(defaults: Vec<RuleSpecV1>, overrides: &[RuleSpecV1]) -> Vec<RuleS
         rules.insert(rule.id.clone(), rule);
     }
     for rule in overrides {
-        rules.insert(rule.id.clone(), rule.clone());
+        if !is_retired_builtin_id(&rule.id) {
+            rules.insert(rule.id.clone(), rule.clone());
+        }
     }
     rules.into_values().collect()
 }
 
-fn safe_id(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 fn merged_rules(
-    substitution: &SubstitutionConfig,
-    protection: &ProtectionPolicy,
+    _substitution: &SubstitutionConfig,
+    _protection: &ProtectionPolicy,
     stored: &[RuleSpecV1],
 ) -> Vec<RuleSpecV1> {
-    let mut defaults = vec![
-        account_failover_rule(true),
-        auth_failover_rule(protection.enabled && protection.reroute_on_auth),
-    ];
-
-    // Keep an inspectable, disabled template until configured child policies
-    // replace it. This prevents the settings pane from toggling a synthetic
-    // class when real legacy equivalencies are available.
-    if protection.equivalencies.is_empty() {
-        defaults.push(model_equivalence_failover_rule(
-            false,
-            vec!["unconfigured-model".into()],
-            "unconfigured".to_string(),
-            Vec::new(),
-        ));
-    }
-
-    for (source, fallbacks) in &substitution.fallbacks {
-        let targets = fallbacks
-            .iter()
-            .map(|model| {
-                let (provider, model) = crate::route_model(model);
-                ModelFallbackTarget {
-                    model,
-                    providers: provider
-                        .map(|provider| vec![provider.as_str().to_string()])
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
-        for mut rule in ordered_model_fallback_rules(substitution.enabled, source, targets) {
-            rule.id = format!("{}.{}", rule.id, safe_id(source));
-            defaults.push(rule);
-        }
-    }
-
-    for (source, equivalents) in &protection.equivalencies {
-        for (index, (provider, model)) in equivalents.iter().enumerate() {
-            let mut rule =
-                exact_legacy_equivalence_rule(protection, source, provider, model, false);
-            rule.id = format!(
-                "alex.model-equivalence-failover.{}.{}.{}",
-                safe_id(source),
-                safe_id(provider),
-                index + 1
-            );
-            defaults.push(rule);
-            if protection.reroute_on_auth {
-                let mut auth =
-                    exact_legacy_equivalence_rule(protection, source, provider, model, true);
-                auth.id = format!(
-                    "alex.auth-failover.{}.{}.{}",
-                    safe_id(source),
-                    safe_id(provider),
-                    index + 1
-                );
-                defaults.push(auth);
-            }
-        }
-    }
-
-    let mut example = fable_to_sol_rule();
-    example.enabled = false;
-    defaults.push(example);
-    merge_by_id(defaults, stored)
-}
-
-fn exact_legacy_equivalence_rule(
-    protection: &ProtectionPolicy,
-    source: &str,
-    provider: &str,
-    model: &str,
-    auth: bool,
-) -> RuleSpecV1 {
-    RuleSpecV1 {
-        id: String::new(),
-        name: if auth {
-            format!("Authentication fallback for {source}")
-        } else {
-            format!("Equivalent model fallback for {source}")
-        },
-        description: Some("Migrated from the legacy protection policy.".into()),
-        enabled: protection.enabled && (!auth || protection.reroute_on_auth),
-        priority: if auth { -250 } else { -300 },
-        hook: HookPoint::AttemptResult,
-        capabilities: vec![alex_middleware::Capability::RouteOverride],
-        when: MatchConditionsV1 {
-            models: {
-                let canonical = crate::canonical_model_alias(source).to_string();
-                if canonical == source {
-                    vec![source.to_string()]
-                } else {
-                    vec![source.to_string(), canonical]
-                }
-            },
-            status: if auth {
-                vec![StatusMatcherSpec::Exact(401), StatusMatcherSpec::Exact(403)]
-            } else {
-                vec![
-                    StatusMatcherSpec::Exact(429),
-                    StatusMatcherSpec::RangeOrClass("500-599".into()),
-                ]
-            },
-            error_classes: if auth {
-                vec![ErrorClass::Auth]
-            } else {
-                vec![ErrorClass::Capacity, ErrorClass::Server]
-            },
-            same_route_accounts_remaining: Some(false),
-            ..Default::default()
-        },
-        expression: None,
-        action: ActionSpecV1 {
-            reroute: Some(RerouteActionSpecV1 {
-                model: Some(model.to_string()),
-                equivalent_class: None,
-                providers: vec![provider.to_string()],
-                provider_mode: ProviderModeV1::Only,
-                scope: RouteScopeKindV1::Request,
-                ttl_seconds: None,
-                notice: None,
-                reason: if auth {
-                    "legacy authentication equivalency".into()
-                } else {
-                    "legacy model equivalency".into()
-                },
-                // The runtime owns the global attempt budget. Legacy
-                // `protection.retries` previously produced only simulated
-                // trace rungs, so migration must not inflate a rule beyond
-                // that authoritative limit.
-                max_attempts: None,
-                required_capabilities: Default::default(),
-            }),
-            ..Default::default()
-        },
-    }
+    merge_by_id(vec![fable_to_sol_rule()], stored)
 }
 
 fn read_stored(root: &Path) -> Result<StoredMiddleware, String> {
@@ -744,28 +605,30 @@ mod tests {
     fn stored_rule_replaces_builtin_and_survives_reload() {
         let root = temp_root("builtin-override");
         let mut runtime = MiddlewareRuntime::load(root.clone(), SubstitutionConfig::default());
-        let mut account = runtime
+        let mut fallback = runtime
             .rules()
             .iter()
-            .find(|rule| rule.id == alex_middleware::ACCOUNT_FAILOVER_ID)
+            .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_ID)
             .unwrap()
             .clone();
-        account.enabled = false;
-        runtime.replace_rule(&account.id.clone(), account).unwrap();
+        fallback.enabled = false;
+        runtime
+            .replace_rule(&fallback.id.clone(), fallback)
+            .unwrap();
 
         let reloaded = MiddlewareRuntime::load(root, SubstitutionConfig::default());
         assert!(
             !reloaded
                 .rules()
                 .iter()
-                .find(|rule| rule.id == alex_middleware::ACCOUNT_FAILOVER_ID)
+                .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_ID)
                 .unwrap()
                 .enabled
         );
     }
 
     #[test]
-    fn legacy_fallbacks_are_visible_public_rules() {
+    fn legacy_fallbacks_do_not_create_additional_middleware() {
         let runtime = MiddlewareRuntime::load(
             temp_root("legacy-fallback"),
             SubstitutionConfig {
@@ -776,10 +639,8 @@ mod tests {
                 )]),
             },
         );
-        assert!(runtime
-            .rules()
-            .iter()
-            .any(|rule| rule.id.starts_with("alex.model-fallbacks.")));
+        assert_eq!(runtime.rules().len(), 1);
+        assert_eq!(runtime.rules()[0].id, alex_middleware::FABLE_TO_SOL_ID);
     }
 
     #[test]
@@ -832,7 +693,7 @@ mod tests {
                 model: "gpt-5.6-sol".into(),
                 providers: alex_middleware::ProviderConstraint::Only(vec!["openai".into()]),
             },
-            source_middleware_id: alex_middleware::FABLE_TO_SOL_EXAMPLE_ID.into(),
+            source_middleware_id: alex_middleware::FABLE_TO_SOL_ID.into(),
             reason: "test".into(),
             created_ms: 1,
             last_used_ms: 1,

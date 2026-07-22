@@ -764,7 +764,7 @@ public struct MiddlewareTestResponse: Codable, Sendable, Equatable {
     }
 }
 
-// MARK: - Tom's Middleware Wizard
+// MARK: - Middleware Wizard
 
 public enum MiddlewareWizardErrorKind: String, Codable, Sendable, CaseIterable, Hashable {
     case any = "Any error"
@@ -793,6 +793,9 @@ public enum MiddlewareWizardAction: String, Codable, Sendable, CaseIterable {
 }
 
 public struct MiddlewareWizardDraft: Sendable, Equatable {
+    public static let defaultNoticeTemplate =
+        "Alex switched from {from_model} to {to_model}."
+
     public var name: String
     public var description: String
     public var harnesses: [String]
@@ -866,25 +869,21 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
 
     public static var fableToSolExample: MiddlewareWizardDraft {
         .init(
-            name: "Move overloaded Fable chats to Sol",
-            description: "Keep a chat moving when Anthropic cannot serve Fable.",
-            harnesses: ["claude", "codex", "pi"],
-            modelPattern: "claude-fable-5, fable-*",
+            name: "Fable 5 → GPT-5.6 Sol",
+            description: "If Fable 5 fails with a capacity or provider error, retry with GPT-5.6 Sol.",
+            modelPattern: "fable-5",
             sourceProvider: "anthropic",
             hook: .attemptResult,
             errorKinds: [.capacity, .server],
             statusText: "429, 500-599",
-            bodyPhrasesText: "model is currently overloaded\nsubscription is unavailable",
             conditionMode: .all,
             action: .routeExact,
             targetModel: "gpt-5.6-sol",
             providerMode: .only,
             targetProviders: ["openai"],
-            scope: .session,
-            stableSessionRequired: true,
-            ttlSeconds: 86_400,
-            includeNotice: true,
-            notice: "We moved this chat from Fable 5 to GPT 5.6 Sol.",
+            scope: .request,
+            includeNotice: false,
+            notice: defaultNoticeTemplate,
             priority: 100)
     }
 
@@ -901,7 +900,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             description: rule.description ?? "",
             harnesses: rule.when.harnessNames ?? [],
             harnessVersion: (rule.when.harnessVersions ?? []).joined(separator: ", "),
-            modelPattern: (rule.when.models ?? []).joined(separator: ", "),
+            modelPattern: Self.displayModelPatterns(rule.when.models ?? []).joined(separator: ", "),
             sourceProvider: (rule.when.providers ?? []).joined(separator: ", "),
             hook: rule.hook,
             errorKinds: selectedErrors,
@@ -918,7 +917,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             stableSessionRequired: rule.when.stableSession ?? true,
             ttlSeconds: reroute?.ttlSeconds ?? 86_400,
             includeNotice: reroute?.notice != nil,
-            notice: reroute?.notice ?? "",
+            notice: reroute?.notice ?? Self.defaultNoticeTemplate,
             priority: rule.priority)
     }
 
@@ -975,7 +974,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         let baseMatch = MiddlewareMatchSpec(
             harnessNames: nilIfEmpty(harnesses),
             harnessVersions: nilIfEmpty(commaSeparated(harnessVersion)),
-            models: nilIfEmpty(commaSeparated(modelPattern)),
+            models: nilIfEmpty(Self.ruleModelPatterns(commaSeparated(modelPattern))),
             providers: nilIfEmpty(commaSeparated(sourceProvider)),
             status: conditionMode == .all ? nilIfEmpty(statusMatchers) : nil,
             errorClasses: conditionMode == .all ? nilIfEmpty(errorClasses) : nil,
@@ -1113,6 +1112,29 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         let components = lowered.components(separatedBy: CharacterSet.alphanumerics.inverted)
         let slug = components.filter { !$0.isEmpty }.joined(separator: "-")
         return slug.isEmpty ? "middleware-rule" : slug
+    }
+
+    private static func ruleModelPatterns(_ values: [String]) -> [String] {
+        unique(values.map { value in
+            switch value.lowercased() {
+            case "fable-5": "claude-fable-5"
+            default: value
+            }
+        })
+    }
+
+    private static func displayModelPatterns(_ values: [String]) -> [String] {
+        unique(values.map { value in
+            switch value.lowercased() {
+            case "claude-fable-5": "fable-5"
+            default: value
+            }
+        })
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
     }
 
     private static func naturalList(_ values: [String]) -> String {

@@ -4,7 +4,7 @@ import AlexCore
 /// A four-step declarative-rule builder. It intentionally exposes the common
 /// email-filter-shaped subset and always asks the daemon to validate the final
 /// RuleSpec before Save becomes available.
-struct TomsMiddlewareWizard: View {
+struct MiddlewareWizard: View {
     let store: SnapshotStore
     @Binding var draft: MiddlewareWizardDraft
     let editingRuleID: String?
@@ -47,6 +47,13 @@ struct TomsMiddlewareWizard: View {
             validationError = nil
             saveError = nil
         }
+        .onChange(of: draft.includeNotice) { _, includeNotice in
+            if includeNotice,
+               draft.notice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                draft.notice = MiddlewareWizardDraft.defaultNoticeTemplate
+            }
+        }
     }
 
     private var header: some View {
@@ -55,7 +62,7 @@ struct TomsMiddlewareWizard: View {
                 .font(.system(size: 20, weight: .medium))
                 .foregroundStyle(AlexTheme.Colors.primary)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Tom's Middleware Wizard")
+                Text("Middleware Wizard")
                     .font(.system(size: 15, weight: .semibold))
                 Text(editingRuleID == nil
                     ? "Build a routing rule without writing code"
@@ -118,7 +125,7 @@ struct TomsMiddlewareWizard: View {
                 "Use a name that explains the behavior when it appears in a trace.")
             VStack(alignment: .leading, spacing: 6) {
                 Text("Name").font(.system(size: 11, weight: .semibold))
-                TextField("Move overloaded Fable chats to Sol", text: $draft.name)
+                TextField("Describe this fallback", text: $draft.name)
                     .textFieldStyle(.roundedBorder)
                     .accessibilityLabel("Middleware name")
             }
@@ -127,23 +134,6 @@ struct TomsMiddlewareWizard: View {
                 TextField("What this rule is for", text: $draft.description)
                     .textFieldStyle(.roundedBorder)
             }
-            HStack(spacing: 10) {
-                Image(systemName: "sparkles")
-                    .foregroundStyle(AlexTheme.Colors.primary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Want a working example?")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text("Load the Fable → GPT 5.6 Sol failover described in the middleware beta plan.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(AlexTheme.Colors.textTertiary)
-                }
-                Spacer()
-                Button("Use example") { draft = .fableToSolExample }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-            .padding(12)
-            .alexCard(background: AlexTheme.Colors.primary.opacity(0.06))
             Spacer(minLength: 0)
         }
     }
@@ -174,13 +164,14 @@ struct TomsMiddlewareWizard: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            HStack(alignment: .top, spacing: 12) {
-                wizardGroup("Requested model") {
-                    TextField("Any, exact, or wildcard: fable-*", text: $draft.modelPattern)
-                        .textFieldStyle(.roundedBorder)
-                }
-                wizardGroup("Current provider") {
-                    chipWrap(values: providers, selected: sourceProviders) { toggleSourceProvider($0) }
+            wizardGroup("Requested model") {
+                TextField("Enter a model, e.g. fable-5", text: $draft.modelPattern)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            wizardGroup("Current provider") {
+                providerPicker(selected: sourceProviders, includesAny: true) { provider in
+                    draft.sourceProvider = provider ?? ""
                 }
             }
 
@@ -241,7 +232,7 @@ struct TomsMiddlewareWizard: View {
             if draft.action != .retrySame {
                 wizardGroup(draft.action == .routeExact ? "Target model" : "Equivalence class") {
                     if draft.action == .routeExact {
-                        TextField("gpt-5.6-sol", text: $draft.targetModel)
+                        TextField("Enter a target model, e.g. gpt-5.6-sol", text: $draft.targetModel)
                             .textFieldStyle(.roundedBorder)
                     } else {
                         TextField("claude-fable-5", text: $draft.equivalenceClass)
@@ -261,7 +252,9 @@ struct TomsMiddlewareWizard: View {
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     if draft.providerMode != .any {
-                        chipWrap(values: providers, selected: draft.targetProviders) { toggleTargetProvider($0) }
+                        providerPicker(selected: draft.targetProviders, includesAny: false) { provider in
+                            draft.targetProviders = provider.map { [$0] } ?? []
+                        }
                     }
                 }
 
@@ -293,8 +286,11 @@ struct TomsMiddlewareWizard: View {
                         .toggleStyle(.checkbox)
                         .font(.system(size: 11))
                     if draft.includeNotice {
-                        TextField("We moved this chat to another model.", text: $draft.notice)
+                        TextField(MiddlewareWizardDraft.defaultNoticeTemplate, text: $draft.notice)
                             .textFieldStyle(.roundedBorder)
+                        Text("Use {from_model} and {to_model} to include the actual model names.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
                         Text("A notice can buffer the exceptional fallback response. Normal successful streaming stays untouched.")
                             .font(.system(size: 10))
                             .foregroundStyle(AlexTheme.Colors.warningOrange)
@@ -400,6 +396,11 @@ struct TomsMiddlewareWizard: View {
                 .buttonStyle(.bordered)
                 .keyboardShortcut(.cancelAction)
             Spacer()
+            if let continueRequirement {
+                Text(continueRequirement)
+                    .font(.system(size: 10))
+                    .foregroundStyle(AlexTheme.Colors.warningOrange)
+            }
             if step > 0 {
                 Button("Back") { step -= 1 }
                     .buttonStyle(.bordered)
@@ -443,6 +444,21 @@ struct TomsMiddlewareWizard: View {
             case .routeEquivalent: !draft.equivalenceClass.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
         default: true
+        }
+    }
+
+    private var continueRequirement: String? {
+        guard !canContinue else { return nil }
+        switch step {
+        case 0: return "Enter a middleware name."
+        case 1: return "Choose at least one condition."
+        case 2:
+            switch draft.action {
+            case .retrySame: return nil
+            case .routeExact: return "Enter a target model."
+            case .routeEquivalent: return "Enter an equivalence class."
+            }
+        default: return nil
         }
     }
 
@@ -507,6 +523,79 @@ struct TomsMiddlewareWizard: View {
         }
     }
 
+    private func providerPicker(
+        selected: [String],
+        includesAny: Bool,
+        action: @escaping (String?) -> Void
+    ) -> some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 145), spacing: 8)],
+            spacing: 8
+        ) {
+            if includesAny {
+                providerChoice(
+                    title: "Any provider",
+                    subtitle: selected.isEmpty ? "Selected" : "No filter",
+                    icon: nil,
+                    selected: selected.isEmpty
+                ) { action(nil) }
+            }
+            ForEach(providers, id: \.self) { provider in
+                let isSelected = selected.contains(provider)
+                providerChoice(
+                    title: ProviderInfo.displayName(provider),
+                    subtitle: isSelected ? "Selected" : "Choose",
+                    icon: ProviderInfo.loginArg(provider),
+                    selected: isSelected
+                ) { action(provider) }
+            }
+        }
+    }
+
+    private func providerChoice(
+        title: String,
+        subtitle: String,
+        icon: String?,
+        selected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if let icon {
+                    HarnessIconView(harness: icon, tags: nil, size: 22, showsFallback: true)
+                } else {
+                    Image(systemName: "network")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(AlexTheme.Colors.primary)
+                        .frame(width: 22, height: 22)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(AlexTheme.Fonts.metaMicro)
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                }
+                Spacer(minLength: 2)
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(AlexTheme.Colors.primary)
+                }
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(selected ? AlexTheme.Colors.primary.opacity(0.10) : AlexTheme.Colors.card))
+            .overlay(RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(selected
+                    ? AlexTheme.Colors.primary.opacity(0.45) : AlexTheme.Colors.cardBorder))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
     private func chip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
@@ -544,24 +633,6 @@ struct TomsMiddlewareWizard: View {
             draft.harnesses.remove(at: index)
         } else {
             draft.harnesses.append(value)
-        }
-    }
-
-    private func toggleSourceProvider(_ value: String) {
-        var selected = sourceProviders
-        if let index = selected.firstIndex(of: value) {
-            selected.remove(at: index)
-        } else {
-            selected.append(value)
-        }
-        draft.sourceProvider = selected.joined(separator: ", ")
-    }
-
-    private func toggleTargetProvider(_ value: String) {
-        if let index = draft.targetProviders.firstIndex(of: value) {
-            draft.targetProviders.remove(at: index)
-        } else {
-            draft.targetProviders.append(value)
         }
     }
 

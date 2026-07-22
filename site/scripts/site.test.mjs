@@ -42,7 +42,7 @@ test("build is deterministic and generated from the proxy fixture", async () => 
   assert.equal(scenario.expected_decision.decision, "reroute");
   assert.equal(scenario.expected_decision.target.model, "gpt-5.6-sol");
   assert.equal(scenario.expected_attempts[1].provider, "openai");
-  assert.equal(scenario.next_turn.anthropic_attempts, 0);
+  assert.equal(scenario.next_turn.anthropic_attempts, 1);
   assert.equal(scenario.steps.length, 6);
   for (const hash of Object.values(scenario.source.sha256)) assert.match(hash, /^[a-f0-9]{64}$/);
 
@@ -72,7 +72,7 @@ test("built HTML has a useful static fallback and accessible controls", async ()
   assert.match(html, /Keep the first answer\. Ask for another opinion/);
   assert.match(html, /<noscript>/);
   assert.match(html, /Reveal the actual middleware rule/);
-  assert.match(html, /example\.fable-overload-to-sol/);
+  assert.match(html, /alex\.fable-5-to-gpt-5\.6-sol/);
   assert.match(html, /aria-live="polite"/);
   assert.doesNotMatch(html, /<!-- BUILD:/);
 });

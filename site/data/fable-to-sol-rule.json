@@ -1,40 +1,25 @@
 {
-  "id": "example.fable-overload-to-sol",
-  "name": "Move overloaded Fable chats to Sol",
-  "description": "Reroute selected failed Anthropic Fable requests to OpenAI Sol.",
+  "id": "alex.fable-5-to-gpt-5.6-sol",
+  "name": "Fable 5 → GPT-5.6 Sol",
+  "description": "If Fable 5 fails with a capacity or provider error, retry with GPT-5.6 Sol.",
   "enabled": true,
   "priority": 100,
   "hook": "attempt_result",
-  "capabilities": [
-    "attempt.read_error_body",
-    "route.override",
-    "session.pin",
-    "response.prepend_text"
-  ],
+  "capabilities": ["route.override"],
   "when": {
-    "harness_names": ["claude", "codex", "pi"],
-    "models": ["claude-fable-5", "fable-*"],
+    "models": ["claude-fable-5"],
     "providers": ["anthropic"],
     "status": [429, "500-599"],
-    "error_classes": ["capacity", "server"],
-    "body_contains_any": [
-      "model is currently overloaded",
-      "subscription is unavailable"
-    ]
+    "error_classes": ["capacity", "server"]
   },
   "then": {
     "reroute": {
       "model": "gpt-5.6-sol",
       "providers": ["openai"],
       "provider_mode": "only",
-      "scope": "session",
-      "ttl_seconds": 86400,
-      "notice": "We moved this chat from Fable 5 to GPT 5.6 Sol.",
-      "reason": "Fable failed with a selected overload or availability error",
-      "max_attempts": 3,
-      "required_capabilities": {
-        "portable_history": true
-      }
+      "scope": "request",
+      "reason": "Fable 5 failed; retrying with GPT-5.6 Sol",
+      "max_attempts": 3
     }
   }
 }

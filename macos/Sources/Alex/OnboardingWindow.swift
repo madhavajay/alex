@@ -1492,13 +1492,12 @@ struct OnboardingView: View {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.success)
             intro("Keep your agents running", "Settings → Middleware lets you enable or edit rules that can move eligible work between models.")
             VStack(alignment: .leading, spacing: 9) {
-                failoverPair("alex/claude-fable-5", "alex/gpt-5.6-sol")
-                failoverPair("alex/gpt-5.6-sol", "alex/claude-fable-5")
+                failoverPair("fable-5", "gpt-5.6-sol")
             }
             .padding(14).cardStyle()
             statusCard(
                 icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary,
-                text: "When enabled, middleware can reroute selected capacity and server failures. Authentication and refusal reroutes require explicit rules.")
+                text: "The default middleware retries Fable 5 capacity and provider failures with GPT-5.6 Sol for that request.")
         }
     }
 

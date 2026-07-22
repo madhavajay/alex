@@ -17,7 +17,7 @@ struct MiddlewarePreferencesSection: View {
     @State private var actionResult: String?
     @State private var actionIsError = false
     @State private var showingWizard = false
-    @State private var wizardDraft = MiddlewareWizardDraft()
+    @State private var wizardDraft = MiddlewareWizardDraft.fableToSolExample
     @State private var wizardEditingID: String?
     @State private var inspectedRule: MiddlewareRuleSpecV1?
     @State private var pendingDelete: MiddlewareRuleSpecV1?
@@ -54,7 +54,7 @@ struct MiddlewarePreferencesSection: View {
         }
         .task { await load() }
         .sheet(isPresented: $showingWizard) {
-            TomsMiddlewareWizard(
+            MiddlewareWizard(
                 store: store,
                 draft: $wizardDraft,
                 editingRuleID: wizardEditingID,
@@ -100,7 +100,7 @@ struct MiddlewarePreferencesSection: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .accessibilityHint("Opens Tom's Middleware Wizard")
+            .accessibilityHint("Opens the Middleware Wizard")
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
@@ -235,8 +235,8 @@ struct MiddlewarePreferencesSection: View {
 
     private var builtInSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel(text: "Built-in policies", style: .prominent)
-            Text("Alex's standard failover behavior is ordinary, inspectable middleware.")
+            SectionLabel(text: "Default middleware", style: .prominent)
+            Text("Alex ships one simple, inspectable Fable 5 fallback.")
                 .font(.system(size: 11))
                 .foregroundStyle(AlexTheme.Colors.textTertiary)
 
@@ -267,15 +267,11 @@ struct MiddlewarePreferencesSection: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 8)
-            Button("Inspect") { if let rule { inspectedRule = rule } }
+            Button("Edit") { if let rule { edit(rule) } }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
-                .disabled(rule == nil)
+                .disabled(rule.map(isWizardEditable) != true)
             Button("Test") { if let rule { Task { await test(rule) } } }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(rule == nil)
-            Button("Duplicate") { if let rule { duplicateInWizard(rule) } }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
                 .disabled(rule == nil)
@@ -308,7 +304,7 @@ struct MiddlewarePreferencesSection: View {
                         .foregroundStyle(AlexTheme.Colors.textFaint)
                     Text("No custom middleware yet")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Tom's wizard can build a safe rerouting rule without code.")
+                    Text("The Middleware Wizard can build a safe rerouting rule without code.")
                         .font(.system(size: 11))
                         .foregroundStyle(AlexTheme.Colors.textTertiary)
                     Button("Add Middleware") { beginCreate() }
@@ -353,7 +349,7 @@ struct MiddlewarePreferencesSection: View {
             Spacer()
             Menu {
                 if isWizardEditable(rule) {
-                    Button("Edit in Tom's Wizard") { edit(rule) }
+                    Button("Edit in Middleware Wizard") { edit(rule) }
                 }
                 Button("Inspect generated rule") { inspectedRule = rule }
                 if isWizardEditable(rule) {
@@ -602,7 +598,7 @@ struct MiddlewarePreferencesSection: View {
     }
 
     private func beginCreate() {
-        wizardDraft = MiddlewareWizardDraft()
+        wizardDraft = .fableToSolExample
         wizardEditingID = nil
         showingWizard = true
     }
@@ -660,56 +656,18 @@ struct MiddlewarePreferencesSection: View {
 }
 
 private enum BuiltInMiddlewarePolicy: String, CaseIterable, Identifiable {
-    case accountFailover = "alex.account-failover"
-    case modelFallbacks = "alex.model-fallbacks"
-    case equivalence = "alex.model-equivalence-failover"
-    case authFailover = "alex.auth-failover"
-    case fableToSol = "example.fable-overload-to-sol"
+    case fableToSol = "alex.fable-5-to-gpt-5.6-sol"
 
     var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .accountFailover: "Account Failover"
-        case .modelFallbacks: "Ordered Model Fallbacks"
-        case .equivalence: "Model Equivalence Failover"
-        case .authFailover: "Authentication Failover"
-        case .fableToSol: "Fable → GPT 5.6 Sol Example"
-        }
-    }
+    var title: String { "Fable 5 → GPT-5.6 Sol" }
     var summary: String {
-        switch self {
-        case .accountFailover: "Try another eligible account on capacity or server failures."
-        case .modelFallbacks: "Follow the configured ordered fallback models."
-        case .equivalence: "Move failed requests to an equivalent model and provider."
-        case .authFailover: "Permit movement after a confirmed login or subscription failure."
-        case .fableToSol: "Move selected overloaded Anthropic Fable chats to OpenAI Sol."
-        }
+        "If Fable 5 hits a capacity or provider failure, retry this request with GPT-5.6 Sol."
     }
-    var icon: String {
-        switch self {
-        case .accountFailover: "person.2"
-        case .modelFallbacks: "list.number"
-        case .equivalence: "arrow.left.arrow.right"
-        case .authFailover: "key.viewfinder"
-        case .fableToSol: "wand.and.stars"
-        }
-    }
-    var defaultEnabled: Bool { self == .accountFailover }
+    var icon: String { "arrow.right.circle" }
+    var defaultEnabled: Bool { true }
 
-    func matches(_ ruleID: String) -> Bool {
-        if ruleID == id { return true }
-        switch self {
-        case .modelFallbacks, .equivalence, .authFailover:
-            return ruleID.hasPrefix(id + ".")
-        case .accountFailover, .fableToSol:
-            return false
-        }
-    }
-
-    func canToggle(_ rules: [MiddlewareRuleSpecV1]) -> Bool {
-        !rules.isEmpty
-            && !(self == .equivalence && rules.count == 1 && rules[0].id == id)
-    }
+    func matches(_ ruleID: String) -> Bool { ruleID == id }
+    func canToggle(_ rules: [MiddlewareRuleSpecV1]) -> Bool { !rules.isEmpty }
 }
 
 private struct MiddlewareRuleInspector: View {

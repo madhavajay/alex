@@ -862,7 +862,9 @@ import Testing
             let rule = try #require(json["rule"] as? [String: Any])
             #expect(rule["id"] as? String == "fable-overload-to-sol")
             let match = try #require(rule["when"] as? [String: Any])
-            #expect(match["harness_names"] as? [String] == ["claude", "codex", "pi"])
+            #expect(match["harness_names"] == nil)
+            #expect(match["models"] as? [String] == ["claude-fable-5"])
+            #expect(match["providers"] as? [String] == ["anthropic"])
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (response, Data(#"{"valid":true,"errors":[],"warnings":[]}"#.utf8))

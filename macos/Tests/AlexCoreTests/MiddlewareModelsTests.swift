@@ -8,36 +8,28 @@ import Testing
             id: "fable-overload-to-sol")
 
         #expect(rule.id == "fable-overload-to-sol")
-        #expect(rule.name == "Move overloaded Fable chats to Sol")
+        #expect(rule.name == "Fable 5 → GPT-5.6 Sol")
         #expect(rule.enabled)
         #expect(rule.priority == 100)
         #expect(rule.hook == .attemptResult)
-        #expect(rule.capabilities == [
-            "attempt.read_error_body",
-            "route.override",
-            "session.pin",
-            "response.prepend_text",
-        ])
+        #expect(rule.capabilities == ["route.override"])
         #expect(rule.expression == nil)
-        #expect(rule.when.harnessNames == ["claude", "codex", "pi"])
-        #expect(rule.when.models == ["claude-fable-5", "fable-*"])
+        #expect(rule.when.harnessNames == nil)
+        #expect(rule.when.models == ["claude-fable-5"])
         #expect(rule.when.providers == ["anthropic"])
         #expect(rule.when.status == [.exact(429), .pattern("500-599")])
         #expect(rule.when.errorClasses == ["capacity", "server"])
-        #expect(rule.when.bodyContainsAny == [
-            "model is currently overloaded",
-            "subscription is unavailable",
-        ])
-        #expect(rule.when.stableSession == true)
+        #expect(rule.when.bodyContainsAny == nil)
+        #expect(rule.when.stableSession == nil)
         #expect(rule.then.retrySameRoute == nil)
         #expect(rule.then.reroute?.model == "gpt-5.6-sol")
         #expect(rule.then.reroute?.providerMode == .only)
         #expect(rule.then.reroute?.providers == ["openai"])
-        #expect(rule.then.reroute?.scope == .session)
-        #expect(rule.then.reroute?.ttlSeconds == 86_400)
-        #expect(rule.then.reroute?.notice == "We moved this chat from Fable 5 to GPT 5.6 Sol.")
+        #expect(rule.then.reroute?.scope == .request)
+        #expect(rule.then.reroute?.ttlSeconds == nil)
+        #expect(rule.then.reroute?.notice == nil)
         #expect(rule.then.reroute?.maxAttempts == 3)
-        #expect(rule.then.reroute?.requiredCapabilities.portableHistory == true)
+        #expect(rule.then.reroute?.requiredCapabilities.portableHistory == false)
     }
 
     @Test func fableRuleEncodesSnakeCaseAndHeterogeneousStatuses() throws {
@@ -51,14 +43,14 @@ import Testing
 
         #expect(json["api_version"] == nil)
         #expect(json["built_in"] == nil)
-        #expect(match["harness_names"] as? [String] == ["claude", "codex", "pi"])
-        #expect(match["body_contains_any"] as? [String] == [
-            "model is currently overloaded", "subscription is unavailable",
-        ])
+        #expect(match["harness_names"] == nil)
+        #expect(match["body_contains_any"] == nil)
+        #expect(match["models"] as? [String] == ["claude-fable-5"])
         let statuses = try #require(match["status"] as? [Any])
         #expect(statuses[0] as? Int == 429)
         #expect(statuses[1] as? String == "500-599")
-        #expect(reroute["ttl_seconds"] as? Int == 86_400)
+        #expect(reroute["ttl_seconds"] == nil)
+        #expect(reroute["scope"] as? String == "request")
         #expect(reroute["provider_mode"] as? String == "only")
     }
 
@@ -107,7 +99,7 @@ import Testing
             Issue.record("Expected an any expression")
             return
         }
-        #expect(alternatives.count == 3)
+        #expect(alternatives.count == 2)
     }
 
     @Test func ruleRoundTripsDaemonStatusMetadata() throws {
@@ -141,6 +133,7 @@ import Testing
     @Test func wizardRejectsBodyMatchingAtRequestHookAndUnsafeSessionChoice() {
         var draft = MiddlewareWizardDraft.fableToSolExample
         draft.hook = .requestReceived
+        draft.scope = .session
         draft.stableSessionRequired = false
         let errors = draft.localValidationErrors
         #expect(errors.contains("Failure and body conditions require the Failed attempt hook."))
@@ -148,6 +141,26 @@ import Testing
         #expect(throws: MiddlewareWizardBuildError.self) {
             try draft.makeRule()
         }
+    }
+
+    @Test func builtInRuleProjectsBackToFriendlyWizardValues() throws {
+        let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
+            id: "alex.fable-5-to-gpt-5.6-sol")
+        let draft = MiddlewareWizardDraft(rule: rule)
+
+        #expect(draft.modelPattern == "fable-5")
+        #expect(draft.sourceProvider == "anthropic")
+        #expect(draft.targetModel == "gpt-5.6-sol")
+        #expect(draft.targetProviders == ["openai"])
+        #expect(draft.notice == MiddlewareWizardDraft.defaultNoticeTemplate)
+    }
+
+    @Test func checkedNoticeUsesModelTemplates() throws {
+        var draft = MiddlewareWizardDraft.fableToSolExample
+        draft.includeNotice = true
+        let rule = try draft.makeRule(id: "fable-notice")
+        #expect(rule.then.reroute?.notice == "Alex switched from {from_model} to {to_model}.")
+        #expect(rule.capabilities.contains("response.prepend_text"))
     }
 
     @Test func retryWizardBuildsRetryActionWithoutReroute() throws {

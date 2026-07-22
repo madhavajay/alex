@@ -11964,6 +11964,23 @@ fn client_respond_as(format: ClientFormat) -> RespondAs {
     }
 }
 
+fn middleware_notice_model_name(model: &str) -> &str {
+    match canonical_model_alias(model) {
+        "claude-fable-5" => "fable-5",
+        model => model,
+    }
+}
+
+fn render_middleware_notice(template: &str, from_model: &str, to_model: &str) -> String {
+    let from_model = middleware_notice_model_name(from_model);
+    let to_model = middleware_notice_model_name(to_model);
+    template
+        .replace("{from_model}", from_model)
+        .replace("{to_model}", to_model)
+        .replace("{requested_model}", from_model)
+        .replace("{target_model}", to_model)
+}
+
 fn prepend_response_notice(response: &mut Value, target: RespondAs, notice: &str) {
     let text = format!("{notice}\n\n");
     match target {
@@ -13140,7 +13157,13 @@ async fn proxy(
                                 }
                             }
                             next_plan.map(|next_plan| {
-                                pending_notice = notice.as_ref().map(|notice| notice.text.clone());
+                                pending_notice = notice.as_ref().map(|notice| {
+                                    render_middleware_notice(
+                                        &notice.text,
+                                        &context.request.current_model,
+                                        &model,
+                                    )
+                                });
                                 if let alex_middleware::RouteScope::Session { ttl_seconds } = scope
                                 {
                                     if context.session.has_stable_id()
@@ -15970,6 +15993,18 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn middleware_notice_expands_model_templates() {
+        assert_eq!(
+            render_middleware_notice(
+                "Switched from {from_model} to {to_model}.",
+                "alex/claude-fable-5",
+                "gpt-5.6-sol",
+            ),
+            "Switched from fable-5 to gpt-5.6-sol."
+        );
+    }
+
     fn fable_acceptance_contract() -> Value {
         serde_json::from_str(include_str!(
             "../tests/fixtures/middleware/fable-to-sol-acceptance.json"
@@ -15991,7 +16026,7 @@ mod tests {
         let mut rule = runtime
             .rules()
             .iter()
-            .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .find(|rule| rule.id == alex_middleware::FABLE_TO_SOL_ID)
             .unwrap()
             .clone();
         rule.enabled = true;
@@ -16000,24 +16035,20 @@ mod tests {
     }
 
     #[test]
-    fn fable_acceptance_contract_has_exactly_four_cases_and_reuses_site_vector() {
+    fn fable_acceptance_contract_has_three_simple_cases_and_reuses_site_vector() {
         let contract = fable_acceptance_contract();
         let cases = contract["cases"].as_array().unwrap();
         assert_eq!(contract["schema_version"], 1);
-        assert_eq!(
-            contract["preset_id"],
-            alex_middleware::FABLE_TO_SOL_EXAMPLE_ID
-        );
-        assert_eq!(cases.len(), 4);
+        assert_eq!(contract["preset_id"], alex_middleware::FABLE_TO_SOL_ID);
+        assert_eq!(cases.len(), 3);
         assert_eq!(
             cases
                 .iter()
                 .map(|case| case["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "overload-reroute-and-lease",
-                "recovery-returns-after-lease-expiry",
-                "non-matching-error-is-returned",
+                "fable-failure-reroutes-request",
+                "next-request-returns-to-fable",
                 "unavailable-fallback-account-returns-original",
             ]
         );
@@ -16026,7 +16057,7 @@ mod tests {
             "../tests/fixtures/middleware/fable-to-sol-vector.json"
         ))
         .unwrap();
-        let overload = fable_acceptance_case(&contract, "overload-reroute-and-lease");
+        let overload = fable_acceptance_case(&contract, "fable-failure-reroutes-request");
         assert_eq!(contract["shared_site_scenario"], "fable-to-sol-vector.json");
         assert_eq!(overload["failure_fixture"], site_vector["failure_fixture"]);
         assert_eq!(
@@ -17007,14 +17038,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_model_catalog_uses_alex_not_alex_namespace() {
+    async fn openai_model_catalog_uses_the_alex_namespace() {
         let state = test_state("models-alex-namespace");
         let ids = model_ids(models(State(state), HeaderMap::new()).await.into_response()).await;
         assert!(ids.iter().any(|id| id.starts_with("alex/")));
-        assert!(
-            ids.iter().all(|id| !id.starts_with("alex/")),
-            "legacy alex/* ids leaked into /v1/models: {ids:?}"
-        );
     }
 
     #[tokio::test]
@@ -19739,7 +19766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protection_endpoint_round_trips_persists_and_applies_live_policy() {
+    async fn protection_endpoint_round_trips_but_does_not_add_middleware_rules() {
         let state = test_state("admin-protection");
         let persister = Arc::new(RecordingProtectionPolicyPersister::default());
         set_protection_policy_persister(&state, persister.clone());
@@ -19868,8 +19895,8 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true, "trace={trace}");
-        assert_eq!(trace["served_model"], "gpt-5.6-sol");
+        assert_eq!(trace["substituted"], false, "trace={trace}");
+        assert!(trace["served_model"].is_null());
         server.abort();
     }
 
@@ -21161,7 +21188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_down_provider_reroutes_unless_no_substitute_is_set() {
+    async fn paused_down_provider_is_not_covered_by_the_fable_fallback() {
         let policy = ProtectionPolicy {
             enabled: true,
             reroute_on_auth: false,
@@ -21194,8 +21221,8 @@ mod tests {
             .remove(0);
         assert_eq!(trace["error_kind"], "provider_paused");
         assert_eq!(trace["error_class"], "server");
-        assert_eq!(trace["substituted"], true);
-        assert_eq!(trace["served_model"], "claude-sonnet-5");
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["served_model"].is_null());
 
         let no_substitute = test_state("provider-pause-down-no-substitute");
         set_protection_policy(&no_substitute, policy);
@@ -21276,50 +21303,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fable_fixture_reroutes_to_sol_then_session_lease_skips_anthropic() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    async fn fable_fixture_reroutes_to_sol_for_one_request_then_returns_to_fable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let acceptance = fable_acceptance_contract();
-        let overload_case = fable_acceptance_case(&acceptance, "overload-reroute-and-lease");
-        let recovery_case =
-            fable_acceptance_case(&acceptance, "recovery-returns-after-lease-expiry");
+        let fallback_case = fable_acceptance_case(&acceptance, "fable-failure-reroutes-request");
+        let next_case = fable_acceptance_case(&acceptance, "next-request-returns-to-fable");
 
         let anthropic_requests = Arc::new(AtomicUsize::new(0));
         let openai_requests = Arc::new(AtomicUsize::new(0));
-        let anthropic_recovered = Arc::new(AtomicBool::new(false));
         let anthropic_seen = anthropic_requests.clone();
-        let recovered = anthropic_recovered.clone();
         let openai_seen = openai_requests.clone();
         let upstream = Router::new()
             .route(
                 "/v1/messages",
                 post(move || {
                     let seen = anthropic_seen.clone();
-                    let recovered = recovered.clone();
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
-                        if recovered.load(Ordering::SeqCst) {
-                            (
-                                StatusCode::OK,
-                                axum::Json(json!({
-                                    "id": "msg_fable_recovered",
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "model": "claude-fable-5",
-                                    "content": [{"type": "text", "text": "Fable recovered"}],
-                                    "stop_reason": "end_turn",
-                                    "usage": {"input_tokens": 3, "output_tokens": 2}
-                                })),
-                            )
-                        } else {
-                            (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                axum::Json(json!({
-                                "type": "error",
-                                "error": {"type": "overloaded_error", "message": "unexpected Anthropic request"}
-                                })),
-                            )
-                        }
+                        axum::Json(json!({
+                            "id": "msg_fable_recovered",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "claude-fable-5",
+                            "content": [{"type": "text", "text": "Fable handled the next request"}],
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 3, "output_tokens": 2}
+                        }))
                     }
                 }),
             )
@@ -21339,7 +21349,7 @@ mod tests {
                                 "id": "msg_sol_middleware",
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "output_text", "text": "Sol handled the turn", "annotations": []}]
+                                "content": [{"type": "output_text", "text": "Sol handled the failed request", "annotations": []}]
                             }],
                             "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9}
                         }))
@@ -21352,7 +21362,7 @@ mod tests {
             axum::serve(listener, upstream).await.unwrap();
         });
 
-        let state = test_state("middleware-fable-sol-lease");
+        let state = test_state("middleware-fable-sol-request");
         state
             .vault
             .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
@@ -21365,9 +21375,8 @@ mod tests {
             .unwrap();
         set_upstream_base_override(&state, Provider::Anthropic, format!("http://{address}"));
         set_upstream_base_override(&state, Provider::Openai, format!("http://{address}"));
-        let fixture_root = tmpdir("middleware-fable-sol-fixtures");
-        set_fixture_dir(&state, fixture_root.join("fixtures"));
-        enable_fable_to_sol_preset(&state);
+        set_fixture_dir(&state, tmpdir("middleware-fable-sol-fixtures"));
+
         let injected = admin_session_inject(
             State(state.clone()),
             Path("session-fable-sol".into()),
@@ -21383,7 +21392,6 @@ mod tests {
                 "x-session-id",
                 HeaderValue::from_static("session-fable-sol"),
             );
-            headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
             proxy(
                 state.clone(),
                 ClientFormat::AnthropicMessages,
@@ -21398,32 +21406,13 @@ mod tests {
 
         let (first_status, first) = response_json(request().await).await;
         assert_eq!(first_status, StatusCode::OK, "{first}");
-        let first_text = first["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(first_text.contains("We moved this chat from Fable 5"));
-        assert!(first_text.contains("Sol handled the turn"));
-        assert_eq!(first["model"], "claude-fable-5");
+        assert_eq!(
+            first["content"][0]["text"],
+            "Sol handled the failed request"
+        );
         assert_eq!(openai_requests.load(Ordering::SeqCst), 1);
         assert_eq!(anthropic_requests.load(Ordering::SeqCst), 0);
-
-        let leases = middleware_leases_snapshot(&state);
-        assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].session_id, "session-fable-sol");
-        assert_eq!(leases[0].original_model, "claude-fable-5");
-
-        let (second_status, second) = response_json(request().await).await;
-        assert_eq!(second_status, StatusCode::OK, "{second}");
-        assert_eq!(openai_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            anthropic_requests.load(Ordering::SeqCst),
-            0,
-            "the active session lease must bypass Anthropic"
-        );
+        assert!(middleware_leases_snapshot(&state).is_empty());
 
         let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
         let first_trace = traces
@@ -21433,158 +21422,35 @@ mod tests {
         let attempts = first_trace["attempts"].as_array().expect("attempt records");
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0]["status"], 529);
-        assert_eq!(attempts[1]["provider"], "openai");
-        assert_eq!(attempts[1]["status"], 200);
-        assert_eq!(attempts[1]["middleware_decisions"], json!([]));
+        assert_eq!(
+            attempts[1]["provider"],
+            fallback_case["expected"]["provider"]
+        );
+        assert_eq!(attempts[1]["model"], fallback_case["expected"]["model"]);
         let decision = attempts[0]["middleware_decisions"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_ID)
             .unwrap();
         assert_eq!(decision["executed"], true);
         assert!(decision["explanation"].as_str().unwrap().contains(
-            overload_case["expected"]["explanation_contains"]
+            fallback_case["expected"]["explanation_contains"]
                 .as_str()
                 .unwrap()
         ));
-        assert!(first_trace["substitution_reason"]
-            .as_str()
-            .unwrap()
-            .contains(
-                overload_case["expected"]["explanation_contains"]
-                    .as_str()
-                    .unwrap()
-            ));
 
-        {
-            let mut leases = state.middleware_leases.lock().unwrap();
-            for lease in leases.values_mut() {
-                lease.expires_ms = now_ms() - 1;
-            }
-        }
-        anthropic_recovered.store(true, Ordering::SeqCst);
-        let (recovered_status, recovered_body) = response_json(request().await).await;
-        assert_eq!(recovered_status, StatusCode::OK, "{recovered_body}");
-        assert_eq!(recovered_body["model"], "claude-fable-5");
-        assert_eq!(recovered_body["content"][0]["text"], "Fable recovered");
-        assert_eq!(openai_requests.load(Ordering::SeqCst), 2);
+        let (second_status, second) = response_json(request().await).await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert_eq!(
+            second["content"][0]["text"],
+            "Fable handled the next request"
+        );
+        assert_eq!(openai_requests.load(Ordering::SeqCst), 1);
         assert_eq!(anthropic_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(next_case["expected"]["provider"], "anthropic");
         assert!(middleware_leases_snapshot(&state).is_empty());
-
-        let recovered_trace = state
-            .store
-            .search_traces(&TraceFilter::default())
-            .unwrap()
-            .into_iter()
-            .find(|trace| {
-                trace["substitution_reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("lease expired"))
-            })
-            .expect("trace explaining the expired lease return");
-        assert_eq!(
-            recovered_trace["upstream_provider"],
-            recovery_case["expected"]["provider"]
-        );
-        assert_eq!(
-            recovered_trace["routed_model"],
-            recovery_case["expected"]["model"]
-        );
-        assert_eq!(
-            recovered_trace["status"],
-            recovery_case["expected"]["status"]
-        );
-        assert_eq!(recovered_trace["substituted"], false);
-        assert!(recovered_trace["substitution_reason"]
-            .as_str()
-            .unwrap()
-            .contains(
-                recovery_case["expected"]["explanation_contains"]
-                    .as_str()
-                    .unwrap()
-            ));
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn fable_nonmatching_error_returns_original_with_trace_explanation() {
-        let acceptance = fable_acceptance_contract();
-        let case = fable_acceptance_case(&acceptance, "non-matching-error-is-returned");
-        let state = test_state("middleware-fable-nonmatch");
-        state
-            .vault
-            .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
-            .await
-            .unwrap();
-        state
-            .vault
-            .upsert(test_api_account("openai-sol", Provider::Openai))
-            .await
-            .unwrap();
-        set_fixture_dir(&state, tmpdir("middleware-fable-nonmatch-fixtures"));
-        enable_fable_to_sol_preset(&state);
-        let fixture = case["failure_fixture"].as_str().unwrap();
-        let injected = admin_session_inject(
-            State(state.clone()),
-            Path("session-fable-nonmatch".into()),
-            axum::Json(json!({"fixture": fixture})),
-        )
-        .await;
-        assert_eq!(injected.status(), StatusCode::CREATED);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
-        headers.insert(
-            "x-session-id",
-            HeaderValue::from_static("session-fable-nonmatch"),
-        );
-        headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
-        let (status, body) = response_json(
-            proxy(
-                state.clone(),
-                ClientFormat::AnthropicMessages,
-                "/v1/messages",
-                headers,
-                Bytes::from_static(
-                    br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"test non-match"}]}"#,
-                ),
-                None,
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(
-            status.as_u16(),
-            case["expected"]["status"].as_u64().unwrap() as u16
-        );
-        assert_eq!(body["error"]["type"], "api_error");
-        assert!(middleware_leases_snapshot(&state).is_empty());
-
-        let trace = state
-            .store
-            .search_traces(&TraceFilter::default())
-            .unwrap()
-            .into_iter()
-            .find(|trace| trace["fixture_name"] == fixture)
-            .unwrap();
-        assert_eq!(trace["upstream_provider"], case["expected"]["provider"]);
-        assert_eq!(trace["routed_model"], case["expected"]["model"]);
-        assert_eq!(trace["substituted"], false);
-        let attempts = trace["attempts"].as_array().unwrap();
-        assert_eq!(attempts.len(), 1);
-        let decision = attempts[0]["middleware_decisions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
-            .unwrap();
-        assert_eq!(decision["state"], "not_matched");
-        assert!(decision["executed"].is_null());
-        assert!(decision["explanation"]
-            .as_str()
-            .unwrap()
-            .contains(case["expected"]["explanation_contains"].as_str().unwrap()));
     }
 
     #[tokio::test]
@@ -21657,7 +21523,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_EXAMPLE_ID)
+            .find(|record| record["rule_id"] == alex_middleware::FABLE_TO_SOL_ID)
             .unwrap();
         assert_eq!(decision["state"], "matched");
         assert_eq!(decision["action"], "reroute");
@@ -21748,7 +21614,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|rule| rule["id"] == alex_middleware::ACCOUNT_FAILOVER_ID));
+            .any(|rule| rule["id"] == alex_middleware::FABLE_TO_SOL_ID));
 
         let mut rule = alex_middleware::fable_to_sol_rule();
         rule.id = "custom.fable-to-sol".into();
@@ -21763,7 +21629,7 @@ mod tests {
         .await;
         assert_eq!(validation_status, StatusCode::OK);
         assert_eq!(validation["valid"], true);
-        assert_eq!(validation["body_inspection_required"], true);
+        assert_eq!(validation["body_inspection_required"], false);
 
         let (created_status, created) = response_json(
             admin_middleware_rule_create(State(state.clone()), axum::Json(rule.clone())).await,
@@ -21835,7 +21701,7 @@ mod tests {
         assert!(dry_record["explanation"]
             .as_str()
             .unwrap()
-            .contains("Fable failed with a selected overload or availability error"));
+            .contains("Fable 5 failed; retrying with GPT-5.6 Sol"));
         let (_, after_dry_run) = response_json(admin_middleware(State(state.clone())).await).await;
         assert!(after_dry_run["rules"]
             .as_array()
@@ -21899,7 +21765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_protection_is_opt_in_and_uses_the_cross_provider_equivalency() {
+    async fn auth_protection_config_does_not_add_a_fable_auth_fallback() {
         let state = test_state("auth-protection-equivalency");
         set_protection_policy(
             &state,
@@ -21944,10 +21810,10 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true);
-        assert_eq!(trace["substitution_reason"], "auth");
-        assert_eq!(trace["original_model"], "claude-fable-5");
-        assert_eq!(trace["served_model"], "gpt-5.6-sol");
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["substitution_reason"].is_null());
+        assert!(trace["original_model"].is_null());
+        assert!(trace["served_model"].is_null());
     }
 
     #[tokio::test]
@@ -22024,7 +21890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simulated_capacity_rotates_to_a_second_account_and_records_the_attempts() {
+    async fn non_fable_capacity_does_not_run_account_failover_middleware() {
         let state = test_state("simulated-account-failover");
         state
             .vault
@@ -22048,13 +21914,9 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true);
-        assert_eq!(trace["original_model"], "gpt-5.5");
-        assert_eq!(trace["served_model"], "gpt-5.5");
-        assert_eq!(trace["original_account_id"], "openai-a");
-        assert_eq!(trace["served_account_id"], "openai-b");
-        assert_eq!(trace["substitution_reason"], "capacity");
-        assert_eq!(trace["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["original_model"].is_null());
+        assert!(trace["served_model"].is_null());
     }
 
     #[tokio::test]
@@ -22083,7 +21945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simulated_cross_model_fallback_requires_explicit_configuration() {
+    async fn legacy_substitution_config_does_not_add_middleware_rules() {
         let mut substitution = SubstitutionConfig {
             enabled: true,
             fallbacks: BTreeMap::new(),
@@ -22114,10 +21976,9 @@ mod tests {
             .search_traces(&TraceFilter::default())
             .unwrap()
             .remove(0);
-        assert_eq!(trace["substituted"], true);
-        assert_eq!(trace["original_model"], "gpt-5.5");
-        assert_eq!(trace["served_model"], "claude-sonnet-5");
-        assert_eq!(trace["served_account_id"], "anthropic-fallback");
+        assert_eq!(trace["substituted"], false);
+        assert!(trace["original_model"].is_null());
+        assert!(trace["served_model"].is_null());
     }
 
     #[tokio::test]
