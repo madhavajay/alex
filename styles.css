@@ -52,6 +52,11 @@ a {
   color: inherit;
 }
 
+img {
+  max-width: 100%;
+  height: auto;
+}
+
 .skip-link {
   position: fixed;
   z-index: 20;
@@ -125,6 +130,9 @@ a {
   display: grid !important;
   width: 34px;
   height: 34px;
+  max-width: 34px;
+  max-height: 34px;
+  flex: 0 0 34px;
   place-items: center;
   border-radius: 9px;
   color: white;
@@ -331,6 +339,8 @@ h2 {
   place-items: center;
   width: 18px;
   height: 18px;
+  max-width: 18px;
+  max-height: 18px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 5px;
   color: #fff;
@@ -360,7 +370,8 @@ h2 {
 .provider-list img { width: 25px; height: 25px; object-fit: contain; border-radius: 6px; }
 .moa-model-bubble { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
 .moa-model-bubble span { display: inline-flex; align-items: center; gap: 7px; min-height: 42px; padding: 6px 13px; border: 1px solid rgba(255,255,255,.1); border-radius: 999px; color: var(--foreground); background: rgba(255,255,255,.07); font-family: var(--mono); font-size: 12px; font-weight: 700; }
-.moa-model-bubble img { width: 25px; height: 25px; object-fit: contain; border-radius: 6px; }
+.moa-model-bubble img { width: 25px; height: 25px; max-width: 25px; max-height: 25px; flex: 0 0 25px; object-fit: contain; border-radius: 6px; }
+.moa-model-bubble .moa-alex-chip img { width: 22px; height: 22px; max-width: 22px; max-height: 22px; flex-basis: 22px; }
 .moa-model-bubble .moa-alex-chip { border-color: rgba(10,132,255,.38); color: #eaf4ff; background: rgba(10,132,255,.14); }
 .moa-model-bubble b { color: var(--primary); font-size: 16px; }
 .how-image { display: block; width: min(100%, 620px); max-height: 360px; margin-top: 14px; object-fit: contain; object-position: left top; border: 1px solid var(--border); border-radius: 10px; }
