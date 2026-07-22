@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_xai_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"grok-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Fake Grok response."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_xai_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"grok-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}
+
+data: [DONE]
+

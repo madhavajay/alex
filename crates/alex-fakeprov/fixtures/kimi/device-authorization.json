@@ -1,0 +1,8 @@
+{
+  "device_code": "kimi_device_fakeprov_0001",
+  "user_code": "KIMI-FAKE",
+  "verification_uri": "https://www.kimi.com/code/authorize_device",
+  "verification_uri_complete": "https://www.kimi.com/code/authorize_device?user_code=KIMI-FAKE",
+  "expires_in": 900,
+  "interval": 1
+}

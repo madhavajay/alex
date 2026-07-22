@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_openrouter_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"anthropic/claude-3.5-sonnet","choices":[{"index":0,"delta":{"role":"assistant","content":"Fake OpenRouter response."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_openrouter_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"anthropic/claude-3.5-sonnet","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

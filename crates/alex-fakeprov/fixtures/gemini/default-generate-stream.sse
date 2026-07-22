@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Fake Gemini "}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"gemini_fakeprov_stream_0001"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"response."}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":12},"modelVersion":"gemini-2.5-pro","responseId":"gemini_fakeprov_stream_0001"}
+

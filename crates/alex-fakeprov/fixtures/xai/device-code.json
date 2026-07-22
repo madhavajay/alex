@@ -1,0 +1,8 @@
+{
+  "device_code": "xai_device_fakeprov_0001",
+  "user_code": "XAI-FAKE",
+  "verification_uri": "https://x.ai/device",
+  "verification_uri_complete": "https://x.ai/device?user_code=XAI-FAKE",
+  "expires_in": 900,
+  "interval": 1
+}

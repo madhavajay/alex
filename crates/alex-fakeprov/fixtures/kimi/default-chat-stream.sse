@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_kimi_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"role":"assistant","content":"Fake Kimi response."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_kimi_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"kimi-for-coding","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}
+
+data: [DONE]
+

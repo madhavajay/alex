@@ -1,0 +1,7 @@
+{
+  "headers": {
+    "content-type": "application/grpc-web+proto",
+    "grpc-status": "0"
+  },
+  "encoding": "hex"
+}

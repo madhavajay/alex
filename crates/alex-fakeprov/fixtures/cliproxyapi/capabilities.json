@@ -1,0 +1,14 @@
+{
+  "object": "alex.capabilities",
+  "alex_version": "0.0.0-fakeprov",
+  "integrations": {
+    "cliproxyapi_reverse": {
+      "schema": "alex.cliproxyapi.reverse/v1",
+      "minimum_cliproxyapi_major": 7,
+      "protocols": ["openai-chat", "openai-responses", "anthropic-messages"],
+      "capabilities": ["openai-chat", "openai-responses", "anthropic-messages", "streaming", "tool-calls", "structured-errors", "trace-correlation"],
+      "correlation_response_header": "x-alex-trace-id",
+      "route_chain_header": "x-alex-route-chain"
+    }
+  }
+}

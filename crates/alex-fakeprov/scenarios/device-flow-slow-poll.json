@@ -1,0 +1,14 @@
+{
+  "endpoints": {
+    "POST /xai/oauth2/token": [
+      {"status": 400, "body": {"error": "authorization_pending"}},
+      {"status": 400, "body": {"error": "authorization_pending"}},
+      {"fixture": "xai/token.json", "repeat": true}
+    ],
+    "POST /kimi/api/oauth/token": [
+      {"status": 400, "body": {"error": "authorization_pending"}},
+      {"status": 400, "body": {"error": "authorization_pending"}},
+      {"fixture": "kimi/token.json", "repeat": true}
+    ]
+  }
+}

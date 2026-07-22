@@ -1,0 +1,5 @@
+{
+  "endpoints": {
+    "GET /openrouter/api/v1/models": [{"body": {"data": []}, "repeat": true}]
+  }
+}

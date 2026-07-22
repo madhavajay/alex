@@ -1,0 +1,8 @@
+{
+  "id": "chatcmpl_exo_fakeprov_0001",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "llama-3.2-3b",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "Fake Exo response."}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
+}
