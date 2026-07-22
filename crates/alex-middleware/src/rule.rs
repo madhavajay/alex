@@ -36,6 +36,10 @@ pub struct RuleSpecV1 {
     pub description: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Emit an opt-in match diagnostic for every response attempt. Debug rules
+    /// may require response-prefix inspection even when the response succeeds.
+    #[serde(default)]
+    pub debug: bool,
     #[serde(default)]
     pub priority: i32,
     pub hook: HookPoint,
@@ -54,8 +58,12 @@ pub struct RuleSpecV1 {
 pub struct MatchConditionsV1 {
     pub harness_names: Vec<String>,
     pub harness_versions: Vec<String>,
+    /// Full Rust regular expressions. Values inside each field are ORed.
+    pub harness_name_regex: Vec<String>,
+    pub harness_version_regex: Vec<String>,
     /// Matches either the originally requested or current selected model.
     pub models: Vec<String>,
+    pub model_regex: Vec<String>,
     pub original_models: Vec<String>,
     pub current_models: Vec<String>,
     pub model_aliases: Vec<String>,
@@ -63,8 +71,11 @@ pub struct MatchConditionsV1 {
     /// Optional reasoning effort/thinking level on the incoming request.
     pub efforts: Vec<String>,
     pub providers: Vec<String>,
+    pub provider_regex: Vec<String>,
     pub exclude_providers: Vec<String>,
     pub status: Vec<StatusMatcherSpec>,
+    pub status_regex: Vec<String>,
+    pub response_header_regex: Vec<HeaderRegexMatcherV1>,
     pub error_classes: Vec<ErrorClass>,
     pub error_kinds: Vec<String>,
     pub error_codes: Vec<String>,
@@ -143,6 +154,12 @@ impl From<u16> for StatusMatcherSpec {
     fn from(value: u16) -> Self {
         Self::Exact(value)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeaderRegexMatcherV1 {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

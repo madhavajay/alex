@@ -7,6 +7,22 @@ import Testing
         JsonSyntax.tokenize(source).map(\.type)
     }
 
+    @Test func prettyPrintsValidJSONWithStableKeys() throws {
+        let formatted = try #require(JSONTextFormatting.prettyPrinted(#"{"z":1,"a":{"enabled":true}}"#))
+        #expect(formatted == """
+        {
+          "a" : {
+            "enabled" : true
+          },
+          "z" : 1
+        }
+        """)
+    }
+
+    @Test func formattingRejectsIncompleteJSON() {
+        #expect(JSONTextFormatting.prettyPrinted(#"{"name":"unfinished""#) == nil)
+    }
+
     @Test func distinguishesKeysFromStringValues() {
         let tokens = JsonSyntax.tokenize(#"{"name": "value"}"#)
         #expect(tokens.contains(JsonSyntax.Token(.key, "\"name\"")))

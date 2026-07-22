@@ -10,18 +10,28 @@ import Testing
         #expect(rule.id == "fable-overload-to-sol")
         #expect(rule.name == "Fable 5 → GPT-5.6 Sol")
         #expect(rule.enabled)
+        #expect(!rule.debug)
         #expect(rule.priority == 100)
         #expect(rule.hook == .attemptResult)
-        #expect(rule.capabilities == ["route.override", "session.pin"])
+        #expect(rule.capabilities == [
+            "attempt.read_error_body", "route.override", "session.pin",
+        ])
         #expect(rule.expression == nil)
         #expect(rule.when.harnessNames == nil)
-        #expect(rule.when.models == ["claude-fable-5"])
+        #expect(rule.when.harnessNameRegex == nil)
+        #expect(rule.when.harnessVersionRegex == nil)
+        #expect(rule.when.models == nil)
+        #expect(rule.when.modelRegex == ["^claude-fable-5$"])
         #expect(rule.when.efforts == nil)
-        #expect(rule.when.providers == ["anthropic"])
+        #expect(rule.when.providers == nil)
+        #expect(rule.when.providerRegex == ["^anthropic$"])
         #expect(rule.when.status == nil)
+        #expect(rule.when.statusRegex == ["^200$"])
+        #expect(rule.when.responseHeaderRegex == nil)
         #expect(rule.when.errorClasses == nil)
-        #expect(rule.when.errorKinds == ["upstream_refusal"])
+        #expect(rule.when.errorKinds == nil)
         #expect(rule.when.bodyContainsAny == nil)
+        #expect(rule.when.bodyRegex == [MiddlewareWizardDraft.fableRefusalBodyRegex])
         #expect(rule.when.stableSession == true)
         #expect(rule.then.retrySameRoute == nil)
         #expect(rule.then.reroute?.model == "gpt-5.6-sol")
@@ -35,7 +45,20 @@ import Testing
         #expect(rule.then.reroute?.requiredCapabilities.portableHistory == true)
     }
 
-    @Test func fableRuleEncodesGuardrailAndReplacementEffort() throws {
+    @Test func ruleDebugFlagDefaultsOffAndRoundTrips() throws {
+        let legacyJSON = #"{"id":"rule","name":"Rule","hook":"attempt_result","when":{},"then":{"continue":true}}"#
+        let legacy = try JSONDecoder().decode(
+            MiddlewareRuleSpecV1.self, from: Data(legacyJSON.utf8))
+        #expect(!legacy.debug)
+
+        var debugRule = legacy
+        debugRule.debug = true
+        let data = try JSONEncoder().encode(debugRule)
+        let decoded = try JSONDecoder().decode(MiddlewareRuleSpecV1.self, from: data)
+        #expect(decoded.debug)
+    }
+
+    @Test func fableRuleRoundTripsWithSnakeCaseRegexFields() throws {
         let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
             id: "fable-overload-to-sol")
         let data = try JSONEncoder().encode(rule)
@@ -47,14 +70,26 @@ import Testing
         #expect(json["api_version"] == nil)
         #expect(json["built_in"] == nil)
         #expect(match["harness_names"] == nil)
+        #expect(match["harness_name_regex"] == nil)
         #expect(match["body_contains_any"] == nil)
-        #expect(match["models"] as? [String] == ["claude-fable-5"])
-        #expect(match["error_kinds"] as? [String] == ["upstream_refusal"])
+        #expect(match["models"] == nil)
+        #expect(match["model_regex"] as? [String] == ["^claude-fable-5$"])
+        #expect(match["providers"] == nil)
+        #expect(match["provider_regex"] as? [String] == ["^anthropic$"])
         #expect(match["status"] == nil)
+        #expect(match["status_regex"] as? [String] == ["^200$"])
+        #expect(match["response_header_regex"] == nil)
+        #expect(match["body_regex"] as? [String] == [
+            MiddlewareWizardDraft.fableRefusalBodyRegex,
+        ])
+        #expect(match["error_kinds"] == nil)
         #expect(reroute["ttl_seconds"] as? Int == 86_400)
         #expect(reroute["scope"] as? String == "session")
         #expect(reroute["provider_mode"] as? String == "only")
         #expect(reroute["effort"] as? String == "high")
+
+        let decoded = try JSONDecoder().decode(MiddlewareRuleSpecV1.self, from: data)
+        #expect(decoded == rule)
     }
 
     @Test func dryRunResponseDerivesMatchAndSummaryFromDaemonRecords() throws {
@@ -114,20 +149,6 @@ import Testing
         #expect(validation.warnings[0].message == "fallback response will be buffered")
     }
 
-    @Test func anyConditionBuildsNestedRuleExpression() throws {
-        var draft = MiddlewareWizardDraft.fableToSolExample
-        draft.conditionMode = .any
-        let rule = try draft.makeRule(id: "fable-any")
-        #expect(rule.when.status == nil)
-        #expect(rule.when.errorClasses == nil)
-        #expect(rule.when.bodyContainsAny == nil)
-        guard case let .some(.any(alternatives)) = rule.expression else {
-            Issue.record("Expected an any expression")
-            return
-        }
-        #expect(alternatives.count == 1)
-    }
-
     @Test func ruleRoundTripsDaemonStatusMetadata() throws {
         let json = #"""
         {
@@ -156,34 +177,60 @@ import Testing
         #expect(decoded == rule)
     }
 
-    @Test func wizardRejectsBodyMatchingAtRequestHookAndUnsafeSessionChoice() {
-        var draft = MiddlewareWizardDraft.fableToSolExample
-        draft.hook = .requestReceived
-        draft.scope = .session
-        draft.stableSessionRequired = false
+    @Test func wizardReportsRequiredFieldsInvalidRegexAndProviderSelection() {
+        var draft = MiddlewareWizardDraft()
+        draft.harnessNameRegex = "["
+        draft.modelRegex = "(unterminated"
+        draft.providerMode = .only
         let errors = draft.localValidationErrors
-        #expect(errors.contains("Failure and body conditions require the Failed attempt hook."))
-        #expect(errors.contains("Session routing requires a stable session identifier policy."))
+        #expect(errors.contains("Enter a name."))
+        #expect(errors.contains("Harness name regex is invalid."))
+        #expect(errors.contains("Model regex is invalid."))
+        #expect(errors.contains("Choose a target model."))
+        #expect(errors.contains("Choose at least one target provider."))
         #expect(throws: MiddlewareWizardBuildError.self) {
             try draft.makeRule()
         }
     }
 
-    @Test func builtInRuleProjectsBackToExactWizardValues() throws {
-        let rule = try MiddlewareWizardDraft.fableToSolExample.makeRule(
-            id: "alex.fable-5-to-gpt-5.6-sol")
+    @Test func legacyRuleProjectsListsAndRefusalIntoRegexDraft() {
+        let rule = MiddlewareRuleSpecV1(
+            id: "legacy-fable-fallback",
+            name: "Legacy Fable fallback",
+            priority: 42,
+            hook: .attemptResult,
+            capabilities: ["route.override", "session.pin"],
+            when: .init(
+                harnessNames: ["claude", "pi"],
+                harnessVersions: ["1.0+beta"],
+                models: ["claude-fable-5", "claude-fable-5.1"],
+                efforts: ["high"],
+                providers: ["anthropic", "bedrock"],
+                status: [.exact(200), .exact(429), .pattern("5xx")],
+                errorKinds: ["upstream_refusal"]),
+            then: .init(reroute: .init(
+                model: "gpt-5.6-sol",
+                providerMode: .only,
+                providers: ["openai"],
+                scope: .session,
+                ttlSeconds: 3_600,
+                effort: "xhigh")))
         let draft = MiddlewareWizardDraft(rule: rule)
 
-        #expect(draft.modelPattern == "claude-fable-5")
-        #expect(draft.sourceProvider == "anthropic")
-        #expect(draft.sourceEffort.isEmpty)
-        #expect(draft.errorKinds == [.refusal])
-        #expect(draft.bodyPhrases.isEmpty)
+        #expect(draft.harnessNameRegex == "^(claude|pi)$")
+        #expect(draft.harnessVersionRegex == #"^1\.0\+beta$"#)
+        #expect(draft.modelRegex == "^(claude-fable-5|claude-fable-5\\.1)$")
+        #expect(draft.providerRegex == "^(anthropic|bedrock)$")
+        #expect(draft.sourceEffort == "high")
+        #expect(draft.statusRegex == #"^(200|429|5\d\d)$"#)
+        #expect(draft.bodyRegex == MiddlewareWizardDraft.fableRefusalBodyRegex)
         #expect(draft.targetModel == "gpt-5.6-sol")
-        #expect(draft.targetEffort == "high")
+        #expect(draft.targetEffort == "xhigh")
+        #expect(draft.providerMode == .only)
         #expect(draft.targetProviders == ["openai"])
-        #expect(draft.scope == .session)
-        #expect(draft.ttlSeconds == 86_400)
+        #expect(draft.ttlSeconds == 3_600)
+        #expect(draft.priority == 42)
+        #expect(!draft.includeNotice)
         #expect(draft.notice == MiddlewareWizardDraft.defaultNoticeTemplate)
     }
 
@@ -198,23 +245,51 @@ import Testing
         var draft = MiddlewareWizardDraft.fableToSolExample
         draft.includeNotice = true
         let rule = try draft.makeRule(id: "fable-notice")
-        #expect(rule.then.reroute?.notice == "Alex switched from {from_model} to {to_model}.")
+        #expect(rule.then.reroute?.notice == MiddlewareWizardDraft.defaultNoticeTemplate)
         #expect(rule.capabilities.contains("response.prepend_text"))
     }
 
-    @Test func retryWizardBuildsRetryActionWithoutReroute() throws {
+    @Test func responseHeaderLinesParseIntoKeyValueRegexMatchers() throws {
         var draft = MiddlewareWizardDraft(
-            name: "Retry server errors",
-            modelPattern: "gpt-*",
-            hook: .attemptResult,
-            errorKinds: [.server],
-            action: .retrySame)
-        draft.statusText = "5xx"
+            name: "Route throttled JSON responses",
+            responseHeaderRegexText: #"^x-request-id$ => ^req-\d+$"# + "\n"
+                + #"^content-type$ => ^application/json(?:;.*)?$"#,
+            targetModel: "gpt-5.6-sol",
+            providerMode: .any)
 
-        let rule = try draft.makeRule()
-        #expect(rule.id == "retry-server-errors")
-        #expect(rule.then.retrySameRoute != nil)
-        #expect(rule.then.reroute == nil)
-        #expect(rule.when.status == [.pattern("5xx")])
+        #expect(draft.responseHeaderMatchers == [
+            .init(key: "^x-request-id$", value: #"^req-\d+$"#),
+            .init(key: "^content-type$", value: "^application/json(?:;.*)?$"),
+        ])
+        #expect(draft.localValidationErrors.isEmpty)
+
+        let rule = try draft.makeRule(id: "header-route")
+        #expect(rule.when.responseHeaderRegex == draft.responseHeaderMatchers)
+
+        draft.responseHeaderRegexText = "missing separator\n[ => ok\nok => ("
+        #expect(draft.localValidationErrors.contains(
+            "Header matcher line 1 must use key-regex => value-regex."))
+        #expect(draft.localValidationErrors.contains(
+            "Header matcher line 2 has an invalid key regex."))
+        #expect(draft.localValidationErrors.contains(
+            "Header matcher line 3 has an invalid value regex."))
+    }
+
+    @Test func summaryDescribesRegexConditionsAndSessionReroute() {
+        let draft = MiddlewareWizardDraft(
+            name: "Fable JSON refusal",
+            harnessNameRegex: "^claude$",
+            modelRegex: "^claude-fable-5$",
+            providerRegex: "^anthropic$",
+            sourceEffort: "high",
+            statusRegex: "^200$",
+            responseHeaderRegexText: "^content-type$ => ^text/event-stream$",
+            bodyRegex: MiddlewareWizardDraft.fableRefusalBodyRegex,
+            targetModel: "gpt-5.6-sol",
+            targetEffort: "xhigh",
+            providerMode: .only,
+            targetProviders: ["openai"])
+
+        #expect(draft.summary == "When ^claude$ requests ^claude-fable-5$ at high effort through ^anthropic$ and the status matches ^200$, a response header matches, and the body matches the configured regex, route to gpt-5.6-sol at xhigh effort using OpenAI and keep it for the session.")
     }
 }

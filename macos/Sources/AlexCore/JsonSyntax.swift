@@ -1,5 +1,19 @@
 import Foundation
 
+public enum JSONTextFormatting {
+    /// Pretty-prints valid JSON while preserving scalar fragments and slash characters.
+    /// Returns nil for incomplete or invalid input so editors can leave it untouched.
+    public static func prettyPrinted(_ source: String) -> String? {
+        guard let data = source.data(using: .utf8),
+            let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+            let formatted = try? JSONSerialization.data(
+                withJSONObject: value,
+                options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes])
+        else { return nil }
+        return String(data: formatted, encoding: .utf8)
+    }
+}
+
 /// Lightweight JSON tokenizer for syntax highlighting, ported from the Trace
 /// Browser mock (shared.tsx:344-378). It is intentionally forgiving: invalid
 /// input degrades to punctuation/whitespace tokens rather than failing.

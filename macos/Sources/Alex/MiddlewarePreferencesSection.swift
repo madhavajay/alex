@@ -17,13 +17,11 @@ struct MiddlewarePreferencesSection: View {
     @State private var loadError: String?
     @State private var actionResult: String?
     @State private var actionIsError = false
-    @State private var showingWizard = false
-    @State private var wizardDraft = MiddlewareWizardDraft.fableToSolExample
-    @State private var wizardEditingID: String?
     @State private var inspectedRule: MiddlewareRuleSpecV1?
     @State private var pendingDelete: MiddlewareRuleSpecV1?
     @State private var activity: [MiddlewareActivityEvent] = []
     @State private var activityLoadError: String?
+    @State private var wizardWindow = MiddlewareWizardWindowController()
 
     private var builtIns: [MiddlewareRuleSpecV1] {
         (runtime?.rules ?? []).filter(\.isBuiltIn)
@@ -57,16 +55,6 @@ struct MiddlewarePreferencesSection: View {
             }
         }
         .task { await load() }
-        .sheet(isPresented: $showingWizard) {
-            MiddlewareWizard(
-                store: store,
-                draft: $wizardDraft,
-                editingRuleID: $wizardEditingID,
-                onSaved: {
-                    showingWizard = false
-                    Task { await load(showSpinner: false) }
-                })
-        }
         .sheet(item: $inspectedRule) { rule in
             MiddlewareRuleInspector(rule: rule)
         }
@@ -275,6 +263,15 @@ struct MiddlewarePreferencesSection: View {
                 .buttonStyle(.borderless)
                 .controlSize(.small)
                 .disabled(rule.map(isWizardEditable) != true)
+            if let rule {
+                Toggle("Debug", isOn: Binding(
+                    get: { rule.debug },
+                    set: { debug in Task { await setDebug(rule, debug) } }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.system(size: 10))
+                .help("Log why this rule matches or does not match every response attempt. Body rules may slow streamed responses.")
+            }
             Toggle("", isOn: Binding(
                 get: { rules.isEmpty ? policy.defaultEnabled : rules.allSatisfy(\.enabled) },
                 set: { enabled in Task { await setEnabled(rules, enabled) } }
@@ -347,6 +344,13 @@ struct MiddlewarePreferencesSection: View {
                     .foregroundStyle(AlexTheme.Colors.textFaint)
             }
             Spacer()
+            Toggle("Debug", isOn: Binding(
+                get: { rule.debug },
+                set: { debug in Task { await setDebug(rule, debug) } }
+            ))
+            .toggleStyle(.checkbox)
+            .font(.system(size: 10))
+            .help("Log why this rule matches or does not match every response attempt. Body rules may slow streamed responses.")
             Menu {
                 if isWizardEditable(rule) {
                     Button("Edit in Middleware Wizard") { edit(rule) }
@@ -671,6 +675,24 @@ struct MiddlewarePreferencesSection: View {
         }
     }
 
+    private func setDebug(_ rule: MiddlewareRuleSpecV1, _ debug: Bool) async {
+        guard let client = client() else { return report("No daemon configuration", error: true) }
+        var updated = rule
+        updated.debug = debug
+        updated.builtIn = nil
+        updated.hitCount = nil
+        updated.lastMatchedMs = nil
+        updated.validationErrors = nil
+        do {
+            _ = try await client.updateMiddlewareRule(updated)
+            await load(showSpinner: false)
+            report(debug
+                ? "Debug logging enabled for \(rule.name) — streamed body rules may be slower"
+                : "Debug logging disabled for \(rule.name)")
+        } catch is CancellationError {
+        } catch { report("Update failed: \(error.localizedDescription)", error: true) }
+    }
+
     private func delete(_ rule: MiddlewareRuleSpecV1) async {
         pendingDelete = nil
         guard let client = client() else { return report("No daemon configuration", error: true) }
@@ -693,23 +715,26 @@ struct MiddlewarePreferencesSection: View {
     }
 
     private func beginCreate() {
-        wizardDraft = .fableToSolExample
-        wizardEditingID = nil
-        showingWizard = true
+        showWizard(draft: .fableToSolExample, editingRuleID: nil)
     }
 
     private func edit(_ rule: MiddlewareRuleSpecV1) {
-        wizardDraft = MiddlewareWizardDraft(rule: rule)
-        wizardEditingID = rule.id
-        showingWizard = true
+        showWizard(draft: MiddlewareWizardDraft(rule: rule), editingRuleID: rule.id)
     }
 
     private func duplicateInWizard(_ rule: MiddlewareRuleSpecV1) {
         var draft = MiddlewareWizardDraft(rule: rule)
         draft.name += " Copy"
-        wizardDraft = draft
-        wizardEditingID = nil
-        showingWizard = true
+        showWizard(draft: draft, editingRuleID: nil)
+    }
+
+    private func showWizard(draft: MiddlewareWizardDraft, editingRuleID: String?) {
+        wizardWindow.show(
+            store: store,
+            draft: draft,
+            editingRuleID: editingRuleID,
+            onSaved: { Task { await load(showSpinner: false) } },
+            onOpenTraceBrowser: onOpenTraceBrowser)
     }
 
     private func report(_ message: String, error: Bool = false) {

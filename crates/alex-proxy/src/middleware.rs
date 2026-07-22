@@ -4,9 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alex_middleware::{
-    fable_to_sol_rule, AttemptResultContext, CompiledRuleSetV1, EvaluationControl,
-    EvaluationResult, ProviderModeV1, RuleSetV1, RuleSpecV1, ValidationError, ValidationErrorCode,
-    ValidationOptions, API_VERSION_V1,
+    fable_to_sol_rule, AttemptResultContext, Capability, CompiledRuleSetV1, EvaluationControl,
+    EvaluationResult, MatchConditionsV1, MatchExpressionV1, ProviderModeV1, RuleSetV1, RuleSpecV1,
+    ValidationError, ValidationErrorCode, ValidationOptions, API_VERSION_V1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -187,6 +187,30 @@ impl MiddlewareRuntime {
         self.compiled.inspection_plan(context)
     }
 
+    pub(crate) fn has_debug_attempt_rules(&self) -> bool {
+        self.settings.enabled && self.compiled.has_debug_attempt_rules()
+    }
+
+    pub(crate) fn debug_inspection_plan(
+        &self,
+        context: &AttemptResultContext,
+    ) -> alex_middleware::BodyInspectionPlan {
+        if !self.settings.enabled {
+            return Default::default();
+        }
+        self.compiled.debug_inspection_plan(context)
+    }
+
+    pub(crate) fn debug_attempt(
+        &self,
+        context: &AttemptResultContext,
+    ) -> Vec<alex_middleware::RuleDebugEvaluation> {
+        if !self.settings.enabled {
+            return Vec::new();
+        }
+        self.compiled.evaluate_debug_attempt(context)
+    }
+
     pub(crate) fn note_evaluation(&mut self, evaluation: &EvaluationResult) {
         let now = now_ms();
         for record in evaluation
@@ -244,10 +268,14 @@ impl MiddlewareRuntime {
 
     pub(crate) fn fable_refusal_interception_enabled(&self) -> bool {
         self.settings.enabled
-            && self
-                .rules
-                .iter()
-                .any(|rule| rule.id == alex_middleware::FABLE_TO_SOL_ID && rule.enabled)
+            && self.rules.iter().any(|rule| {
+                rule.enabled
+                    && (conditions_match_structured_refusal(&rule.when)
+                        || rule
+                            .expression
+                            .as_ref()
+                            .is_some_and(expression_matches_structured_refusal))
+            })
     }
 
     pub(crate) fn validate_rule(&self, rule: RuleSpecV1) -> Vec<ValidationError> {
@@ -426,6 +454,25 @@ impl MiddlewareRuntime {
     }
 }
 
+fn conditions_match_structured_refusal(conditions: &MatchConditionsV1) -> bool {
+    conditions
+        .error_kinds
+        .iter()
+        .any(|kind| kind == alex_middleware::FABLE_REFUSAL_KIND)
+        || !conditions.body_regex.is_empty()
+}
+
+fn expression_matches_structured_refusal(expression: &MatchExpressionV1) -> bool {
+    match expression {
+        MatchExpressionV1::All { all } => all.iter().any(expression_matches_structured_refusal),
+        MatchExpressionV1::Any { any } => any.iter().any(expression_matches_structured_refusal),
+        MatchExpressionV1::Not { not } => expression_matches_structured_refusal(not),
+        MatchExpressionV1::Conditions { conditions } => {
+            conditions_match_structured_refusal(conditions)
+        }
+    }
+}
+
 fn compile_rules(
     rules: &[RuleSpecV1],
     max_attempts: u32,
@@ -543,10 +590,43 @@ fn merge_by_id(defaults: Vec<RuleSpecV1>, overrides: &[RuleSpecV1]) -> Vec<RuleS
     }
     for rule in overrides {
         if !is_retired_builtin_id(&rule.id) {
-            rules.insert(rule.id.clone(), rule.clone());
+            let rule = migrate_legacy_fable_matcher(rule.clone());
+            rules.insert(rule.id.clone(), rule);
         }
     }
     rules.into_values().collect()
+}
+
+fn migrate_legacy_fable_matcher(mut rule: RuleSpecV1) -> RuleSpecV1 {
+    let legacy_matcher = rule.id == alex_middleware::FABLE_TO_SOL_ID
+        && rule.when.error_kinds == [alex_middleware::FABLE_REFUSAL_KIND]
+        && rule
+            .when
+            .models
+            .iter()
+            .any(|model| model == "claude-fable-5")
+        && rule
+            .when
+            .providers
+            .iter()
+            .any(|provider| provider == "anthropic");
+    if legacy_matcher {
+        rule.when.models.clear();
+        rule.when.providers.clear();
+        rule.when.error_kinds.clear();
+        rule.when.model_regex = vec![r"^claude-fable-5$".into()];
+        rule.when.provider_regex = vec![r"^anthropic$".into()];
+        rule.when.status_regex = vec![r"^200$".into()];
+        rule.when.body_regex = vec![alex_middleware::FABLE_REFUSAL_BODY_REGEX.into()];
+        if !rule
+            .capabilities
+            .contains(&Capability::AttemptReadErrorBody)
+        {
+            rule.capabilities
+                .insert(0, Capability::AttemptReadErrorBody);
+        }
+    }
+    rule
 }
 
 fn merged_rules(

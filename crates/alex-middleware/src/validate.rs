@@ -256,13 +256,33 @@ fn validate_conditions(
             ));
         }
     }
-    for (index, expression) in conditions.body_regex.iter().enumerate() {
-        if let Err(error) = Regex::new(expression) {
-            errors.push(ValidationError::new(
-                ValidationErrorCode::InvalidRegex,
-                format!("{path}.body_regex[{index}]"),
-                error.to_string(),
-            ));
+    for (field, expressions) in [
+        ("harness_name_regex", &conditions.harness_name_regex),
+        ("harness_version_regex", &conditions.harness_version_regex),
+        ("model_regex", &conditions.model_regex),
+        ("provider_regex", &conditions.provider_regex),
+        ("status_regex", &conditions.status_regex),
+        ("body_regex", &conditions.body_regex),
+    ] {
+        for (index, expression) in expressions.iter().enumerate() {
+            if let Err(error) = Regex::new(expression) {
+                errors.push(ValidationError::new(
+                    ValidationErrorCode::InvalidRegex,
+                    format!("{path}.{field}[{index}]"),
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    for (index, matcher) in conditions.response_header_regex.iter().enumerate() {
+        for (field, expression) in [("key", &matcher.key), ("value", &matcher.value)] {
+            if let Err(error) = Regex::new(expression) {
+                errors.push(ValidationError::new(
+                    ValidationErrorCode::InvalidRegex,
+                    format!("{path}.response_header_regex[{index}].{field}"),
+                    error.to_string(),
+                ));
+            }
         }
     }
     for (field, phrases) in [
@@ -823,6 +843,7 @@ mod tests {
             name: "Test".into(),
             description: None,
             enabled: true,
+            debug: false,
             priority: 0,
             hook: HookPoint::AttemptResult,
             capabilities: vec![Capability::RouteOverride],

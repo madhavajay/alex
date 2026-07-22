@@ -7,6 +7,7 @@ use crate::{
 /// the same public rule schema used by the Middleware Wizard.
 pub const FABLE_TO_SOL_ID: &str = "alex.fable-5-to-gpt-5.6-sol";
 pub const FABLE_REFUSAL_KIND: &str = "upstream_refusal";
+pub const FABLE_REFUSAL_BODY_REGEX: &str = r#"(?m)^event:\s*message_delta\r?$\ndata:\s*\{[^\r\n]*\"delta\"\s*:\s*\{[^\r\n]*\"stop_reason\"\s*:\s*\"refusal\""#;
 pub const FABLE_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 /// If Anthropic Fable emits its structured SSE refusal signal, retry with
@@ -20,13 +21,19 @@ pub fn fable_to_sol_rule() -> RuleSpecV1 {
                 .into(),
         ),
         enabled: true,
+        debug: false,
         priority: 100,
         hook: HookPoint::AttemptResult,
-        capabilities: vec![Capability::RouteOverride, Capability::SessionPin],
+        capabilities: vec![
+            Capability::AttemptReadErrorBody,
+            Capability::RouteOverride,
+            Capability::SessionPin,
+        ],
         when: MatchConditionsV1 {
-            models: vec!["claude-fable-5".into()],
-            providers: vec!["anthropic".into()],
-            error_kinds: vec![FABLE_REFUSAL_KIND.into()],
+            model_regex: vec![r"^claude-fable-5$".into()],
+            provider_regex: vec![r"^anthropic$".into()],
+            status_regex: vec![r"^200$".into()],
+            body_regex: vec![FABLE_REFUSAL_BODY_REGEX.into()],
             stable_session: Some(true),
             ..Default::default()
         },
@@ -62,14 +69,14 @@ pub fn default_builtin_rule_set() -> RuleSetV1 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use crate::{
         AttemptOutcome, AttemptResultContext, BodyView, ClientFormat, ClientRequestView,
         CompiledRuleSetV1, ErrorClass, ErrorInfo, EvaluationControl, HarnessView, JsonBodyView,
         ModelCapabilities, ModelRef, ProviderConstraint, ProviderView, RouteScope, RouteTarget,
         RouteView, SafeHeaders, SessionIdSource, SessionView,
     };
-
-    use serde_json::json;
 
     use super::*;
 

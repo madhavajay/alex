@@ -141,6 +141,7 @@ public struct TraceBodyContent: Sendable, Equatable {
 public struct AlexClient: Sendable {
     public let config: DaemonConfig
     private let session: URLSession
+    private static let harnessConfigurationTimeout: TimeInterval = 60
 
     public init(config: DaemonConfig) {
         self.config = config
@@ -570,7 +571,9 @@ public struct AlexClient: Sendable {
 
     public func connectHarness(_ name: String) async throws -> HarnessConfigWriteResponse {
         let encoded = encodedPathComponent(name)
-        let data = try await request("admin/harnesses/\(encoded)/connect", method: "POST")
+        let data = try await request(
+            "admin/harnesses/\(encoded)/connect", method: "POST",
+            timeout: Self.harnessConfigurationTimeout)
         return try JSONDecoder().decode(HarnessConfigWriteResponse.self, from: data)
     }
 
@@ -579,13 +582,15 @@ public struct AlexClient: Sendable {
         let data = try await request(
             "admin/harnesses/\(encoded)/connect",
             query: [URLQueryItem(name: "dry_run", value: "true")],
-            method: "POST")
+            method: "POST", timeout: Self.harnessConfigurationTimeout)
         return try JSONDecoder().decode(HarnessPlanResponse.self, from: data)
     }
 
     public func disconnectHarness(_ name: String) async throws -> HarnessDisconnectResponse {
         let encoded = encodedPathComponent(name)
-        let data = try await request("admin/harnesses/\(encoded)/disconnect", method: "POST")
+        let data = try await request(
+            "admin/harnesses/\(encoded)/disconnect", method: "POST",
+            timeout: Self.harnessConfigurationTimeout)
         return try JSONDecoder().decode(HarnessDisconnectResponse.self, from: data)
     }
 
@@ -594,13 +599,15 @@ public struct AlexClient: Sendable {
         let data = try await request(
             "admin/harnesses/\(encoded)/disconnect",
             query: [URLQueryItem(name: "dry_run", value: "true")],
-            method: "POST")
+            method: "POST", timeout: Self.harnessConfigurationTimeout)
         return try JSONDecoder().decode(HarnessPlanResponse.self, from: data)
     }
 
     public func refreshHarnessConfig(_ name: String) async throws -> HarnessConfigWriteResponse {
         let encoded = encodedPathComponent(name)
-        let data = try await request("admin/harnesses/\(encoded)/refresh-config", method: "POST")
+        let data = try await request(
+            "admin/harnesses/\(encoded)/refresh-config", method: "POST",
+            timeout: Self.harnessConfigurationTimeout)
         return try JSONDecoder().decode(HarnessConfigWriteResponse.self, from: data)
     }
 
@@ -738,6 +745,18 @@ public struct AlexClient: Sendable {
         return try JSONDecoder().decode(MiddlewareTestResponse.self, from: data)
     }
 
+    /// Tests only an unsaved rule's match conditions against recent stored
+    /// attempts. This deliberately shares the saved-rule dry-run endpoint.
+    public func matchingMiddlewareTraces(
+        for rule: MiddlewareRuleSpecV1,
+        limit: Int = 200
+    ) async throws -> MiddlewareTraceMatchResponse {
+        let data = try await request(
+            "admin/middleware/test", method: "POST",
+            body: body(MiddlewareTestRequest(rule: rule, limit: limit)))
+        return try JSONDecoder().decode(MiddlewareTraceMatchResponse.self, from: data)
+    }
+
     public func middlewareActivity(limit: Int = 8) async throws -> [MiddlewareActivityEvent] {
         try await get(
             "admin/middleware/activity",
@@ -866,12 +885,15 @@ public struct AlexClient: Sendable {
         return try JSONDecoder().decode(OpenRouterExposedResponse.self, from: data).exposed
     }
 
-    public func traceSessions(since: String = "24h", limit: Int = 200) async throws -> [TraceSession] {
+    public func traceSessions(
+        since: String = "24h", limit: Int = 200, middlewareId: String? = nil
+    ) async throws -> [TraceSession] {
         try await get(
             "traces/sessions",
             query: [
                 URLQueryItem(name: "since", value: since),
                 URLQueryItem(name: "limit", value: "\(limit)"),
+                URLQueryItem(name: "middleware_id", value: middlewareId),
             ],
             as: TraceSessionsResponse.self
         ).sessions

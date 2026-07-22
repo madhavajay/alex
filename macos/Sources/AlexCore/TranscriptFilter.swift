@@ -73,14 +73,21 @@ public enum TranscriptFilter {
             }
             if !userText.isEmpty { total += 1 }
             let toolsPresent = hasTools(turn)
+            let attemptEventPresent = turn.hasInlineAttemptEvents
             let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
             let errorPresent = turn.error?.isEmpty == false
             let assistant = assistantText(turn)
-            guard !assistant.isEmpty || toolsPresent || errorPresent || clientClosed else { continue }
+            guard !assistant.isEmpty || toolsPresent || errorPresent || clientClosed
+                || attemptEventPresent
+            else { continue }
             total += 1
-            let eventText = clientClosed ? "\nclient closed" : ""
+            let eventText = [
+                clientClosed ? "client closed" : nil,
+                attemptEventPresent ? attemptSearchText(turn) : nil,
+            ].compactMap { $0 }.joined(separator: "\n")
             let searchText = trimmed.isEmpty
-                ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "") + eventText
+                ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "")
+                    + (eventText.isEmpty ? "" : "\n" + eventText)
             if matches(
                 role: .assistant, searchText: searchText, hasTools: toolsPresent,
                 filterTab: filterTab, query: trimmed)
@@ -102,6 +109,19 @@ public enum TranscriptFilter {
             .compactMap(\.text)
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+    }
+
+    static func attemptSearchText(_ turn: TranscriptTurn) -> String {
+        var values: [String] = [turn.substitutionReason].compactMap { $0 }
+        for attempt in turn.attempts ?? [] {
+            values += [attempt.provider, attempt.model, attempt.error?.kind,
+                       attempt.error?.code, attempt.error?.message].compactMap { $0 }
+            for decision in attempt.middlewareDecisions ?? [] {
+                values += [decision.ruleId, decision.ruleName, decision.action,
+                           decision.explanation].compactMap { $0 }
+            }
+        }
+        return values.joined(separator: "\n")
     }
 
     static func hasTools(_ turn: TranscriptTurn) -> Bool {

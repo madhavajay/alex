@@ -145,6 +145,9 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
     public let toolCalls: [ToolCall]?
     public let assistantBlocks: [AssistantBlock]?
     public let executedTools: [ExecutedTool]?
+    public let attempts: [TraceAttempt]?
+    public let substituted: Bool?
+    public let substitutionReason: String?
 
     public var id: String { traceId }
 
@@ -168,6 +171,72 @@ public struct TranscriptTurn: Codable, Sendable, Identifiable, Equatable {
         case toolCalls = "tool_calls"
         case assistantBlocks = "assistant_blocks"
         case executedTools = "executed_tools"
+        case attempts, substituted
+        case substitutionReason = "substitution_reason"
+    }
+}
+
+public extension TranscriptTurn {
+    var hasInlineAttemptEvents: Bool {
+        let attempts = attempts ?? []
+        let hasFailure = attempts.contains { attempt in
+            let kind = attempt.error?.kind?.lowercased() ?? ""
+            return attempt.error != nil || (attempt.status ?? 0) >= 400
+                || kind.contains("refusal") || kind.contains("denial")
+        }
+        let decisions: [TraceMiddlewareDecision] = attempts.reduce(into: []) { result, attempt in
+            result.append(contentsOf: attempt.middlewareDecisions ?? [])
+        }
+        let middlewareUsed = decisions.contains { decision in
+            decision.state == "matched"
+                && decision.suppressed != true
+                && decision.executed != false
+        }
+        let hasClientDisconnect = TraceClassification.isClientDisconnect(errorKind: errorKind)
+        let leaseApplied = substituted == true && middlewareUsed == false && attempts.count <= 1
+        return hasFailure || middlewareUsed || leaseApplied || hasClientDisconnect
+    }
+}
+
+public struct TraceAttempt: Codable, Sendable, Equatable, Identifiable {
+    public let accountId: String?
+    public let provider: String?
+    public let model: String?
+    public let status: Int?
+    public let error: TraceAttemptError?
+    public let middlewareDecisions: [TraceMiddlewareDecision]?
+
+    public var id: String {
+        "\(provider ?? "unknown"):\(model ?? "unknown"):\(status ?? 0):\(accountId ?? "")"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case provider, model, status, error
+        case accountId = "account_id"
+        case middlewareDecisions = "middleware_decisions"
+    }
+}
+
+public struct TraceAttemptError: Codable, Sendable, Equatable {
+    public let `class`: String?
+    public let kind: String?
+    public let code: String?
+    public let message: String?
+}
+
+public struct TraceMiddlewareDecision: Codable, Sendable, Equatable {
+    public let ruleId: String
+    public let ruleName: String?
+    public let state: String
+    public let action: String?
+    public let explanation: String?
+    public let suppressed: Bool?
+    public let executed: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case state, action, explanation, suppressed, executed
+        case ruleId = "rule_id"
+        case ruleName = "rule_name"
     }
 }
 
@@ -1647,6 +1716,7 @@ public struct OmniQuery: Equatable, Sendable {
     public var account: String?
     public var key: String?
     public var errorClass: String?
+    public var middleware: String?
 
     public init() {}
 
@@ -1659,7 +1729,7 @@ public struct OmniQuery: Equatable, Sendable {
             || status != nil || run != nil || session != nil
             || task != nil || job != nil || tag != nil
             || effort != nil || duration != nil || account != nil
-            || key != nil || errorClass != nil
+            || key != nil || errorClass != nil || middleware != nil
     }
 
     public static func parse(_ raw: String) -> OmniQuery {
@@ -1685,6 +1755,7 @@ public struct OmniQuery: Equatable, Sendable {
                     case "account": query.account = value; continue
                     case "key": query.key = value; continue
                     case "error_class": query.errorClass = value; continue
+                    case "middleware": query.middleware = value; continue
                     default: break
                     }
                 }
@@ -1869,11 +1940,13 @@ public enum SessionDurationFilter: String, CaseIterable, Sendable {
 }
 
 public enum TagFilterDimension: String, CaseIterable, Sendable {
-    case harness, task, job, model, account, effort, duration, errorClass = "error_class"
+    case harness, task, job, model, account, effort, duration, middleware
+    case errorClass = "error_class"
 
     public var title: String {
         if self == .account { return "Billing Account" }
         if self == .errorClass { return "Error Class" }
+        if self == .middleware { return "Middleware" }
         return rawValue.capitalized
     }
 
@@ -1921,7 +1994,7 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
                 (session.accountIds ?? []).forEach { add($0) }
             case .errorClass:
                 (session.errorClassCounts ?? [:]).keys.forEach { add($0) }
-            case .duration:
+            case .duration, .middleware:
                 break
             }
         }
@@ -1938,6 +2011,7 @@ public enum TagFilterDimension: String, CaseIterable, Sendable {
         case .duration: query.duration
         case .account: query.account
         case .errorClass: query.errorClass
+        case .middleware: query.middleware
         }
     }
 }
@@ -2729,8 +2803,44 @@ public enum TranscriptRender {
                 }
             }
             for lifecycle in toolLifecycles.dropFirst(nextTool) { appendTool(lifecycle) }
+            if turn.hasInlineAttemptEvents {
+                let attempts = turn.attempts ?? []
+                let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
+                if let failed = attempts.first(where: { $0.error != nil || ($0.status ?? 0) >= 400 }) {
+                    let kind = failed.error?.kind ?? "upstream error"
+                    let code = failed.error?.code.map { " · \($0)" } ?? ""
+                    out.append(NSAttributedString(
+                        string: "⚠ \(kind)\(code) · \(failed.provider ?? "unknown")/\(failed.model ?? "unknown")\n",
+                        attributes: error))
+                }
+                let decisions: [TraceMiddlewareDecision] = attempts.reduce(into: []) {
+                    result, attempt in
+                    result.append(contentsOf: attempt.middlewareDecisions ?? [])
+                }
+                if let decision = decisions.first(where: { decision in
+                    decision.state == "matched"
+                        && decision.suppressed != true
+                        && decision.executed != false
+                }) {
+                    out.append(NSAttributedString(
+                        string: "↪ Middleware: \(decision.ruleName ?? decision.ruleId)\(decision.action.map { " · \($0)" } ?? "")\n",
+                        attributes: event))
+                    if let explanation = decision.explanation, !explanation.isEmpty {
+                        out.append(NSAttributedString(
+                            string: "\(cap(explanation))\n", attributes: event))
+                    }
+                } else if let reason = turn.substitutionReason, !reason.isEmpty {
+                    out.append(NSAttributedString(
+                        string: "↪ Middleware route: \(cap(reason))\n", attributes: event))
+                } else if clientClosed {
+                    out.append(NSAttributedString(
+                        string: " client closed \n", attributes: event))
+                }
+            }
             if TraceClassification.isClientDisconnect(errorKind: turn.errorKind) {
-                out.append(NSAttributedString(string: " client closed \n", attributes: event))
+                if !turn.hasInlineAttemptEvents {
+                    out.append(NSAttributedString(string: " client closed \n", attributes: event))
+                }
             } else if let text = turn.error, !text.isEmpty {
                 out.append(NSAttributedString(string: "\(cap(text))\n", attributes: error))
             }

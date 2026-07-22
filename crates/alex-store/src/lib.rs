@@ -1736,6 +1736,15 @@ impl Store {
     }
 
     pub fn sessions(&self, since_ms: Option<i64>, limit: usize) -> Result<Vec<Value>> {
+        self.sessions_filtered(since_ms, limit, None)
+    }
+
+    pub fn sessions_filtered(
+        &self,
+        since_ms: Option<i64>,
+        limit: usize,
+        middleware_id: Option<&str>,
+    ) -> Result<Vec<Value>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             "SELECT session_id, MAX(run_id), MIN(ts_request_ms), MAX(ts_request_ms), COUNT(*),
@@ -1755,6 +1764,22 @@ impl Store {
         if let Some(since) = since_ms {
             sql.push_str(" AND ts_request_ms >= ?");
             args.push(since.to_string());
+        }
+        if let Some(middleware_id) = middleware_id {
+            // A rule appearing in the decision list only means it was
+            // evaluated. "Used" means it matched and its selected action was
+            // actually executed; failed route resolution remains excluded.
+            sql.push_str(
+                " AND EXISTS (
+                    SELECT 1 FROM json_each(COALESCE(traces.attempts, '[]')) attempt
+                    JOIN json_each(COALESCE(json_extract(attempt.value, '$.middleware_decisions'), '[]')) decision
+                    WHERE json_extract(decision.value, '$.rule_id') = ?
+                      AND json_extract(decision.value, '$.state') = 'matched'
+                      AND COALESCE(json_extract(decision.value, '$.suppressed'), 0) = 0
+                      AND COALESCE(json_extract(decision.value, '$.executed'), 1) = 1
+                )",
+            );
+            args.push(middleware_id.to_string());
         }
         sql.push_str(" GROUP BY session_id ORDER BY MAX(ts_request_ms) DESC LIMIT ?");
         let limit = if limit == 0 {
@@ -3424,6 +3449,63 @@ mod tests {
         assert_eq!(recent[0]["session_id"], "ses_2");
         let limited = store.sessions(None, 1).unwrap();
         assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn sessions_filter_by_executed_middleware_rule() {
+        let store = Store::open(tmpdir("sessions-middleware-filter")).unwrap();
+        let mut used = trace("used", 1000, None);
+        used.session_id = Some("session-used".into());
+        used.attempts = Some(
+            json!([{
+                "middleware_decisions": [{
+                    "rule_id": "rule.used", "state": "matched", "executed": true
+                }]
+            }])
+            .to_string(),
+        );
+        let mut evaluated = trace("evaluated", 2000, None);
+        evaluated.session_id = Some("session-evaluated".into());
+        evaluated.attempts = Some(
+            json!([{
+                "middleware_decisions": [{
+                    "rule_id": "rule.used", "state": "not_matched", "executed": false
+                }]
+            }])
+            .to_string(),
+        );
+        let mut unresolved = trace("unresolved", 3000, None);
+        unresolved.session_id = Some("session-unresolved".into());
+        unresolved.attempts = Some(
+            json!([{
+                "middleware_decisions": [{
+                    "rule_id": "rule.used", "state": "matched", "executed": false
+                }]
+            }])
+            .to_string(),
+        );
+        let mut legacy = trace("legacy", 4000, None);
+        legacy.session_id = Some("session-legacy".into());
+        legacy.attempts = Some(
+            json!([{
+                "middleware_decisions": [{
+                    "rule_id": "rule.used", "state": "matched", "suppressed": false
+                }]
+            }])
+            .to_string(),
+        );
+        for row in [&used, &evaluated, &unresolved, &legacy] {
+            store.insert_trace(row).unwrap();
+        }
+
+        let sessions = store.sessions_filtered(None, 0, Some("rule.used")).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["session_id"], "session-legacy");
+        assert_eq!(sessions[1]["session_id"], "session-used");
+        assert!(store
+            .sessions_filtered(None, 0, Some("missing"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

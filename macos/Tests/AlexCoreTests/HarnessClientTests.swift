@@ -551,6 +551,7 @@ import Testing
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses/pi/refresh-config")
             #expect(request.httpMethod == "POST")
+            #expect(request.timeoutInterval == 60)
             #expect(request.value(forHTTPHeaderField: "x-api-key") == "local-test-key")
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -611,6 +612,7 @@ import Testing
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses/pi/connect")
             #expect(request.httpMethod == "POST")
+            #expect(request.timeoutInterval == 60)
             #expect(request.url?.query?.contains("dry_run") != true)
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -644,6 +646,7 @@ import Testing
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses/pi/connect")
             #expect(request.httpMethod == "POST")
+            #expect(request.timeoutInterval == 60)
             #expect(request.url?.query?.contains("dry_run=true") == true)
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -679,6 +682,7 @@ import Testing
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/harnesses/pi/disconnect")
             #expect(request.httpMethod == "POST")
+            #expect(request.timeoutInterval == 60)
             let isDry = request.url?.query?.contains("dry_run=true") == true
             if isDry { sawDryRun = true }
             let response = HTTPURLResponse(
@@ -863,8 +867,12 @@ import Testing
             #expect(rule["id"] as? String == "fable-overload-to-sol")
             let match = try #require(rule["when"] as? [String: Any])
             #expect(match["harness_names"] == nil)
-            #expect(match["models"] as? [String] == ["claude-fable-5"])
-            #expect(match["providers"] as? [String] == ["anthropic"])
+            #expect(match["model_regex"] as? [String] == ["^claude-fable-5$"])
+            #expect(match["provider_regex"] as? [String] == ["^anthropic$"])
+            #expect(match["status_regex"] as? [String] == ["^200$"])
+            #expect(match["body_regex"] as? [String] == [
+                MiddlewareWizardDraft.fableRefusalBodyRegex,
+            ])
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (response, Data(#"{"valid":true,"errors":[],"warnings":[]}"#.utf8))
@@ -930,6 +938,44 @@ import Testing
             middlewareId: "fable-overload-to-sol", fixtureName: "fable-real-error"))
         #expect(result.matched)
         #expect(result.proposedAction == "reroute")
+    }
+
+    @Test func middlewareRecentTraceTestEncodesDraftAndDecodesMatches() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/middleware/test")
+            #expect(request.httpMethod == "POST")
+            let json = try #require(
+                JSONSerialization.jsonObject(with: requestBody(request)) as? [String: Any])
+            #expect(json["middleware_id"] as? String == "__alex_unsaved_rule_preview__")
+            #expect(json["limit"] as? Int == 200)
+            #expect(json["fixture_name"] == nil)
+            let rule = try #require(json["rule"] as? [String: Any])
+            #expect(rule["id"] as? String == "unsaved-live-rule")
+            let match = try #require(rule["when"] as? [String: Any])
+            #expect(match["status_regex"] as? [String] == ["^529$"])
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"valid":true,"middleware_id":"unsaved-live-rule","body_inspection_required":true,"scanned":17,"match_count":1,"matches":[{"trace_id":"trace-529","timestamp_ms":1784700000123,"harness_name":"claude","harness_version":"2.1.0","model":"claude-fable-5","provider":"anthropic","status":529,"matched_condition_groups":["model","provider","status","body"]}]}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+        var draft = MiddlewareWizardDraft.fableToSolExample
+        draft.statusRegex = "^529$"
+        let rule = try draft.makeRule(id: "unsaved-live-rule")
+
+        let result = try await client.matchingMiddlewareTraces(for: rule)
+        #expect(result.valid)
+        #expect(result.scanned == 17)
+        #expect(result.matchCount == 1)
+        #expect(result.matches[0].traceId == "trace-529")
+        #expect(result.matches[0].timestampMs == 1_784_700_000_123)
+        #expect(result.matches[0].harnessVersion == "2.1.0")
+        #expect(result.matches[0].matchedConditionGroups == ["model", "provider", "status", "body"])
     }
 }
 

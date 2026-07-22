@@ -5367,9 +5367,9 @@ pub(crate) fn filter_model_ids(ids: Vec<String>) -> Vec<String> {
             continue;
         }
         let identity = id.strip_prefix("alex/").unwrap_or(&id);
-        if (id.starts_with("alex/") && direct.contains(identity))
-            || !seen.insert(identity.to_string())
-        {
+        let duplicate_alias = id.starts_with("alex/")
+            && (direct.contains(identity) || direct.contains(&format!("exo/{identity}")));
+        if duplicate_alias || !seen.insert(identity.to_string()) {
             continue;
         }
         out.push(id);
@@ -6856,8 +6856,7 @@ fi"#,
                 "gemini-2.5-flash",
                 "openrouter/anthropic/claude-opus-4.8",
                 "openrouter/meta-llama/llama-4:free",
-                "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
-                "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+                "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
             ]
         );
     }

@@ -9,7 +9,7 @@ import Testing
 
     @Test func omniQueryTokens() {
         let q = OmniQuery.parse(
-            "auth failed model:grok provider:xai harness:claude status:401 run:r-1 session:abc")
+            "auth failed model:grok provider:xai harness:claude status:401 run:r-1 session:abc middleware:rule.fallback")
         #expect(q.freeText == "auth failed")
         #expect(q.model == "grok")
         #expect(q.provider == "xai")
@@ -17,6 +17,7 @@ import Testing
         #expect(q.status == "401")
         #expect(q.run == "r-1")
         #expect(q.session == "abc")
+        #expect(q.middleware == "rule.fallback")
         let effort = OmniQuery.parse("effort:high duration:5m")
         #expect(effort.effort == "high")
         #expect(effort.duration == "5m")
@@ -220,6 +221,9 @@ import Testing
         #expect(
             TagFilterDimension.account.activeValue(
                 in: OmniQuery.parse("account:openai-oauth-b")) == "openai-oauth-b")
+        #expect(
+            TagFilterDimension.middleware.activeValue(
+                in: OmniQuery.parse("middleware:rule.fallback")) == "rule.fallback")
     }
 
     @Test func multiModelFilterPipeline() {
@@ -387,6 +391,16 @@ import Testing
         #expect(transcript.turns[1].error == "upstream 429")
         #expect(transcript.turns[1].model == nil)
         #expect(transcript.turns[1].thinkingBudget == 16_000)
+    }
+
+    @Test func transcriptDecodesInlineMiddlewareAttemptEvents() throws {
+        let json = #"""
+        {"session_id":"s","turns":[{"trace_id":"t","ts_request_ms":1,"ts_response_ms":2,"model":"gpt-5.6-sol","provider":"openai","status":200,"substituted":true,"substitution_reason":"fallback","attempts":[{"provider":"anthropic","model":"claude-fable-5","status":200,"error":{"class":"other","kind":"upstream_refusal","code":"bio","message":null},"middleware_decisions":[{"rule_id":"alex.fable","rule_name":"Fable fallback","state":"matched","action":"reroute","executed":true,"suppressed":false,"explanation":"selected openai/gpt-5.6-sol"}]},{"provider":"openai","model":"gpt-5.6-sol","status":200,"middleware_decisions":[]}]}]}
+        """#
+        let turn = try decode(json, as: TranscriptResponse.self).turns[0]
+        #expect(turn.hasInlineAttemptEvents)
+        #expect(turn.attempts?.first?.error?.kind == "upstream_refusal")
+        #expect(turn.attempts?.first?.middlewareDecisions?.first?.ruleName == "Fable fallback")
     }
 
     @Test func searchDecoding() throws {

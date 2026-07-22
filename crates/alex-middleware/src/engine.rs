@@ -56,6 +56,20 @@ pub struct RuleEvaluationRecord {
     pub suppressed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleConditionDebugRecord {
+    pub group: String,
+    pub state: MatchState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDebugEvaluation {
+    pub rule_id: String,
+    pub state: MatchState,
+    #[serde(default)]
+    pub conditions: Vec<RuleConditionDebugRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationResult {
     pub decision: AttemptDecision,
@@ -172,6 +186,42 @@ impl CompiledRuleSetV1 {
                         .as_ref()
                         .is_some_and(MatchExpressionV1::needs_body))
         })
+    }
+
+    pub fn has_debug_attempt_rules(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.spec.debug && rule.spec.hook == HookPoint::AttemptResult)
+    }
+
+    /// Returns the body work required solely for opt-in diagnostics. Unlike
+    /// the indexed execution path this deliberately considers every debug
+    /// rule so a rule excluded by a cheap condition still gets a no-match log.
+    pub fn debug_inspection_plan(&self, context: &AttemptResultContext) -> BodyInspectionPlan {
+        let mut plan = BodyInspectionPlan::default();
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| rule.spec.debug && rule.spec.hook == HookPoint::AttemptResult)
+        {
+            if rule.matches(context) == MatchState::NeedsBody {
+                plan.needs_body = true;
+                plan.needs_json |= rule.needs_json_body;
+                plan.candidate_rule_ids.push(rule.spec.id.clone());
+            }
+        }
+        plan
+    }
+
+    pub fn evaluate_debug_attempt(
+        &self,
+        context: &AttemptResultContext,
+    ) -> Vec<RuleDebugEvaluation> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.spec.debug && rule.spec.hook == HookPoint::AttemptResult)
+            .map(|rule| rule.debug_evaluation(context))
+            .collect()
     }
 
     /// Returns a conservative plan from response-head and request metadata. A
@@ -335,6 +385,7 @@ struct CompiledRule {
     spec: RuleSpecV1,
     conditions: CompiledConditions,
     expression: Option<CompiledExpression>,
+    debug_conditions: Vec<(String, CompiledConditions)>,
     needs_json_body: bool,
 }
 
@@ -342,6 +393,10 @@ impl CompiledRule {
     fn compile(spec: RuleSpecV1) -> Self {
         let conditions = CompiledConditions::compile(&spec.when);
         let expression = spec.expression.as_ref().map(CompiledExpression::compile);
+        let debug_conditions = spec
+            .debug
+            .then(|| debug_condition_groups(&spec.when))
+            .unwrap_or_default();
         let needs_json_body = spec.when.needs_json_body()
             || spec
                 .expression
@@ -351,6 +406,7 @@ impl CompiledRule {
             spec,
             conditions,
             expression,
+            debug_conditions,
             needs_json_body,
         }
     }
@@ -363,11 +419,34 @@ impl CompiledRule {
         }
     }
 
+    fn debug_evaluation(&self, context: &AttemptResultContext) -> RuleDebugEvaluation {
+        let mut conditions = self
+            .debug_conditions
+            .iter()
+            .map(|(group, condition)| RuleConditionDebugRecord {
+                group: group.clone(),
+                state: condition.matches_attempt(context),
+            })
+            .collect::<Vec<_>>();
+        if let Some(expression) = &self.expression {
+            conditions.push(RuleConditionDebugRecord {
+                group: "expression".into(),
+                state: expression.matches_attempt(context),
+            });
+        }
+        RuleDebugEvaluation {
+            rule_id: self.spec.id.clone(),
+            state: self.matches(context),
+            conditions,
+        }
+    }
+
     fn matches_request(&self, context: &RequestReceivedContext) -> MatchState {
         let base = self.conditions.matches_parts(
             &context.request,
             &context.harness,
             &context.session,
+            None,
             None,
             None,
             None,
@@ -378,6 +457,7 @@ impl CompiledRule {
                 &context.request,
                 &context.harness,
                 &context.session,
+                None,
                 None,
                 None,
                 None,
@@ -394,6 +474,7 @@ impl CompiledRule {
             &context.session,
             Some(&context.route),
             Some(context.response.status),
+            Some(&context.response.headers),
             Some(&context.response.body),
             None,
         );
@@ -404,6 +485,7 @@ impl CompiledRule {
                 &context.session,
                 Some(&context.route),
                 Some(context.response.status),
+                Some(&context.response.headers),
                 Some(&context.response.body),
                 None,
             )),
@@ -471,6 +553,108 @@ impl CompiledRule {
     }
 }
 
+fn debug_condition_groups(spec: &MatchConditionsV1) -> Vec<(String, CompiledConditions)> {
+    let mut groups = Vec::new();
+    let mut push = |name: &str, conditions: MatchConditionsV1| {
+        if !conditions.is_empty() {
+            groups.push((name.to_owned(), CompiledConditions::compile(&conditions)));
+        }
+    };
+
+    push(
+        "harness",
+        MatchConditionsV1 {
+            harness_names: spec.harness_names.clone(),
+            harness_versions: spec.harness_versions.clone(),
+            harness_name_regex: spec.harness_name_regex.clone(),
+            harness_version_regex: spec.harness_version_regex.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "model",
+        MatchConditionsV1 {
+            models: spec.models.clone(),
+            model_regex: spec.model_regex.clone(),
+            original_models: spec.original_models.clone(),
+            current_models: spec.current_models.clone(),
+            model_aliases: spec.model_aliases.clone(),
+            equivalence_classes: spec.equivalence_classes.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "effort",
+        MatchConditionsV1 {
+            efforts: spec.efforts.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "provider",
+        MatchConditionsV1 {
+            providers: spec.providers.clone(),
+            provider_regex: spec.provider_regex.clone(),
+            exclude_providers: spec.exclude_providers.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "status",
+        MatchConditionsV1 {
+            status: spec.status.clone(),
+            status_regex: spec.status_regex.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "response_headers",
+        MatchConditionsV1 {
+            response_header_regex: spec.response_header_regex.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "error",
+        MatchConditionsV1 {
+            error_classes: spec.error_classes.clone(),
+            error_kinds: spec.error_kinds.clone(),
+            error_codes: spec.error_codes.clone(),
+            error_messages: spec.error_messages.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "body",
+        MatchConditionsV1 {
+            body_contains: spec.body_contains.clone(),
+            body_contains_any: spec.body_contains_any.clone(),
+            body_regex: spec.body_regex.clone(),
+            body_json_equals: spec.body_json_equals.clone(),
+            require_complete_body: spec.require_complete_body,
+            content_types: spec.content_types.clone(),
+            ..Default::default()
+        },
+    );
+    push(
+        "attempt",
+        MatchConditionsV1 {
+            attempt_numbers: spec.attempt_numbers.clone(),
+            same_route_accounts_remaining: spec.same_route_accounts_remaining,
+            ..Default::default()
+        },
+    );
+    push(
+        "session",
+        MatchConditionsV1 {
+            session_present: spec.session_present,
+            stable_session: spec.stable_session,
+            ..Default::default()
+        },
+    );
+    groups
+}
+
 fn nonempty_reason(reason: &str, fallback: &str) -> String {
     if reason.trim().is_empty() {
         fallback.to_owned()
@@ -506,6 +690,7 @@ impl CompiledExpression {
             &context.session,
             Some(&context.route),
             Some(context.outcome.status),
+            Some(&context.outcome.headers),
             Some(&context.outcome.body),
             context.outcome.error.as_ref(),
         )
@@ -519,6 +704,7 @@ impl CompiledExpression {
         session: &crate::SessionView,
         route: Option<&crate::RouteView>,
         status: Option<u16>,
+        response_headers: Option<&crate::SafeHeaders>,
         body: Option<&crate::BodyView>,
         error: Option<&crate::ErrorInfo>,
     ) -> MatchState {
@@ -527,19 +713,31 @@ impl CompiledExpression {
                 expressions
                     .iter()
                     .fold(MatchState::Matched, |state, expression| {
-                        state.and(
-                            expression.matches_parts(
-                                request, harness, session, route, status, body, error,
-                            ),
-                        )
+                        state.and(expression.matches_parts(
+                            request,
+                            harness,
+                            session,
+                            route,
+                            status,
+                            response_headers,
+                            body,
+                            error,
+                        ))
                     })
             }
             Self::Any(expressions) => {
                 let mut needs_body = false;
                 for expression in expressions {
-                    match expression
-                        .matches_parts(request, harness, session, route, status, body, error)
-                    {
+                    match expression.matches_parts(
+                        request,
+                        harness,
+                        session,
+                        route,
+                        status,
+                        response_headers,
+                        body,
+                        error,
+                    ) {
                         MatchState::Matched => return MatchState::Matched,
                         MatchState::NeedsBody => needs_body = true,
                         MatchState::NotMatched => {}
@@ -552,11 +750,27 @@ impl CompiledExpression {
                 }
             }
             Self::Not(expression) => expression
-                .matches_parts(request, harness, session, route, status, body, error)
+                .matches_parts(
+                    request,
+                    harness,
+                    session,
+                    route,
+                    status,
+                    response_headers,
+                    body,
+                    error,
+                )
                 .invert(),
-            Self::Conditions(conditions) => {
-                conditions.matches_parts(request, harness, session, route, status, body, error)
-            }
+            Self::Conditions(conditions) => conditions.matches_parts(
+                request,
+                harness,
+                session,
+                route,
+                status,
+                response_headers,
+                body,
+                error,
+            ),
         }
     }
 }
@@ -565,15 +779,21 @@ impl CompiledExpression {
 struct CompiledConditions {
     harness_names: StringSet,
     harness_versions: VersionSet,
+    harness_name_regex: Vec<Regex>,
+    harness_version_regex: Vec<Regex>,
     models: StringSet,
+    model_regex: Vec<Regex>,
     original_models: StringSet,
     current_models: StringSet,
     model_aliases: StringSet,
     equivalence_classes: StringSet,
     efforts: StringSet,
     providers: StringSet,
+    provider_regex: Vec<Regex>,
     exclude_providers: StringSet,
     status: Vec<(u16, u16)>,
+    status_regex: Vec<Regex>,
+    response_header_regex: Vec<(Regex, Regex)>,
     error_classes: HashSet<ErrorClass>,
     error_kinds: StringSet,
     error_codes: StringSet,
@@ -608,15 +828,30 @@ impl CompiledConditions {
         Self {
             harness_names: StringSet::compile(&spec.harness_names),
             harness_versions: VersionSet::compile(&spec.harness_versions),
+            harness_name_regex: compile_regexes(&spec.harness_name_regex),
+            harness_version_regex: compile_regexes(&spec.harness_version_regex),
             models: StringSet::compile(&spec.models),
+            model_regex: compile_regexes(&spec.model_regex),
             original_models: StringSet::compile(&spec.original_models),
             current_models: StringSet::compile(&spec.current_models),
             model_aliases: StringSet::compile(&spec.model_aliases),
             equivalence_classes: StringSet::compile(&spec.equivalence_classes),
             efforts: StringSet::compile(&spec.efforts),
             providers: StringSet::compile(&spec.providers),
+            provider_regex: compile_regexes(&spec.provider_regex),
             exclude_providers: StringSet::compile(&spec.exclude_providers),
             status: spec.status.iter().filter_map(parse_status).collect(),
+            status_regex: compile_regexes(&spec.status_regex),
+            response_header_regex: spec
+                .response_header_regex
+                .iter()
+                .map(|matcher| {
+                    (
+                        Regex::new(&matcher.key).expect("validated header key regex"),
+                        Regex::new(&matcher.value).expect("validated header value regex"),
+                    )
+                })
+                .collect(),
             error_classes: spec.error_classes.iter().copied().collect(),
             error_kinds: StringSet::compile(&spec.error_kinds),
             error_codes: StringSet::compile(&spec.error_codes),
@@ -651,6 +886,7 @@ impl CompiledConditions {
             &context.session,
             Some(&context.route),
             Some(context.outcome.status),
+            Some(&context.outcome.headers),
             Some(&context.outcome.body),
             context.outcome.error.as_ref(),
         )
@@ -664,6 +900,7 @@ impl CompiledConditions {
         session: &crate::SessionView,
         route: Option<&crate::RouteView>,
         status: Option<u16>,
+        response_headers: Option<&crate::SafeHeaders>,
         body: Option<&crate::BodyView>,
         error: Option<&crate::ErrorInfo>,
     ) -> MatchState {
@@ -672,9 +909,14 @@ impl CompiledConditions {
             || !self
                 .harness_versions
                 .matches_optional(harness.version.as_deref())
+            || !regexes_match_optional(&self.harness_name_regex, harness.name.as_deref())
+            || !regexes_match_optional(&self.harness_version_regex, harness.version.as_deref())
             || (!self.models.is_empty()
                 && !self.models.matches(&request.original_model)
                 && !self.models.matches(&request.current_model))
+            || (!self.model_regex.is_empty()
+                && !regexes_match(&self.model_regex, &request.original_model)
+                && !regexes_match(&self.model_regex, &request.current_model))
             || !self.original_models.matches(&request.original_model)
             || !self.current_models.matches(&request.current_model)
             || (!self.model_aliases.is_empty()
@@ -698,6 +940,9 @@ impl CompiledConditions {
             || !self.efforts.matches_optional(request_effort(request))
             || (!self.providers.is_empty()
                 && !route.is_some_and(|route| self.providers.matches(&route.provider.id)))
+            || (!self.provider_regex.is_empty()
+                && !route
+                    .is_some_and(|route| regexes_match(&self.provider_regex, &route.provider.id)))
             || (!self.exclude_providers.is_empty()
                 && route.is_some_and(|route| self.exclude_providers.matches(&route.provider.id)))
             || (!self.status.is_empty()
@@ -705,6 +950,21 @@ impl CompiledConditions {
                     self.status
                         .iter()
                         .any(|(start, end)| (*start..=*end).contains(&status))
+                }))
+            || !regexes_match_optional(
+                &self.status_regex,
+                status.map(|status| status.to_string()).as_deref(),
+            )
+            || (!self.response_header_regex.is_empty()
+                && !response_headers.is_some_and(|headers| {
+                    self.response_header_regex
+                        .iter()
+                        .all(|(key_regex, value_regex)| {
+                            headers.iter().any(|(key, values)| {
+                                key_regex.is_match(key)
+                                    && values.iter().any(|value| value_regex.is_match(value))
+                            })
+                        })
                 }))
             || (!self.error_classes.is_empty()
                 && !error.is_some_and(|error| self.error_classes.contains(&error.class)))
@@ -786,6 +1046,21 @@ impl CompiledConditions {
         }
         MatchState::Matched
     }
+}
+
+fn compile_regexes(patterns: &[String]) -> Vec<Regex> {
+    patterns
+        .iter()
+        .map(|pattern| Regex::new(pattern).expect("validated matcher regex"))
+        .collect()
+}
+
+fn regexes_match(regexes: &[Regex], value: &str) -> bool {
+    regexes.is_empty() || regexes.iter().any(|regex| regex.is_match(value))
+}
+
+fn regexes_match_optional(regexes: &[Regex], value: Option<&str>) -> bool {
+    regexes.is_empty() || value.is_some_and(|value| regexes_match(regexes, value))
 }
 
 fn request_effort(request: &crate::ClientRequestView) -> Option<&str> {
@@ -1129,6 +1404,7 @@ mod tests {
             name: id.into(),
             description: None,
             enabled: true,
+            debug: false,
             priority,
             hook: HookPoint::AttemptResult,
             capabilities: if when.needs_body() {
@@ -1151,6 +1427,7 @@ mod tests {
             name: id.into(),
             description: None,
             enabled: true,
+            debug: false,
             priority,
             hook: HookPoint::AttemptResult,
             capabilities: vec![Capability::RouteOverride],
@@ -1176,6 +1453,69 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn debug_rules_report_grouped_match_reasons_and_body_work() {
+        let mut rule = continue_rule(
+            "debug-rule",
+            0,
+            MatchConditionsV1 {
+                model_regex: vec!["^claude-fable-5$".into()],
+                provider_regex: vec!["^anthropic$".into()],
+                status_regex: vec!["^529$".into()],
+                body_regex: vec!["currently overloaded".into()],
+                stable_session: Some(true),
+                ..Default::default()
+            },
+        );
+        rule.debug = true;
+        let engine = CompiledRuleSetV1::compile(RuleSetV1 {
+            api_version: 1,
+            rules: vec![rule],
+        })
+        .unwrap();
+
+        let evaluation = engine.evaluate_debug_attempt(&context());
+        assert_eq!(evaluation.len(), 1);
+        assert_eq!(evaluation[0].state, MatchState::Matched);
+        assert_eq!(
+            evaluation[0]
+                .conditions
+                .iter()
+                .map(|condition| (condition.group.as_str(), condition.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model", MatchState::Matched),
+                ("provider", MatchState::Matched),
+                ("status", MatchState::Matched),
+                ("body", MatchState::Matched),
+                ("session", MatchState::Matched),
+            ]
+        );
+
+        let mut head_only = context();
+        head_only.outcome.body = BodyView {
+            content_type: Some("application/json".into()),
+            ..Default::default()
+        };
+        let plan = engine.debug_inspection_plan(&head_only);
+        assert!(plan.needs_body);
+        assert_eq!(plan.candidate_rule_ids, ["debug-rule"]);
+
+        head_only.request.original_model = "other".into();
+        head_only.request.current_model = "other".into();
+        assert!(!engine.debug_inspection_plan(&head_only).needs_body);
+        let evaluation = engine.evaluate_debug_attempt(&head_only);
+        assert_eq!(evaluation[0].state, MatchState::NotMatched);
+        assert_eq!(
+            evaluation[0]
+                .conditions
+                .iter()
+                .find(|condition| condition.group == "model")
+                .map(|condition| condition.state),
+            Some(MatchState::NotMatched)
+        );
     }
 
     #[test]
@@ -1485,6 +1825,7 @@ mod tests {
             name: id.into(),
             description: None,
             enabled: true,
+            debug: false,
             priority,
             hook: HookPoint::RequestReceived,
             capabilities: vec![Capability::RequestPatch],
@@ -1506,6 +1847,7 @@ mod tests {
             name: id.into(),
             description: None,
             enabled: true,
+            debug: false,
             priority,
             hook: HookPoint::ResponseReady,
             capabilities: vec![Capability::ResponsePatch],

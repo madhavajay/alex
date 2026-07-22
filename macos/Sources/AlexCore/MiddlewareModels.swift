@@ -12,6 +12,7 @@ public struct MiddlewareRuleSpecV1: Codable, Sendable, Equatable, Identifiable {
     public var name: String
     public var description: String?
     public var enabled: Bool
+    public var debug: Bool
     public var priority: Int
     public var hook: MiddlewareHookPoint
     public var capabilities: [String]
@@ -30,6 +31,7 @@ public struct MiddlewareRuleSpecV1: Codable, Sendable, Equatable, Identifiable {
         name: String,
         description: String? = nil,
         enabled: Bool = true,
+        debug: Bool = false,
         priority: Int = 100,
         hook: MiddlewareHookPoint,
         capabilities: [String] = [],
@@ -45,6 +47,7 @@ public struct MiddlewareRuleSpecV1: Codable, Sendable, Equatable, Identifiable {
         self.name = name
         self.description = description
         self.enabled = enabled
+        self.debug = debug
         self.priority = priority
         self.hook = hook
         self.capabilities = capabilities
@@ -60,7 +63,7 @@ public struct MiddlewareRuleSpecV1: Codable, Sendable, Equatable, Identifiable {
     public var isBuiltIn: Bool { builtIn == true || id.hasPrefix("alex.") }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, description, enabled, priority, hook, capabilities, when, expression, then
+        case id, name, description, enabled, debug, priority, hook, capabilities, when, expression, then
         case builtIn = "built_in"
         case hitCount = "hit_count"
         case lastMatchedMs = "last_matched_ms"
@@ -73,6 +76,7 @@ public struct MiddlewareRuleSpecV1: Codable, Sendable, Equatable, Identifiable {
         name = try values.decodeIfPresent(String.self, forKey: .name) ?? id
         description = try values.decodeIfPresent(String.self, forKey: .description)
         enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        debug = try values.decodeIfPresent(Bool.self, forKey: .debug) ?? false
         priority = try values.decodeIfPresent(Int.self, forKey: .priority) ?? 100
         hook = try values.decodeIfPresent(MiddlewareHookPoint.self, forKey: .hook) ?? .attemptResult
         capabilities = try values.decodeIfPresent([String].self, forKey: .capabilities) ?? []
@@ -128,39 +132,70 @@ public enum MiddlewareStatusMatcher: Codable, Sendable, Equatable, Hashable {
     }
 }
 
+public struct MiddlewareHeaderRegexMatcher: Codable, Sendable, Equatable {
+    public var key: String
+    public var value: String
+
+    public init(key: String, value: String) {
+        self.key = key
+        self.value = value
+    }
+}
+
 public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
     public var harnessNames: [String]?
     public var harnessVersions: [String]?
+    public var harnessNameRegex: [String]?
+    public var harnessVersionRegex: [String]?
     public var models: [String]?
+    public var modelRegex: [String]?
     public var efforts: [String]?
     public var providers: [String]?
+    public var providerRegex: [String]?
     public var status: [MiddlewareStatusMatcher]?
+    public var statusRegex: [String]?
+    public var responseHeaderRegex: [MiddlewareHeaderRegexMatcher]?
     public var errorClasses: [String]?
     public var errorKinds: [String]?
     public var bodyContainsAny: [String]?
+    public var bodyRegex: [String]?
     public var stableSession: Bool?
 
     public init(
         harnessNames: [String]? = nil,
         harnessVersions: [String]? = nil,
+        harnessNameRegex: [String]? = nil,
+        harnessVersionRegex: [String]? = nil,
         models: [String]? = nil,
+        modelRegex: [String]? = nil,
         efforts: [String]? = nil,
         providers: [String]? = nil,
+        providerRegex: [String]? = nil,
         status: [MiddlewareStatusMatcher]? = nil,
+        statusRegex: [String]? = nil,
+        responseHeaderRegex: [MiddlewareHeaderRegexMatcher]? = nil,
         errorClasses: [String]? = nil,
         errorKinds: [String]? = nil,
         bodyContainsAny: [String]? = nil,
+        bodyRegex: [String]? = nil,
         stableSession: Bool? = nil
     ) {
         self.harnessNames = harnessNames
         self.harnessVersions = harnessVersions
+        self.harnessNameRegex = harnessNameRegex
+        self.harnessVersionRegex = harnessVersionRegex
         self.models = models
+        self.modelRegex = modelRegex
         self.efforts = efforts
         self.providers = providers
+        self.providerRegex = providerRegex
         self.status = status
+        self.statusRegex = statusRegex
+        self.responseHeaderRegex = responseHeaderRegex
         self.errorClasses = errorClasses
         self.errorKinds = errorKinds
         self.bodyContainsAny = bodyContainsAny
+        self.bodyRegex = bodyRegex
         self.stableSession = stableSession
     }
 
@@ -168,17 +203,28 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         case models, efforts, providers, status
         case harnessNames = "harness_names"
         case harnessVersions = "harness_versions"
+        case harnessNameRegex = "harness_name_regex"
+        case harnessVersionRegex = "harness_version_regex"
+        case modelRegex = "model_regex"
+        case providerRegex = "provider_regex"
+        case statusRegex = "status_regex"
+        case responseHeaderRegex = "response_header_regex"
         case errorClasses = "error_classes"
         case errorKinds = "error_kinds"
         case bodyContainsAny = "body_contains_any"
+        case bodyRegex = "body_regex"
         case stableSession = "stable_session"
     }
 
     public var isEmpty: Bool {
-        let lists = [harnessNames, models, efforts, providers, errorClasses, errorKinds, bodyContainsAny]
+        let lists = [
+            harnessNames, harnessVersions, harnessNameRegex, harnessVersionRegex,
+            models, modelRegex, efforts, providers, providerRegex, statusRegex,
+            errorClasses, errorKinds, bodyContainsAny, bodyRegex,
+        ]
         return lists.allSatisfy { $0?.isEmpty != false }
             && status?.isEmpty != false
-            && harnessVersions?.isEmpty != false
+            && responseHeaderRegex?.isEmpty != false
             && stableSession == nil
     }
 }
@@ -814,9 +860,11 @@ public struct MiddlewareMutationResponse: Codable, Sendable, Equatable {
 }
 
 public struct MiddlewareTestRequest: Codable, Sendable, Equatable {
-    public var middlewareId: String
+    public var middlewareId: String?
     public var fixtureName: String?
     public var traceId: String?
+    public var rule: MiddlewareRuleSpecV1?
+    public var limit: Int?
 
     public init(
         middlewareId: String,
@@ -826,12 +874,82 @@ public struct MiddlewareTestRequest: Codable, Sendable, Equatable {
         self.middlewareId = middlewareId
         self.fixtureName = fixtureName
         self.traceId = traceId
+        rule = nil
+        limit = nil
+    }
+
+    /// Builds the recent-trace form of `/admin/middleware/test`. The sentinel
+    /// saved-rule ID preserves soft compatibility: older daemons ignore `rule`
+    /// and return 404 for the sentinel, which the wizard hides.
+    public init(rule: MiddlewareRuleSpecV1, limit: Int? = nil) {
+        middlewareId = "__alex_unsaved_rule_preview__"
+        fixtureName = nil
+        traceId = nil
+        self.rule = rule
+        self.limit = limit
     }
 
     enum CodingKeys: String, CodingKey {
+        case rule, limit
         case middlewareId = "middleware_id"
         case fixtureName = "fixture_name"
         case traceId = "trace_id"
+    }
+}
+
+public struct MiddlewareTraceMatch: Codable, Sendable, Equatable, Identifiable {
+    public var traceId: String
+    public var sessionId: String?
+    public var timestampMs: Int64
+    public var attemptNumber: Int?
+    public var harnessName: String?
+    public var harnessVersion: String?
+    public var model: String
+    public var provider: String
+    public var status: Int
+    public var matched: Bool?
+    public var matchedConditionGroups: [String]
+    public var responseHeaders: [String: [String]]?
+    public var bodyPreview: String?
+    public var bodyTruncated: Bool?
+    public var contentType: String?
+
+    public var id: String {
+        "\(traceId):\(attemptNumber ?? 0):\(provider):\(model):\(status)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case model, provider, status, matched
+        case traceId = "trace_id"
+        case sessionId = "session_id"
+        case timestampMs = "timestamp_ms"
+        case attemptNumber = "attempt_number"
+        case harnessName = "harness_name"
+        case harnessVersion = "harness_version"
+        case matchedConditionGroups = "matched_condition_groups"
+        case responseHeaders = "response_headers"
+        case bodyPreview = "body_preview"
+        case bodyTruncated = "body_truncated"
+        case contentType = "content_type"
+    }
+}
+
+public struct MiddlewareTraceMatchResponse: Codable, Sendable, Equatable {
+    public var valid: Bool
+    public var middlewareId: String
+    public var bodyInspectionRequired: Bool
+    public var scanned: Int
+    public var matchCount: Int
+    public var matches: [MiddlewareTraceMatch]
+    public var candidates: [MiddlewareTraceMatch]?
+
+    public var recentCandidates: [MiddlewareTraceMatch] { candidates ?? matches }
+
+    enum CodingKeys: String, CodingKey {
+        case valid, scanned, matches, candidates
+        case middlewareId = "middleware_id"
+        case bodyInspectionRequired = "body_inspection_required"
+        case matchCount = "match_count"
     }
 }
 
@@ -884,139 +1002,100 @@ public struct MiddlewareTestResponse: Decodable, Sendable, Equatable {
         warnings = try values.decodeIfPresent([String].self, forKey: .warnings) ?? []
     }
 }
-
 // MARK: - Middleware Wizard
 
-public enum MiddlewareWizardErrorKind: String, Codable, Sendable, CaseIterable, Hashable {
-    case any = "Any error"
-    case authentication = "Authentication"
-    case capacity = "Rate / capacity"
-    case badRequest = "Bad request"
-    case server = "Provider / server"
-    case network = "Network"
-    case refusal = "Model refusal"
-
-    var errorClasses: [String] {
-        switch self {
-        case .any: ["auth", "bad_request", "capacity", "client_disconnect", "network", "other", "server"]
-        case .authentication: ["auth"]
-        case .capacity: ["capacity"]
-        case .badRequest: ["bad_request"]
-        case .server: ["server"]
-        case .network: ["network"]
-        case .refusal: []
-        }
-    }
-
-    var normalizedErrorKinds: [String] {
-        self == .refusal ? ["upstream_refusal"] : []
-    }
-}
-
-public enum MiddlewareWizardAction: String, Codable, Sendable, CaseIterable {
-    case retrySame = "Retry the same model"
-    case routeExact = "Route to a specific model"
-    case routeEquivalent = "Route to an equivalent model"
-}
-
+/// The regex-first draft behind the Middleware Wizard. Every matcher is a
+/// full regular expression; an empty field places no constraint. The wizard
+/// always builds a session-scoped reroute to a specific model — advanced
+/// shapes are edited through the code view instead.
 public struct MiddlewareWizardDraft: Sendable, Equatable {
     public static let defaultNoticeTemplate =
-        "Alex switched from {from_model} to {to_model}."
+        "**Alex detected {from_provider} {from_model} refused. Switching to {to_provider} {to_model}.**"
+    public static let noticeTemplatePlaceholders = [
+        "{from_model}", "{to_model}", "{from_provider}", "{to_provider}",
+    ]
+    public static let fableRefusalBodyRegex =
+        #"(?m)^event:\s*message_delta\r?$\ndata:\s*\{[^\r\n]*"delta"\s*:\s*\{[^\r\n]*"stop_reason"\s*:\s*"refusal""#
 
     public var name: String
     public var description: String
-    public var harnesses: [String]
-    public var harnessVersion: String
-    public var modelPattern: String
-    public var sourceProvider: String
+    public var harnessNameRegex: String
+    public var harnessVersionRegex: String
+    public var modelRegex: String
+    public var providerRegex: String
     public var sourceEffort: String
     public var hook: MiddlewareHookPoint
-    public var errorKinds: Set<MiddlewareWizardErrorKind>
-    public var statusText: String
-    public var bodyPhrasesText: String
-    public var conditionMode: MiddlewareConditionMode
-    public var action: MiddlewareWizardAction
+    public var statusRegex: String
+    public var responseHeaderRegexText: String
+    public var bodyRegex: String
     public var targetModel: String
     public var targetEffort: String
-    public var equivalenceClass: String
     public var providerMode: MiddlewareProviderMode
     public var targetProviders: [String]
-    public var scope: MiddlewareRouteScope
-    public var stableSessionRequired: Bool
     public var ttlSeconds: Int
     public var includeNotice: Bool
     public var notice: String
     public var priority: Int
+    public var debug: Bool
 
     public init(
         name: String = "",
         description: String = "",
-        harnesses: [String] = [],
-        harnessVersion: String = "",
-        modelPattern: String = "",
-        sourceProvider: String = "",
+        harnessNameRegex: String = "",
+        harnessVersionRegex: String = "",
+        modelRegex: String = "",
+        providerRegex: String = "",
         sourceEffort: String = "",
         hook: MiddlewareHookPoint = .attemptResult,
-        errorKinds: Set<MiddlewareWizardErrorKind> = [.capacity, .server],
-        statusText: String = "429, 500-599",
-        bodyPhrasesText: String = "",
-        conditionMode: MiddlewareConditionMode = .all,
-        action: MiddlewareWizardAction = .routeExact,
+        statusRegex: String = "",
+        responseHeaderRegexText: String = "",
+        bodyRegex: String = "",
         targetModel: String = "",
         targetEffort: String = "",
-        equivalenceClass: String = "",
         providerMode: MiddlewareProviderMode = .only,
         targetProviders: [String] = [],
-        scope: MiddlewareRouteScope = .session,
-        stableSessionRequired: Bool = true,
         ttlSeconds: Int = 86_400,
         includeNotice: Bool = false,
         notice: String = "",
-        priority: Int = 100
+        priority: Int = 100,
+        debug: Bool = false
     ) {
         self.name = name
         self.description = description
-        self.harnesses = harnesses
-        self.harnessVersion = harnessVersion
-        self.modelPattern = modelPattern
-        self.sourceProvider = sourceProvider
+        self.harnessNameRegex = harnessNameRegex
+        self.harnessVersionRegex = harnessVersionRegex
+        self.modelRegex = modelRegex
+        self.providerRegex = providerRegex
         self.sourceEffort = sourceEffort
         self.hook = hook
-        self.errorKinds = errorKinds
-        self.statusText = statusText
-        self.bodyPhrasesText = bodyPhrasesText
-        self.conditionMode = conditionMode
-        self.action = action
+        self.statusRegex = statusRegex
+        self.responseHeaderRegexText = responseHeaderRegexText
+        self.bodyRegex = bodyRegex
         self.targetModel = targetModel
         self.targetEffort = targetEffort
-        self.equivalenceClass = equivalenceClass
         self.providerMode = providerMode
         self.targetProviders = targetProviders
-        self.scope = scope
-        self.stableSessionRequired = stableSessionRequired
         self.ttlSeconds = ttlSeconds
         self.includeNotice = includeNotice
         self.notice = notice
         self.priority = priority
+        self.debug = debug
     }
 
     public static var fableToSolExample: MiddlewareWizardDraft {
         .init(
             name: "Fable 5 → GPT-5.6 Sol",
             description: "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
-            modelPattern: "claude-fable-5",
-            sourceProvider: "anthropic",
+            modelRegex: "^claude-fable-5$",
+            providerRegex: "^anthropic$",
             hook: .attemptResult,
-            errorKinds: [.refusal],
-            statusText: "",
-            bodyPhrasesText: "",
-            conditionMode: .all,
-            action: .routeExact,
+            statusRegex: "^200$",
+            bodyRegex: fableRefusalBodyRegex,
             targetModel: "gpt-5.6-sol",
             targetEffort: "high",
             providerMode: .only,
             targetProviders: ["openai"],
-            scope: .session,
+            ttlSeconds: 86_400,
             includeNotice: false,
             notice: defaultNoticeTemplate,
             priority: 100)
@@ -1024,83 +1103,78 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
 
     /// Best-effort projection used when a declarative rule is opened in the
     /// basic wizard. Server validation remains authoritative, and advanced
-    /// shapes that cannot be represented are left for the structured preview.
+    /// shapes that cannot be represented are edited through the code view.
     public init(rule: MiddlewareRuleSpecV1) {
         let reroute = rule.then.reroute
-        let selectedErrors = Set(MiddlewareWizardErrorKind.allCases.filter { kind in
-            guard kind != .any else { return false }
-            if kind == .refusal {
-                return !Set(rule.when.errorKinds ?? []).isDisjoint(with: kind.normalizedErrorKinds)
-            }
-            return !Set(kind.errorClasses).isDisjoint(with: rule.when.errorClasses ?? [])
-        })
+        let legacyRefusal = rule.when.errorKinds == ["upstream_refusal"]
         self.init(
             name: rule.name,
             description: rule.description ?? "",
-            harnesses: rule.when.harnessNames ?? [],
-            harnessVersion: (rule.when.harnessVersions ?? []).joined(separator: ", "),
-            modelPattern: Self.displayModelPatterns(rule.when.models ?? []).joined(separator: ", "),
-            sourceProvider: (rule.when.providers ?? []).joined(separator: ", "),
+            harnessNameRegex: (rule.when.harnessNameRegex ?? []).first
+                ?? Self.exactAlternation(rule.when.harnessNames ?? []),
+            harnessVersionRegex: (rule.when.harnessVersionRegex ?? []).first
+                ?? Self.exactAlternation(rule.when.harnessVersions ?? []),
+            modelRegex: (rule.when.modelRegex ?? []).first
+                ?? Self.exactAlternation(rule.when.models ?? []),
+            providerRegex: (rule.when.providerRegex ?? []).first
+                ?? Self.exactAlternation(rule.when.providers ?? []),
             sourceEffort: (rule.when.efforts ?? []).first ?? "",
             hook: rule.hook,
-            errorKinds: selectedErrors,
-            statusText: (rule.when.status ?? []).map(\.displayValue).joined(separator: ", "),
-            bodyPhrasesText: (rule.when.bodyContainsAny ?? []).joined(separator: "\n"),
-            conditionMode: rule.expression == nil ? .all : .any,
-            action: rule.then.retrySameRoute != nil
-                ? .retrySame : (reroute?.equivalenceClass == nil ? .routeExact : .routeEquivalent),
+            statusRegex: (rule.when.statusRegex ?? []).first
+                ?? Self.statusAlternation(rule.when.status ?? []),
+            responseHeaderRegexText: (rule.when.responseHeaderRegex ?? []).map {
+                "\($0.key) => \($0.value)"
+            }.joined(separator: "\n"),
+            bodyRegex: (rule.when.bodyRegex ?? []).first
+                ?? (legacyRefusal ? Self.fableRefusalBodyRegex : ""),
             targetModel: reroute?.model ?? "",
             targetEffort: reroute?.effort ?? "",
-            equivalenceClass: reroute?.equivalenceClass ?? "",
             providerMode: reroute?.providerMode ?? .any,
             targetProviders: reroute?.providers ?? [],
-            scope: reroute?.scope ?? .request,
-            stableSessionRequired: rule.when.stableSession ?? true,
             ttlSeconds: reroute?.ttlSeconds ?? 86_400,
             includeNotice: reroute?.notice != nil,
             notice: reroute?.notice ?? Self.defaultNoticeTemplate,
-            priority: rule.priority)
+            priority: rule.priority,
+            debug: rule.debug)
     }
 
     public var localValidationErrors: [String] {
         var errors: [String] = []
         if trimmed(name).isEmpty { errors.append("Enter a name.") }
-        if !trimmed(statusText).isEmpty && statusMatchers.count != commaSeparated(statusText).count {
-            errors.append("HTTP statuses must be codes, ranges, 4xx, or 5xx.")
+        for (label, pattern) in [
+            ("Harness name", harnessNameRegex),
+            ("Harness version", harnessVersionRegex),
+            ("Model", modelRegex),
+            ("Provider", providerRegex),
+            ("HTTP status", statusRegex),
+            ("Response body", bodyRegex),
+        ] where !trimmed(pattern).isEmpty {
+            if !Self.isValidRegex(trimmed(pattern)) { errors.append("\(label) regex is invalid.") }
         }
+        errors.append(contentsOf: responseHeaderRegexErrors)
         if hook != .attemptResult {
-            errors.append("Retry and reroute actions require the Failed attempt hook.")
+            errors.append("Routing rules require the failed-attempt hook.")
         }
-        if hook != .attemptResult && (!bodyPhrases.isEmpty || !errorKinds.isEmpty || !statusMatchers.isEmpty) {
-            errors.append("Failure and body conditions require the Failed attempt hook.")
-        }
-        if matcherIsEmpty { errors.append("Choose at least one condition.") }
-        if action == .routeExact && trimmed(targetModel).isEmpty {
-            errors.append("Choose a target model.")
-        }
-        if action == .routeEquivalent && trimmed(equivalenceClass).isEmpty {
-            errors.append("Enter an equivalence class.")
-        }
-        if providerMode != .any && targetProviders.isEmpty && action != .retrySame {
+        if trimmed(targetModel).isEmpty { errors.append("Choose a target model.") }
+        if providerMode != .any && targetProviders.isEmpty {
             errors.append("Choose at least one target provider.")
         }
-        if usesSessionScope && !stableSessionRequired {
-            errors.append("Session routing requires a stable session identifier policy.")
-        }
-        if action != .retrySame && includeNotice && trimmed(notice).isEmpty {
+        if includeNotice && trimmed(notice).isEmpty {
             errors.append("Enter the notice Alex should add after a successful reroute.")
         }
         if !(0...10_000).contains(priority) { errors.append("Priority must be between 0 and 10000.") }
-        if usesSessionScope && ttlSeconds <= 0 { errors.append("Session route TTL must be positive.") }
+        if ttlSeconds <= 0 { errors.append("Session route TTL must be positive.") }
         return errors
     }
 
     public var warnings: [String] {
         var result: [String] = []
-        if matcherIsEmpty { result.append("This rule would match every event at its hook.") }
-        if !bodyPhrases.isEmpty { result.append("Matching this rule may inspect up to the configured error-body limit.") }
-        if usesSessionScope { result.append("The target route is kept only when Alex has a stable, portable session.") }
-        if action != .retrySame && includeNotice {
+        if matcherIsEmpty { result.append("This rule would match every failed attempt.") }
+        if !trimmed(bodyRegex).isEmpty {
+            result.append("Body matching inspects up to the configured failed-response byte limit.")
+        }
+        result.append("The target route is kept only when Alex has a stable, portable session.")
+        if includeNotice {
             result.append("A notice can buffer the exceptional fallback response before delivery.")
         }
         return result
@@ -1110,147 +1184,159 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         let errors = localValidationErrors
         guard errors.isEmpty else { throw MiddlewareWizardBuildError.invalid(errors) }
 
-        let normalizedID = id ?? Self.slug(trimmed(name))
-        let errorClasses = errorKinds.flatMap(\.errorClasses).sorted()
-        let normalizedErrorKinds = errorKinds.flatMap(\.normalizedErrorKinds).sorted()
-        let baseMatch = MiddlewareMatchSpec(
-            harnessNames: nilIfEmpty(harnesses),
-            harnessVersions: nilIfEmpty(commaSeparated(harnessVersion)),
-            models: nilIfEmpty(Self.ruleModelPatterns(commaSeparated(modelPattern))),
+        let match = MiddlewareMatchSpec(
+            harnessNameRegex: regexMatchers(harnessNameRegex),
+            harnessVersionRegex: regexMatchers(harnessVersionRegex),
+            modelRegex: regexMatchers(modelRegex),
             efforts: nilIfEmpty(trimmed(sourceEffort)).map { [$0] },
-            providers: nilIfEmpty(commaSeparated(sourceProvider)),
-            status: conditionMode == .all ? nilIfEmpty(statusMatchers) : nil,
-            errorClasses: conditionMode == .all ? nilIfEmpty(errorClasses) : nil,
-            errorKinds: conditionMode == .all ? nilIfEmpty(normalizedErrorKinds) : nil,
-            bodyContainsAny: conditionMode == .all ? nilIfEmpty(bodyPhrases) : nil,
-            stableSession: usesSessionScope ? stableSessionRequired : nil)
+            providerRegex: regexMatchers(providerRegex),
+            statusRegex: regexMatchers(statusRegex),
+            responseHeaderRegex: nilIfEmpty(responseHeaderMatchers),
+            bodyRegex: regexMatchers(bodyRegex),
+            stableSession: true)
 
-        let expression: MiddlewareMatchExpression?
-        if conditionMode == .any {
-            var alternatives: [MiddlewareMatchExpression] = []
-            if !statusMatchers.isEmpty {
-                alternatives.append(.conditions(.init(status: statusMatchers)))
-            }
-            if !errorClasses.isEmpty {
-                alternatives.append(.conditions(.init(errorClasses: errorClasses)))
-            }
-            if !normalizedErrorKinds.isEmpty {
-                alternatives.append(.conditions(.init(errorKinds: normalizedErrorKinds)))
-            }
-            if !bodyPhrases.isEmpty {
-                alternatives.append(.conditions(.init(bodyContainsAny: bodyPhrases)))
-            }
-            expression = alternatives.isEmpty ? nil : .any(alternatives)
-        } else {
-            expression = nil
-        }
-
-        let actionSpec: MiddlewareActionSpec
-        switch action {
-        case .retrySame:
-            actionSpec = .init(retrySameRoute: .init(reason: "Matched \(trimmed(name))"))
-        case .routeExact, .routeEquivalent:
-            actionSpec = .init(reroute: .init(
-                model: action == .routeExact ? trimmed(targetModel) : nil,
-                equivalenceClass: action == .routeEquivalent ? trimmed(equivalenceClass) : nil,
-                providerMode: providerMode,
-                providers: targetProviders,
-                scope: scope,
-                ttlSeconds: scope == .session ? ttlSeconds : nil,
-                notice: includeNotice ? trimmed(notice) : nil,
-                effort: nilIfEmpty(trimmed(targetEffort)),
-                reason: "Matched \(trimmed(name))",
-                maxAttempts: 3,
-                requiredCapabilities: .init(portableHistory: usesSessionScope)))
-        }
+        let reroute = MiddlewareRerouteAction(
+            model: trimmed(targetModel),
+            providerMode: providerMode,
+            providers: providerMode == .any ? [] : targetProviders,
+            scope: .session,
+            ttlSeconds: ttlSeconds,
+            notice: includeNotice ? trimmed(notice) : nil,
+            effort: nilIfEmpty(trimmed(targetEffort)),
+            reason: "Matched \(trimmed(name))",
+            maxAttempts: 3,
+            requiredCapabilities: .init(portableHistory: true))
 
         var capabilities: [String] = []
-        if !bodyPhrases.isEmpty { capabilities.append("attempt.read_error_body") }
+        if regexMatchers(bodyRegex) != nil { capabilities.append("attempt.read_error_body") }
         capabilities.append("route.override")
-        if usesSessionScope { capabilities.append("session.pin") }
-        if action != .retrySame && includeNotice { capabilities.append("response.prepend_text") }
+        capabilities.append("session.pin")
+        if includeNotice { capabilities.append("response.prepend_text") }
 
         return MiddlewareRuleSpecV1(
-            id: normalizedID,
+            id: id ?? Self.slug(trimmed(name)),
             name: trimmed(name),
             description: nilIfEmpty(trimmed(description)),
             enabled: true,
+            debug: debug,
             priority: priority,
             hook: hook,
             capabilities: capabilities,
-            when: baseMatch,
-            expression: expression,
-            then: actionSpec)
+            when: match,
+            expression: nil,
+            then: .init(reroute: reroute))
     }
 
     public var summary: String {
-        let harness = harnesses.isEmpty ? "any harness" : Self.naturalList(harnesses.map(Self.titleCase))
-        let model = commaSeparated(modelPattern).isEmpty
-            ? "any model" : Self.naturalList(commaSeparated(modelPattern))
-        let provider = trimmed(sourceProvider).isEmpty ? "any provider" : Self.titleCase(trimmed(sourceProvider))
-        let condition: String
-        if hook == .attemptResult {
-            let labels = errorKinds.map(\.rawValue).sorted()
-            condition = labels.isEmpty ? "a failed attempt" : "a \(Self.naturalList(labels).lowercased()) error"
-        } else {
-            condition = hook == .requestReceived ? "the request arrives" : "the response is ready"
+        let harness = displayPattern(harnessNameRegex, fallback: "any harness")
+        let model = displayPattern(modelRegex, fallback: "any model")
+        let provider = displayPattern(providerRegex, fallback: "any provider")
+        var conditions: [String] = []
+        if regexMatchers(statusRegex) != nil { conditions.append("the status matches \(trimmed(statusRegex))") }
+        if !responseHeaderMatchers.isEmpty {
+            conditions.append(responseHeaderMatchers.count == 1
+                ? "a response header matches" : "\(responseHeaderMatchers.count) response headers match")
         }
-        let result: String
-        switch action {
-        case .retrySame:
-            result = "retry the same route"
-        case .routeExact:
-            let providers = targetProviders.isEmpty ? "any provider" : Self.naturalList(targetProviders.map(Self.titleCase))
-            result = "route to \(trimmed(targetModel)) using \(providers)"
-        case .routeEquivalent:
-            result = "route within the \(trimmed(equivalenceClass)) equivalence class"
-        }
+        if regexMatchers(bodyRegex) != nil { conditions.append("the body matches the configured regex") }
+        let condition = conditions.isEmpty
+            ? "the attempt fails" : Self.naturalList(conditions, conjunction: "and")
         let sourceEffortSummary = trimmed(sourceEffort).isEmpty
             ? "" : " at \(trimmed(sourceEffort)) effort"
-        let targetEffortSummary = trimmed(targetEffort).isEmpty || action == .retrySame
+        let targetEffortSummary = trimmed(targetEffort).isEmpty
             ? "" : " at \(trimmed(targetEffort)) effort"
-        let persistence = usesSessionScope ? " and keep it for the session" : ""
-        return "When \(harness) requests \(model)\(sourceEffortSummary) through \(provider) and Alex sees \(condition), \(result)\(targetEffortSummary)\(persistence)."
+        let providers = providerMode == .any || targetProviders.isEmpty
+            ? "any provider" : Self.naturalList(targetProviders.map(Self.titleCase), conjunction: "or")
+        return "When \(harness) requests \(model)\(sourceEffortSummary) through \(provider) and \(condition), route to \(trimmed(targetModel))\(targetEffortSummary) using \(providers) and keep it for the session."
     }
 
-    public var bodyPhrases: [String] {
-        bodyPhrasesText
-            .components(separatedBy: .newlines)
-            .flatMap { $0.components(separatedBy: ",") }
-            .map { trimmed($0) }
-            .filter { !$0.isEmpty }
+    public var responseHeaderMatchers: [MiddlewareHeaderRegexMatcher] {
+        responseHeaderSourceLines.compactMap { _, source in
+            guard let separator = source.range(of: "=>") else { return nil }
+            let key = trimmed(String(source[..<separator.lowerBound]))
+            let value = trimmed(String(source[separator.upperBound...]))
+            guard !key.isEmpty, !value.isEmpty else { return nil }
+            return .init(key: key, value: value)
+        }
     }
 
-    public var statusMatchers: [MiddlewareStatusMatcher] {
-        commaSeparated(statusText).compactMap { value in
-            if let exact = Int(value), (100...599).contains(exact) { return .exact(exact) }
-            let lower = value.lowercased()
-            if lower == "4xx" || lower == "5xx" { return .pattern(lower) }
-            let parts = lower.split(separator: "-", maxSplits: 1).compactMap { Int($0) }
-            if parts.count == 2, parts[0] >= 100, parts[1] <= 599, parts[0] <= parts[1] {
-                return .pattern("\(parts[0])-\(parts[1])")
+    public static func isValidRegex(_ pattern: String) -> Bool {
+        (try? NSRegularExpression(pattern: pattern)) != nil
+    }
+
+    /// Builds an anchored alternation such as `^(a|b)$` so plain lists from
+    /// legacy rules project into the regex fields without changing behavior.
+    public static func exactAlternation(_ values: [String]) -> String {
+        let escaped = values.map { NSRegularExpression.escapedPattern(for: $0) }
+        switch escaped.count {
+        case 0: return ""
+        case 1: return "^\(escaped[0])$"
+        default: return "^(\(escaped.joined(separator: "|")))$"
+        }
+    }
+
+    private static func statusAlternation(_ matchers: [MiddlewareStatusMatcher]) -> String {
+        let parts: [String] = matchers.compactMap { matcher in
+            switch matcher {
+            case let .exact(status):
+                return "\(status)"
+            case let .pattern(pattern):
+                let lower = pattern.lowercased()
+                if lower == "4xx" { return #"4\d\d"# }
+                if lower == "5xx" { return #"5\d\d"# }
+                let bounds = lower.split(separator: "-").compactMap { Int($0) }
+                if bounds.count == 2, bounds[0] % 100 == 0, bounds[1] == bounds[0] + 99 {
+                    return "\(bounds[0] / 100)\\d\\d"
+                }
+                if bounds.count == 2, bounds[0] <= bounds[1] {
+                    return (bounds[0]...bounds[1]).map(String.init).joined(separator: "|")
+                }
+                return nil
+            }
+        }
+        return parts.isEmpty ? "" : "^(\(parts.joined(separator: "|")))$"
+    }
+
+    private var responseHeaderRegexErrors: [String] {
+        responseHeaderSourceLines.compactMap { lineNumber, source in
+            guard let separator = source.range(of: "=>") else {
+                return "Header matcher line \(lineNumber) must use key-regex => value-regex."
+            }
+            let key = trimmed(String(source[..<separator.lowerBound]))
+            let value = trimmed(String(source[separator.upperBound...]))
+            guard !key.isEmpty, !value.isEmpty else {
+                return "Header matcher line \(lineNumber) must use key-regex => value-regex."
+            }
+            if !Self.isValidRegex(key) {
+                return "Header matcher line \(lineNumber) has an invalid key regex."
+            }
+            if !Self.isValidRegex(value) {
+                return "Header matcher line \(lineNumber) has an invalid value regex."
             }
             return nil
         }
     }
 
+    private var responseHeaderSourceLines: [(Int, String)] {
+        responseHeaderRegexText.components(separatedBy: .newlines).enumerated().compactMap { index, line in
+            let source = trimmed(line)
+            return source.isEmpty ? nil : (index + 1, source)
+        }
+    }
+
+    private func regexMatchers(_ pattern: String) -> [String]? {
+        let value = trimmed(pattern)
+        return value.isEmpty || value == ".*" ? nil : [value]
+    }
+
+    private func displayPattern(_ pattern: String, fallback: String) -> String {
+        regexMatchers(pattern) == nil ? fallback : trimmed(pattern)
+    }
+
     private var matcherIsEmpty: Bool {
-        harnesses.isEmpty
-            && trimmed(harnessVersion).isEmpty
-            && commaSeparated(modelPattern).isEmpty
-            && trimmed(sourceProvider).isEmpty
+        [harnessNameRegex, harnessVersionRegex, modelRegex, providerRegex, statusRegex, bodyRegex]
+            .allSatisfy { regexMatchers($0) == nil }
             && trimmed(sourceEffort).isEmpty
-            && errorKinds.isEmpty
-            && statusMatchers.isEmpty
-            && bodyPhrases.isEmpty
-    }
-
-    private var usesSessionScope: Bool {
-        action != .retrySame && scope == .session
-    }
-
-    private func commaSeparated(_ text: String) -> [String] {
-        text.split(separator: ",").map { trimmed(String($0)) }.filter { !$0.isEmpty }
+            && responseHeaderMatchers.isEmpty
     }
 
     private func trimmed(_ value: String) -> String {
@@ -1267,30 +1353,14 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         return slug.isEmpty ? "middleware-rule" : slug
     }
 
-    private static func ruleModelPatterns(_ values: [String]) -> [String] {
-        unique(values.map { value in
-            switch value.lowercased() {
-            case "fable-5": "claude-fable-5"
-            default: value
-            }
-        })
-    }
-
-    private static func displayModelPatterns(_ values: [String]) -> [String] {
-        unique(values)
-    }
-
-    private static func unique(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-        return values.filter { seen.insert($0).inserted }
-    }
-
-    private static func naturalList(_ values: [String]) -> String {
+    private static func naturalList(_ values: [String], conjunction: String) -> String {
         switch values.count {
-        case 0: ""
-        case 1: values[0]
-        case 2: values.joined(separator: " or ")
-        default: values.dropLast().joined(separator: ", ") + ", or " + (values.last ?? "")
+        case 0: return ""
+        case 1: return values[0]
+        case 2: return values.joined(separator: " \(conjunction) ")
+        default:
+            return values.dropLast().joined(separator: ", ")
+                + ", \(conjunction) " + (values.last ?? "")
         }
     }
 

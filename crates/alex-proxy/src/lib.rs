@@ -5714,7 +5714,8 @@ async fn traces_sessions(
 ) -> Response {
     let since = q.get("since").and_then(|s| parse_since(s, now_ms()));
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0);
-    match state.store.sessions(since, limit) {
+    let middleware_id = q.get("middleware_id").map(String::as_str);
+    match state.store.sessions_filtered(since, limit, middleware_id) {
         Ok(rows) => axum::Json(json!({"sessions": rows})).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -6056,6 +6057,9 @@ fn transcript_turn(store: &Store, row: &Value) -> Value {
         "error_kind": row["error_kind"],
         "error_code": row["error_code"],
         "error_class": row["error_class"],
+        "attempts": row["attempts"],
+        "substituted": row["substituted"],
+        "substitution_reason": row["substitution_reason"],
         "user": user,
         "assistant": assistant,
         "tool_calls": tool_calls,
@@ -6253,7 +6257,20 @@ fn transcript_tab_counts(turns: &[Value]) -> Value {
                 })
             })
             || has_tools
-            || turn["error"].as_str().is_some_and(|text| !text.is_empty());
+            || turn["error"].as_str().is_some_and(|text| !text.is_empty())
+            || turn["attempts"].as_array().is_some_and(|attempts| {
+                attempts.iter().any(|attempt| {
+                    attempt["error"].is_object()
+                        || attempt["middleware_decisions"]
+                            .as_array()
+                            .is_some_and(|decisions| {
+                                decisions
+                                    .iter()
+                                    .any(|decision| decision["state"] == "matched")
+                            })
+                })
+            })
+            || turn["substituted"].as_bool() == Some(true);
         if has_user {
             user += 1;
             all += 1;
@@ -6380,6 +6397,9 @@ fn transcript_turn_metadata(row: &Value) -> Value {
         "output_tokens": row["output_tokens"],
         "error": row["error"],
         "error_kind": row["error_kind"],
+        "attempts": row["attempts"],
+        "substituted": row["substituted"],
+        "substitution_reason": row["substitution_reason"],
         "streamed": row["streamed"],
         "has_request": row["req_body_path"].as_str().is_some(),
         "has_response": row["resp_body_path"].as_str().is_some(),
@@ -7468,13 +7488,462 @@ async fn admin_middleware_lease_delete(
 
 #[derive(Debug, Deserialize)]
 struct MiddlewareTestRequest {
-    middleware_id: String,
+    #[serde(default)]
+    middleware_id: Option<String>,
     #[serde(default)]
     fixture_name: Option<String>,
     #[serde(default)]
     trace_id: Option<String>,
     #[serde(default)]
     context: Option<alex_middleware::AttemptResultContext>,
+    /// An unsaved rule supplied by the wizard. When no single fixture, trace,
+    /// or context is selected, `/admin/middleware/test` scans recent attempts.
+    #[serde(default)]
+    rule: Option<alex_middleware::RuleSpecV1>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const DEFAULT_MIDDLEWARE_TRACE_TEST_LIMIT: usize = 200;
+const MAX_MIDDLEWARE_TRACE_TEST_LIMIT: usize = 1_000;
+
+fn stored_header_map(raw: Option<&str>) -> BTreeMap<String, Vec<String>> {
+    let Some(Value::Object(values)) = raw.and_then(|raw| serde_json::from_str(raw).ok()) else {
+        return BTreeMap::new();
+    };
+    values
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let values = match value {
+                Value::String(value) => vec![value],
+                Value::Array(values) => values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (!values.is_empty()).then_some((key, values))
+        })
+        .collect()
+}
+
+fn stored_safe_headers(raw: Option<&str>) -> alex_middleware::SafeHeaders {
+    alex_middleware::SafeHeaders::from_untrusted(stored_header_map(raw)).headers
+}
+
+fn stored_attempt_headers(value: Option<&Value>) -> alex_middleware::SafeHeaders {
+    let raw = value.and_then(|value| serde_json::to_string(value).ok());
+    stored_safe_headers(raw.as_deref())
+}
+
+fn stored_error_class(value: Option<&str>) -> Option<alex_middleware::ErrorClass> {
+    match value? {
+        "auth" => Some(alex_middleware::ErrorClass::Auth),
+        "capacity" => Some(alex_middleware::ErrorClass::Capacity),
+        "bad_request" => Some(alex_middleware::ErrorClass::BadRequest),
+        "server" => Some(alex_middleware::ErrorClass::Server),
+        "client_disconnect" => Some(alex_middleware::ErrorClass::ClientDisconnect),
+        "network" => Some(alex_middleware::ErrorClass::Network),
+        "other" => Some(alex_middleware::ErrorClass::Other),
+        _ => None,
+    }
+}
+
+fn middleware_condition_groups(rule: &alex_middleware::RuleSpecV1) -> Vec<&'static str> {
+    let conditions = &rule.when;
+    let mut groups = Vec::new();
+    if !conditions.harness_names.is_empty()
+        || !conditions.harness_versions.is_empty()
+        || !conditions.harness_name_regex.is_empty()
+        || !conditions.harness_version_regex.is_empty()
+    {
+        groups.push("harness");
+    }
+    if !conditions.models.is_empty()
+        || !conditions.model_regex.is_empty()
+        || !conditions.original_models.is_empty()
+        || !conditions.current_models.is_empty()
+        || !conditions.model_aliases.is_empty()
+        || !conditions.equivalence_classes.is_empty()
+    {
+        groups.push("model");
+    }
+    if !conditions.efforts.is_empty() {
+        groups.push("effort");
+    }
+    if !conditions.providers.is_empty()
+        || !conditions.provider_regex.is_empty()
+        || !conditions.exclude_providers.is_empty()
+    {
+        groups.push("provider");
+    }
+    if !conditions.status.is_empty() || !conditions.status_regex.is_empty() {
+        groups.push("status");
+    }
+    if !conditions.response_header_regex.is_empty() {
+        groups.push("response_headers");
+    }
+    if !conditions.error_classes.is_empty()
+        || !conditions.error_kinds.is_empty()
+        || !conditions.error_codes.is_empty()
+        || !conditions.error_messages.is_empty()
+    {
+        groups.push("error");
+    }
+    if conditions.needs_body() || !conditions.content_types.is_empty() {
+        groups.push("body");
+    }
+    if !conditions.attempt_numbers.is_empty() || conditions.same_route_accounts_remaining.is_some()
+    {
+        groups.push("attempt");
+    }
+    if conditions.session_present.is_some() || conditions.stable_session.is_some() {
+        groups.push("session");
+    }
+    if rule.expression.is_some() {
+        groups.push("expression");
+    }
+    groups
+}
+
+fn stored_middleware_body_prefix(
+    store: &Store,
+    row: &Value,
+    max_bytes: usize,
+) -> Option<(Vec<u8>, bool)> {
+    let trace_id = row["id"].as_str()?;
+    match store.read_trace_body(trace_id, TraceBodyKind::Response, max_bytes as u64) {
+        Ok(Some(body)) => return Some((body.bytes, false)),
+        Ok(None) | Err(_) => {}
+    }
+    // LAR and legacy gzip coexist during the archive migration. The ordinary
+    // store API deliberately refuses an oversized allocation, so match-only
+    // preview falls back to a bounded gzip prefix instead of loading the full
+    // response or silently losing an early body-regex hit.
+    let path = row["resp_body_path"].as_str()?;
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut decoder = std::io::Read::take(decoder, (max_bytes as u64).saturating_add(1));
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024).saturating_add(1));
+    std::io::Read::read_to_end(&mut decoder, &mut bytes).ok()?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Some((bytes, truncated))
+}
+
+fn stored_middleware_context(
+    state: &AppState,
+    row: &Value,
+    attempt: &Value,
+    attempt_number: u32,
+    include_response: bool,
+    body_limit: usize,
+    needs_body: bool,
+) -> Option<alex_middleware::AttemptResultContext> {
+    let trace_id = row["id"].as_str()?.to_string();
+    let status = attempt["status"]
+        .as_u64()
+        .or_else(|| row["status"].as_u64())
+        .and_then(|value| u16::try_from(value).ok())?;
+    let original_model = row["original_model"]
+        .as_str()
+        .or_else(|| row["requested_model"].as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let current_model = attempt["model"]
+        .as_str()
+        .or_else(|| row["routed_model"].as_str())
+        .or_else(|| row["served_model"].as_str())
+        .unwrap_or(&original_model)
+        .to_string();
+    let provider = attempt["provider"]
+        .as_str()
+        .or_else(|| row["upstream_provider"].as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let request_headers = stored_header_map(row["req_headers_json"].as_str());
+    let harness_version = request_headers
+        .get("x-alex-harness-version")
+        .and_then(|values| values.first())
+        .cloned();
+    let attempt_headers = stored_attempt_headers(attempt.get("response_headers"));
+    let response_headers = if !attempt_headers.is_empty() {
+        attempt_headers
+    } else if include_response {
+        stored_safe_headers(row["resp_headers_json"].as_str())
+    } else {
+        Default::default()
+    };
+    let content_type = response_headers
+        .get("content-type")
+        .and_then(|values| values.first())
+        .cloned();
+    let inspected_attempt_body = attempt["inspected_response_body"].as_str();
+    let body = if needs_body {
+        inspected_attempt_body
+            .map(|text| alex_middleware::BodyView {
+                content_type: content_type.clone(),
+                size_bytes: (!attempt["body_truncated"].as_bool().unwrap_or(false))
+                    .then_some(text.len() as u64),
+                json: (!attempt["body_truncated"].as_bool().unwrap_or(false))
+                    .then(|| serde_json::from_str(text).ok())
+                    .flatten(),
+                text: Some(text.to_string()),
+                truncated: attempt["body_truncated"].as_bool().unwrap_or(false),
+                inspected_bytes: text.len(),
+            })
+            .or_else(|| {
+                include_response
+                    .then(|| stored_middleware_body_prefix(&state.store, row, body_limit))
+                    .flatten()
+                    .map(|(bytes, truncated)| {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        alex_middleware::BodyView {
+                            content_type: content_type.clone(),
+                            size_bytes: (!truncated).then_some(bytes.len() as u64),
+                            json: (!truncated)
+                                .then(|| serde_json::from_slice(&bytes).ok())
+                                .flatten(),
+                            text: Some(text),
+                            truncated,
+                            inspected_bytes: bytes.len(),
+                        }
+                    })
+            })
+            .unwrap_or_else(|| alex_middleware::BodyView {
+                content_type,
+                ..Default::default()
+            })
+    } else {
+        alex_middleware::BodyView {
+            content_type,
+            ..Default::default()
+        }
+    };
+    let attempt_error = attempt.get("error").filter(|value| value.is_object());
+    let error_kind = attempt_error
+        .and_then(|error| error["kind"].as_str())
+        .or_else(|| row["error_kind"].as_str());
+    let error_code = attempt_error
+        .and_then(|error| error["code"].as_str())
+        .or_else(|| row["error_code"].as_str());
+    let error_message = attempt_error
+        .and_then(|error| error["message"].as_str())
+        .or_else(|| row["error"].as_str());
+    let error_class = attempt_error
+        .and_then(|error| error["class"].as_str())
+        .and_then(|value| stored_error_class(Some(value)))
+        .or_else(|| stored_error_class(row["error_class"].as_str()))
+        .unwrap_or_else(|| {
+            middleware_error_class(classify_error(&provider, Some(status), error_kind))
+        });
+    let request_json = row["reasoning_effort"]
+        .as_str()
+        .map(|effort| json!({"reasoning_effort": effort}));
+    let original_classes = state
+        .middleware
+        .read()
+        .map(|runtime| runtime.equivalence_classes_for_model(&original_model))
+        .unwrap_or_default();
+    let current_classes = state
+        .middleware
+        .read()
+        .map(|runtime| runtime.equivalence_classes_for_model(&current_model))
+        .unwrap_or_default();
+    let model_capabilities = alex_middleware::ModelCapabilities::default();
+    let requested = alex_middleware::ModelRef {
+        provider: route_model(&original_model)
+            .0
+            .unwrap_or(Provider::Anthropic)
+            .as_str()
+            .into(),
+        id: original_model.clone(),
+        aliases: vec![canonical_model_alias(&original_model).into()],
+        equivalence_classes: original_classes,
+        capabilities: model_capabilities.clone(),
+    };
+    let selected = alex_middleware::ModelRef {
+        provider: provider.clone(),
+        id: current_model.clone(),
+        aliases: vec![canonical_model_alias(&current_model).into()],
+        equivalence_classes: current_classes,
+        capabilities: model_capabilities,
+    };
+    let session_id = row["session_id"].as_str().map(String::from);
+    Some(alex_middleware::AttemptResultContext {
+        request: alex_middleware::ClientRequestView {
+            trace_id,
+            method: row["method"].as_str().unwrap_or("POST").into(),
+            path: row["path"].as_str().unwrap_or("/").into(),
+            client_format: match row["client_format"].as_str() {
+                Some("openai-chat") | Some("openai_chat") => {
+                    alex_middleware::ClientFormat::OpenaiChat
+                }
+                Some("openai-responses") | Some("openai_responses") => {
+                    alex_middleware::ClientFormat::OpenaiResponses
+                }
+                Some("gemini") | Some("gemini-generate") | Some("gemini_generate") => {
+                    alex_middleware::ClientFormat::GeminiGenerate
+                }
+                _ => alex_middleware::ClientFormat::AnthropicMessages,
+            },
+            original_model: original_model.clone(),
+            current_model: current_model.clone(),
+            streaming: row["streamed"].as_bool().unwrap_or(false),
+            headers: alex_middleware::SafeHeaders::from_untrusted(request_headers).headers,
+            body: alex_middleware::JsonBodyView {
+                json: request_json,
+                size_bytes: None,
+                truncated: false,
+            },
+        },
+        harness: alex_middleware::HarnessView {
+            name: row["harness"].as_str().map(String::from),
+            version: harness_version,
+        },
+        session: alex_middleware::SessionView {
+            id: session_id.clone(),
+            run_id: row["run_id"].as_str().map(String::from),
+            source: if session_id.is_some() {
+                alex_middleware::SessionIdSource::NativeHeader
+            } else {
+                alex_middleware::SessionIdSource::Unknown
+            },
+            active_route_lease: None,
+        },
+        route: alex_middleware::RouteView {
+            requested,
+            selected,
+            provider: alex_middleware::ProviderView {
+                id: provider.clone(),
+                enabled: true,
+                paused: false,
+                healthy: true,
+                supported_formats: row["upstream_format"]
+                    .as_str()
+                    .map(|value| vec![value.to_string()])
+                    .unwrap_or_default(),
+            },
+            upstream_format: row["upstream_format"]
+                .as_str()
+                .unwrap_or(&provider)
+                .to_string(),
+            attempt_number,
+            same_route_accounts_remaining: false,
+        },
+        outcome: alex_middleware::AttemptOutcome {
+            status,
+            headers: response_headers,
+            body,
+            error: Some(alex_middleware::ErrorInfo {
+                class: error_class,
+                kind: error_kind.map(String::from),
+                code: error_code.map(String::from),
+                message: error_message.map(String::from),
+            }),
+            timing: Default::default(),
+        },
+    })
+}
+
+fn middleware_recent_trace_test(
+    state: &AppState,
+    rule: alex_middleware::RuleSpecV1,
+    engine: &alex_middleware::CompiledRuleSetV1,
+    limit: Option<usize>,
+    body_limit: usize,
+) -> Response {
+    let limit = limit
+        .unwrap_or(DEFAULT_MIDDLEWARE_TRACE_TEST_LIMIT)
+        .clamp(1, MAX_MIDDLEWARE_TRACE_TEST_LIMIT);
+    let rows = match state.store.search_traces(&TraceFilter {
+        limit,
+        ..Default::default()
+    }) {
+        Ok(rows) => rows,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let needs_body = rule.when.needs_body()
+        || rule
+            .expression
+            .as_ref()
+            .is_some_and(alex_middleware::MatchExpressionV1::needs_body);
+    let condition_groups = middleware_condition_groups(&rule);
+    let mut scanned = 0usize;
+    let mut matches = Vec::new();
+    let mut candidates = Vec::new();
+    'traces: for row in rows {
+        let mut attempts = middleware_activity_attempts(&row);
+        if attempts.is_empty() {
+            attempts.push(json!({}));
+        }
+        let last_index = attempts.len() - 1;
+        for (index, attempt) in attempts.iter().enumerate().rev() {
+            if scanned >= limit {
+                break 'traces;
+            }
+            scanned += 1;
+            let attempt_number = (index + 1) as u32;
+            // Evaluation may need the configured body cap; otherwise load only
+            // enough text for the sidebar preview rather than reading every
+            // recent response in full on each debounced edit.
+            let preview_body_limit = if needs_body {
+                body_limit
+            } else {
+                body_limit.min(2_000)
+            };
+            let Some(context) = stored_middleware_context(
+                state,
+                &row,
+                attempt,
+                attempt_number,
+                index == last_index,
+                preview_body_limit,
+                true,
+            ) else {
+                continue;
+            };
+            let evaluation = engine.evaluate_attempt(&context);
+            let matched = evaluation.records.iter().any(|record| {
+                record.rule_id == rule.id && record.state == alex_middleware::MatchState::Matched
+            });
+            let body_text = context.outcome.body.text.as_deref().unwrap_or_default();
+            let body_preview = body_text.chars().take(2_000).collect::<String>();
+            let body_truncated = context.outcome.body.truncated
+                || body_text.chars().count() > body_preview.chars().count();
+            let candidate = json!({
+                "trace_id": context.request.trace_id,
+                "session_id": context.session.id,
+                "timestamp_ms": row["ts_request_ms"],
+                "attempt_number": attempt_number,
+                "harness_name": context.harness.name,
+                "harness_version": context.harness.version,
+                "model": context.request.current_model,
+                "provider": context.route.provider.id,
+                "status": context.outcome.status,
+                "matched": matched,
+                "matched_condition_groups": if matched { condition_groups.clone() } else { Vec::new() },
+                "response_headers": context.outcome.headers.clone().into_inner(),
+                "body_preview": body_preview,
+                "body_truncated": body_truncated,
+                "content_type": context.outcome.body.content_type,
+            });
+            if matched {
+                matches.push(candidate.clone());
+            }
+            candidates.push(candidate);
+        }
+    }
+    axum::Json(json!({
+        "valid": true,
+        "middleware_id": rule.id,
+        "body_inspection_required": needs_body,
+        "scanned": scanned,
+        "match_count": matches.len(),
+        "matches": matches,
+        "candidates": candidates,
+    }))
+    .into_response()
 }
 
 fn middleware_error_class(class: ErrorClass) -> alex_middleware::ErrorClass {
@@ -7598,15 +8067,23 @@ async fn admin_middleware_test(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<MiddlewareTestRequest>,
 ) -> Response {
-    let (rule, max_attempts) = match state.middleware.read() {
-        Ok(runtime) => (
-            runtime
-                .rules()
-                .iter()
-                .find(|rule| rule.id == request.middleware_id)
-                .cloned(),
-            runtime.settings.max_attempts,
-        ),
+    let (rule, max_attempts, body_limit) = match state.middleware.read() {
+        Ok(runtime) => {
+            let rule = request.rule.clone().or_else(|| {
+                request.middleware_id.as_deref().and_then(|middleware_id| {
+                    runtime
+                        .rules()
+                        .iter()
+                        .find(|rule| rule.id == middleware_id)
+                        .cloned()
+                })
+            });
+            (
+                rule,
+                runtime.settings.max_attempts,
+                runtime.settings.error_body_limit_bytes,
+            )
+        }
         Err(_) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7620,6 +8097,35 @@ async fn admin_middleware_test(
     // Dry runs are explicitly scoped to the requested rule. A user must be
     // able to validate its behavior before enabling it in the live runtime.
     rule.enabled = true;
+    let engine = match alex_middleware::CompiledRuleSetV1::compile_with(
+        alex_middleware::RuleSetV1 {
+            api_version: alex_middleware::API_VERSION_V1,
+            rules: vec![rule.clone()],
+        },
+        &alex_middleware::ValidationOptions {
+            max_attempts,
+            ..Default::default()
+        },
+        None,
+    ) {
+        Ok(engine) => engine,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"valid": false, "errors": error.errors})),
+            )
+                .into_response()
+        }
+    };
+    if request.fixture_name.is_none() && request.trace_id.is_none() && request.context.is_none() {
+        if request.rule.is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "provide fixture_name, trace_id, context, or an unsaved rule",
+            );
+        }
+        return middleware_recent_trace_test(&state, rule, &engine, request.limit, body_limit);
+    }
     let context = if let Some(context) = request.context {
         context
     } else if let Some(name) = request.fixture_name.as_deref() {
@@ -7659,26 +8165,6 @@ async fn admin_middleware_test(
             StatusCode::BAD_REQUEST,
             "provide fixture_name, trace_id, or context",
         );
-    };
-    let engine = match alex_middleware::CompiledRuleSetV1::compile_with(
-        alex_middleware::RuleSetV1 {
-            api_version: alex_middleware::API_VERSION_V1,
-            rules: vec![rule.clone()],
-        },
-        &alex_middleware::ValidationOptions {
-            max_attempts,
-            ..Default::default()
-        },
-        None,
-    ) {
-        Ok(engine) => engine,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({"valid": false, "errors": error.errors})),
-            )
-                .into_response()
-        }
     };
     let inspection = engine.inspection_plan(&context);
     let evaluation = engine.evaluate_attempt(&context);
@@ -11500,6 +11986,18 @@ fn retry_failover_allowed(
     provider != Provider::Openai || !thread_was_affined || allow_mid_thread_failover
 }
 
+/// Dario owns ordinary upstream failure handling, but a successful Anthropic
+/// stream carrying a structured Fable refusal must still reach declarative
+/// middleware. Otherwise the held refusal prefix is replayed without ever
+/// giving the matching rule a chance to reroute.
+fn should_evaluate_attempt_result(
+    status: reqwest::StatusCode,
+    structured_refusal: bool,
+    account_kind: &str,
+) -> bool {
+    structured_refusal || (!status.is_success() && account_kind != "dario")
+}
+
 fn alex_error_trace_response(
     state: &Arc<AppState>,
     mut trace: TraceRecord,
@@ -11916,6 +12414,42 @@ fn middleware_records_for_trace(
         .collect()
 }
 
+fn log_middleware_rule_debug(
+    context: &alex_middleware::AttemptResultContext,
+    evaluations: &[alex_middleware::RuleDebugEvaluation],
+) {
+    for evaluation in evaluations {
+        let conditions =
+            serde_json::to_string(&evaluation.conditions).unwrap_or_else(|_| "[]".to_owned());
+        tracing::info!(
+            target: "alex::middleware::rule_debug",
+            rule_id = %evaluation.rule_id,
+            state = ?evaluation.state,
+            conditions = %conditions,
+            trace_id = %context.request.trace_id,
+            harness = context.harness.name.as_deref().unwrap_or("unknown"),
+            harness_version = context.harness.version.as_deref().unwrap_or("unknown"),
+            original_model = %context.request.original_model,
+            current_model = %context.request.current_model,
+            provider = %context.route.provider.id,
+            status = context.outcome.status,
+            attempt = context.route.attempt_number,
+            streaming = context.request.streaming,
+            stable_session = context.session.has_stable_id(),
+            body_inspected = context.outcome.body.inspected(),
+            body_inspected_bytes = context.outcome.body.inspected_bytes,
+            body_truncated = context.outcome.body.truncated,
+            error_kind = context
+                .outcome
+                .error
+                .as_ref()
+                .and_then(|error| error.kind.as_deref())
+                .unwrap_or("none"),
+            "middleware rule debug evaluation"
+        );
+    }
+}
+
 fn set_middleware_execution_explanation(
     attempts: &mut [Value],
     rule_id: &str,
@@ -12091,7 +12625,13 @@ fn middleware_notice_model_name(model: &str) -> &str {
     }
 }
 
-fn render_middleware_notice(template: &str, from_model: &str, to_model: &str) -> String {
+fn render_middleware_notice(
+    template: &str,
+    from_model: &str,
+    to_model: &str,
+    from_provider: &str,
+    to_provider: &str,
+) -> String {
     let from_model = middleware_notice_model_name(from_model);
     let to_model = middleware_notice_model_name(to_model);
     template
@@ -12099,6 +12639,8 @@ fn render_middleware_notice(template: &str, from_model: &str, to_model: &str) ->
         .replace("{to_model}", to_model)
         .replace("{requested_model}", from_model)
         .replace("{target_model}", to_model)
+        .replace("{from_provider}", from_provider)
+        .replace("{to_provider}", to_provider)
 }
 
 fn prepend_response_notice(response: &mut Value, target: RespondAs, notice: &str) {
@@ -13095,9 +13637,105 @@ async fn proxy(
             }
 
             let status = resp.status().as_u16();
-            if (!resp.status().is_success() || successful_refusal.is_some())
-                && account.kind != "dario"
-            {
+            let debug_success_attempt = successful_refusal.is_none()
+                && resp.status().is_success()
+                && state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.has_debug_attempt_rules())
+                    .unwrap_or(false);
+            if debug_success_attempt {
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from);
+                let mut context = middleware_attempt_context(
+                    &state,
+                    format,
+                    path,
+                    &headers,
+                    &original_body_json,
+                    &trace,
+                    &requested_model,
+                    &current_model,
+                    current_provider,
+                    plan.upstream_format,
+                    attempt_records.len() as u32,
+                    false,
+                    status,
+                    resp.headers(),
+                    alex_middleware::BodyView {
+                        content_type: content_type.clone(),
+                        ..Default::default()
+                    },
+                );
+                let (inspection, body_limit) = state
+                    .middleware
+                    .read()
+                    .map(|runtime| {
+                        (
+                            runtime.debug_inspection_plan(&context),
+                            runtime.settings.error_body_limit_bytes,
+                        )
+                    })
+                    .unwrap_or_default();
+                if inspection.needs_body {
+                    match inspect_response_prefix(resp, body_limit).await {
+                        Ok((rebuilt, prefix, truncated)) => {
+                            resp = rebuilt;
+                            let text = String::from_utf8_lossy(&prefix).into_owned();
+                            context = middleware_attempt_context(
+                                &state,
+                                format,
+                                path,
+                                &headers,
+                                &original_body_json,
+                                &trace,
+                                &requested_model,
+                                &current_model,
+                                current_provider,
+                                plan.upstream_format,
+                                attempt_records.len() as u32,
+                                false,
+                                status,
+                                resp.headers(),
+                                alex_middleware::BodyView {
+                                    content_type,
+                                    size_bytes: (!truncated).then_some(prefix.len() as u64),
+                                    text: Some(text),
+                                    json: (!truncated)
+                                        .then(|| serde_json::from_slice(&prefix).ok())
+                                        .flatten(),
+                                    truncated,
+                                    inspected_bytes: prefix.len(),
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            trace.status = Some(502);
+                            trace.error = Some(error.clone());
+                            trace.error_kind = Some("upstream_unreachable".into());
+                            trace.error_class = Some(ErrorClass::Network.as_str().into());
+                            finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                            return error_response(StatusCode::BAD_GATEWAY, &error);
+                        }
+                    }
+                }
+                let evaluations = state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.debug_attempt(&context))
+                    .unwrap_or_default();
+                log_middleware_rule_debug(&context, &evaluations);
+                upstream_resp = Some(resp);
+                break 'accounts;
+            }
+            if should_evaluate_attempt_result(
+                resp.status(),
+                successful_refusal.is_some(),
+                &account.kind,
+            ) {
                 let protection = state
                     .protection
                     .read()
@@ -13243,6 +13881,12 @@ async fn proxy(
                         }
                     }
                 }
+                let debug_evaluations = state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.debug_attempt(&context))
+                    .unwrap_or_default();
+                log_middleware_rule_debug(&context, &debug_evaluations);
                 let evaluation = state
                     .middleware
                     .read()
@@ -13257,6 +13901,13 @@ async fn proxy(
                     record.insert("provider".into(), json!(current_provider.as_str()));
                     record.insert("status".into(), json!(status));
                     record.insert("error".into(), json!(context.outcome.error));
+                    record.insert(
+                        "response_headers".into(),
+                        json!(context.outcome.headers.clone().into_inner()),
+                    );
+                    if let Some(text) = context.outcome.body.text.as_deref() {
+                        record.insert("inspected_response_body".into(), json!(text));
+                    }
                     record.insert(
                         "body_truncated".into(),
                         json!(context.outcome.body.truncated),
@@ -13349,6 +14000,8 @@ async fn proxy(
                                         &notice.text,
                                         &context.request.current_model,
                                         &model,
+                                        current_provider.as_str(),
+                                        provider.as_str(),
                                     )
                                 });
                                 if let alex_middleware::RouteScope::Session { ttl_seconds } = scope
@@ -16374,11 +17027,13 @@ mod tests {
     fn middleware_notice_expands_model_templates() {
         assert_eq!(
             render_middleware_notice(
-                "Switched from {from_model} to {to_model}.",
+                "Switched from {from_model} ({from_provider}) to {to_model} ({to_provider}).",
                 "alex/claude-fable-5",
                 "gpt-5.6-sol",
+                "anthropic",
+                "openai",
             ),
-            "Switched from fable-5 to gpt-5.6-sol."
+            "Switched from fable-5 (anthropic) to gpt-5.6-sol (openai)."
         );
     }
 
@@ -17751,6 +18406,7 @@ mod tests {
                 name: "Deterministic platform reroute".into(),
                 description: Some("Local smoke rule from OpenAI to Exo.".into()),
                 enabled: true,
+                debug: false,
                 priority: 1_000,
                 hook: alex_middleware::HookPoint::AttemptResult,
                 capabilities: vec![alex_middleware::Capability::RouteOverride],
@@ -19918,6 +20574,30 @@ mod tests {
             "normal completion must be untouched"
         );
         assert!(trace.error_kind.is_none());
+    }
+
+    #[test]
+    fn dario_structured_refusals_reach_attempt_middleware() {
+        assert!(should_evaluate_attempt_result(
+            reqwest::StatusCode::OK,
+            true,
+            "dario"
+        ));
+        assert!(!should_evaluate_attempt_result(
+            reqwest::StatusCode::OK,
+            false,
+            "dario"
+        ));
+        assert!(!should_evaluate_attempt_result(
+            reqwest::StatusCode::BAD_GATEWAY,
+            false,
+            "dario"
+        ));
+        assert!(should_evaluate_attempt_result(
+            reqwest::StatusCode::BAD_GATEWAY,
+            false,
+            "oauth"
+        ));
     }
 
     #[test]
@@ -22101,7 +22781,7 @@ mod tests {
         .await;
         assert_eq!(validation_status, StatusCode::OK);
         assert_eq!(validation["valid"], true);
-        assert_eq!(validation["body_inspection_required"], false);
+        assert_eq!(validation["body_inspection_required"], true);
 
         let (created_status, created) = response_json(
             admin_middleware_rule_create(State(state.clone()), axum::Json(rule.clone())).await,
@@ -22152,10 +22832,12 @@ mod tests {
             admin_middleware_test(
                 State(state.clone()),
                 axum::Json(MiddlewareTestRequest {
-                    middleware_id: rule.id.clone(),
+                    middleware_id: Some(rule.id.clone()),
                     fixture_name: Some("anthropic-fable-refusal-200".into()),
                     trace_id: None,
                     context: None,
+                    rule: None,
+                    limit: None,
                 }),
             )
             .await,
@@ -22191,6 +22873,262 @@ mod tests {
             .unwrap()
             .iter()
             .any(|candidate| candidate["id"] == "custom.fable-to-sol"));
+    }
+
+    #[tokio::test]
+    async fn middleware_unsaved_rule_scans_recent_attempts_with_bounded_bodies() {
+        let state = test_state("middleware-unsaved-trace-test");
+        {
+            let mut runtime = state.middleware.write().unwrap();
+            let mut settings = runtime.settings.clone();
+            settings.error_body_limit_bytes = 1_024;
+            runtime.update_settings(settings).unwrap();
+        }
+        let records = [
+            (
+                "trace-old-overload",
+                100,
+                529,
+                r#"{"error":{"message":"service overloaded"}}"#,
+                "overloaded_error",
+            ),
+            (
+                "trace-wrong-status",
+                200,
+                400,
+                r#"{"error":{"message":"overload"}}"#,
+                "invalid_request",
+            ),
+            (
+                "trace-body-miss",
+                300,
+                529,
+                r#"{"error":{"message":"temporarily unavailable"}}"#,
+                "overloaded_error",
+            ),
+            (
+                "trace-new-refusal",
+                400,
+                200,
+                r#"{"delta":{"stop_reason":"refusal"}}"#,
+                "upstream_refusal",
+            ),
+        ];
+        for (id, timestamp, status, body, error_kind) in records {
+            let body = if id == "trace-old-overload" {
+                format!(
+                    r#"{{"error":{{"message":"service overloaded{}"}}}}"#,
+                    "x".repeat(2_048)
+                )
+            } else {
+                body.to_string()
+            };
+            let body_path = state
+                .store
+                .write_body(id, "response.body", body.as_bytes())
+                .unwrap();
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: timestamp,
+                    ts_response_ms: Some(timestamp + 10),
+                    session_id: Some(format!("session-{id}")),
+                    harness: Some("claude".into()),
+                    client_format: Some("anthropic".into()),
+                    upstream_provider: Some("anthropic".into()),
+                    upstream_format: Some("anthropic".into()),
+                    requested_model: Some("claude-fable-5".into()),
+                    routed_model: Some("claude-fable-5".into()),
+                    status: Some(status),
+                    resp_body_path: Some(body_path),
+                    req_headers_json: Some(
+                        json!({
+                            "x-alex-harness": "claude",
+                            "x-alex-harness-version": "2.1.0",
+                        })
+                        .to_string(),
+                    ),
+                    resp_headers_json: Some(
+                        json!({"content-type": "application/json"}).to_string(),
+                    ),
+                    error_kind: Some(error_kind.into()),
+                    error_class: Some("capacity".into()),
+                    attempts: Some(
+                        json!([{
+                            "provider": "anthropic",
+                            "model": "claude-fable-5",
+                            "status": status,
+                            "error": {"class": "capacity", "kind": error_kind},
+                        }])
+                        .to_string(),
+                    ),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let mut rule = alex_middleware::fable_to_sol_rule();
+        rule.id = "wizard.unsaved-overload-or-refusal".into();
+        rule.when = alex_middleware::MatchConditionsV1 {
+            harness_name_regex: vec!["^claude$".into()],
+            harness_version_regex: vec![r"^2\.1\.".into()],
+            model_regex: vec!["^claude-fable-5$".into()],
+            provider_regex: vec!["^anthropic$".into()],
+            status_regex: vec![r"^(200|529)$".into()],
+            body_regex: vec!["(?i)(overload|refusal)".into()],
+            ..Default::default()
+        };
+
+        let (limited_status, limited) = response_json(
+            admin_middleware_test(
+                State(state.clone()),
+                axum::Json(MiddlewareTestRequest {
+                    middleware_id: None,
+                    fixture_name: None,
+                    trace_id: None,
+                    context: None,
+                    rule: Some(rule.clone()),
+                    limit: Some(3),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(limited_status, StatusCode::OK, "{limited}");
+        assert_eq!(limited["scanned"], 3);
+        assert_eq!(limited["match_count"], 1);
+        assert_eq!(limited["matches"][0]["trace_id"], "trace-new-refusal");
+        assert_eq!(limited["matches"][0]["harness_version"], "2.1.0");
+        assert_eq!(limited["matches"][0]["status"], 200);
+        assert_eq!(limited["candidates"].as_array().unwrap().len(), 3);
+        assert_eq!(limited["candidates"][0]["matched"], true);
+        assert_eq!(limited["candidates"][1]["matched"], false);
+        assert_eq!(limited["candidates"][0]["attempt_number"], 1);
+        assert_eq!(limited["candidates"][0]["body_preview"], records[3].3);
+        assert!(limited["matches"][0]["matched_condition_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group == "body"));
+
+        let (all_status, all) = response_json(
+            admin_middleware_test(
+                State(state),
+                axum::Json(MiddlewareTestRequest {
+                    middleware_id: None,
+                    fixture_name: None,
+                    trace_id: None,
+                    context: None,
+                    rule: Some(rule),
+                    limit: Some(4),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(all_status, StatusCode::OK, "{all}");
+        assert_eq!(all["scanned"], 4);
+        assert_eq!(all["match_count"], 2);
+        assert_eq!(all["matches"][0]["trace_id"], "trace-new-refusal");
+        assert_eq!(all["matches"][1]["trace_id"], "trace-old-overload");
+        assert!(!all["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["trace_id"] == "trace-wrong-status"));
+        assert!(!all["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["trace_id"] == "trace-body-miss"));
+    }
+
+    #[tokio::test]
+    async fn middleware_live_match_uses_each_attempt_model_and_body() {
+        let state = test_state("middleware-multi-attempt-live-match");
+        let refusal = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",",
+            "\"stop_details\":{\"type\":\"refusal\",\"category\":\"bio\"}}}\n\n",
+        );
+        let final_body = r#"{"type":"message","content":[{"type":"text","text":"Sol answered"}]}"#;
+        let body_path = state
+            .store
+            .write_body("trace-fable-to-sol", "response.body", final_body.as_bytes())
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "trace-fable-to-sol".into(),
+                ts_request_ms: 500,
+                ts_response_ms: Some(510),
+                session_id: Some("session-fable-to-sol".into()),
+                harness: Some("claude".into()),
+                client_format: Some("anthropic".into()),
+                upstream_provider: Some("openai".into()),
+                upstream_format: Some("openai-responses".into()),
+                requested_model: Some("claude-alex/claude-fable-5".into()),
+                routed_model: Some("gpt-5.6-sol".into()),
+                served_model: Some("gpt-5.6-sol".into()),
+                status: Some(200),
+                resp_body_path: Some(body_path),
+                resp_headers_json: Some(json!({"content-type": "text/event-stream"}).to_string()),
+                attempts: Some(
+                    json!([
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-fable-5",
+                            "status": 200,
+                            "error": {
+                                "class": "other",
+                                "kind": "upstream_refusal",
+                                "code": "bio",
+                            },
+                            "response_headers": {
+                                "content-type": ["text/event-stream"],
+                            },
+                            "inspected_response_body": refusal,
+                            "body_truncated": false,
+                        },
+                        {
+                            "provider": "openai",
+                            "model": "gpt-5.6-sol",
+                            "status": 200,
+                        },
+                    ])
+                    .to_string(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let rule = alex_middleware::fable_to_sol_rule();
+        let (status, result) = response_json(
+            admin_middleware_test(
+                State(state),
+                axum::Json(MiddlewareTestRequest {
+                    middleware_id: None,
+                    fixture_name: None,
+                    trace_id: None,
+                    context: None,
+                    rule: Some(rule),
+                    limit: Some(10),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["scanned"], 2);
+        assert_eq!(result["match_count"], 1);
+        assert_eq!(result["matches"][0]["attempt_number"], 1);
+        assert_eq!(result["matches"][0]["model"], "claude-fable-5");
+        assert_eq!(result["matches"][0]["provider"], "anthropic");
+        assert_eq!(result["matches"][0]["body_preview"], refusal);
+        assert_eq!(result["candidates"][0]["attempt_number"], 2);
+        assert_eq!(result["candidates"][0]["model"], "gpt-5.6-sol");
+        assert_eq!(result["candidates"][0]["matched"], false);
     }
 
     #[tokio::test]

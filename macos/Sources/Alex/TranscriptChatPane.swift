@@ -85,9 +85,9 @@ struct TranscriptChatPane: View {
                 fetchToolBodyText: { id, kind in
                     try? await model.fetchToolBody(id: id, kind: kind).text
                 })
-                .overlay(alignment: entry.role == .user ? .topLeading : .topTrailing) {
+                .overlay(alignment: message.role == .user ? .topLeading : .topTrailing) {
                     if isThreaded {
-                        threadConnector(role: entry.role)
+                        threadConnector(role: message.role)
                     }
                 }
                 .overlay(alignment: .trailing) {
@@ -115,7 +115,13 @@ struct TranscriptChatPane: View {
         // is (structural), while the resolved message may be `.harness`
         // instead of `.user` for that same slot — match on "assistant half
         // vs. not" rather than exact role equality.
-        guard var message = messages.first(where: { entry.role == .assistant ? $0.role == .assistant : $0.role != .assistant }) else {
+        guard var message = messages.first(where: {
+            switch entry.role {
+            case .assistant: $0.role == .assistant
+            case .event: $0.role == .harness && $0.id.hasSuffix("#event")
+            case .user: $0.role != .assistant && !$0.id.hasSuffix("#event")
+            }
+        }) else {
             return nil
         }
         // Turn-number gutter (mock TB App.tsx:534-539). MessageBubble has no
@@ -188,12 +194,21 @@ private struct RoleChangeDivider: View {
 
 /// One renderable message slot of a turn (user or assistant half).
 struct TranscriptChatEntry: Identifiable {
+    enum Role {
+        case user, event, assistant
+    }
+
     let turn: TranscriptTurn
     let turnNumber: Int
-    let role: MessageDisplay.Role
+    let role: Role
 
     var id: String {
-        turn.traceId + (role == .user ? "#user" : "#assistant")
+        let suffix = switch role {
+        case .user: "#user"
+        case .event: "#event"
+        case .assistant: "#assistant"
+        }
+        return turn.traceId + suffix
     }
 }
 
@@ -231,11 +246,25 @@ enum TranscriptChatMessages {
                 tokenText: ChatDisplayFormat.tokenLabel(turn.inputTokens)))
         }
 
+        if let event = attemptEvent(for: turn) {
+            out.append(MessageDisplay(
+                id: turn.traceId + "#event",
+                turnId: turn.traceId,
+                role: .harness,
+                roleLabel: "Alex routing",
+                content: event.detail,
+                isMonospaced: false,
+                model: event.model,
+                detail: event.provider,
+                timestamp: TraceFormat.time(turn.tsResponseMs ?? turn.tsRequestMs),
+                event: event.title))
+        }
+
         let toolCalls = toolDisplays(for: turn)
         let content = assistantText(turn)
         let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
         let hasError = !clientClosed && turn.error?.isEmpty == false
-        if !content.isEmpty || !toolCalls.isEmpty || hasError || clientClosed {
+        if !content.isEmpty || !toolCalls.isEmpty || hasError {
             let effort = TurnHeader.effort(
                 reasoningEffort: turn.reasoningEffort, thinkingBudget: turn.thinkingBudget)
             out.append(MessageDisplay(
@@ -249,10 +278,82 @@ enum TranscriptChatMessages {
                 timestamp: TraceFormat.time(turn.tsResponseMs ?? turn.tsRequestMs),
                 tokenText: ChatDisplayFormat.tokenLabel(turn.outputTokens),
                 toolCalls: toolCalls,
-                error: hasError ? turn.error : nil,
-                event: clientClosed ? "client closed" : nil))
+                error: hasError ? turn.error : nil))
         }
         return out
+    }
+
+    struct AttemptEvent {
+        let title: String
+        let detail: String
+        let model: String?
+        let provider: String?
+    }
+
+    static func attemptEvent(for turn: TranscriptTurn) -> AttemptEvent? {
+        let attempts = turn.attempts ?? []
+        let failed = attempts.first { attempt in
+            let kind = attempt.error?.kind?.lowercased() ?? ""
+            return attempt.error != nil || (attempt.status ?? 0) >= 400
+                || kind.contains("refusal") || kind.contains("denial")
+        }
+        let decisions: [TraceMiddlewareDecision] = attempts.reduce(into: []) { result, attempt in
+            result.append(contentsOf: attempt.middlewareDecisions ?? [])
+        }
+        let matchedDecision = decisions.first { decision in
+            decision.state == "matched"
+                && decision.suppressed != true
+                && decision.executed != false
+        }
+        let evaluatedDecision = decisions.first
+        let leaseApplied = turn.substituted == true && matchedDecision == nil && attempts.count <= 1
+        let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
+
+        guard failed != nil || matchedDecision != nil || leaseApplied || clientClosed else {
+            return nil
+        }
+        var titleParts: [String] = []
+        if let error = failed?.error {
+            let kind = error.kind ?? "upstream error"
+            titleParts.append(kind.localizedCaseInsensitiveContains("refusal")
+                ? "Model refusal" : "Upstream error")
+            titleParts.append(kind)
+            if let code = error.code, !code.isEmpty { titleParts.append(code) }
+        }
+        if let decision = matchedDecision {
+            titleParts.append("Middleware: \(decision.ruleName ?? decision.ruleId)")
+            if let action = decision.action, !action.isEmpty { titleParts.append(action) }
+        } else if leaseApplied {
+            titleParts.append("Middleware route active")
+        } else if let decision = evaluatedDecision, failed != nil {
+            titleParts.append("Middleware: \(decision.ruleName ?? decision.ruleId) did not match")
+        }
+
+        var details: [String] = []
+        if let message = failed?.error?.message, !message.isEmpty { details.append(message) }
+        if let explanation = matchedDecision?.explanation, !explanation.isEmpty {
+            details.append(explanation)
+        } else if let reason = turn.substitutionReason, !reason.isEmpty {
+            details.append(reason)
+        } else if let explanation = evaluatedDecision?.explanation, !explanation.isEmpty {
+            details.append(explanation)
+        }
+        if attempts.count > 1, let from = attempts.first, let to = attempts.last {
+            details.append("Route: \(routeLabel(from)) → \(routeLabel(to))")
+        }
+        if clientClosed && failed == nil && matchedDecision == nil && !leaseApplied {
+            titleParts.append("Client closed the stream")
+            if let error = turn.error, !error.isEmpty { details.append(error) }
+        }
+        return AttemptEvent(
+            title: titleParts.joined(separator: " · "),
+            detail: details.joined(separator: "\n"),
+            model: failed?.model ?? attempts.first?.model,
+            provider: failed?.provider ?? attempts.first?.provider)
+    }
+
+    private static func routeLabel(_ attempt: TraceAttempt) -> String {
+        [attempt.provider, attempt.model].compactMap { $0 }.joined(separator: "/")
     }
 
     static func assistantText(_ turn: TranscriptTurn) -> String {

@@ -20,6 +20,8 @@ final class TraceBrowserModel {
     private(set) var sessionsLoading = true
     private(set) var sessionsUnreachable = false
     private(set) var simulationFixtures: [ErrorSimulationFixture] = []
+    private(set) var middlewareRules: [MiddlewareRuleSpecV1] = []
+    private var lastSessionsMiddlewareId: String?
     private(set) var fixturesLoading = false
     private(set) var fixtureLoadError: String?
     private(set) var simulationNotice: String?
@@ -144,13 +146,21 @@ final class TraceBrowserModel {
     private func mapFilterEntries(
         _ filtered: [TranscriptFilterEntry], turns: [TranscriptTurn]
     ) -> [TranscriptChatEntry] {
-        filtered.compactMap { entry in
-            guard turns.indices.contains(entry.turnIndex) else { return nil }
+        filtered.flatMap { entry -> [TranscriptChatEntry] in
+            guard turns.indices.contains(entry.turnIndex) else { return [] }
             let turn = turns[entry.turnIndex]
-            guard turn.traceId == entry.turnId else { return nil }
-            return TranscriptChatEntry(
-                turn: turn, turnNumber: entry.turnIndex + 1,
-                role: entry.role == .user ? .user : .assistant)
+            guard turn.traceId == entry.turnId else { return [] }
+            let role: TranscriptChatEntry.Role = entry.role == .user ? .user : .assistant
+            if entry.role == .assistant, turn.hasInlineAttemptEvents {
+                return [
+                    TranscriptChatEntry(
+                        turn: turn, turnNumber: entry.turnIndex + 1, role: .event),
+                    TranscriptChatEntry(
+                        turn: turn, turnNumber: entry.turnIndex + 1, role: role),
+                ]
+            }
+            return [TranscriptChatEntry(
+                turn: turn, turnNumber: entry.turnIndex + 1, role: role)]
         }
     }
 
@@ -509,6 +519,12 @@ final class TraceBrowserModel {
     }
 
     func filterValues(_ dimension: TagFilterDimension) -> [String] {
+        if dimension == .middleware {
+            return middlewareRules.map(\.id).sorted {
+                filterLabel(.middleware, value: $0).localizedCaseInsensitiveCompare(
+                    filterLabel(.middleware, value: $1)) == .orderedAscending
+            }
+        }
         if dimension == .account {
             let known = Set(billingAccounts.map(\.id))
             let observed = dimension.values(in: sessions).filter { known.contains($0) }
@@ -527,6 +543,9 @@ final class TraceBrowserModel {
     }
 
     func filterLabel(_ dimension: TagFilterDimension, value: String) -> String {
+        if dimension == .middleware {
+            return middlewareRules.first(where: { $0.id == value })?.name ?? value
+        }
         if dimension == .account {
             return AccountIdentity.label(accountId: value, accounts: billingAccounts)
         }
@@ -573,6 +592,16 @@ final class TraceBrowserModel {
 
     func setFilter(_ dimension: TagFilterDimension, _ value: String?) {
         queryText = OmniQuery.settingToken(in: queryText, key: dimension.rawValue, value: value)
+    }
+
+    private func loadMiddlewareRules() async {
+        guard let client = client() else { return }
+        do {
+            middlewareRules = try await client.middlewareStatus().rules
+        } catch is CancellationError {
+        } catch {
+            BarLog.warn(.browser, "middleware filter rules unavailable: \(error.localizedDescription)")
+        }
     }
 
     private(set) var errorClassSummaryLine: String?
@@ -622,6 +651,7 @@ final class TraceBrowserModel {
         stop()
         fixtureLoadTask = Task { [weak self] in
             await self?.loadSimulationFixtures()
+            await self?.loadMiddlewareRules()
         }
         sessionsTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -847,7 +877,11 @@ final class TraceBrowserModel {
             }
         }
         do {
-            let fetched = try await client.traceSessions(since: "24h", limit: 200)
+            let middlewareId = parsedQuery.middleware
+            let fetched = try await client.traceSessions(
+                since: "24h", limit: 200, middlewareId: middlewareId)
+            guard middlewareId == parsedQuery.middleware else { return }
+            lastSessionsMiddlewareId = middlewareId
             daemonDown = false
             sessionsLoading = false
             sessionsUnreachable = false
@@ -941,6 +975,10 @@ final class TraceBrowserModel {
     private func queryChanged() {
         searchTask?.cancel()
         let query = parsedQuery
+        if query.middleware != lastSessionsMiddlewareId {
+            sessionsFingerprint = ""
+            Task { [weak self] in await self?.pollSessions() }
+        }
         recomputeSessionSummary()
         applyTurnFilter()
         guard !query.freeText.isEmpty || query.key != nil else {
