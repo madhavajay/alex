@@ -91,6 +91,7 @@ pub struct DarioSettings {
     pub probe_failures: u32,
     pub probe_model: String,
     pub validate_subscription: bool,
+    pub upstream_base: Option<String>,
     /// Resolved by the daemon before it starts the child. This avoids relying
     /// on a service manager's deliberately minimal PATH.
     pub claude_bin: Option<PathBuf>,
@@ -1342,6 +1343,9 @@ impl DarioSupervisor {
         if let Some(real) = &self.settings.claude_bin {
             child_cmd.env("ALEX_REAL_CLAUDE_BIN", real);
         }
+        if let Some(upstream) = &self.settings.upstream_base {
+            child_cmd.env("ALEX_DARIO_UPSTREAM_URL", upstream);
+        }
         let child = child_cmd
             .spawn()
             .with_context(|| format!("spawning {bin:?}"))?;
@@ -1957,6 +1961,7 @@ const { syncBuiltinESMExports } = require('node:module');
 
 const captureDir = process.env.ALEX_DARIO_CAPTURE_DIR || '';
 const promptCacheDir = process.env.ALEX_DARIO_PROMPT_CACHE_DIR || '';
+const upstreamBase = (process.env.ALEX_DARIO_UPSTREAM_URL || '').replace(/\/$/, '');
 const promptCacheKeys = (() => {
   try { return JSON.parse(process.env.ALEX_DARIO_PROMPT_CACHE_KEYS || '{}'); } catch { return {}; }
 })();
@@ -2383,7 +2388,8 @@ if (typeof originalFetch === 'function') {
       body: requestBody,
     });
 
-    const response = await originalFetch.call(this, input, fetchInit);
+    const target = upstreamBase ? `${upstreamBase}${new URL(url).pathname}${new URL(url).search}` : input;
+    const response = await originalFetch.call(this, target, fetchInit);
     try {
       const clone = response.clone();
       clone.text().then((text) => {
@@ -2709,6 +2715,13 @@ mod tests {
     fn claude_prompt_capture_uses_private_working_directory() {
         let preload = fetch_capture_preload();
         assert!(preload.contains("cwd: process.env.ALEX_DARIO_WORK_DIR"));
+    }
+
+    #[test]
+    fn fetch_preload_rewrites_anthropic_to_validated_override() {
+        let preload = fetch_capture_preload();
+        assert!(preload.contains("process.env.ALEX_DARIO_UPSTREAM_URL"));
+        assert!(preload.contains("const target = upstreamBase"));
     }
 
     #[test]

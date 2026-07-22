@@ -149,6 +149,45 @@ jobs:
       - name: Fakeprov crate suite
         run: cargo test -p alex-fakeprov
 
+  harness-mock:
+    # Real harness CLIs in Docker -> real daemon -> fakeprov. Sharded by
+    # harness so each runner pulls exactly one harness image; lifecycle
+    # (C*) cells and that harness's matrix cells stay on the same shard.
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [claude, codex, grok-build, kimi]
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: harness-mock
+      - name: Assert Docker available
+        run: docker info >/dev/null
+      - name: Offline harness matrix (${{ matrix.harness }})
+        run: ./test.sh harness-mock --harness ${{ matrix.harness }} --json | tee harness-mock-${{ matrix.harness }}.json
+      - name: Upload cell report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-mock-${{ matrix.harness }}
+          path: harness-mock-${{ matrix.harness }}.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  harness-versions:
+    # Advisory drift check: reports when harness npm releases move past the
+    # pinned catalog versions. The weekly bump-and-test flow runs the write
+    # mode; see the header of scripts/bump-harness-versions.sh.
+    runs-on: namespace-profile-linux-medium
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Harness version drift
+        run: scripts/bump-harness-versions.sh --check
+
   mock-windows:
     # Windows is not a stable-release gate yet; this job surfaces platform
     # quirks in the new offline test stack without blocking the pipeline.

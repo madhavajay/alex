@@ -3660,8 +3660,12 @@ async fn main() -> Result<()> {
                 "https://api.anthropic.com",
             )
             .is_some();
+            let testing_dario_override = alex_core::resolve_endpoint_override(
+                "ALEX_DARIO_UPSTREAM_URL",
+                "https://api.anthropic.com",
+            );
             let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth)
-                && !testing_anthropic_override;
+                && (!testing_anthropic_override || testing_dario_override.is_some());
             let dario_routing_reason = config.dario_routing_reason(has_active_anthropic_oauth);
             let dario_routing_mode = config.anthropic_upstream.clone();
             // Dario normally installs on demand when its supervisor creates a
@@ -3702,10 +3706,11 @@ async fn main() -> Result<()> {
                 probe_failures: config.dario_probe_failures,
                 probe_model: config.dario_probe_model.clone(),
                 validate_subscription: dario_route_enabled,
+                upstream_base: testing_dario_override.clone(),
                 claude_bin: resolve_dario_claude_bin(config.dario_claude_bin.as_deref()),
                 node_bin: dario::resolve_dario_node_bin(config.dario_node_path.as_deref()),
             };
-            let initial_start = if testing_anthropic_override {
+            let initial_start = if testing_anthropic_override && testing_dario_override.is_none() {
                 Err(anyhow::anyhow!(
                     "Dario disabled while a testing Anthropic upstream is active"
                 ))
@@ -3754,10 +3759,12 @@ async fn main() -> Result<()> {
                     (Some(glue.clone() as Arc<dyn alex_proxy::DarioRouter>), None)
                 }
             };
-            if testing_anthropic_override {
+            if testing_anthropic_override && testing_dario_override.is_none() {
                 dario_router = None;
             }
-            if supervisor.is_none() && !testing_anthropic_override {
+            if supervisor.is_none()
+                && (!testing_anthropic_override || testing_dario_override.is_some())
+            {
                 glue.spawn_initial_retry();
             }
             let state = alex_proxy::build_state_with_substitution(
@@ -13087,6 +13094,22 @@ continue = true
         config.anthropic_upstream = "direct".into();
         assert!(config.dario_route_should_enable(true));
         assert!(config.dario_route_should_enable(false));
+    }
+
+    #[test]
+    fn dario_upstream_override_uses_loopback_gate() {
+        let resolve = |value: &str| {
+            alex_core::testing_overrides::resolve_endpoint_override_with(
+                "ALEX_DARIO_UPSTREAM_URL",
+                "https://api.anthropic.com",
+                |name| (name == "ALEX_DARIO_UPSTREAM_URL").then(|| value.to_string()),
+            )
+        };
+        assert_eq!(
+            resolve("http://127.0.0.1:4200/anthropic"),
+            Some("http://127.0.0.1:4200/anthropic".into())
+        );
+        assert_eq!(resolve("https://example.com/anthropic"), None);
     }
 
     #[test]

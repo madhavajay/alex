@@ -306,3 +306,67 @@ worktree; land order matters for 1→2→3, then 4/5/6 parallelize.
 - **gRPC-web (Grok billing)** and **Amp product protocol** are the two
   non-plain-HTTP surfaces; both already have parsers/mocks in-repo to crib from.
 - **XCUITest cost**: keep to golden flows; logic stays in AlexCoreTests.
+
+## 8. Offline harness matrix
+
+`./test.sh harness-mock` starts an isolated daemon and fakeprov, then runs the
+connect lifecycle checks, the real Claude, Codex, Grok Build, and Kimi harness
+images through Docker, and mock-only bonus scenarios. `--only`, `--provider`,
+`--harness`, `--jobs`, and `--json` use the standard test reporter. Matrix
+cells are data-driven and serialized because each one resets fakeprov's ordered
+scenario queue.
+
+The C* lifecycle cells run before the Docker matrix for each connectable
+harness:
+
+- C1 connects with `alex connect <harness> --config-dir <tmp>` and asserts
+  managed config files, key material, permissions, backups/original references,
+  and preservation of seeded user config.
+- C2 verifies the written harness catalog/config exposes every canonical
+  `alex/*` fake model; if a harness has a cheap native config/model-list mode,
+  that mode may be used as an additional assertion.
+- C3 picks a model from the written config, sends a completion using the
+  installed key/base URL/model namespace, and verifies fakeprov served it.
+- C4 disconnects, verifies Alex-managed entries are gone, seeded user config is
+  preserved, and the daemon run key was revoked.
+- C5 runs the existing mock-upstream wrap smoke for Amp and uses wrap status or
+  a cheap launch assertion where available.
+
+A failing C-cell marks that harness' downstream matrix cells as FAIL instead of
+SKIP, so install/config regressions are visible before wire-level assertions.
+Harnesses or sub-asserts with unavailable binaries, Docker, images, or no
+catalog route SKIP cleanly.
+
+The canonical fake models are `claude-fake-1` (Anthropic), `gpt-fake-1`
+(OpenAI API), `codex-fake-1` (Codex OAuth), `gemini-fake-1`, `grok-fake-1`,
+`kimi-fake-1`, `openrouter/fake/fake-1`, and `exo/fake-1`. fakeprov also lists
+`fable-5`/`claude-fable-5` for refusal middleware coverage and
+`gpt-5.6-sol` for mock OpenAI reroute targets.
+
+The bonus block keeps the existing B1-B5 cells that pass and prioritizes these
+middleware/Dario acceptance cells:
+
+- B-DARIO-TOOL runs the Codex harness against `alex/claude-fake-1` with
+  `anthropic_upstream=dario`, exercising Codex OpenAI ingress translation,
+  daemon-to-Dario routing, Dario's real Node sidecar, fakeprov Anthropic
+  sequenced tool use, a real harness shell/listing tool execution, and trace +
+  fakeprov request-log assertions for both turns through Dario.
+- B-FABLE-REROUTE-ON enables the built-in
+  `alex.fable-5-to-gpt-5.6-sol` rule, has fake Anthropic stream a Fable refusal,
+  asserts refusal bytes are intercepted before reaching Claude Code, then
+  asserts fake OpenAI `gpt-5.6-sol` returns the distinctive success completion
+  and middleware activity records the executed reroute.
+- B-FABLE-REROUTE-OFF disables the same rule through the admin API, reruns the
+  same Claude Code/Fable refusal flow, asserts no OpenAI reroute occurs, checks
+  the raw refusal SSE body including terminal `stop_reason=refusal`, and
+  re-enables the rule afterward.
+
+Harness versions come only from `crates/alex/config/harnesses.json`.
+`scripts/bump-harness-versions.sh --check` queries npm latest metadata for
+package-backed harnesses and exits 1 when any default version is stale. Write
+mode updates the existing `default_version` fields in place, preserving
+unrelated catalog bytes; `--pack` additionally freezes bumped packages with
+`alex harness pack <target> --version <latest>`. The script header contains the
+weekly CI recipe: run the bump script in write mode, then `./test.sh
+harness-mock`, so new harness-release breakage surfaces against fakeprov without
+credentials.
