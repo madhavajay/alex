@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "POST /v1/messages": [{"use_default": true, "repeat": true}],
+    "POST /v1/chat/completions": [{"use_default": true, "repeat": true}],
+    "POST /v1/responses": [{"use_default": true, "repeat": true}],
+    "POST /backend-api/codex/responses": [{"use_default": true, "repeat": true}]
+  }
+}

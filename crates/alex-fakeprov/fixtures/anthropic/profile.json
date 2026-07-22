@@ -1,0 +1,8 @@
+{
+  "account": {
+    "uuid": "acct_anthropic_fakeprov_0001",
+    "email": "fakeprov@example.test",
+    "full_name": "Fake Provider",
+    "has_claude_max": true
+  }
+}

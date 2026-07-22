@@ -1,0 +1,5 @@
+{
+  "endpoints": {
+    "POST /v1/messages": [{"failure": "529", "repeat": true}]
+  }
+}

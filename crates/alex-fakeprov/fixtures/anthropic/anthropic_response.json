@@ -1,0 +1,23 @@
+{
+  "id": "msg_cove_anthropic_tool",
+  "type": "message",
+  "role": "assistant",
+  "model": "opus-4.8",
+  "content": [
+    {
+      "type": "text",
+      "text": "The Write tool isn't available here, so I'll use a shell heredoc instead."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_013yTmLYz8da1p56sBPGpQJR",
+      "name": "Bash",
+      "input": {
+        "command": "cat > /app/whoami.txt <<'EOF'\nI am Claude, an AI coding assistant.\nEOF",
+        "description": "Write whoami answer to file"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "usage": {"input_tokens": 1376, "output_tokens": 194}
+}

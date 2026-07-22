@@ -1,0 +1,7 @@
+{
+  "five_hour": {"utilization": 20.0, "resets_at": "2023-11-15T03:13:20Z"},
+  "seven_day": {"utilization": 10.0, "resets_at": "2023-11-21T22:13:20Z"},
+  "seven_day_opus": {"utilization": 5.0, "resets_at": "2023-11-21T22:13:20Z"},
+  "seven_day_sonnet": {"utilization": 8.0, "resets_at": "2023-11-21T22:13:20Z"},
+  "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": 0, "utilization": 0.0}
+}

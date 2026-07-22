@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "POST /v1/messages": [{"fixture": "anthropic/default-message-stream.sse", "stall_after_chunks": 3, "repeat": true}],
+    "POST /v1/chat/completions": [{"fixture": "openai/default-chat-stream.sse", "stall_after_chunks": 2, "repeat": true}],
+    "POST /v1/responses": [{"fixture": "openai/default-responses-stream.sse", "stall_after_chunks": 3, "repeat": true}],
+    "POST /backend-api/codex/responses": [{"fixture": "openai/default-codex-responses.sse", "stall_after_chunks": 3, "repeat": true}]
+  }
+}
