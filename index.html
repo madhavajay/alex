@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Alex routes AI subscriptions into compatible harnesses, survives overloads with programmable middleware, and records what happened.">
+  <meta name="theme-color" content="#080c14">
+  <title>Alex — your subscriptions, one resilient model team</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#demo">Skip to walkthrough</a>
+  <header class="shell">
+    <a class="brand" href="./" aria-label="Alex home"><span>A</span>lex</a>
+    <nav class="top-links" aria-label="Main navigation">
+      <a data-campaign-link href="https://github.com/madhavajay/alex#readme">Docs</a>
+      <a data-campaign-link href="https://github.com/madhavajay/alex">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero shell" aria-labelledby="hero-title">
+      <div class="eyebrow">Local AI control plane</div>
+      <h1 id="hero-title">Your subscriptions.<br>One resilient model team.</h1>
+      <p>Route the models you already pay for into a compatible harness you prefer. When one model is overloaded, enabled middleware can move the session and leave a trace that explains exactly why.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="#demo">Watch Fable move to Sol</a>
+        <a class="button" data-campaign-link href="https://github.com/madhavajay/alex#quick-start">Install Alex</a>
+      </div>
+    </section>
+
+    <section id="demo" class="demo-wrap shell" aria-labelledby="walkthroughs-title">
+      <div class="walkthrough-intro">
+        <div class="eyebrow">Three source-checked walkthroughs</div>
+        <h2 id="walkthroughs-title">Route it. Rescue it. Ask again.</h2>
+        <p>Each replay is synthetic, contains no visitor data, and is checked against the implementation during the site build.</p>
+      </div>
+      <noscript>
+        <p class="no-js-note"><strong>JavaScript is off.</strong> Every routing step, trace summary, and outbound action remains available. Playback controls and anonymous engagement measurement are disabled.</p>
+      </noscript>
+
+      <article class="demo-card" data-demo="use-it-anywhere">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Use it anywhere</div>
+            <h2>Your Claude subscription. The harness you prefer.</h2>
+            <p>Connect once, then use Opus from Pi while Alex preserves the real route.</p>
+          </div>
+          <div class="demo-controls" aria-label="Use it anywhere walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="5" aria-label="Use it anywhere walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            
+            <li class="demo-step request" data-demo-step data-label="Connect the Claude subscription">
+              <span class="step-index" aria-hidden="true">1</span>
+              <span class="step-copy"><strong>Connect the Claude subscription</strong><span>OAuth credentials stay in Alex's encrypted local vault</span></span>
+            </li>
+            <li class="demo-step route" data-demo-step data-label="Connect Pi to Alex">
+              <span class="step-index" aria-hidden="true">2</span>
+              <span class="step-copy"><strong>Connect Pi to Alex</strong><span>alex connect pi installs the scoped local route</span></span>
+            </li>
+            <li class="demo-step request" data-demo-step data-label="Pi asks for Opus 4.8">
+              <span class="step-index" aria-hidden="true">3</span>
+              <span class="step-copy"><strong>Pi asks for Opus 4.8</strong><span>pi --model alex/claude-opus-4-8 -p “Review this”</span></span>
+            </li>
+            <li class="demo-step decision" data-demo-step data-label="Alex selects the subscription path">
+              <span class="step-index" aria-hidden="true">4</span>
+              <span class="step-copy"><strong>Alex selects the subscription path</strong><span>Non-Claude-Code Anthropic traffic is routed through Dario</span></span>
+            </li>
+            <li class="demo-step success" data-demo-step data-label="The trace proves where it ran">
+              <span class="step-index" aria-hidden="true">5</span>
+              <span class="step-copy"><strong>The trace proves where it ran</strong><span>Pi · Anthropic · Opus 4.8 · subscription identity · Dario</span></span>
+            </li>
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting cross-harness trace summary">
+            <h3>Trace proof</h3>
+            <div class="trace-row"><span>Harness</span><strong>Pi</strong></div>
+            <div class="trace-row"><span>Requested</span><strong>alex/claude-opus-4-8</strong></div>
+            <div class="trace-row"><span>Provider</span><strong>Anthropic subscription</strong></div>
+            <div class="trace-row"><span>Path</span><strong>Dario</strong></div>
+            <div class="trace-row"><span>Result</span><strong class="status-good">Opus 4.8 · 200</strong></div>
+            <p class="privacy-note"><strong>No credential is shown.</strong> The trace keeps a local account identity, not its OAuth token.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <div class="demo-next">
+          <span>Try this route locally.</span>
+          <a class="button primary" data-demo-action="use_anywhere_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/harnesses.md">Connect a harness</a>
+        </div>
+      </article>
+
+      <article class="demo-card" data-demo="fable-to-sol-refusal">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Sanitized refusal fixture · no live prompts</div>
+            <h2 id="demo-title">Fable 5 refuses. The session keeps moving.</h2>
+            <p>Play the whole route, pause it, or inspect one decision at a time.</p>
+          </div>
+          <div class="demo-controls" aria-label="Walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="6" aria-label="Walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            
+            <li class="demo-step request" data-demo-step data-label="Request enters Alex">
+              <span class="step-index" aria-hidden="true">1</span>
+              <span class="step-copy"><strong>Request enters Alex</strong><span>claude asks for claude-fable-5</span></span>
+            </li>
+            <li class="demo-step route" data-demo-step data-label="Alex routes to Fable 5">
+              <span class="step-index" aria-hidden="true">2</span>
+              <span class="step-copy"><strong>Alex routes to Fable 5</strong><span>anthropic receives the first attempt</span></span>
+            </li>
+            <li class="demo-step signal" data-demo-step data-label="Fable returns a refusal signal">
+              <span class="step-index" aria-hidden="true">3</span>
+              <span class="step-copy"><strong>Fable returns a refusal signal</strong><span>HTTP 200 · refusal · bio</span></span>
+            </li>
+            <li class="demo-step decision" data-demo-step data-label="The middleware rule matches">
+              <span class="step-index" aria-hidden="true">4</span>
+              <span class="step-copy"><strong>The middleware rule matches</strong><span>Fable 5 refused the request; switching this session to GPT-5.6 Sol</span></span>
+            </li>
+            <li class="demo-step route" data-demo-step data-label="Alex retries with Sol 5.6">
+              <span class="step-index" aria-hidden="true">5</span>
+              <span class="step-copy"><strong>Alex retries with Sol 5.6</strong><span>openai serves gpt-5.6-sol</span></span>
+            </li>
+            <li class="demo-step success" data-demo-step data-label="The trace explains the session fallback">
+              <span class="step-index" aria-hidden="true">6</span>
+              <span class="step-copy"><strong>The trace explains the session fallback</strong><span>Later requests in this session stay on Sol for 24 hours</span></span>
+            </li>
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting trace summary">
+            <h3>Trace proof</h3>
+            <div class="trace-row"><span>Harness</span><strong>Claude</strong></div>
+            <div class="trace-row"><span>Requested</span><strong>claude-fable-5</strong></div>
+            <div class="trace-row"><span>Attempt 1</span><strong class="status-fail">Anthropic · refusal</strong></div>
+            <div class="trace-row"><span>Decision</span><strong>middleware reroute</strong></div>
+            <div class="trace-row"><span>Attempt 2</span><strong class="status-good">OpenAI · 200</strong></div>
+            <div class="trace-row"><span>Fallback scope</span><strong>Session · 24 hours</strong></div>
+            <p class="privacy-note"><strong>This is sanitized.</strong> The envelope mirrors observed Anthropic refusals but contains no fallback token or visitor activity.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <details class="rule" data-rule="alex.fable-5-to-gpt-5.6-sol">
+          <summary>Reveal the actual middleware rule</summary>
+          <p>This readable rule is checked against the same Rust built-in and deterministic fixture used by Alex.</p>
+          <pre><code>{
+  &quot;id&quot;: &quot;alex.fable-5-to-gpt-5.6-sol&quot;,
+  &quot;name&quot;: &quot;Fable 5 → GPT-5.6 Sol&quot;,
+  &quot;description&quot;: &quot;When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.&quot;,
+  &quot;enabled&quot;: true,
+  &quot;priority&quot;: 100,
+  &quot;hook&quot;: &quot;attempt_result&quot;,
+  &quot;capabilities&quot;: [
+    &quot;route.override&quot;,
+    &quot;session.pin&quot;
+  ],
+  &quot;when&quot;: {
+    &quot;models&quot;: [
+      &quot;claude-fable-5&quot;
+    ],
+    &quot;providers&quot;: [
+      &quot;anthropic&quot;
+    ],
+    &quot;error_kinds&quot;: [
+      &quot;upstream_refusal&quot;
+    ],
+    &quot;stable_session&quot;: true
+  },
+  &quot;then&quot;: {
+    &quot;reroute&quot;: {
+      &quot;model&quot;: &quot;gpt-5.6-sol&quot;,
+      &quot;providers&quot;: [
+        &quot;openai&quot;
+      ],
+      &quot;provider_mode&quot;: &quot;only&quot;,
+      &quot;scope&quot;: &quot;session&quot;,
+      &quot;ttl_seconds&quot;: 86400,
+      &quot;effort&quot;: &quot;high&quot;,
+      &quot;reason&quot;: &quot;Fable 5 refused the request; switching this session to GPT-5.6 Sol&quot;,
+      &quot;max_attempts&quot;: 3,
+      &quot;required_capabilities&quot;: {
+        &quot;portable_history&quot;: true
+      }
+    }
+  }
+}</code></pre>
+        </details>
+        <div class="demo-next">
+          <span>Edit the fallback, run your harness, and inspect its real trace match.</span>
+          <a class="button primary" data-demo-action="middleware_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/providers-and-routing.md#fable--sol-preset-contract">Open middleware docs</a>
+        </div>
+      </article>
+
+      <article class="demo-card" data-demo="ask-another-model">
+        <div class="demo-head">
+          <div>
+            <div class="eyebrow">Ask a second model</div>
+            <h2>Keep the first answer. Ask for another opinion.</h2>
+            <p>Fork the captured session into Pi and Sol without losing which model produced which answer.</p>
+          </div>
+          <div class="demo-controls" aria-label="Ask another model walkthrough controls">
+            <button class="primary" type="button" data-action="start" aria-pressed="false">Play</button>
+            <button type="button" data-action="step">Step</button>
+            <button type="button" data-action="reset">Reset</button>
+          </div>
+        </div>
+        <div class="progress-track" aria-hidden="true"></div>
+        <progress data-demo-progress value="0" max="5" aria-label="Ask another model walkthrough progress"></progress>
+        <div class="demo-grid">
+          <ol class="demo-steps">
+            
+            <li class="demo-step request" data-demo-step data-label="Claude produces the first answer">
+              <span class="step-index" aria-hidden="true">1</span>
+              <span class="step-copy"><strong>Claude produces the first answer</strong><span>The source turn is captured with its model and account provenance</span></span>
+            </li>
+            <li class="demo-step decision" data-demo-step data-label="Ask for an independent opinion">
+              <span class="step-index" aria-hidden="true">2</span>
+              <span class="step-copy"><strong>Ask for an independent opinion</strong><span>alex resume session-42 pi --model alex/gpt-5.6-sol</span></span>
+            </li>
+            <li class="demo-step route" data-demo-step data-label="Alex reconstructs the verified history">
+              <span class="step-index" aria-hidden="true">3</span>
+              <span class="step-copy"><strong>Alex reconstructs the verified history</strong><span>The target receives the prior conversation in provider-native order</span></span>
+            </li>
+            <li class="demo-step route" data-demo-step data-label="Sol 5.6 answers in Pi">
+              <span class="step-index" aria-hidden="true">4</span>
+              <span class="step-copy"><strong>Sol 5.6 answers in Pi</strong><span>The second subscription produces a separately attributed turn</span></span>
+            </li>
+            <li class="demo-step success" data-demo-step data-label="Both answers remain in one lineage">
+              <span class="step-index" aria-hidden="true">5</span>
+              <span class="step-copy"><strong>Both answers remain in one lineage</strong><span>The target records its source session, harness, model, and fork time</span></span>
+            </li>
+          </ol>
+          <aside class="trace-panel" aria-label="Resulting oracle lineage summary">
+            <h3>Lineage proof</h3>
+            <div class="trace-row"><span>First answer</span><strong>Claude · Opus 4.8</strong></div>
+            <div class="trace-row"><span>Fork action</span><strong>alex resume</strong></div>
+            <div class="trace-row"><span>Second answer</span><strong>Pi · Sol 5.6</strong></div>
+            <div class="trace-row"><span>Source</span><strong>session-42 · Claude</strong></div>
+            <div class="trace-row"><span>Provenance</span><strong class="status-good">both retained</strong></div>
+            <p class="privacy-note"><strong>This is synthetic.</strong> It mirrors Alex's durable cross-harness fork record and transcript-order tests.</p>
+          </aside>
+        </div>
+        <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
+        <div class="demo-next">
+          <span>Fork a real captured session into another harness.</span>
+          <a class="button primary" data-demo-action="resume_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/cli.md">Read session-fork docs</a>
+        </div>
+      </article>
+    </section>
+
+    <section class="interest shell" aria-label="Try Alex">
+      <article class="provider-card">
+        <div class="eyebrow">Your path</div>
+        <h2>Which setup sounds like yours?</h2>
+        <p>Selecting an option records only its name—never account details or credentials.</p>
+        <div class="provider-options">
+          <button type="button" data-provider="anthropic" aria-pressed="false">Claude subscription</button>
+          <button type="button" data-provider="openai" aria-pressed="false">Codex subscription</button>
+          <button type="button" data-provider="cliproxyapi" aria-pressed="false">CLIProxyAPI</button>
+        </div>
+        <h3>Use it from</h3>
+        <div class="provider-options">
+          <button type="button" data-harness="pi" aria-pressed="false">Pi</button>
+          <button type="button" data-harness="codex" aria-pressed="false">Codex</button>
+          <button type="button" data-harness="claude" aria-pressed="false">Claude Code</button>
+          <button type="button" data-harness="kimi" aria-pressed="false">Kimi</button>
+        </div>
+        <p class="privacy-note" data-route-interest aria-live="polite">Pick a provider and harness to see the route you are interested in.</p>
+        <p><a data-cliproxyapi-docs data-campaign-link href="https://github.com/router-for-me/CLIProxyAPI#readme">Open the CLIProxyAPI docs</a></p>
+      </article>
+
+      <article class="cta-card">
+        <div class="eyebrow">Keep your next session moving</div>
+        <h2>Install Alex locally.</h2>
+        <div class="install-command">
+          <code data-install-command>curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh</code>
+          <button type="button" data-install-copy="curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh">Copy install</button>
+        </div>
+        <div class="cta-links">
+          <a class="button primary" data-download="releases" data-campaign-link href="https://github.com/madhavajay/alex/releases/latest">Open downloads</a>
+          <a class="button" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/configuration.md">Read configuration docs</a>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">Alex runs locally. Site analytics accept only named UI events and campaign attribution—never prompts, traces, credentials, or product activity.</div>
+  </footer>
+</body>
+</html>

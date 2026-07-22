@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "id": "fable-to-sol-refusal",
+  "title": "Fable 5 refuses. The session keeps moving.",
+  "description": "An Anthropic Fable refusal is replaced by OpenAI Sol and pinned for the stable session.",
+  "source": {
+    "vector": "crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json",
+    "failure_fixture": "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json",
+    "rule_builtin": "crates/alex-middleware/src/builtins.rs",
+    "sha256": {
+      "vector": "e3089b381073e0dae6e6cefe43a2db571c0d6807724e402058257e16ee16600b",
+      "failure_fixture": "d37a0e26f70396a9da4060c8008ba1c9daea3b0984914e5ca27b983fff63163f",
+      "rule": "788b8f5a970e811bc04e117f898bac04139e169788b2f7c4194f150bbc1e8a60",
+      "rule_builtin": "04dda877aaf8712d1a3d3d491186599b793cf0e899f117b9c52adcb6c89e0b4b"
+    }
+  },
+  "steps": [
+    {
+      "id": "request",
+      "label": "Request enters Alex",
+      "detail": "claude asks for claude-fable-5",
+      "kind": "request"
+    },
+    {
+      "id": "fable-attempt",
+      "label": "Alex routes to Fable 5",
+      "detail": "anthropic receives the first attempt",
+      "kind": "route"
+    },
+    {
+      "id": "capacity-signal",
+      "label": "Fable returns a refusal signal",
+      "detail": "HTTP 200 · refusal · bio",
+      "kind": "signal"
+    },
+    {
+      "id": "rule-match",
+      "label": "The middleware rule matches",
+      "detail": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+      "kind": "decision"
+    },
+    {
+      "id": "sol-attempt",
+      "label": "Alex retries with Sol 5.6",
+      "detail": "openai serves gpt-5.6-sol",
+      "kind": "route"
+    },
+    {
+      "id": "trace",
+      "label": "The trace explains the session fallback",
+      "detail": "Later requests in this session stay on Sol for 24 hours",
+      "kind": "success"
+    }
+  ],
+  "request": {
+    "harness": "claude",
+    "session_id": "fixture-session-fable-sol",
+    "client_format": "anthropic_messages",
+    "model": "claude-fable-5"
+  },
+  "expected_decision": {
+    "decision": "reroute",
+    "target": {
+      "kind": "exact",
+      "model": "gpt-5.6-sol",
+      "providers": {
+        "only": [
+          "openai"
+        ]
+      }
+    },
+    "scope": {
+      "scope": "session",
+      "ttl_seconds": 86400
+    }
+  },
+  "expected_attempts": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "status": 200,
+      "error_kind": "upstream_refusal"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "status": 200
+    }
+  ],
+  "next_turn": {
+    "model": "claude-fable-5",
+    "expected_provider": "openai",
+    "expected_model": "gpt-5.6-sol",
+    "openai_attempts": 2
+  },
+  "failure": {
+    "name": "anthropic-fable-refusal-200",
+    "provider": "anthropic",
+    "status": 200,
+    "error_kind": "upstream_refusal"
+  },
+  "rule": {
+    "id": "alex.fable-5-to-gpt-5.6-sol",
+    "name": "Fable 5 → GPT-5.6 Sol",
+    "description": "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
+    "enabled": true,
+    "priority": 100,
+    "hook": "attempt_result",
+    "capabilities": [
+      "route.override",
+      "session.pin"
+    ],
+    "when": {
+      "models": [
+        "claude-fable-5"
+      ],
+      "providers": [
+        "anthropic"
+      ],
+      "error_kinds": [
+        "upstream_refusal"
+      ],
+      "stable_session": true
+    },
+    "then": {
+      "reroute": {
+        "model": "gpt-5.6-sol",
+        "providers": [
+          "openai"
+        ],
+        "provider_mode": "only",
+        "scope": "session",
+        "ttl_seconds": 86400,
+        "effort": "high",
+        "reason": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+        "max_attempts": 3,
+        "required_capabilities": {
+          "portable_history": true
+        }
+      }
+    }
+  }
+}

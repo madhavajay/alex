@@ -1,0 +1,271 @@
+[
+  {
+    "schema_version": 1,
+    "id": "use-it-anywhere",
+    "title": "Your Claude subscription. The harness you prefer.",
+    "description": "A Pi request uses Alex's model namespace, routes through Dario because the caller is not Claude Code, and retains the harness and subscription provenance in one trace.",
+    "steps": [
+      {
+        "id": "connect",
+        "label": "Connect the Claude subscription",
+        "detail": "OAuth credentials stay in Alex's encrypted local vault",
+        "kind": "request"
+      },
+      {
+        "id": "configure-pi",
+        "label": "Connect Pi to Alex",
+        "detail": "alex connect pi installs the scoped local route",
+        "kind": "route"
+      },
+      {
+        "id": "request",
+        "label": "Pi asks for Opus 4.8",
+        "detail": "pi --model alex/claude-opus-4-8 -p “Review this”",
+        "kind": "request"
+      },
+      {
+        "id": "dario",
+        "label": "Alex selects the subscription path",
+        "detail": "Non-Claude-Code Anthropic traffic is routed through Dario",
+        "kind": "decision"
+      },
+      {
+        "id": "proof",
+        "label": "The trace proves where it ran",
+        "detail": "Pi · Anthropic · Opus 4.8 · subscription identity · Dario",
+        "kind": "success"
+      }
+    ],
+    "request": {
+      "harness": "pi",
+      "model": "alex/claude-opus-4-8"
+    },
+    "trace": {
+      "harness": "pi",
+      "provider": "anthropic",
+      "served_model": "claude-opus-4-8",
+      "via_dario": true,
+      "subscription_identity": "local account identity"
+    },
+    "source_contracts": [
+      "claude-opus-4-8",
+      "alex connect pi",
+      "non_claude_code_anthropic_uses_dario_even_with_legacy_direct_flag",
+      "via_dario",
+      "subscription_identity"
+    ],
+    "source_evidence": {
+      "crates/alex-core/src/lib.rs": "1c1f3ebe04f6d70263961658a86bf2931e202f44e7f2d585025ddcd55da17358",
+      "crates/alex/src/main.rs": "5187935b13a3a210d6b8d73837445162b9f82d8614edaceed183ec0b52b93f18",
+      "crates/alex/src/harness_connect.rs": "ba478ad0f08a888875a6e4d4858bf4cc727e97b0e4ca70f28e27643cbdf9edf9",
+      "crates/alex/src/resume.rs": "d339b392079d8e3f00a111703e327867403b02fee539f698fe658f110b861a22",
+      "crates/alex-store/src/lib.rs": "f24d8912bc0f17de06d0737b3d7735c4fe51470879b2b1118334f6e78168821e",
+      "crates/alex-proxy/src/lib.rs": "4724a9feea6196d792689aafb31f2afa41de31fa522c81cba40e726368f6fc08"
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "fable-to-sol-refusal",
+    "title": "Fable 5 refuses. The session keeps moving.",
+    "description": "An Anthropic Fable refusal is replaced by OpenAI Sol and pinned for the stable session.",
+    "source": {
+      "vector": "crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json",
+      "failure_fixture": "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json",
+      "rule_builtin": "crates/alex-middleware/src/builtins.rs",
+      "sha256": {
+        "vector": "e3089b381073e0dae6e6cefe43a2db571c0d6807724e402058257e16ee16600b",
+        "failure_fixture": "d37a0e26f70396a9da4060c8008ba1c9daea3b0984914e5ca27b983fff63163f",
+        "rule": "788b8f5a970e811bc04e117f898bac04139e169788b2f7c4194f150bbc1e8a60",
+        "rule_builtin": "04dda877aaf8712d1a3d3d491186599b793cf0e899f117b9c52adcb6c89e0b4b"
+      }
+    },
+    "steps": [
+      {
+        "id": "request",
+        "label": "Request enters Alex",
+        "detail": "claude asks for claude-fable-5",
+        "kind": "request"
+      },
+      {
+        "id": "fable-attempt",
+        "label": "Alex routes to Fable 5",
+        "detail": "anthropic receives the first attempt",
+        "kind": "route"
+      },
+      {
+        "id": "capacity-signal",
+        "label": "Fable returns a refusal signal",
+        "detail": "HTTP 200 · refusal · bio",
+        "kind": "signal"
+      },
+      {
+        "id": "rule-match",
+        "label": "The middleware rule matches",
+        "detail": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+        "kind": "decision"
+      },
+      {
+        "id": "sol-attempt",
+        "label": "Alex retries with Sol 5.6",
+        "detail": "openai serves gpt-5.6-sol",
+        "kind": "route"
+      },
+      {
+        "id": "trace",
+        "label": "The trace explains the session fallback",
+        "detail": "Later requests in this session stay on Sol for 24 hours",
+        "kind": "success"
+      }
+    ],
+    "request": {
+      "harness": "claude",
+      "session_id": "fixture-session-fable-sol",
+      "client_format": "anthropic_messages",
+      "model": "claude-fable-5"
+    },
+    "expected_decision": {
+      "decision": "reroute",
+      "target": {
+        "kind": "exact",
+        "model": "gpt-5.6-sol",
+        "providers": {
+          "only": [
+            "openai"
+          ]
+        }
+      },
+      "scope": {
+        "scope": "session",
+        "ttl_seconds": 86400
+      }
+    },
+    "expected_attempts": [
+      {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "status": 200,
+        "error_kind": "upstream_refusal"
+      },
+      {
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "status": 200
+      }
+    ],
+    "next_turn": {
+      "model": "claude-fable-5",
+      "expected_provider": "openai",
+      "expected_model": "gpt-5.6-sol",
+      "openai_attempts": 2
+    },
+    "failure": {
+      "name": "anthropic-fable-refusal-200",
+      "provider": "anthropic",
+      "status": 200,
+      "error_kind": "upstream_refusal"
+    },
+    "rule": {
+      "id": "alex.fable-5-to-gpt-5.6-sol",
+      "name": "Fable 5 → GPT-5.6 Sol",
+      "description": "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
+      "enabled": true,
+      "priority": 100,
+      "hook": "attempt_result",
+      "capabilities": [
+        "route.override",
+        "session.pin"
+      ],
+      "when": {
+        "models": [
+          "claude-fable-5"
+        ],
+        "providers": [
+          "anthropic"
+        ],
+        "error_kinds": [
+          "upstream_refusal"
+        ],
+        "stable_session": true
+      },
+      "then": {
+        "reroute": {
+          "model": "gpt-5.6-sol",
+          "providers": [
+            "openai"
+          ],
+          "provider_mode": "only",
+          "scope": "session",
+          "ttl_seconds": 86400,
+          "effort": "high",
+          "reason": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+          "max_attempts": 3,
+          "required_capabilities": {
+            "portable_history": true
+          }
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "ask-another-model",
+    "title": "Keep the first answer. Ask a second model.",
+    "description": "A captured Claude session is reconstructed in Pi with Sol 5.6. Alex records the explicit cross-harness fork so the original and independent answer remain connected without pretending they were one model.",
+    "steps": [
+      {
+        "id": "source",
+        "label": "Claude produces the first answer",
+        "detail": "The source turn is captured with its model and account provenance",
+        "kind": "request"
+      },
+      {
+        "id": "ask",
+        "label": "Ask for an independent opinion",
+        "detail": "alex resume session-42 pi --model alex/gpt-5.6-sol",
+        "kind": "decision"
+      },
+      {
+        "id": "history",
+        "label": "Alex reconstructs the verified history",
+        "detail": "The target receives the prior conversation in provider-native order",
+        "kind": "route"
+      },
+      {
+        "id": "second",
+        "label": "Sol 5.6 answers in Pi",
+        "detail": "The second subscription produces a separately attributed turn",
+        "kind": "route"
+      },
+      {
+        "id": "lineage",
+        "label": "Both answers remain in one lineage",
+        "detail": "The target records its source session, harness, model, and fork time",
+        "kind": "success"
+      }
+    ],
+    "source": {
+      "harness": "claude",
+      "session_id": "session-42",
+      "model": "claude-opus-4-8"
+    },
+    "target": {
+      "harness": "pi",
+      "model": "gpt-5.6-sol",
+      "forked_from_session_id": "session-42",
+      "forked_from_harness": "claude"
+    },
+    "source_contracts": [
+      "Fork a captured session into a new interactive harness session",
+      "record_session_fork",
+      "forked_from_session_id",
+      "forked_from_harness",
+      "transcript_first_fork_request_renders_inherited_history_in_order"
+    ],
+    "source_evidence": {
+      "crates/alex/src/main.rs": "5187935b13a3a210d6b8d73837445162b9f82d8614edaceed183ec0b52b93f18",
+      "crates/alex/src/resume.rs": "d339b392079d8e3f00a111703e327867403b02fee539f698fe658f110b861a22",
+      "crates/alex-store/src/lib.rs": "f24d8912bc0f17de06d0737b3d7735c4fe51470879b2b1118334f6e78168821e",
+      "crates/alex-proxy/src/lib.rs": "4724a9feea6196d792689aafb31f2afa41de31fa522c81cba40e726368f6fc08"
+    }
+  }
+]
