@@ -76,6 +76,10 @@ pub struct ResponseSpec {
     pub repeat: bool,
     #[serde(default)]
     pub use_default: bool,
+    #[serde(default)]
+    pub directory_tool_call: bool,
+    #[serde(default)]
+    pub tool_final: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -141,16 +145,20 @@ fn ok_status() -> u16 {
 struct ScenarioFile {
     #[serde(default)]
     endpoints: HashMap<String, Vec<ResponseSpec>>,
+    #[serde(default)]
+    per_conversation: bool,
 }
 
 struct ScenarioEngine {
     initial: HashMap<String, Vec<ResponseSpec>>,
     active: HashMap<String, VecDeque<ResponseSpec>>,
+    conversations: HashMap<String, HashMap<String, VecDeque<ResponseSpec>>>,
+    per_conversation: bool,
     queued: HashMap<String, VecDeque<ResponseSpec>>,
 }
 
 impl ScenarioEngine {
-    fn new(endpoints: HashMap<String, Vec<ResponseSpec>>) -> Self {
+    fn new(endpoints: HashMap<String, Vec<ResponseSpec>>, per_conversation: bool) -> Self {
         let active = endpoints
             .iter()
             .map(|(key, values)| (key.clone(), values.clone().into()))
@@ -158,12 +166,14 @@ impl ScenarioEngine {
         Self {
             initial: endpoints,
             active,
+            conversations: HashMap::new(),
+            per_conversation,
             queued: HashMap::new(),
         }
     }
 
-    fn install(&mut self, endpoints: HashMap<String, Vec<ResponseSpec>>) {
-        *self = Self::new(endpoints);
+    fn install(&mut self, endpoints: HashMap<String, Vec<ResponseSpec>>, per_conversation: bool) {
+        *self = Self::new(endpoints, per_conversation);
     }
 
     fn reset(&mut self) {
@@ -172,6 +182,7 @@ impl ScenarioEngine {
             .iter()
             .map(|(key, values)| (key.clone(), values.clone().into()))
             .collect();
+        self.conversations.clear();
         self.queued.clear();
     }
 
@@ -179,7 +190,12 @@ impl ScenarioEngine {
         self.queued.entry(endpoint).or_default().push_back(response);
     }
 
-    fn take(&mut self, endpoint: &str, path: &str) -> Option<ResponseSpec> {
+    fn take(
+        &mut self,
+        endpoint: &str,
+        path: &str,
+        conversation: Option<&str>,
+    ) -> Option<ResponseSpec> {
         for key in [endpoint, path, "*"] {
             if let Some(queue) = self.queued.get_mut(key) {
                 if let Some(response) = queue.pop_front() {
@@ -187,8 +203,19 @@ impl ScenarioEngine {
                 }
             }
         }
+        let active = if self.per_conversation {
+            let key = conversation.unwrap_or("default").to_string();
+            self.conversations.entry(key).or_insert_with(|| {
+                self.initial
+                    .iter()
+                    .map(|(key, values)| (key.clone(), values.clone().into()))
+                    .collect()
+            })
+        } else {
+            &mut self.active
+        };
         for key in [endpoint, path, "*"] {
-            if let Some(queue) = self.active.get_mut(key) {
+            if let Some(queue) = active.get_mut(key) {
                 if let Some(response) = queue.front().cloned() {
                     if !response.repeat {
                         queue.pop_front();
@@ -244,7 +271,10 @@ impl FakeProv {
             fixtures_dir,
             scenarios_dir,
             control_key: control_key.clone(),
-            engine: Mutex::new(ScenarioEngine::new(scenario.endpoints)),
+            engine: Mutex::new(ScenarioEngine::new(
+                scenario.endpoints,
+                scenario.per_conversation,
+            )),
             requests: Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(config.bind, config.port))
@@ -326,6 +356,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/backend-api/wham/usage", get(codex_usage))
         .route("/oauth/token", post(openai_token))
         .route("/anthropic/v1/messages", post(anthropic_messages))
+        .route("/anthropic/v1/models", get(anthropic_models))
         .route("/anthropic/api/oauth/profile", get(anthropic_profile))
         .route("/anthropic/api/oauth/usage", get(anthropic_usage))
         .route("/anthropic/v1/oauth/token", post(anthropic_token))
@@ -340,6 +371,7 @@ fn router(state: Arc<AppState>) -> Router {
             "/gemini/v1beta/models/{model_action}",
             post(gemini_generate),
         )
+        .route("/gemini/v1beta/models", get(gemini_models))
         .route(
             "/gemini/v1internal:generateContent",
             post(gemini_code_assist_generate),
@@ -354,6 +386,7 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route("/gemini/v1internal:onboardUser", post(gemini_onboard_user))
         .route("/xai/v1/chat/completions", post(openai_chat))
+        .route("/xai/v1/models", get(xai_models))
         .route("/xai/oauth2/device/code", post(xai_device_code))
         .route("/xai/oauth2/token", post(xai_token))
         .route("/xai/oauth2/userinfo", get(xai_userinfo))
@@ -362,6 +395,7 @@ fn router(state: Arc<AppState>) -> Router {
             post(xai_billing),
         )
         .route("/kimi/coding/v1/chat/completions", post(openai_chat))
+        .route("/kimi/coding/v1/models", get(kimi_models))
         .route("/kimi/coding/v1/usages", get(kimi_usage))
         .route(
             "/kimi/api/oauth/device_authorization",
@@ -509,6 +543,62 @@ async fn openai_models(
     .await
 }
 
+async fn anthropic_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    handle_fixed(
+        state,
+        Method::GET,
+        uri,
+        headers,
+        Bytes::new(),
+        "anthropic/models.json",
+    )
+    .await
+}
+
+async fn gemini_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    handle_fixed(
+        state,
+        Method::GET,
+        uri,
+        headers,
+        Bytes::new(),
+        "gemini/models.json",
+    )
+    .await
+}
+
+async fn xai_models(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
+    handle_fixed(
+        state,
+        Method::GET,
+        uri,
+        headers,
+        Bytes::new(),
+        "xai/models.json",
+    )
+    .await
+}
+
+async fn kimi_models(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
+    handle_fixed(
+        state,
+        Method::GET,
+        uri,
+        headers,
+        Bytes::new(),
+        "kimi/models.json",
+    )
+    .await
+}
+
 async fn codex_usage(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
     handle_fixed(
         state,
@@ -631,13 +721,37 @@ async fn handle_model(
     let path = uri.path().to_string();
     record_request(&state, &method, &path, &headers, &body).await;
     let endpoint = format!("{method} {path}");
+    let conversation = conversation_key(&headers, &body);
+    let request_value = serde_json::from_slice::<Value>(&body).ok();
     let stream_requested = path.ends_with("/backend-api/codex/responses")
         || path == "/openai/responses"
         || path.ends_with(":streamGenerateContent")
-        || serde_json::from_slice::<Value>(&body)
-            .ok()
+        || request_value
+            .as_ref()
             .and_then(|value| value.get("stream").and_then(Value::as_bool))
             .unwrap_or(false);
+    if request_value
+        .as_ref()
+        .and_then(|value| value.pointer("/tool_choice/function/name"))
+        .and_then(Value::as_str)
+        == Some("session_title")
+    {
+        return match render_native_tool_response(
+            &path,
+            stream_requested,
+            request_value.as_ref().expect("parsed request"),
+            Some((
+                "session_title".to_string(),
+                json!({"session_title": "Offline harness tool round trip"}),
+            )),
+            "",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => internal_error(error),
+        };
+    }
     let header_failure = headers
         .get("x-mock-fail")
         .and_then(|value| value.to_str().ok())
@@ -651,11 +765,17 @@ async fn handle_model(
             .engine
             .lock()
             .await
-            .take(&endpoint, &path)
+            .take(&endpoint, &path, conversation.as_deref())
             .unwrap_or_default(),
     };
     if response.failure.as_deref() == Some("timeout") {
         return std::future::pending::<Response>().await;
+    }
+    if response.directory_tool_call || response.tool_final.is_some() {
+        return match render_tool_roundtrip(&path, stream_requested, &body, &response).await {
+            Ok(response) => response,
+            Err(error) => internal_error(error),
+        };
     }
     let default_fixture = default_model_fixture(&path, stream_requested);
     match render_response(&state, &path, stream_requested, response, default_fixture).await {
@@ -688,7 +808,7 @@ async fn handle_fixed(
             .engine
             .lock()
             .await
-            .take(&endpoint, &path)
+            .take(&endpoint, &path, None)
             .unwrap_or_default(),
     };
     if response.failure.as_deref() == Some("timeout") {
@@ -698,6 +818,239 @@ async fn handle_fixed(
         Ok(response) => response,
         Err(error) => internal_error(error),
     }
+}
+
+fn conversation_key(headers: &HeaderMap, body: &Bytes) -> Option<String> {
+    for name in ["x-session-id", "x-alex-session", "x-conversation-id"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    let value: Value = serde_json::from_slice(body).ok()?;
+    for candidate in [
+        value.get("prompt_cache_key"),
+        value.pointer("/metadata/user_id"),
+        value.pointer("/metadata/session_id"),
+    ] {
+        if let Some(value) = candidate.and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn request_tools(body: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    for tool in body["tools"].as_array().into_iter().flatten() {
+        if tool["type"].as_str() == Some("local_shell") {
+            names.push("exec_command".to_string());
+        }
+        if let Some(name) = tool["name"].as_str() {
+            names.push(name.to_string());
+        }
+        if let Some(name) = tool["function"]["name"].as_str() {
+            names.push(name.to_string());
+        }
+        for declaration in tool["functionDeclarations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = declaration["name"].as_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn directory_tool(body: &Value) -> Result<(String, Value)> {
+    let names = request_tools(body);
+    let priorities = [
+        "exec_command",
+        "bash",
+        "shell",
+        "run_shell_command",
+        "execute_command",
+        "ls",
+        "list_directory",
+        "list_files",
+    ];
+    let name = priorities
+        .iter()
+        .find_map(|wanted| {
+            names
+                .iter()
+                .find(|name| name.to_ascii_lowercase() == *wanted)
+        })
+        .or_else(|| {
+            names.iter().find(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.contains("shell")
+                    || lower.contains("command")
+                    || lower.contains("bash")
+                    || lower.contains("list")
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| "exec_command".to_string());
+    let lower = name.to_ascii_lowercase();
+    let args = if lower == "exec_command" {
+        json!({"cmd": "ls"})
+    } else if lower == "run_terminal_command" {
+        json!({"command": "ls", "description": "List the current directory"})
+    } else if lower == "ls" || lower.contains("list_directory") || lower.contains("list_files") {
+        json!({"path": "."})
+    } else {
+        json!({"command": "ls"})
+    };
+    Ok((name, args))
+}
+
+fn contains_tool_result(body: &Value) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Array(values) => values.iter().any(walk),
+            Value::Object(values) => {
+                values
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "tool_result" | "function_call_output"))
+                    || values.contains_key("functionResponse")
+                    || values.get("role").and_then(Value::as_str) == Some("tool")
+                    || values.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(body)
+}
+
+async fn render_tool_roundtrip(
+    path: &str,
+    stream_requested: bool,
+    body: &Bytes,
+    response: &ResponseSpec,
+) -> Result<Response> {
+    let request: Value = serde_json::from_slice(body).context("parsing tool-roundtrip request")?;
+    if let Some(canary) = response.tool_final.as_deref() {
+        if !contains_tool_result(&request) {
+            return Ok(provider_error(
+                path,
+                409,
+                "missing_tool_result",
+                "tool result was not returned before the final response",
+            ));
+        }
+        return render_native_tool_response(path, stream_requested, &request, None, canary).await;
+    }
+    let tool = directory_tool(&request)?;
+    render_native_tool_response(path, stream_requested, &request, Some(tool), "").await
+}
+
+async fn render_native_tool_response(
+    path: &str,
+    stream_requested: bool,
+    request: &Value,
+    tool: Option<(String, Value)>,
+    final_text: &str,
+) -> Result<Response> {
+    let model = request["model"]
+        .as_str()
+        .or_else(|| {
+            path.split("/models/")
+                .nth(1)
+                .and_then(|v| v.split(':').next())
+        })
+        .unwrap_or("fake-1");
+    let value = if is_anthropic_messages(path) {
+        let content = match tool {
+            Some((name, args)) => vec![json!({
+                "type": "tool_use", "id": "toolu_fakeprov_ls_0001", "name": name, "input": args
+            })],
+            None => vec![json!({"type": "text", "text": final_text})],
+        };
+        json!({
+            "id": "msg_fakeprov_tool_0001", "type": "message", "role": "assistant",
+            "model": model, "content": content,
+            "stop_reason": if final_text.is_empty() { "tool_use" } else { "end_turn" },
+            "stop_sequence": null,
+            "usage": {"input_tokens": 11, "output_tokens": 7}
+        })
+    } else if is_openai_responses(path) {
+        let output = match tool {
+            Some((name, args)) => vec![json!({
+                "id": "fc_fakeprov_ls_0001", "type": "function_call", "status": "completed",
+                "call_id": "call_fakeprov_ls_0001", "name": name,
+                "arguments": serde_json::to_string(&args)?
+            })],
+            None => vec![json!({
+                "id": "msg_fakeprov_tool_final_0001", "type": "message", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text", "text": final_text, "annotations": []}]
+            })],
+        };
+        json!({
+            "id": "resp_fakeprov_tool_0001", "object": "response", "created_at": 1700000000,
+            "status": "completed", "model": model, "output": output,
+            "parallel_tool_calls": true,
+            "usage": {"input_tokens": 11, "input_tokens_details": {"cached_tokens": 0},
+                      "output_tokens": 7, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 18}
+        })
+    } else if path.starts_with("/gemini/") {
+        let parts = match tool {
+            Some((name, args)) => vec![json!({
+                "functionCall": {"id": "call_fakeprov_ls_0001", "name": name, "args": args}
+            })],
+            None => vec![json!({"text": final_text})],
+        };
+        json!({
+            "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP", "index": 0}],
+            "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 7, "totalTokenCount": 18},
+            "modelVersion": model, "responseId": "gemini_fakeprov_tool_0001"
+        })
+    } else {
+        let message = match tool {
+            Some((name, args)) => json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_fakeprov_ls_0001", "type": "function",
+                    "function": {"name": name, "arguments": serde_json::to_string(&args)?}}]
+            }),
+            None => json!({"role": "assistant", "content": final_text}),
+        };
+        json!({
+            "id": "chatcmpl_fakeprov_tool_0001", "object": "chat.completion", "created": 1700000000,
+            "model": model, "choices": [{"index": 0, "message": message,
+                "finish_reason": if final_text.is_empty() { "tool_calls" } else { "stop" }}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        })
+    };
+    let raw = if stream_requested {
+        if is_anthropic_messages(path) {
+            alex_core::translate::synth_anthropic_sse(&value)
+        } else if is_openai_responses(path) {
+            alex_core::translate::synth_openai_responses_sse(&value)
+        } else if path.starts_with("/gemini/") {
+            format!("data: {value}\n\n")
+        } else {
+            alex_core::translate::synth_openai_chat_sse(&value)
+        }
+    } else {
+        serde_json::to_string(&value)?
+    };
+    let content_type = if stream_requested {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    build_response(
+        LoadedResponse::raw(200, content_type, raw.into_bytes()),
+        None,
+    )
+    .await
 }
 
 fn default_model_fixture(path: &str, stream: bool) -> &'static str {
@@ -1172,7 +1525,11 @@ fn read_scenario(root: &Path, name: &str) -> Result<ScenarioFile> {
 
 async fn set_scenario(state: &AppState, name: &str) -> Result<()> {
     let scenario = read_scenario(&state.scenarios_dir, name)?;
-    state.engine.lock().await.install(scenario.endpoints);
+    state
+        .engine
+        .lock()
+        .await
+        .install(scenario.endpoints, scenario.per_conversation);
     Ok(())
 }
 
@@ -1451,7 +1808,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(models["object"], "list");
-        assert_eq!(models["data"].as_array().unwrap().len(), 3);
+        assert_eq!(models["data"].as_array().unwrap().len(), 6);
 
         let responses: Value = client
             .post(format!("{}/v1/responses", server.base_url()))
@@ -1708,6 +2065,7 @@ mod tests {
         assert_eq!(
             alex_core::openrouter_catalog::parse_models_response(&catalog),
             vec![
+                "fake/fake-1",
                 "anthropic/claude-3.5-sonnet",
                 "openai/gpt-4o",
                 "meta-llama/llama-3.1-70b-instruct",
@@ -1923,6 +2281,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_harness_models_are_listed_by_provider_catalogs() {
+        let server = server().await;
+        let client = reqwest::Client::new();
+        for (path, pointer, expected) in [
+            ("/anthropic/v1/models", "/data/0/id", "claude-fake-1"),
+            ("/openai/v1/models", "/data/0/id", "gpt-fake-1"),
+            (
+                "/gemini/v1beta/models",
+                "/models/0/name",
+                "models/gemini-fake-1",
+            ),
+            ("/xai/v1/models", "/data/0/id", "grok-fake-1"),
+            ("/kimi/coding/v1/models", "/data/0/id", "kimi-fake-1"),
+            ("/openrouter/api/v1/models", "/data/0/id", "fake/fake-1"),
+            ("/exo/v1/models", "/data/0/id", "fake-1"),
+        ] {
+            let body: Value = client
+                .get(format!("{}{path}", server.base_url()))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                body.pointer(pointer).and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+        let openai: Value = client
+            .get(format!("{}/openai/v1/models", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<_> = openai["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"codex-fake-1"));
+        assert!(ids.contains(&"gpt-5.6-sol"));
+    }
+
+    #[tokio::test]
+    async fn tool_roundtrip_sequences_independently_per_conversation() {
+        let server = FakeProv::spawn(Config {
+            scenario: "harness-tool-roundtrip".into(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("{}/anthropic/v1/messages", server.base_url());
+        let request = json!({
+            "model": "claude-fake-1",
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "list files"}]
+        });
+        for session in ["conversation-a", "conversation-b"] {
+            let first: Value = client
+                .post(&url)
+                .header("x-session-id", session)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(first["content"][0]["type"], "tool_use");
+            assert_eq!(first["content"][0]["name"], "Bash");
+            assert_eq!(first["content"][0]["input"]["command"], "ls");
+        }
+        for session in ["conversation-a", "conversation-b"] {
+            let final_response: Value = client
+                .post(&url)
+                .header("x-session-id", session)
+                .json(&json!({
+                    "model": "claude-fake-1",
+                    "messages": [{"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_fakeprov_ls_0001",
+                        "content": "Cargo.toml\ncrates\ntest.sh"
+                    }]}]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(final_response["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("alex-harness-tool-ok")));
+        }
+        let requests = server.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|row| row.body.contains("tool_result"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn external_service_stubs_return_consumer_shapes() {
         let server = server().await;
         let client = reqwest::Client::new();
@@ -1984,5 +2457,70 @@ mod tests {
             .unwrap();
         assert_eq!(updates["result"][0]["message"]["chat"]["id"], 42);
         assert!(updates["result"][0]["update_id"].is_number());
+    }
+
+    #[tokio::test]
+    async fn grok_title_request_does_not_consume_tool_sequence() {
+        let server = FakeProv::spawn(Config {
+            scenario: "harness-tool-roundtrip".into(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("{}/xai/v1/chat/completions", server.base_url());
+        let title: Value = client
+            .post(&url)
+            .json(&json!({
+                "model": "grok-4.5",
+                "tool_choice": {"type": "function", "function": {"name": "session_title"}},
+                "tools": [{"type": "function", "function": {"name": "session_title"}}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            title["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "session_title"
+        );
+        let first: Value = client
+            .post(&url)
+            .json(&json!({
+                "model": "alex/claude-fake-1",
+                "tools": [{"type": "function", "function": {
+                    "name": "run_terminal_command"
+                }}],
+                "messages": [{"role": "user", "content": "list files"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let call = &first["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "run_terminal_command");
+        assert!(call["arguments"]
+            .as_str()
+            .is_some_and(|args| args.contains("description")));
+        let final_response: Value = client
+            .post(&url)
+            .json(&json!({
+                "model": "alex/claude-fake-1",
+                "messages": [{"role": "tool", "tool_call_id": "call_fakeprov_ls_0001",
+                    "content": "alex-harness-tool-canary"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(final_response["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("alex-harness-tool-ok")));
     }
 }

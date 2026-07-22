@@ -306,3 +306,19 @@ worktree; land order matters for 1→2→3, then 4/5/6 parallelize.
 - **gRPC-web (Grok billing)** and **Amp product protocol** are the two
   non-plain-HTTP surfaces; both already have parsers/mocks in-repo to crib from.
 - **XCUITest cost**: keep to golden flows; logic stays in AlexCoreTests.
+
+## 8. Offline harness matrix
+
+`./test.sh harness-mock` starts an isolated daemon and fakeprov, then runs the
+real Claude, Codex, Grok Build, and Kimi harness images through Docker. The
+data-driven matrix covers every harness/provider dialect combination, including
+a native tool-call followed by a final canary response. Cells SKIP when Docker
+or a harness image is unavailable. `--only`, `--provider`, `--harness`,
+`--jobs`, and `--json` use the standard test reporter; cells are serialized
+because each one resets fakeprov's ordered scenario queue.
+
+The canonical fake models are `claude-fake-1` (Anthropic), `gpt-fake-1`
+(OpenAI API), `codex-fake-1` (Codex OAuth), `gemini-fake-1`, `grok-fake-1`,
+`kimi-fake-1`, `openrouter/fake/fake-1`, and `exo/fake-1`. The tier also runs
+the real Dario sidecar cell and B1-B5 for account failover, Fable refusal
+rerouting, stalled streams, Kimi quota cooldown, and model-list integrity.

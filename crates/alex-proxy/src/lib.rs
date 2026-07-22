@@ -7041,6 +7041,8 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "health": account_health(&a, last_heartbeat),
                 "last_probe": a.account_meta.get("last_probe").cloned().unwrap_or(Value::Null),
                 "needs_reauth": a.needs_reauth(),
+                "cooldown_until_ms": a.cooldown_until_ms,
+                "cooling_down": a.cooldown_until_ms.is_some_and(|until| until > now_ms()),
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
                 "routing": routing,
@@ -11926,7 +11928,6 @@ fn reroutable_error_class(class: ErrorClass) -> bool {
     matches!(class, ErrorClass::Capacity | ErrorClass::Server)
 }
 
-#[cfg(test)]
 fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
     reroutable_error_class(classify_error("unknown", Some(status.as_u16()), None))
 }
@@ -14139,6 +14140,18 @@ async fn proxy(
                             }
                             None
                         }
+                    }
+                    alex_middleware::AttemptDecision::Continue
+                        if retryable_failover_status(resp.status()) =>
+                    {
+                        same_route_plan.map(|next_plan| {
+                            (
+                                current_provider,
+                                current_model.clone(),
+                                next_plan,
+                                format!("retryable upstream status {}", status),
+                            )
+                        })
                     }
                     alex_middleware::AttemptDecision::Continue
                     | alex_middleware::AttemptDecision::ReturnOriginal { .. } => None,

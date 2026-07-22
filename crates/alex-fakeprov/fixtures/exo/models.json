@@ -1,6 +1,7 @@
 {
   "object": "list",
   "data": [
+    {"id": "fake-1", "object": "model", "owned_by": "exo"},
     {"id": "llama-3.2-3b", "object": "model", "owned_by": "exo"},
     {"id": "deepseek-r1-distill", "object": "model", "owned_by": "exo"}
   ]
