@@ -38,18 +38,21 @@ test("build is deterministic and generated from the proxy fixture", async () => 
 
   const scenario = JSON.parse(await readFile(path.join(siteRoot, "dist/assets/scenario.json"), "utf8"));
   assert.equal(scenario.request.model, "claude-fable-5");
-  assert.equal(scenario.failure.status, 529);
+  assert.equal(scenario.failure.status, 200);
+  assert.equal(scenario.failure.error_kind, "upstream_refusal");
   assert.equal(scenario.expected_decision.decision, "reroute");
   assert.equal(scenario.expected_decision.target.model, "gpt-5.6-sol");
+  assert.equal(scenario.expected_decision.scope.scope, "session");
+  assert.equal(scenario.expected_decision.scope.ttl_seconds, 86400);
   assert.equal(scenario.expected_attempts[1].provider, "openai");
-  assert.equal(scenario.next_turn.anthropic_attempts, 1);
+  assert.equal(scenario.next_turn.openai_attempts, 2);
   assert.equal(scenario.steps.length, 6);
   for (const hash of Object.values(scenario.source.sha256)) assert.match(hash, /^[a-f0-9]{64}$/);
 
   const scenarios = JSON.parse(await readFile(path.join(siteRoot, "dist/assets/scenarios.json"), "utf8"));
   assert.deepEqual(scenarios.map(({ id }) => id), [
     "use-it-anywhere",
-    "fable-to-sol-overload",
+    "fable-to-sol-refusal",
     "ask-another-model"
   ]);
   assert.equal(scenarios[0].trace.via_dario, true);
@@ -119,12 +122,12 @@ test("analytics schema exposes the full privacy-safe funnel", () => {
   for (const name of forbidden) assert(!fields.includes(name), `${name} must not be an analytics property`);
 
   assert.deepEqual(sanitizeProperties("demo_started", {
-    demo_id: "fable-to-sol-overload",
+    demo_id: "fable-to-sol-refusal",
     entry_point: "play_control",
     prompt: "secret",
     trace_id: "trace-123"
   }), {
-    demo_id: "fable-to-sol-overload",
+    demo_id: "fable-to-sol-refusal",
     entry_point: "play_control"
   });
   assert.equal(sanitizeProperties("not_declared", { anything: "no" }), null);

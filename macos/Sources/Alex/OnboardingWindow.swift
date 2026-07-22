@@ -1284,6 +1284,19 @@ struct OnboardingView: View {
                         isBusy: model.harnessState.isWorking
                     ) { model.connectSelectedHarness() }
                     operation(model.harnessState)
+                    if model.harnessState.isSuccess,
+                       let harness = model.selectedHarness,
+                       let command = OnboardingSupport.launchCommand(harness: harness)
+                    {
+                        Text("Launch the connected profile with:")
+                            .font(.system(size: 11, weight: .semibold))
+                        CopyableCode(value: command)
+                        if harness == "claude" {
+                            Text("Plain `claude` still uses your normal authentication. `alex wrap claude` is the equivalent shortcut.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        }
+                    }
                 }
                 .padding(12).cardStyle()
             }
@@ -1497,7 +1510,7 @@ struct OnboardingView: View {
             .padding(14).cardStyle()
             statusCard(
                 icon: "arrow.triangle.branch", tint: AlexTheme.Colors.primary,
-                text: "The default middleware retries Anthropic HTTP 529 overloaded_error responses with high-effort GPT-5.6 Sol for that request.")
+                text: "The default middleware catches any structured Fable refusal, retries with high-effort GPT-5.6 Sol, and keeps that route for the session for 24 hours.")
         }
     }
 

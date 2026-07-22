@@ -7,6 +7,7 @@ import AlexCore
 struct MiddlewarePreferencesSection: View {
     let store: SnapshotStore
     var migratedFromFailover = false
+    var onOpenTraceBrowser: (String) -> Void = { _ in }
 
     @State private var runtime: MiddlewareRuntimeStatus?
     @State private var settings = MiddlewareSettings()
@@ -21,6 +22,8 @@ struct MiddlewarePreferencesSection: View {
     @State private var wizardEditingID: String?
     @State private var inspectedRule: MiddlewareRuleSpecV1?
     @State private var pendingDelete: MiddlewareRuleSpecV1?
+    @State private var activity: [MiddlewareActivityEvent] = []
+    @State private var activityLoadError: String?
 
     private var builtIns: [MiddlewareRuleSpecV1] {
         (runtime?.rules ?? []).filter(\.isBuiltIn)
@@ -43,6 +46,7 @@ struct MiddlewarePreferencesSection: View {
                         runtimeSection
                         builtInSection
                         rulesSection
+                        activitySection
                         scriptsSection
                         leasesSection
                         safetySection
@@ -57,7 +61,7 @@ struct MiddlewarePreferencesSection: View {
             MiddlewareWizard(
                 store: store,
                 draft: $wizardDraft,
-                editingRuleID: wizardEditingID,
+                editingRuleID: $wizardEditingID,
                 onSaved: {
                     showingWizard = false
                     Task { await load(showSpinner: false) }
@@ -271,10 +275,6 @@ struct MiddlewarePreferencesSection: View {
                 .buttonStyle(.borderless)
                 .controlSize(.small)
                 .disabled(rule.map(isWizardEditable) != true)
-            Button("Test") { if let rule { Task { await test(rule) } } }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(rule == nil)
             Toggle("", isOn: Binding(
                 get: { rules.isEmpty ? policy.defaultEnabled : rules.allSatisfy(\.enabled) },
                 set: { enabled in Task { await setEnabled(rules, enabled) } }
@@ -355,7 +355,6 @@ struct MiddlewarePreferencesSection: View {
                 if isWizardEditable(rule) {
                     Button("Duplicate") { duplicateInWizard(rule) }
                 }
-                Button("Test") { Task { await test(rule) } }
                 Divider()
                 Button("Delete", role: .destructive) { pendingDelete = rule }
             } label: {
@@ -365,6 +364,91 @@ struct MiddlewarePreferencesSection: View {
             .menuStyle(.borderlessButton)
             .frame(width: 24)
             .accessibilityLabel("Actions for \(rule.name)")
+        }
+        .padding(11)
+        .alexCard(background: AlexTheme.Colors.overlay(0.03))
+    }
+
+    private var activitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                SectionLabel(text: "Recent middleware activity", style: .prominent)
+                Spacer()
+                Button("Refresh") { Task { await load(showSpinner: false) } }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+            }
+            Text("Run a real request in Claude, Pi, or another connected harness. Alex shows whether the resulting trace matched a rule and whether the action executed.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+
+            if activity.isEmpty {
+                Text(activityLoadError.map { "Activity unavailable: \($0)" }
+                    ?? "No recent Fable or middleware events in the last 24 hours.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AlexTheme.Colors.textTertiary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .alexCard(background: AlexTheme.Colors.overlay(0.03))
+            } else {
+                ForEach(activity) { event in
+                    activityRow(event)
+                }
+            }
+        }
+    }
+
+    private func activityRow(_ event: MiddlewareActivityEvent) -> some View {
+        let matches = event.matchedDecisions
+        let executed = matches.contains { $0.executed == true }
+        let source = event.attempts.first?.model ?? event.requestedModel ?? "unknown model"
+        let target = event.finalModel ?? event.attempts.last?.model ?? source
+        let refusal = event.attempts.first { $0.errorKind == "upstream_refusal" }
+        let outcome: String = if let match = matches.first {
+            "Matched \(match.ruleName ?? match.ruleId) · \(executed ? "action executed" : "action not executed")"
+        } else if let refusal {
+            "Refusal observed\(refusal.errorCode.map { " (\($0))" } ?? "") · no rule matched"
+        } else {
+            "No rule matched"
+        }
+
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: executed
+                ? "arrow.triangle.branch" : (matches.isEmpty ? "circle.dashed" : "exclamationmark.triangle"))
+                .foregroundStyle(executed
+                    ? AlexTheme.Colors.success : (matches.isEmpty
+                        ? AlexTheme.Colors.textTertiary : AlexTheme.Colors.warningOrange))
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(event.harness?.capitalized ?? "Harness")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(source == target ? source : "\(source) → \(target)")
+                        .font(AlexTheme.Fonts.metaMono)
+                        .lineLimit(1)
+                }
+                Text(outcome)
+                    .font(.system(size: 10, weight: matches.isEmpty ? .regular : .medium))
+                    .foregroundStyle(executed
+                        ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
+                HStack(spacing: 6) {
+                    if let ts = event.tsMs { Text(formattedDate(ts)) }
+                    if let status = event.status { Text("HTTP \(status)") }
+                    Text(String(event.id.prefix(8)))
+                }
+                .font(AlexTheme.Fonts.metaMicro)
+                .foregroundStyle(AlexTheme.Colors.textFaint)
+            }
+            Spacer()
+            Button("Open Trace") {
+                if let session = event.sessionId {
+                    onOpenTraceBrowser("session:\(session)")
+                } else {
+                    onOpenTraceBrowser(event.id)
+                }
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
         }
         .padding(11)
         .alexCard(background: AlexTheme.Colors.overlay(0.03))
@@ -492,6 +576,13 @@ struct MiddlewarePreferencesSection: View {
             let value = try await client.middlewareStatus()
             runtime = value
             settings = value.settings
+            do {
+                activity = try await client.middlewareActivity()
+                activityLoadError = nil
+            } catch is CancellationError {
+            } catch {
+                activityLoadError = error.localizedDescription
+            }
         } catch is CancellationError {
         } catch {
             runtime = nil
@@ -578,17 +669,6 @@ struct MiddlewarePreferencesSection: View {
         } catch { report("Delete failed: \(error.localizedDescription)", error: true) }
     }
 
-    private func test(_ rule: MiddlewareRuleSpecV1) async {
-        guard let client = client() else { return report("No daemon configuration", error: true) }
-        do {
-            let result = try await client.testMiddleware(.init(
-                middlewareId: rule.id,
-                fixtureName: "anthropic-fable-unavailable-529"))
-            report(result.summary ?? (result.matched ? "Test matched" : "Test did not match"), error: false)
-        } catch is CancellationError {
-        } catch { report("Test failed: \(error.localizedDescription)", error: true) }
-    }
-
     private func clear(_ lease: MiddlewareRouteLease) async {
         guard let client = client() else { return report("No daemon configuration", error: true) }
         do {
@@ -663,7 +743,7 @@ private enum BuiltInMiddlewarePolicy: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String { "Fable 5 → GPT-5.6 Sol" }
     var summary: String {
-        "On Anthropic HTTP 529 overloaded_error, retry this request with high-effort GPT-5.6 Sol."
+        "When Anthropic Fable 5 refuses, switch the stable session to high-effort GPT-5.6 Sol for 24 hours."
     }
     var icon: String { "arrow.right.circle" }
     var defaultEnabled: Bool { true }

@@ -147,9 +147,12 @@ struct PreferencesView: View {
                 case .dario:
                     DarioPreferencesSection(store: store, onOpenDario: onOpenDario)
                 case .protection:
-                    MiddlewarePreferencesSection(store: store, migratedFromFailover: true)
+                    MiddlewarePreferencesSection(
+                        store: store, migratedFromFailover: true,
+                        onOpenTraceBrowser: onOpenTraceBrowser)
                 case .middleware:
-                    MiddlewarePreferencesSection(store: store)
+                    MiddlewarePreferencesSection(
+                        store: store, onOpenTraceBrowser: onOpenTraceBrowser)
                 case .notifications:
                     NotificationsPreferencesSection(store: store)
                 }

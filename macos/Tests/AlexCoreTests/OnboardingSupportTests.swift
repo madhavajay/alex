@@ -77,6 +77,8 @@ struct OnboardingSupportTests {
             "codex --profile alex exec --skip-git-repo-check -m alex/gpt-5 \"test\"")
         #expect(OnboardingSupport.testCommand(harness: "amp", model: "alex/gpt-5") ==
             "alex wrap amp -- -x \"test\"")
+        #expect(OnboardingSupport.launchCommand(harness: "claude") ==
+            "claude --settings ~/.claude/alex-settings.json")
     }
 
     @Test func environmentUsesLiveDaemonBaseURL() {
@@ -102,6 +104,10 @@ struct OnboardingSupportTests {
         #expect(amp.contains("alex wrap amp"))
         #expect(amp.contains("native models"))
         #expect(!amp.contains("exposed model list"))
+
+        let claude = OnboardingSupport.harnessInstallDescription("claude")
+        #expect(claude.contains("claude --settings ~/.claude/alex-settings.json"))
+        #expect(claude.contains("alex wrap claude"))
 
         let pi = OnboardingSupport.harnessInstallDescription("pi")
         #expect(pi.contains("exposed model list"))

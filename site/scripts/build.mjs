@@ -10,7 +10,7 @@ const sourceRoot = path.join(siteRoot, "src");
 const outputRoot = path.join(siteRoot, "dist");
 
 const vectorPath = path.join(repoRoot, "crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json");
-const failurePath = path.join(repoRoot, "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json");
+const failurePath = path.join(repoRoot, "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json");
 const builtinPath = path.join(repoRoot, "crates/alex-middleware/src/builtins.rs");
 const rulePath = path.join(siteRoot, "data/fable-to-sol-rule.json");
 const useAnywherePath = path.join(siteRoot, "data/use-anywhere-vector.json");
@@ -52,8 +52,7 @@ function validateSources(vector, failure, rule, builtinSource) {
     rule.name,
     rule.when.models[0],
     rule.when.providers[0],
-    ...rule.when.status.map(String),
-    ...rule.when.body_contains_any,
+    ...rule.when.error_kinds,
     rule.then.reroute.model,
     rule.then.reroute.providers[0],
     rule.then.reroute.effort,
@@ -65,11 +64,10 @@ function validateSources(vector, failure, rule, builtinSource) {
 
   const requiredRustStructure = [
     "HookPoint::AttemptResult",
-    "Capability::AttemptReadErrorBody",
     "Capability::RouteOverride",
-    "ErrorClass::Capacity",
+    "Capability::SessionPin",
     "ProviderModeV1::Only",
-    "RouteScopeKindV1::Request",
+    "RouteScopeKindV1::Session",
     "max_attempts: Some(3)"
   ];
   for (const fragment of requiredRustStructure) {
@@ -77,10 +75,13 @@ function validateSources(vector, failure, rule, builtinSource) {
   }
 
   assert(rule.hook === "attempt_result", "rule hook must be attempt_result");
-  assert(rule.capabilities.join(",") === "attempt.read_error_body,route.override", "rule capabilities must match the built-in");
-  assert(rule.when.error_classes.join(",") === "capacity", "error classes must match the built-in");
+  assert(rule.capabilities.join(",") === "route.override,session.pin", "rule capabilities must match the built-in");
+  assert(rule.when.error_kinds.join(",") === "upstream_refusal", "the rule must match normalized refusals");
+  assert(rule.when.stable_session === true, "session fallback requires a stable session");
   assert(rule.then.reroute.provider_mode === "only", "provider mode must remain only");
-  assert(rule.then.reroute.scope === "request", "reroute must remain request-scoped");
+  assert(rule.then.reroute.scope === "session", "reroute must remain session-scoped");
+  assert(rule.then.reroute.ttl_seconds === 86400, "session route must last 24 hours");
+  assert(rule.then.reroute.required_capabilities.portable_history === true, "session history must be portable");
   assert(rule.then.reroute.effort === "high", "replacement effort must remain high");
   assert(rule.then.reroute.max_attempts === 3, "attempt guard must match the built-in");
 }
@@ -103,11 +104,16 @@ function validateSourceCheckedScenario(vector, sourceFiles) {
 }
 
 function buildScenario(vector, failure, rule, hashes) {
-  const errorBody = JSON.parse(failure.body);
+  const refusalEvent = failure.body
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => JSON.parse(line.slice(5).trim()))
+    .find((event) => event?.delta?.stop_reason === "refusal");
+  assert(refusalEvent, "failure fixture must contain a structured refusal event");
   return {
     schema_version: 1,
-    id: "fable-to-sol-overload",
-    title: "Fable 5 fails. This request keeps moving.",
+    id: "fable-to-sol-refusal",
+    title: "Fable 5 refuses. The session keeps moving.",
     description: vector.description,
     source: {
       vector: path.relative(repoRoot, vectorPath),
@@ -130,8 +136,8 @@ function buildScenario(vector, failure, rule, hashes) {
       },
       {
         id: "capacity-signal",
-        label: "Fable returns a capacity signal",
-        detail: `HTTP ${failure.status} · ${errorBody.error.type}`,
+        label: "Fable returns a refusal signal",
+        detail: `HTTP ${failure.status} · refusal · ${refusalEvent.delta.stop_details.category}`,
         kind: "signal"
       },
       {
@@ -148,8 +154,8 @@ function buildScenario(vector, failure, rule, hashes) {
       },
       {
         id: "trace",
-        label: "The trace explains the request fallback",
-        detail: "The next request starts on Fable 5 again",
+        label: "The trace explains the session fallback",
+        detail: "Later requests in this session stay on Sol for 24 hours",
         kind: "success"
       }
     ],

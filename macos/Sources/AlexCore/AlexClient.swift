@@ -738,6 +738,13 @@ public struct AlexClient: Sendable {
         return try JSONDecoder().decode(MiddlewareTestResponse.self, from: data)
     }
 
+    public func middlewareActivity(limit: Int = 8) async throws -> [MiddlewareActivityEvent] {
+        try await get(
+            "admin/middleware/activity",
+            query: [URLQueryItem(name: "limit", value: "\(limit)")],
+            as: MiddlewareActivityResponse.self).events
+    }
+
     public func middlewareLeases() async throws -> [MiddlewareRouteLease] {
         // During beta the status response carries leases as well. Keeping the
         // dedicated endpoint makes refresh/clear operations cheap later.

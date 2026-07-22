@@ -572,17 +572,24 @@ pub fn generate_fable_sol_fixture(
     {
         bail!("Fable→Sol middleware vector does not describe the expected route");
     }
-    let failure_body: Value = serde_json::from_str(
-        failure["body"]
-            .as_str()
-            .context("failure fixture body is not a JSON string")?,
-    )?;
+    let failure_body_text = failure["body"]
+        .as_str()
+        .context("failure fixture body is not a string")?;
+    let structured_refusal = failure_body_text.lines().any(|line| {
+        line.strip_prefix("data:")
+            .and_then(|data| serde_json::from_str::<Value>(data.trim()).ok())
+            .is_some_and(|event| {
+                event["type"] == "message_delta" && event["delta"]["stop_reason"] == "refusal"
+            })
+    });
     if failure["provider"] != "anthropic"
-        || failure["status"] != 529
-        || failure_body["error"]["type"] != failure["error_kind"]
+        || failure["status"] != 200
+        || failure["error_kind"] != "upstream_refusal"
+        || !structured_refusal
     {
-        bail!("Fable failure fixture metadata and body disagree");
+        bail!("Fable refusal fixture metadata and SSE body disagree");
     }
+    let failure_body = Value::String(failure_body_text.to_string());
 
     let temporary = output.with_file_name(format!(
         ".{}.source.{}.lar",
@@ -965,7 +972,7 @@ mod tests {
         let report = generate_fable_sol_fixture(
             &workspace.join("crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json"),
             &workspace.join(
-                "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json",
+                "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json",
             ),
             &output,
         )

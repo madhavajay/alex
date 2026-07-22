@@ -883,6 +883,28 @@ import Testing
         #expect(result.valid)
     }
 
+    @Test func middlewareActivityReadsRealTraceEvents() async throws {
+        HarnessEndpointURLProtocol.handler = { request in
+            #expect(request.url?.path == "/admin/middleware/activity")
+            let components = try #require(
+                URLComponents(url: request.url!, resolvingAgainstBaseURL: false))
+            #expect(components.queryItems?.first { $0.name == "limit" }?.value == "6")
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"events":[{"id":"trace-1","attempts":[]}]}"#.utf8))
+        }
+        defer { HarnessEndpointURLProtocol.handler = nil }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [HarnessEndpointURLProtocol.self]
+        let client = AlexClient(
+            config: DaemonConfig(host: "127.0.0.1", port: 4100, localKey: "local-test-key"),
+            session: URLSession(configuration: cfg))
+
+        let events = try await client.middlewareActivity(limit: 6)
+        #expect(events.map(\.id) == ["trace-1"])
+    }
+
     @Test func middlewareDryRunUsesCanonicalIdentifierFields() async throws {
         HarnessEndpointURLProtocol.handler = { request in
             #expect(request.url?.path == "/admin/middleware/test")

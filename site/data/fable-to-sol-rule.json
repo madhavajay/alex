@@ -1,27 +1,30 @@
 {
   "id": "alex.fable-5-to-gpt-5.6-sol",
   "name": "Fable 5 → GPT-5.6 Sol",
-  "description": "On Anthropic HTTP 529 overloaded_error, retry with high-effort GPT-5.6 Sol.",
+  "description": "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
   "enabled": true,
   "priority": 100,
   "hook": "attempt_result",
-  "capabilities": ["attempt.read_error_body", "route.override"],
+  "capabilities": ["route.override", "session.pin"],
   "when": {
     "models": ["claude-fable-5"],
     "providers": ["anthropic"],
-    "status": [529],
-    "error_classes": ["capacity"],
-    "body_contains_any": ["overloaded_error"]
+    "error_kinds": ["upstream_refusal"],
+    "stable_session": true
   },
   "then": {
     "reroute": {
       "model": "gpt-5.6-sol",
       "providers": ["openai"],
       "provider_mode": "only",
-      "scope": "request",
+      "scope": "session",
+      "ttl_seconds": 86400,
       "effort": "high",
-      "reason": "Fable 5 returned Anthropic's overloaded_error; retrying with GPT-5.6 Sol",
-      "max_attempts": 3
+      "reason": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+      "max_attempts": 3,
+      "required_capabilities": {
+        "portable_history": true
+      }
     }
   }
 }

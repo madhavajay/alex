@@ -85,7 +85,7 @@ Anthropic Fable failure and OpenAI Sol reroute decision remain replayable:
 
     cargo run --release --locked -p alex-lar-scale -- fixture-fable-sol \
       --vector crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json \
-      --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json \
+      --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json \
       --output /tmp/fable-to-sol.lar \
       --report /tmp/fable-to-sol.json
 

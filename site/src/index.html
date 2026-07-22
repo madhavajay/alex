@@ -76,11 +76,11 @@
         </div>
       </article>
 
-      <article class="demo-card" data-demo="fable-to-sol-overload">
+      <article class="demo-card" data-demo="fable-to-sol-refusal">
         <div class="demo-head">
           <div>
-            <div class="eyebrow">Deterministic fixture · no live prompts</div>
-            <h2 id="demo-title">Fable 5 is full. The session keeps moving.</h2>
+            <div class="eyebrow">Sanitized refusal fixture · no live prompts</div>
+            <h2 id="demo-title">Fable 5 refuses. The session keeps moving.</h2>
             <p>Play the whole route, pause it, or inspect one decision at a time.</p>
           </div>
           <div class="demo-controls" aria-label="Walkthrough controls">
@@ -99,11 +99,11 @@
             <h3>Trace proof</h3>
             <div class="trace-row"><span>Harness</span><strong>Claude</strong></div>
             <div class="trace-row"><span>Requested</span><strong>claude-fable-5</strong></div>
-            <div class="trace-row"><span>Attempt 1</span><strong class="status-fail">Anthropic · 529</strong></div>
+            <div class="trace-row"><span>Attempt 1</span><strong class="status-fail">Anthropic · refusal</strong></div>
             <div class="trace-row"><span>Decision</span><strong>middleware reroute</strong></div>
             <div class="trace-row"><span>Attempt 2</span><strong class="status-good">OpenAI · 200</strong></div>
-            <div class="trace-row"><span>Fallback scope</span><strong>This request</strong></div>
-            <p class="privacy-note"><strong>This is synthetic.</strong> The animation is built from a repository test fixture, not visitor activity.</p>
+            <div class="trace-row"><span>Fallback scope</span><strong>Session · 24 hours</strong></div>
+            <p class="privacy-note"><strong>This is sanitized.</strong> The envelope mirrors observed Anthropic refusals but contains no fallback token or visitor activity.</p>
           </aside>
         </div>
         <p class="sr-only" role="status" aria-live="polite" data-demo-status>Demo ready. Play it or move one step at a time.</p>
@@ -113,7 +113,7 @@
           <pre><code><!-- BUILD:RULE_SOURCE --></code></pre>
         </details>
         <div class="demo-next">
-          <span>Edit the built-in fallback and replay its fixture.</span>
+          <span>Edit the fallback, run your harness, and inspect its real trace match.</span>
           <a class="button primary" data-demo-action="middleware_docs" data-campaign-link href="https://github.com/madhavajay/alex/blob/main/docs/providers-and-routing.md#fable--sol-preset-contract">Open middleware docs</a>
         </div>
       </article>

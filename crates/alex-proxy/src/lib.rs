@@ -1927,6 +1927,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin_middleware_rule_replace).delete(admin_middleware_rule_delete),
         )
         .route("/admin/middleware/test", post(admin_middleware_test))
+        .route("/admin/middleware/activity", get(admin_middleware_activity))
         .route("/admin/middleware/leases", get(admin_middleware_leases))
         .route(
             "/admin/middleware/leases/{id}",
@@ -4957,15 +4958,14 @@ fn starter_fixtures(root: &std::path::Path) -> Result<(), String> {
             "rate_limit_error",
             r#"{"type":"error","error":{"type":"rate_limit_error","message":"Overloaded"}}"#,
         ),
-        // Sanitized design vector for the first middleware vertical slice.
-        // A real captured Fable failure can replace the wording later without
-        // changing the rule, coordinator, or fixture-injection contract.
+        // Sanitized from observed Anthropic Fable refusal streams. The opaque
+        // fallback credit token is deliberately excluded.
         (
-            "anthropic-fable-unavailable-529",
+            "anthropic-fable-refusal-200",
             "anthropic",
-            529,
-            "overloaded_error",
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"Fable subscription is unavailable; please retry shortly"}}"#,
+            200,
+            alex_middleware::FABLE_REFUSAL_KIND,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-fable-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"bio\",\"explanation\":null,\"fallback_credit_token\":null,\"fallback_has_prefill_claim\":true}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ),
         (
             "anthropic-fable-nonmatching-500",
@@ -7198,6 +7198,89 @@ async fn admin_middleware(State(state): State<Arc<AppState>>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "middleware runtime unavailable",
         ),
+    }
+}
+
+fn middleware_activity_attempts(row: &Value) -> Vec<Value> {
+    if let Some(attempts) = row["attempts"].as_array() {
+        return attempts.clone();
+    }
+    row["attempts"]
+        .as_str()
+        .and_then(|attempts| serde_json::from_str::<Vec<Value>>(attempts).ok())
+        .unwrap_or_default()
+}
+
+fn middleware_activity_event(row: Value) -> Option<Value> {
+    let attempts = middleware_activity_attempts(&row);
+    let has_middleware_decision = attempts.iter().any(|attempt| {
+        attempt["middleware_decisions"]
+            .as_array()
+            .is_some_and(|records| !records.is_empty())
+    });
+    let includes_fable = attempts.iter().any(|attempt| {
+        attempt["model"]
+            .as_str()
+            .is_some_and(|model| canonical_model_alias(model) == "claude-fable-5")
+    }) || row["requested_model"]
+        .as_str()
+        .is_some_and(|model| canonical_model_alias(model) == "claude-fable-5");
+    if !has_middleware_decision && !includes_fable {
+        return None;
+    }
+
+    let attempts = attempts
+        .into_iter()
+        .map(|attempt| {
+            json!({
+                "provider": attempt["provider"],
+                "model": attempt["model"],
+                "status": attempt["status"],
+                "error_kind": attempt["error"]["kind"],
+                "error_code": attempt["error"]["code"],
+                "middleware_decisions": attempt["middleware_decisions"],
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "id": row["id"],
+        "ts_ms": row["ts_request_ms"],
+        "session_id": row["session_id"],
+        "harness": row["harness"],
+        "requested_model": row["requested_model"],
+        "routed_model": row["routed_model"],
+        "served_model": row["served_model"],
+        "status": row["status"],
+        "substituted": row["substituted"],
+        "substitution_reason": row["substitution_reason"],
+        "attempts": attempts,
+    }))
+}
+
+async fn admin_middleware_activity(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 25);
+    let filter = TraceFilter {
+        since_ms: Some(now_ms() - 24 * 60 * 60 * 1000),
+        limit: 100,
+        ..Default::default()
+    };
+    match state.store.search_traces(&filter) {
+        Ok(rows) => {
+            let events = rows
+                .into_iter()
+                .filter_map(middleware_activity_event)
+                .take(limit)
+                .collect::<Vec<_>>();
+            axum::Json(json!({"events": events})).into_response()
+        }
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -12935,6 +13018,46 @@ async fn proxy(
                 }
             };
 
+            // Anthropic reports model safeguards as a successful SSE stream
+            // whose terminal message_delta has stop_reason=refusal. Hold only
+            // the undecided Fable prefix so Alex can reroute before committing
+            // bytes to the harness. Normal text/tool responses resume streaming
+            // immediately after their first user-visible event.
+            let should_inspect_refusal = resp.status().is_success()
+                && current_provider == Provider::Anthropic
+                && canonical_model_alias(&current_model) == "claude-fable-5"
+                && !substitution_disabled
+                && state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.fable_refusal_interception_enabled())
+                    .unwrap_or(false);
+            let mut successful_refusal = None;
+            if should_inspect_refusal {
+                let limit = state
+                    .middleware
+                    .read()
+                    .map(|runtime| runtime.settings.error_body_limit_bytes)
+                    .unwrap_or(64 * 1024);
+                match inspect_anthropic_refusal_prefix(resp, limit).await {
+                    Ok((rebuilt, inspection)) => {
+                        resp = rebuilt;
+                        if inspection.refusal.is_some() {
+                            successful_refusal = Some(inspection);
+                        }
+                    }
+                    Err(msg) => {
+                        suspect_dario(&state, &account);
+                        trace.status = Some(502);
+                        trace.error = Some(msg.clone());
+                        trace.error_kind = Some("upstream_unreachable".into());
+                        trace.error_class = Some(ErrorClass::Network.as_str().into());
+                        finalize_trace(&state, trace, &body, Some(&plan.body), None);
+                        return error_response(StatusCode::BAD_GATEWAY, &msg);
+                    }
+                }
+            }
+
             if account.kind == "oauth" {
                 if let Some(snapshot) =
                     routing_limits_from_headers(account.provider, resp.headers())
@@ -12972,7 +13095,9 @@ async fn proxy(
             }
 
             let status = resp.status().as_u16();
-            if !resp.status().is_success() && account.kind != "dario" {
+            if (!resp.status().is_success() || successful_refusal.is_some())
+                && account.kind != "dario"
+            {
                 let protection = state
                     .protection
                     .read()
@@ -13032,10 +13157,23 @@ async fn proxy(
                     .get("content-type")
                     .and_then(|value| value.to_str().ok())
                     .map(String::from);
-                let empty_body = alex_middleware::BodyView {
-                    content_type: content_type.clone(),
-                    ..Default::default()
-                };
+                let inspected_refusal_body =
+                    successful_refusal
+                        .as_ref()
+                        .map(|inspection| alex_middleware::BodyView {
+                            content_type: content_type.clone(),
+                            size_bytes: (!inspection.truncated)
+                                .then_some(inspection.prefix.len() as u64),
+                            text: Some(String::from_utf8_lossy(&inspection.prefix).into_owned()),
+                            json: None,
+                            truncated: inspection.truncated,
+                            inspected_bytes: inspection.prefix.len(),
+                        });
+                let initial_body =
+                    inspected_refusal_body.unwrap_or_else(|| alex_middleware::BodyView {
+                        content_type: content_type.clone(),
+                        ..Default::default()
+                    });
                 let mut context = middleware_attempt_context(
                     &state,
                     format,
@@ -13051,7 +13189,7 @@ async fn proxy(
                     same_route_accounts_remaining,
                     status,
                     resp.headers(),
-                    empty_body,
+                    initial_body,
                 );
                 let (inspection, body_limit) = state
                     .middleware
@@ -13063,7 +13201,7 @@ async fn proxy(
                         )
                     })
                     .unwrap_or_default();
-                if inspection.needs_body {
+                if inspection.needs_body && successful_refusal.is_none() {
                     match inspect_response_prefix(resp, body_limit).await {
                         Ok((rebuilt, prefix, truncated)) => {
                             resp = rebuilt;
@@ -14048,10 +14186,70 @@ fn json_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
-/// Reads the native provider error envelope without translating it.  `format`
-/// is the upstream wire format, including the two OpenAI variants.
+fn anthropic_refusal_from_value(value: &Value) -> Option<ParsedError> {
+    let delta = if value["type"] == "message_delta" {
+        &value["delta"]
+    } else {
+        value
+    };
+    (delta["stop_reason"] == "refusal").then(|| {
+        let details = &delta["stop_details"];
+        ParsedError {
+            kind: Some(alex_middleware::FABLE_REFUSAL_KIND.into()),
+            code: json_string(&details["category"]),
+            message: json_string(&details["explanation"]),
+        }
+    })
+}
+
+fn anthropic_event_commits_response(value: &Value) -> bool {
+    match value["type"].as_str() {
+        Some("content_block_start") => {
+            let block = &value["content_block"];
+            match block["type"].as_str() {
+                Some("tool_use" | "server_tool_use") => true,
+                Some("text") => block["text"].as_str().is_some_and(|text| !text.is_empty()),
+                _ => false,
+            }
+        }
+        Some("content_block_delta") => {
+            let delta = &value["delta"];
+            match delta["type"].as_str() {
+                Some("text_delta") => delta["text"].as_str().is_some_and(|text| !text.is_empty()),
+                Some("input_json_delta") => delta["partial_json"]
+                    .as_str()
+                    .is_some_and(|json| !json.is_empty()),
+                _ => false,
+            }
+        }
+        Some("message_delta") => value["delta"]["stop_reason"]
+            .as_str()
+            .is_some_and(|reason| reason != "refusal"),
+        _ => false,
+    }
+}
+
+fn parse_anthropic_sse_refusal(body: &[u8]) -> Option<ParsedError> {
+    let mut observer = SseErrorObserver::new("anthropic");
+    observer.observe(body);
+    observer.finish();
+    observer.anthropic_refusal()
+}
+
+/// Reads a native provider error or Anthropic's structured SSE refusal without
+/// translating it. `format` is the upstream wire format.
 fn parse_upstream_error(format: &str, _status: u16, body: &[u8]) -> Option<ParsedError> {
+    if format == "anthropic" {
+        if let Some(refusal) = parse_anthropic_sse_refusal(body) {
+            return Some(refusal);
+        }
+    }
     let value: Value = serde_json::from_slice(body).ok()?;
+    if format == "anthropic" {
+        if let Some(refusal) = anthropic_refusal_from_value(&value) {
+            return Some(refusal);
+        }
+    }
     let error = match format {
         "anthropic" => value.get("error")?,
         "openai-chat" | "openai-responses" => value.get("error")?,
@@ -14068,6 +14266,79 @@ fn parse_upstream_error(format: &str, _status: u16, body: &[u8]) -> Option<Parse
         code: json_string(&error["code"]),
         message: json_string(&error["message"]),
     })
+}
+
+#[derive(Debug)]
+struct AnthropicRefusalInspection {
+    refusal: Option<ParsedError>,
+    prefix: Vec<u8>,
+    truncated: bool,
+}
+
+/// Hold only the undecided prefix of an Anthropic stream. A structured refusal
+/// is intercepted before any bytes reach the harness. As soon as text or a
+/// tool call proves this is a normal response, every held chunk is replayed and
+/// streaming continues unchanged. CPU work is bounded and routine SSE events
+/// are rejected by cheap marker checks before JSON parsing.
+async fn inspect_anthropic_refusal_prefix(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(reqwest::Response, AnthropicRefusalInspection), String> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let mut stream = response.bytes_stream();
+    let mut replay_chunks = Vec::<Bytes>::new();
+    let mut prefix = Vec::with_capacity(limit.min(64 * 1024));
+    let mut observer = SseErrorObserver::new("anthropic");
+    let mut ended = false;
+
+    while prefix.len() < limit {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = limit - prefix.len();
+                let observed = &chunk[..chunk.len().min(remaining)];
+                prefix.extend_from_slice(observed);
+                observer.observe(observed);
+                replay_chunks.push(chunk);
+                if observer.anthropic_refusal().is_some()
+                    || observer.response_committed()
+                    || observer.upstream_error().is_some()
+                {
+                    break;
+                }
+            }
+            Some(Err(error)) => {
+                return Err(format!(
+                    "upstream body read failed during refusal inspection: {error}"
+                ));
+            }
+            None => {
+                ended = true;
+                observer.finish();
+                break;
+            }
+        }
+    }
+
+    let refusal = observer.anthropic_refusal();
+    let replay =
+        futures_util::stream::iter(replay_chunks.into_iter().map(Ok::<Bytes, reqwest::Error>))
+            .chain(stream);
+    let mut rebuilt = axum::http::Response::builder()
+        .status(status)
+        .version(version)
+        .body(reqwest::Body::wrap_stream(replay))
+        .map_err(|error| format!("could not rebuild refusal-inspected response: {error}"))?;
+    *rebuilt.headers_mut() = headers;
+    Ok((
+        reqwest::Response::from(rebuilt),
+        AnthropicRefusalInspection {
+            refusal,
+            prefix,
+            truncated: !ended,
+        },
+    ))
 }
 
 /// Inspect a bounded response prefix without making a no-match response
@@ -14222,6 +14493,8 @@ struct SseErrorObserver {
     event_name: Option<String>,
     event_data: Vec<String>,
     error: Option<UpstreamSseError>,
+    anthropic_refusal: Option<ParsedError>,
+    response_committed: bool,
 }
 
 impl SseErrorObserver {
@@ -14232,6 +14505,8 @@ impl SseErrorObserver {
             event_name: None,
             event_data: Vec::new(),
             error: None,
+            anthropic_refusal: None,
+            response_committed: false,
         }
     }
 
@@ -14264,6 +14539,14 @@ impl SseErrorObserver {
         self.error.clone()
     }
 
+    fn anthropic_refusal(&self) -> Option<ParsedError> {
+        self.anthropic_refusal.clone()
+    }
+
+    fn response_committed(&self) -> bool {
+        self.response_committed
+    }
+
     #[cfg(test)]
     fn error(&self) -> Option<String> {
         self.error.as_ref().map(UpstreamSseError::trace_message)
@@ -14289,11 +14572,24 @@ impl SseErrorObserver {
     }
 
     fn finish_event(&mut self) {
-        if self.error.is_none() && !self.event_data.is_empty() && self.event_may_be_an_error() {
+        if !self.event_data.is_empty()
+            && (self.event_may_be_an_error() || self.event_may_decide_anthropic_refusal())
+        {
             let data = self.event_data.join("\n");
             if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                self.error =
-                    upstream_sse_error(self.upstream_format, self.event_name.as_deref(), &value);
+                if self.error.is_none() {
+                    self.error = upstream_sse_error(
+                        self.upstream_format,
+                        self.event_name.as_deref(),
+                        &value,
+                    );
+                }
+                if self.upstream_format == "anthropic" {
+                    if self.anthropic_refusal.is_none() {
+                        self.anthropic_refusal = anthropic_refusal_from_value(&value);
+                    }
+                    self.response_committed |= anthropic_event_commits_response(&value);
+                }
             }
         }
         self.event_name = None;
@@ -14312,6 +14608,20 @@ impl SseErrorObserver {
             .event_data
             .iter()
             .any(|line| line.contains("error") || line.contains("failed"))
+    }
+
+    /// Parse only Anthropic events that can either prove a refusal or prove
+    /// that user-visible output has started. This avoids JSON-decoding routine
+    /// thinking/signature traffic while preserving structured matching.
+    fn event_may_decide_anthropic_refusal(&self) -> bool {
+        self.upstream_format == "anthropic"
+            && self.event_data.iter().any(|line| {
+                line.contains("refusal")
+                    || line.contains("text_delta")
+                    || line.contains("input_json_delta")
+                    || line.contains("tool_use")
+                    || line.contains("stop_reason")
+            })
     }
 }
 
@@ -16102,6 +16412,43 @@ mod tests {
     }
 
     #[test]
+    fn middleware_activity_projects_real_attempt_decisions_without_bodies() {
+        let event = middleware_activity_event(json!({
+            "id": "trace-activity",
+            "ts_request_ms": 123,
+            "session_id": "session-activity",
+            "harness": "pi",
+            "requested_model": "alex/claude-fable-5",
+            "routed_model": "gpt-5.6-sol",
+            "served_model": "gpt-5.6-sol",
+            "status": 200,
+            "substituted": true,
+            "substitution_reason": "refusal fallback",
+            "attempts": [{
+                "provider": "anthropic",
+                "model": "claude-fable-5",
+                "status": 200,
+                "error": {"kind": "upstream_refusal", "code": "bio"},
+                "middleware_decisions": [{
+                    "rule_id": alex_middleware::FABLE_TO_SOL_ID,
+                    "rule_name": "Fable 5 → GPT-5.6 Sol",
+                    "state": "matched",
+                    "action": "reroute",
+                    "executed": true
+                }]
+            }]
+        }))
+        .expect("activity event");
+        assert_eq!(event["attempts"][0]["error_kind"], "upstream_refusal");
+        assert_eq!(event["attempts"][0]["error_code"], "bio");
+        assert_eq!(
+            event["attempts"][0]["middleware_decisions"][0]["rule_id"],
+            alex_middleware::FABLE_TO_SOL_ID
+        );
+        assert!(event.get("req_body_path").is_none());
+    }
+
+    #[test]
     fn fable_acceptance_contract_has_three_simple_cases_and_reuses_site_vector() {
         let contract = fable_acceptance_contract();
         let cases = contract["cases"].as_array().unwrap();
@@ -16114,9 +16461,9 @@ mod tests {
                 .map(|case| case["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "fable-failure-reroutes-request",
-                "next-request-returns-to-fable",
-                "unavailable-fallback-account-returns-original",
+                "fable-refusal-reroutes-session",
+                "next-request-uses-session-route",
+                "unavailable-fallback-account-returns-refusal",
             ]
         );
 
@@ -16124,15 +16471,15 @@ mod tests {
             "../tests/fixtures/middleware/fable-to-sol-vector.json"
         ))
         .unwrap();
-        let overload = fable_acceptance_case(&contract, "fable-failure-reroutes-request");
+        let refusal = fable_acceptance_case(&contract, "fable-refusal-reroutes-session");
         assert_eq!(contract["shared_site_scenario"], "fable-to-sol-vector.json");
-        assert_eq!(overload["failure_fixture"], site_vector["failure_fixture"]);
+        assert_eq!(refusal["failure_fixture"], site_vector["failure_fixture"]);
         assert_eq!(
-            overload["expected"]["provider"],
+            refusal["expected"]["provider"],
             site_vector["expected_attempts"][1]["provider"]
         );
         assert_eq!(
-            overload["expected"]["model"],
+            refusal["expected"]["model"],
             site_vector["expected_attempts"][1]["model"]
         );
     }
@@ -21371,12 +21718,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fable_fixture_reroutes_to_sol_for_one_request_then_returns_to_fable() {
+    async fn fable_refusal_reroutes_to_sol_and_pins_the_session() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let acceptance = fable_acceptance_contract();
-        let fallback_case = fable_acceptance_case(&acceptance, "fable-failure-reroutes-request");
-        let next_case = fable_acceptance_case(&acceptance, "next-request-returns-to-fable");
+        let fallback_case = fable_acceptance_case(&acceptance, "fable-refusal-reroutes-session");
+        let next_case = fable_acceptance_case(&acceptance, "next-request-uses-session-route");
 
         let anthropic_requests = Arc::new(AtomicUsize::new(0));
         let openai_requests = Arc::new(AtomicUsize::new(0));
@@ -21394,7 +21741,7 @@ mod tests {
                             "type": "message",
                             "role": "assistant",
                             "model": "claude-fable-5",
-                            "content": [{"type": "text", "text": "Fable handled the next request"}],
+                            "content": [{"type": "text", "text": "Fable should not handle a leased request"}],
                             "stop_reason": "end_turn",
                             "usage": {"input_tokens": 3, "output_tokens": 2}
                         }))
@@ -21418,7 +21765,7 @@ mod tests {
                                 "id": "msg_sol_middleware",
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "output_text", "text": "Sol handled the failed request", "annotations": []}]
+                                "content": [{"type": "output_text", "text": "Sol handled the session request", "annotations": []}]
                             }],
                             "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9}
                         }))
@@ -21431,7 +21778,7 @@ mod tests {
             axum::serve(listener, upstream).await.unwrap();
         });
 
-        let state = test_state("middleware-fable-sol-request");
+        let state = test_state("middleware-fable-sol-session");
         state
             .vault
             .upsert(test_api_account("anthropic-fable", Provider::Anthropic))
@@ -21449,7 +21796,7 @@ mod tests {
         let injected = admin_session_inject(
             State(state.clone()),
             Path("session-fable-sol".into()),
-            axum::Json(json!({"fixture": "anthropic-fable-unavailable-529"})),
+            axum::Json(json!({"fixture": "anthropic-fable-refusal-200"})),
         )
         .await;
         assert_eq!(injected.status(), StatusCode::CREATED);
@@ -21457,6 +21804,7 @@ mod tests {
         let request = || {
             let mut headers = HeaderMap::new();
             headers.insert("x-api-key", HeaderValue::from_static("alx-local"));
+            headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
             headers.insert(
                 "x-session-id",
                 HeaderValue::from_static("session-fable-sol"),
@@ -21477,11 +21825,19 @@ mod tests {
         assert_eq!(first_status, StatusCode::OK, "{first}");
         assert_eq!(
             first["content"][0]["text"],
-            "Sol handled the failed request"
+            "Sol handled the session request"
         );
         assert_eq!(openai_requests.load(Ordering::SeqCst), 1);
         assert_eq!(anthropic_requests.load(Ordering::SeqCst), 0);
-        assert!(middleware_leases_snapshot(&state).is_empty());
+        let leases = middleware_leases_snapshot(&state);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].session_id, "session-fable-sol");
+        assert_eq!(leases[0].original_model, "claude-fable-5");
+        assert_eq!(
+            leases[0].source_middleware_id,
+            alex_middleware::FABLE_TO_SOL_ID
+        );
+        assert!(leases[0].expires_ms - leases[0].created_ms >= 86_399_000);
 
         let traces = state.store.search_traces(&TraceFilter::default()).unwrap();
         let first_trace = traces
@@ -21490,7 +21846,8 @@ mod tests {
             .expect("injected trace");
         let attempts = first_trace["attempts"].as_array().expect("attempt records");
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0]["status"], 529);
+        assert_eq!(attempts[0]["status"], 200);
+        assert_eq!(attempts[0]["error"]["kind"], "upstream_refusal");
         assert_eq!(
             attempts[1]["provider"],
             fallback_case["expected"]["provider"]
@@ -21513,12 +21870,12 @@ mod tests {
         assert_eq!(second_status, StatusCode::OK, "{second}");
         assert_eq!(
             second["content"][0]["text"],
-            "Fable handled the next request"
+            "Sol handled the session request"
         );
-        assert_eq!(openai_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(anthropic_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(next_case["expected"]["provider"], "anthropic");
-        assert!(middleware_leases_snapshot(&state).is_empty());
+        assert_eq!(openai_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(anthropic_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(next_case["expected"]["provider"], "openai");
+        assert_eq!(middleware_leases_snapshot(&state).len(), 1);
         server.abort();
     }
 
@@ -21526,7 +21883,7 @@ mod tests {
     async fn fable_match_without_sol_account_returns_original_with_trace_explanation() {
         let acceptance = fable_acceptance_contract();
         let case =
-            fable_acceptance_case(&acceptance, "unavailable-fallback-account-returns-original");
+            fable_acceptance_case(&acceptance, "unavailable-fallback-account-returns-refusal");
         let state = test_state("middleware-fable-no-sol-account");
         state
             .vault
@@ -21551,25 +21908,25 @@ mod tests {
             HeaderValue::from_static("session-fable-no-sol"),
         );
         headers.insert("x-alex-harness", HeaderValue::from_static("claude"));
-        let (status, body) = response_json(
-            proxy(
-                state.clone(),
-                ClientFormat::AnthropicMessages,
-                "/v1/messages",
-                headers,
-                Bytes::from_static(
-                    br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"test unavailable fallback"}]}"#,
-                ),
-                None,
-            )
-            .await,
+        let response = proxy(
+            state.clone(),
+            ClientFormat::AnthropicMessages,
+            "/v1/messages",
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-fable-5","stream":false,"max_tokens":128,"messages":[{"role":"user","content":"test unavailable fallback"}]}"#,
+            ),
+            None,
         )
         .await;
         assert_eq!(
-            status.as_u16(),
+            response.status().as_u16(),
             case["expected"]["status"].as_u64().unwrap() as u16
         );
-        assert_eq!(body["error"]["type"], "overloaded_error");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"stop_reason\":\"refusal\""));
         assert!(middleware_leases_snapshot(&state).is_empty());
 
         let trace = state
@@ -21671,6 +22028,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_refusal_inspection_is_structured_bounded_and_lossless() {
+        let refusal = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"blocked\"}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let chunks = refusal
+            .chunks(17)
+            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let response = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .map(reqwest::Response::from)
+            .unwrap();
+        let (rebuilt, inspection) = inspect_anthropic_refusal_prefix(response, 64 * 1024)
+            .await
+            .unwrap();
+        let parsed = inspection.refusal.expect("structured refusal");
+        assert_eq!(parsed.kind.as_deref(), Some("upstream_refusal"));
+        assert_eq!(parsed.code.as_deref(), Some("cyber"));
+        assert_eq!(parsed.message.as_deref(), Some("blocked"));
+        assert_eq!(rebuilt.bytes().await.unwrap().as_ref(), refusal);
+
+        // Quoted refusal text is ordinary output, proving this is not grep-based.
+        let normal = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"example stop_reason refusal\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let response = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                normal
+                    .chunks(13)
+                    .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk))),
+            )))
+            .map(reqwest::Response::from)
+            .unwrap();
+        let (rebuilt, inspection) = inspect_anthropic_refusal_prefix(response, 64 * 1024)
+            .await
+            .unwrap();
+        assert!(inspection.refusal.is_none());
+        assert!(
+            inspection.truncated,
+            "normal stream was released before its end"
+        );
+        assert_eq!(rebuilt.bytes().await.unwrap().as_ref(), normal);
+    }
+
+    #[tokio::test]
     async fn middleware_admin_status_validate_crud_and_fixture_dry_run_round_trip() {
         let state = test_state("middleware-admin-round-trip");
         let fixture_root = tmpdir("middleware-admin-fixtures");
@@ -21698,7 +22101,7 @@ mod tests {
         .await;
         assert_eq!(validation_status, StatusCode::OK);
         assert_eq!(validation["valid"], true);
-        assert_eq!(validation["body_inspection_required"], true);
+        assert_eq!(validation["body_inspection_required"], false);
 
         let (created_status, created) = response_json(
             admin_middleware_rule_create(State(state.clone()), axum::Json(rule.clone())).await,
@@ -21750,7 +22153,7 @@ mod tests {
                 State(state.clone()),
                 axum::Json(MiddlewareTestRequest {
                     middleware_id: rule.id.clone(),
-                    fixture_name: Some("anthropic-fable-unavailable-529".into()),
+                    fixture_name: Some("anthropic-fable-refusal-200".into()),
                     trace_id: None,
                     context: None,
                 }),
@@ -21770,7 +22173,7 @@ mod tests {
         assert!(dry_record["explanation"]
             .as_str()
             .unwrap()
-            .contains("Fable 5 returned Anthropic's overloaded_error; retrying with GPT-5.6 Sol"));
+            .contains("Fable 5 refused the request; switching this session to GPT-5.6 Sol"));
         let (_, after_dry_run) = response_json(admin_middleware(State(state.clone())).await).await;
         assert!(after_dry_run["rules"]
             .as_array()

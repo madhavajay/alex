@@ -12,26 +12,27 @@ import Testing
         #expect(rule.enabled)
         #expect(rule.priority == 100)
         #expect(rule.hook == .attemptResult)
-        #expect(rule.capabilities == ["attempt.read_error_body", "route.override"])
+        #expect(rule.capabilities == ["route.override", "session.pin"])
         #expect(rule.expression == nil)
         #expect(rule.when.harnessNames == nil)
         #expect(rule.when.models == ["claude-fable-5"])
         #expect(rule.when.efforts == nil)
         #expect(rule.when.providers == ["anthropic"])
-        #expect(rule.when.status == [.exact(529)])
-        #expect(rule.when.errorClasses == ["capacity"])
-        #expect(rule.when.bodyContainsAny == ["overloaded_error"])
-        #expect(rule.when.stableSession == nil)
+        #expect(rule.when.status == nil)
+        #expect(rule.when.errorClasses == nil)
+        #expect(rule.when.errorKinds == ["upstream_refusal"])
+        #expect(rule.when.bodyContainsAny == nil)
+        #expect(rule.when.stableSession == true)
         #expect(rule.then.retrySameRoute == nil)
         #expect(rule.then.reroute?.model == "gpt-5.6-sol")
         #expect(rule.then.reroute?.providerMode == .only)
         #expect(rule.then.reroute?.providers == ["openai"])
-        #expect(rule.then.reroute?.scope == .request)
-        #expect(rule.then.reroute?.ttlSeconds == nil)
+        #expect(rule.then.reroute?.scope == .session)
+        #expect(rule.then.reroute?.ttlSeconds == 86_400)
         #expect(rule.then.reroute?.notice == nil)
         #expect(rule.then.reroute?.effort == "high")
         #expect(rule.then.reroute?.maxAttempts == 3)
-        #expect(rule.then.reroute?.requiredCapabilities.portableHistory == false)
+        #expect(rule.then.reroute?.requiredCapabilities.portableHistory == true)
     }
 
     @Test func fableRuleEncodesGuardrailAndReplacementEffort() throws {
@@ -46,13 +47,12 @@ import Testing
         #expect(json["api_version"] == nil)
         #expect(json["built_in"] == nil)
         #expect(match["harness_names"] == nil)
-        #expect(match["body_contains_any"] as? [String] == ["overloaded_error"])
+        #expect(match["body_contains_any"] == nil)
         #expect(match["models"] as? [String] == ["claude-fable-5"])
-        let statuses = try #require(match["status"] as? [Any])
-        #expect(statuses.count == 1)
-        #expect(statuses[0] as? Int == 529)
-        #expect(reroute["ttl_seconds"] == nil)
-        #expect(reroute["scope"] as? String == "request")
+        #expect(match["error_kinds"] as? [String] == ["upstream_refusal"])
+        #expect(match["status"] == nil)
+        #expect(reroute["ttl_seconds"] as? Int == 86_400)
+        #expect(reroute["scope"] as? String == "session")
         #expect(reroute["provider_mode"] as? String == "only")
         #expect(reroute["effort"] as? String == "high")
     }
@@ -65,6 +65,19 @@ import Testing
         #expect(response.matched)
         #expect(response.summary == "Fable fallback matched")
         #expect(response.proposedAction == "reroute")
+    }
+
+    @Test func middlewareActivityDecodesRealTraceMatches() throws {
+        let json = #"{"events":[{"id":"trace-1","ts_ms":123,"session_id":"session-1","harness":"pi","requested_model":"alex/claude-fable-5","routed_model":"gpt-5.6-sol","served_model":"gpt-5.6-sol","status":200,"substituted":true,"attempts":[{"provider":"anthropic","model":"claude-fable-5","status":200,"error_kind":"upstream_refusal","error_code":"bio","middleware_decisions":[{"rule_id":"alex.fable-5-to-gpt-5.6-sol","rule_name":"Fable 5 → GPT-5.6 Sol","state":"matched","action":"reroute","executed":true}]}]}]}"#
+        let response = try JSONDecoder().decode(
+            MiddlewareActivityResponse.self, from: Data(json.utf8))
+        let event = try #require(response.events.first)
+
+        #expect(event.harness == "pi")
+        #expect(event.finalModel == "gpt-5.6-sol")
+        #expect(event.attempts.first?.errorCode == "bio")
+        #expect(event.matchedDecisions.first?.ruleId == "alex.fable-5-to-gpt-5.6-sol")
+        #expect(event.matchedDecisions.first?.executed == true)
     }
 
     @Test func middlewareStatusDecodingUsesBetaSafeDefaults() throws {
@@ -112,7 +125,7 @@ import Testing
             Issue.record("Expected an any expression")
             return
         }
-        #expect(alternatives.count == 3)
+        #expect(alternatives.count == 1)
     }
 
     @Test func ruleRoundTripsDaemonStatusMetadata() throws {
@@ -164,10 +177,13 @@ import Testing
         #expect(draft.modelPattern == "claude-fable-5")
         #expect(draft.sourceProvider == "anthropic")
         #expect(draft.sourceEffort.isEmpty)
-        #expect(draft.bodyPhrases == ["overloaded_error"])
+        #expect(draft.errorKinds == [.refusal])
+        #expect(draft.bodyPhrases.isEmpty)
         #expect(draft.targetModel == "gpt-5.6-sol")
         #expect(draft.targetEffort == "high")
         #expect(draft.targetProviders == ["openai"])
+        #expect(draft.scope == .session)
+        #expect(draft.ttlSeconds == 86_400)
         #expect(draft.notice == MiddlewareWizardDraft.defaultNoticeTemplate)
     }
 

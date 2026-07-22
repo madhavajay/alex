@@ -136,6 +136,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
     public var providers: [String]?
     public var status: [MiddlewareStatusMatcher]?
     public var errorClasses: [String]?
+    public var errorKinds: [String]?
     public var bodyContainsAny: [String]?
     public var stableSession: Bool?
 
@@ -147,6 +148,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         providers: [String]? = nil,
         status: [MiddlewareStatusMatcher]? = nil,
         errorClasses: [String]? = nil,
+        errorKinds: [String]? = nil,
         bodyContainsAny: [String]? = nil,
         stableSession: Bool? = nil
     ) {
@@ -157,6 +159,7 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         self.providers = providers
         self.status = status
         self.errorClasses = errorClasses
+        self.errorKinds = errorKinds
         self.bodyContainsAny = bodyContainsAny
         self.stableSession = stableSession
     }
@@ -166,12 +169,13 @@ public struct MiddlewareMatchSpec: Codable, Sendable, Equatable {
         case harnessNames = "harness_names"
         case harnessVersions = "harness_versions"
         case errorClasses = "error_classes"
+        case errorKinds = "error_kinds"
         case bodyContainsAny = "body_contains_any"
         case stableSession = "stable_session"
     }
 
     public var isEmpty: Bool {
-        let lists = [harnessNames, models, efforts, providers, errorClasses, bodyContainsAny]
+        let lists = [harnessNames, models, efforts, providers, errorClasses, errorKinds, bodyContainsAny]
         return lists.allSatisfy { $0?.isEmpty != false }
             && status?.isEmpty != false
             && harnessVersions?.isEmpty != false
@@ -579,6 +583,102 @@ public struct MiddlewareLeasesResponse: Codable, Sendable, Equatable {
     }
 }
 
+public struct MiddlewareActivityResponse: Codable, Sendable, Equatable {
+    public var events: [MiddlewareActivityEvent]
+
+    public init(events: [MiddlewareActivityEvent] = []) {
+        self.events = events
+    }
+}
+
+public struct MiddlewareActivityEvent: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var tsMs: Int64?
+    public var sessionId: String?
+    public var harness: String?
+    public var requestedModel: String?
+    public var routedModel: String?
+    public var servedModel: String?
+    public var status: Int?
+    public var substituted: Bool
+    public var substitutionReason: String?
+    public var attempts: [MiddlewareActivityAttempt]
+
+    enum CodingKeys: String, CodingKey {
+        case id, harness, status, substituted, attempts
+        case tsMs = "ts_ms"
+        case sessionId = "session_id"
+        case requestedModel = "requested_model"
+        case routedModel = "routed_model"
+        case servedModel = "served_model"
+        case substitutionReason = "substitution_reason"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        tsMs = try values.decodeIfPresent(Int64.self, forKey: .tsMs)
+        sessionId = try values.decodeIfPresent(String.self, forKey: .sessionId)
+        harness = try values.decodeIfPresent(String.self, forKey: .harness)
+        requestedModel = try values.decodeIfPresent(String.self, forKey: .requestedModel)
+        routedModel = try values.decodeIfPresent(String.self, forKey: .routedModel)
+        servedModel = try values.decodeIfPresent(String.self, forKey: .servedModel)
+        status = try values.decodeIfPresent(Int.self, forKey: .status)
+        substituted = try values.decodeIfPresent(Bool.self, forKey: .substituted) ?? false
+        substitutionReason = try values.decodeIfPresent(String.self, forKey: .substitutionReason)
+        attempts = try values.decodeIfPresent([MiddlewareActivityAttempt].self, forKey: .attempts) ?? []
+    }
+
+    public var matchedDecisions: [MiddlewareActivityDecision] {
+        attempts.flatMap(\.middlewareDecisions).filter { $0.state == "matched" }
+    }
+
+    public var finalModel: String? { servedModel ?? routedModel }
+}
+
+public struct MiddlewareActivityAttempt: Codable, Sendable, Equatable {
+    public var provider: String?
+    public var model: String?
+    public var status: Int?
+    public var errorKind: String?
+    public var errorCode: String?
+    public var middlewareDecisions: [MiddlewareActivityDecision]
+
+    enum CodingKeys: String, CodingKey {
+        case provider, model, status
+        case errorKind = "error_kind"
+        case errorCode = "error_code"
+        case middlewareDecisions = "middleware_decisions"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try values.decodeIfPresent(String.self, forKey: .provider)
+        model = try values.decodeIfPresent(String.self, forKey: .model)
+        status = try values.decodeIfPresent(Int.self, forKey: .status)
+        errorKind = try values.decodeIfPresent(String.self, forKey: .errorKind)
+        errorCode = try values.decodeIfPresent(String.self, forKey: .errorCode)
+        middlewareDecisions = try values.decodeIfPresent(
+            [MiddlewareActivityDecision].self, forKey: .middlewareDecisions) ?? []
+    }
+}
+
+public struct MiddlewareActivityDecision: Codable, Sendable, Equatable {
+    public var ruleId: String
+    public var ruleName: String?
+    public var state: String
+    public var action: String?
+    public var explanation: String?
+    public var suppressed: Bool?
+    public var executed: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case state, action, explanation, suppressed, executed
+        case ruleId = "rule_id"
+        case ruleName = "rule_name"
+    }
+}
+
 public struct MiddlewareRuntimeStatus: Codable, Sendable, Equatable {
     public var settings: MiddlewareSettings
     public var generation: String?
@@ -794,6 +894,7 @@ public enum MiddlewareWizardErrorKind: String, Codable, Sendable, CaseIterable, 
     case badRequest = "Bad request"
     case server = "Provider / server"
     case network = "Network"
+    case refusal = "Model refusal"
 
     var errorClasses: [String] {
         switch self {
@@ -803,7 +904,12 @@ public enum MiddlewareWizardErrorKind: String, Codable, Sendable, CaseIterable, 
         case .badRequest: ["bad_request"]
         case .server: ["server"]
         case .network: ["network"]
+        case .refusal: []
         }
+    }
+
+    var normalizedErrorKinds: [String] {
+        self == .refusal ? ["upstream_refusal"] : []
     }
 }
 
@@ -861,7 +967,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
         equivalenceClass: String = "",
         providerMode: MiddlewareProviderMode = .only,
         targetProviders: [String] = [],
-        scope: MiddlewareRouteScope = .request,
+        scope: MiddlewareRouteScope = .session,
         stableSessionRequired: Bool = true,
         ttlSeconds: Int = 86_400,
         includeNotice: Bool = false,
@@ -897,20 +1003,20 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     public static var fableToSolExample: MiddlewareWizardDraft {
         .init(
             name: "Fable 5 → GPT-5.6 Sol",
-            description: "On Anthropic HTTP 529 overloaded_error, retry with high-effort GPT-5.6 Sol.",
+            description: "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
             modelPattern: "claude-fable-5",
             sourceProvider: "anthropic",
             hook: .attemptResult,
-            errorKinds: [.capacity],
-            statusText: "529",
-            bodyPhrasesText: "overloaded_error",
+            errorKinds: [.refusal],
+            statusText: "",
+            bodyPhrasesText: "",
             conditionMode: .all,
             action: .routeExact,
             targetModel: "gpt-5.6-sol",
             targetEffort: "high",
             providerMode: .only,
             targetProviders: ["openai"],
-            scope: .request,
+            scope: .session,
             includeNotice: false,
             notice: defaultNoticeTemplate,
             priority: 100)
@@ -922,7 +1028,11 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
     public init(rule: MiddlewareRuleSpecV1) {
         let reroute = rule.then.reroute
         let selectedErrors = Set(MiddlewareWizardErrorKind.allCases.filter { kind in
-            kind != .any && !Set(kind.errorClasses).isDisjoint(with: rule.when.errorClasses ?? [])
+            guard kind != .any else { return false }
+            if kind == .refusal {
+                return !Set(rule.when.errorKinds ?? []).isDisjoint(with: kind.normalizedErrorKinds)
+            }
+            return !Set(kind.errorClasses).isDisjoint(with: rule.when.errorClasses ?? [])
         })
         self.init(
             name: rule.name,
@@ -1002,6 +1112,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
 
         let normalizedID = id ?? Self.slug(trimmed(name))
         let errorClasses = errorKinds.flatMap(\.errorClasses).sorted()
+        let normalizedErrorKinds = errorKinds.flatMap(\.normalizedErrorKinds).sorted()
         let baseMatch = MiddlewareMatchSpec(
             harnessNames: nilIfEmpty(harnesses),
             harnessVersions: nilIfEmpty(commaSeparated(harnessVersion)),
@@ -1010,6 +1121,7 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             providers: nilIfEmpty(commaSeparated(sourceProvider)),
             status: conditionMode == .all ? nilIfEmpty(statusMatchers) : nil,
             errorClasses: conditionMode == .all ? nilIfEmpty(errorClasses) : nil,
+            errorKinds: conditionMode == .all ? nilIfEmpty(normalizedErrorKinds) : nil,
             bodyContainsAny: conditionMode == .all ? nilIfEmpty(bodyPhrases) : nil,
             stableSession: usesSessionScope ? stableSessionRequired : nil)
 
@@ -1021,6 +1133,9 @@ public struct MiddlewareWizardDraft: Sendable, Equatable {
             }
             if !errorClasses.isEmpty {
                 alternatives.append(.conditions(.init(errorClasses: errorClasses)))
+            }
+            if !normalizedErrorKinds.isEmpty {
+                alternatives.append(.conditions(.init(errorKinds: normalizedErrorKinds)))
             }
             if !bodyPhrases.isEmpty {
                 alternatives.append(.conditions(.init(bodyContainsAny: bodyPhrases)))

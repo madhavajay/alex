@@ -175,10 +175,23 @@ public enum OnboardingSupport {
     }
 
     public static func harnessInstallDescription(_ harness: String) -> String {
-        if harness.lowercased() == "amp" {
+        switch harness.lowercased() {
+        case "amp":
             return "Alex will install capture metadata and a scoped lifecycle credential for Amp. Amp keeps its native models and runs through `alex wrap amp`."
+        case "claude":
+            return "Alex creates a separate opt-in profile without changing normal Claude authentication. Launch it with `claude --settings ~/.claude/alex-settings.json` or `alex wrap claude`."
+        default:
+            return "Alex will add its local endpoint, scoped credential, and exposed model list to \(HarnessCatalog.displayName(harness))."
         }
-        return "Alex will add its local endpoint, scoped credential, and exposed model list to \(HarnessCatalog.displayName(harness))."
+    }
+
+    public static func launchCommand(harness: String) -> String? {
+        switch harness.lowercased() {
+        case "claude": "claude --settings ~/.claude/alex-settings.json"
+        case "amp": "alex wrap amp"
+        case "codex": "codex --profile alex"
+        default: nil
+        }
     }
 
     public static func testCommand(harness: String?, model: String) -> String {

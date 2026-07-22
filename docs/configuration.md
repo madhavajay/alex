@@ -152,14 +152,17 @@ that sidecar is loaded first; any provider also present in
 ## Middleware
 
 Middleware settings and editable rule overrides are stored in
-`~/.alex/middleware/rules.toml`. Alex ships one enabled rule for the documented
-Anthropic Fable overload signal: `claude-fable-5` HTTP `529`
-`overloaded_error` → OpenAI `gpt-5.6-sol` at high effort. Configure it in
-Settings → Middleware rather than editing `config.toml`.
+`~/.alex/middleware/rules.toml`. Configure it in Settings → Middleware rather
+than editing `config.toml`.
+
+Alex's shipped rule recognizes Anthropic's structured Fable refusal event
+(`message_delta.delta.stop_reason = refusal`) regardless of refusal category,
+then routes the stable session to OpenAI `gpt-5.6-sol` for 24 hours.
 
 The Middleware Wizard can optionally match the incoming effort/thinking level,
 set replacement effort, choose request or session scope, and add a templated
-harness notice.
+harness notice. New reroute rules default to a 24-hour session route so a
+recovered conversation does not immediately return to the failing model.
 
 ## Notifications
 

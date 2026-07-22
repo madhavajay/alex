@@ -7,7 +7,7 @@ import AlexCore
 struct MiddlewareWizard: View {
     let store: SnapshotStore
     @Binding var draft: MiddlewareWizardDraft
-    let editingRuleID: String?
+    @Binding var editingRuleID: String?
     let onSaved: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -720,7 +720,13 @@ struct MiddlewareWizard: View {
             saveError = "The rule could not be built or the daemon is unavailable."
             return
         }
-        let rule = validation?.canonicalRule ?? builtRule
+        var rule = validation?.canonicalRule ?? builtRule
+        if let editingRuleID {
+            // The sheet's edit identity is authoritative. Validation may
+            // canonicalize fields, but saving an edit must never create a new
+            // slugged rule beside the original.
+            rule.id = editingRuleID
+        }
         isSaving = true
         saveError = nil
         defer { isSaving = false }

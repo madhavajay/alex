@@ -7,6 +7,20 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+### Changed
+- The default Fable fallback now intercepts any structured Anthropic SSE
+  refusal, routes to high-effort GPT-5.6 Sol, and keeps the replacement route
+  for the stable session for 24 hours.
+- Middleware Settings now shows recent real trace matches and execution results
+  instead of presenting a synthetic Test button.
+
+### Fixed
+- Editing the built-in middleware rule now always updates its existing ID
+  rather than occasionally creating a second custom rule from a stale sheet
+  state.
+- Claude onboarding now shows the opt-in `--settings` launch command directly
+  after connection.
+
 ## [0.1.29-beta.11] - 2026-07-20
 
 ### Fixed

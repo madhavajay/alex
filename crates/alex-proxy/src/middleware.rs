@@ -242,6 +242,14 @@ impl MiddlewareRuntime {
             .and_then(|reroute| reroute.effort.clone())
     }
 
+    pub(crate) fn fable_refusal_interception_enabled(&self) -> bool {
+        self.settings.enabled
+            && self
+                .rules
+                .iter()
+                .any(|rule| rule.id == alex_middleware::FABLE_TO_SOL_ID && rule.enabled)
+    }
+
     pub(crate) fn validate_rule(&self, rule: RuleSpecV1) -> Vec<ValidationError> {
         let set = RuleSetV1 {
             api_version: API_VERSION_V1,
