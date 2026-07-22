@@ -119,6 +119,8 @@ enum Command {
     Ping {
         #[arg(default_value = "all")]
         target: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Run frozen CLI harnesses in Docker against this proxy and verify traces
     Harness {
@@ -3607,7 +3609,13 @@ async fn main() -> Result<()> {
                 eprintln!("generated dario_api_key and saved it to config.toml");
             }
             let has_active_anthropic_oauth = has_active_anthropic_oauth(&vault).await;
-            let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth);
+            let testing_anthropic_override = alex_core::resolve_endpoint_override(
+                "ALEX_UPSTREAM_ANTHROPIC_URL",
+                "https://api.anthropic.com",
+            )
+            .is_some();
+            let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth)
+                && !testing_anthropic_override;
             let dario_routing_reason = config.dario_routing_reason(has_active_anthropic_oauth);
             let dario_routing_mode = config.anthropic_upstream.clone();
             // Dario normally installs on demand when its supervisor creates a
@@ -3651,7 +3659,13 @@ async fn main() -> Result<()> {
                 claude_bin: resolve_dario_claude_bin(config.dario_claude_bin.as_deref()),
                 node_bin: dario::resolve_dario_node_bin(config.dario_node_path.as_deref()),
             };
-            let initial_start = dario::DarioSupervisor::start(settings.clone()).await;
+            let initial_start = if testing_anthropic_override {
+                Err(anyhow::anyhow!(
+                    "Dario disabled while a testing Anthropic upstream is active"
+                ))
+            } else {
+                dario::DarioSupervisor::start(settings.clone()).await
+            };
             let initial_error = initial_start.as_ref().err().map(ToString::to_string);
             let initial_supervisor = initial_start.ok();
             let glue = Arc::new(DarioGlue {
@@ -3664,7 +3678,7 @@ async fn main() -> Result<()> {
                 last_error: Arc::new(std::sync::Mutex::new(initial_error.clone())),
                 notification_state: Arc::new(std::sync::Mutex::new(None)),
             });
-            let (dario_router, supervisor) = match initial_supervisor {
+            let (mut dario_router, supervisor) = match initial_supervisor {
                 Some(sup) => {
                     eprintln!(
                         "dario: ready generation {} (routing {})",
@@ -3694,7 +3708,10 @@ async fn main() -> Result<()> {
                     (Some(glue.clone() as Arc<dyn alex_proxy::DarioRouter>), None)
                 }
             };
-            if supervisor.is_none() {
+            if testing_anthropic_override {
+                dario_router = None;
+            }
+            if supervisor.is_none() && !testing_anthropic_override {
                 glue.spawn_initial_retry();
             }
             let state = alex_proxy::build_state_with_substitution(
@@ -4639,7 +4656,7 @@ async fn main() -> Result<()> {
         } => {
             harness_connect::disconnect_cmd(&config, harness, config_dir).await?;
         }
-        Command::Ping { target } => {
+        Command::Ping { target, json } => {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             let state = alex_proxy::build_state(
@@ -4650,6 +4667,7 @@ async fn main() -> Result<()> {
                 config.base_url(),
                 config.upstream_stream_idle_timeout(),
             );
+            alex_proxy::apply_upstream_env_overrides(&state);
             let models = config.ping_models();
             let wants_dario = target == "all" || target == "dario";
             let providers: Vec<alex_core::Provider> = if target == "all" {
@@ -4682,22 +4700,44 @@ async fn main() -> Result<()> {
                 ]
             };
             if providers.is_empty() && !wants_dario {
-                println!("no pingable accounts — run `alex auth import`");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "summary": "no pingable accounts",
+                            "results": [],
+                        }))?
+                    );
+                } else {
+                    println!("no pingable accounts — run `alex auth import`");
+                }
                 return Ok(());
             }
             let mut results = if providers.is_empty() {
                 vec![]
             } else {
-                run_pings(&state, &models, &providers).await
+                run_pings(&state, &models, &providers, !json).await
             };
             if wants_dario {
                 let dario = ping_dario_daemon(&config).await;
-                println!("{}", ping_done_line(&dario));
+                if !json {
+                    println!("{}", ping_done_line(&dario));
+                }
                 results.push(dario);
             }
             let ok = results.iter().filter(|r| r.ok).count();
             let summary = format!("{ok}/{} providers healthy", results.len());
-            if ok == results.len() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": ok == results.len(),
+                        "summary": summary,
+                        "results": results,
+                    }))?
+                );
+            } else if ok == results.len() {
                 println!("{} {}", ui::gold(ui::diamond()), ui::bold(&summary));
             } else {
                 println!("{} {}", ui::red("✗"), ui::red(&ui::bold(&summary)));
@@ -9325,6 +9365,7 @@ async fn run_pings(
     state: &Arc<alex_proxy::AppState>,
     models: &alex_proxy::PingModels,
     providers: &[alex_core::Provider],
+    display: bool,
 ) -> Vec<alex_proxy::PingResult> {
     use std::io::{IsTerminal, Write};
     let n = providers.len();
@@ -9361,7 +9402,7 @@ async fn run_pings(
         alex_core::Provider::Amp => "amp".to_string(),
         alex_core::Provider::Kimi => models.kimi.clone(),
     };
-    if std::io::stdout().is_terminal() {
+    if display && std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
         print!("\x1b[?25l");
         let start = std::time::Instant::now();
@@ -9404,7 +9445,7 @@ async fn run_pings(
     }
     let results: Vec<alex_proxy::PingResult> =
         slots.lock().unwrap().iter().flatten().cloned().collect();
-    if !std::io::stdout().is_terminal() {
+    if display && !std::io::stdout().is_terminal() {
         for r in &results {
             println!("{}", ping_done_line(r));
         }

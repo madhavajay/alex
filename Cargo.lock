@@ -196,6 +196,7 @@ version = "0.1.25"
 dependencies = [
  "alex-auth",
  "alex-core",
+ "alex-fakeprov",
  "alex-middleware",
  "alex-store",
  "anyhow",

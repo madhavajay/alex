@@ -13576,6 +13576,12 @@ async fn proxy(
                     return error_response(status, &msg);
                 }
             };
+            if let Some(value) = headers
+                .get("x-mock-fail")
+                .filter(|_| allowed_override_url(&plan.url))
+            {
+                up_headers.insert("x-mock-fail", value.clone());
+            }
             if current_provider == Provider::Cliproxyapi {
                 let route_chain = upstream_route_chain(&headers, "alex");
                 if let Ok(value) = HeaderValue::from_str(&route_chain) {
@@ -18378,74 +18384,63 @@ mod tests {
     /// middleware rerouting/provenance, and durable recovery after restart.
     #[tokio::test]
     async fn deterministic_platform_smoke_daemon_route_trace_and_restart_recovery() {
-        use axum::routing::post;
+        use alex_fakeprov::{Config as FakeProvConfig, FakeProv, ResponseSpec};
 
-        let received_models = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let captured_models = received_models.clone();
-        let upstream = Router::new().route(
-            "/v1/chat/completions",
-            post(move |axum::Json(body): axum::Json<Value>| {
-                let captured_models = captured_models.clone();
-                async move {
-                    let model = body["model"].as_str().unwrap_or_default().to_string();
-                    captured_models.lock().await.push(model.clone());
-                    match model.as_str() {
-                        "smoke/stream" => {
-                            assert_eq!(body["stream"], true);
-                            let chunks = [
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
-                            ];
-                            let mut sse = chunks
-                                .into_iter()
-                                .map(|chunk| format!("data: {chunk}\n\n"))
-                                .collect::<String>();
-                            sse.push_str("data: [DONE]\n\n");
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/event-stream")
-                                .body(Body::from(sse))
-                                .unwrap()
-                        }
-                        "smoke/fail" => (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}})),
-                        )
-                            .into_response(),
-                        "smoke/fallback" => axum::Json(json!({
-                            "id": "mock-fallback",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "fallback ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-                        }))
-                        .into_response(),
-                        "smoke/model" => axum::Json(json!({
-                            "id": "mock-completion",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "mock ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                        }))
-                        .into_response(),
-                        other => panic!("unexpected smoke model {other}"),
-                    }
-                }
-            }),
-        );
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_server = tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream).await.unwrap();
-        });
+        let upstream = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
+        let chunks = [
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
+        ];
+        let mut stream = chunks
+            .into_iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        stream.push_str("data: [DONE]\n\n");
+        for response in [
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-completion",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "mock ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                })),
+                ..Default::default()
+            },
+            ResponseSpec {
+                raw_body: Some(stream),
+                content_type: Some("text/event-stream".into()),
+                ..Default::default()
+            },
+            ResponseSpec {
+                status: Some(503),
+                body: Some(
+                    json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}}),
+                ),
+                ..Default::default()
+            },
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-fallback",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "fallback ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                })),
+                ..Default::default()
+            },
+        ] {
+            upstream.queue("POST /v1/chat/completions", response).await;
+        }
+        let upstream_base = upstream.base_url().to_string();
 
         let root = tmpdir("deterministic-platform-smoke");
         let store_root = root.join("store");
@@ -18462,7 +18457,7 @@ mod tests {
             set_exo_config(
                 &state,
                 ExoConfig {
-                    url: format!("http://{upstream_addr}"),
+                    url: upstream_base.clone(),
                     enabled_models: vec![
                         "smoke/model".into(),
                         "smoke/stream".into(),
@@ -18470,7 +18465,7 @@ mod tests {
                     ],
                 },
             );
-            set_upstream_base_override(&state, Provider::Openai, format!("http://{upstream_addr}"));
+            set_upstream_base_override(&state, Provider::Openai, upstream_base.clone());
             state
         };
         let serve = |state: Arc<AppState>| async move {
@@ -18673,8 +18668,18 @@ mod tests {
         assert_eq!(attempts[1]["provider"], "exo");
         assert_eq!(attempts[1]["model"], "smoke/fallback");
         assert_eq!(attempts[1]["status"], 200);
+        let requests = upstream.requests().await;
+        let request_bodies = requests
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(request_bodies[1]["stream"], true);
         assert_eq!(
-            *received_models.lock().await,
+            request_bodies
+                .iter()
+                .map(|body| body["model"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec![
                 "smoke/model",
                 "smoke/stream",
@@ -18783,7 +18788,7 @@ mod tests {
             .any(|rule| rule["id"] == middleware_id && rule["enabled"] == true));
 
         restarted_server.abort();
-        upstream_server.abort();
+        upstream.shutdown().await;
     }
 
     #[tokio::test]
