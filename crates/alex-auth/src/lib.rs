@@ -2611,6 +2611,107 @@ mod tests {
         assert!(expired.needs_refresh());
     }
 
+    #[test]
+    fn account_refresh_eligibility_covers_credential_kind_and_expiry_state() {
+        let now = now_ms();
+        let mut fresh = oauth_account(
+            "openai-oauth-fresh",
+            Provider::Openai,
+            "fresh@example.com",
+            now + REFRESH_MARGIN_MS + 300_000,
+        );
+        let mut inside_margin = fresh.clone();
+        inside_margin.id = "openai-oauth-margin".into();
+        inside_margin.expires_at_ms = Some(now + REFRESH_MARGIN_MS / 2);
+        let mut expired = fresh.clone();
+        expired.id = "openai-oauth-expired".into();
+        expired.expires_at_ms = Some(now - 1);
+        let mut unknown_expiry = fresh.clone();
+        unknown_expiry.id = "openai-oauth-no-expiry".into();
+        unknown_expiry.expires_at_ms = None;
+        let api_key = api_key_account("openai-api_key", Provider::Openai);
+        fresh.refresh_token = None;
+
+        let cases = [
+            ("fresh oauth", fresh, false),
+            ("inside refresh margin", inside_margin, true),
+            ("expired oauth", expired, true),
+            ("oauth without expiry", unknown_expiry, true),
+            ("api key", api_key, false),
+        ];
+
+        for (name, account, expected) in cases {
+            assert_eq!(account.needs_refresh(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn jwt_expiry_parsing_accepts_valid_claims_and_rejects_malformed_tokens() {
+        let cases = [
+            (
+                "integer expiry",
+                json!({"exp": 1_800_000_000_i64}),
+                Some(1_800_000_000_000_i64),
+            ),
+            ("missing expiry", json!({"sub": "user"}), None),
+            ("string expiry", json!({"exp": "1800000000"}), None),
+            ("null expiry", json!({"exp": null}), None),
+        ];
+
+        for (name, payload, expected) in cases {
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap());
+            assert_eq!(
+                jwt_exp_ms(&format!("header.{encoded}.signature")),
+                expected,
+                "{name}"
+            );
+        }
+
+        for malformed in ["", "header", "header.***.signature", "header.e30"] {
+            assert_eq!(jwt_exp_ms(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn pure_account_state_flags_cover_reauth_policy_and_credential_freshness() {
+        let now = now_ms();
+        let mut account = oauth_account(
+            "openai-oauth-work",
+            Provider::Openai,
+            "work@example.com",
+            now + 600_000,
+        );
+        account.name = "work".into();
+        assert!(!account.needs_reauth());
+        account.account_meta["needs_reauth"] = json!(true);
+        assert!(account.needs_reauth());
+        account.account_meta["needs_reauth"] = json!("true");
+        assert!(!account.needs_reauth());
+
+        let enabled = AccountPolicy::default();
+        assert!(account_proxy_eligible(&account, &enabled));
+        for disabled in [vec!["work".into()], vec![account.id.clone()]] {
+            let policy = AccountPolicy {
+                disabled,
+                ..AccountPolicy::default()
+            };
+            assert!(!account_proxy_eligible(&account, &policy));
+        }
+
+        account.account_meta = json!({"email": "work@example.com"});
+        let valid_rank = credential_rank(&account);
+        account.expires_at_ms = Some(now - 1);
+        let expired_rank = credential_rank(&account);
+        account.expires_at_ms = Some(now + 600_000);
+        account.access_token = None;
+        account.refresh_token = None;
+        let missing_rank = credential_rank(&account);
+        assert!(valid_rank.0);
+        assert!(!expired_rank.0);
+        assert!(!missing_rank.0);
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

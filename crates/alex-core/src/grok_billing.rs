@@ -455,6 +455,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_truncated_and_garbage_grpc_web_responses() {
+        let cases: &[(&str, &[u8], GrokWebBillingError)] = &[
+            ("empty", &[], GrokWebBillingError::EmptyResponse),
+            (
+                "header shorter than five bytes",
+                &[0x00, 0x00, 0x00, 0x00],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "declared payload is truncated",
+                &[0x00, 0x00, 0x00, 0x00, 0x04, 0x0D, 0x00],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "garbage wire type",
+                &[0xFF, 0xFF, 0xFF],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "protobuf-shaped garbage",
+                &[0x08, 0x80],
+                GrokWebBillingError::ParseFailed,
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            assert_eq!(
+                parse_grpc_web_response(body, 1_800_000_000),
+                Err(expected.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_unframed_grok_billing_protobuf_payload() {
         // Captured fixture from CodexBar GrokWebBillingFetcherTests.
         let data = hex(
