@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "published_at": "2026-07-22T00:00:00Z",
+  "components": {
+    "cli": {
+      "version": "99.0.0",
+      "notes_url": "https://github.com/madhavajay/alex/releases/tag/v99.0.0",
+      "platforms": {
+        "aarch64-apple-darwin": {"url": "https://example.test/alex-aarch64-apple-darwin.tgz", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 123},
+        "x86_64-apple-darwin": {"url": "https://example.test/alex-x86_64-apple-darwin.tgz", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 123},
+        "x86_64-unknown-linux-gnu": {"url": "https://example.test/alex-x86_64-unknown-linux-gnu.tgz", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size": 123},
+        "aarch64-unknown-linux-gnu": {"url": "https://example.test/alex-aarch64-unknown-linux-gnu.tgz", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "size": 123},
+        "x86_64-pc-windows-msvc": {"url": "https://example.test/alex-x86_64-pc-windows-msvc.zip", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "size": 123}
+      }
+    }
+  }
+}

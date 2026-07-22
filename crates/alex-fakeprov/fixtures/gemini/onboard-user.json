@@ -1,0 +1,5 @@
+{
+  "name": "operations/fakeprov-onboard",
+  "done": true,
+  "response": {"cloudaicompanionProject": {"id": "fakeprov-gemini-project"}}
+}

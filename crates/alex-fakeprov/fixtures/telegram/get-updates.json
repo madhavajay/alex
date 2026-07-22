@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "result": [{
+    "update_id": 2001,
+    "message": {
+      "message_id": 1002,
+      "date": 1700000001,
+      "chat": {"id": 42, "type": "private", "title": "FakeProv Ops"},
+      "text": "/status"
+    }
+  }]
+}

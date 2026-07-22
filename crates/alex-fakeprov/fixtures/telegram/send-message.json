@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "result": {
+    "message_id": 1001,
+    "date": 1700000000,
+    "chat": {"id": 42, "type": "private", "username": "fakeprov"},
+    "text": "Fake Telegram message"
+  }
+}

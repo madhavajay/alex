@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_exo_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"llama-3.2-3b","choices":[{"index":0,"delta":{"role":"assistant","content":"Fake Exo response."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_exo_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"llama-3.2-3b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

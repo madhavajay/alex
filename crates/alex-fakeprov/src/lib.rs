@@ -117,6 +117,8 @@ struct FixtureMeta {
     latency_ms: u64,
     #[serde(default)]
     chunk_delay_ms: u64,
+    #[serde(default)]
+    encoding: Option<String>,
 }
 
 impl Default for FixtureMeta {
@@ -126,6 +128,7 @@ impl Default for FixtureMeta {
             headers: BTreeMap::new(),
             latency_ms: 0,
             chunk_delay_ms: 0,
+            encoding: None,
         }
     }
 }
@@ -322,6 +325,64 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/backend-api/codex/responses", post(codex_responses))
         .route("/backend-api/wham/usage", get(codex_usage))
         .route("/oauth/token", post(openai_token))
+        .route("/anthropic/v1/messages", post(anthropic_messages))
+        .route("/anthropic/api/oauth/profile", get(anthropic_profile))
+        .route("/anthropic/api/oauth/usage", get(anthropic_usage))
+        .route("/anthropic/v1/oauth/token", post(anthropic_token))
+        .route("/openai/v1/chat/completions", post(openai_chat))
+        .route("/openai/v1/responses", post(openai_responses))
+        .route("/openai/v1/models", get(openai_models))
+        .route("/openai/backend-api/codex/responses", post(codex_responses))
+        .route("/openai/responses", post(codex_responses))
+        .route("/openai/backend-api/wham/usage", get(codex_usage))
+        .route("/openai/oauth/token", post(openai_token))
+        .route(
+            "/gemini/v1beta/models/{model_action}",
+            post(gemini_generate),
+        )
+        .route(
+            "/gemini/v1internal:generateContent",
+            post(gemini_code_assist_generate),
+        )
+        .route(
+            "/gemini/v1internal:streamGenerateContent",
+            post(gemini_code_assist_generate),
+        )
+        .route(
+            "/gemini/v1internal:loadCodeAssist",
+            post(gemini_load_code_assist),
+        )
+        .route("/gemini/v1internal:onboardUser", post(gemini_onboard_user))
+        .route("/xai/v1/chat/completions", post(openai_chat))
+        .route("/xai/oauth2/device/code", post(xai_device_code))
+        .route("/xai/oauth2/token", post(xai_token))
+        .route("/xai/oauth2/userinfo", get(xai_userinfo))
+        .route(
+            "/xai/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
+            post(xai_billing),
+        )
+        .route("/kimi/coding/v1/chat/completions", post(openai_chat))
+        .route("/kimi/coding/v1/usages", get(kimi_usage))
+        .route(
+            "/kimi/api/oauth/device_authorization",
+            post(kimi_device_authorization),
+        )
+        .route("/kimi/api/oauth/token", post(kimi_token))
+        .route("/openrouter/api/v1/chat/completions", post(openai_chat))
+        .route("/openrouter/api/v1/models", get(openrouter_models))
+        .route("/exo/v1/chat/completions", post(openai_chat))
+        .route("/exo/v1/models", get(exo_models))
+        .route("/cliproxyapi/v1/models", get(cliproxyapi_models))
+        .route("/cliproxyapi/v1/chat/completions", post(openai_chat))
+        .route(
+            "/cliproxyapi/v1/alex/capabilities",
+            get(cliproxyapi_capabilities),
+        )
+        .route("/amp/api/internal", post(amp_usage))
+        .route("/github/manifest.json", get(github_manifest))
+        .route("/github/releases", get(github_releases))
+        .route("/npm/@askalf%2Fdario/latest", get(npm_dario_latest))
+        .route("/telegram/{*method}", get(telegram_get).post(telegram_post))
         .route("/_control/reset", post(control_reset))
         .route("/_control/scenario", post(control_scenario))
         .route("/_control/queue", post(control_queue))
@@ -348,6 +409,24 @@ async fn openai_chat(
 }
 
 async fn openai_responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    handle_model(state, Method::POST, uri, headers, body).await
+}
+
+async fn gemini_generate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    handle_model(state, Method::POST, uri, headers, body).await
+}
+
+async fn gemini_code_assist_generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
@@ -451,6 +530,97 @@ async fn openai_token(
     handle_fixed(state, Method::POST, uri, headers, body, "openai/token.json").await
 }
 
+macro_rules! fixed_handler {
+    ($name:ident, $method:ident, $fixture:literal, body) => {
+        async fn $name(
+            State(state): State<Arc<AppState>>,
+            headers: HeaderMap,
+            uri: Uri,
+            body: Bytes,
+        ) -> Response {
+            handle_fixed(state, Method::$method, uri, headers, body, $fixture).await
+        }
+    };
+    ($name:ident, $method:ident, $fixture:literal) => {
+        async fn $name(
+            State(state): State<Arc<AppState>>,
+            headers: HeaderMap,
+            uri: Uri,
+        ) -> Response {
+            handle_fixed(state, Method::$method, uri, headers, Bytes::new(), $fixture).await
+        }
+    };
+}
+
+fixed_handler!(
+    gemini_load_code_assist,
+    POST,
+    "gemini/load-code-assist.json",
+    body
+);
+fixed_handler!(gemini_onboard_user, POST, "gemini/onboard-user.json", body);
+fixed_handler!(xai_device_code, POST, "xai/device-code.json", body);
+fixed_handler!(xai_token, POST, "xai/token.json", body);
+fixed_handler!(xai_userinfo, GET, "xai/userinfo.json");
+fixed_handler!(xai_billing, POST, "xai/billing.hex", body);
+fixed_handler!(kimi_usage, GET, "kimi/usage.json");
+fixed_handler!(
+    kimi_device_authorization,
+    POST,
+    "kimi/device-authorization.json",
+    body
+);
+fixed_handler!(kimi_token, POST, "kimi/token.json", body);
+fixed_handler!(openrouter_models, GET, "openrouter/models.json");
+fixed_handler!(exo_models, GET, "exo/models.json");
+fixed_handler!(cliproxyapi_models, GET, "cliproxyapi/models.json");
+fixed_handler!(
+    cliproxyapi_capabilities,
+    GET,
+    "cliproxyapi/capabilities.json"
+);
+fixed_handler!(amp_usage, POST, "amp/usage.json", body);
+fixed_handler!(github_manifest, GET, "github/manifest.json");
+fixed_handler!(github_releases, GET, "github/releases.json");
+fixed_handler!(npm_dario_latest, GET, "npm/dario-latest.json");
+
+async fn telegram_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    telegram_response(state, Method::GET, headers, uri, Bytes::new()).await
+}
+
+async fn telegram_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    telegram_response(state, Method::POST, headers, uri, body).await
+}
+
+async fn telegram_response(
+    state: Arc<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let fixture = match (method.clone(), uri.path()) {
+        (Method::GET, path) if path.ends_with("/getUpdates") => "telegram/get-updates.json",
+        (Method::POST, path) if path.ends_with("/sendMessage") => "telegram/send-message.json",
+        _ => {
+            return json_response(
+                404,
+                json!({"ok": false, "description": "unsupported Telegram method"}),
+            )
+        }
+    };
+    handle_fixed(state, method, uri, headers, body, fixture).await
+}
+
 async fn handle_model(
     state: Arc<AppState>,
     method: Method,
@@ -461,7 +631,9 @@ async fn handle_model(
     let path = uri.path().to_string();
     record_request(&state, &method, &path, &headers, &body).await;
     let endpoint = format!("{method} {path}");
-    let stream_requested = path == "/backend-api/codex/responses"
+    let stream_requested = path.ends_with("/backend-api/codex/responses")
+        || path == "/openai/responses"
+        || path.ends_with(":streamGenerateContent")
         || serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|value| value.get("stream").and_then(Value::as_bool))
@@ -503,12 +675,25 @@ async fn handle_fixed(
     let path = uri.path().to_string();
     record_request(&state, &method, &path, &headers, &body).await;
     let endpoint = format!("{method} {path}");
-    let response = state
-        .engine
-        .lock()
-        .await
-        .take(&endpoint, &path)
-        .unwrap_or_default();
+    let header_failure = headers
+        .get("x-mock-fail")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| ResponseSpec {
+            failure: Some(value.to_ascii_lowercase()),
+            ..ResponseSpec::default()
+        });
+    let response = match header_failure {
+        Some(response) => response,
+        None => state
+            .engine
+            .lock()
+            .await
+            .take(&endpoint, &path)
+            .unwrap_or_default(),
+    };
+    if response.failure.as_deref() == Some("timeout") {
+        return std::future::pending::<Response>().await;
+    }
     match render_response(&state, &path, false, response, fixture).await {
         Ok(response) => response,
         Err(error) => internal_error(error),
@@ -517,13 +702,40 @@ async fn handle_fixed(
 
 fn default_model_fixture(path: &str, stream: bool) -> &'static str {
     match (path, stream) {
-        ("/v1/messages", false) => "anthropic/default-message.json",
-        ("/v1/messages", true) => "anthropic/default-message-stream.sse",
-        ("/v1/chat/completions", false) => "openai/default-chat.json",
-        ("/v1/chat/completions", true) => "openai/default-chat-stream.sse",
-        ("/v1/responses", false) => "openai/default-responses.json",
-        ("/v1/responses", true) => "openai/default-responses-stream.sse",
-        ("/backend-api/codex/responses", _) => "openai/default-codex-responses.sse",
+        (path, false) if matches!(path, "/v1/messages" | "/anthropic/v1/messages") => {
+            "anthropic/default-message.json"
+        }
+        (path, true) if matches!(path, "/v1/messages" | "/anthropic/v1/messages") => {
+            "anthropic/default-message-stream.sse"
+        }
+        (path, false) if path.starts_with("/gemini/v1beta/models/") => {
+            "gemini/default-generate.json"
+        }
+        (path, true) if path.starts_with("/gemini/v1beta/models/") => {
+            "gemini/default-generate-stream.sse"
+        }
+        ("/gemini/v1internal:generateContent", false) => "gemini/code-assist-generate.json",
+        ("/gemini/v1internal:streamGenerateContent", true) => {
+            "gemini/code-assist-generate-stream.sse"
+        }
+        (path, false) if path.ends_with("/v1/responses") => "openai/default-responses.json",
+        (path, true) if path.ends_with("/v1/responses") => "openai/default-responses-stream.sse",
+        (path, _) if path.ends_with("/backend-api/codex/responses") => {
+            "openai/default-codex-responses.sse"
+        }
+        ("/openai/responses", _) => "openai/default-codex-responses.sse",
+        ("/xai/v1/chat/completions", false) => "xai/default-chat.json",
+        ("/xai/v1/chat/completions", true) => "xai/default-chat-stream.sse",
+        ("/kimi/coding/v1/chat/completions", false) => "kimi/default-chat.json",
+        ("/kimi/coding/v1/chat/completions", true) => "kimi/default-chat-stream.sse",
+        ("/openrouter/api/v1/chat/completions", false) => "openrouter/default-chat.json",
+        ("/openrouter/api/v1/chat/completions", true) => "openrouter/default-chat-stream.sse",
+        ("/exo/v1/chat/completions", false) => "exo/default-chat.json",
+        ("/exo/v1/chat/completions", true) => "exo/default-chat-stream.sse",
+        ("/cliproxyapi/v1/chat/completions", false) => "cliproxyapi/default-chat.json",
+        ("/cliproxyapi/v1/chat/completions", true) => "cliproxyapi/default-chat-stream.sse",
+        (path, false) if path.ends_with("/v1/chat/completions") => "openai/default-chat.json",
+        (path, true) if path.ends_with("/v1/chat/completions") => "openai/default-chat-stream.sse",
         _ => "openai/default-chat.json",
     }
 }
@@ -600,11 +812,18 @@ async fn render_failure(
             "overloaded_error",
             "provider is overloaded",
         )),
+        "quota" if path == "/kimi/coding/v1/chat/completions" => {
+            let mut loaded = load_fixture(&state.fixtures_dir, "kimi/quota-exhausted.json")?;
+            loaded.status = 403;
+            build_response(loaded, None).await
+        }
         "truncated-sse" => {
-            let raw = match path {
-                "/v1/messages" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fakeprov_truncated\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":",
-                "/v1/responses" | "/backend-api/codex/responses" => "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fakeprov_truncated\",\"status\":\"in_progress\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":",
-                _ => "data: {\"id\":\"fakeprov-truncated\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"truncated\":",
+            let raw = if is_anthropic_messages(path) {
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fakeprov_truncated\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":"
+            } else if is_openai_responses(path) {
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fakeprov_truncated\",\"status\":\"in_progress\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":"
+            } else {
+                "data: {\"id\":\"fakeprov-truncated\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"truncated\":"
             };
             build_response(
                 LoadedResponse::raw(200, "text/event-stream", raw.as_bytes().to_vec()),
@@ -612,7 +831,7 @@ async fn render_failure(
             )
             .await
         }
-        "refusal" if path == "/v1/messages" && stream_requested => {
+        "refusal" if is_anthropic_messages(path) && stream_requested => {
             let loaded = load_fixture(
                 &state.fixtures_dir,
                 "anthropic/anthropic-fable-refusal-200.sse",
@@ -652,7 +871,7 @@ async fn render_failure(
 }
 
 fn refusal_sse(path: &str) -> String {
-    if matches!(path, "/v1/responses" | "/backend-api/codex/responses") {
+    if is_openai_responses(path) {
         let response = refusal_body(path);
         return format!(
             "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
@@ -669,8 +888,8 @@ fn refusal_sse(path: &str) -> String {
 }
 
 fn refusal_body(path: &str) -> Value {
-    match path {
-        "/v1/messages" => json!({
+    if is_anthropic_messages(path) {
+        json!({
             "id": "msg_fakeprov_refusal",
             "type": "message",
             "role": "assistant",
@@ -679,8 +898,9 @@ fn refusal_body(path: &str) -> Value {
             "stop_reason": "refusal",
             "stop_sequence": null,
             "usage": {"input_tokens": 8, "output_tokens": 0}
-        }),
-        "/v1/responses" | "/backend-api/codex/responses" => json!({
+        })
+    } else if is_openai_responses(path) {
+        json!({
             "id": "resp_fakeprov_refusal",
             "object": "response",
             "status": "completed",
@@ -693,8 +913,9 @@ fn refusal_body(path: &str) -> Value {
                 "content": [{"type": "refusal", "refusal": "I cannot help with that request."}]
             }],
             "usage": {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12}
-        }),
-        _ => json!({
+        })
+    } else {
+        json!({
             "id": "chatcmpl_fakeprov_refusal",
             "object": "chat.completion",
             "created": 1700000000,
@@ -705,12 +926,22 @@ fn refusal_body(path: &str) -> Value {
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
-        }),
+        })
     }
 }
 
+fn is_anthropic_messages(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/anthropic/v1/messages")
+}
+
+fn is_openai_responses(path: &str) -> bool {
+    path.ends_with("/v1/responses")
+        || path.ends_with("/backend-api/codex/responses")
+        || path == "/openai/responses"
+}
+
 fn provider_error(path: &str, status: u16, error_type: &str, message: &str) -> Response {
-    let body = if path == "/v1/messages" {
+    let body = if is_anthropic_messages(path) {
         json!({"type": "error", "error": {"type": error_type, "message": message}})
     } else {
         json!({"error": {"message": message, "type": error_type, "param": null, "code": error_type}})
@@ -760,7 +991,7 @@ fn load_fixture(root: &Path, name: &str) -> Result<LoadedResponse> {
         bail!("fixture path must be relative and cannot contain traversal");
     }
     let path = root.join(relative);
-    let body =
+    let mut body =
         std::fs::read(&path).with_context(|| format!("reading fixture {}", path.display()))?;
     let stem = path
         .file_stem()
@@ -773,6 +1004,11 @@ fn load_fixture(root: &Path, name: &str) -> Result<LoadedResponse> {
     } else {
         FixtureMeta::default()
     };
+    match meta.encoding.as_deref() {
+        Some("hex") => body = decode_hex(&body)?,
+        Some(encoding) => bail!("unsupported fixture encoding: {encoding}"),
+        None => {}
+    }
     if !meta.headers.contains_key("content-type") {
         let content_type = match path.extension().and_then(|value| value.to_str()) {
             Some("sse") => "text/event-stream",
@@ -788,6 +1024,29 @@ fn load_fixture(root: &Path, name: &str) -> Result<LoadedResponse> {
         latency_ms: meta.latency_ms,
         chunk_delay_ms: meta.chunk_delay_ms,
     })
+}
+
+fn decode_hex(input: &[u8]) -> Result<Vec<u8>> {
+    let digits = input
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if digits.len() % 2 != 0 {
+        bail!("hex fixture has an odd number of digits");
+    }
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .context("hex fixture contains a non-hex digit")?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .context("hex fixture contains a non-hex digit")?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
 }
 
 async fn build_response(
@@ -1315,5 +1574,415 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn prefixed_provider_surfaces_return_compatible_shapes() {
+        let server = server().await;
+        let client = reqwest::Client::new();
+        for (path, model, expected) in [
+            ("/xai/v1/chat/completions", "grok-4", "grok-4"),
+            (
+                "/kimi/coding/v1/chat/completions",
+                "kimi-for-coding",
+                "kimi-for-coding",
+            ),
+            (
+                "/openrouter/api/v1/chat/completions",
+                "anthropic/claude-3.5-sonnet",
+                "anthropic/claude-3.5-sonnet",
+            ),
+            ("/exo/v1/chat/completions", "llama-3.2-3b", "llama-3.2-3b"),
+            ("/cliproxyapi/v1/chat/completions", "cpa/echo", "cpa/echo"),
+        ] {
+            let response: Value = client
+                .post(format!("{}{path}", server.base_url()))
+                .json(&json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["object"], "chat.completion");
+            assert_eq!(response["model"], expected);
+            assert!(response["choices"][0]["message"]["content"].is_string());
+        }
+
+        let exo_models: Value = client
+            .get(format!("{}/exo/v1/models", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exo_models["object"], "list");
+        assert!(!exo_models["data"].as_array().unwrap().is_empty());
+
+        let cliproxyapi_models: Value = client
+            .get(format!("{}/cliproxyapi/v1/models", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cliproxyapi_models["data"][0]["id"], "cpa/echo");
+        let capabilities: Value = client
+            .get(format!(
+                "{}/cliproxyapi/v1/alex/capabilities",
+                server.base_url()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            capabilities["integrations"]["cliproxyapi_reverse"]["schema"],
+            "alex.cliproxyapi.reverse/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_parsers_roundtrip_usage_billing_and_catalog_fixtures() {
+        let server = server().await;
+        let client = reqwest::Client::new();
+
+        let billing = client
+            .post(format!(
+                "{}/xai/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
+                server.base_url()
+            ))
+            .body(alex_core::grok_billing::GROK_CREDITS_REQUEST_BODY)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(
+            billing.headers()["content-type"],
+            "application/grpc-web+proto"
+        );
+        let billing = alex_core::grok_billing::parse_grpc_web_response(
+            &billing.bytes().await.unwrap(),
+            1_900_000_000,
+        )
+        .unwrap();
+        assert!((billing.used_percent - 42.5).abs() < 1e-5);
+        assert_eq!(billing.resets_at_s, Some(2_000_000_000));
+
+        let amp = client
+            .post(format!(
+                "{}/amp/api/internal?userDisplayBalanceInfo",
+                server.base_url()
+            ))
+            .json(&json!({"method": "userDisplayBalanceInfo", "params": {}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let amp = alex_core::amp_usage::parse_usage_api_response(&amp).unwrap();
+        assert_eq!(amp.account_email.as_deref(), Some("fakeprov@example.test"));
+        assert_eq!(amp.individual_credits, Some(5.0));
+        assert_eq!(amp.workspace_balances.len(), 1);
+
+        let catalog: Value = client
+            .get(format!("{}/openrouter/api/v1/models", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            alex_core::openrouter_catalog::parse_models_response(&catalog),
+            vec![
+                "anthropic/claude-3.5-sonnet",
+                "openai/gpt-4o",
+                "meta-llama/llama-3.1-70b-instruct",
+            ]
+        );
+
+        let kimi: Value = client
+            .get(format!("{}/kimi/coding/v1/usages", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(kimi["usage"]["limit"].is_number());
+        assert!(kimi["usage"]["used"].is_number());
+        assert!(kimi["limits"][0]["detail"]["remaining"].is_number());
+        assert!(kimi["boosterWallet"].is_object());
+    }
+
+    #[tokio::test]
+    async fn gemini_api_and_code_assist_replay_json_and_sse_envelopes() {
+        let server = FakeProv::spawn(Config {
+            scenario: "gemini-code-assist-onboard-flow".into(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+
+        let generated: Value = client
+            .post(format!(
+                "{}/gemini/v1beta/models/gemini-2.5-pro:generateContent",
+                server.base_url()
+            ))
+            .json(&json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(generated["candidates"][0]["finishReason"], "STOP");
+
+        let streamed = client
+            .post(format!(
+                "{}/gemini/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+                server.base_url()
+            ))
+            .json(&json!({"contents": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(streamed.headers()["content-type"], "text/event-stream");
+        let chunks = streamed
+            .bytes_stream()
+            .map(|chunk| chunk.unwrap().to_vec())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.ends_with(b"\n\n")));
+
+        let load: Value = client
+            .post(format!(
+                "{}/gemini/v1internal:loadCodeAssist",
+                server.base_url()
+            ))
+            .json(&json!({"cloudaicompanionProject": null, "metadata": {}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(load["allowedTiers"][0]["id"], "free-tier");
+        let onboard: Value = client
+            .post(format!(
+                "{}/gemini/v1internal:onboardUser",
+                server.base_url()
+            ))
+            .json(&json!({"tierId": "free-tier"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(onboard["done"], true);
+        let code_assist: Value = client
+            .post(format!(
+                "{}/gemini/v1internal:generateContent",
+                server.base_url()
+            ))
+            .json(&json!({"model": "gemini-2.5-pro", "project": "fakeprov-gemini-project", "request": {"contents": []}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            code_assist["response"]["candidates"][0]["finishReason"],
+            "STOP"
+        );
+        let paths = server
+            .requests()
+            .await
+            .into_iter()
+            .map(|record| record.path)
+            .collect::<Vec<_>>();
+        assert!(paths.windows(3).any(|paths| paths
+            == [
+                "/gemini/v1internal:loadCodeAssist",
+                "/gemini/v1internal:onboardUser",
+                "/gemini/v1internal:generateContent",
+            ]));
+    }
+
+    #[tokio::test]
+    async fn device_flow_slow_poll_returns_pending_twice_then_tokens() {
+        let server = FakeProv::spawn(Config {
+            scenario: "device-flow-slow-poll".into(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        for path in ["/xai/oauth2/token", "/kimi/api/oauth/token"] {
+            let url = format!("{}{path}", server.base_url());
+            for _ in 0..2 {
+                let response = client
+                    .post(&url)
+                    .form(&[("device_code", "fake")])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["error"],
+                    "authorization_pending"
+                );
+            }
+            let response: Value = client
+                .post(&url)
+                .form(&[("device_code", "fake")])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(response["access_token"].is_string());
+            assert!(response["refresh_token"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_and_empty_catalog_scenarios_are_selectable() {
+        let server = FakeProv::spawn(Config {
+            scenario: "kimi-quota-exhausted".into(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let quota = client
+            .post(format!(
+                "{}/kimi/coding/v1/chat/completions",
+                server.base_url()
+            ))
+            .json(&json!({"model": "kimi-for-coding"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(quota.status(), 403);
+        assert_eq!(
+            quota.json::<Value>().await.unwrap()["error"]["type"],
+            "access_terminated_error"
+        );
+
+        server
+            .set_scenario("openrouter-catalog-empty")
+            .await
+            .unwrap();
+        let catalog: Value = client
+            .get(format!("{}/openrouter/api/v1/models", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(alex_core::openrouter_catalog::parse_models_response(&catalog).is_empty());
+
+        server.set_scenario("ok").await.unwrap();
+        let quota = client
+            .post(format!(
+                "{}/kimi/coding/v1/chat/completions",
+                server.base_url()
+            ))
+            .header("x-mock-fail", "quota")
+            .json(&json!({"model": "kimi-for-coding"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(quota.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn external_service_stubs_return_consumer_shapes() {
+        let server = server().await;
+        let client = reqwest::Client::new();
+        let manifest: Value = client
+            .get(format!("{}/github/manifest.json", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(manifest["schema_version"], 1);
+        assert!(manifest["components"]["cli"]["platforms"].is_object());
+        let releases: Value = client
+            .get(format!("{}/github/releases", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(releases[0]["assets"][0]["name"], "manifest.json");
+        let dario: Value = client
+            .get(format!("{}/npm/@askalf%2Fdario/latest", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dario["name"], "@askalf/dario");
+        assert!(dario["version"].is_string());
+
+        let sent: Value = client
+            .post(format!(
+                "{}/telegram/bot123:fake/sendMessage",
+                server.base_url()
+            ))
+            .json(&json!({"chat_id": "42", "text": "hello"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sent["ok"], true);
+        let updates: Value = client
+            .get(format!(
+                "{}/telegram/bot123:fake/getUpdates",
+                server.base_url()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(updates["result"][0]["message"]["chat"]["id"], 42);
+        assert!(updates["result"][0]["update_id"].is_number());
     }
 }

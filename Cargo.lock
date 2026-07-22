@@ -134,6 +134,7 @@ dependencies = [
 name = "alex-fakeprov"
 version = "0.1.25"
 dependencies = [
+ "alex-core",
  "anyhow",
  "axum",
  "clap",

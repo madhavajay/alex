@@ -1,0 +1,8 @@
+{
+  "id": "chatcmpl_cliproxyapi_fakeprov_0001",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "cpa/echo",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "cliproxyapi-v1-ok"}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+}
