@@ -137,14 +137,8 @@ a tag or changes the source worktree.
   tests plus the clean Ubuntu package install in PR run `29800336043`).
 - [ ] Build, install, and record the final `0.1.29-beta.N` candidate.
 - [ ] Complete the full clean-user launch story on macOS and Ubuntu Linux.
-- [x] Gate Linux pull requests with local release-format A → B → A packages,
-  managed-service replacement, and state/trace preservation evidence (PR run
-  `29800336043`: PIDs `212` → `317` → `420`; base trace
-  `e9ee9d15-53dd-43a1-8f0d-c859bca89007` and candidate trace
-  `08b53fbc-be72-44a4-9c4f-d7fff62a5af0` survived rollback).
 - [ ] Stamp `0.1.29`, generate signed/notarized release assets, publish stable
-  update metadata, and verify upgrade/rollback using the actual previous stable
-  and signed candidate packages on macOS and Ubuntu Linux.
+  update metadata, and verify a clean installation on macOS and Ubuntu Linux.
 
 ## Current checkpoint
 

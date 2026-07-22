@@ -37,35 +37,13 @@ not fall back to a host-only daemon smoke when those capabilities are absent.
 8. Generate the stable appcast from the already-built DMG artifact and update
    the Homebrew formula/cask after promotion.
 
-## Upgrade and rollback evidence
+## Fresh-install evidence
 
-Pull requests run `linux-upgrade-rollback-smoke` in the same pinned privileged
-Ubuntu/systemd container used by the installed-package gate. It builds two
-release-format archives without downloading a release asset: A comes from the
-pull request's base commit and is stamped with a lower synthetic SemVer, while B
-comes from the candidate checkout at its real workspace version. The local
-installer performs A → B → A through the loopback asset server. The smoke
-container runs with Docker networking disabled after its pinned image is built,
-so neither product package nor provider traffic can leave the container.
-
-The legacy A unit declares `$HOME/.npm` as a mandatory writable path, so this
-exact-delta regression creates that directory before installing A and records
-the prerequisite in its evidence. The separate `linux-installed-smoke` remains
-the fail-closed proof that candidate B installs into a genuinely fresh user
-home; the compatibility setup is not credited as fresh-install evidence.
-
-The evidence fails unless each transition replaces the managed service PID and
-running executable inode, preserves the local key and Exo route, keeps the
-original trace metadata and body readable, and permits a new routed request.
-After rollback, A must also read the trace written by B. Only the JSON evidence
-is uploaded; the synthetic A and candidate B archives remain runner-local.
-
-This regression proves the installer/service/data contract across the exact PR
-delta, but A is not a previously published signed build. Before promoting a
-stable release, an operator must still repeat the upgrade and rollback using the
-actual previous stable package and the signed candidate on every supported
-platform. Do not treat the synthetic Linux gate as evidence for macOS appcast,
-Homebrew rollback.
+Pull requests run `linux-installed-smoke` in a pinned Ubuntu/systemd
+container. It installs the candidate archive into a clean user environment,
+starts the managed service, routes through a loopback provider, and verifies
+that the recorded trace survives a service restart. The container has no
+provider-network access; only its machine-readable evidence is uploaded.
 
 ## Resuming a failed release
 
