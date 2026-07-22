@@ -161,13 +161,23 @@ public struct AlexClient: Sendable {
 
     public enum ClientError: Error, LocalizedError {
         case http(Int, String)
+        case transport(String)
         case daemonUpdateRejected(String)
         public var errorDescription: String? {
             switch self {
-            case let .http(code, body): "HTTP \(code): \(body.prefix(200))"
+            case let .http(code, body): "HTTP \(code): \(body)"
+            case let .transport(message): "Transport error: \(message)"
             case let .daemonUpdateRejected(reason): reason
             }
         }
+    }
+
+    private static func httpError(status: Int, data: Data) -> ClientError {
+        .http(status, String((String(data: data, encoding: .utf8) ?? "").prefix(200)))
+    }
+
+    private static func transportError(_ error: Error) -> ClientError {
+        .transport(error.localizedDescription)
     }
 
     private func url(_ path: String, query: [URLQueryItem] = []) -> URL {
@@ -197,12 +207,12 @@ public struct AlexClient: Sendable {
             (data, resp) = try await session.data(for: req)
         } catch {
             BarLog.error(.net, "\(method) /\(path) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
-            throw error
+            throw Self.transportError(error)
         }
         let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
         if status >= 400 {
             BarLog.error(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
-            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: status, data: data)
         }
         BarLog.info(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
         return data
@@ -941,13 +951,13 @@ public struct AlexClient: Sendable {
             BarLog.error(
                 .net,
                 "GET /traces/\(id)/body/\(kind.rawValue) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
-            throw error
+            throw Self.transportError(error)
         }
         let http = resp as? HTTPURLResponse
         let status = http?.statusCode ?? -1
         if status >= 400 {
             BarLog.error(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
-            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: status, data: data)
         }
         BarLog.info(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
         return TraceBodyContent(
@@ -958,10 +968,16 @@ public struct AlexClient: Sendable {
     public func toolBody(id: String, kind: String) async throws -> TraceBodyContent {
         var req = URLRequest(url: url("tools/\(id)/body/\(kind)"))
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
-        let (data, response) = try await session.data(for: req)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch {
+            throw Self.transportError(error)
+        }
         let http = response as? HTTPURLResponse
         guard (http?.statusCode ?? -1) < 400 else {
-            throw ClientError.http(http?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: http?.statusCode ?? -1, data: data)
         }
         return TraceBodyContent(text: String(data: data, encoding: .utf8) ?? "", diskPath: nil)
     }
