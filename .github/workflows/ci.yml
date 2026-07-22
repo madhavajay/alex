@@ -149,6 +149,24 @@ jobs:
       - name: Fakeprov crate suite
         run: cargo test -p alex-fakeprov
 
+  mock-windows:
+    # Windows is not a stable-release gate yet; this job surfaces platform
+    # quirks in the new offline test stack without blocking the pipeline.
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mock-windows
+      - name: Fakeprov crate suite
+        run: cargo test -p alex-fakeprov
+      - name: Core parser and override suites
+        run: cargo test -p alex-core -p alex-auth -p alex-store
+      - name: Fakeprov router integration
+        run: cargo test -p alex-proxy --test fakeprov_router -- --nocapture
+
   webui:
     runs-on: namespace-profile-linux-medium
     steps:
