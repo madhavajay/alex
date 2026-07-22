@@ -70,11 +70,15 @@
   },
   "harnesses": {
     "claude": {
-      "aliases": ["claude-code"],
+      "aliases": [
+        "claude-code"
+      ],
       "default_model": "claude-opus-4-8",
-      "model_env": ["CLAUDE_MODEL"],
+      "model_env": [
+        "CLAUDE_MODEL"
+      ],
       "version_env": "CLAUDE_CODE_VERSION",
-      "default_version": "2.1.202",
+      "default_version": "2.1.218",
       "proxy_supported": true,
       "proxy_mode": "anthropic-native-or-codex-bridge",
       "source": {
@@ -88,7 +92,9 @@
     "codex": {
       "aliases": [],
       "default_model": "gpt-5.5",
-      "model_env": ["CODEX_MODEL"],
+      "model_env": [
+        "CODEX_MODEL"
+      ],
       "default_version": "0.145.0",
       "proxy_supported": true,
       "proxy_mode": "openai-native",
@@ -103,9 +109,11 @@
       "aliases": [],
       "default_model": "openai/gpt-5.5",
       "non_proxy_default_model": "openai-codex/gpt-5.5",
-      "model_env": ["PI_MODEL"],
+      "model_env": [
+        "PI_MODEL"
+      ],
       "version_env": "PI_VERSION",
-      "default_version": "0.80.3",
+      "default_version": "0.81.1",
       "proxy_supported": true,
       "proxy_mode": "openai-compatible",
       "source": {
@@ -116,11 +124,15 @@
       }
     },
     "oh-my-pi": {
-      "aliases": ["omp"],
+      "aliases": [
+        "omp"
+      ],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["OH_MY_PI_MODEL"],
+      "model_env": [
+        "OH_MY_PI_MODEL"
+      ],
       "version_env": "OH_MY_PI_VERSION",
-      "default_version": "16.3.11",
+      "default_version": "17.0.7",
       "runtime_versions": {
         "bun": {
           "env": "OH_MY_PI_BUN_VERSION",
@@ -140,7 +152,9 @@
     "opencode": {
       "aliases": [],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["OPENCODE_MODEL"],
+      "model_env": [
+        "OPENCODE_MODEL"
+      ],
       "version_env": "OPENCODE_VERSION",
       "default_version": "1.17.14",
       "proxy_supported": true,
@@ -151,22 +165,14 @@
         "default_path": "repos/opencode"
       }
     },
-    "mini-swe-agent": {
-      "aliases": ["mini"],
-      "default_model": "openai/gpt-5.5",
-      "model_env": ["MINI_SWE_AGENT_MODEL"],
-      "proxy_supported": true,
-      "proxy_mode": "litellm-openai-compatible",
-      "source": {
-        "mode": "mounted local source",
-        "env": "MINI_SWE_AGENT_REPO",
-        "default_path": "repos/mini-swe-agent"
-      }
-    },
     "kimi-code": {
-      "aliases": ["kimi"],
+      "aliases": [
+        "kimi"
+      ],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["KIMI_CODE_MODEL"],
+      "model_env": [
+        "KIMI_CODE_MODEL"
+      ],
       "default_version": "0.29.0",
       "proxy_supported": true,
       "proxy_mode": "openai-compatible",
@@ -178,9 +184,13 @@
       }
     },
     "gemini-cli": {
-      "aliases": ["gemini"],
+      "aliases": [
+        "gemini"
+      ],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["GEMINI_CLI_MODEL"],
+      "model_env": [
+        "GEMINI_CLI_MODEL"
+      ],
       "proxy_supported": true,
       "proxy_mode": "gemini-gateway-to-openai-compatible",
       "source": {
@@ -190,9 +200,13 @@
       }
     },
     "qwen-code": {
-      "aliases": ["qwen"],
+      "aliases": [
+        "qwen"
+      ],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["QWEN_CODE_MODEL"],
+      "model_env": [
+        "QWEN_CODE_MODEL"
+      ],
       "version_env": "QWEN_CODE_PACKAGE",
       "default_version": "@qwen-code/qwen-code@0.19.3",
       "proxy_supported": true,
@@ -201,28 +215,22 @@
     "goose": {
       "aliases": [],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["GOOSE_MODEL"],
+      "model_env": [
+        "GOOSE_MODEL"
+      ],
       "version_env": "GOOSE_VERSION",
       "default_version": "1.41.0",
       "proxy_supported": true,
       "proxy_mode": "openai-compatible"
     },
-    "opensage-adk": {
-      "aliases": ["opensage"],
-      "default_model": "openai/gpt-5.5",
-      "model_env": ["OPENSAGE_ADK_MODEL"],
-      "proxy_supported": true,
-      "proxy_mode": "litellm-openai-compatible",
-      "source": {
-        "mode": "mounted local source",
-        "env": "OPENSAGE_ADK_REPO",
-        "default_path": "repos/opensage-adk"
-      }
-    },
     "pydantic-ai-harness": {
-      "aliases": ["pydantic-ai"],
+      "aliases": [
+        "pydantic-ai"
+      ],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["PYDANTIC_AI_HARNESS_MODEL"],
+      "model_env": [
+        "PYDANTIC_AI_HARNESS_MODEL"
+      ],
       "proxy_supported": true,
       "proxy_mode": "openai-compatible",
       "source": {
@@ -231,40 +239,38 @@
         "default_path": "repos/pydantic-ai-harness"
       }
     },
-    "stirrup": {
-      "aliases": [],
-      "default_model": "openai/gpt-5.5",
-      "model_env": ["STIRRUP_MODEL"],
-      "proxy_supported": true,
-      "proxy_mode": "openai-compatible",
-      "source": {
-        "mode": "mounted local source",
-        "env": "STIRRUP_REPO",
-        "default_path": "repos/Stirrup"
-      }
-    },
     "jcode": {
       "aliases": [],
       "default_model": "openai/gpt-5.5",
-      "model_env": ["JCODE_TB_MODEL"],
+      "model_env": [
+        "JCODE_TB_MODEL"
+      ],
       "version_env": "JCODE_HARBOR_VERSION",
       "default_version": "v0.36.0",
       "proxy_supported": true,
       "proxy_mode": "openai-compatible"
     },
     "cursor-cli": {
-      "aliases": ["cursor"],
+      "aliases": [
+        "cursor"
+      ],
       "default_model": "composer-2.5",
-      "model_env": ["CURSOR_MODEL"],
+      "model_env": [
+        "CURSOR_MODEL"
+      ],
       "enabled": false,
       "proxy_supported": false,
       "proxy_mode": "native-only",
       "notes": "Disabled from --harness all unless Cursor native auth is configured; imports ~/.cursor CLI config/state."
     },
     "amp-code": {
-      "aliases": ["amp"],
+      "aliases": [
+        "amp"
+      ],
       "default_model": "amp/default",
-      "model_env": ["AMP_MODEL"],
+      "model_env": [
+        "AMP_MODEL"
+      ],
       "version_env": "AMP_VERSION",
       "default_version": "0.0.1783383739-g931303",
       "enabled": false,
@@ -273,19 +279,27 @@
       "notes": "Use `alex auth import amp` for billing + `alex wrap env amp` for AMP_URL capture. Full stream dump needs HTTPS_PROXY wrap (see alex-wrap). Actor protocol reroute still experimental."
     },
     "droid-cli": {
-      "aliases": ["droid"],
+      "aliases": [
+        "droid"
+      ],
       "default_model": "gpt-5.5",
       "non_proxy_default_model": "factory/default",
-      "model_env": ["DROID_MODEL"],
+      "model_env": [
+        "DROID_MODEL"
+      ],
       "proxy_supported": true,
       "proxy_mode": "openai-compatible",
       "version_policy": "Factory install script controlled by DROID_INSTALL_COMMAND; no public npm package pin found."
     },
     "grok-build": {
-      "aliases": ["grok"],
+      "aliases": [
+        "grok"
+      ],
       "default_model": "gpt-5.5",
       "non_proxy_default_model": "grok-build",
-      "model_env": ["GROK_MODEL"],
+      "model_env": [
+        "GROK_MODEL"
+      ],
       "version_env": "GROK_CLIENT_VERSION",
       "default_version": "0.2.77",
       "proxy_supported": true,
@@ -294,22 +308,19 @@
       "notes": "Uses the xAI Grok CLI (`agent`, falling back to `grok`) with XAI_API_KEY or imported ~/.grok auth."
     },
     "hermes": {
-      "aliases": ["hermes-agent"],
+      "aliases": [
+        "hermes-agent"
+      ],
       "default_model": "alex/gpt-5.5",
-      "model_env": ["HERMES_MODEL"],
+      "model_env": [
+        "HERMES_MODEL"
+      ],
       "version_env": "HERMES_VERSION",
       "default_version": "main",
       "commit_env": "HERMES_COMMIT",
       "default_commit": "88d1d6206f399c134d1f4c0b7db27733aaa3c50c",
       "proxy_supported": true,
       "proxy_mode": "litellm-openai-compatible"
-    },
-    "oracle": {
-      "aliases": [],
-      "default_model": null,
-      "model_env": [],
-      "proxy_supported": false,
-      "proxy_mode": "none"
     }
   }
 }

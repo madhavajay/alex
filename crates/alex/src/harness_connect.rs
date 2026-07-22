@@ -218,14 +218,6 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         install: None,
     },
     HarnessSpec {
-        name: "mini-swe-agent",
-        binary: "mini-swe-agent",
-        config_dir: mini_swe_agent_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
         name: "kimi",
         binary: "kimi",
         config_dir: kimi_config_dir_for_home,
@@ -260,25 +252,9 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         install: None,
     },
     HarnessSpec {
-        name: "opensage",
-        binary: "opensage",
-        config_dir: opensage_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
         name: "pydantic-ai",
         binary: "pydantic-ai",
         config_dir: pydantic_ai_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
-        name: "stirrup",
-        binary: "stirrup",
-        config_dir: stirrup_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
         install: None,
@@ -5012,9 +4988,6 @@ fn opencode_config_dir_for_home(home: &Path) -> PathBuf {
 fn omp_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".omp").join("agent")
 }
-fn mini_swe_agent_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".mini-swe-agent")
-}
 fn kimi_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".kimi-code")
 }
@@ -5024,14 +4997,8 @@ fn qwen_config_dir_for_home(home: &Path) -> PathBuf {
 fn goose_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".config").join("goose")
 }
-fn opensage_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".opensage")
-}
 fn pydantic_ai_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".pydantic-ai")
-}
-fn stirrup_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".stirrup")
 }
 fn jcode_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".jcode")
@@ -5885,7 +5852,7 @@ mod tests {
         );
 
         let statuses = harness_statuses(&config, None, true).await.unwrap();
-        assert_eq!(statuses.len(), 19);
+        assert_eq!(statuses.len(), 16);
         assert!(statuses.iter().any(|s| s.name == "opencode"));
         assert!(statuses.iter().any(|s| s.name == "amp"));
     }
