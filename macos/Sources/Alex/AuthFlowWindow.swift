@@ -67,15 +67,21 @@ final class AuthFlowModel {
                     force: force)
                 self.sessionUpdated(session)
             } catch {
-                let message = error.localizedDescription
-                if message.localizedCaseInsensitiveContains("session")
-                    && message.localizedCaseInsensitiveContains("pending")
-                {
-                    self.stage = .pendingConflict
-                } else {
-                    self.fail(message)
-                }
+                self.loginStartFailed(error)
             }
+        }
+    }
+
+    /// Kept separate from daemon startup so the pending-session transition is
+    /// deterministic and testable without opening a window or making a request.
+    func loginStartFailed(_ error: Error) {
+        let message = error.localizedDescription
+        if message.localizedCaseInsensitiveContains("session")
+            && message.localizedCaseInsensitiveContains("pending")
+        {
+            stage = .pendingConflict
+        } else {
+            fail(message)
         }
     }
 
