@@ -130,6 +130,50 @@ jobs:
       - run: cargo test --workspace
       - run: cargo package -p alex-core
 
+  mock-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [namespace-profile-linux-medium, namespace-profile-mac-medium]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mock-matrix
+      - name: Credential-free mock tier (daemon + fakeprov)
+        run: ./test.sh mock
+      - name: Fakeprov router integration
+        run: cargo test -p alex-proxy --test fakeprov_router -- --nocapture
+      - name: Fakeprov crate suite
+        run: cargo test -p alex-fakeprov
+
+  webui:
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: webui
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build daemon and fakeprov
+        run: cargo build -p alex -p alex-fakeprov
+      - name: Install Playwright
+        working-directory: webui-tests
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+      - name: Web UI suite against mock stack
+        working-directory: webui-tests
+        run: pnpm test
+
   swift:
     runs-on: namespace-profile-mac-medium
     steps:
