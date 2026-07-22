@@ -513,6 +513,26 @@ enum FixturesCommand {
     Show {
         name: String,
     },
+    /// Export sanitized wire transactions from captured traces
+    Record {
+        /// Provider captured in the selected traces
+        #[arg(long)]
+        provider: String,
+        /// Exact trace id to export; repeat for multiple transactions
+        #[arg(long = "trace-id", conflicts_with_all = ["since", "limit"])]
+        trace_ids: Vec<String>,
+        #[command(flatten)]
+        filter: TraceSelectionArgs,
+        /// Fixture root directory
+        #[arg(long, default_value = "crates/alex-fakeprov/fixtures")]
+        out: PathBuf,
+    },
+    /// Generate the fixture provenance ledger
+    Inventory {
+        /// Fixture root directory
+        #[arg(long, default_value = "crates/alex-fakeprov/fixtures")]
+        dir: PathBuf,
+    },
     Save {
         #[arg(long)]
         name: String,
@@ -1039,11 +1059,19 @@ enum TracesCommand {
     },
 }
 
-#[derive(clap::Args)]
-struct TraceFilterArgs {
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+struct TraceSelectionArgs {
     /// RFC3339 timestamp or relative (30m, 2h, 7d, 45s)
     #[arg(long)]
     since: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(clap::Args)]
+struct TraceFilterArgs {
+    #[command(flatten)]
+    selection: TraceSelectionArgs,
     #[arg(long)]
     until: Option<String>,
     #[arg(long)]
@@ -1067,8 +1095,6 @@ struct TraceFilterArgs {
     errors: bool,
     #[arg(long)]
     key_fingerprint: Option<String>,
-    #[arg(long)]
-    limit: Option<usize>,
     /// Skip this many matching trace summaries (bounded by the daemon)
     #[arg(long)]
     offset: Option<usize>,
@@ -1078,7 +1104,7 @@ impl TraceFilterArgs {
     fn query_params(&self) -> Vec<(&'static str, String)> {
         let mut params: Vec<(&'static str, String)> = Vec::new();
         let opts = [
-            ("since", &self.since),
+            ("since", &self.selection.since),
             ("until", &self.until),
             ("run_id", &self.run_id),
             ("session", &self.session),
@@ -1100,7 +1126,7 @@ impl TraceFilterArgs {
         if self.errors {
             params.push(("errors", "1".into()));
         }
-        if let Some(l) = self.limit {
+        if let Some(l) = self.selection.limit {
             params.push(("limit", l.to_string()));
         }
         if let Some(offset) = self.offset {
@@ -5280,6 +5306,41 @@ async fn main() -> Result<()> {
                 if !status.is_success() {
                     anyhow::bail!("fixture delete failed: {body}");
                 }
+            }
+            FixturesCommand::Record {
+                provider,
+                trace_ids,
+                filter,
+                out,
+            } => {
+                let limit = filter.limit.unwrap_or(20);
+                if limit == 0 {
+                    anyhow::bail!("--limit must be positive");
+                }
+                let since_ms = filter
+                    .since
+                    .as_deref()
+                    .map(|value| {
+                        alex_core::parse_since(value, now_ms())
+                            .with_context(|| format!("invalid --since value '{value}'"))
+                    })
+                    .transpose()?;
+                let store = Store::open(config.data_dir.clone())?;
+                let report = alex_store::recording::record_fixtures(
+                    &store,
+                    &alex_store::recording::RecordFixturesOptions {
+                        provider,
+                        trace_ids,
+                        since_ms,
+                        limit,
+                        out_dir: out,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            FixturesCommand::Inventory { dir } => {
+                let inventory = alex_store::recording::write_inventory(&dir)?;
+                println!("{}", inventory.display());
             }
             FixturesCommand::Save {
                 name,
@@ -11306,6 +11367,65 @@ mod tests {
             }
             _ => panic!("unexpected CLIProxyAPI reverse export parse"),
         }
+    }
+
+    #[test]
+    fn fixture_recording_cli_supports_ids_or_shared_trace_filters() {
+        let cli = Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--trace-id",
+            "trace-a",
+            "--trace-id",
+            "trace-b",
+            "--out",
+            "fixtures",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Fixtures {
+                command:
+                    FixturesCommand::Record {
+                        provider,
+                        trace_ids,
+                        filter,
+                        out,
+                    },
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(trace_ids, ["trace-a", "trace-b"]);
+                assert_eq!(filter, TraceSelectionArgs::default());
+                assert_eq!(out, PathBuf::from("fixtures"));
+            }
+            _ => panic!("unexpected fixture record parse"),
+        }
+        assert!(Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--trace-id",
+            "trace-a",
+            "--since",
+            "2h",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--since",
+            "2h",
+            "--limit",
+            "10",
+        ])
+        .is_ok());
     }
 
     #[test]

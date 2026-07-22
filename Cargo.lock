@@ -231,6 +231,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "flate2",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
