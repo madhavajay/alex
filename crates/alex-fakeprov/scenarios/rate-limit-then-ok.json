@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "POST /v1/messages": [{"failure": "429"}, {"use_default": true}],
+    "POST /v1/chat/completions": [{"failure": "429"}, {"use_default": true}],
+    "POST /v1/responses": [{"failure": "429"}, {"use_default": true}],
+    "POST /backend-api/codex/responses": [{"failure": "429"}, {"use_default": true}]
+  }
+}

@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_cliproxyapi_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"cpa/echo","choices":[{"index":0,"delta":{"role":"assistant","content":"cliproxyapi-v1-ok"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_cliproxyapi_fakeprov_stream_0001","object":"chat.completion.chunk","created":1700000000,"model":"cpa/echo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

@@ -17,10 +17,11 @@ use alex_auth::{
     BundleSelection, RemovedAccount, Vault,
 };
 use alex_core::{
-    compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
-    parse_trace_tags, parse_usage_api_response, quota_state, route_model, usage_from_json,
+    allowed_override_url, compute_cost, conversation_root, grok_credits_endpoint,
+    parse_grpc_web_response, parse_since, parse_sse_usage, parse_trace_tags,
+    parse_usage_api_response, quota_state, resolve_endpoint_override, route_model, usage_from_json,
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
-    TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+    TraceIngestPayload, TraceRecord, GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{KnownAccount, Store, ToolCallRecord, TraceBodyKind, TraceFilter};
 use anyhow::Result;
@@ -51,6 +52,7 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+const AMP_BASE: &str = "https://ampcode.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -646,6 +648,8 @@ pub struct AppState {
     /// seam exists so local integrations can exercise the complete dispatch,
     /// retry, and translation path without contacting a live provider.
     upstream_base_overrides: std::sync::RwLock<HashMap<Provider, String>>,
+    codex_base_override: std::sync::RwLock<Option<String>>,
+    gemini_code_assist_base_override: std::sync::RwLock<Option<String>>,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
     /// Set before graceful shutdown begins. Background provider probes use it
@@ -1040,6 +1044,8 @@ pub fn build_state_with_substitution(
         store: store.clone(),
         http,
         upstream_base_overrides: std::sync::RwLock::new(HashMap::new()),
+        codex_base_override: std::sync::RwLock::new(None),
+        gemini_code_assist_base_override: std::sync::RwLock::new(None),
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1105,16 +1111,96 @@ fn upstream_base(state: &AppState, provider: Provider, default: &str) -> String 
         .to_string()
 }
 
-/// Overrides one provider's dispatch base. This deliberately changes only
-/// model traffic; usage/auth endpoints retain their provider-owned URLs.
-/// Primarily used by deterministic middleware and wire integration tests.
+fn dedicated_upstream_base(
+    override_slot: &std::sync::RwLock<Option<String>>,
+    default: &str,
+) -> String {
+    override_slot
+        .read()
+        .ok()
+        .and_then(|override_url| override_url.clone())
+        .unwrap_or_else(|| default.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn codex_upstream_base(state: &AppState) -> String {
+    dedicated_upstream_base(&state.codex_base_override, CODEX_BASE)
+}
+
+fn gemini_code_assist_upstream_base(state: &AppState) -> String {
+    dedicated_upstream_base(
+        &state.gemini_code_assist_base_override,
+        GEMINI_CODE_ASSIST_BASE,
+    )
+}
+
 pub fn set_upstream_base_override(
     state: &Arc<AppState>,
     provider: Provider,
     base_url: impl Into<String>,
 ) {
+    let base_url = base_url.into();
+    if !allowed_override_url(&base_url) {
+        return;
+    }
     if let Ok(mut overrides) = state.upstream_base_overrides.write() {
-        overrides.insert(provider, base_url.into());
+        overrides.insert(provider, base_url);
+    }
+}
+
+pub fn set_codex_base_override(state: &Arc<AppState>, base_url: impl Into<String>) {
+    let base_url = base_url.into();
+    if allowed_override_url(&base_url) {
+        if let Ok(mut slot) = state.codex_base_override.write() {
+            *slot = Some(base_url);
+        }
+    }
+}
+
+pub fn set_gemini_code_assist_base_override(state: &Arc<AppState>, base_url: impl Into<String>) {
+    let base_url = base_url.into();
+    if allowed_override_url(&base_url) {
+        if let Ok(mut slot) = state.gemini_code_assist_base_override.write() {
+            *slot = Some(base_url);
+        }
+    }
+}
+
+pub fn apply_upstream_env_overrides(state: &Arc<AppState>) {
+    for (provider, env, default) in [
+        (
+            Provider::Anthropic,
+            "ALEX_UPSTREAM_ANTHROPIC_URL",
+            ANTHROPIC_BASE,
+        ),
+        (Provider::Openai, "ALEX_UPSTREAM_OPENAI_URL", OPENAI_BASE),
+        (Provider::Xai, "ALEX_UPSTREAM_XAI_URL", XAI_BASE),
+        (
+            Provider::Gemini,
+            "ALEX_UPSTREAM_GEMINI_URL",
+            GEMINI_API_BASE,
+        ),
+        (
+            Provider::Openrouter,
+            "ALEX_UPSTREAM_OPENROUTER_URL",
+            OPENROUTER_BASE,
+        ),
+        (Provider::Kimi, "ALEX_UPSTREAM_KIMI_URL", KIMI_BASE),
+        (Provider::Amp, "ALEX_UPSTREAM_AMP_URL", AMP_BASE),
+    ] {
+        if let Some(url) = resolve_endpoint_override(env, default) {
+            set_upstream_base_override(state, provider, url);
+        }
+    }
+    if let Some(url) = resolve_endpoint_override("ALEX_UPSTREAM_CODEX_URL", CODEX_BASE) {
+        set_codex_base_override(state, url);
+    }
+    if let Some(url) = resolve_endpoint_override(
+        "ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL",
+        GEMINI_CODE_ASSIST_BASE,
+    ) {
+        set_gemini_code_assist_base_override(state, url);
     }
 }
 
@@ -1508,8 +1594,8 @@ pub async fn kimi_catalog_models(state: &AppState) -> Vec<String> {
 
 /// Kimi's usage/quota endpoint (discovered in the kimi node binary:
 /// `managedUsageUrl` -> `${base}/usages`, GET with a Bearer token).
-fn kimi_usage_url() -> String {
-    format!("{KIMI_BASE}/usages")
+fn kimi_usage_url(state: &AppState) -> String {
+    format!("{}/usages", upstream_base(state, Provider::Kimi, KIMI_BASE))
 }
 
 fn kimi_usage_num(raw: &Value, key: &str) -> Option<i64> {
@@ -1633,7 +1719,7 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
     };
     let resp = state
         .http
-        .get(kimi_usage_url())
+        .get(kimi_usage_url(state))
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/json")
         .timeout(Duration::from_secs(15))
@@ -3574,7 +3660,10 @@ pub async fn refresh_openrouter_models(state: &AppState) {
     };
     let Ok(response) = state
         .http
-        .get(format!("{OPENROUTER_BASE}/models"))
+        .get(format!(
+            "{}/models",
+            upstream_base(state, Provider::Openrouter, OPENROUTER_BASE)
+        ))
         .headers(headers)
         .timeout(Duration::from_secs(5))
         .send()
@@ -4175,7 +4264,10 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         || async move {
             let result = state
                 .http
-                .get(format!("{ANTHROPIC_BASE}/api/oauth/usage"))
+                .get(format!(
+                    "{}/api/oauth/usage",
+                    upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE)
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
                 .header("accept", "application/json")
@@ -4238,8 +4330,6 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     .await
 }
 
-const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
-
 /// Amp Free / individual / workspace credits via the same API CodexBar uses.
 async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     let account = state.vault.account_for(Provider::Amp, false).await.ok()?;
@@ -4256,7 +4346,10 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
             let body = json!({ "method": "userDisplayBalanceInfo", "params": {} });
             let result = state
                 .http
-                .post(AMP_USAGE_URL)
+                .post(format!(
+                    "{}/api/internal?userDisplayBalanceInfo",
+                    upstream_base(state, Provider::Amp, AMP_BASE)
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .header("accept", "application/json")
                 .header("content-type", "application/json")
@@ -4336,7 +4429,7 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         || async move {
             let result = state
                 .http
-                .post(GROK_CREDITS_ENDPOINT)
+                .post(grok_credits_endpoint())
                 .header("authorization", format!("Bearer {token}"))
                 .header("origin", "https://grok.com")
                 .header("referer", "https://grok.com/?_s=usage")
@@ -9206,7 +9299,8 @@ async fn ensure_gemini_project(
             "gemini account has no access token".into(),
         )
     })?;
-    let load_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
+    let code_assist_base = gemini_code_assist_upstream_base(state);
+    let load_url = format!("{code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
     let load_body = json!({
         "cloudaicompanionProject": null,
         "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"},
@@ -9270,7 +9364,7 @@ async fn ensure_gemini_project(
         .and_then(|t| t["id"].as_str())
         .unwrap_or("free-tier")
         .to_string();
-    let onboard_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
+    let onboard_url = format!("{code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
     let onboard_body = json!({
         "tierId": tier,
         "cloudaicompanionProject": load["cloudaicompanionProject"],
@@ -9497,11 +9591,11 @@ async fn plan_upstream(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
-            let openai_base = upstream_base(
-                state,
-                Provider::Openai,
-                if oauth { CODEX_BASE } else { OPENAI_BASE },
-            );
+            let openai_base = if oauth {
+                codex_upstream_base(state)
+            } else {
+                upstream_base(state, Provider::Openai, OPENAI_BASE)
+            };
             bind_codex_account(state, affinity_session, &account);
             match format {
                 ClientFormat::OpenaiChat if !oauth => {
@@ -9637,6 +9731,7 @@ async fn plan_upstream(
             }
         }
         Provider::Xai => {
+            let xai_base = upstream_base(state, Provider::Xai, XAI_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
@@ -9652,7 +9747,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{XAI_BASE}/chat/completions"),
+                        url: format!("{xai_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9676,7 +9771,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{XAI_BASE}/chat/completions"),
+                        url: format!("{xai_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9787,6 +9882,7 @@ async fn plan_upstream(
             }
         }
         Provider::Openrouter => {
+            let openrouter_base = upstream_base(state, Provider::Openrouter, OPENROUTER_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
@@ -9798,7 +9894,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        url: format!("{openrouter_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9820,7 +9916,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        url: format!("{openrouter_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9869,6 +9965,7 @@ async fn plan_upstream(
             }
         }
         Provider::Kimi => {
+            let kimi_base = upstream_base(state, Provider::Kimi, KIMI_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
@@ -9880,7 +9977,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{KIMI_BASE}/chat/completions"),
+                        url: format!("{kimi_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9902,7 +9999,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{KIMI_BASE}/chat/completions"),
+                        url: format!("{kimi_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -9928,6 +10025,8 @@ async fn plan_upstream(
             "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
         )),
         Provider::Gemini => {
+            let gemini_api_base = upstream_base(state, Provider::Gemini, GEMINI_API_BASE);
+            let gemini_code_assist_base = gemini_code_assist_upstream_base(state);
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
                 .vault
@@ -9967,9 +10066,8 @@ async fn plan_upstream(
             };
             let (url, body) = if account.kind == "api_key" {
                 // AI Studio: plain request, model in the path, x-goog-api-key header.
-                let mut url = format!(
-                    "{GEMINI_API_BASE}/v1beta/models/{routed_model}:{method}"
-                );
+                let mut url =
+                    format!("{gemini_api_base}/v1beta/models/{routed_model}:{method}");
                 if client_stream {
                     url.push_str("?alt=sse");
                 }
@@ -9980,7 +10078,7 @@ async fn plan_upstream(
                 // Code Assist (OAuth): wrapped envelope + project.
                 let project = ensure_gemini_project(state, &account).await?;
                 let mut url = format!(
-                    "{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
+                    "{gemini_code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
                 );
                 if client_stream {
                     url.push_str("?alt=sse");
@@ -13478,6 +13576,12 @@ async fn proxy(
                     return error_response(status, &msg);
                 }
             };
+            if let Some(value) = headers
+                .get("x-mock-fail")
+                .filter(|_| allowed_override_url(&plan.url))
+            {
+                up_headers.insert("x-mock-fail", value.clone());
+            }
             if current_provider == Provider::Cliproxyapi {
                 let route_chain = upstream_route_chain(&headers, "alex");
                 if let Ok(value) = HeaderValue::from_str(&route_chain) {
@@ -18280,74 +18384,63 @@ mod tests {
     /// middleware rerouting/provenance, and durable recovery after restart.
     #[tokio::test]
     async fn deterministic_platform_smoke_daemon_route_trace_and_restart_recovery() {
-        use axum::routing::post;
+        use alex_fakeprov::{Config as FakeProvConfig, FakeProv, ResponseSpec};
 
-        let received_models = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let captured_models = received_models.clone();
-        let upstream = Router::new().route(
-            "/v1/chat/completions",
-            post(move |axum::Json(body): axum::Json<Value>| {
-                let captured_models = captured_models.clone();
-                async move {
-                    let model = body["model"].as_str().unwrap_or_default().to_string();
-                    captured_models.lock().await.push(model.clone());
-                    match model.as_str() {
-                        "smoke/stream" => {
-                            assert_eq!(body["stream"], true);
-                            let chunks = [
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
-                            ];
-                            let mut sse = chunks
-                                .into_iter()
-                                .map(|chunk| format!("data: {chunk}\n\n"))
-                                .collect::<String>();
-                            sse.push_str("data: [DONE]\n\n");
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/event-stream")
-                                .body(Body::from(sse))
-                                .unwrap()
-                        }
-                        "smoke/fail" => (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}})),
-                        )
-                            .into_response(),
-                        "smoke/fallback" => axum::Json(json!({
-                            "id": "mock-fallback",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "fallback ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-                        }))
-                        .into_response(),
-                        "smoke/model" => axum::Json(json!({
-                            "id": "mock-completion",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "mock ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                        }))
-                        .into_response(),
-                        other => panic!("unexpected smoke model {other}"),
-                    }
-                }
-            }),
-        );
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_server = tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream).await.unwrap();
-        });
+        let upstream = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
+        let chunks = [
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
+        ];
+        let mut stream = chunks
+            .into_iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        stream.push_str("data: [DONE]\n\n");
+        for response in [
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-completion",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "mock ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                })),
+                ..Default::default()
+            },
+            ResponseSpec {
+                raw_body: Some(stream),
+                content_type: Some("text/event-stream".into()),
+                ..Default::default()
+            },
+            ResponseSpec {
+                status: Some(503),
+                body: Some(
+                    json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}}),
+                ),
+                ..Default::default()
+            },
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-fallback",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "fallback ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                })),
+                ..Default::default()
+            },
+        ] {
+            upstream.queue("POST /v1/chat/completions", response).await;
+        }
+        let upstream_base = upstream.base_url().to_string();
 
         let root = tmpdir("deterministic-platform-smoke");
         let store_root = root.join("store");
@@ -18364,7 +18457,7 @@ mod tests {
             set_exo_config(
                 &state,
                 ExoConfig {
-                    url: format!("http://{upstream_addr}"),
+                    url: upstream_base.clone(),
                     enabled_models: vec![
                         "smoke/model".into(),
                         "smoke/stream".into(),
@@ -18372,7 +18465,7 @@ mod tests {
                     ],
                 },
             );
-            set_upstream_base_override(&state, Provider::Openai, format!("http://{upstream_addr}"));
+            set_upstream_base_override(&state, Provider::Openai, upstream_base.clone());
             state
         };
         let serve = |state: Arc<AppState>| async move {
@@ -18575,8 +18668,18 @@ mod tests {
         assert_eq!(attempts[1]["provider"], "exo");
         assert_eq!(attempts[1]["model"], "smoke/fallback");
         assert_eq!(attempts[1]["status"], 200);
+        let requests = upstream.requests().await;
+        let request_bodies = requests
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(request_bodies[1]["stream"], true);
         assert_eq!(
-            *received_models.lock().await,
+            request_bodies
+                .iter()
+                .map(|body| body["model"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec![
                 "smoke/model",
                 "smoke/stream",
@@ -18685,7 +18788,7 @@ mod tests {
             .any(|rule| rule["id"] == middleware_id && rule["enabled"] == true));
 
         restarted_server.abort();
-        upstream_server.abort();
+        upstream.shutdown().await;
     }
 
     #[tokio::test]
@@ -20713,6 +20816,179 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    async fn override_path_listener(
+        response: Value,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = paths.clone();
+        let app = Router::new().fallback(axum::routing::any(
+            move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                let seen = seen.clone();
+                let response = response.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    axum::Json(response)
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), paths, server)
+    }
+
+    #[tokio::test]
+    async fn provider_dispatch_overrides_reach_each_local_upstream_path() {
+        let state = test_state("provider-dispatch-overrides");
+        let cases = [
+            (
+                Provider::Anthropic,
+                ClientFormat::AnthropicMessages,
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5",
+                "/v1/messages",
+                "",
+                "/v1/messages",
+            ),
+            (
+                Provider::Xai,
+                ClientFormat::OpenaiChat,
+                "grok-4",
+                "grok-4",
+                "/v1/chat/completions",
+                "/v1",
+                "/v1/chat/completions",
+            ),
+            (
+                Provider::Kimi,
+                ClientFormat::OpenaiChat,
+                "kimi/k3",
+                "k3",
+                "/v1/chat/completions",
+                "/coding/v1",
+                "/coding/v1/chat/completions",
+            ),
+            (
+                Provider::Openrouter,
+                ClientFormat::OpenaiChat,
+                "openrouter/anthropic/claude-sonnet-4",
+                "anthropic/claude-sonnet-4",
+                "/v1/chat/completions",
+                "/api/v1",
+                "/api/v1/chat/completions",
+            ),
+            (
+                Provider::Gemini,
+                ClientFormat::GeminiGenerate,
+                "gemini/gemini-2.5-pro",
+                "gemini-2.5-pro",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+            ),
+        ];
+        let mut servers = Vec::new();
+
+        for (
+            provider,
+            format,
+            requested_model,
+            routed_model,
+            client_path,
+            base_path,
+            expected_path,
+        ) in cases
+        {
+            state
+                .vault
+                .upsert(test_api_account(
+                    &format!("{}-override", provider.as_str()),
+                    provider,
+                ))
+                .await
+                .unwrap();
+            let upstream_response = match provider {
+                Provider::Anthropic => json!({
+                    "id": "msg_override",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": routed_model,
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }),
+                Provider::Gemini => json!({
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "ok"}]},
+                        "finishReason": "STOP",
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2,
+                    },
+                }),
+                _ => json!({
+                    "id": "chat_override",
+                    "object": "chat.completion",
+                    "model": routed_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }),
+            };
+            let (base, paths, server) = override_path_listener(upstream_response).await;
+            servers.push(server);
+            set_upstream_base_override(&state, provider, format!("{base}{base_path}"));
+
+            let request = json!({
+                "model": requested_model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false,
+            });
+            let response = proxy(
+                state.clone(),
+                format,
+                client_path,
+                local_proxy_headers(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(paths.lock().unwrap().as_slice(), [expected_path]);
+        }
+
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn override_urls_are_absent_from_connect_and_credentials_payloads() {
+        let state = test_state("override-redaction");
+        let marker = "http://127.0.0.1:43210/override-marker";
+        set_upstream_base_override(&state, Provider::Anthropic, marker);
+        set_codex_base_override(&state, marker);
+        set_gemini_code_assist_base_override(&state, marker);
+
+        let (connect, exports) = connect_payload(&state.base_url, "alx-local");
+        assert!(!connect.to_string().contains("override-marker"));
+        assert!(!exports.contains("override-marker"));
+
+        let (_, credentials) = response_json(admin_credentials(State(state)).await).await;
+        assert!(!credentials.to_string().contains("override-marker"));
     }
 
     #[test]

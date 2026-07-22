@@ -29,24 +29,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_openrouter_models_payload() {
-        let payload = json!({
-            "data": [
-                {"id": "anthropic/claude-3.5-sonnet", "name": "Claude"},
-                {"id": "openai/gpt-4o"},
-                {"id": "meta-llama/llama-3.1-70b-instruct"},
-                {"id": "openai/gpt-4o"},
-                {"id": ""},
-                {"name": "missing id"}
-            ]
-        });
+    fn parses_realistic_openrouter_catalog_with_extra_fields() {
+        let payload: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/openrouter_models.json")).unwrap();
         assert_eq!(
             parse_models_response(&payload),
             vec![
-                "anthropic/claude-3.5-sonnet",
-                "openai/gpt-4o",
-                "meta-llama/llama-3.1-70b-instruct",
+                "anthropic/claude-sonnet-4",
+                "openai/gpt-5",
+                "google/gemini-2.5-pro",
             ]
         );
+    }
+
+    #[test]
+    fn model_catalog_edge_cases_are_ignored_without_reordering_valid_ids() {
+        let cases = [
+            ("empty list", json!({"data": []}), Vec::<String>::new()),
+            ("missing data", json!({}), Vec::new()),
+            ("wrong data type", json!({"data": {"id": "m"}}), Vec::new()),
+            (
+                "missing and invalid ids",
+                json!({
+                    "data": [
+                        {"name": "missing"},
+                        {"id": null},
+                        {"id": 7},
+                        {"id": "   "},
+                        {"id": " valid/model ", "unexpected": {"nested": true}},
+                        {"id": "valid/model"},
+                        {"id": "second/model", "extra": [1, 2, 3]}
+                    ],
+                    "unexpected_top_level": true
+                }),
+                vec!["valid/model".to_string(), "second/model".to_string()],
+            ),
+        ];
+
+        for (name, payload, expected) in cases {
+            assert_eq!(parse_models_response(&payload), expected, "{name}");
+        }
     }
 }

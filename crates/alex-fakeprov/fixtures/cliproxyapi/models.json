@@ -1,0 +1,8 @@
+{
+  "object": "list",
+  "data": [
+    {"id": "cpa/echo", "object": "model", "owned_by": "cliproxyapi"},
+    {"id": "cpa/tool", "object": "model", "owned_by": "cliproxyapi"},
+    {"id": "cpa/rate", "object": "model", "owned_by": "cliproxyapi"}
+  ]
+}

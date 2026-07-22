@@ -127,6 +127,23 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "alex-fakeprov"
+version = "0.1.25"
+dependencies = [
+ "alex-core",
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -180,6 +197,7 @@ version = "0.1.25"
 dependencies = [
  "alex-auth",
  "alex-core",
+ "alex-fakeprov",
  "alex-middleware",
  "alex-store",
  "anyhow",
@@ -213,6 +231,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "flate2",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

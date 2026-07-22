@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Alex test suite (TODO.md section 11): ./test.sh [unit|wire|harness|cliproxyapi|dario|all] [flags]
+# Alex test suite (TODO.md section 11): ./test.sh [unit|mock|webui|wire|harness|cliproxyapi|dario|all] [flags]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,14 +26,16 @@ Usage: ./test.sh [TIER ...] [flags]
 
 Tiers (default: unit wire):
   unit      cargo test --workspace
+  mock      credential-free CLI + daemon tier against alex-fakeprov (M1..M6)
+  webui     Playwright Chromium suite against an isolated daemon + alex-fakeprov
   wire      curl-level matrix through the proxy (W1..W12), all cells parallel
   harness   Docker harness matrix (H1..H7), parallel
   cliproxyapi pinned real CLIProxyAPI v7 Docker matrix, both proxy directions
   dario     dario supervisor cells (SKIP cleanly when /admin/dario is absent)
-  all       unit + wire + harness + cliproxyapi + dario
+  all       unit + mock + webui + wire + harness + cliproxyapi + dario
 
 Flags:
-  --only W1,H2,...        run only these cell ids (UNIT, W*, H*, CLIPROXYAPI, DARIO; W11 matches W11a+W11b)
+  --only M1,W1,H2,...     run only these cell ids (UNIT, M*, WEBUI, W*, H*, CLIPROXYAPI, DARIO; W11 matches W11a+W11b)
   --provider P            anthropic|openai|xai - only cells needing provider P
   --harness H             claude|codex|grok-build|kimi - only these harness cells
   --jobs N                max parallel cells (default: CPU count; harness capped at 4)
@@ -63,7 +65,7 @@ need_val() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    unit|wire|harness|cliproxyapi|dario|all) TIERS="$TIERS $1" ;;
+    unit|mock|webui|wire|harness|cliproxyapi|dario|all) TIERS="$TIERS $1" ;;
     --only)        need_val "$@"; ONLY=$2; shift ;;
     --only=*)      ONLY=${1#*=} ;;
     --provider)    need_val "$@"; PROVIDER_FILTER=$2; shift ;;
@@ -94,7 +96,7 @@ done
 if [ -z "$TIERS" ]; then
   TIERS="unit wire"
 fi
-case " $TIERS " in *" all "*) TIERS="unit wire harness cliproxyapi dario" ;; esac
+case " $TIERS " in *" all "*) TIERS="unit mock webui wire harness cliproxyapi dario" ;; esac
 
 has_tier() {
   case " $TIERS " in *" $1 "*) return 0 ;; esac
@@ -167,12 +169,21 @@ RESULTS="$TMP/results"
 PRE="$TMP/pre"
 mkdir -p "$RESULTS" "$PRE"
 DAEMON_PID=""
+MOCK_DAEMON_PID=""
+FAKEPROV_PID=""
 
 cleanup() {
   rc=$?
   if [ -n "$DAEMON_PID" ]; then
     pkill -P "$DAEMON_PID" 2>/dev/null || true
     kill "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [ -n "$MOCK_DAEMON_PID" ]; then
+    pkill -P "$MOCK_DAEMON_PID" 2>/dev/null || true
+    kill "$MOCK_DAEMON_PID" 2>/dev/null || true
+  fi
+  if [ -n "$FAKEPROV_PID" ]; then
+    kill "$FAKEPROV_PID" 2>/dev/null || true
   fi
   rm -rf "$TMP"
   exit "$rc"
@@ -847,6 +858,262 @@ run_unit_tier() {
   fi
 }
 
+run_webui_tier() {
+  in_only WEBUI || return 0
+  log "== webui: Playwright Chromium suite =="
+  local t0 t1 rc=0
+  t0=$(now_ms)
+  (cd "$ROOT/webui-tests" && pnpm test) >&2 || rc=$?
+  t1=$(now_ms)
+  if [ "$rc" -eq 0 ]; then
+    write_result WEBUI PASS "$((t1 - t0))" "pnpm test"
+  else
+    write_result WEBUI FAIL "$((t1 - t0))" "pnpm test exited $rc"
+  fi
+}
+
+mock_env() {
+  ALEX_HOME="$1" \
+  ALEX_UPSTREAM_ANTHROPIC_URL="$2" \
+  ALEX_UPSTREAM_OPENAI_URL="$2" \
+  ALEX_UPSTREAM_CODEX_URL="$2" \
+  ALEX_UPSTREAM_XAI_URL="$2" \
+  ALEX_UPSTREAM_GEMINI_URL="$2" \
+  ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL="$2" \
+  ALEX_UPSTREAM_OPENROUTER_URL="$2" \
+  ALEX_UPSTREAM_KIMI_URL="$2" \
+  ALEX_UPSTREAM_AMP_URL="$2" \
+  "${@:3}"
+}
+
+run_mock_m1() {
+  in_only M1 || return 0
+  local base=$1 key=$2 out="$TMP/mock-m1.json" t0 t1 code session="mock-m1-$$"
+  t0=$(now_ms)
+  code=$(curl -sS --max-time "$WIRE_TIMEOUT" -o "$out" -w '%{http_code}' \
+    -H "x-api-key: $key" -H 'content-type: application/json' \
+    -H "x-session-id: $session" -H 'x-alex-harness: mock-tier' \
+    -d '{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"mock anthropic"}]}' \
+    "$base/v1/messages" 2>"$TMP/mock-m1.err" || echo 000)
+  t1=$(now_ms)
+  if [ "$code" = "200" ] && python3 - "$out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["content"][0]["text"] == "Fake Anthropic response."
+assert d["usage"]["input_tokens"] == 8 and d["usage"]["output_tokens"] == 4
+PY
+  then
+    write_result M1 PASS "$((t1-t0))" "anthropic completion returned expected text and usage"
+  else
+    write_result M1 FAIL "$((t1-t0))" "http $code: $(head -c 180 "$out" 2>/dev/null)"
+  fi
+}
+
+run_mock_m2() {
+  in_only M2 || return 0
+  local base=$1 key=$2 out="$TMP/mock-m2.json" t0 t1 code session="mock-m2-$$"
+  t0=$(now_ms)
+  code=$(curl -sS --max-time "$WIRE_TIMEOUT" -o "$out" -w '%{http_code}' \
+    -H "x-api-key: $key" -H 'content-type: application/json' \
+    -H "x-session-id: $session" -H 'x-alex-harness: mock-tier' \
+    -d '{"model":"gpt-4.1","messages":[{"role":"user","content":"mock openai"}]}' \
+    "$base/v1/chat/completions" 2>"$TMP/mock-m2.err" || echo 000)
+  t1=$(now_ms)
+  if [ "$code" = "200" ] && python3 - "$out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["choices"][0]["message"]["content"] == "Fake OpenAI chat response."
+assert d["usage"]["prompt_tokens"] == 8 and d["usage"]["completion_tokens"] == 4
+PY
+  then
+    write_result M2 PASS "$((t1-t0))" "openai chat completion returned expected text and usage"
+  else
+    write_result M2 FAIL "$((t1-t0))" "http $code: $(head -c 180 "$out" 2>/dev/null)"
+  fi
+}
+
+run_mock_m3() {
+  in_only M3 || return 0
+  local base=$1 key=$2 out="$TMP/mock-m3.json" t0 t1 code
+  t0=$(now_ms)
+  code=$(curl -sS --max-time "$WIRE_TIMEOUT" -o "$out" -w '%{http_code}' \
+    -H "x-api-key: $key" -H 'content-type: application/json' -H 'x-mock-fail: 429' \
+    -H "x-session-id: mock-m3-$$" -H 'x-alex-harness: mock-tier' \
+    -d '{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"mock failure"}]}' \
+    "$base/v1/messages" 2>"$TMP/mock-m3.err" || echo 000)
+  t1=$(now_ms)
+  if [ "$code" = "429" ] && python3 - "$out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["type"] == "error"
+assert d["error"]["type"] == "rate_limit_error"
+assert d["error"]["message"] == "rate limit exceeded"
+PY
+  then
+    write_result M3 PASS "$((t1-t0))" "x-mock-fail surfaced native anthropic 429 error"
+  else
+    write_result M3 FAIL "$((t1-t0))" "http $code: $(head -c 180 "$out" 2>/dev/null)"
+  fi
+}
+
+run_mock_m4() {
+  in_only M4 || return 0
+  local base=$1 key=$2 out="$TMP/mock-m4.json" t0 t1 code msg
+  t0=$(now_ms)
+  code=$(curl -sS --max-time 15 -o "$out" -w '%{http_code}' \
+    -H "x-api-key: $key" "$base/v1/models" 2>"$TMP/mock-m4.err" || echo 000)
+  t1=$(now_ms)
+  if [ "$code" = "200" ] && msg=$(python3 - "$out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ids = [row["id"] for row in d["data"]]
+assert any(model.startswith("claude-") for model in ids)
+assert any(model.startswith("gpt-") for model in ids)
+print(f"{len(ids)} models include anthropic and openai")
+PY
+  ); then
+    write_result M4 PASS "$((t1-t0))" "$msg"
+  else
+    write_result M4 FAIL "$((t1-t0))" "http $code: $(head -c 180 "$out" 2>/dev/null)"
+  fi
+}
+
+run_mock_m5() {
+  in_only M5 || return 0
+  local home=$1 fake_base=$2 control_key=$3 out="$TMP/mock-m5.json" requests="$TMP/mock-m5-requests.json" t0 t1 msg rc=0
+  t0=$(now_ms)
+  mock_env "$home" "$fake_base" "$ROOT/target/debug/alex" ping openai --json \
+    >"$out" 2>"$TMP/mock-m5.err" || rc=$?
+  curl -sS --max-time 10 -H "x-control-key: $control_key" \
+    -o "$requests" "$fake_base/_control/requests" 2>/dev/null || true
+  t1=$(now_ms)
+  if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" "$requests" <<'PY'
+import json, sys
+result = json.load(open(sys.argv[1]))
+assert result["ok"] is True
+rows = result["results"]
+assert len(rows) == 1 and rows[0]["provider"] == "openai" and rows[0]["status"] == 200
+requests = json.load(open(sys.argv[2]))
+assert any(row["path"] == "/v1/responses" and row["headers"].get("authorization") == "Bearer mock-openai-key" for row in requests)
+print(result["summary"] + "; fakeprov received /v1/responses")
+PY
+  ); then
+    write_result M5 PASS "$((t1-t0))" "$msg"
+  else
+    write_result M5 FAIL "$((t1-t0))" "exit $rc: $(tail -c 180 "$TMP/mock-m5.err" 2>/dev/null)"
+  fi
+}
+
+run_mock_m6() {
+  in_only M6 || return 0
+  local home=$1 out="$TMP/mock-m6.json" t0 t1 msg rc=0
+  t0=$(now_ms)
+  ALEX_HOME="$home" "$ROOT/target/debug/alex" traces search --since 10m --json \
+    >"$out" 2>"$TMP/mock-m6.err" || rc=$?
+  t1=$(now_ms)
+  if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" "mock-m1-$$" "mock-m2-$$" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+by_session = {row.get("session_id"): row for row in rows}
+for session, provider, model in [(sys.argv[2], "anthropic", "claude-sonnet-4-5"), (sys.argv[3], "openai", "gpt-4.1")]:
+    row = by_session[session]
+    assert row["status"] == 200 and row["upstream_provider"] == provider and row["routed_model"] == model
+    assert row.get("req_body_path") and row.get("resp_body_path")
+print("M1/M2 traces persisted with request and response bodies")
+PY
+  ); then
+    write_result M6 PASS "$((t1-t0))" "$msg"
+  else
+    write_result M6 FAIL "$((t1-t0))" "exit $rc: $(tail -c 180 "$TMP/mock-m6.err" 2>/dev/null)"
+  fi
+}
+
+run_mock_tier() {
+  local build_start build_end rc=0 home fake_line fake_base control_key port base key i
+  log "== mock: building alex + alex-fakeprov =="
+  build_start=$(now_ms)
+  (cd "$ROOT" && cargo build -p alex --bin alex -p alex-fakeprov --bin alex-fakeprov) >&2 || rc=$?
+  build_end=$(now_ms)
+  if [ "$rc" -ne 0 ]; then
+    write_result M1 FAIL "$((build_end-build_start))" "cargo build exited $rc"
+    return 0
+  fi
+
+  home="$TMP/mock-home"
+  mkdir -p "$home/accounts"
+  port=$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+  )
+  key="alx-mock-tier-key"
+  python3 - "$home" "$port" "$key" <<'PY'
+import json, os, sys
+home, port, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+quoted = json.dumps(home)
+with open(os.path.join(home, "config.toml"), "w") as f:
+    f.write(f'host = "127.0.0.1"\nport = {port}\ndata_dir = {quoted}\nlocal_key = "{key}"\nheartbeat_minutes = 0\nreauth_check_minutes = 0\nupdate_check_hours = 0\nanthropic_upstream = "direct"\ndario_mode_migrated = true\ndario_update_check_minutes = 0\n')
+accounts = [
+    {"id": "mock-anthropic", "provider": "anthropic", "kind": "api_key", "name": "mock", "api_key": "mock-anthropic-key", "status": "active"},
+    {"id": "mock-openai", "provider": "openai", "kind": "api_key", "name": "mock", "api_key": "mock-openai-key", "status": "active"},
+]
+for account in accounts:
+    with open(os.path.join(home, "accounts", account["id"] + ".json"), "w") as f:
+        json.dump(account, f, indent=2)
+PY
+  chmod 600 "$home/config.toml" "$home/accounts/"*.json
+
+  : > "$TMP/fakeprov.handshake"
+  "$ROOT/target/debug/alex-fakeprov" --port 0 >"$TMP/fakeprov.handshake" 2>"$TMP/fakeprov.log" &
+  FAKEPROV_PID=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$TMP/fakeprov.handshake" ]; do
+    if ! kill -0 "$FAKEPROV_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fake_line=$(head -1 "$TMP/fakeprov.handshake" 2>/dev/null || true)
+  fake_base=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["base_url"])' "$fake_line" 2>/dev/null || true)
+  control_key=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["control_key"])' "$fake_line" 2>/dev/null || true)
+  if [ -z "$fake_base" ] || [ -z "$control_key" ]; then
+    write_result M1 FAIL 0 "fakeprov did not emit a valid JSON handshake"
+    return 0
+  fi
+
+  base="http://127.0.0.1:$port"
+  mock_env "$home" "$fake_base" "$ROOT/target/debug/alex" daemon --host 127.0.0.1 --port "$port" \
+    >"$TMP/mock-daemon.log" 2>&1 &
+  MOCK_DAEMON_PID=$!
+  i=0
+  while [ "$i" -lt 240 ]; do
+    if curl -fsS --max-time 1 "$base/health" >/dev/null 2>&1; then break; fi
+    if ! kill -0 "$MOCK_DAEMON_PID" 2>/dev/null; then break; fi
+    sleep 0.25
+    i=$((i + 1))
+  done
+  if ! curl -fsS --max-time 2 "$base/health" >/dev/null 2>&1; then
+    write_result M1 FAIL 0 "mock daemon failed to become healthy: $(tail -c 180 "$TMP/mock-daemon.log" 2>/dev/null)"
+    return 0
+  fi
+
+  run_mock_m1 "$base" "$key"
+  run_mock_m2 "$base" "$key"
+  run_mock_m3 "$base" "$key"
+  run_mock_m4 "$base" "$key"
+  run_mock_m5 "$home" "$fake_base" "$control_key"
+  run_mock_m6 "$home"
+
+  kill "$MOCK_DAEMON_PID" 2>/dev/null || true
+  wait "$MOCK_DAEMON_PID" 2>/dev/null || true
+  MOCK_DAEMON_PID=""
+  kill "$FAKEPROV_PID" 2>/dev/null || true
+  wait "$FAKEPROV_PID" 2>/dev/null || true
+  FAKEPROV_PID=""
+}
+
 run_cliproxyapi_tier() {
   in_only CLIPROXYAPI || return 0
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
@@ -867,6 +1134,8 @@ run_cliproxyapi_tier() {
 
 main() {
   if has_tier unit; then run_unit_tier; fi
+  if has_tier mock; then run_mock_tier; fi
+  if has_tier webui; then run_webui_tier; fi
   if has_tier cliproxyapi; then run_cliproxyapi_tier; fi
   : > "$TMP/wire.cells"
   : > "$TMP/harness.cells"

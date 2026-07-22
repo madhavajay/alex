@@ -135,4 +135,54 @@ mod tests {
         );
         assert_eq!(state["kind"], "rate_window");
     }
+
+    #[test]
+    fn credit_provider_quota_variants_are_normalized() {
+        let cases = [
+            (
+                "string unlimited",
+                Provider::Xai,
+                json!({"credits": {"unlimited": " TRUE "}}),
+                "unlimited",
+                None,
+            ),
+            (
+                "string out of credits",
+                Provider::Amp,
+                json!({"credits": {"has_credits": "false"}}),
+                "out_of_credits",
+                None,
+            ),
+            (
+                "numeric balance",
+                Provider::Amp,
+                json!({"credits": {"has_credits": true, "balance": 12.5}}),
+                "balance",
+                Some("12.5"),
+            ),
+            (
+                "credit utilization",
+                Provider::Xai,
+                json!({"credits": {"has_credits": true, "used_pct": 37.25}}),
+                "credit_window",
+                None,
+            ),
+            (
+                "unknown boolean text",
+                Provider::Xai,
+                json!({"credits": {"has_credits": "unknown"}}),
+                "rate_window",
+                None,
+            ),
+        ];
+
+        for (name, provider, limits, kind, balance) in cases {
+            let state = quota_state(provider, &limits);
+            assert_eq!(state["kind"], kind, "{name}");
+            assert_eq!(state["balance"].as_str(), balance, "{name}");
+            if name == "credit utilization" {
+                assert_eq!(state["remaining_pct"], 62.75);
+            }
+        }
+    }
 }

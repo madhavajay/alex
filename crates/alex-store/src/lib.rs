@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+pub mod recording;
+
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
