@@ -1,0 +1,40 @@
+{
+  "description": "An Anthropic Fable refusal is replaced by OpenAI Sol and pinned for the stable session.",
+  "request": {
+    "harness": "claude",
+    "session_id": "fixture-session-fable-sol",
+    "client_format": "anthropic_messages",
+    "model": "claude-fable-5"
+  },
+  "failure_fixture": "anthropic-fable-refusal-200",
+  "expected_decision": {
+    "decision": "reroute",
+    "target": {
+      "kind": "exact",
+      "model": "gpt-5.6-sol",
+      "providers": {
+        "only": ["openai"]
+      }
+    },
+    "scope": {"scope": "session", "ttl_seconds": 86400}
+  },
+  "expected_attempts": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "status": 200,
+      "error_kind": "upstream_refusal"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "status": 200
+    }
+  ],
+  "next_turn": {
+    "model": "claude-fable-5",
+    "expected_provider": "openai",
+    "expected_model": "gpt-5.6-sol",
+    "openai_attempts": 2
+  }
+}

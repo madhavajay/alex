@@ -417,6 +417,79 @@ async fn save_named_login_account(
     Ok(id)
 }
 
+/// Stable upstream identity for an OAuth account. Prefer a provider-issued
+/// account id, then the verified/display email, then the OIDC subject carried
+/// by a token returned directly from the provider's token endpoint.
+fn automatic_account_identity(account: &Account) -> Option<String> {
+    let provider = account.provider.as_str();
+    if let Some(account_id) = account
+        .account_meta
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("{provider}:account:{account_id}"));
+    }
+    if let Some(email) = account.email() {
+        return Some(format!("{provider}:email:{email}"));
+    }
+    [account.id_token.as_deref(), account.access_token.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|token| {
+            jwt_payload(token)
+                .and_then(|payload| payload.get("sub").and_then(Value::as_str).map(String::from))
+        })
+        .map(|subject| format!("{provider}:subject:{subject}"))
+}
+
+/// Save a subscription login without asking the user for a local nickname.
+/// A fresh upstream identity gets a generated local id; logging into the same
+/// identity again replaces its credentials while retaining its local routing
+/// history and settings.
+async fn save_auto_login_account(vault: &Vault, mut account: Account) -> Result<String> {
+    let identity = automatic_account_identity(&account).with_context(|| {
+        format!(
+            "{} login succeeded but no account identity or email was returned",
+            account.provider.as_str()
+        )
+    })?;
+    let existing = vault.list().await.into_iter().find(|candidate| {
+        candidate.provider == account.provider
+            && candidate.kind == account.kind
+            && automatic_account_identity(candidate).as_deref() == Some(identity.as_str())
+    });
+    if let Some(existing) = existing {
+        if let (Some(old), Some(new)) = (
+            existing.account_meta.as_object(),
+            account.account_meta.as_object_mut(),
+        ) {
+            for (key, value) in old {
+                new.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        account.id = existing.id;
+        account.name = existing.name;
+        account.description = account.description.or(existing.description);
+        account.paused = existing.paused;
+        account.cooldown_until_ms = None;
+        account.path = existing.path;
+    } else {
+        let digest = Sha256::digest(identity.as_bytes());
+        let suffix: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        account.name = format!("acct-{suffix}");
+        account.id = named_account_id(account.provider, &account.kind, &account.name);
+        account.path = None;
+    }
+    let id = account.id.clone();
+    vault.upsert(account).await?;
+    Ok(id)
+}
+
 /// Amp auth: prefer importing CLI secrets, else AMP_API_KEY env, else paste prompt.
 async fn login_amp(vault: &Vault) -> Result<String> {
     let imported = import_amp(vault).await;
@@ -454,11 +527,11 @@ async fn login_amp(vault: &Vault) -> Result<String> {
     save_amp_api_key(vault, key).await
 }
 
-pub async fn claude_exchange(
+async fn claude_exchange_with_identity(
     vault: &Vault,
     verifier: &str,
     input: &str,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     let (code, state) = parse_authorization_input(input);
     let code = code.ok_or_else(|| anyhow!("no authorization code provided"))?;
@@ -521,7 +594,23 @@ pub async fn claude_exchange(
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn claude_exchange(
+    vault: &Vault,
+    verifier: &str,
+    input: &str,
+    account_name: &str,
+) -> Result<String> {
+    claude_exchange_with_identity(vault, verifier, input, Some(account_name)).await
+}
+
+pub async fn claude_exchange_auto(vault: &Vault, verifier: &str, input: &str) -> Result<String> {
+    claude_exchange_with_identity(vault, verifier, input, None).await
 }
 
 async fn login_claude(vault: &Vault, account_name: &str) -> Result<String> {
@@ -643,15 +732,71 @@ impl From<CodexDevicePoll> for DeviceFlowPoll<(String, String)> {
 }
 
 pub async fn codex_device_start(client: &reqwest::Client) -> Result<CodexDeviceStart> {
-    let response = client
-        .post(OPENAI_DEVICE_USER_CODE_URL)
-        .json(&json!({"client_id": OPENAI_CLIENT_ID}))
-        .send()
-        .await?;
-    let status = response.status();
-    let raw: Value = response.json().await?;
-    if !status.is_success() {
-        bail!("Codex device login could not start ({status})");
+    // Cloudflare occasionally terminates a successful device-code response
+    // before reqwest can decode its body. A device code has no durable side
+    // effect until the user authorizes it, so one bounded retry is safe and
+    // prevents a transient upstream body error surfacing as an opaque local
+    // HTTP 400 in Settings.
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let response = match client
+            .post(OPENAI_DEVICE_USER_CODE_URL)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&json!({"client_id": OPENAI_CLIENT_ID}))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(anyhow!(error).context("requesting a Codex device code"));
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        match response.bytes().await {
+            Ok(body) => match parse_codex_device_start(status.as_u16(), &body) {
+                Ok(start) => return Ok(start),
+                Err(error) => {
+                    let retryable = status.is_success();
+                    last_error = Some(error);
+                    if attempt == 0 && retryable {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break;
+                }
+            },
+            Err(error) => {
+                last_error = Some(anyhow!(error).context("reading the Codex device-code response"));
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Codex device login could not start")))
+}
+
+fn parse_codex_device_start(status: u16, body: &[u8]) -> Result<CodexDeviceStart> {
+    let raw: Value = serde_json::from_slice(body).with_context(|| {
+        format!("Codex device login returned an invalid response (HTTP {status})")
+    })?;
+    if !(200..300).contains(&status) {
+        let detail = raw
+            .pointer("/error/message")
+            .or_else(|| raw.get("message"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty());
+        if let Some(detail) = detail {
+            bail!("Codex device login could not start (HTTP {status}): {detail}");
+        }
+        bail!("Codex device login could not start (HTTP {status})");
     }
     let device_auth_id = raw
         .get("device_auth_id")
@@ -880,7 +1025,7 @@ async fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Resu
         .get(OPENAI_USAGE_URL)
         .bearer_auth(access_token)
         .header("accept", "application/json")
-        .header("user-agent", "Alexandria");
+        .header("user-agent", concat!("Alex/", env!("CARGO_PKG_VERSION")));
     if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
         request = request.header("chatgpt-account-id", account_id);
     }
@@ -957,10 +1102,7 @@ async fn refresh_codex_usage_for_account(vault: &Vault, account: Account) -> Res
 /// pinned to the credential's exact ChatGPT workspace and never sends a model
 /// prompt. Failures are returned per account so one stale credential cannot
 /// prevent the remaining subscriptions from updating.
-pub async fn refresh_due_codex_usage(
-    vault: &Vault,
-    max_age_ms: i64,
-) -> Vec<(String, Result<()>)> {
+pub async fn refresh_due_codex_usage(vault: &Vault, max_age_ms: i64) -> Vec<(String, Result<()>)> {
     let now = now_ms();
     let accounts: Vec<Account> = vault
         .list()
@@ -1074,12 +1216,12 @@ pub fn gemini_authorize_url(challenge: &str, state: &str, redirect_uri: &str) ->
     url.to_string()
 }
 
-pub async fn gemini_exchange(
+async fn gemini_exchange_with_identity(
     vault: &Vault,
     verifier: &str,
     redirect_uri: &str,
     code: &str,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     let resp = reqwest::Client::new()
         .post(crate::GOOGLE_TOKEN_URL)
@@ -1122,7 +1264,29 @@ pub async fn gemini_exchange(
         status: "active".into(),
         path: None,
     };
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn gemini_exchange(
+    vault: &Vault,
+    verifier: &str,
+    redirect_uri: &str,
+    code: &str,
+    account_name: &str,
+) -> Result<String> {
+    gemini_exchange_with_identity(vault, verifier, redirect_uri, code, Some(account_name)).await
+}
+
+pub async fn gemini_exchange_auto(
+    vault: &Vault,
+    verifier: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<String> {
+    gemini_exchange_with_identity(vault, verifier, redirect_uri, code, None).await
 }
 
 pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
@@ -1270,10 +1434,10 @@ pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> 
     }
 }
 
-pub async fn xai_upsert_from_tokens(
+async fn xai_upsert_from_tokens_with_identity(
     vault: &Vault,
     tokens: &XaiTokens,
-    account_name: &str,
+    account_name: Option<&str>,
 ) -> Result<String> {
     // Prefer xAI's HTTPS OIDC userinfo response over locally decoded JWT
     // claims. The latter are not signature-verified here.
@@ -1312,7 +1476,22 @@ pub async fn xai_upsert_from_tokens(
     if let Some(email) = email {
         persist_account_email(&mut account, &email);
     }
-    save_named_login_account(vault, account, account_name).await
+    match account_name {
+        Some(name) => save_named_login_account(vault, account, name).await,
+        None => save_auto_login_account(vault, account).await,
+    }
+}
+
+pub async fn xai_upsert_from_tokens(
+    vault: &Vault,
+    tokens: &XaiTokens,
+    account_name: &str,
+) -> Result<String> {
+    xai_upsert_from_tokens_with_identity(vault, tokens, Some(account_name)).await
+}
+
+pub async fn xai_upsert_from_tokens_auto(vault: &Vault, tokens: &XaiTokens) -> Result<String> {
+    xai_upsert_from_tokens_with_identity(vault, tokens, None).await
 }
 
 async fn login_grok(vault: &Vault, account_name: &str) -> Result<String> {
@@ -1528,6 +1707,17 @@ pub async fn kimi_upsert_from_tokens(
     save_named_login_account(vault, account, account_name).await
 }
 
+pub async fn kimi_upsert_from_tokens_auto(vault: &Vault, tokens: &KimiTokens) -> Result<String> {
+    let account = crate::kimi_account_from_credentials(
+        tokens.access_token.clone(),
+        tokens.refresh_token.clone(),
+        None,
+        tokens.expires_in,
+        tokens.scope.clone(),
+    );
+    save_auto_login_account(vault, account).await
+}
+
 async fn login_kimi(vault: &Vault, account_name: &str) -> Result<String> {
     let http = reqwest::Client::new();
     let start = match kimi_device_start(&http).await {
@@ -1616,7 +1806,7 @@ mod tests {
     #[tokio::test]
     async fn named_claude_save_preserves_existing_default_on_disk() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-named-claude-{}-{}",
+            "alex-named-claude-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1655,10 +1845,61 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn identified_claude_account(token: &str, email: &str) -> Account {
+        let mut account = test_claude_account(token);
+        account.description = Some(email.into());
+        account.label = Some(format!("claude ({email})"));
+        account.account_meta = json!({"email": email, "scopes": []});
+        account
+    }
+
+    #[tokio::test]
+    async fn automatic_subscription_identity_adds_new_and_replaces_same_login() {
+        let dir = std::env::temp_dir().join(format!(
+            "alex-auto-subscription-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let vault = Vault::open(dir.clone()).unwrap();
+
+        let first_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("first-token", "person@example.com"),
+        )
+        .await
+        .unwrap();
+        let second_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("second-token", "work@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(vault.list().await.len(), 2);
+
+        let replaced_id = save_auto_login_account(
+            &vault,
+            identified_claude_account("fresh-token", "PERSON@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced_id, first_id);
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.id == first_id)
+                .and_then(|account| account.access_token.as_deref()),
+            Some("fresh-token")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn unnamed_kimi_upsert_uses_default_id() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-default-kimi-{}-{}",
+            "alex-default-kimi-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1687,7 +1928,7 @@ mod tests {
     #[tokio::test]
     async fn named_codex_save_preserves_existing_default() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-named-codex-{}-{}",
+            "alex-named-codex-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1733,7 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_codex_identity_adds_reauths_and_preserves_workspaces() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-auto-codex-{}-{}",
+            "alex-auto-codex-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1818,7 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_codex_identity_rejects_unidentified_account_without_mutation() {
         let dir = std::env::temp_dir().join(format!(
-            "alexandria-auto-codex-missing-{}-{}",
+            "alex-auto-codex-missing-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -1864,12 +2105,10 @@ mod tests {
         });
         assert!(!codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 - 1);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 - 1);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 
-        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] =
-            json!(now / 1_000 + 60);
+        account.account_meta["codex_limits"]["windows"][0]["resets_at_s"] = json!(now / 1_000 + 60);
         account.account_meta["codex_limits"]["observed_at_ms"] = json!(now - 300_000);
         assert!(codex_usage_refresh_due(&account, now, 300_000));
 
@@ -1905,6 +2144,29 @@ mod tests {
             parse_codex_device_poll(200, &bad),
             CodexDevicePoll::Failed(_)
         ));
+    }
+
+    #[test]
+    fn codex_device_start_parses_success_and_explains_upstream_errors() {
+        let start = parse_codex_device_start(
+            200,
+            br#"{"device_auth_id":"device-1","user_code":"ABCD-EFGH","interval":"7"}"#,
+        )
+        .unwrap();
+        assert_eq!(start.device_auth_id, "device-1");
+        assert_eq!(start.user_code, "ABCD-EFGH");
+        assert_eq!(start.interval_s, 7);
+
+        let error = parse_codex_device_start(429, br#"{"error":{"message":"try again later"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 429"));
+        assert!(error.contains("try again later"));
+
+        let malformed = parse_codex_device_start(200, b"not-json")
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("invalid response"));
     }
 
     #[test]

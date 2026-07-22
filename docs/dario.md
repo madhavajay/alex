@@ -2,7 +2,7 @@
 
 Dario is a supervised local proxy used to make a Claude subscription usable by
 non-Claude-Code clients. Harnesses still call Alex. Alex chooses the
-Anthropic account, optionally sends the Messages request to the active Dario
+Anthropic account, sends eligible Messages requests to the active Dario
 generation, and records the real Anthropic account as the billing/trace identity
 rather than the synthetic Dario connection key.
 
@@ -11,13 +11,14 @@ does not replace Alex's general format translation.
 
 ## Routing modes
 
-`anthropic_upstream` is a tri-state string controlled by the Dario commands:
+`anthropic_upstream` remains a tri-state stored value for compatibility, but
+non-Claude-Code Anthropic traffic is always routed through Dario:
 
 | Command | Stored value | Effective behavior after daemon restart |
 | --- | --- | --- |
 | `alex dario enable` | `dario` | Route eligible non-Claude-Code Anthropic requests through Dario. |
-| `alex dario disable` | `direct` | Keep Dario available but route Anthropic requests directly. |
-| `alex dario auto` | `auto` | Use Dario when an active Anthropic OAuth account exists; otherwise direct. This is the default. |
+| `alex dario disable` | `direct` | Legacy spelling; direct remains reserved for genuine Claude Code. |
+| `alex dario auto` | `auto` | Route eligible non-Claude-Code Anthropic requests through Dario. This is the default. |
 
 Example setup:
 
@@ -38,9 +39,8 @@ and real Claude Code executable paths, then rolls a fresh generation.
 The provider planner considers Dario only when all of these are true:
 
 1. the routed provider is Anthropic;
-2. the effective routing mode enables Dario;
-3. the request is not positively identified as genuine Claude Code;
-4. a healthy generation can be obtained and the model prompt cache is ready.
+2. the request is not positively identified as genuine Claude Code;
+3. a healthy generation can be obtained and the model prompt cache is ready.
 
 Genuine Claude Code detection deliberately requires a complete signature:
 
@@ -49,7 +49,7 @@ Genuine Claude Code detection deliberately requires a complete signature:
 - `x-app: cli`;
 - a non-empty `x-claude-code-session-id`;
 - first `system` block text beginning `x-anthropic-billing-header:`; and
-- if `x-alexandria-harness` is present, every value must identify Claude or
+- if `x-alex-harness` is present, every value must identify Claude or
   Claude Code.
 
 Only that complete signature bypasses Dario. A partial or conflicting signature
@@ -139,8 +139,7 @@ update` checks npm and rolls only when a newer version exists.
 
 ## Failure behavior
 
-The implementation uses more precise behavior than a blanket "always fail
-closed":
+Non-Claude-Code Anthropic traffic is fail-closed:
 
 - a cold prompt cache is never served through Dario before its warm attempt
   finishes;
@@ -148,14 +147,13 @@ closed":
 - startup reports enabled-but-unavailable routing as fail-closed while the
   supervisor attempts on-demand repair;
 - if on-demand repair, prompt warming, or the request-generation handoff fails,
-  the current proxy planner has explicit direct-Anthropic fallback branches;
-  it records the reason in trace tag `dario_fallback`;
+  the proxy returns `503 Service Unavailable` instead of leaking the request to
+  Anthropic's third-party-app billing path;
 - a healthy generation is used only after acquisition of an in-flight guard,
   so a draining generation cannot accept an untracked new request.
 
-This distinction matters operationally: inspect the trace's `via_dario`,
-`dario_generation`, and `dario_fallback` fields instead of inferring the path
-from the configured mode alone.
+Inspect the trace's `via_dario` and `dario_generation` fields to verify the
+route used by an eligible request.
 
 ## Status and invariants
 

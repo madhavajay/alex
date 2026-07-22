@@ -225,7 +225,7 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
         { type: "context",  content: '  "theme": "dark",' },
         { type: "removed",  content: '  "mcp_servers": {}' },
         { type: "added",    content: '  "mcp_servers": {' },
-        { type: "added",    content: '    "alexandria": { "command": "alexandria-mcp" }' },
+        { type: "added",    content: '    "alex": { "command": "alex-mcp" }' },
         { type: "added",    content: '  }' },
       ],
     },
@@ -235,9 +235,9 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
       lines: [
         { type: "context",  content: "# Project context" },
         { type: "added",    content: "" },
-        { type: "added",    content: "## AlexandriaBar" },
+        { type: "added",    content: "## Alex" },
         { type: "added",    content: "Session capture is enabled. Tool calls are" },
-        { type: "added",    content: "forwarded to the AlexandriaBar harness for" },
+        { type: "added",    content: "forwarded to the Alex harness for" },
         { type: "added",    content: "indexing and retrieval." },
       ],
     },
@@ -253,7 +253,7 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
         { type: "context",  content: "" },
         { type: "context",  content: "[tools]" },
         { type: "removed",  content: "# no external tools" },
-        { type: "added",    content: "external = [\"alexandria-mcp\"]" },
+        { type: "added",    content: "external = [\"alex-mcp\"]" },
         { type: "added",    content: "capture = true" },
         { type: "added",    content: "capture_endpoint = \"localhost:7842\"" },
       ],
@@ -266,9 +266,9 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
       lines: [
         { type: "context",  content: "{" },
         { type: "context",  content: '  "mcpServers": {' },
-        { type: "added",    content: '    "alexandria": {' },
+        { type: "added",    content: '    "alex": {' },
         { type: "added",    content: '      "command": "npx",' },
-        { type: "added",    content: '      "args": ["-y", "alexandria-mcp"],' },
+        { type: "added",    content: '      "args": ["-y", "alex-mcp"],' },
         { type: "added",    content: '      "env": { "PORT": "7842" }' },
         { type: "added",    content: "    }" },
         { type: "added",    content: "  }" },
@@ -292,7 +292,7 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
         { type: "context",  content: "{" },
         { type: "context",  content: '  "model": "gemini-2.0-flash",' },
         { type: "added",    content: '  "tools": {' },
-        { type: "added",    content: '    "alexandria_capture": true' },
+        { type: "added",    content: '    "alex_capture": true' },
         { type: "added",    content: "  }" },
       ],
     },
@@ -307,7 +307,7 @@ const HARNESS_CHANGES: Record<string, FileChange[]> = {
         { type: "added",    content: '  "providers": {' },
         { type: "added",    content: '    "anthropic": { "model": "claude-sonnet-4-5" }' },
         { type: "added",    content: "  }," },
-        { type: "added",    content: '  "mcp": ["alexandria-mcp"]' },
+        { type: "added",    content: '  "mcp": ["alex-mcp"]' },
       ],
     },
   ],
@@ -597,7 +597,7 @@ function GeneralPanel() {
       <div className="flex-1 overflow-y-auto px-[24px] pb-[20px]">
         <SectionLabel title="System" />
         <div className="divide-y divide-[rgba(255,255,255,0.05)]">
-          <SettingRow label="Launch at login" hint="Start AlexandriaBar when you log in">
+          <SettingRow label="Launch at login" hint="Start Alex when you log in">
             <Toggle checked={startAtLogin} onChange={() => setStartAtLogin(v => !v)} />
           </SettingRow>
           <SettingRow label="Show in menu bar">
@@ -617,7 +617,7 @@ function GeneralPanel() {
 
         <SectionLabel title="Privacy" />
         <div className="divide-y divide-[rgba(255,255,255,0.05)]">
-          <SettingRow label="Usage telemetry" hint="Help improve AlexandriaBar anonymously">
+          <SettingRow label="Usage telemetry" hint="Help improve Alex anonymously">
             <Toggle checked={telemetry} onChange={() => setTelemetry(v => !v)} />
           </SettingRow>
         </div>
@@ -727,7 +727,7 @@ export default function App() {
           </div>
 
           <div className="px-[14px] pb-[12px] shrink-0">
-            <p className="text-[10px] font-semibold text-[#48484a] uppercase tracking-[0.07em]">AlexandriaBar</p>
+            <p className="text-[10px] font-semibold text-[#48484a] uppercase tracking-[0.07em]">Alex</p>
           </div>
 
           <nav className="flex-1 px-[8px] flex flex-col gap-[2px]">

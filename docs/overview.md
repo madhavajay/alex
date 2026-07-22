@@ -1,6 +1,6 @@
 # Alex architecture
 
-Alex (`alex` and `alexandria` are two names for the same binary) is a local
+Alex (`alex` and `alex` are two names for the same binary) is a local
 credential vault, HTTP model gateway, account router, and trace recorder. It
 accepts several model API dialects, chooses an upstream provider and account,
 injects the upstream credential, translates formats when necessary, and stores
@@ -19,7 +19,7 @@ and defaults see [Configuration](configuration.md).
 | `alex-proxy` | The Axum ingress and admin router, request authentication, provider planning, credential/header injection, failover, Dario dispatch, trace finalization, and agent-facing trace/transcript handlers. |
 | `alex-auth` | Vault account files, OAuth/device login and native credential import, refresh, multi-account selection policies, pauses/cooldowns, routing reserves, encrypted vault bundles, and removed-account tombstones. |
 | `alex-core` | Provider/model-name routing, the four client formats, request/response/SSE translation, usage parsing, quota normalization, and price-based cost calculation. |
-| `alex-store` | SQLite schema and queries for traces, accounts, pricing, heartbeats, run keys, lineage, and tool calls; dated gzip body artifacts; retention and analytics. |
+| `alex-store` | SQLite schema and queries for traces, accounts, pricing, heartbeats, run keys, lineage, and tool calls; live gzip body capture; migrated LAR body pointers and bounded reads; retention and analytics. |
 | `alex-wrap` | Catalog-driven application-level reverse wraps, launch environment/settings generation, HTTP/WebSocket capture, secret redaction, and wrapped process execution. |
 
 ## Request data flow
@@ -48,7 +48,7 @@ Provider upstream
 Response adapter -> original client dialect
   |  parse usage; calculate catalog cost; classify error
   v
-SQLite trace row + gzip request/upstream-request/response artifacts
+SQLite trace row + live gzip artifacts or migrated LAR body pointers
 ```
 
 The client never supplies an upstream provider secret. It supplies an
@@ -70,12 +70,11 @@ substitution and protection equivalencies. See
 
 ### Dario path
 
-When configured, non-Claude-Code Anthropic traffic can go to a supervised local
-Dario generation instead of directly to `api.anthropic.com`. Dario supplies the
-Claude-subscription wire shape and Alex keeps the underlying Anthropic
-account as the trace/billing identity. Genuine Claude Code requests are
-detected from their complete request signature and remain direct. See
-[Dario](dario.md).
+All non-genuine-Claude-Code Anthropic traffic goes through a supervised local
+Dario generation and fails closed if Dario is unavailable. Dario supplies the
+Claude-subscription wire shape and Alex keeps the underlying Anthropic account
+as the trace/billing identity. Genuine Claude Code requests are detected from
+their complete request signature and remain direct. See [Dario](dario.md).
 
 ### Wrap path
 
@@ -101,17 +100,19 @@ operator reads those traces through the local-key-gated API.
 
 ## Local state
 
-The state root defaults to `~/.alexandria`; `ALEXANDRIA_HOME` changes the config
+The state root defaults to `~/.alex`; `ALEX_HOME` changes the config
 root, and a custom `data_dir` can place runtime data elsewhere.
 
 ```text
-~/.alexandria/
+~/.alex/
   config.toml                 daemon settings and local admin key (mode 0600)
   accounts/                   one JSON file per vault account
     removed-accounts/         non-secret account tombstones
     .routing-policies         persisted account selection/reserve policies
-  alexandria.sqlite3[-wal|-shm]
-  bodies/YYYY-MM-DD/          gzipped trace and tool payloads
+  alex.sqlite3[-wal|-shm]
+  bodies/YYYY-MM-DD/          live gzipped trace and tool payloads
+  lar/legacy-v1.lar           migrated immutable trace-body records
+  lar/legacy-v1.import.json   resumable migration checkpoint (while incomplete)
   dario/                      installed generations, logs, runtime state
   dario-prompt-cache/         model-specific captured Claude prompt material
   fixtures/                   saved upstream error fixtures
@@ -134,6 +135,9 @@ written only to the explicit `--out` path.
   received chunk resets it.
 - Trace body and row retention are independent. Bodies default to 30 days;
   rows default to unlimited retention.
+- Live capture writes gzip. `alex traces migrate-lar` can add LAR pointers to
+  existing trace bodies; readers prefer bounded LAR reads and fall back to the
+  preserved gzip source if an archive is unavailable or corrupt.
 - Full request/response bodies are sensitive. Header and tool-capture
   redaction does not turn the trace body store into a secret-free store.
 - `alex reset` is a dry run until `--yes` is supplied.

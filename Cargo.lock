@@ -130,11 +130,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "alex-lar"
+version = "0.1.25"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crc32fast",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "alex-lar-scale"
+version = "0.1.25"
+dependencies = [
+ "alex-lar",
+ "alex-store",
+ "anyhow",
+ "clap",
+ "flate2",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "alex-middleware"
+version = "0.1.25"
+dependencies = [
+ "aho-corasick",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "alex-proxy"
 version = "0.1.25"
 dependencies = [
  "alex-auth",
  "alex-core",
+ "alex-middleware",
  "alex-store",
  "anyhow",
  "async-trait",
@@ -152,6 +198,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
+ "toml",
  "tower",
  "tracing",
  "uuid",
@@ -162,12 +209,14 @@ name = "alex-store"
 version = "0.1.25"
 dependencies = [
  "alex-core",
+ "alex-lar",
  "anyhow",
  "chrono",
  "flate2",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 
@@ -1946,6 +1995,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2832,6 +2887,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

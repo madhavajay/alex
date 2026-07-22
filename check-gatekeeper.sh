@@ -57,7 +57,7 @@ pick_latest_artifact() {
 mount_dmg() {
   local dmg="$1"
   DMG_INPUT="$dmg"
-  MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-mnt-XXXXXX")"
+  MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alex-mnt-XXXXXX")"
   info "Mounting DMG: $dmg"
   hdiutil attach "$dmg" -nobrowse -mountpoint "$MOUNT_POINT" >/dev/null
   APP_PATH="$(find "$MOUNT_POINT" -maxdepth 2 -name "*.app" -type d | head -1 || true)"

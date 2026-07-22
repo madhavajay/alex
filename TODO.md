@@ -1,4 +1,4 @@
-# Alexandria
+# Alex
 
 A long-lived local **daemon** that holds your LLM provider credentials, auto-routes
 LLM/agent-harness traffic through itself, and captures full request/response traces
@@ -38,7 +38,7 @@ per-job spawns with a single durable service.
 
 ```
                           ┌───────────────────────────────────────────┐
-   harness (claude-code,  │              alexandria daemon             │
+   harness (claude-code,  │              alex daemon             │
    codex, gemini-cli,     │                                            │
    pi, opencode, …)       │  ┌──────────┐   ┌───────────────────────┐  │
         │  base-URL env    │  │ ingress  │──▶│ router (model→upstream)│  │
@@ -70,18 +70,18 @@ per-job spawns with a single durable service.
 - **DB**: `rusqlite` (or `sqlx` if we want async/compile-checked queries — recommend
   `sqlx` with the sqlite backend). WAL mode.
 - **Serde** for all wire formats; keep translation as pure fns over `serde_json::Value`.
-- **Config**: `figment` or plain `serde` + TOML at `~/.alexandria/config.toml`.
+- **Config**: `figment` or plain `serde` + TOML at `~/.alex/config.toml`.
 - **CLI**: `clap`. **TUI** (later): `ratatui`.
 
 ### Crate layout
 ```
-alexandria/
+alex/
 ├─ crates/
-│  ├─ alexandria-core/      # pure logic: translation, routing, trace model, 
-│  ├─ alexandria-auth/      # credential vault, OAuth flows, refresh, import
-│  ├─ alexandria-proxy/     # ingress server, upstream client, capture
-│  ├─ alexandria-store/     # SQLite + file body store, migrations
-│  └─ alexandria-daemon/    # binary: wiring, config, control API, lifecycle
+│  ├─ alex-core/      # pure logic: translation, routing, trace model,
+│  ├─ alex-auth/      # credential vault, OAuth flows, refresh, import
+│  ├─ alex-proxy/     # ingress server, upstream client, capture
+│  ├─ alex-store/     # SQLite + file body store, migrations
+│  └─ alex-daemon/    # binary: wiring, config, control API, lifecycle
 └─ xtask/ or scripts/
 ```
 Keep `core` free of I/O so translation + routing are unit-testable in isolation
@@ -152,7 +152,7 @@ CREATE TABLE accounts (
 );
 ```
 
-File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstream-request,response}.{json,body}.gz`
+File body layout: `~/.alex/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstream-request,response}.{json,body}.gz`
 
 ---
 
@@ -160,8 +160,8 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
 
 ### M0 — Skeleton & daemon shell
 - [x] Cargo workspace with the 5 crates above.
-- [x] `alexandria daemon` starts, binds a port, `/health` endpoint, graceful shutdown.
-- [x] Config load from `~/.alexandria/config.toml` (bind host/port, data dir, local key).
+- [x] `alex daemon` starts, binds a port, `/health` endpoint, graceful shutdown.
+- [x] Config load from `~/.alex/config.toml` (bind host/port, data dir, local key).
 - [x] SQLite store init + migrations; WAL; `pricing` seeded from a `models.json`.
 - [x] launchd plist + systemd unit templates (`config/launchd/`, `config/systemd/`).
 - [x] `./install.sh [--service|--upgrade|--prefix DIR]` — release build + system install;
@@ -178,13 +178,13 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
       (Also OpenAI chat/responses shapes; sniffs SSE when upstream omits content-type.)
 - [x] Point real `claude-code` at it via `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY`.
       **Acceptance:** run a claude-code task through it, see traces + correct token/cost.
-      (Met: `./test.sh harness --only H1` runs claude-code in Docker → Alexandria →
+      (Met: `./test.sh harness --only H1` runs claude-code in Docker → Alex →
       dario → Anthropic with complete trace capture.)
 
 ### M2 — Credential vault + OAuth (Anthropic first)
 - [x] Import existing creds: read `~/.claude/.credentials.json` (+ macOS Keychain),
-      `~/.codex/auth.json`, `~/.gemini/oauth_creds.json` → `accounts`. `alexandria auth import`.
-- [x] `alexandria auth login claude|codex` — full PKCE OAuth flows from the terminal
+      `~/.codex/auth.json`, `~/.gemini/oauth_creds.json` → `accounts`. `alex auth import`.
+- [x] `alex auth login claude|codex` — full PKCE OAuth flows from the terminal
       (prints authorize URL + opens browser; claude = code-paste, codex = loopback
       listener on :1455). `auth login grok` delegates to the grok CLI login then
       auto-imports; gemini not yet supported.
@@ -194,21 +194,21 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
 - [x] Inject real token on forward; harness only ever sees the fake key.
 
 ### M-extra — shipped ahead of schedule
-- [x] `alexandria ping [anthropic|openai|all]` — fire a tiny prompt through the proxy
+- [x] `alex ping [anthropic|openai|all]` — fire a tiny prompt through the proxy
       to verify credentials end-to-end (exit code 1 on failure).
 - [x] Heartbeat loop: `heartbeat_minutes` in config (default 15, 0 = off); pings each
       provider, records to `heartbeats` table, surfaced at `GET /admin/health`.
-- [x] `alexandria traces` query CLI + `GET /admin/traces` + `GET /admin/accounts`.
-- [x] `alexandria env` — print base-URL/key exports for harnesses.
+- [x] `alex traces` query CLI + `GET /admin/traces` + `GET /admin/accounts`.
+- [x] `alex env` — print base-URL/key exports for harnesses.
 - [x] Codex/ChatGPT oauth upstream (`chatgpt.com/backend-api/codex/responses`) with
       `chatgpt-account-id`/`originator`/`OpenAI-Beta` headers; OpenAI api-key upstream.
-- [x] `./alexandria` dev shim (cargo run wrapper).
+- [x] `./alex` dev shim (cargo run wrapper).
 
 ### M3 — Multi-provider routing + translation (see §9 for cove-parity detail)
-- [x] Router: model-prefix → provider (colon + slash prefixes, `cove/`/`alexandria/`
+- [x] Router: model-prefix → provider (colon + slash prefixes, `cove/`/`alex/`
       passthrough, bare aliases like `opus-4.8`); `/v1/models` advertises models +
-      aliases (`alexandria_core::model_aliases`).
-- [x] Translation layer (`alexandria-core/src/translate.rs`, pure fns over `Value`,
+      aliases (`alex_core::model_aliases`).
+- [x] Translation layer (`alex-core/src/translate.rs`, pure fns over `Value`,
       buffered v1 with synthesized SSE back to the client):
   - [x] OpenAI chat ↔ Anthropic messages (both directions, tools included)
   - [x] OpenAI responses ↔ Anthropic messages (both directions)
@@ -219,7 +219,7 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
 - [x] Upstream clients per provider incl. xai/grok CLI upstream
       (`cli-chat-proxy.grok.com`, `X-XAI-Token-Auth`/`x-grok-*` headers).
 - [x] Dual-format SSE usage parser (Anthropic + OpenAI shapes).
-- [x] Per-provider adapters — harness wiring via `alexandria env`, `harness run`, §5.
+- [x] Per-provider adapters — harness wiring via `alex env`, `harness run`, §5.
 
 ### M4 — Account pool + resilience
 - [x] Multiple accounts per provider; selector with round-robin + cooldown on 429
@@ -231,20 +231,20 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
 
 ### M5 — Observability & control
 - [x] Control/admin API: `/admin/{traces,accounts,health,analytics,limits,dario}`.
-- [x] `alexandria limits` — subscription plan + limit-window utilization + reset times
+- [x] `alex limits` — subscription plan + limit-window utilization + reset times
       per provider (Anthropic via the OAuth usage endpoint; Codex/xai from captured
       rate-limit response headers).
 - [x] Rolling-window analytics (`GET /admin/analytics?since_minutes=` — per-model
       requests/tokens/cost/errors/latency + billing-bucket split).
-- [x] `alexandria tui` live view (ratatui): sessions tab (grouped, ping-filtered),
+- [x] `alex tui` live view (ratatui): sessions tab (grouped, ping-filtered),
       Enter → live transcript follow, limits gauges, accounts, dario tabs.
       (Polling-based; a push SSE trace stream remains a possible optimization.)
 - [x] Shipped beyond plan: run keys (`/admin/run-keys`, `alex keys`) for
       harness-agnostic run attribution; metadata headers (harness/task/model/job/
       phase/kind) → tags; sessions + transcript API with tool_calls; body-text
-      search; `/traces/{id}/body/{kind}`; AlexandriaBar macOS app (menu bar +
+      search; `/traces/{id}/body/{kind}`; Alex macOS app (menu bar +
       Trace Browser + Dario window); `GET /admin/storage` retention (§ M8+).
-- [x] Query CLI: `alexandria traces --session … --model …`.
+- [x] Query CLI: `alex traces --session … --model …`.
 
 ### M6 — Dario runtime + generational supervisor (see §10)
 - [x] Submodule `repos/dario`, npm runtime (`@askalf/dario`, per-version installs),
@@ -252,11 +252,11 @@ File body layout: `~/.alexandria/bodies/<yyyy-mm-dd>/<trace_id>.{request,upstrea
 - [x] Generational supervisor: warm → health + preflight → promote → drain
       (streaming-aware in_flight) → SIGTERM/kill; rollback on failed preflight.
 - [x] `anthropic_upstream = "direct" | "dario"` routing; `GET /admin/dario`,
-      `POST /admin/dario/{restart,update}`, `alexandria dario status|restart|update`.
+      `POST /admin/dario/{restart,update}`, `alex dario status|restart|update`.
 
 ### M7 — Claude subscription billing preservation
 - [x] Primary path: CC wire-shape delegated to Dario via §10 (verified live:
-      claude-code Docker harness → Alexandria → dario generation → Anthropic, W10/H1).
+      claude-code Docker harness → Alex → dario generation → Anthropic, W10/H1).
 - [ ] Fallback (only if Dario path insufficient): rewrite outbound to interactive
       Claude-Code wire-shape natively (dario `cc-template.ts` reference).
       **Caution**: dario hit payload corruption from over-aggressive identifier
@@ -319,9 +319,9 @@ Container reachability: bind `0.0.0.0`, advertise `host.docker.internal` (macOS)
 - **SQLite is a real trace sink**, not a placeholder — cove's `runs.sqlite3` was 0 bytes;
   traces were only files. Keep files for bodies, but index everything in SQLite.
 - **Keep translation pure and testable.** Cove's converters were buried in a 573 KB
-  `main.rs`. Isolate in `alexandria-core` with snapshot tests.
+  `main.rs`. Isolate in `alex-core` with snapshot tests.
 - **Native token refresh.** Cove never refreshed — it read tokens the CLIs refreshed, and
-  Dario owned Claude's lifecycle. Alexandria must refresh all providers itself.
+  Dario owned Claude's lifecycle. Alex must refresh all providers itself.
 
 ---
 
@@ -329,7 +329,7 @@ Container reachability: bind `0.0.0.0`, advertise `host.docker.internal` (macOS)
 
 1. **Credential storage**: SQLite rows vs `0600` JSON files (CLIProxyAPI style)? JSON
    files are easier to inspect/import and match native tools; SQLite is queryable and
-   atomic. Recommend: JSON files under `~/.alexandria/accounts/` as source of truth,
+   atomic. Recommend: JSON files under `~/.alex/accounts/` as source of truth,
    mirrored read-only into an `accounts` view. Encrypt at rest? (macOS Keychain / age?)
 3. **Billing-bucket preservation (M7)** — do we need Claude subscription-pool routing, or
    is API-key/normal-OAuth enough? This is the riskiest, highest-maintenance piece.
@@ -342,14 +342,14 @@ Container reachability: bind `0.0.0.0`, advertise `host.docker.internal` (macOS)
 
 ## 9. Cove proxy replacement (parity notes)
 
-Goal: Alexandria replaces cove's in-repo proxy while preserving the harness
-compatibility cove accumulated. Alexandria is the better foundation (daemon, vault,
+Goal: Alex replaces cove's in-repo proxy while preserving the harness
+compatibility cove accumulated. Alex is the better foundation (daemon, vault,
 refresh, traces, health, admin); cove's proxy is ad hoc but speaks more wire formats.
 
 ### Gate first: prove the Dario replacement
 
 Cove starts/reuses Dario as the Anthropic upstream for Claude subscription traffic
-(port discovery, concurrency, timeouts, traffic logs). Alexandria talks to Anthropic
+(port discovery, concurrency, timeouts, traffic logs). Alex talks to Anthropic
 directly with imported Claude OAuth creds. Before investing in the conversion matrix,
 run real claude-code end-to-end through the current passthrough (the unchecked M1
 acceptance item) and confirm subscription traffic works. If plain OAuth forwarding
@@ -361,8 +361,8 @@ isn't equivalent (M7 billing-bucket risk), the replacement plan changes shape.
    (`/v1/responses`, `/responses`), OpenAI Chat (`/v1/chat/completions`), Anthropic
    Messages (`/v1/messages`, `/messages`), and Gemini
    `models/<model>:generateContent` / `:streamGenerateContent`, then routes by model
-   name to Codex, Claude, or xAI. Alexandria currently 501s every cross-format combo
-   (`plan_upstream` in `alexandria-proxy/src/lib.rs`):
+   name to Codex, Claude, or xAI. Alex currently 501s every cross-format combo
+   (`plan_upstream` in `alex-proxy/src/lib.rs`):
    - OpenAI Responses/Chat + Claude model → Anthropic Messages, and the Anthropic
      stream converted back to OpenAI Responses/Chat.
    - Anthropic Messages + Codex model → OpenAI Responses, and back.
@@ -385,15 +385,15 @@ isn't equivalent (M7 billing-bucket risk), the replacement plan changes shape.
 4. **xAI/Grok upstream** (small). Route `xai/`|`xai:`|`grok/`|`grok:` to Grok CLI
    auth with headers `X-XAI-Token-Auth`, `x-grok-client-version`,
    `x-grok-model-override`, `x-grok-conv-id`. Prefix parsing already exists in
-   `alexandria-core`; the upstream arm is 501 + Grok auth import is missing.
+   `alex-core`; the upstream arm is 501 + Grok auth import is missing.
 5. **Gemini upstream** (largest). OAuth + code-assist endpoint + a third conversion
    axis. Decide open question §8.5 (client-format-only vs real upstream) first.
-6. **Cove integration mode**. Cove discovers/starts Alexandria instead of spawning
+6. **Cove integration mode**. Cove discovers/starts Alex instead of spawning
    per-job proxies, injects Docker-safe `OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL` +
    local key (`host.docker.internal` on macOS / `172.17.0.1` on Linux). The adapter
-   lives in cove; Alexandria stays a static daemon.
+   lives in cove; Alex stays a static daemon.
 7. **Auth-error visibility parity**. Cove surfaces `token_expired`, status, message,
-   `cf-ray`, and upstream body per request. Preserve that in Alexandria traces +
+   `cf-ray`, and upstream body per request. Preserve that in Alex traces +
    admin output (structured traces already exist; make sure these fields survive).
 
 ### Pre-proxy agent auth failures (run diagnostics)
@@ -404,10 +404,10 @@ Some failures never reach the proxy. Example claude-code output: `apiKeySource:"
 Not an upstream 401 and not a model failure — the CLI never picked up usable
 creds/proxy env before making any request. The proxy alone cannot see this.
 
-Split ownership so Alexandria stays inside its non-goals (§1 — benchmark semantics
+Split ownership so Alex stays inside its non-goals (§1 — benchmark semantics
 stay in cove):
 
-- **Alexandria**: generic run-event ingestion (`POST /admin/runs/<id>/events` or a
+- **Alex**: generic run-event ingestion (`POST /admin/runs/<id>/events` or a
   local JSONL watcher) + a correlation query — "did session/run/job X produce any
   traces?" (match on `session_id`, `x-session-id`, run id). Stable, harness-agnostic
   surface.
@@ -424,7 +424,7 @@ stay in cove):
 - Classification labels: `pre_proxy_auth_failure` / `client_not_logged_in`. Zero
   token usage + zero proxy traces ⇒ mark the run invalid benchmark data.
 
-### Already better in Alexandria (keep, don't regress)
+### Already better in Alex (keep, don't regress)
 
 Persistent credential vault; OAuth refresh for OpenAI + Anthropic; forced refresh on
 upstream 401 with re-import fallback; structured traces + cost + usage + admin
@@ -447,18 +447,18 @@ endpoints; real async streaming proxy.
 
 Dario handles Claude-subscription wire-shape (the M7 billing-bucket problem) — delegate
 to it instead of reimplementing `cc-template`. Harnesses **never** talk to Dario
-directly: they talk to Alexandria, and Alexandria routes to the currently active Dario
+directly: they talk to Alex, and Alex routes to the currently active Dario
 generation.
 
 ### Source + runtime
 - [x] Add submodule `repos/dario` ← `git@github.com:askalf/dario.git` (reference code,
       read-only; used for reading auth/config semantics).
 - [x] Runtime via npm package `@askalf/dario`, installed per-version under
-      `~/.alexandria/dario/<version>/` (npm install --prefix), never global.
+      `~/.alex/dario/<version>/` (npm install --prefix), never global.
 - [x] Update monitor: poll npm registry for `@askalf/dario` latest (and optionally the
       git remote main SHA) every `dario_update_check_minutes`; on new version → install
       → spawn new generation → promote → drain old (below).
-- [x] Dario credentials/password (`dario pwd`): store in `~/.alexandria/config.toml`
+- [x] Dario credentials/password (`dario pwd`): store in `~/.alex/config.toml`
       (or vault) and hand to the spawned Dario process (env/flag — confirm exact
       mechanism from `repos/dario` once the submodule lands).
 
@@ -475,10 +475,10 @@ generation.
       same-version replacement; `dario_probe_model` config). Failed probes persisted to
       `<log_root>/<gen>.last-probe.json` (distinguish timeout/auth/rate-limit/wire).
 - [x] Phases starting|ready|unhealthy|draining|dead in `/admin/dario`; route only to
-      ready — `active()` returns None while unhealthy, so Alexandria falls back to the
+      ready — `active()` returns None while unhealthy, so Alex falls back to the
       direct Anthropic upstream until a replacement is ready.
 - [x] Process-death self-heal: reaper detects an exited active child (kill -9, crash)
-      and respawns the same version with 10s retry backoff — no Alexandria restart.
+      and respawns the same version with 10s retry backoff — no Alex restart.
       Proxy `suspect()` hook fires an immediate debounced probe when a dario-routed
       request errors mid-flight.
 - [x] Chaos verified: `./test.sh dario` → DARIO-PROBE (phase=ready + passing probe) and
@@ -501,7 +501,7 @@ generation.
       Anthropic-bound requests go to the active generation's `base_url`; trace records
       the generation id. Keep `direct` as fallback.
 - [x] Admin surface: `GET /admin/dario` (generations, states, in_flight, versions),
-      `alexandria dario status|restart|update`.
+      `alex dario status|restart|update`.
 
 ---
 
@@ -545,7 +545,7 @@ translation path ran; for dario cells the trace carries the generation id.
 | W8 | openai-responses `/v1/responses` | claude-opus-4-8 | anthropic (responses→messages + back) | subscription | M3 |
 | W9 | openai-chat `/v1/chat/completions` | grok-code-fast-1 | xai (native) | subscription (grok CLI oauth) | ✅ live |
 | W10 | anthropic `/v1/messages` | claude-opus-4-8 | **dario** active generation | subscription | §10 |
-| W11 | model aliases (`cove/`, `alexandria/`, `opus-4.8`, slash prefixes) | various | correct provider | — | M3 |
+| W11 | model aliases (`cove/`, `alex/`, `opus-4.8`, slash prefixes) | various | correct provider | — | M3 |
 | W12 | gemini `generateContent` | gemini-* | decide §8.5 first | — | open |
 
 ### Harness matrix (Docker, parallel `--jobs`)
@@ -561,7 +561,7 @@ translation path ran; for dario cells the trace carries the generation id.
 | H7+ | pi / opencode / mini-swe-agent / … | openai/gpt-5.5 | openai-compatible fan-out | add runners incrementally |
 
 Speed: wire cells are all concurrent single completions; harness containers use
-pre-packed tarballs from `~/.alexandria/harness-packages/` (no live npm) and run
+pre-packed tarballs from `~/.alex/harness-packages/` (no live npm) and run
 under `--jobs` (default = CPU count). Target: `wire` < 30 s, `harness` < 3 min warm.
 
 ### Suite plumbing
@@ -577,26 +577,26 @@ under `--jobs` (default = CPU count). Target: `wire` < 30 s, `harness` < 3 min w
 
 ## 12. Testing — harness e2e groundwork (done)
 
-### Harness e2e — Alexandria-owned registry/cache (done)
+### Harness e2e — Alex-owned registry/cache (done)
 
-- [x] Alexandria-owned harness catalog at `config/harnesses.json` — supported harness
+- [x] Alex-owned harness catalog at `config/harnesses.json` — supported harness
       list copied in, external project/path references scrubbed, proxy/model aliases
-      reworded around Alexandria.
+      reworded around Alex.
 - [x] Removed hardcoded external Claude tarball path from
-      `crates/alexandria-daemon/src/harness_e2e.rs`; `harness run claude` now resolves
-      `@anthropic-ai/claude-code@2.1.202` from Alexandria's own cache at
-      `~/.alexandria/harness-packages/`.
-- [x] Package preparation owned by Alexandria: `alexandria harness pack claude`,
-      `alexandria harness pack @openai/codex` (uses
-      `npm pack … --pack-destination ~/.alexandria/harness-packages`).
-- [x] `alexandria harness list` reads the catalog and shows all harnesses, plus
+      `crates/alex-daemon/src/harness_e2e.rs`; `harness run claude` now resolves
+      `@anthropic-ai/claude-code@2.1.202` from Alex's own cache at
+      `~/.alex/harness-packages/`.
+- [x] Package preparation owned by Alex: `alex harness pack claude`,
+      `alex harness pack @openai/codex` (uses
+      `npm pack … --pack-destination ~/.alex/harness-packages`).
+- [x] `alex harness list` reads the catalog and shows all harnesses, plus
       Docker smoke-runner availability, default package/version, and whether the
       cached tarball is present.
 - [x] Docker smoke runners: claude, codex, grok-build / grok.
-- [x] `docs/harness-e2e.md` updated to describe Alexandria's own registry/cache
+- [x] `docs/harness-e2e.md` updated to describe Alex's own registry/cache
       pattern (Dario notes kept as reference context).
-- Verified: `cargo test` passes; `alexandria harness list` and
-  `alexandria harness pack --help` work.
+- Verified: `cargo test` passes; `alex harness list` and
+  `alex harness pack --help` work.
 - [ ] Live `npm pack` + Docker harness run not yet exercised (needs network + live
       proxy credentials).
 
@@ -621,7 +621,7 @@ is still unimplemented against current `main` before picking it up.
       chat log from a captured trace (request/response bodies are already stored),
       reconstruct it as the target harness's native session/conversation format,
       and launch that harness resumed into the conversation under a NEW trace id.
-      Link lineage with a header (e.g. `x-alexandria-resumed-from: <old-trace-id>`)
+      Link lineage with a header (e.g. `x-alex-resumed-from: <old-trace-id>`)
       recorded on the new session's traces so the Trace Browser can show the
       resume chain across harnesses. Open questions: per-harness session-file
       formats (claude/codex/pi/kimi all differ), tool-call history fidelity, and

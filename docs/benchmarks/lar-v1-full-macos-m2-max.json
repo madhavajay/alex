@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "measured_unix_ms": 1784596343450,
+  "passed": true,
+  "profile": {
+    "profile": "full",
+    "trace_count": 55000,
+    "logical_body_bytes": 9400000000,
+    "samples": 100,
+    "resume_first_entries": 257,
+    "budgets": {
+      "generation_ms": 900000,
+      "migration_ms": 3600000,
+      "archive_verify_ms": 1200000,
+      "sqlite_summary_p95_us": 100000,
+      "sqlite_session_summary_p95_us": 600000,
+      "sqlite_filtered_search_p95_us": 100000,
+      "sqlite_trace_get_p95_us": 25000,
+      "lar_random_read_p95_us": 25000,
+      "trace_turn_open_p95_us": 75000,
+      "peak_rss_bytes": 536870912
+    }
+  },
+  "machine": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu_model": "Apple M2 Max",
+    "logical_cpus": 12,
+    "total_memory_bytes": 68719476736,
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "git_commit": "5b2554e4d5a4f8115c4b6bdd6625ac08498b3b18",
+    "package_version": "0.1.25"
+  },
+  "corpus": {
+    "schema_version": 1,
+    "profile": "full",
+    "seed": 1279349297,
+    "trace_count": 55000,
+    "session_count": 55000,
+    "bodies_per_trace": 2,
+    "body_count": 110000,
+    "logical_body_bytes": 9400000000,
+    "legacy_file_count": 55000,
+    "deterministic_date": "2000-01-01"
+  },
+  "legacy_bytes_on_disk": 39019588,
+  "sqlite_bytes_on_disk": 61660352,
+  "generation_ms": 17718,
+  "migration_ms": 963080,
+  "archive_verify_ms": 57791,
+  "migration": {
+    "first_batch": {
+      "archive": "/private/tmp/alex-lar-full-5b2554e/lar/legacy-v1.lar",
+      "candidates": 110000,
+      "missing_originals": 0,
+      "imported": 257,
+      "already_present": 0,
+      "next_index": 257,
+      "pointers_switched": 0,
+      "complete": false,
+      "validated": false,
+      "originals_preserved": true
+    },
+    "resumed": {
+      "archive": "/private/tmp/alex-lar-full-5b2554e/lar/legacy-v1.lar",
+      "candidates": 110000,
+      "missing_originals": 0,
+      "imported": 109743,
+      "already_present": 0,
+      "next_index": 110000,
+      "pointers_switched": 110000,
+      "complete": true,
+      "validated": true,
+      "originals_preserved": true
+    },
+    "partial_run_switched_zero_pointers": true,
+    "resumed_to_complete_validation": true,
+    "originals_preserved": true
+  },
+  "archive": {
+    "path": "/private/tmp/alex-lar-full-5b2554e/lar/legacy-v1.lar",
+    "archive_bytes": 9424475088,
+    "record_count": 110000,
+    "expected_record_count": 110000,
+    "resident_index_bytes": 0,
+    "fully_verified": true
+  },
+  "peak_rss_bytes": 65110016,
+  "peak_rss_budget_bytes": 536870912,
+  "peak_rss_passed": true,
+  "metrics": [
+    {
+      "name": "generation",
+      "unit": "ms",
+      "samples": 1,
+      "min": 17718,
+      "p50": 17718,
+      "p95": 17718,
+      "max": 17718,
+      "budget": 900000,
+      "passed": true
+    },
+    {
+      "name": "migration_resume_and_validation",
+      "unit": "ms",
+      "samples": 1,
+      "min": 963080,
+      "p50": 963080,
+      "p95": 963080,
+      "max": 963080,
+      "budget": 3600000,
+      "passed": true
+    },
+    {
+      "name": "archive_full_verify",
+      "unit": "ms",
+      "samples": 1,
+      "min": 57791,
+      "p50": 57791,
+      "p95": 57791,
+      "max": 57791,
+      "budget": 1200000,
+      "passed": true
+    },
+    {
+      "name": "sqlite_trace_summary_page",
+      "unit": "us",
+      "samples": 100,
+      "min": 1720,
+      "p50": 8379,
+      "p95": 14747,
+      "max": 15889,
+      "budget": 100000,
+      "passed": true
+    },
+    {
+      "name": "sqlite_session_summary_page",
+      "unit": "us",
+      "samples": 100,
+      "min": 253945,
+      "p50": 272984,
+      "p95": 342611,
+      "max": 615524,
+      "budget": 600000,
+      "passed": true
+    },
+    {
+      "name": "sqlite_filtered_model_search",
+      "unit": "us",
+      "samples": 100,
+      "min": 1213,
+      "p50": 1283,
+      "p95": 1943,
+      "max": 3020,
+      "budget": 100000,
+      "passed": true
+    },
+    {
+      "name": "sqlite_one_trace_get",
+      "unit": "us",
+      "samples": 100,
+      "min": 32,
+      "p50": 35,
+      "p95": 42,
+      "max": 92,
+      "budget": 25000,
+      "passed": true
+    },
+    {
+      "name": "lar_random_body_read_warm_cache",
+      "unit": "us",
+      "samples": 100,
+      "min": 261,
+      "p50": 467,
+      "p95": 864,
+      "max": 1186,
+      "budget": 25000,
+      "passed": true
+    },
+    {
+      "name": "trace_one_turn_open_with_two_bodies",
+      "unit": "us",
+      "samples": 100,
+      "min": 2391,
+      "p50": 3007,
+      "p95": 4022,
+      "max": 5729,
+      "budget": 75000,
+      "passed": true
+    }
+  ],
+  "limitations": [
+    "random LAR reads are warm-cache; privileged OS cache eviction is not attempted",
+    "payloads are deterministic synthetic JSON and do not claim private-corpus compression representativeness",
+    "web UI virtualization, HAR conversion, live capture, and tool-body archives are outside this verifier"
+  ]
+}

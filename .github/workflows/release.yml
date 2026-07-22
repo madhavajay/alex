@@ -1,4 +1,4 @@
-name: Release to crates.io
+name: Stable Release
 
 on:
   workflow_dispatch:
@@ -10,32 +10,67 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
+permissions:
+  contents: read
+
 concurrency:
-  group: release
+  group: stable-release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   meta:
+    name: Validate stable tag
     runs-on: namespace-profile-linux-medium
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
-      - name: Validate stable tag
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Validate stable tag and checkout
         id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "tag '$tag' is not a stable tag (expected vX.Y.Z)" >&2
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag '$RELEASE_TAG' is not a stable tag (expected vX.Y.Z)" >&2
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ -z "$tag_sha" || "$tag_sha" != "$checkout_sha" ]]; then
+            echo "checkout $checkout_sha does not match $RELEASE_TAG ($tag_sha)" >&2
+            exit 1
+          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=${RELEASE_TAG#v}"
+            echo "sha=$checkout_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  rust-test:
+    name: Test Rust workspace
+    needs: meta
+    runs-on: namespace-profile-linux-medium
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
 
   swift-test:
+    name: Test macOS app
     needs: meta
     runs-on: namespace-profile-mac-medium
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,155 +79,49 @@ jobs:
         working-directory: macos
         run: swift test
 
-  publish:
-    needs: meta
+  linux-gnu-asset:
+    name: Build Linux GNU CLI artifact
+    needs: [meta, rust-test]
     runs-on: namespace-profile-linux-medium
-    if: ${{ !cancelled() && needs.meta.result == 'success' }}
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    permissions:
-      contents: write
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           ref: ${{ needs.meta.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      - name: Stamp version from tag
-        id: version
+      - name: Build and package CLI from tagged source
         run: |
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           ./scripts/stamp-version.sh "$version"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      - run: cargo test --workspace
-
-      - name: Publish crates in dependency order
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          for crate in alex-core alex-auth alex-store alex-proxy alex-wrap alex; do
-            echo "::group::publish ${crate} ${version}"
-            status=$(curl -s -o /dev/null -w "%{http_code}" \
-              -A "alex-release-workflow" \
-              "https://crates.io/api/v1/crates/${crate}/${version}")
-            if [ "$status" = "200" ]; then
-              echo "${crate} ${version} already published; skipping"
-            else
-              cargo publish -p "$crate" --allow-dirty
-            fi
-            echo "::endgroup::"
-          done
-
-      - name: Build CLI binary from crates.io
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          root="$RUNNER_TEMP/alex-cli-install"
-          artifact_dir="$PWD/dist/release-assets"
-          asset="alex-cli-${version}-linux-x86_64.tar.gz"
-
-          rm -rf "$root" "$artifact_dir"
-          mkdir -p "$artifact_dir"
-
-          for attempt in {1..12}; do
-            if cargo install alex --version "$version" --root "$root" --force --bins; then
-              break
-            fi
-
-            if [[ "$attempt" -eq 12 ]]; then
-              echo "cargo install alex ${version} failed after ${attempt} attempts" >&2
-              exit 1
-            fi
-
-            echo "alex ${version} is not installable from crates.io yet; retrying in 15s..."
-            sleep 15
-          done
-
-          tar -C "$root/bin" -czf "$artifact_dir/$asset" alex alexandria
-          shasum -a 256 "$artifact_dir/$asset" > "$artifact_dir/$asset.sha256"
-
-      - name: Publish CLI binary to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          tag="v${version}"
-          asset_dir="dist/release-assets"
-          notes="Release assets for Alex ${version}."
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$asset_dir"/* --clobber
-          else
-            if ! gh release create "$tag" "$asset_dir"/* \
-              --target "$(git rev-parse HEAD)" \
-              --title "Alex ${tag}" \
-              --notes "$notes"; then
-              gh release upload "$tag" "$asset_dir"/* --clobber
-            fi
-          fi
-  windows-asset:
-    needs: [meta, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    runs-on: namespace-profile-windows-medium
-    permissions:
-      contents: write
-    steps:
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build CLI binaries from crates.io
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
-          root="$RUNNER_TEMP/alex-cli-install"
-          asset="alex-cli-${version}-windows-x86_64.zip"
-
-          for attempt in {1..12}; do
-            if cargo install alex --version "$version" --root "$root" --force --bins; then
-              break
-            fi
-            if [[ "$attempt" -eq 12 ]]; then
-              echo "cargo install alex ${version} failed after ${attempt} attempts" >&2
-              exit 1
-            fi
-            echo "alex ${version} is not installable from crates.io yet; retrying in 15s..."
-            sleep 15
-          done
-
+          cargo build --release -p alex --bins
           mkdir -p dist
-          7z a "dist/$asset" "$root/bin/alex.exe" "$root/bin/alexandria.exe"
+          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+          tar -C target/release -czf "dist/$asset" alex
           sha256sum "dist/$asset" > "dist/$asset.sha256"
-      - name: Upload to GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "v${{ needs.publish.outputs.version }}" dist/* --clobber -R "${{ github.repository }}"
+      - name: Upload Linux GNU workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
 
   linux-musl-asset:
-    needs: [meta, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    name: Build static Linux CLI artifacts
+    needs: [meta, rust-test]
     runs-on: namespace-profile-linux-medium
-    permissions:
-      contents: write
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
-      - name: Build fully static musl binaries (x86_64 + aarch64) + checksums
+      - name: Build static musl binaries from tagged source
         run: |
           set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
-          ./scripts/stamp-version.sh "$version"
-          # Static musl (no glibc floor, no dynamic OpenSSL) so the CLI runs in
-          # any Linux container. TLS is rustls, so nothing links libssl.
+          ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
           docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
             set -euo pipefail
             rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -200,99 +129,74 @@ jobs:
               --target x86_64-unknown-linux-musl \
               --target aarch64-unknown-linux-musl
             mkdir -p dist
-            cp target/x86_64-unknown-linux-musl/release/alex  dist/alex-x86_64-unknown-linux-musl
+            cp target/x86_64-unknown-linux-musl/release/alex dist/alex-x86_64-unknown-linux-musl
             cp target/aarch64-unknown-linux-musl/release/alex dist/alex-aarch64-unknown-linux-musl
-            file dist/alex-x86_64-unknown-linux-musl  | grep -q "statically linked"
+            file dist/alex-x86_64-unknown-linux-musl | grep -q "statically linked"
             file dist/alex-aarch64-unknown-linux-musl | grep -q "statically linked"
-            ( cd dist && sha256sum alex-x86_64-unknown-linux-musl alex-aarch64-unknown-linux-musl > checksums.txt )
+            (cd dist && sha256sum alex-x86_64-unknown-linux-musl alex-aarch64-unknown-linux-musl > checksums.txt)
             chmod -R a+rX dist
           '
-          cat dist/checksums.txt
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "v${{ needs.publish.outputs.version }}" \
-            dist/alex-x86_64-unknown-linux-musl \
-            dist/alex-aarch64-unknown-linux-musl \
-            dist/checksums.txt --clobber -R "${{ github.repository }}"
+      - name: Upload Linux musl workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-linux-musl
+          path: |
+            dist/alex-x86_64-unknown-linux-musl
+            dist/alex-aarch64-unknown-linux-musl
+            dist/checksums.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
 
-  macos-asset:
-    needs: [meta, publish, swift-test]
-    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.swift-test.result == 'success' }}
+  macos-cli-asset:
+    name: Build signed macOS CLI artifacts
+    needs: [meta, rust-test, swift-test]
     runs-on: namespace-profile-mac-medium
-    permissions:
-      contents: write
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build CLI binaries from crates.io
+      - name: Build CLI binaries from tagged source
         run: |
           set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
+          ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
+          cargo build --release -p alex --bins
+          cargo build --release -p alex --bins --target x86_64-apple-darwin
           arm_root="$RUNNER_TEMP/alex-cli-aarch64"
           intel_root="$RUNNER_TEMP/alex-cli-x86_64"
           rm -rf "$arm_root" "$intel_root"
+          mkdir -p "$arm_root" "$intel_root"
+          cp target/release/alex "$arm_root/"
+          cp target/x86_64-apple-darwin/release/alex "$intel_root/"
 
-          install_with_retry() {
-            local root="$1"
-            shift
-            for attempt in {1..12}; do
-              if cargo install alex --version "$version" --root "$root" --force --bins "$@"; then
-                return 0
-              fi
-              if [[ "$attempt" -eq 12 ]]; then
-                echo "cargo install alex ${version} failed after ${attempt} attempts" >&2
-                return 1
-              fi
-              echo "alex ${version} is not installable from crates.io yet; retrying in 15s..."
-              sleep 15
-            done
-          }
-
-          install_with_retry "$arm_root"
-          rustup target add x86_64-apple-darwin
-          install_with_retry "$intel_root" --target x86_64-apple-darwin
-
-      - name: Check CLI signing secrets
-        id: cli_signing
+      - name: Require CLI signing and notarization secrets
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
           SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
-          for key in \
-            APPLE_SIGNING_IDENTITY \
-            SIGNING_CERTIFICATE_P12_DATA \
-            SIGNING_CERTIFICATE_PASSWORD
+          for key in APPLE_ID APPLE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID \
+            SIGNING_CERTIFICATE_P12_DATA SIGNING_CERTIFICATE_PASSWORD
           do
-            if [[ -z "${!key:-}" ]]; then
-              missing+=("$key")
-            fi
+            [[ -n "${!key:-}" ]] || missing+=("$key")
           done
-
           if [[ "${#missing[@]}" -gt 0 ]]; then
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              # A tag release must never publish unsigned macOS CLI archives.
-              printf 'Missing required macOS CLI signing secret(s): %s\n' "${missing[*]}" >&2
-              exit 1
-            fi
-            printf 'Skipping macOS CLI codesign for workflow_dispatch; missing secret(s): %s\n' "${missing[*]}"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
+            printf 'Missing required macOS CLI signing secret(s): %s\n' "${missing[*]}" >&2
+            exit 1
           fi
 
       - name: Set up CLI signing keychain
-        if: steps.cli_signing.outputs.available == 'true'
         id: signing_keychain
         uses: ./.github/actions/mac-signing-keychain
         with:
@@ -302,112 +206,96 @@ jobs:
           signing_certificate_password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
 
       - name: Sign CLI binaries
-        if: steps.cli_signing.outputs.available == 'true'
         env:
           CODESIGN_IDENTITY: ${{ steps.signing_keychain.outputs.identity }}
         run: |
           set -euo pipefail
           for bin in \
-            "$RUNNER_TEMP/alex-cli-aarch64/bin/alex" \
-            "$RUNNER_TEMP/alex-cli-aarch64/bin/alexandria" \
-            "$RUNNER_TEMP/alex-cli-x86_64/bin/alex" \
-            "$RUNNER_TEMP/alex-cli-x86_64/bin/alexandria"
+            "$RUNNER_TEMP/alex-cli-aarch64/alex" \
+            "$RUNNER_TEMP/alex-cli-x86_64/alex"
           do
-            codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
+            codesign --force --options runtime --timestamp \
+              --identifier "com.madhavajay.alex.cli" \
+              --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
 
+      - name: Notarize CLI binaries
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          notary_root="$RUNNER_TEMP/alex-cli-notary"
+          notary_zip="$RUNNER_TEMP/alex-cli-notary.zip"
+          notary_result="$RUNNER_TEMP/alex-cli-notary-result.json"
+          rm -rf "$notary_root" "$notary_zip" "$notary_result"
+          mkdir -p "$notary_root/aarch64" "$notary_root/x86_64"
+          cp "$RUNNER_TEMP/alex-cli-aarch64/"* "$notary_root/aarch64/"
+          cp "$RUNNER_TEMP/alex-cli-x86_64/"* "$notary_root/x86_64/"
+          ditto -c -k --sequesterRsrc "$notary_root" "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --output-format json > "$notary_result"
+          verdict="$(plutil -extract status raw -o - "$notary_result")"
+          if [[ "$verdict" != "Accepted" ]]; then
+            submission_id="$(plutil -extract id raw -o - "$notary_result")"
+            xcrun notarytool log "$submission_id" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            echo "CLI notarization failed with status: $verdict" >&2
+            exit 1
+          fi
+
+      - name: Package signed CLI binaries
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          mkdir -p dist/release-assets
+          arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
+          intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
+          tar -C "$RUNNER_TEMP/alex-cli-aarch64" -czf "dist/release-assets/$arm_asset" alex
+          tar -C "$RUNNER_TEMP/alex-cli-x86_64" -czf "dist/release-assets/$intel_asset" alex
+          shasum -a 256 "dist/release-assets/$arm_asset" > "dist/release-assets/$arm_asset.sha256"
+          shasum -a 256 "dist/release-assets/$intel_asset" > "dist/release-assets/$intel_asset.sha256"
+
+          verify_root="$RUNNER_TEMP/alex-cli-verify"
+          mkdir -p "$verify_root/arm" "$verify_root/intel"
+          tar -xzf "dist/release-assets/$arm_asset" -C "$verify_root/arm"
+          tar -xzf "dist/release-assets/$intel_asset" -C "$verify_root/intel"
+          for bin in "$verify_root/arm/"* "$verify_root/intel/"*; do
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+          case "$(uname -m)" in
+            arm64) native_root="$verify_root/arm" ;;
+            x86_64) native_root="$verify_root/intel" ;;
+            *) echo "unsupported macOS runner architecture" >&2; exit 1 ;;
+          esac
+          "$native_root/alex" --version
+
       - name: Clean up CLI signing keychain
-        if: always() && steps.cli_signing.outputs.available == 'true'
+        if: always()
         uses: ./.github/actions/mac-signing-keychain
         with:
           cleanup: "true"
           keychain: ${{ steps.signing_keychain.outputs.keychain }}
           original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
-      - name: Package CLI binaries
-        run: |
-          set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
-          artifact_dir="$PWD/dist/release-assets"
-          mkdir -p "$artifact_dir"
-
-          arm_asset="alex-cli-${version}-macos-aarch64.tar.gz"
-          intel_asset="alex-cli-${version}-macos-x86_64.tar.gz"
-
-          tar -C "$RUNNER_TEMP/alex-cli-aarch64/bin" -czf "$artifact_dir/$arm_asset" alex alexandria
-          tar -C "$RUNNER_TEMP/alex-cli-x86_64/bin" -czf "$artifact_dir/$intel_asset" alex alexandria
-          shasum -a 256 "$artifact_dir/$arm_asset" > "$artifact_dir/$arm_asset.sha256"
-          shasum -a 256 "$artifact_dir/$intel_asset" > "$artifact_dir/$intel_asset.sha256"
-
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "v${{ needs.publish.outputs.version }}" dist/release-assets/* --clobber -R "${{ github.repository }}"
-
-  manifest:
-    needs:
-      - meta
-      - publish
-      - windows-asset
-      - linux-musl-asset
-      - macos-asset
-    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.windows-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.macos-asset.result == 'success' }}
-    runs-on: namespace-profile-linux-medium
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
+      - name: Upload macOS CLI workflow artifacts
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ needs.meta.outputs.tag }}
+          name: stable-macos-cli
+          path: dist/release-assets/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
 
-      - name: Set manifest metadata
-        id: version
-        run: echo "version=${{ needs.publish.outputs.version }}" >> "$GITHUB_OUTPUT"
-
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
-          tag="v${version}"
-          rm -rf dist/manifest-assets
-          mkdir -p dist/manifest-assets
-          gh release download "$tag" --dir dist/manifest-assets --clobber -R "${{ github.repository }}"
-          find dist/manifest-assets -type f -name '*.sha256' -delete
-
-      - name: Generate manifest
-        run: |
-          set -euo pipefail
-          version="${{ needs.publish.outputs.version }}"
-          tag="v${version}"
-          merge_args=()
-          if [[ -f dist/manifest-assets/manifest.json ]]; then
-            merge_args=(--merge-existing dist/manifest-assets/manifest.json)
-          fi
-          python3 scripts/gen-manifest.py \
-            --tag "$tag" \
-            --repo "${{ github.repository }}" \
-            --assets-dir dist/manifest-assets \
-            "${merge_args[@]}" \
-            --out manifest.json
-          cat manifest.json
-
-      - name: Upload manifest
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "v${{ needs.publish.outputs.version }}" manifest.json --clobber -R "${{ github.repository }}"
-
-  stable-app:
-    needs: [meta, manifest, swift-test]
-    if: ${{ !cancelled() && needs.manifest.result == 'success' && needs.swift-test.result == 'success' }}
+  stable-dmg:
+    name: Build signed and notarized DMG artifact
+    needs: [meta, rust-test, swift-test]
     permissions:
       contents: write
     uses: ./.github/workflows/dmg-appcast.yml
@@ -415,104 +303,589 @@ jobs:
       channel: stable
       tag: ${{ needs.meta.outputs.tag }}
       overwrite: true
-      hard_fail_missing_secrets: ${{ github.event_name == 'push' }}
-      require_existing_manifest: true
+      notarize: true
+      build_dmg: true
+      publish_release: false
+      publish_appcast: false
+      hard_fail_missing_secrets: true
+      require_existing_manifest: false
     secrets: inherit
 
-  tap-formula:
-    needs: manifest
-    if: ${{ !cancelled() && needs.manifest.result == 'success' }}
+  linux-packaged-smoke:
+    name: Smoke installed Linux release package
+    needs: [meta, linux-gnu-asset]
     runs-on: namespace-profile-linux-medium
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
 
-      - name: Check tap deploy key
-        id: tap_key
+      - name: Download packaged Linux CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-linux-gnu
+          path: dist/linux
+
+      - name: Smoke installer, systemd, routing, trace persistence, and restart
         env:
-          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/linux-smoke.json
+          ALEX_CI_LINUX_VERSION: ${{ needs.meta.outputs.version }}
+          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/linux
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          RELEASE_SHA: ${{ needs.meta.outputs.sha }}
         run: |
           set -euo pipefail
-          if [[ -z "${TAP_DEPLOY_KEY:-}" ]]; then
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              # A tag release must update the tap instead of silently omitting formulae.
-              echo "TAP_DEPLOY_KEY is required for a stable tag release." >&2
-              exit 1
-            fi
-            echo "Skipping Homebrew formula update for workflow_dispatch; TAP_DEPLOY_KEY is not configured."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
+          packaging/ci-linux/run-systemd-container.sh
+          jq --arg commit "$RELEASE_SHA" '. + {commit:$commit}' \
+            dist/linux-smoke.json > dist/linux-smoke.with-commit.json
+          mv dist/linux-smoke.with-commit.json dist/linux-smoke.json
+
+      - name: Clean installed smoke container
+        if: always()
+        env:
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set +e
+          docker rm --force "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1
+          if docker container inspect "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "container cleanup failed: $ALEX_CI_LINUX_CONTAINER_NAME" >&2
+            exit 1
           fi
 
-      - name: Download manifest
-        if: steps.tap_key.outputs.present == 'true'
+      - name: Upload Linux smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-linux-smoke-evidence
+          path: dist/linux-smoke.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  macos-packaged-smoke:
+    name: Smoke packaged macOS app and CLI
+    needs: [meta, macos-cli-asset, stable-dmg]
+    runs-on: namespace-profile-mac-medium
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Download packaged macOS CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-macos-cli
+          path: dist/stable-macos-cli
+
+      - name: Download signed DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.stable-dmg.outputs.artifact_name }}
+          path: dist/stable-dmg
+
+      - name: Assemble exact release package smoke bundle
+        env:
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/alex-stable-smoke-bundle"
+          mount_point="$RUNNER_TEMP/alex-stable-dmg-mount"
+          rm -rf "$stage" "$mount_point"
+          mkdir -p "$stage/bin" "$mount_point"
+
+          case "$(uname -m)" in
+            arm64) cli_arch=aarch64 ;;
+            x86_64) cli_arch=x86_64 ;;
+            *) echo "unsupported macOS runner architecture" >&2; exit 1 ;;
+          esac
+          cli_asset="alex-cli-${RELEASE_VERSION}-macos-${cli_arch}.tar.gz"
+          sed 's#dist/release-assets/##; s#dist/##' \
+            "dist/stable-macos-cli/$cli_asset.sha256" \
+            | (cd dist/stable-macos-cli && shasum -a 256 -c -)
+          tar -xzf "dist/stable-macos-cli/$cli_asset" -C "$stage/bin"
+
+          dmg="$(find dist/stable-dmg -maxdepth 1 -name 'Alex-*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          ditto "$mount_point/Alex.app" "$stage/Alex.app"
+          hdiutil detach "$mount_point" >/dev/null
+          trap - EXIT
+
+          cp packaging/ci-macos/install.sh \
+            packaging/ci-macos/mock-openai.py \
+            packaging/ci-macos/smoke-installed.sh \
+            packaging/ci-macos/README.md \
+            "$stage/"
+          cp scripts/lib/install-common.sh "$stage/"
+          chmod +x "$stage/install.sh" "$stage/mock-openai.py" \
+            "$stage/smoke-installed.sh" "$stage/bin/alex"
+
+      - name: Smoke installed app, routing, trace persistence, and launchd restart
+        env:
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+          ALEX_CI_SMOKE_RESULT: ${{ github.workspace }}/dist/macos-smoke.json
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+          RELEASE_SHA: ${{ needs.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/alex-stable-smoke-bundle/smoke-installed.sh"
+          jq --arg version "$RELEASE_VERSION" --arg commit "$RELEASE_SHA" \
+            '. + {version:$version,commit:$commit}' \
+            dist/macos-smoke.json > dist/macos-smoke.with-release.json
+          mv dist/macos-smoke.with-release.json dist/macos-smoke.json
+
+      - name: Clean installed smoke service and files
+        if: always()
+        env:
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+        run: |
+          set +e
+          service_target="gui/$(id -u)/com.madhavajay.alex.daemon"
+          alex_bin="$ALEX_CI_SMOKE_ROOT/bin/alex"
+          if [[ -f "$ALEX_CI_SMOKE_ROOT/service-cleanup-allowed" ]]; then
+            [[ -x "$alex_bin" ]] && ALEX_HOME="$ALEX_CI_SMOKE_ROOT/state" \
+              "$alex_bin" service uninstall >/dev/null 2>&1
+            launchctl bootout "$service_target" >/dev/null 2>&1
+            rm -f "$HOME/Library/LaunchAgents/com.madhavajay.alex.daemon.plist"
+          fi
+          if [[ -s "$ALEX_CI_SMOKE_ROOT/mock.pid" ]]; then
+            mock_pid="$(tr -d '[:space:]' < "$ALEX_CI_SMOKE_ROOT/mock.pid")"
+            [[ "$mock_pid" =~ ^[0-9]+$ ]] && kill "$mock_pid" >/dev/null 2>&1
+          fi
+          rm -rf "$ALEX_CI_SMOKE_ROOT" "$RUNNER_TEMP/alex-stable-smoke-bundle"
+          ! launchctl print "$service_target" >/dev/null 2>&1
+
+      - name: Upload macOS smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-macos-smoke-evidence
+          path: dist/macos-smoke.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  release-gates:
+    name: Verify packaged smoke evidence
+    needs: [meta, linux-packaged-smoke, macos-packaged-smoke]
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - name: Download all packaged-smoke evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stable-*-smoke-evidence
+          path: dist/evidence
+          merge-multiple: true
+
+      - name: Fail closed unless every platform passed
+        env:
+          RELEASE_SHA: ${{ needs.meta.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$RELEASE_SHA" "$RELEASE_VERSION" <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path("dist/evidence")
+          expected = {"linux-smoke.json", "macos-smoke.json"}
+          present = {path.name for path in root.glob("*.json")}
+          if present != expected:
+              raise SystemExit(f"incomplete packaged smoke evidence: {sorted(present)}")
+          records = {name: json.loads((root / name).read_text()) for name in expected}
+          for name, record in records.items():
+              if record.get("schema_version") != 1 or not record.get("passed"):
+                  raise SystemExit(f"failed smoke evidence: {name}")
+              if record.get("commit") != sys.argv[1]:
+                  raise SystemExit(f"stale smoke evidence: {name}")
+
+          linux = records["linux-smoke.json"]
+          if not (
+              linux.get("platform") == {"os": "ubuntu", "arch": "x86_64"}
+              and linux.get("package", {}).get("version") == sys.argv[2]
+              and linux.get("package", {}).get("archive_checksum_verified") is True
+              and linux.get("package", {}).get("installed_binary") is True
+              and linux.get("service", {}).get("manager") == "systemd-user"
+              and linux.get("service", {}).get("replaced") is True
+              and linux.get("trace", {}).get("persisted_across_restart") is True
+              and linux.get("external_provider_network") is False
+          ):
+              raise SystemExit("Linux installed-package evidence is incomplete")
+
+          macos = records["macos-smoke.json"]
+          if not (
+              macos.get("version") == sys.argv[2]
+              and macos.get("install", {}).get("app") is True
+              and macos.get("install", {}).get("packaged_binary") is True
+              and macos.get("install", {}).get("launchd_managed") is True
+              and macos.get("launchd", {}).get("replaced") is True
+              and macos.get("trace", {}).get("persisted_across_restart") is True
+              and macos.get("external_provider_network") is False
+          ):
+              raise SystemExit("macOS installed-package evidence is incomplete")
+
+          pathlib.Path("dist/release-gates.json").write_text(
+              json.dumps({"schema_version": 1, "passed": True,
+                          "commit": sys.argv[1], "version": sys.argv[2],
+                          "evidence": records}, indent=2) + "\n")
+          PY
+
+      - name: Upload combined gate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-release-gate-evidence
+          path: dist/release-gates.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
+  manifest:
+    name: Build complete release manifest
+    needs:
+      - meta
+      - release-gates
+      - linux-gnu-asset
+      - linux-musl-asset
+      - macos-cli-asset
+      - stable-dmg
+    runs-on: namespace-profile-linux-medium
+    outputs:
+      version: ${{ needs.meta.outputs.version }}
+      artifact_name: stable-release-bundle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: stable-linux-gnu
+          path: dist/release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: stable-linux-musl
+          path: dist/release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: stable-macos-cli
+          path: dist/release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.stable-dmg.outputs.artifact_name }}
+          path: dist/release-assets
+
+      - name: Generate and verify one complete manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/gen-manifest.py \
+            --tag "${{ needs.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --assets-dir dist/release-assets \
+            --out dist/release-assets/manifest.json
+          python3 scripts/verify-release-manifest.py \
+            --manifest dist/release-assets/manifest.json \
+            --assets-dir dist/release-assets \
+            --tag "${{ needs.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}"
+          cat dist/release-assets/manifest.json
+
+      - name: Upload complete release bundle workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-release-bundle
+          path: dist/release-assets/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  draft-release:
+    name: Create and fill draft GitHub release
+    needs: [meta, manifest]
+    runs-on: namespace-profile-linux-medium
+    outputs:
+      already_published: ${{ steps.release.outputs.already_published }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.manifest.outputs.artifact_name }}
+          path: dist/release-assets
+
+      - name: Create or resume draft and upload every asset
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          already_published=false
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              already_published=true
+              echo "Release is already public; refusing to mutate it before verification."
+            fi
+          else
+            notes_file="$RUNNER_TEMP/alex-$RELEASE_VERSION-release-notes.md"
+            awk -v version="$RELEASE_VERSION" '
+              BEGIN { header = "## [" version "]" }
+              $0 == header || index($0, header " - ") == 1 { found = 1; next }
+              found && index($0, "## [") == 1 { exit }
+              found { print }
+              END { if (!found) exit 2 }
+            ' CHANGELOG.md > "$notes_file"
+            if ! grep -q '[^[:space:]]' "$notes_file"; then
+              echo "CHANGELOG.md has no release notes for $RELEASE_VERSION" >&2
+              exit 1
+            fi
+            gh release create "$RELEASE_TAG" \
+              --draft --latest=false --verify-tag \
+              --title "Alex $RELEASE_TAG" \
+              --notes-file "$notes_file"
+          fi
+
+          if [[ "$already_published" == "false" ]]; then
+            mapfile -t assets < <(find dist/release-assets -maxdepth 1 -type f -print | sort)
+            [[ "${#assets[@]}" -gt 0 ]]
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          fi
+          echo "already_published=$already_published" >> "$GITHUB_OUTPUT"
+
+      - name: Verify assets attached to draft or resumed release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          version="${{ needs.manifest.outputs.version }}"
-          gh release download "v${version}" --pattern manifest.json --clobber -R "${{ github.repository }}"
+          tag="${{ needs.meta.outputs.tag }}"
+          version="${{ needs.meta.outputs.version }}"
+          rm -rf dist/release-verify
+          mkdir -p dist/release-verify
+          gh release download "$tag" --dir dist/release-verify --clobber
+          for name in \
+            "alex-cli-${version}-linux-x86_64.tar.gz" \
+            "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-macos-aarch64.tar.gz" \
+            "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
+            "alex-cli-${version}-macos-x86_64.tar.gz" \
+            "alex-cli-${version}-macos-x86_64.tar.gz.sha256" \
+            alex-x86_64-unknown-linux-musl \
+            alex-aarch64-unknown-linux-musl \
+            checksums.txt \
+            "Alex-${version}.dmg" \
+            manifest.json
+          do
+            [[ -f "dist/release-verify/$name" ]] || {
+              echo "release is missing $name" >&2
+              exit 1
+            }
+          done
+          python3 scripts/verify-release-manifest.py \
+            --manifest dist/release-verify/manifest.json \
+            --assets-dir dist/release-verify \
+            --tag "$tag" --repo "${{ github.repository }}"
 
-      - name: Render formula
-        if: steps.tap_key.outputs.present == 'true'
+  publish-crates:
+    name: Publish crates after packaged gates
+    needs: [meta, release-gates, draft-release]
+    runs-on: namespace-profile-linux-medium
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stamp version from tag
+        run: ./scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
+
+      - name: Publish crates idempotently in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          version="${{ needs.manifest.outputs.version }}"
+          [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]] || {
+            echo "CARGO_REGISTRY_TOKEN is required for a stable release." >&2
+            exit 1
+          }
+          version="${{ needs.meta.outputs.version }}"
+          for crate in alex-middleware alex-core alex-auth alex-lar alex-store alex-proxy alex-wrap alex; do
+            echo "::group::publish ${crate} ${version}"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A 'alex-release-workflow' \
+              "https://crates.io/api/v1/crates/${crate}/${version}" || true)"
+            if [[ "$status" == "200" ]]; then
+              echo "${crate} ${version} already published; skipping"
+            else
+              published=false
+              for attempt in {1..8}; do
+                if cargo publish -p "$crate" --allow-dirty; then
+                  published=true
+                  break
+                fi
+                echo "publish attempt $attempt for $crate failed; retrying in 20s" >&2
+                sleep 20
+              done
+              [[ "$published" == "true" ]]
+            fi
+            echo "::endgroup::"
+          done
+
+  promote-release:
+    name: Verify and promote stable release
+    needs: [meta, draft-release, publish-crates]
+    runs-on: namespace-profile-linux-medium
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: Re-download and verify every public asset before promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          version="${{ needs.meta.outputs.version }}"
+          rm -rf dist/promotion-verify
+          mkdir -p dist/promotion-verify
+          gh release download "$tag" --dir dist/promotion-verify --clobber
+          for name in \
+            "alex-cli-${version}-linux-x86_64.tar.gz" \
+            "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-macos-aarch64.tar.gz" \
+            "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
+            "alex-cli-${version}-macos-x86_64.tar.gz" \
+            "alex-cli-${version}-macos-x86_64.tar.gz.sha256" \
+            alex-x86_64-unknown-linux-musl \
+            alex-aarch64-unknown-linux-musl \
+            checksums.txt \
+            "Alex-${version}.dmg" \
+            manifest.json
+          do
+            [[ -f "dist/promotion-verify/$name" ]] || {
+              echo "promotion blocked: release is missing $name" >&2
+              exit 1
+            }
+          done
+          python3 scripts/verify-release-manifest.py \
+            --manifest dist/promotion-verify/manifest.json \
+            --assets-dir dist/promotion-verify \
+            --tag "$tag" --repo "${{ github.repository }}"
+
+      - name: Promote verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+          is_prerelease="$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)"
+          if [[ "$is_draft" == "true" || "$is_prerelease" == "true" ]]; then
+            gh release edit "$tag" --draft=false --prerelease=false --latest
+          else
+            echo "$tag is already a public stable release; verification passed."
+          fi
+
+  stable-appcast:
+    name: Publish stable appcast from promoted DMG
+    needs: [meta, stable-dmg, promote-release]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/dmg-appcast.yml
+    with:
+      channel: stable
+      tag: ${{ needs.meta.outputs.tag }}
+      overwrite: true
+      notarize: true
+      build_dmg: false
+      publish_release: false
+      publish_appcast: true
+      hard_fail_missing_secrets: true
+      require_existing_manifest: true
+    secrets: inherit
+
+  tap-formula:
+    name: Publish Homebrew formula and cask
+    needs: [meta, manifest, stable-dmg, promote-release]
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Require tap deploy key
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          [[ -n "${TAP_DEPLOY_KEY:-}" ]] || {
+            echo "TAP_DEPLOY_KEY is required for a stable release." >&2
+            exit 1
+          }
+
+      - name: Download promoted manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ needs.meta.outputs.tag }}" \
+            --pattern manifest.json --clobber -R "${{ github.repository }}"
+
+      - name: Render formula and cask from the complete manifest
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
           sha_mac_arm="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["aarch64-apple-darwin"]["sha256"])')"
           sha_mac_intel="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["x86_64-apple-darwin"]["sha256"])')"
           sha_linux="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["x86_64-unknown-linux-gnu"]["sha256"])')"
-
+          sha_dmg="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["app"]["platforms"]["darwin-universal"]["sha256"])')"
           mkdir -p dist/homebrew
           sed \
             -e "s/{{VERSION}}/${version}/g" \
             -e "s/{{SHA_MAC_ARM}}/${sha_mac_arm}/g" \
             -e "s/{{SHA_MAC_INTEL}}/${sha_mac_intel}/g" \
             -e "s/{{SHA_LINUX}}/${sha_linux}/g" \
-            packaging/homebrew/alex.rb.tmpl > dist/homebrew/alex.rb
-
-      - name: Render cask
-        if: steps.tap_key.outputs.present == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version="${{ needs.manifest.outputs.version }}"
-          # Compute the DMG sha256 straight from the published release asset, so
-          # the cask can never drift from the actual DMG.
-          gh release download "v${version}" --pattern "Alex-${version}.dmg" --clobber -R "${{ github.repository }}"
-          sha_dmg="$(sha256sum "Alex-${version}.dmg" | awk '{print $1}')"
-          mkdir -p dist/homebrew
+            packaging/homebrew/alex-formula.rb.tmpl > dist/homebrew/alex-formula.rb
           sed \
             -e "s/{{VERSION}}/${version}/g" \
             -e "s/{{SHA_DMG}}/${sha_dmg}/g" \
-            packaging/homebrew/alexandria.rb.tmpl > dist/homebrew/alexandria.rb
+            packaging/homebrew/alex-cask.rb.tmpl > dist/homebrew/alex-cask.rb
 
-      - name: Push formula + cask to Homebrew tap
-        if: steps.tap_key.outputs.present == 'true'
+      - name: Push formula and cask to Homebrew tap
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          version="${{ needs.manifest.outputs.version }}"
+          version="${{ needs.meta.outputs.version }}"
           key_file="$RUNNER_TEMP/homebrew-alex-deploy-key"
           printf '%s\n' "$TAP_DEPLOY_KEY" > "$key_file"
           chmod 600 "$key_file"
           export GIT_SSH_COMMAND="ssh -i $key_file -o StrictHostKeyChecking=accept-new"
-
           git clone git@github.com:madhavajay/homebrew-alex.git "$RUNNER_TEMP/homebrew-alex"
           cd "$RUNNER_TEMP/homebrew-alex"
-          if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-            git checkout -B main
-          fi
+          if ! git rev-parse --verify HEAD >/dev/null 2>&1; then git checkout -B main; fi
           mkdir -p Formula Casks
-          cp "$GITHUB_WORKSPACE/dist/homebrew/alex.rb" Formula/alex.rb
-          cp "$GITHUB_WORKSPACE/dist/homebrew/alexandria.rb" Casks/alexandria.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alex-formula.rb" Formula/alex.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alex-cask.rb" Casks/alex.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/alex.rb Casks/alexandria.rb
+          git add Formula/alex.rb Casks/alex.rb
           if git diff --cached --quiet; then
-            echo "Formula + cask are already up to date; skipping commit."
+            echo "Formula and cask are already current."
           else
             git commit -m "alex ${version} (formula + cask)"
             git push origin HEAD:main
           fi
+
+  release-complete:
+    name: Stable release complete
+    needs: [meta, promote-release, stable-appcast, tap-formula]
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - run: |
+          echo "${{ needs.meta.outputs.tag }} is promoted with verified assets, appcast, and Homebrew metadata."

@@ -329,7 +329,7 @@ function Header({ onRestart, onCheckUpdate }: { onRestart: () => void; onCheckUp
             <CpuIcon />
           </div>
           <div className="flex flex-col items-start leading-[normal]">
-            <span className="font-['Inter',sans-serif] font-semibold text-[#e5e5ea] text-[14px] whitespace-nowrap">Alexandria - Dario</span>
+            <span className="font-['Inter',sans-serif] font-semibold text-[#e5e5ea] text-[14px] whitespace-nowrap">Alex - Dario</span>
             <span className="font-['Inter',sans-serif] font-normal text-[#636366] text-[10px] whitespace-nowrap">Dario 5.1.1 - active gen-5.1.1-50932</span>
           </div>
         </div>
@@ -428,7 +428,7 @@ interface CacheEntry {
 const CACHE_DATA: CacheEntry[] = [
   {
     model: "claude-haiku-4-5",
-    path: "/Users/mochav/dev/.alexandria/dario-prompt-cache/claude-haiku-4-5-f73a3fface2eb.json",
+    path: "/Users/mochav/dev/.alex/dario-prompt-cache/claude-haiku-4-5-f73a3fface2eb.json",
     status: "hit",
     statusColor: "#30d158",
     chars: 26941,
@@ -437,7 +437,7 @@ const CACHE_DATA: CacheEntry[] = [
   },
   {
     model: "claude-opus-4-8",
-    path: "/Users/mochav/dev/.alexandria/dario-prompt-cache/claude-opus-4-8-efaeac877ff7.json",
+    path: "/Users/mochav/dev/.alex/dario-prompt-cache/claude-opus-4-8-efaeac877ff7.json",
     status: "hit",
     statusColor: "#30d158",
     chars: 5440,

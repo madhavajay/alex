@@ -1,6 +1,6 @@
 # `alex` command reference
 
-`alex` and `alexandria` are identical binaries. Examples use `alex`. With no
+`alex` and `alex` are identical binaries. Examples use `alex`. With no
 subcommand and an interactive terminal, the binary opens the TUI; with
 non-terminal stdout it errors and asks for an explicit command.
 
@@ -11,7 +11,7 @@ supports `--version`.
 
 ## `daemon`
 
-Run the proxy in the foreground, or detach to `~/.alexandria/daemon.log`.
+Run the proxy in the foreground, or detach to `~/.alex/daemon.log`.
 
 | Syntax | Important arguments | Example |
 | --- | --- | --- |
@@ -128,8 +128,8 @@ Detect or configure one installed harness to use Alex.
 | --- | --- |
 | `[HARNESS]` | Omit to show detection status. |
 | `--config-dir <PATH>` | Override the native harness config directory. |
-| `--url <URL>` | Remote daemon URL; environment alternative `ALEXANDRIA_URL`. |
-| `--key <KEY>` | Pre-minted harness key; environment alternative `ALEXANDRIA_HARNESS_KEY`. Requires harness and remote URL. |
+| `--url <URL>` | Remote daemon URL, or the upstream URL for `cliproxyapi`; environment alternatives are provider-specific. |
+| `--key <KEY>` | Pre-minted harness key, or the `cliproxyapi` bearer credential; environment alternatives are provider-specific. |
 | `--key-id <ID>` | Cosmetic ID recorded for a pre-minted key. |
 | `--tool-capture` | Install tool-execution hooks during this connection. |
 | `--json` | Machine-readable status/result. |
@@ -137,10 +137,41 @@ Detect or configure one installed harness to use Alex.
 ```bash
 alex connect codex --tool-capture
 alex connect pi --url https://alex.example.invalid --key '<redacted>' --key-id rk-abcd1234
+alex connect cliproxyapi --url http://127.0.0.1:8317/v1 --key '<redacted>'
 ```
 
 The fully remote pre-minted form is handled before local config loading, so it
-does not create `~/.alexandria/config.toml` in a worker/container.
+does not create `~/.alex/config.toml` in a worker/container.
+
+`cliproxyapi` is a provider connection rather than a harness connection. Alex
+probes the upstream `/v1/models` endpoint with the bearer credential before it
+saves or replaces the connection. Use HTTPS for remote servers; plain HTTP is
+accepted only for loopback addresses. Discovered models are exposed through
+Alex as `cliproxyapi/<upstream-model-id>`.
+
+## `cliproxyapi`
+
+Manage the reverse CLIProxyAPI → Alex arrangement. `export` probes
+`/v1/alex/capabilities`, reads Alex's model catalog, mints a dedicated scoped
+harness key for a local daemon, and creates (without overwriting) a mode-`0600`
+CLIProxyAPI v7 config fragment:
+
+```bash
+alex cliproxyapi capabilities
+alex cliproxyapi export \
+  --output ./alex-provider.yaml \
+  --cliproxyapi-version v7.4.1
+```
+
+Repeat `--model` to export only selected `alex/*` models. For a remote Alex,
+provide an existing scoped key through `--key-file` or
+`ALEX_HARNESS_KEY`; the remote local/admin key is never requested. The
+generated file contains the scoped credential and must be merged privately
+into CLIProxyAPI's `config.yaml`. See [CLIProxyAPI integration](cliproxyapi.md).
+
+Run `./test.sh cliproxyapi` (or
+`./scripts/cliproxyapi-v1-integration.sh` directly) for the pinned real-binary
+compatibility gate.
 
 ## `tool-capture`
 
@@ -191,8 +222,8 @@ Install and operate the generational Claude-subscription broker.
 | --- | --- | --- |
 | `bootstrap` | Install with npm/pnpm/Bun; `--json`. | `alex dario bootstrap --json` |
 | `enable` | Persist `anthropic_upstream="dario"`; restart required. | `alex dario enable` |
-| `disable` | Persist `anthropic_upstream="direct"`; restart required. | `alex dario disable` |
-| `auto` | Persist automatic subscription-based routing; restart required. | `alex dario auto` |
+| `disable` | Persist the legacy `direct` value; genuine Claude Code is still the only direct Anthropic path. | `alex dario disable` |
+| `auto` | Persist the default always-Dario route for eligible Anthropic traffic; restart required. | `alex dario auto` |
 | `status` | Query daemon generation/routing/prompt-cache state. | `alex dario status` |
 | `restart` | Roll a fresh generation of the current version. | `alex dario restart` |
 | `update` | Check npm and roll when newer. | `alex dario update` |
@@ -362,6 +393,22 @@ One-shot daemon, service, accounts, limits, and Dario overview.
 ```bash
 alex status --json
 ```
+
+## `doctor`
+
+Run bounded, secret-safe diagnostics for the activation path:
+
+```bash
+alex doctor
+alex doctor --json
+```
+
+The report checks the running executable and detected harnesses, duplicate Alex
+installs, data/config permissions, storage writability and SQLite integrity,
+the OS user service, the local daemon port, connected credential state,
+provider health, and Dario readiness/runtime prerequisites. It does not print
+tokens, API keys, request bodies, or response bodies. The command exits nonzero
+when a blocking check fails; warnings leave the exit status successful.
 
 ## `keys`
 

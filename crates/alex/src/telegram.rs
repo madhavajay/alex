@@ -90,10 +90,7 @@ pub(crate) fn spawn_command_poller_supervisor(
         > = std::collections::HashMap::new();
         loop {
             let snapshot = config.lock().ok().map(|config| config.clone());
-            let wanted = snapshot
-                .as_ref()
-                .map(command_channels)
-                .unwrap_or_default();
+            let wanted = snapshot.as_ref().map(command_channels).unwrap_or_default();
             let wanted_ids: std::collections::HashSet<_> =
                 wanted.iter().map(|channel| channel.id.clone()).collect();
             running.retain(|id, (_, task)| {
@@ -114,7 +111,9 @@ pub(crate) fn spawn_command_poller_supervisor(
                     old.abort();
                 }
                 let context = Arc::new(DaemonCommandContext::new(
-                    snapshot.clone().expect("wanted channels require a config snapshot"),
+                    snapshot
+                        .clone()
+                        .expect("wanted channels require a config snapshot"),
                     channel.id.clone(),
                 ));
                 let task = tokio::spawn(poll_channel(
@@ -145,7 +144,10 @@ async fn poll_channel(
         Err(error) => {
             tracing::warn!(channel = %channel.id, %error, "telegram command client failed to initialize");
             if let Ok(dispatcher) = dispatchers.read() {
-                dispatcher.record_poll_error(&channel.id, "telegram command client initialization failed");
+                dispatcher.record_poll_error(
+                    &channel.id,
+                    "telegram command client initialization failed",
+                );
             }
             return;
         }
@@ -304,8 +306,14 @@ mod tests {
 
     #[test]
     fn command_dispatch_failures_are_classified_for_channel_visibility() {
-        assert_eq!(command_reply_error("status unavailable; try again shortly"), Some("command dispatch failed"));
-        assert_eq!(command_reply_error("Could not submit the code"), Some("command dispatch failed"));
+        assert_eq!(
+            command_reply_error("status unavailable; try again shortly"),
+            Some("command dispatch failed")
+        );
+        assert_eq!(
+            command_reply_error("Could not submit the code"),
+            Some("command dispatch failed")
+        );
         assert_eq!(command_reply_error("pong"), None);
     }
 }

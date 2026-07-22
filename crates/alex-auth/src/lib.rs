@@ -237,7 +237,10 @@ fn credential_rank(account: &Account) -> (bool, i64) {
     let unexpired =
         account.kind != "oauth" || account.expires_at_ms.map(|e| e > now).unwrap_or(true);
     let valid = has_secret && unexpired;
-    let freshness = account.last_refresh_ms.or(account.expires_at_ms).unwrap_or(i64::MIN);
+    let freshness = account
+        .last_refresh_ms
+        .or(account.expires_at_ms)
+        .unwrap_or(i64::MIN);
     (valid, freshness)
 }
 
@@ -408,6 +411,12 @@ fn routing_binding_reset(account: &Account, now_s: i64) -> Option<i64> {
     routing_reset_selection(account, now_s)?["resets_at_s"].as_i64()
 }
 
+fn routing_binding_used_basis_points(account: &Account, now_s: i64) -> Option<u32> {
+    routing_reset_selection(account, now_s)?["used_pct"]
+        .as_f64()
+        .map(|used| (used.clamp(0.0, 100.0) * 100.0).round() as u32)
+}
+
 fn account_proxy_eligible(account: &Account, policy: &AccountPolicy) -> bool {
     !policy
         .disabled
@@ -465,6 +474,22 @@ fn sort_by_policy(accounts: &mut Vec<Account>, policy: &AccountPolicy, prefer_oa
                 )
             });
         }
+        AccountPolicyMode::HighestQuota => {
+            accounts.sort_by_key(|a| {
+                (
+                    oauth_rank(a, prefer_oauth),
+                    routing_reserve_blocked(a, routing_reserve_pct(a, policy), now_s),
+                    // The quota APIs expose percentages rather than absolute
+                    // plan allowances. Lowest usage in the binding (most
+                    // consumed) active window therefore means the greatest
+                    // reliably observable remaining quota.
+                    routing_binding_used_basis_points(a, now_s).unwrap_or(u32::MAX),
+                    policy_rank(policy, &a.name),
+                    a.name.clone(),
+                    a.id.clone(),
+                )
+            });
+        }
     }
 }
 
@@ -490,6 +515,7 @@ pub enum AccountPolicyMode {
     RoundRobin,
     Threshold,
     ResetFirst,
+    HighestQuota,
 }
 
 impl Default for AccountPolicyMode {
@@ -888,7 +914,9 @@ impl Vault {
         into_id: &str,
         allow_mismatch: bool,
     ) -> Result<MergeOutcome> {
-        let (from, into) = self.validate_merge(from_id, into_id, allow_mismatch).await?;
+        let (from, into) = self
+            .validate_merge(from_id, into_id, allow_mismatch)
+            .await?;
         let mut survivor = into.clone();
         let adopted = if credential_rank(&from) > credential_rank(&into) {
             survivor.kind = from.kind.clone();
@@ -1021,7 +1049,7 @@ impl Vault {
         };
         if candidates.is_empty() {
             bail!(
-                "no active {} account; run `alexandria auth import`",
+                "no active {} account; run `alex auth import`",
                 provider.as_str()
             );
         }
@@ -1170,6 +1198,9 @@ impl Vault {
             (Provider::Openrouter, _) => Err(anyhow!(
                 "openrouter accounts use a long-lived API key; re-run `alex auth openrouter-key`"
             )),
+            (Provider::Cliproxyapi, _) => Err(anyhow!(
+                "CLIProxyAPI accounts use a long-lived API key; reconnect the integration"
+            )),
             (Provider::Exo, _) => Err(anyhow!("exo is configured locally and has no account to refresh")),
             (Provider::Kimi, Some(rt)) => self.refresh_kimi(&rt).await,
             (Provider::Amp, _) => Err(anyhow!(
@@ -1259,6 +1290,7 @@ impl Vault {
                 let _ = import_amp(self).await;
             }
             Provider::Openrouter => {}
+            Provider::Cliproxyapi => {}
             Provider::Exo => {}
             Provider::Kimi => {
                 let _ = import_kimi(self).await;
@@ -1546,6 +1578,192 @@ pub struct ImportOutcome {
     pub note: Option<String>,
 }
 
+/// Non-secret metadata about credentials owned by another CLI. Detecting a
+/// candidate is deliberately read-only: callers must ask the user before
+/// invoking `import_all` for its `source`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportCandidate {
+    pub source: String,
+    pub provider: String,
+    pub label: String,
+    pub kind: String,
+    pub source_path: String,
+    pub requires_confirmation: bool,
+}
+
+/// Detect file-backed CLI credentials without copying, refreshing, or deleting
+/// them. The explicit home argument keeps onboarding discovery isolated and
+/// testable; the Kimi override mirrors `KIMI_CODE_HOME`.
+pub fn detect_import_candidates_in(
+    home: &Path,
+    kimi_home_override: Option<&Path>,
+) -> Vec<ImportCandidate> {
+    fn json(path: &Path) -> Option<Value> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+    fn candidate(
+        source: &str,
+        provider: &str,
+        label: &str,
+        kind: &str,
+        source_path: &str,
+    ) -> ImportCandidate {
+        ImportCandidate {
+            source: source.into(),
+            provider: provider.into(),
+            label: label.into(),
+            kind: kind.into(),
+            source_path: source_path.into(),
+            requires_confirmation: true,
+        }
+    }
+
+    let mut found = Vec::new();
+    if json(&home.join(".claude/.credentials.json"))
+        .and_then(|v| {
+            v["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "claude",
+            "anthropic",
+            "Claude Code",
+            "oauth",
+            "~/.claude/.credentials.json",
+        ));
+    }
+    if let Some(value) = json(&home.join(".codex/auth.json")) {
+        let oauth = value["tokens"]["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty());
+        let api_key = value["OPENAI_API_KEY"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty());
+        if oauth || api_key {
+            found.push(candidate(
+                "codex",
+                "openai",
+                "Codex",
+                if oauth && api_key {
+                    "oauth+api_key"
+                } else if oauth {
+                    "oauth"
+                } else {
+                    "api_key"
+                },
+                "~/.codex/auth.json",
+            ));
+        }
+    }
+    if json(&home.join(".gemini/oauth_creds.json"))
+        .and_then(|v| v["access_token"].as_str().map(str::to_owned))
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "gemini",
+            "gemini",
+            "Gemini CLI",
+            "oauth",
+            "~/.gemini/oauth_creds.json",
+        ));
+    }
+    if json(&home.join(".grok/auth.json"))
+        .and_then(|v| {
+            v.as_object().map(|entries| {
+                entries
+                    .values()
+                    .any(|entry| entry["key"].as_str().is_some_and(|token| !token.is_empty()))
+            })
+        })
+        .unwrap_or(false)
+    {
+        found.push(candidate(
+            "grok",
+            "xai",
+            "Grok",
+            "oauth",
+            "~/.grok/auth.json",
+        ));
+    }
+    if json(&home.join(".local/share/amp/secrets.json"))
+        .and_then(|v| {
+            v.as_object().map(|entries| {
+                entries.iter().any(|(key, value)| {
+                    key.starts_with("apiKey@")
+                        && value.as_str().is_some_and(|token| !token.is_empty())
+                })
+            })
+        })
+        .unwrap_or(false)
+    {
+        found.push(candidate(
+            "amp",
+            "amp",
+            "Amp",
+            "api_key",
+            "~/.local/share/amp/secrets.json",
+        ));
+    }
+    let kimi_root = kimi_home_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".kimi-code"));
+    if json(&kimi_root.join("credentials/kimi-code.json"))
+        .and_then(|v| v["access_token"].as_str().map(str::to_owned))
+        .is_some_and(|token| !token.is_empty())
+    {
+        found.push(candidate(
+            "kimi",
+            "kimi",
+            "Kimi Code",
+            "oauth",
+            if kimi_home_override.is_some() {
+                "$KIMI_CODE_HOME/credentials/kimi-code.json"
+            } else {
+                "~/.kimi-code/credentials/kimi-code.json"
+            },
+        ));
+    }
+    found
+}
+
+pub fn detect_import_candidates() -> Vec<ImportCandidate> {
+    let home = home();
+    let kimi_override = std::env::var_os("KIMI_CODE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut candidates = detect_import_candidates_in(&home, kimi_override.as_deref());
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.source == "claude")
+    {
+        let has_keychain_oauth = claude_keychain()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| {
+                value["claudeAiOauth"]["accessToken"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .is_some_and(|token| !token.is_empty());
+        if has_keychain_oauth {
+            candidates.insert(
+                0,
+                ImportCandidate {
+                    source: "claude".into(),
+                    provider: "anthropic".into(),
+                    label: "Claude Code".into(),
+                    kind: "oauth".into(),
+                    source_path: "macOS Keychain: Claude Code-credentials".into(),
+                    requires_confirmation: true,
+                },
+            );
+        }
+    }
+    candidates
+}
+
 pub async fn import_all(vault: &Vault, source: &str) -> Result<Vec<ImportOutcome>> {
     let mut outcomes = Vec::new();
     if source == "all" || source == "claude" {
@@ -1807,7 +2025,13 @@ struct KimiCredentialFile {
 
 /// Build a Kimi account from an already-parsed credential file. Kept pure so it
 /// can be unit-tested without touching disk or the network. Never logs tokens.
-pub fn kimi_account_from_credentials(access_token: String, refresh_token: Option<String>, expires_at_s: Option<i64>, expires_in_s: Option<i64>, scope: Option<String>) -> Account {
+pub fn kimi_account_from_credentials(
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_s: Option<i64>,
+    expires_in_s: Option<i64>,
+    scope: Option<String>,
+) -> Account {
     let expires_at_ms = expires_at_s
         .map(|s| s * 1000)
         .or_else(|| expires_in_s.map(|s| now_ms() + s * 1000))
@@ -2026,7 +2250,7 @@ pub async fn fetch_amp_account_email(api_key: &str) -> Option<String> {
         .bearer_auth(key)
         .header("accept", "application/json")
         .header("content-type", "application/json")
-        .header("user-agent", "alexandria-amp-auth")
+        .header("user-agent", "alex-amp-auth")
         .json(&json!({"method": "userDisplayBalanceInfo", "params": {}}))
         .send()
         .await
@@ -2083,11 +2307,140 @@ pub async fn save_openrouter_api_key(
     Ok("openrouter-api-key".into())
 }
 
+/// Save an OpenRouter key under a user-facing identity. OpenRouter keys do not
+/// expose an account profile, so onboarding asks for this label. Reusing the
+/// same label or key updates the existing vault row; a different label/key
+/// creates another routable OpenRouter account.
+pub async fn save_named_openrouter_api_key(
+    vault: &Vault,
+    display_name: &str,
+    api_key: &str,
+    http_referer: Option<&str>,
+    x_title: Option<&str>,
+) -> Result<String> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        bail!("empty openrouter account name");
+    }
+    if display_name.chars().count() > 80 {
+        bail!("openrouter account name must be 80 characters or fewer");
+    }
+    let key = api_key.trim();
+    if key.is_empty() {
+        bail!("empty openrouter api key");
+    }
+    let existing = vault.list().await.into_iter().find(|account| {
+        account.provider == Provider::Openrouter
+            && (account.api_key.as_deref() == Some(key)
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.eq_ignore_ascii_case(display_name)))
+    });
+    let digest = Sha256::digest(display_name.to_lowercase().as_bytes());
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let id = existing
+        .as_ref()
+        .map(|account| account.id.clone())
+        .unwrap_or_else(|| format!("openrouter-api-key-{suffix}"));
+    let name = existing
+        .as_ref()
+        .map(|account| account.name.clone())
+        .unwrap_or_else(|| format!("acct-{suffix}"));
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+    let account = Account {
+        id: id.clone(),
+        provider: Provider::Openrouter,
+        kind: "api_key".into(),
+        name,
+        description: Some(display_name.to_string()),
+        paused: existing.as_ref().is_some_and(|account| account.paused),
+        label: Some(display_name.to_string()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(key.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: json!({
+            "http_referer": clean(http_referer),
+            "x_title": clean(x_title),
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: existing.and_then(|account| account.path),
+    };
+    vault.upsert(account).await?;
+    Ok(id)
+}
+
 /// Remove the single OpenRouter API-key account. Both the CLI and admin API
 /// use this helper so the account identity and idempotent removal semantics
 /// stay aligned.
 pub async fn remove_openrouter_api_key(vault: &Vault) -> Result<bool> {
     vault.remove("openrouter-api-key").await
+}
+
+/// Save or replace the single CLIProxyAPI integration. The caller is
+/// responsible for probing and normalizing the endpoint first; keeping that
+/// network validation in the proxy crate lets the CLI and admin API share the
+/// exact same capability check without teaching the vault about HTTP.
+pub async fn save_cliproxyapi_account(
+    vault: &Vault,
+    api_base: &str,
+    credential: &str,
+    models: &[String],
+) -> Result<String> {
+    let api_base = api_base.trim();
+    if api_base.is_empty() {
+        bail!("empty CLIProxyAPI URL");
+    }
+    let credential = credential.trim();
+    if credential.is_empty() {
+        bail!("empty CLIProxyAPI credential");
+    }
+    let id = "cliproxyapi-default";
+    let existing = vault
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == id);
+    let account = Account {
+        id: id.into(),
+        provider: Provider::Cliproxyapi,
+        kind: "api_key".into(),
+        name: "default".into(),
+        description: Some(api_base.to_string()),
+        paused: existing.as_ref().is_some_and(|account| account.paused),
+        label: Some("CLIProxyAPI".into()),
+        access_token: None,
+        refresh_token: None,
+        id_token: None,
+        api_key: Some(credential.to_string()),
+        expires_at_ms: None,
+        last_refresh_ms: None,
+        account_meta: json!({
+            "api_base": api_base,
+            "models": models,
+        }),
+        cooldown_until_ms: None,
+        status: "active".into(),
+        path: existing.and_then(|account| account.path),
+    };
+    vault.upsert(account).await?;
+    Ok(id.into())
+}
+
+pub async fn remove_cliproxyapi_account(vault: &Vault) -> Result<bool> {
+    vault.remove("cliproxyapi-default").await
 }
 
 async fn import_grok(vault: &Vault) -> ImportOutcome {
@@ -2220,7 +2573,10 @@ mod tests {
         assert_eq!(account.kind, "oauth");
         assert_eq!(account.id, "kimi-oauth");
         assert_eq!(account.expires_at_ms, Some(expires_at_s * 1000));
-        assert_eq!(account.refresh_token.as_deref(), Some("refresh-token-shape"));
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("refresh-token-shape")
+        );
         assert_eq!(account.account_meta["scope"], json!("kimi-code"));
     }
 
@@ -2260,10 +2616,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "alexandria-auth-{name}-{nanos}-{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("alex-auth-{name}-{nanos}-{}", std::process::id()))
     }
 
     fn api_key_account(id: &str, provider: Provider) -> Account {
@@ -2670,8 +3023,8 @@ mod tests {
         save_openrouter_api_key(
             &vault,
             "or-test-key",
-            Some("https://alexandria.example"),
-            Some("Alexandria"),
+            Some("https://alex.example"),
+            Some("Alex"),
         )
         .await
         .unwrap();
@@ -2684,11 +3037,77 @@ mod tests {
             .unwrap();
         assert_eq!(account.id, "openrouter-api-key");
         assert_eq!(account.api_key.as_deref(), Some("or-test-key"));
+        assert_eq!(account.account_meta["http_referer"], "https://alex.example");
+        assert_eq!(account.account_meta["x_title"], "Alex");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_openrouter_keys_add_and_replace_by_display_identity() {
+        let dir = temp_dir("named-openrouter-keys");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let personal = save_named_openrouter_api_key(&vault, "Personal", "or-personal", None, None)
+            .await
+            .unwrap();
+        let work = save_named_openrouter_api_key(&vault, "Work", "or-work", None, None)
+            .await
+            .unwrap();
+        assert_ne!(personal, work);
+        assert_eq!(vault.list().await.len(), 2);
+
+        let replaced =
+            save_named_openrouter_api_key(&vault, "personal", "or-personal-fresh", None, None)
+                .await
+                .unwrap();
+        assert_eq!(replaced, personal);
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 2);
         assert_eq!(
-            account.account_meta["http_referer"],
-            "https://alexandria.example"
+            accounts
+                .iter()
+                .find(|account| account.id == personal)
+                .and_then(|account| account.api_key.as_deref()),
+            Some("or-personal-fresh")
         );
-        assert_eq!(account.account_meta["x_title"], "Alexandria");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cliproxyapi_account_save_replaces_url_key_and_catalog() {
+        let dir = temp_dir("cliproxyapi-account");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let id = save_cliproxyapi_account(
+            &vault,
+            "http://127.0.0.1:8317/v1",
+            "first-key",
+            &["gpt-4o".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(id, "cliproxyapi-default");
+        let replaced = save_cliproxyapi_account(
+            &vault,
+            "https://proxy.example/v1",
+            "second-key",
+            &["claude-sonnet".into(), "gpt-5".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced, id);
+        assert_eq!(vault.list().await.len(), 1);
+
+        drop(vault);
+        let reopened = Vault::open(dir.clone()).unwrap();
+        let account = reopened
+            .account_for(Provider::Cliproxyapi, false)
+            .await
+            .unwrap();
+        assert_eq!(account.api_key.as_deref(), Some("second-key"));
+        assert_eq!(account.account_meta["api_base"], "https://proxy.example/v1");
+        assert_eq!(
+            account.account_meta["models"],
+            json!(["claude-sonnet", "gpt-5"])
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3297,6 +3716,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn highest_quota_prefers_lowest_binding_usage() {
+        let dir = temp_dir("highest-quota");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let now_s = now_ms() / 1000;
+        let mut fuller = api_key_account("openai-api_key-fuller", Provider::Openai);
+        fuller.name = "fuller".into();
+        fuller.account_meta = codex_limits(70.0, now_s + 600);
+        let mut emptier = api_key_account("openai-api_key-emptier", Provider::Openai);
+        emptier.name = "emptier".into();
+        emptier.account_meta = codex_limits(25.0, now_s + 3600);
+        vault.upsert(fuller).await.unwrap();
+        vault.upsert(emptier).await.unwrap();
+        vault
+            .set_policies(vec![(
+                Provider::Openai,
+                AccountPolicy {
+                    mode: AccountPolicyMode::HighestQuota,
+                    reserve_pct: Some(10),
+                    ..AccountPolicy::default()
+                },
+            )])
+            .await;
+
+        assert_eq!(
+            vault
+                .account_for(Provider::Openai, false)
+                .await
+                .unwrap()
+                .name,
+            "emptier"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn routing_policy_and_limits_survive_reopen() {
         let dir = temp_dir("routing-persist");
         {
@@ -3374,11 +3828,7 @@ mod tests {
             .await
             .is_err());
         vault
-            .record_routing_limits_for_workspace(
-                "openai-api_key-work",
-                "workspace-a",
-                snapshot,
-            )
+            .record_routing_limits_for_workspace("openai-api_key-work", "workspace-a", snapshot)
             .await
             .unwrap();
 
@@ -3394,5 +3844,89 @@ mod tests {
         );
         assert_eq!(account.account_meta["routing_limits"]["plan"], "plus");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credential_detection_is_read_only_secret_free_and_requires_confirmation() {
+        let home = temp_dir("import-candidates");
+        let files = [
+            (
+                ".claude/.credentials.json",
+                r#"{"claudeAiOauth":{"accessToken":"claude-secret"}}"#,
+            ),
+            (
+                ".codex/auth.json",
+                r#"{"tokens":{"access_token":"codex-secret"}}"#,
+            ),
+            (
+                ".gemini/oauth_creds.json",
+                r#"{"access_token":"gemini-secret"}"#,
+            ),
+            (".grok/auth.json", r#"{"primary":{"key":"grok-secret"}}"#),
+            (
+                ".local/share/amp/secrets.json",
+                r#"{"apiKey@https://ampcode.com/":"amp-secret"}"#,
+            ),
+            (
+                ".kimi-code/credentials/kimi-code.json",
+                r#"{"access_token":"kimi-secret"}"#,
+            ),
+        ];
+        for (relative, contents) in files {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let before = files
+            .iter()
+            .map(|(relative, _)| std::fs::read(home.join(relative)).unwrap())
+            .collect::<Vec<_>>();
+
+        let candidates = detect_import_candidates_in(&home, None);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.source.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "gemini", "grok", "amp", "kimi"]
+        );
+        assert!(candidates.iter().all(|item| item.requires_confirmation));
+        let encoded = serde_json::to_string(&candidates).unwrap();
+        for secret in [
+            "claude-secret",
+            "codex-secret",
+            "gemini-secret",
+            "grok-secret",
+            "amp-secret",
+            "kimi-secret",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let after = files
+            .iter()
+            .map(|(relative, _)| std::fs::read(home.join(relative)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "detection must not mutate source credentials"
+        );
+        assert!(
+            !home.join("accounts").exists(),
+            "detection must not create an Alex vault"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn malformed_or_empty_external_credentials_are_not_candidates() {
+        let home = temp_dir("invalid-import-candidates");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), r#"{"tokens":{}}"#).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/amp")).unwrap();
+        std::fs::write(home.join(".local/share/amp/secrets.json"), "not json").unwrap();
+
+        assert!(detect_import_candidates_in(&home, None).is_empty());
+        std::fs::remove_dir_all(&home).ok();
     }
 }

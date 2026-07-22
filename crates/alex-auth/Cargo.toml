@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Credential vault and OAuth/device login flows for alex (Alexandria)"
+description = "Credential vault and OAuth/device login flows for Alex"
 
 [dependencies]
 alex-core = { workspace = true }

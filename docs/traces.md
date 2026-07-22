@@ -1,8 +1,10 @@
 # Traces, transcripts, and scoped capture
 
-Every model request creates a metadata record and, where available, gzip body
-artifacts. The same store accepts normalized reverse-wrap traces, harness
-lifecycle events, and consented tool execution events.
+Every model request creates a metadata record and, where available, body
+artifacts. Live capture writes gzip; migrated trace bodies gain LAR pointers.
+Readers prefer bounded LAR reads and fall back to preserved gzip sources. The
+same store accepts normalized reverse-wrap traces, harness lifecycle events,
+and consented tool execution events.
 
 The local TUI (`alex` or `alex tui`) is the terminal Trace Browser. The daemon
 also exposes the JSON/NDJSON API used by UI clients and automation.
@@ -18,27 +20,37 @@ The SQLite `traces` row is the searchable index. Important field groups are:
 | Result | status, streamed, latency, error kind/code/class, injection/fixture markers |
 | Usage | input, cached input, cache creation, output, reasoning tokens, computed cost, billing bucket |
 | Retry/protection | substituted, original/served account, substitution reason, JSON attempt list |
-| Dario | `via_dario`, generation ID, and `dario_fallback` in tags when a direct fallback occurred |
-| Artifacts | client request, translated upstream request, response body paths, redacted request/response header JSON |
+| Dario | `via_dario`, generation ID, and failed-closed setup or transport errors in the normal error fields; `dario_fallback` is legacy-only |
+| Artifacts | client request, translated upstream request, and response body paths plus optional LAR pointers; redacted request/response header JSON |
 
 `finalize_trace` writes the client request unconditionally. It writes a separate
 upstream request only when its bytes differ, and writes the response when one
-exists. The row is inserted after artifact writes, so paths refer to completed
-gzip files.
+exists. The row is inserted after live artifact writes, so paths refer to
+completed gzip files. An offline migration can later attach validated LAR
+pointers without deleting or replacing those source paths.
 
 ```text
-<data_dir>/alexandria.sqlite3
+<data_dir>/alex.sqlite3
 <data_dir>/bodies/2026-07-19/
   <trace-id>.request.json.gz
   <trace-id>.upstream-request.json.gz
   <trace-id>.response.body.gz
   <tool-id>.tool-args.json.gz
   <tool-id>.tool-result.json.gz
+<data_dir>/lar/
+  legacy-v1.lar
+  legacy-v1.import.json       # present only while a migration is incomplete
 ```
 
 Writes use a same-directory temporary file, gzip it, sync it, then rename it to
 the final path. This prevents a trace row from pointing at a partially written
 artifact after the normal write succeeds.
+
+`alex traces migrate-lar [--max-entries N]` imports authoritative SQLite body
+references into `lar/legacy-v1.lar`. The archive and resumable checkpoint are
+synced before all selected SQLite pointers switch in one transaction. Original
+gzip paths and files remain available for fallback and rollback. See
+[LAR V1](lar-v1.md) for the exact migration and bounded-read contract.
 
 ## Redaction boundary
 
@@ -56,9 +68,9 @@ contain prompts, source code, tool results, or user-supplied secrets. Treat
 
 The proxy discovers a session from explicit Alex/Claude session headers,
 known request metadata, and format-specific fields such as Codex
-`prompt_cache_key`. A harness tag comes from `x-alexandria-harness` (with a
+`prompt_cache_key`. A harness tag comes from `x-alex-harness` (with a
 user-agent fallback). Run keys can supply a fixed `run_id` and tags; request
-headers can add trace tags and selected `x-alexandria-*` metadata.
+headers can add trace tags and selected `x-alex-*` metadata.
 
 Harness lifecycle hooks post to `/harness-events`. The accepted events are
 `SessionStart`, `SubagentStart`, `SubagentStop`, and `Stop`. Parent/child edges
@@ -173,7 +185,7 @@ curl -H 'x-api-key: <redacted-local-key>' \
 
 | Key kind | Lifetime | Trace capability |
 | --- | --- | --- |
-| `run` | User TTL, default 24h, capped at 7d | Invoke models; trace rows default to the key's `run_id` and tags. An `x-alexandria-run-id` header takes precedence, and request trace tags extend/override same-named key tags. |
+| `run` | User TTL, default 24h, capped at 7d | Invoke models; trace rows default to the key's `run_id` and tags. An `x-alex-run-id` header takes precedence, and request trace tags extend/override same-named key tags. |
 | `harness` | No expiry until revoked | Invoke models and post lifecycle/tool events under its required harness label. |
 | `wrap` | No expiry until revoked | Preflight/post only `/traces/ingest`; cannot invoke models or browse traces. |
 
@@ -202,8 +214,9 @@ alex traces du --json
 alex traces prune --older-than 30d --dry-run
 ```
 
-Export rows are ordered by request time. `--bodies` inlines all available gzip
-artifacts as base64 and can produce sensitive, large files.
+Export rows are ordered by request time. `--bodies` uses the unified body
+resolver (bounded LAR first, preserved gzip fallback) and inlines available
+artifacts as base64, which can produce sensitive, large files.
 
 Body retention defaults to 30 days. Row retention defaults to `0` (unlimited).
 `alex traces prune` removes old bodies/headers by default; `--rows` also deletes

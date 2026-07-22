@@ -1,10 +1,10 @@
-# Alexandria macOS PR test bundle
+# Alex macOS PR test bundle
 
 This archive contains the exact pull-request build of:
 
 - `Alex.app`, ad-hoc signed with the production bundle identifier;
 - the release-mode `alex` daemon/CLI; and
-- the equivalent `alexandria` CLI binary.
+- the equivalent `alex` CLI binary.
 
 It is intentionally **not Developer ID signed or notarized**. It contains no
 credentials, account files, or developer-machine configuration.
@@ -19,8 +19,22 @@ From Terminal, in the extracted bundle directory:
 
 The script stops the current menu app, saves the first app and CLI builds it
 replaces, clears quarantine from this ad-hoc build, installs the CLI under
-`~/.local/bin`, registers/restarts Alexandria's launchd user service, and opens
-the app. Existing data under `~/.alexandria` is left untouched.
+`~/.local/bin`, registers/restarts Alex's launchd user service, and opens
+the app. Existing data under `~/.alex` is left untouched.
+
+Automation can copy the same bundle without opening the app or registering a
+service:
+
+```bash
+./install.sh --no-open --no-service
+```
+
+The PR workflow itself uses `--no-open` but keeps service registration enabled.
+On its clean ephemeral macOS runner it routes a request to the bundled
+loopback-only mock, reads the resulting trace, performs a real launchd hard
+restart, and confirms the same trace and response body remain readable. The
+gate creates no provider account and uses no provider credential or external
+provider endpoint.
 
 The app uses the same bundle identifier as production, so only one
 `Alex.app` should be running. macOS may request an administrator

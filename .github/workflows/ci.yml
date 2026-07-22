@@ -9,21 +9,124 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lar-scale:
+    name: LAR deterministic scale gate
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lar-scale
+      - name: Run bounded CI scale profile
+        run: |
+          cargo run --release --locked -p alex-lar-scale -- run \
+            --profile ci \
+            --root "$RUNNER_TEMP/alex-lar-ci" \
+            --output "$RUNNER_TEMP/alex-lar-ci-result.json"
+      - name: Generate and verify sanitized Fable to Sol fixture
+        run: |
+          cargo run --release --locked -p alex-lar-scale -- fixture-fable-sol \
+            --vector crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json \
+            --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json \
+            --output "$RUNNER_TEMP/fable-to-sol.lar" \
+            --report "$RUNNER_TEMP/fable-to-sol-result.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lar-scale-results
+          path: |
+            ${{ runner.temp }}/alex-lar-ci-result.json
+            ${{ runner.temp }}/fable-to-sol-result.json
+            ${{ runner.temp }}/fable-to-sol.lar
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-installed-smoke:
+    name: Linux x86-64 installed release smoke
+    if: github.event_name == 'pull_request'
+    runs-on: namespace-profile-linux-medium
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-installed-smoke
+
+      - name: Assert clean Ubuntu x86-64 runner
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == "Linux" ]]
+          [[ "$(uname -m)" == "x86_64" ]]
+          . /etc/os-release
+          [[ "$ID" == "ubuntu" ]]
+          docker info >/dev/null
+
+      - name: Build release-format candidate archive and checksum
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          asset_dir="$GITHUB_WORKSPACE/dist/ci-linux/assets"
+          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+
+          rm -rf "$GITHUB_WORKSPACE/dist/ci-linux"
+          mkdir -p "$asset_dir"
+          cargo build --release --locked -p alex --bins
+          tar -C target/release -czf "$asset_dir/$asset" alex
+          shasum -a 256 "$asset_dir/$asset" > "$asset_dir/$asset.sha256"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke public installer, routing, trace persistence, and systemd restart
+        env:
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux/installed-smoke.json
+          ALEX_CI_LINUX_VERSION: ${{ steps.package.outputs.version }}
+          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux/assets
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: packaging/ci-linux/run-systemd-container.sh
+
+      - name: Clean installed smoke container
+        if: always()
+        env:
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set +e
+          docker rm --force "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1
+          if docker container inspect "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "container cleanup failed: $ALEX_CI_LINUX_CONTAINER_NAME" >&2
+            exit 1
+          fi
+
+      - name: Upload Linux candidate and smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86-64-installed-smoke
+          path: dist/ci-linux/
+          if-no-files-found: error
+          retention-days: 14
+
   rust:
     strategy:
       fail-fast: false
       matrix:
-        os: [namespace-profile-linux-medium, namespace-profile-mac-medium, namespace-profile-windows-medium]
+        os: [namespace-profile-linux-medium, namespace-profile-mac-medium]
     runs-on: ${{ matrix.os }}
-    # Windows is pre-release ("coming soon"): keep its job for signal, but do
-    # not let it fail the workflow (or the README badge) until it ships.
-    # Known failure: Vault::open in the dario test fixtures, os error 87.
-    continue-on-error: ${{ matrix.os == 'namespace-profile-windows-medium' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
+      - name: Deterministic shared-web platform smoke
+        run: cargo test -p alex-proxy deterministic_platform_smoke -- --nocapture
+      - name: Platform browser-launch contract
+        run: cargo test -p alex browser_launch_commands_are_platform_specific -- --nocapture
+      - name: Platform path and service lifecycle contract
+        run: cargo test -p alex platform_path_and_service_lifecycle_contracts -- --nocapture
       - run: cargo test --workspace
       - run: cargo package -p alex-core
 
@@ -31,10 +134,10 @@ jobs:
     runs-on: namespace-profile-mac-medium
     steps:
       - uses: actions/checkout@v4
-      - name: Build AlexandriaBar
+      - name: Build Alex
         working-directory: macos
         run: swift build
-      - name: Test AlexandriaBar
+      - name: Test Alex
         working-directory: macos
         run: swift test
 
@@ -59,7 +162,7 @@ jobs:
       - name: Build release daemon and CLI
         run: cargo build --release --locked -p alex --bins
 
-      - name: Build ad-hoc AlexandriaBar app
+      - name: Build ad-hoc Alex app
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
@@ -77,17 +180,26 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:12}"
-          bundle_name="alexandria-macos-pr-${PR_NUMBER}-${short_sha}"
+          bundle_name="alex-macos-pr-${PR_NUMBER}-${short_sha}"
           stage="$RUNNER_TEMP/$bundle_name"
           output="$GITHUB_WORKSPACE/dist/ci-macos"
 
           rm -rf "$stage" "$output"
           mkdir -p "$stage/bin" "$output"
           ditto macos/dist/Alex.app "$stage/Alex.app"
-          cp target/release/alex target/release/alexandria "$stage/bin/"
-          cp packaging/ci-macos/install.sh packaging/ci-macos/README.md "$stage/"
+          cp target/release/alex "$stage/bin/"
+          cp \
+            packaging/ci-macos/install.sh \
+            packaging/ci-macos/mock-openai.py \
+            packaging/ci-macos/smoke-installed.sh \
+            packaging/ci-macos/README.md \
+            "$stage/"
           cp scripts/lib/install-common.sh "$stage/"
-          chmod +x "$stage/install.sh" "$stage/bin/alex" "$stage/bin/alexandria"
+          chmod +x \
+            "$stage/install.sh" \
+            "$stage/mock-openai.py" \
+            "$stage/smoke-installed.sh" \
+            "$stage/bin/alex"
 
           {
             echo "Alex macOS PR test bundle"
@@ -105,7 +217,52 @@ jobs:
             "$bundle_name.tar.gz" "$bundle_name" > "$output/HOW_TO_INSTALL.txt"
           echo "artifact_name=$bundle_name" >> "$GITHUB_OUTPUT"
 
+      - name: Smoke packaged install, routing, trace persistence, and launchd restart
+        env:
+          BUNDLE_NAME: ${{ steps.bundle.outputs.artifact_name }}
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+          ALEX_CI_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-macos/installed-smoke.json
+        run: |
+          set -euo pipefail
+          extract_root="$RUNNER_TEMP/alex-installed-smoke-package"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          tar -C "$extract_root" -xzf "dist/ci-macos/$BUNDLE_NAME.tar.gz"
+          "$extract_root/$BUNDLE_NAME/smoke-installed.sh"
+
+      - name: Clean installed smoke service and files
+        if: always()
+        env:
+          ALEX_CI_SMOKE_ROOT: ${{ runner.temp }}/alex-installed-smoke
+        run: |
+          set +e
+          service_target="gui/$(id -u)/com.madhavajay.alex.daemon"
+          alex_bin="$ALEX_CI_SMOKE_ROOT/bin/alex"
+          if [[ -f "$ALEX_CI_SMOKE_ROOT/service-cleanup-allowed" ]]; then
+            if [[ -x "$alex_bin" ]]; then
+              ALEX_HOME="$ALEX_CI_SMOKE_ROOT/state" \
+                "$alex_bin" service uninstall >/dev/null 2>&1
+            fi
+            launchctl bootout "$service_target" >/dev/null 2>&1
+            rm -f "$HOME/Library/LaunchAgents/com.madhavajay.alex.daemon.plist"
+            rm -f /tmp/alex.daemon.out.log /tmp/alex.daemon.err.log
+          fi
+          if [[ -s "$ALEX_CI_SMOKE_ROOT/mock.pid" ]]; then
+            mock_pid="$(tr -d '[:space:]' < "$ALEX_CI_SMOKE_ROOT/mock.pid")"
+            if [[ "$mock_pid" =~ ^[0-9]+$ ]]; then
+              kill "$mock_pid" >/dev/null 2>&1
+            fi
+          fi
+          rm -rf \
+            "$ALEX_CI_SMOKE_ROOT" \
+            "$RUNNER_TEMP/alex-installed-smoke-package"
+          if launchctl print "$service_target" >/dev/null 2>&1; then
+            echo "launchd cleanup failed: $service_target is still loaded" >&2
+            exit 1
+          fi
+
       - name: Upload macOS test bundle
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.bundle.outputs.artifact_name }}

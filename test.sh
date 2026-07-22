@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Alexandria test suite (TODO.md section 11): ./test.sh [unit|wire|harness|dario|all] [flags]
+# Alex test suite (TODO.md section 11): ./test.sh [unit|wire|harness|cliproxyapi|dario|all] [flags]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${ALEXANDRIA_CONFIG:-$HOME/.alexandria/config.toml}"
-PROMPT="Reply with exactly: alexandria-test-ok"
+CONFIG_FILE="${ALEX_CONFIG:-$HOME/.alex/config.toml}"
+PROMPT="Reply with exactly: alex-test-ok"
 
 TIERS=""
 ONLY=""
@@ -28,17 +28,18 @@ Tiers (default: unit wire):
   unit      cargo test --workspace
   wire      curl-level matrix through the proxy (W1..W12), all cells parallel
   harness   Docker harness matrix (H1..H7), parallel
+  cliproxyapi pinned real CLIProxyAPI v7 Docker matrix, both proxy directions
   dario     dario supervisor cells (SKIP cleanly when /admin/dario is absent)
-  all       unit + wire + harness + dario
+  all       unit + wire + harness + cliproxyapi + dario
 
 Flags:
-  --only W1,H2,...        run only these cell ids (UNIT, W*, H*, DARIO; W11 matches W11a+W11b)
+  --only W1,H2,...        run only these cell ids (UNIT, W*, H*, CLIPROXYAPI, DARIO; W11 matches W11a+W11b)
   --provider P            anthropic|openai|xai - only cells needing provider P
   --harness H             claude|codex|grok-build|kimi - only these harness cells
   --jobs N                max parallel cells (default: CPU count; harness capped at 4)
   --json                  machine-readable report on stdout
   --timeout N             per-cell seconds (default: 120 wire / 600 harness)
-  --host H, --port N      daemon overrides (default: ~/.alexandria/config.toml)
+  --host H, --port N      daemon overrides (default: ~/.alex/config.toml)
   --base URL              point the whole suite at a (possibly remote) proxy,
                           e.g. http://192.168.1.150:4100 for the Mac's daemon;
                           uses the already-running daemon, does not start one
@@ -62,7 +63,7 @@ need_val() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    unit|wire|harness|dario|all) TIERS="$TIERS $1" ;;
+    unit|wire|harness|cliproxyapi|dario|all) TIERS="$TIERS $1" ;;
     --only)        need_val "$@"; ONLY=$2; shift ;;
     --only=*)      ONLY=${1#*=} ;;
     --provider)    need_val "$@"; PROVIDER_FILTER=$2; shift ;;
@@ -93,7 +94,7 @@ done
 if [ -z "$TIERS" ]; then
   TIERS="unit wire"
 fi
-case " $TIERS " in *" all "*) TIERS="unit wire harness dario" ;; esac
+case " $TIERS " in *" all "*) TIERS="unit wire harness cliproxyapi dario" ;; esac
 
 has_tier() {
   case " $TIERS " in *" $1 "*) return 0 ;; esac
@@ -312,7 +313,7 @@ W7|openai-chat|/v1/chat/completions|claude-haiku-4-5|anthropic|anthropic|subscri
 W8|openai-responses|/v1/responses|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|1|claude-haiku-4-5|0
 W9|openai-chat|/v1/chat/completions|grok-code-fast-1|xai|openai-|subscription|xai|0|0|grok-code-fast-1|0
 W10|anthropic|/v1/messages|claude-haiku-4-5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|1
-W11a|openai-chat|/v1/chat/completions|alexandria/gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
+W11a|openai-chat|/v1/chat/completions|alex/gpt-5.6-luna|openai|openai-|subscription|openai|0|0|gpt-5.6-luna|0
 W11b|anthropic|/v1/messages|haiku-4.5|anthropic|anthropic|subscription|anthropic|0|0|claude-haiku-4-5|0
 W12|gemini|/v1beta/models/gpt-5.6-luna:generateContent|gpt-5.6-luna|openai|openai-|subscription|openai|0|1|gpt-5.6-luna|0
 W13|gemini|/v1beta/models/gpt-5.6-luna:streamGenerateContent?alt=sse|gpt-5.6-luna|openai|openai-|subscription|openai|1|1|gpt-5.6-luna|0
@@ -742,7 +743,7 @@ run_dario_cc_direct_cell() {
   if ! command -v claude >/dev/null 2>&1; then write_result DARIO-CC-DIRECT SKIP 0 "claude is not on host PATH"; return 0; fi
   if ! dario_active; then write_result DARIO-CC-DIRECT SKIP 0 "dario unavailable"; return 0; fi
   local t0 t1 marker all selected sess msg
-  t0=$(now_ms); marker="alexandria-dario-cc-$t0-$$"
+  t0=$(now_ms); marker="alex-dario-cc-$t0-$$"
   ANTHROPIC_BASE_URL="$BASE" ANTHROPIC_API_KEY="$KEY" claude --model claude-haiku-4-5 -p "$marker" >"$TMP/dario-cc.out" 2>"$TMP/dario-cc.err" || { t1=$(now_ms); write_result DARIO-CC-DIRECT FAIL "$((t1-t0))" "claude failed: $(tail -c 180 "$TMP/dario-cc.err")"; return 0; }
   all="$TMP/dario-cc.all.json"; selected="$TMP/dario-cc.traces.json"
   curl -sS --max-time 10 -H "x-api-key: $KEY" -o "$all" "$BASE/admin/traces?limit=200" 2>/dev/null || true
@@ -846,8 +847,27 @@ run_unit_tier() {
   fi
 }
 
+run_cliproxyapi_tier() {
+  in_only CLIPROXYAPI || return 0
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    write_result CLIPROXYAPI SKIP 0 "docker unavailable"
+    return 0
+  fi
+  log "== cliproxyapi: pinned v7 Docker compatibility matrix =="
+  local t0 t1 rc=0
+  t0=$(now_ms)
+  (cd "$ROOT" && ./scripts/cliproxyapi-v1-integration.sh) >&2 || rc=$?
+  t1=$(now_ms)
+  if [ "$rc" -eq 0 ]; then
+    write_result CLIPROXYAPI PASS "$((t1 - t0))" "CLIProxyAPI v7.2.92 both directions"
+  else
+    write_result CLIPROXYAPI FAIL "$((t1 - t0))" "Docker fixture exited $rc"
+  fi
+}
+
 main() {
   if has_tier unit; then run_unit_tier; fi
+  if has_tier cliproxyapi; then run_cliproxyapi_tier; fi
   : > "$TMP/wire.cells"
   : > "$TMP/harness.cells"
   if has_tier wire; then select_wire; fi

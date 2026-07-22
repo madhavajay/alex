@@ -14,10 +14,10 @@ sha256_file() {
 
 quit_alex_apps() {
   wait_steps="${1:-0}"
-  for app in AlexandriaBar Alex; do
+  for app in Alex; do
     osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 || true
   done
-  for process in AlexandriaBar Alex; do
+  for process in Alex; do
     if pgrep -x "$process" >/dev/null 2>&1; then
       printf 'Quitting the running %s...\n' "$process"
       waited=0
@@ -30,20 +30,6 @@ quit_alex_apps() {
       fi
     fi
   done
-}
-
-remove_legacy_app() {
-  app_dir="$1"
-  new_app_name="${2:-Alex.app}"
-  legacy_app_name="${3:-AlexandriaBar.app}"
-  [ -n "$app_dir" ] || return 1
-  [ -e "$app_dir/$new_app_name" ] || return 0
-  [ -e "$app_dir/$legacy_app_name" ] || return 0
-  if [ -w "$app_dir" ]; then
-    rm -rf "$app_dir/$legacy_app_name"
-  else
-    sudo rm -rf "$app_dir/$legacy_app_name"
-  fi
 }
 
 INSTALL_COMMON_MOUNT_POINT=""
@@ -60,13 +46,12 @@ install_app_from_dmg() {
   dmg_path="$1"
   app_name="$2"
   install_dir="$3"
-  legacy_app_name="${4:-AlexandriaBar.app}"
 
   [ -n "$install_dir" ] || {
     printf '%s\n' "The app install directory is empty." >&2
     return 1
   }
-  INSTALL_COMMON_MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alexandria-install-XXXXXX")"
+  INSTALL_COMMON_MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/alex-install-XXXXXX")"
   hdiutil attach "$dmg_path" -nobrowse -quiet -mountpoint "$INSTALL_COMMON_MOUNT_POINT" </dev/null
 
   if [ ! -d "$INSTALL_COMMON_MOUNT_POINT/$app_name" ]; then
@@ -81,6 +66,5 @@ install_app_from_dmg() {
 
   rm -rf "$install_dir/$app_name"
   ditto "$INSTALL_COMMON_MOUNT_POINT/$app_name" "$install_dir/$app_name"
-  remove_legacy_app "$install_dir" "$app_name" "$legacy_app_name"
   install_common_cleanup_mount
 }

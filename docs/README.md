@@ -14,7 +14,9 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | [API and formats](api-and-formats.md) | Model ingress, control/trace routes, the four API dialects, Anthropic-pivot translation, SSE, usage, and cost. |
 | [Configuration](configuration.md) | Full `config.toml` key/default reference, environment variables, and on-disk layout. |
 | [Dario](dario.md) | Dario routing modes, three-block prompt rewrite, header handling, generations, health, and fallback behavior. |
-| [Traces](traces.md) | Trace rows and gzip bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
+| [CLIProxyAPI integration](cliproxyapi.md) | Both routing directions, safe reverse config export, version/capability negotiation, correlation, and loop prevention. |
+| [Traces](traces.md) | Trace rows, live gzip and migrated LAR bodies, redaction, transcripts/tool calls, browser API, scoped keys, export, and retention. |
+| [Shared web UI](web-ui.md) | macOS/Linux local status, onboarding, and trace preview, with bounded pagination and smoke-test behavior. |
 
 ## Harnesses and capture
 
@@ -28,4 +30,5 @@ use the root [`TODO.md`](../TODO.md); for released changes use
 | Doc | What it covers |
 | --- | --- |
 | [Signed macOS build](build-signed.md) | `build-signed.sh`, Developer ID signing, notarization, and release-workflow secrets. |
+| [Stable releases](releasing.md) | Artifact-first macOS/Linux release gates, draft promotion, and resumability. |
 | [Credential plan](credentials-plan.md) | Credential-vault design/roadmap context; open implementation work remains tracked in `TODO.md`. |

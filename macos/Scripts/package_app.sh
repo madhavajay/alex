@@ -13,11 +13,17 @@ cd "$(dirname "$0")/.."
 
 CONFIGURATION="${CONFIGURATION:-release}"
 IDENTITY="${IDENTITY:--}"
-APP_NAME="AlexandriaBar"
+APP_NAME="Alex"
 APP_DISPLAY="Alex"
 BUNDLE_ID="${BUNDLE_ID:-com.madhavajay.alex}"
 VERSION="${VERSION:-0.1.0}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://madhavajay.github.io/alex/appcast.xml}"
+SPARKLE_AUTOMATIC_CHECKS="${SPARKLE_AUTOMATIC_CHECKS:-true}"
+case "$SPARKLE_AUTOMATIC_CHECKS" in
+  true|1|yes) SPARKLE_AUTOMATIC_CHECKS_PLIST='<true/>' ;;
+  false|0|no) SPARKLE_AUTOMATIC_CHECKS_PLIST='<false/>' ;;
+  *) echo "SPARKLE_AUTOMATIC_CHECKS must be true or false" >&2; exit 2 ;;
+esac
 
 # The Sparkle EdDSA *public* key. This is not a secret -- a copy ships inside the
 # Info.plist of every DMG we publish, so anyone can already read it. Defaulting it
@@ -109,10 +115,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
-    <key>NSHumanReadableCopyright</key><string>Alexandria</string>
+    <key>NSHumanReadableCopyright</key><string>Alex</string>
     <key>SUFeedURL</key><string>$SPARKLE_FEED_URL_ESCAPED</string>
 $SPARKLE_PUBLIC_ED_KEY_PLIST
-    <key>SUEnableAutomaticChecks</key><true/>
+    <key>SUEnableAutomaticChecks</key>$SPARKLE_AUTOMATIC_CHECKS_PLIST
     <key>SUScheduledCheckInterval</key><integer>86400</integer>
     <key>NSAppTransportSecurity</key>
     <dict>

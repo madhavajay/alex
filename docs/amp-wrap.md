@@ -4,7 +4,7 @@ Self-contained harness capture for the Sourcegraph Amp CLI. Lives in `crates/ale
 
 ## Goal
 
-Point Amp at a local reverse wrap (`AMP_URL` / `amp.url`) so management REST **and** actor WebSocket traffic can be captured and (later) rerouted — without Docker MITM and without polluting `alex-proxy`.
+Point Amp at a local reverse wrap (`AMP_URL` / `amp.url`) so management REST **and** actor WebSocket traffic can be captured without Docker MITM and without polluting `alex-proxy`. Amp model rerouting is not supported.
 
 ## Quick use
 
@@ -27,7 +27,7 @@ alex wrap status
 Capture artifacts (default):
 
 ```text
-~/.alexandria/wrap/amp/
+~/.alex/wrap/amp/
   settings.json   # amp.url = wrap base URL
   amp.log         # AMP_LOG_FILE / --log-file
   flows.jsonl     # reverse wrap request/response events
@@ -46,23 +46,23 @@ alex keys mint --kind wrap --label remote-mac
 On the machine running Amp:
 
 ```bash
-export ALEXANDRIA_TRACE_URL=https://alex.example.net
-export ALEXANDRIA_TRACE_KEY=alxk-...
+export ALEX_TRACE_URL=https://alex.example.net
+export ALEX_TRACE_KEY=alxk-...
 
 alex wrap amp
 ```
 
-For persistent setup, put only the key in a mode-`0600` file and use `--trace-key-file ~/.config/alexandria/wrap.key`. The equivalent flags are `--trace-url` and `--trace-key-file`; the equivalent environment variables are `ALEXANDRIA_TRACE_URL`, `ALEXANDRIA_TRACE_KEY`, and `ALEXANDRIA_TRACE_KEY_FILE`.
+For persistent setup, put only the key in a mode-`0600` file and use `--trace-key-file ~/.config/alex/wrap.key`. The equivalent flags are `--trace-url` and `--trace-key-file`; the equivalent environment variables are `ALEX_TRACE_URL`, `ALEX_TRACE_KEY`, and `ALEX_TRACE_KEY_FILE`.
 
 If preflight or a later upload fails, the wrapper continues capturing locally. After connectivity is restored, replay the run printed by `alex wrap`:
 
 ```bash
 alex traces push --run-id wrap-amp-<timestamp>-<suffix> \
   --trace-url https://alex.example.net \
-  --trace-key-file ~/.config/alexandria/wrap.key
+  --trace-key-file ~/.config/alex/wrap.key
 ```
 
-Plain `http://` is accepted automatically only for loopback. A trusted private-network HTTP endpoint requires `--allow-insecure-http` or `ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP=1`; use HTTPS for internet-facing endpoints. A `kind=wrap` key can only access `GET/POST /traces/ingest`, cannot invoke models or browse/administer traces, and can be disabled centrally with `alex keys revoke <rk-id>`.
+Plain `http://` is accepted automatically only for loopback. A trusted private-network HTTP endpoint requires `--allow-insecure-http` or `ALEX_TRACE_ALLOW_INSECURE_HTTP=1`; use HTTPS for internet-facing endpoints. A `kind=wrap` key can only access `GET/POST /traces/ingest`, cannot invoke models or browse/administer traces, and can be disabled centrally with `alex keys revoke <rk-id>`.
 
 Requires:
 
@@ -101,7 +101,7 @@ Native Amp inference is **actor WebSocket (Rivet)**, not OpenAI-style `/v1` thro
 ### Config-driven catalog
 
 Profiles: `crates/alex-wrap/config/wrap-harnesses.json`  
-Optional override: `~/.alexandria/wrap-harnesses.json`
+Optional override: `~/.alex/wrap-harnesses.json`
 
 Amp profile knobs (no code change for renames):
 

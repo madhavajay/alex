@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.madhavajay.alex.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/alex</string>
+    <string>daemon</string>
+  </array>
+__ALEX_LAUNCHD_SOCKETS__
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/alex.daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/alex.daemon.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ALEX_LAUNCHD_SOCKET_ACTIVATION</key>
+    <string>1</string>
+__ALEX_LAUNCHD_HOME__
+    <key>PATH</key>
+    <string>__ALEX_LAUNCHD_PATH__</string>
+    <key>RUST_LOG</key>
+    <string>info,alex=debug</string>
+  </dict>
+</dict>
+</plist>

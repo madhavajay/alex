@@ -19,6 +19,7 @@ for dialect conversion.
 | Grok / xAI | Grok OAuth subscription | Anthropic Messages or OpenAI Chat | Upstream is OpenAI-chat-compatible. Responses and Gemini ingress return `501 Not Implemented` for this provider. |
 | Kimi Code | Imported or device-flow OAuth | Anthropic Messages or OpenAI Chat | Routes to Kimi's coding Chat Completions endpoint. Responses and Gemini ingress are not implemented. |
 | OpenRouter | API key plus optional HTTP-Referer/X-Title attribution | Anthropic Messages or OpenAI Chat | Model IDs are `openrouter/<vendor>/<model>`. Only the configured curated subset is advertised to harnesses. |
+| CLIProxyAPI | User-managed URL and bearer credential | Anthropic Messages, OpenAI Chat, or OpenAI Responses | Upstream models use `cliproxyapi/<model>`. The reverse CLIProxyAPI → Alex arrangement is generated with `alex cliproxyapi export`. |
 | Amp | Amp access token/API key | None | Billing and reverse-wrap capture only. `alex wrap amp` handles the product protocol; `/v1` routing returns `501`. |
 | Exo | No vault account; configured local URL and dummy bearer auth | Anthropic Messages or OpenAI Chat | Local OpenAI-chat-compatible provider, enabled per model with `exo_enabled_models`. |
 
@@ -134,7 +135,7 @@ accounts rather than one upstream credential.
 
 ## Model-to-provider routing
 
-`route_model` first strips a harness namespace (`alex/`, `alexandria/`,
+`route_model` first strips a harness namespace (`alex/`,
 `cove/`, or Claude-compatible `claude-alex/`), then resolves an explicit
 provider prefix.
 
@@ -171,33 +172,41 @@ are not ordinary account-failover triggers. A retry account must be ready and
 not reserve-blocked; the selector's degraded "soonest cooldown" escape hatch is
 not used for retries.
 
-## Cross-model fallback and protection
+## Fable 5 → GPT-5.6 Sol fallback
 
-Same-model account failover is independent of these opt-in layers:
+Alex ships one default middleware rule: `alex.fable-5-to-gpt-5.6-sol`.
+Anthropic returns Fable safeguards as an HTTP `200` SSE stream whose terminal
+`message_delta` has `delta.stop_reason = "refusal"`. Alex incrementally parses
+that event and matches the normalized `upstream_refusal` kind regardless of
+category (`bio`, `cyber`, or a future category). It then retries with
+high-effort `gpt-5.6-sol` through OpenAI and keeps that route for the same
+stable session for 24 hours. The request header `x-alex-no-substitute: 1`
+disables interception and rerouting for that request.
 
-```toml
-[substitution]
-enabled = true
+This is structured SSE parsing, not substring matching. Alex holds only the
+undecided prefix. A refusal is intercepted before any bytes reach the harness;
+a normal response resumes unchanged as soon as text or a tool call proves it
+is not a refusal. Inspection is bounded by the configured error-body limit.
+The sanitized starter fixture is based on observed Fable refusal envelopes and
+excludes Anthropic's opaque fallback-credit token.
 
-[substitution.fallbacks]
-"claude-fable-5" = ["openai/gpt-5.6-sol"]
+The rule is editable in Settings → Middleware using the Middleware Wizard.
+Optional match and replacement effort levels are represented by `when.efforts`
+and `then.reroute.effort`. Request scope retries only the refused call; session
+scope creates a time-bounded lease after success so later calls in the same
+stable session use the replacement route. If “Tell the harness” is enabled,
+notice text can use `{from_model}` and `{to_model}` placeholders.
 
-[protection]
-enabled = true
-reroute_on_auth = false
-retries = 1
-auto_return = true
+If no eligible OpenAI account can serve Sol, Alex returns the original refusal
+stream and records why the reroute could not execute. Settings shows recent
+real trace activity, including the matched rule and whether its action
+executed, so users can test by running their normal harness rather than using a
+synthetic Test button.
 
-[protection.equivalencies.claude-fable-5]
-openai = "gpt-5.6-sol"
-```
-
-`substitution.fallbacks` is an ordered explicit model list. Protection
-equivalencies select a different provider/model after covered failures;
-capacity/server errors are covered when protection is enabled, and auth is
-covered only with `reroute_on_auth = true`. The request header
-`x-alexandria-no-substitute: 1` disables configured cross-model substitution
-for that request.
+The deterministic acceptance contract is
+`crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-acceptance.json`. It
+covers the refusal reroute, the next request using the active session route,
+and an unavailable fallback account.
 
 Next: [Configuration](configuration.md) · [API and formats](api-and-formats.md)
 · [Traces](traces.md)

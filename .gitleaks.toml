@@ -8,13 +8,13 @@ useDefault = true
 
 [[rules]]
 id = "alex-inbound-key"
-description = "Alexandria inbound API key (alx-)"
+description = "Alex inbound API key (alx-)"
 regex = '''alx-[0-9a-f]{40,}'''
 keywords = ["alx-"]
 
 [[rules]]
 id = "alex-run-key"
-description = "Alexandria scoped run key (alxk-)"
+description = "Alex scoped run key (alxk-)"
 regex = '''alxk-[0-9a-f]{40,}'''
 keywords = ["alxk-"]
 

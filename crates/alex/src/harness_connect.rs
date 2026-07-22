@@ -16,57 +16,58 @@ use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
 
 use crate::{ui, Config, HarnessOverride};
 
-const PROVIDER_NAME: &str = "alexandria";
-const PI_SESSION_EXTENSION_FILE: &str = "alexandria-session.ts";
+const PROVIDER_NAME: &str = "alex";
+const CODEX_PROVIDER_NAME: &str = "alex";
+const PI_SESSION_EXTENSION_FILE: &str = "alex-session.ts";
 const CODEX_CONFIG_FILE: &str = "config.toml";
-const CODEX_CATALOG_FILE: &str = "alexandria-models.json";
-const CODEX_NATIVE_CATALOG_FILE: &str = "alexandria-openai-models.json";
-const CODEX_KEY_FILE: &str = "alexandria-api-key";
-const CODEX_STATE_FILE: &str = "alexandria-harness-state.json";
-const CODEX_BACKUP_FILE: &str = "alexandria-original-config.toml";
+const CODEX_CATALOG_FILE: &str = "alex-models.json";
+const CODEX_NATIVE_CATALOG_FILE: &str = "alex-openai-models.json";
+const CODEX_KEY_FILE: &str = "alex-api-key";
+const CODEX_STATE_FILE: &str = "alex-harness-state.json";
+const CODEX_BACKUP_FILE: &str = "alex-original-config.toml";
 const CODEX_OPENAI_PROFILE_FILE: &str = "openai.config.toml";
 pub(crate) const CODEX_ALEX_PROFILE_FILE: &str = "alex.config.toml";
-const CODEX_HOOK_FILE: &str = "alexandria-session-hook.sh";
-const CODEX_HOOK_CURL_FILE: &str = "alexandria-hook-curl.conf";
-const CODEX_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
-const CODEX_TOOL_HOOK_FILE: &str = "alexandria-tool-hook.sh";
-const CODEX_TOOL_HOOK_CURL_FILE: &str = "alexandria-tool-curl.conf";
-const CODEX_TOOL_EVENT_LOG_FILE: &str = "alexandria-tool-events.jsonl";
+const CODEX_HOOK_FILE: &str = "alex-session-hook.sh";
+const CODEX_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
+const CODEX_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+const CODEX_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
+const CODEX_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
+const CODEX_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
-pub(crate) const CLAUDE_PROFILE_FILE: &str = "alexandria-settings.json";
-const CLAUDE_CATALOG_FILE: &str = "alexandria-models.json";
-const CLAUDE_KEY_FILE: &str = "alexandria-api-key";
-const CLAUDE_STATE_FILE: &str = "alexandria-harness-state.json";
-const CLAUDE_BACKUP_FILE: &str = "alexandria-original-settings.json";
-const CLAUDE_HOOK_FILE: &str = "alexandria-session-hook.sh";
-const CLAUDE_HOOK_CURL_FILE: &str = "alexandria-hook-curl.conf";
-const CLAUDE_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
-const CLAUDE_TOOL_HOOK_FILE: &str = "alexandria-tool-hook.sh";
-const CLAUDE_TOOL_HOOK_CURL_FILE: &str = "alexandria-tool-curl.conf";
-const CLAUDE_TOOL_EVENT_LOG_FILE: &str = "alexandria-tool-events.jsonl";
+pub(crate) const CLAUDE_PROFILE_FILE: &str = "alex-settings.json";
+const CLAUDE_CATALOG_FILE: &str = "alex-models.json";
+const CLAUDE_KEY_FILE: &str = "alex-api-key";
+const CLAUDE_STATE_FILE: &str = "alex-harness-state.json";
+const CLAUDE_BACKUP_FILE: &str = "alex-original-settings.json";
+const CLAUDE_HOOK_FILE: &str = "alex-session-hook.sh";
+const CLAUDE_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
+const CLAUDE_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+const CLAUDE_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
+const CLAUDE_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
+const CLAUDE_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
 const GROK_CONFIG_FILE: &str = "config.toml";
-const GROK_KEY_FILE: &str = "alexandria-api-key";
-const GROK_STATE_FILE: &str = "alexandria-harness-state.json";
-const GROK_BACKUP_FILE: &str = "alexandria-original-config.toml";
-const GROK_HOOK_FILE: &str = "alexandria-session-hook.sh";
-const GROK_HOOK_CONFIG_FILE: &str = "alexandria-hook-curl.conf";
-const GROK_HOOK_REGISTRATION_FILE: &str = "alexandria.json";
-const GROK_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
-const AMP_PLUGIN_FILE: &str = "alexandria.ts";
-const AMP_KEY_FILE: &str = "alexandria-api-key";
-const AMP_STATE_FILE: &str = "alexandria-harness-state.json";
-const AMP_EVENT_LOG_FILE: &str = "alexandria-session-events.jsonl";
+const GROK_KEY_FILE: &str = "alex-api-key";
+const GROK_STATE_FILE: &str = "alex-harness-state.json";
+const GROK_BACKUP_FILE: &str = "alex-original-config.toml";
+const GROK_HOOK_FILE: &str = "alex-session-hook.sh";
+const GROK_HOOK_CONFIG_FILE: &str = "alex-hook-curl.conf";
+const GROK_HOOK_REGISTRATION_FILE: &str = "alex.json";
+const GROK_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+const AMP_PLUGIN_FILE: &str = "alex.ts";
+const AMP_KEY_FILE: &str = "alex-api-key";
+const AMP_STATE_FILE: &str = "alex-harness-state.json";
+const AMP_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
 const KIMI_CONFIG_FILE: &str = "config.toml";
-const KIMI_STATE_FILE: &str = "alexandria-harness-state.json";
-const KIMI_BACKUP_FILE: &str = "alexandria-original-config.toml";
-const KIMI_PROVIDER_NAME: &str = "alexandria";
-const KIMI_INSTALL_DESCRIPTION: &str = "Alex backs up your Kimi Code config.toml and adds an OpenAI-compatible provider named `alexandria` plus selectable models named alex/* that route through the local proxy. Those models use a local-only harness credential and static Alex headers; Kimi's own kimi/* models and subscription authentication are left untouched. `alex harness disconnect kimi` removes the added provider and models and restores the backup.";
+const KIMI_STATE_FILE: &str = "alex-harness-state.json";
+const KIMI_BACKUP_FILE: &str = "alex-original-config.toml";
+const KIMI_PROVIDER_NAME: &str = "alex";
+const KIMI_INSTALL_DESCRIPTION: &str = "Alex backs up your Kimi Code config.toml and adds an OpenAI-compatible provider named `alex` plus selectable models named alex/* that route through the local proxy. Those models use a local-only harness credential and static Alex headers; Kimi's own kimi/* models and subscription authentication are left untouched. `alex harness disconnect kimi` removes the added provider and models and restores the backup.";
 const PI_INSTALL_DESCRIPTION: &str = "Alex adds models named alex/* to Pi and installs a small session hook. The hook sets a local session header that the Alex proxy detects for tracing and removes before forwarding traffic upstream.";
 const CODEX_INSTALL_DESCRIPTION: &str = "Alex backs up your original Codex configuration and any existing openai/alex profile files, then creates two fixed profiles. `codex --profile openai` uses normal Codex authentication; `codex --profile alex` routes alex/* models through the local proxy. A lifecycle hook sends session and sub-agent events to Alex so related traces can be grouped; Alex-only headers and credentials are not forwarded upstream.";
-const CLAUDE_INSTALL_DESCRIPTION: &str = "Alex leaves your normal Claude Code configuration untouched and backs it up for reference. It creates a separate Alex settings profile that routes gateway models displayed as alex/* through the local proxy. Start it with `claude --settings ~/.claude/alexandria-settings.json`; plain `claude` continues to use your normal Claude authentication. Claude's native session, agent, and parent-agent headers provide exact nested traces, while lifecycle hooks add sub-agent names and timing.";
+const CLAUDE_INSTALL_DESCRIPTION: &str = "Alex leaves your normal Claude Code configuration untouched and backs it up for reference. It creates a separate Alex settings profile that routes gateway models displayed as alex/* through the local proxy. Start it with `claude --settings ~/.claude/alex-settings.json`; plain `claude` continues to use your normal Claude authentication. Claude's native session, agent, and parent-agent headers provide exact nested traces, while lifecycle hooks add sub-agent names and timing.";
 const GROK_INSTALL_DESCRIPTION: &str = "Alex backs up your Grok configuration, preserves Grok's built-in models and current default, and adds selectable models named alex/*. Those custom models use Grok's OpenAI-compatible Chat Completions backend, a local-only credential in the 0600 config, and static Alex harness headers. A trusted global lifecycle hook reports sessions and sub-agents to the local proxy; plain built-in Grok models continue to use your normal Grok authentication.";
 const AMP_INSTALL_DESCRIPTION: &str = "Alex installs a reversible system Amp plugin that records thread, turn, tool, and exact native T-* session identifiers without changing prompts, permissions, tools, models, or Amp authentication. The plugin reports lineage to the local daemon and can recover exact built-in sub-agent edges when Amp exposes child thread IDs. Start Amp with `alex wrap amp` to capture model traffic; the wrapper and plugin join on the same native Amp thread ID. Amp's public plugin API cannot add an Alex model provider, so model selection remains Amp-native.";
-const PI_SESSION_EXTENSION: &str = r#"// Generated by Alex. Re-run `alex harness connect pi` to refresh.
+const PI_SESSION_EXTENSION: &str = r#"// Generated by Alex. Re-run `alex connect pi` to refresh.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
@@ -77,7 +78,7 @@ export default function (pi: ExtensionAPI) {
   // Pi spawns subagents as child `pi` processes, so the parent's session id
   // reaches them only through inherited environment. Capture it before this
   // session overwrites the variable with its own id for grandchildren.
-  const inheritedParent = process.env.ALEXANDRIA_SESSION_ID;
+  const inheritedParent = process.env.ALEX_SESSION_ID;
   let announced = false;
   let turnId: string | undefined;
   const post = (event: Record<string, unknown>) => {
@@ -89,14 +90,14 @@ export default function (pi: ExtensionAPI) {
   const announce = (sessionId: string) => {
     if (announced || !sessionId) return;
     announced = true;
-    process.env.ALEXANDRIA_SESSION_ID = sessionId;
+    process.env.ALEX_SESSION_ID = sessionId;
     if (!inheritedParent || inheritedParent === sessionId) return;
     void fetch(harnessEventsUrl, { method: "POST", headers: { "content-type": "application/json", "x-api-key": apiKey }, body: JSON.stringify({ hook_event_name: "SubagentStart", session_id: inheritedParent, agent_id: sessionId, agent_type: "pi", timestamp_ms: Date.now() }) }).catch(() => {});
   };
   pi.on("before_provider_headers", (event, ctx) => {
     // This extension is global, but session attribution belongs only on
     // requests routed through Alex's provider.
-    if (ctx.model.provider !== "alexandria") return;
+    if (ctx.model.provider !== "alex") return;
 
     announce(ctx.sessionManager.getSessionId());
     event.headers["x-session-id"] = ctx.sessionManager.getSessionId();
@@ -438,7 +439,7 @@ struct AmpManagedState {
 #[serde(default)]
 struct KimiManagedState {
     managed_models: Vec<String>,
-    /// Whether Alexandria added the `[providers."alexandria"]` table (so
+    /// Whether Alex added the `[providers.alex]` table (so
     /// disconnect only removes a provider it created, never a user's own).
     added_provider: bool,
 }
@@ -470,7 +471,7 @@ pub(crate) async fn connect_cmd(
 
 /// Connect using a controller-minted harness key. This path deliberately has
 /// no `Config` argument: it is used by container entrypoints that do not have
-/// the host's Alexandria home directory or local admin key.
+/// the host's Alex home directory or local admin key.
 pub(crate) async fn connect_with_preminted_key(
     harness: &str,
     explicit_config_dir: Option<PathBuf>,
@@ -494,15 +495,11 @@ pub(crate) async fn connect_with_preminted_key(
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         (spec.config_dir)(&home)
     });
-    if !config_dir.is_dir() {
-        std::fs::create_dir_all(&config_dir).with_context(|| {
-            format!("create {harness} config directory {}", config_dir.display())
-        })?;
-    }
+    ensure_harness_config_dir(harness, &config_dir)?;
 
     let base_url = base_url.trim_end_matches('/').to_string();
     if base_url.is_empty() {
-        bail!("--url / ALEXANDRIA_URL must not be empty");
+        bail!("--url / ALEX_URL must not be empty");
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -536,6 +533,18 @@ pub(crate) async fn connect_with_preminted_key(
         println!("config: {}", summary.config_path.display());
     }
     Ok(())
+}
+
+/// Harnesses can be installed before their first interactive launch. Onboarding
+/// owns the Alex-managed files it writes, so a missing config directory is a
+/// first-run condition to bootstrap rather than an instruction to leave the
+/// wizard and run the harness manually.
+pub(crate) fn ensure_harness_config_dir(harness: &str, config_dir: &Path) -> Result<()> {
+    if config_dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("create {harness} config directory {}", config_dir.display()))
 }
 
 fn write_preminted_connection(
@@ -608,7 +617,7 @@ pub(crate) async fn tool_capture_cmd(
             .json(&json!({"enabled": enabled}))
             .send()
             .await
-            .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+            .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or_default();
         if !status.is_success() {
@@ -634,7 +643,7 @@ pub(crate) async fn tool_capture_cmd(
         .header("x-api-key", &config.local_key)
         .send()
         .await
-        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+        .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or_default();
     if !status.is_success() {
@@ -837,16 +846,11 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
     }
 
     let config_dir = resolve_config_dir(config, pi_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "pi config dir does not exist at {}; run pi once first (it creates ~/.pi/agent), or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("pi", &config_dir)?;
 
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -891,7 +895,7 @@ async fn connect_pi(config: &Config, config_dir: Option<PathBuf>, json_out: bool
         println!("models: {}", summary.models.len());
         println!("session extension: {}", summary.extension_path.display());
         println!();
-        println!("pi --provider alexandria --model claude-opus-4-8");
+        println!("pi --model alex/claude-opus-4-8");
         println!("or pick via /model inside pi — changes hot-reload");
     }
     Ok(())
@@ -964,15 +968,10 @@ async fn connect_claude(
         .as_ref()
         .context("claude is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, claude_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "claude config dir does not exist at {}; run claude once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("claude", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1042,15 +1041,10 @@ async fn connect_codex(config: &Config, config_dir: Option<PathBuf>, json_out: b
         .binary
         .context("codex is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, codex_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "codex config dir does not exist at {}; run codex once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("codex", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1125,15 +1119,10 @@ async fn connect_grok(config: &Config, config_dir: Option<PathBuf>, json_out: bo
         .as_ref()
         .context("grok is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, grok_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "grok config dir does not exist at {}; run grok once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("grok", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1198,15 +1187,10 @@ async fn connect_kimi(config: &Config, config_dir: Option<PathBuf>, json_out: bo
         "kimi is not installed or not on PATH; install it with `npm install -g @moonshot-ai/kimi-code`",
     )?;
     let config_dir = resolve_config_dir(config, kimi_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "kimi config dir does not exist at {}; run kimi once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("kimi", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1271,15 +1255,10 @@ async fn connect_amp(config: &Config, config_dir: Option<PathBuf>, json_out: boo
         .as_ref()
         .context("amp is not installed or not on PATH")?;
     let config_dir = resolve_config_dir(config, amp_spec(), config_dir);
-    if !config_dir.is_dir() {
-        bail!(
-            "amp config dir does not exist at {}; run amp once first, or pass --config-dir",
-            config_dir.display()
-        );
-    }
+    ensure_harness_config_dir("amp", &config_dir)?;
     if !daemon_health(config).await {
         bail!(
-            "could not reach the alexandria daemon at {}; start it with `alex daemon --background`",
+            "could not reach the Alex daemon at {}; start it with `alex daemon --background`",
             normalized_base_url(config)
         );
     }
@@ -1346,25 +1325,18 @@ async fn codex_model_catalog_with_timeout(
     available: &[String],
     timeout: Duration,
 ) -> Result<Value> {
-    let binary = binary.to_path_buf();
     let display = binary.display().to_string();
-    let output = match tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || {
-            Command::new(binary)
-                .args(["debug", "models", "--bundled"])
-                .output()
-        }),
-    )
-    .await
-    {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["debug", "models", "--bundled"])
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(timeout, command.output()).await {
         Err(_) => bail!("timed out reading bundled model catalog from {display}"),
-        Ok(Err(e)) => return Err(e).context("Codex model catalog task failed"),
-        Ok(Ok(Err(e))) => {
-            return Err(e)
+        Ok(Err(error)) => {
+            return Err(error)
                 .with_context(|| format!("could not read bundled model catalog from {display}"))
         }
-        Ok(Ok(Ok(output))) => output,
+        Ok(Ok(output)) => output,
     };
     if !output.status.success() {
         bail!(
@@ -1401,7 +1373,6 @@ async fn codex_model_catalog_with_timeout(
     for available_id in available {
         let bare_id = available_id
             .strip_prefix("alex/")
-            .or_else(|| available_id.strip_prefix("alexandria/"))
             .or_else(|| available_id.strip_prefix("cove/"))
             .unwrap_or(available_id);
         let alex_id = format!("alex/{bare_id}");
@@ -1469,7 +1440,7 @@ pub(crate) fn write_pi_connection_with_capture(
     })
 }
 
-/// Set the model used by a connected harness's Alexandria profile. `alex up`
+/// Set the model used by a connected harness's Alex profile. `alex up`
 /// calls this after connection so its explicit default wins over a harness's
 /// usual "first catalog entry" choice.
 pub(crate) fn set_default_model(harness: &str, config_dir: &Path, model: &str) -> Result<()> {
@@ -1557,7 +1528,7 @@ pub(crate) fn write_claude_connection_with_capture(
     };
 
     // Validate the normal user settings before advertising a backup. The
-    // Alexandria profile is additive and never changes this file.
+    // Alex profile is additive and never changes this file.
     let original_settings = if settings_path.exists() {
         let raw = std::fs::read_to_string(&settings_path)?;
         let parsed: Value = serde_json::from_str(&raw).with_context(|| {
@@ -1620,7 +1591,7 @@ pub(crate) fn write_claude_connection_with_capture(
         "env": {
             "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_CUSTOM_HEADERS": format!(
-                "x-alexandria-harness: claude\nx-alexandria-harness-version: {}",
+                "x-alex-harness: claude\nx-alex-harness-version: {}",
                 version.as_deref().unwrap_or("unknown")
             ),
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
@@ -1719,7 +1690,7 @@ pub(crate) fn claude_config_connected(config_dir: &Path) -> Result<bool> {
     Ok(profile["env"]["ANTHROPIC_BASE_URL"].is_string()
         && profile["env"]["ANTHROPIC_CUSTOM_HEADERS"]
             .as_str()
-            .is_some_and(|headers| headers.contains("x-alexandria-harness: claude"))
+            .is_some_and(|headers| headers.contains("x-alex-harness: claude"))
         && profile["apiKeyHelper"].is_string())
 }
 
@@ -1823,9 +1794,9 @@ fn remove_hook_handlers(value: &mut Value, command: &str, hook_path: &Path) -> R
 }
 
 /// Claude Code can persist a model selected from an additive `--settings`
-/// profile into the user's ordinary settings file. Once Alexandria's profile
+/// profile into the user's ordinary settings file. Once Alex's profile
 /// is removed that provider-prefixed model is no longer resolvable, so remove
-/// only the stale Alexandria selection and its discovered gateway cache.
+/// only the stale Alex selection and its discovered gateway cache.
 /// Native model choices and unrelated gateway caches are left untouched.
 fn clear_stale_claude_gateway_selection(config_dir: &Path) -> Result<bool> {
     let mut changed = false;
@@ -1848,14 +1819,14 @@ fn clear_stale_claude_gateway_selection(config_dir: &Path) -> Result<bool> {
     let cache_path = config_dir.join("cache").join("gateway-models.json");
     if cache_path.exists() {
         let cache = read_json_object(&cache_path)?;
-        let is_alexandria_cache = cache["models"].as_array().is_some_and(|models| {
+        let is_alex_cache = cache["models"].as_array().is_some_and(|models| {
             models.iter().any(|model| {
                 model["id"]
                     .as_str()
                     .is_some_and(|id| id.starts_with("claude-alex/"))
             })
         });
-        if is_alexandria_cache {
+        if is_alex_cache {
             std::fs::remove_file(&cache_path)
                 .with_context(|| format!("could not remove {}", cache_path.display()))?;
             changed = true;
@@ -1987,9 +1958,9 @@ pub(crate) fn write_grok_connection(
         entry["api_backend"] = value("chat_completions");
         entry["context_window"] = value(200_000);
         let mut headers = InlineTable::new();
-        headers.insert("x-alexandria-harness", "grok".into());
+        headers.insert("x-alex-harness", "grok".into());
         headers.insert(
-            "x-alexandria-harness-version",
+            "x-alex-harness-version",
             version.as_deref().unwrap_or("unknown").into(),
         );
         entry["extra_headers"] = value(headers);
@@ -2087,7 +2058,7 @@ pub(crate) fn grok_config_connected(config_dir: &Path) -> Result<bool> {
             .and_then(Item::as_table_like)
             .and_then(|entry| entry.get("extra_headers"))
             .and_then(Item::as_inline_table)
-            .and_then(|headers| headers.get("x-alexandria-harness"))
+            .and_then(|headers| headers.get("x-alex-harness"))
             .and_then(|value| value.as_str())
             == Some("grok")
     }))
@@ -2156,7 +2127,7 @@ fn read_grok_state(path: &Path) -> Result<GrokManagedState> {
 // Kimi Code (Moonshot AI) bidirectional connect: add alex/* models to Kimi.
 // ---------------------------------------------------------------------------
 
-/// Rewrite `~/.kimi-code/config.toml` to add an OpenAI-compatible `alexandria`
+/// Rewrite `~/.kimi-code/config.toml` to add an OpenAI-compatible `alex`
 /// provider pointing at the local proxy plus alex/* models, backing up the
 /// original once. Reversible via [`disconnect_kimi_config`].
 pub(crate) fn write_kimi_connection(
@@ -2197,7 +2168,7 @@ pub(crate) fn write_kimi_connection(
     if !managed_before || !backup_path.exists() {
         atomic_write_text(&backup_path, &original_config)?;
     }
-    let orphan_adoptable = kimi_provider_is_ours(&doc);
+    let orphan_adoptable = kimi_provider_named_is_ours(&doc, KIMI_PROVIDER_NAME);
 
     if doc.get("providers").is_none() {
         doc["providers"] = Item::Table(Table::new());
@@ -2311,8 +2282,8 @@ pub(crate) fn read_kimi_model_ids(config_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The Alexandria harness key Kimi stores inside its config.toml
-/// (`[providers."alexandria"].api_key`). Lets the daemon `refresh-config`
+/// The Alex harness key Kimi stores inside its config.toml
+/// (`[providers.alex].api_key`). Lets the daemon `refresh-config`
 /// endpoint reuse the existing key instead of minting (and orphaning) a new one
 /// on every refresh, matching how the other harnesses read their stored key.
 pub(crate) fn read_kimi_api_key(config_dir: &Path) -> Option<String> {
@@ -2323,7 +2294,7 @@ pub(crate) fn read_kimi_api_key(config_dir: &Path) -> Option<String> {
         .and_then(Item::as_table_like)
         .and_then(|provider| provider.get("api_key"))
         .and_then(Item::as_str)
-        .filter(|key| !key.is_empty())
+        .filter(|key| key.starts_with("alxk-"))
         .map(String::from)
 }
 
@@ -2357,7 +2328,7 @@ pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
         if !config_path.exists() {
             return Ok(false);
         }
-        // No managed-state marker, but Alexandria's entries are self-identifying
+        // No managed-state marker, but Alex's entries are self-identifying
         // — remove them anyway so a lost state file can't leave Kimi wired to a
         // revoked key.
         let mut doc = read_grok_config(&config_path)?;
@@ -2396,8 +2367,8 @@ pub(crate) fn disconnect_kimi_config(config_dir: &Path) -> Result<bool> {
 }
 
 /// Kimi persists a model chosen as its default in the same config file as the
-/// additive Alexandria provider. Restore a native selection without replacing
-/// unrelated configuration changes made since Alexandria connected.
+/// additive Alex provider. Restore a native selection without replacing
+/// unrelated configuration changes made since Alex connected.
 fn clear_stale_kimi_default_selection(config_dir: &Path, doc: &mut DocumentMut) -> Result<bool> {
     let stale_model = doc
         .get("default_model")
@@ -2442,16 +2413,16 @@ fn clear_stale_kimi_default_selection(config_dir: &Path, doc: &mut DocumentMut) 
 }
 
 fn is_alex_kimi_model(model: &str) -> bool {
-    model.starts_with("alex/") || model.starts_with("alexandria/")
+    model.starts_with("alex/")
 }
 
-/// True when the `alexandria` provider block in a Kimi config carries an Alex
+/// True when the named provider block in a Kimi config carries an Alex
 /// run key (`alxk-` prefix) — the marker that it was written by `alex connect`
 /// rather than authored by the user.
-fn kimi_provider_is_ours(doc: &DocumentMut) -> bool {
+fn kimi_provider_named_is_ours(doc: &DocumentMut, name: &str) -> bool {
     doc.get("providers")
         .and_then(Item::as_table_like)
-        .and_then(|providers| providers.get(KIMI_PROVIDER_NAME))
+        .and_then(|providers| providers.get(name))
         .and_then(Item::as_table_like)
         .and_then(|entry| entry.get("api_key"))
         .and_then(Item::as_str)
@@ -2459,15 +2430,15 @@ fn kimi_provider_is_ours(doc: &DocumentMut) -> bool {
 }
 
 /// Removes every Kimi config entry that is Alex's by construction — the
-/// `alexandria` provider block (when its key proves it ours) and any model
-/// named `alex/*` or routed through that provider. These entries are
+/// `alex` provider block (when its key proves it ours) and any model named
+/// `alex/*` or routed through that provider. These entries are
 /// self-identifying, so they can be cleaned up even when the managed-state
 /// marker file has been lost (a partial disconnect or a crash between writes
 /// previously stranded them, leaving Kimi pointed at a revoked key and
 /// blocking reconnects). A user-authored provider that happens to share the
 /// name is left alone.
 fn remove_self_identifying_kimi_entries(doc: &mut DocumentMut) -> bool {
-    let provider_is_ours = kimi_provider_is_ours(doc);
+    let provider_is_ours = kimi_provider_named_is_ours(doc, KIMI_PROVIDER_NAME);
     let mut changed = false;
     if let Some(models) = doc.get_mut("models").and_then(Item::as_table_mut) {
         let orphaned: Vec<String> = models
@@ -2592,8 +2563,10 @@ pub(crate) fn amp_config_connected(config_dir: &Path) -> Result<bool> {
         return Ok(false);
     }
     let source = std::fs::read_to_string(plugin_path)?;
-    Ok(source.contains("Generated by Alex for Amp")
-        || source.contains("Generated by Alexandria for Amp"))
+    Ok(
+        source.contains("Generated by Alex for Amp")
+            || source.contains("Generated by Alex for Amp"),
+    )
 }
 
 pub(crate) fn set_amp_tool_capture(config_dir: &Path, base_url: &str, enabled: bool) -> Result<()> {
@@ -2731,7 +2704,7 @@ export default function (amp: PluginAPI) {
           headers: {
             authorization: `Bearer ${key}`,
             'content-type': 'application/json',
-            'x-alexandria-harness': 'amp',
+            'x-alex-harness': 'amp',
           },
           body: JSON.stringify(record),
           signal: controller.signal,
@@ -2757,7 +2730,7 @@ export default function (amp: PluginAPI) {
       try {
         await fetch(TOOL_EVENT_URL, {
           method: 'POST',
-          headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-alexandria-harness': 'amp' },
+          headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-alex-harness': 'amp' },
           body: JSON.stringify(record),
           signal: controller.signal,
         })
@@ -2895,11 +2868,7 @@ export default function (amp: PluginAPI) {
     }, true)
   })
 
-  amp.registerCommand('alexandria-status', {
-    title: 'Status',
-    category: 'Alex',
-    description: 'Check lifecycle reporting and show the current Amp thread ID',
-  }, async (ctx) => {
+  const statusCommand = async (ctx) => {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 1000)
     try {
@@ -2913,7 +2882,18 @@ export default function (amp: PluginAPI) {
     } finally {
       clearTimeout(timeout)
     }
-  })
+  }
+  const statusCommandOptions = {
+    title: 'Status',
+    category: 'Alex',
+    description: 'Check lifecycle reporting and show the current Amp thread ID',
+  }
+  amp.registerCommand('alex-status', statusCommandOptions, statusCommand)
+  // Keep the old command as a compatibility alias for existing Amp installs.
+  amp.registerCommand('alex-status', {
+    ...statusCommandOptions,
+    title: 'Status (legacy alias)',
+  }, statusCommand)
 }
 "#;
 
@@ -2958,36 +2938,48 @@ pub(crate) fn write_codex_connection_with_capture(
     let native_models = codex_catalog_model_ids(&native_catalog)?;
     let before = read_codex_model_ids(&config_dir);
 
-    let mut config_doc = read_codex_config(&config_path)?;
     let managed_before = state_path.exists();
-    if !managed_before
-        && config_doc
-            .get("model_providers")
-            .and_then(Item::as_table_like)
-            .and_then(|providers| providers.get(PROVIDER_NAME))
-            .is_some_and(Item::is_table_like)
-    {
+    let mut config_doc = read_codex_config(&config_path)?;
+    let current_provider_exists = config_doc
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(CODEX_PROVIDER_NAME))
+        .is_some_and(Item::is_table_like);
+    if current_provider_exists && !codex_provider_named_is_ours(&config_doc, CODEX_PROVIDER_NAME) {
         bail!(
-            "{} already defines model_providers.{PROVIDER_NAME}; Alex will not replace an unmanaged provider",
+            "{} already defines model_providers.{CODEX_PROVIDER_NAME}; Alex will not replace an unmanaged provider",
             config_path.display()
         );
     }
+    let adopting_orphan = current_provider_exists && !managed_before;
     let mut state = if managed_before {
         read_codex_state(&state_path)?
     } else {
         CodexManagedState {
-            previous_model: config_doc
-                .get("model")
-                .and_then(Item::as_str)
-                .map(String::from),
-            previous_model_provider: config_doc
-                .get("model_provider")
-                .and_then(Item::as_str)
-                .map(String::from),
-            previous_model_catalog_json: config_doc
-                .get("model_catalog_json")
-                .and_then(Item::as_str)
-                .map(String::from),
+            previous_model: (!adopting_orphan)
+                .then(|| {
+                    config_doc
+                        .get("model")
+                        .and_then(Item::as_str)
+                        .map(String::from)
+                })
+                .flatten(),
+            previous_model_provider: (!adopting_orphan)
+                .then(|| {
+                    config_doc
+                        .get("model_provider")
+                        .and_then(Item::as_str)
+                        .map(String::from)
+                })
+                .flatten(),
+            previous_model_catalog_json: (!adopting_orphan)
+                .then(|| {
+                    config_doc
+                        .get("model_catalog_json")
+                        .and_then(Item::as_str)
+                        .map(String::from)
+                })
+                .flatten(),
             previous_hooks_enabled: codex_hooks_enabled(&config_doc),
             manages_model: true,
             profiles_backed_up: true,
@@ -2997,7 +2989,7 @@ pub(crate) fn write_codex_connection_with_capture(
             alex_model: None,
         }
     };
-    // Migrate connections created before Alexandria managed the namespaced
+    // Migrate connections created before Alex managed the namespaced
     // default model. At that point the current model was still the user's
     // pre-connect value, so it is safe to capture for disconnect restoration.
     if !state.manages_model {
@@ -3090,7 +3082,7 @@ pub(crate) fn write_codex_connection_with_capture(
     )?;
     atomic_write_text(
         &alex_profile_path,
-        &codex_profile_source(PROVIDER_NAME, &selected_model, &catalog_path),
+        &codex_profile_source(CODEX_PROVIDER_NAME, &selected_model, &catalog_path),
     )?;
     atomic_write_text(&key_path, &format!("{api_key}\n"))?;
     let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
@@ -3229,7 +3221,7 @@ fn codex_original_config_source(
         .get_mut("model_providers")
         .and_then(Item::as_table_mut)
     {
-        providers.remove(PROVIDER_NAME);
+        providers.remove(CODEX_PROVIDER_NAME);
     }
     restore_string_key(
         &mut original,
@@ -3253,8 +3245,9 @@ pub(crate) fn codex_default_route(config_dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     let doc = read_codex_config(&config_dir.join(CODEX_CONFIG_FILE))?;
+    let provider = doc.get("model_provider").and_then(Item::as_str);
     Ok(Some(
-        if doc.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_NAME) {
+        if provider == Some(CODEX_PROVIDER_NAME) {
             "alex"
         } else {
             "openai"
@@ -3272,24 +3265,24 @@ pub(crate) fn set_codex_default_route(config_dir: &Path, route: &str) -> Result<
         bail!("Codex is not connected to Alex");
     }
     let state = read_codex_state(&state_path)?;
-    let (provider, model, catalog_path) = if route == "alex" {
-        (
-            PROVIDER_NAME,
-            state.alex_model.as_deref().context(
-                "Alex profile is missing its selected model; update the Codex config",
-            )?,
-            config_dir.join(CODEX_CATALOG_FILE),
-        )
-    } else {
-        (
-            "openai",
-            state
-                .native_model
-                .as_deref()
-                .context("OpenAI profile is missing its selected model; update the Codex config")?,
-            config_dir.join(CODEX_NATIVE_CATALOG_FILE),
-        )
-    };
+    let (provider, model, catalog_path) =
+        if route == "alex" {
+            (
+                CODEX_PROVIDER_NAME,
+                state.alex_model.as_deref().context(
+                    "Alex profile is missing its selected model; update the Codex config",
+                )?,
+                config_dir.join(CODEX_CATALOG_FILE),
+            )
+        } else {
+            (
+                "openai",
+                state.native_model.as_deref().context(
+                    "OpenAI profile is missing its selected model; update the Codex config",
+                )?,
+                config_dir.join(CODEX_NATIVE_CATALOG_FILE),
+            )
+        };
     let config_path = config_dir.join(CODEX_CONFIG_FILE);
     let mut doc = read_codex_config(&config_path)?;
     apply_codex_route(&mut doc, provider, model, &catalog_path);
@@ -3315,14 +3308,18 @@ fn set_codex_default_model(config_dir: &Path, model: &str) -> Result<()> {
     let profile_path = config_dir.join(CODEX_ALEX_PROFILE_FILE);
     atomic_write_text(
         &profile_path,
-        &codex_profile_source(PROVIDER_NAME, model, &config_dir.join(CODEX_CATALOG_FILE)),
+        &codex_profile_source(
+            CODEX_PROVIDER_NAME,
+            model,
+            &config_dir.join(CODEX_CATALOG_FILE),
+        ),
     )?;
     let config_path = config_dir.join(CODEX_CONFIG_FILE);
     let mut doc = read_codex_config(&config_path)?;
-    if doc.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_NAME) {
+    if doc.get("model_provider").and_then(Item::as_str) == Some(CODEX_PROVIDER_NAME) {
         apply_codex_route(
             &mut doc,
-            PROVIDER_NAME,
+            CODEX_PROVIDER_NAME,
             model,
             &config_dir.join(CODEX_CATALOG_FILE),
         );
@@ -3338,11 +3335,7 @@ pub(crate) fn codex_config_connected(config_dir: &Path) -> Result<bool> {
     }
     let doc = read_codex_config(&path)?;
     Ok(config_dir.join(CODEX_STATE_FILE).exists()
-        && doc
-            .get("model_providers")
-            .and_then(Item::as_table_like)
-            .and_then(|providers| providers.get(PROVIDER_NAME))
-            .is_some_and(Item::is_table_like))
+        && codex_provider_named_is_ours(&doc, CODEX_PROVIDER_NAME))
 }
 
 pub(crate) fn disconnect_codex_config(config_dir: &Path) -> Result<bool> {
@@ -3356,8 +3349,11 @@ pub(crate) fn disconnect_codex_config(config_dir: &Path) -> Result<bool> {
     let catalog_path = config_dir.join(CODEX_CATALOG_FILE);
     let mut changed = false;
 
+    let current_provider_is_ours = codex_provider_named_is_ours(&doc, CODEX_PROVIDER_NAME);
     if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
-        changed |= providers.remove(PROVIDER_NAME).is_some();
+        if current_provider_is_ours {
+            changed |= providers.remove(CODEX_PROVIDER_NAME).is_some();
+        }
     }
     if state.manages_model {
         restore_string_key(
@@ -3447,6 +3443,18 @@ fn read_codex_config(path: &Path) -> Result<DocumentMut> {
     })
 }
 
+fn codex_provider_named_is_ours(doc: &DocumentMut, name: &str) -> bool {
+    doc.get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(name))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("http_headers"))
+        .and_then(Item::as_inline_table)
+        .and_then(|headers| headers.get("x-alex-harness"))
+        .and_then(|value| value.as_str())
+        == Some("codex")
+}
+
 fn read_codex_state(path: &Path) -> Result<CodexManagedState> {
     let raw = std::fs::read_to_string(path)?;
     serde_json::from_str(&raw).with_context(|| {
@@ -3481,9 +3489,9 @@ fn upsert_codex_config(
     version: Option<&str>,
 ) -> Result<()> {
     doc["model"] = value(selected_model);
-    doc["model_provider"] = value(PROVIDER_NAME);
+    doc["model_provider"] = value(CODEX_PROVIDER_NAME);
     doc["model_catalog_json"] = value(catalog_path.to_string_lossy().as_ref());
-    // Codex treats an omitted setting as disabled. Alexandria's lifecycle
+    // Codex treats an omitted setting as disabled. Alex's lifecycle
     // hooks must therefore opt in both absent and explicitly-false configs,
     // while preserving an explicit user true.
     if codex_hooks_enabled(doc) != Some(true) {
@@ -3502,9 +3510,9 @@ fn upsert_codex_config(
     provider["wire_api"] = value("responses");
     provider["supports_websockets"] = value(false);
     let mut headers = InlineTable::new();
-    headers.insert("x-alexandria-harness", "codex".into());
+    headers.insert("x-alex-harness", "codex".into());
     headers.insert(
-        "x-alexandria-harness-version",
+        "x-alex-harness-version",
         version.unwrap_or("unknown").into(),
     );
     provider["http_headers"] = value(headers);
@@ -3532,7 +3540,7 @@ fn upsert_codex_config(
     auth["timeout_ms"] = value(5000);
     auth["refresh_interval_ms"] = value(0);
     provider["auth"] = Item::Table(auth);
-    providers[PROVIDER_NAME] = Item::Table(provider);
+    providers[CODEX_PROVIDER_NAME] = Item::Table(provider);
     Ok(())
 }
 
@@ -3755,8 +3763,6 @@ fn install_harness_hook(
 fn short_alex_model_id(id: &str) -> String {
     if id.starts_with("alex/") {
         id.to_string()
-    } else if let Some(rest) = id.strip_prefix("alexandria/") {
-        format!("alex/{rest}")
     } else if let Some(rest) = id.strip_prefix("cove/") {
         format!("alex/{rest}")
     } else {
@@ -3806,7 +3812,7 @@ pub(crate) fn read_pi_api_key(config_dir: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Read only the credential Alexandria itself wrote. This is intentionally
+/// Read only the credential Alex itself wrote. This is intentionally
 /// limited to connected harnesses and is used by `alex up` solely to prove a
 /// re-run can skip its connection step; it never prints the secret.
 pub(crate) fn configured_api_key(harness: &str, config_dir: &Path) -> Option<String> {
@@ -3926,9 +3932,9 @@ pub(crate) fn plan_connect(
     let file_exists = models_path.exists();
     let action = if !file_exists { "create" } else { "modify" };
     let detail = if connected {
-        format!("update provider 'alexandria' with {model_count} models")
+        format!("update provider 'alex' with {model_count} models")
     } else {
-        format!("add provider 'alexandria' with {model_count} models")
+        format!("add provider 'alex' with {model_count} models")
     };
     plan.push(json!({
         "path": models_path.display().to_string(),
@@ -4305,7 +4311,7 @@ pub(crate) fn plan_codex_connect(
         json!({
             "path": config_path.display().to_string(),
             "action": if config_path.exists() { "modify" } else { "create" },
-            "detail": format!("activate provider 'alexandria' with {model_count} native and alex/* models"),
+            "detail": format!("activate provider 'alex' with {model_count} native and alex/* models"),
         }),
     ];
     for (path, detail) in [
@@ -4621,7 +4627,7 @@ async fn fetch_models_with_harness_key(
         .header("x-api-key", api_key)
         .send()
         .await
-        .with_context(|| format!("could not reach the alexandria daemon at {base_url}"))?;
+        .with_context(|| format!("could not reach the Alex daemon at {base_url}"))?;
     let status = response.status();
     let value: Value = response.json().await.unwrap_or_default();
     if !status.is_success() {
@@ -4657,7 +4663,7 @@ async fn admin_get(
         .await
         .with_context(|| {
             format!(
-                "could not reach the alexandria daemon at {}",
+                "could not reach the Alex daemon at {}",
                 normalized_base_url(config)
             )
         })?;
@@ -4687,7 +4693,7 @@ async fn admin_send(
     }
     let resp = req.send().await.with_context(|| {
         format!(
-            "could not reach the alexandria daemon at {}",
+            "could not reach the Alex daemon at {}",
             normalized_base_url(config)
         )
     })?;
@@ -5141,29 +5147,23 @@ async fn command_version_uncached(
     args: &[&str],
     timeout: Duration,
 ) -> VersionOutput {
-    let binary = binary.to_path_buf();
-    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    match tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || {
-            let out = Command::new(binary).args(args).output().ok()?;
-            let raw = if out.stdout.is_empty() {
-                String::from_utf8_lossy(&out.stderr).to_string()
+    let mut command = tokio::process::Command::new(binary);
+    command.args(args).kill_on_drop(true);
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) => {
+            let raw = if output.stdout.is_empty() {
+                String::from_utf8_lossy(&output.stderr)
             } else {
-                String::from_utf8_lossy(&out.stdout).to_string()
+                String::from_utf8_lossy(&output.stdout)
             };
-            version_token(&raw)
-        }),
-    )
-    .await
-    {
-        Ok(Ok(version)) => VersionOutput {
-            version,
-            warning: None,
-        },
-        Ok(Err(e)) => VersionOutput {
+            VersionOutput {
+                version: version_token(&raw),
+                warning: None,
+            }
+        }
+        Ok(Err(error)) => VersionOutput {
             version: None,
-            warning: Some(format!("version check failed: {e}")),
+            warning: Some(format!("version check failed: {error}")),
         },
         Err(_) => VersionOutput {
             version: None,
@@ -5258,8 +5258,8 @@ pub(crate) fn upsert_pi_provider(
             "api": "anthropic-messages",
             "apiKey": api_key,
             "headers": {
-                "x-alexandria-harness": "pi",
-                "x-alexandria-harness-version": "!pi --version",
+                "x-alex-harness": "pi",
+                "x-alex-harness-version": "!pi --version",
             },
             "models": model_ids.iter().map(|id| pi_model_config(id)).collect::<Vec<_>>(),
         }),
@@ -5355,10 +5355,21 @@ fn atomic_write_text(path: &Path, data: &str) -> Result<()> {
 }
 
 pub(crate) fn filter_model_ids(ids: Vec<String>) -> Vec<String> {
+    let direct = ids
+        .iter()
+        .filter(|id| !id.starts_with("alex/") && allowed_model_id(id))
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for id in ids {
-        if !allowed_model_id(&id) || !seen.insert(id.clone()) {
+        if !allowed_model_id(&id) {
+            continue;
+        }
+        let identity = id.strip_prefix("alex/").unwrap_or(&id);
+        let duplicate_alias = id.starts_with("alex/")
+            && (direct.contains(identity) || direct.contains(&format!("exo/{identity}")));
+        if duplicate_alias || !seen.insert(identity.to_string()) {
             continue;
         }
         out.push(id);
@@ -5373,7 +5384,7 @@ fn allowed_model_id(id: &str) -> bool {
     // Provider-prefixed catalog ids the daemon advertises in /v1/models. Any new
     // provider whose ids carry a `provider/` prefix (e.g. Kimi's `kimi/k3`) must
     // be listed here, otherwise it is silently dropped from every connected
-    // harness's model list. `alexandria/*` is deliberately absent: it is only a
+    // harness's model list. `alex/*` is deliberately absent: it is only a
     // duplicate alias of the bare/prefixed ids and would produce a second
     // `alex/...` entry after `short_alex_model_ids` normalization.
     let Some(model) = ["openrouter/", "exo/", "kimi/", "alex/"]
@@ -5477,7 +5488,10 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let timed_out = command_version(&bin, &[], Duration::from_millis(30)).await;
-        assert_eq!(timed_out.warning.as_deref(), Some("version check timed out"));
+        assert_eq!(
+            timed_out.warning.as_deref(),
+            Some("version check timed out")
+        );
         // The failure must not be memoized: a retry with a workable timeout
         // succeeds instead of replaying the cached timeout.
         let retried = command_version(&bin, &[], Duration::from_secs(10)).await;
@@ -5523,7 +5537,7 @@ mod tests {
             short_alex_model_ids(vec![
                 "claude-opus-4-8".into(),
                 "alex/gpt-5.5".into(),
-                "alexandria/grok-4.5".into(),
+                "alex/grok-4.5".into(),
                 "cove/claude-fable-5".into(),
             ]),
             vec![
@@ -5763,13 +5777,13 @@ mod tests {
         let path = dir.join("models.json");
         upsert_pi_provider(&path, "http://127.0.0.1:4100", "alxk-test", &model_ids()).unwrap();
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let provider = &value["providers"]["alexandria"];
+        let provider = &value["providers"]["alex"];
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:4100");
         assert_eq!(provider["api"], "anthropic-messages");
         assert_eq!(provider["apiKey"], "alxk-test");
-        assert_eq!(provider["headers"]["x-alexandria-harness"], "pi");
+        assert_eq!(provider["headers"]["x-alex-harness"], "pi");
         assert_eq!(
-            provider["headers"]["x-alexandria-harness-version"],
+            provider["headers"]["x-alex-harness-version"],
             "!pi --version"
         );
         assert_eq!(provider["models"].as_array().unwrap().len(), 2);
@@ -5794,7 +5808,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap())
                 .unwrap();
         assert_eq!(
-            models["providers"]["alexandria"]["baseUrl"],
+            models["providers"]["alex"]["baseUrl"],
             "http://127.0.0.1:4100"
         );
     }
@@ -5812,7 +5826,7 @@ mod tests {
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["top"], true);
         assert_eq!(value["providers"]["other"]["api"], "openai");
-        assert!(value["providers"]["alexandria"].is_object());
+        assert!(value["providers"]["alex"].is_object());
     }
 
     #[test]
@@ -5832,7 +5846,7 @@ mod tests {
         let path = dir.join("models.json");
         std::fs::write(
             &path,
-            r#"{"providers":{"alexandria":{"api":"anthropic-messages"},"foreign":{"api":"x"}}}"#,
+            r#"{"providers":{"alex":{"api":"anthropic-messages"},"foreign":{"api":"x"}}}"#,
         )
         .unwrap();
         install_pi_session_extension(&dir, "http://127.0.0.1:4100", "test-key", false).unwrap();
@@ -5840,7 +5854,7 @@ mod tests {
         assert!(extension_path.exists());
         assert!(disconnect_pi_config(&dir).unwrap());
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(value["providers"]["alexandria"].is_null());
+        assert!(value["providers"]["alex"].is_null());
         assert_eq!(value["providers"]["foreign"]["api"], "x");
         assert!(!extension_path.exists());
         assert!(!disconnect_pi_config(&dir).unwrap());
@@ -5861,7 +5875,7 @@ mod tests {
 
         assert_eq!(summary.extension_path, pi_session_extension_path(&dir));
         let source = std::fs::read_to_string(&summary.extension_path).unwrap();
-        assert!(source.contains("ctx.model.provider !== \"alexandria\""));
+        assert!(source.contains("ctx.model.provider !== \"alex\""));
         assert!(
             source.contains("event.headers[\"x-session-id\"] = ctx.sessionManager.getSessionId()")
         );
@@ -5870,7 +5884,7 @@ mod tests {
         assert!(
             source.contains("const harnessEventsUrl = \"http://127.0.0.1:4100/harness-events\"")
         );
-        assert!(source.contains("process.env.ALEXANDRIA_SESSION_ID"));
+        assert!(source.contains("process.env.ALEX_SESSION_ID"));
         assert!(source.contains("\"SubagentStart\""));
     }
 
@@ -5917,7 +5931,9 @@ mod tests {
             assert!(source.contains(&format!("amp.on('{event}'")));
         }
         assert!(source.contains("return { action: 'allow' }"));
-        assert!(source.contains("alexandria-status"));
+        assert!(source.contains("alex-status"));
+        assert!(source.contains("alex-status"));
+        assert!(source.contains("Status (legacy alias)"));
         assert!(source.contains("hook_event_name: 'SubagentStart'"));
         assert!(source.contains("hook_event_name: 'SubagentStop'"));
         assert!(source.contains("http://127.0.0.1:4100/harness-events"));
@@ -6011,7 +6027,7 @@ mod tests {
         assert!(profile["env"]["ANTHROPIC_CUSTOM_HEADERS"]
             .as_str()
             .unwrap()
-            .contains("x-alexandria-harness: claude"));
+            .contains("x-alex-harness: claude"));
         assert!(profile["apiKeyHelper"]
             .as_str()
             .unwrap()
@@ -6078,7 +6094,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_disconnect_cleans_persisted_alexandria_model_after_state_is_gone() {
+    fn claude_disconnect_cleans_persisted_alex_model_after_state_is_gone() {
         let dir = tmpdir("claude-stale-selection");
         std::fs::create_dir_all(dir.join("cache")).unwrap();
         std::fs::write(
@@ -6178,7 +6194,7 @@ yolo = false
                 entry["extra_headers"]
                     .as_inline_table()
                     .unwrap()
-                    .get("x-alexandria-harness")
+                    .get("x-alex-harness")
                     .and_then(|value| value.as_str()),
                 Some("grok")
             );
@@ -6259,7 +6275,7 @@ display_name = "K3"
             config["models"]["kimi-code/k3"]["model"].as_str(),
             Some("k3")
         );
-        // The alexandria OpenAI-compatible provider points at the local proxy.
+        // The alex OpenAI-compatible provider points at the local proxy.
         let provider = &config["providers"][KIMI_PROVIDER_NAME];
         assert_eq!(provider["type"].as_str(), Some("openai"));
         assert_eq!(provider["api_key"].as_str(), Some("alxk-kimi"));
@@ -6275,7 +6291,7 @@ display_name = "K3"
             assert_eq!(entry["display_name"].as_str(), Some(model.as_str()));
         }
 
-        // Disconnect removes only what Alexandria added and reverts the config.
+        // Disconnect removes only what Alex added and reverts the config.
         assert!(disconnect_kimi_config(&dir).unwrap());
         assert!(!kimi_config_connected(&dir).unwrap());
         let restored = read_grok_config(&config_path).unwrap();
@@ -6312,7 +6328,7 @@ type = "kimi"
 api_key = ""
 base_url = "https://api.kimi.com/coding/v1"
 
-[providers.alexandria]
+[providers.alex]
 type = "openai"
 api_key = "alxk-revoked"
 base_url = "http://127.0.0.1:4100/v1"
@@ -6322,7 +6338,7 @@ provider = "managed:kimi-code"
 model = "k3"
 
 [models."alex/gpt-5.5"]
-provider = "alexandria"
+provider = "alex"
 model = "alex/gpt-5.5"
 "#,
         )
@@ -6348,13 +6364,13 @@ model = "alex/gpt-5.5"
         // revoked key in place).
         std::fs::write(
             dir.join(KIMI_CONFIG_FILE),
-            r#"[providers.alexandria]
+            r#"[providers.alex]
 type = "openai"
 api_key = "alxk-revoked"
 base_url = "http://127.0.0.1:4100/v1"
 
 [models."alex/legacy-model"]
-provider = "alexandria"
+provider = "alex"
 model = "alex/legacy-model"
 "#,
         )
@@ -6400,7 +6416,7 @@ model = "alex/legacy-model"
             r#"default_model = "alex/gpt-5.6-sol"
 theme = "dark"
 
-[providers.alexandria]
+[providers.alex]
 type = "openai"
 base_url = "http://127.0.0.1:4100/v1"
 
@@ -6409,7 +6425,7 @@ provider = "managed:kimi-code"
 model = "k3"
 
 [models."alex/gpt-5.6-sol"]
-provider = "alexandria"
+provider = "alex"
 model = "alex/gpt-5.6-sol"
 "#,
         )
@@ -6446,7 +6462,7 @@ provider = "managed:kimi-code"
 model = "k3"
 
 [models."alex/gpt-5.6-sol"]
-provider = "alexandria"
+provider = "alex"
 model = "alex/gpt-5.6-sol"
 "#,
         )
@@ -6468,7 +6484,7 @@ model = "alex/gpt-5.6-sol"
         .unwrap();
         std::fs::write(
             dir.join(KIMI_CONFIG_FILE),
-            r#"default_model = "alexandria/gpt-5.6-sol"
+            r#"default_model = "alex/gpt-5.6-sol"
 theme = "dark"
 "#,
         )
@@ -6483,16 +6499,16 @@ theme = "dark"
 
     #[cfg(unix)]
     #[test]
-    fn kimi_connection_refuses_to_clobber_a_user_provider() {
+    fn kimi_connection_rejects_a_user_owned_alex_provider() {
         let dir = tmpdir("kimi-guard");
         let config_path = dir.join(KIMI_CONFIG_FILE);
-        // A user already has their own [providers.alexandria]; we must not touch it.
+        // A user already has their own [providers.alex]; we must not touch it.
         std::fs::write(
             &config_path,
-            "[providers.alexandria]\ntype = \"openai\"\napi_key = \"user-key\"\nbase_url = \"https://example.test\"\n",
+            "[providers.alex]\ntype = \"openai\"\napi_key = \"user-key\"\nbase_url = \"https://example.test\"\n",
         )
         .unwrap();
-        let err = write_kimi_connection(
+        let error = write_kimi_connection(
             dir.clone(),
             "http://127.0.0.1:4100".into(),
             "rk-kimi".into(),
@@ -6501,7 +6517,14 @@ theme = "dark"
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("unmanaged provider"));
+        assert!(error
+            .to_string()
+            .contains("will not replace an unmanaged provider"));
+        let config = read_grok_config(&config_path).unwrap();
+        assert_eq!(
+            config["providers"][KIMI_PROVIDER_NAME]["api_key"].as_str(),
+            Some("user-key")
+        );
     }
 
     #[cfg(unix)]
@@ -6568,21 +6591,21 @@ trust_level = "trusted"
         let connected = std::fs::read_to_string(&config_path).unwrap();
         let doc = DocumentMut::from_str(&connected).unwrap();
         assert_eq!(doc["model"].as_str(), Some("alex/gpt-5.6-luna"));
-        assert_eq!(doc["model_provider"].as_str(), Some("alexandria"));
+        assert_eq!(doc["model_provider"].as_str(), Some("alex"));
         assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
         assert_eq!(
-            doc["model_providers"]["alexandria"]["base_url"].as_str(),
+            doc["model_providers"]["alex"]["base_url"].as_str(),
             Some("http://127.0.0.1:4100/v1")
         );
         assert_eq!(
-            doc["model_providers"]["alexandria"]["http_headers"]
+            doc["model_providers"]["alex"]["http_headers"]
                 .as_inline_table()
-                .and_then(|headers| headers.get("x-alexandria-harness"))
+                .and_then(|headers| headers.get("x-alex-harness"))
                 .and_then(|value| value.as_str()),
             Some("codex")
         );
         assert_eq!(
-            doc["model_providers"]["alexandria"]["auth"]["command"].as_str(),
+            doc["model_providers"]["alex"]["auth"]["command"].as_str(),
             Some("/bin/cat")
         );
         assert_eq!(
@@ -6607,7 +6630,7 @@ trust_level = "trusted"
         assert!(openai_profile.contains("model_provider = \"openai\""));
         let alex_profile = std::fs::read_to_string(dir.join(CODEX_ALEX_PROFILE_FILE)).unwrap();
         assert!(alex_profile.contains("codex --profile alex"));
-        assert!(alex_profile.contains("model_provider = \"alexandria\""));
+        assert!(alex_profile.contains("model_provider = \"alex\""));
         let native_catalog: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join(CODEX_NATIVE_CATALOG_FILE)).unwrap(),
         )
@@ -6668,8 +6691,85 @@ trust_level = "trusted"
     }
 
     #[cfg(unix)]
+    #[test]
+    fn codex_adopts_and_cleanly_removes_generated_provider_without_state() {
+        let dir = tmpdir("codex-orphaned-provider");
+        let config_path = dir.join(CODEX_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"model = "alex/gpt-5.5"
+model_provider = "alex"
+model_catalog_json = "/tmp/old-alex-catalog.json"
+
+[model_providers.alex]
+name = "Alex Proxy"
+base_url = "http://127.0.0.1:4100/v1"
+http_headers = { x-alex-harness = "codex" }
+"#,
+        )
+        .unwrap();
+        write_codex_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-new".into(),
+            "alxk-new".into(),
+            json!({"models": [{"slug": "gpt-5.5"}, {"slug": "alex/gpt-5.5"}]}),
+            None,
+        )
+        .unwrap();
+        assert!(disconnect_codex_config(&dir).unwrap());
+        let restored = read_codex_config(&config_path).unwrap();
+        assert!(restored.get("model_provider").is_none());
+        assert!(restored.get("model").is_none());
+        assert!(restored.get("model_catalog_json").is_none());
+        assert!(restored
+            .get("model_providers")
+            .and_then(Item::as_table_like)
+            .is_none_or(|providers| !providers.contains_key(CODEX_PROVIDER_NAME)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_connect_rejects_user_owned_alex_provider() {
+        let dir = tmpdir("codex-user-alex-provider");
+        let config_path = dir.join(CODEX_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"model = "custom"
+model_provider = "alex"
+
+[model_providers.alex]
+name = "User gateway"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+        let catalog = json!({"models": [
+            {"slug": "gpt-5.5"},
+            {"slug": "alex/gpt-5.5"}
+        ]});
+        let error = write_codex_connection(
+            dir.clone(),
+            "http://127.0.0.1:4100".into(),
+            "rk-new".into(),
+            "alxk-new".into(),
+            catalog,
+            None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("will not replace an unmanaged provider"));
+        let unchanged = read_codex_config(&config_path).unwrap();
+        assert_eq!(
+            unchanged["model_providers"][CODEX_PROVIDER_NAME]["base_url"].as_str(),
+            Some("https://example.test/v1")
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn codex_catalog_preserves_native_and_adds_all_alexandria_models() {
+    async fn codex_catalog_preserves_native_and_adds_all_alex_models() {
         let dir = tmpdir("codex-catalog");
         let binary = fake_executable(
             &dir,
@@ -6731,7 +6831,7 @@ fi"#,
     fn model_id_filter_dedupes_and_rejects_wrapped_ids() {
         let ids = vec![
             "claude-opus-4-8".into(),
-            "alexandria/claude-opus-4-8".into(),
+            "alex/claude-opus-4-8".into(),
             "gpt-5.5".into(),
             "gpt-5.5".into(),
             "random".into(),
@@ -6742,7 +6842,7 @@ fi"#,
             "openrouter/meta-llama/llama-4:free".into(),
             "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".into(),
             "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".into(),
-            "alexandria/openrouter/anthropic/claude-opus-4.8".into(),
+            "alex/openrouter/anthropic/claude-opus-4.8".into(),
             "openrouter/../secret".into(),
             "openrouter/provider/model with space".into(),
         ];
@@ -6756,16 +6856,15 @@ fi"#,
                 "gemini-2.5-flash",
                 "openrouter/anthropic/claude-opus-4.8",
                 "openrouter/meta-llama/llama-4:free",
-                "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
-                "alex/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+                "exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
             ]
         );
     }
 
     #[test]
-    fn model_id_filter_keeps_kimi_provider_ids_and_drops_alexandria_alias() {
+    fn model_id_filter_keeps_kimi_provider_ids_and_drops_alex_alias() {
         // The daemon advertises Kimi Code models with a `kimi/` prefix (plus an
-        // `alexandria/kimi/...` duplicate for non-Claude harnesses). The prefixed
+        // `alex/kimi/...` duplicate for non-Claude harnesses). The prefixed
         // ids must survive so a newly-added Kimi provider reaches connected
         // harnesses; the duplicate alias must not, or `short_alex_model_ids`
         // would emit two `alex/kimi/k3` entries. Path-traversal ids stay barred.
@@ -6774,7 +6873,7 @@ fi"#,
             "kimi/k3".into(),
             "kimi/kimi-for-coding".into(),
             "kimi/kimi-for-coding-highspeed".into(),
-            "alexandria/kimi/k3".into(),
+            "alex/kimi/k3".into(),
             "kimi/../secret".into(),
         ];
         assert_eq!(
@@ -6799,7 +6898,7 @@ fi"#,
     fn pi_connection_carries_kimi_provider_models() {
         let dir = tmpdir("pi-kimi-models");
         // Post-filter model list as `fetch_models` hands it to the writer: bare
-        // Alexandria ids plus Kimi's provider-prefixed ids.
+        // Alex ids plus Kimi's provider-prefixed ids.
         let summary = write_pi_connection(
             dir.clone(),
             "http://127.0.0.1:4100".into(),

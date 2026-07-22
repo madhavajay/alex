@@ -1,0 +1,18 @@
+[package]
+name = "alex-middleware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime-neutral declarative middleware policy engine for Alex"
+
+[dependencies]
+aho-corasick = "1"
+regex = { workspace = true }
+semver = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "1"
+
+[dev-dependencies]
+toml = { workspace = true }

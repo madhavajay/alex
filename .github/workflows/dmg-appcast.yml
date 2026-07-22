@@ -20,8 +20,18 @@ on:
         required: false
         default: true
         type: boolean
+      build_dmg:
+        description: Build the DMG; false reuses the named workflow artifact.
+        required: false
+        default: true
+        type: boolean
       publish_release:
-        description: Upload the DMG, manifest, and appcast.
+        description: Upload the DMG and refreshed manifest to a GitHub Release.
+        required: false
+        default: true
+        type: boolean
+      publish_appcast:
+        description: Generate and deploy the channel appcast from the DMG.
         required: false
         default: true
         type: boolean
@@ -107,7 +117,7 @@ jobs:
           {
             echo "version=${RELEASE_TAG#v}"
             echo "appcast_file=$appcast_file"
-            echo "artifact_name=alexandria-macos-dmg"
+            echo "artifact_name=alex-macos-dmg"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check app signing secrets
@@ -121,6 +131,11 @@ jobs:
           SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ "${{ inputs.build_dmg }}" != "true" ]]; then
+            echo "Reusing the previously built DMG workflow artifact."
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           missing=()
           for key in \
             APPLE_ID \
@@ -148,7 +163,7 @@ jobs:
           fi
 
       - name: Set up app signing keychain
-        if: steps.app_signing.outputs.available == 'true'
+        if: inputs.build_dmg && steps.app_signing.outputs.available == 'true'
         id: signing_keychain
         uses: ./.github/actions/mac-signing-keychain
         with:
@@ -158,7 +173,7 @@ jobs:
           signing_certificate_password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
 
       - name: Build signed DMG
-        if: steps.app_signing.outputs.available == 'true'
+        if: inputs.build_dmg && steps.app_signing.outputs.available == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -177,7 +192,7 @@ jobs:
           fi
 
       - name: Clean up app signing keychain
-        if: always() && steps.app_signing.outputs.available == 'true'
+        if: always() && inputs.build_dmg && steps.app_signing.outputs.available == 'true'
         uses: ./.github/actions/mac-signing-keychain
         with:
           cleanup: "true"
@@ -185,8 +200,15 @@ jobs:
           original_default_keychain: ${{ steps.signing_keychain.outputs.original_default_keychain }}
 
       - name: Check Gatekeeper
-        if: steps.app_signing.outputs.available == 'true' && inputs.notarize
+        if: inputs.build_dmg && steps.app_signing.outputs.available == 'true' && inputs.notarize
         run: ./check-gatekeeper.sh macos/dist/*.dmg
+
+      - name: Download previously built DMG artifact
+        if: ${{ !inputs.build_dmg }}
+        uses: actions/download-artifact@v4
+        with:
+          name: alex-macos-dmg
+          path: macos/dist
 
       - name: Prepare release metadata
         id: release
@@ -265,7 +287,7 @@ jobs:
 
       - name: Check Sparkle signing key
         id: sparkle_key
-        if: steps.app_signing.outputs.available == 'true' && inputs.notarize && inputs.publish_release
+        if: steps.app_signing.outputs.available == 'true' && inputs.notarize && inputs.publish_appcast
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
@@ -338,8 +360,9 @@ jobs:
           gh api "${args[@]}" --jq '.commit.sha'
 
       - name: Upload DMG artifact
-        if: steps.app_signing.outputs.available == 'true'
+        if: inputs.build_dmg && steps.app_signing.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: alexandria-macos-dmg
+          name: alex-macos-dmg
           path: macos/dist/*.dmg
+          overwrite: true

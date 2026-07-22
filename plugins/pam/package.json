@@ -2,7 +2,7 @@
   "name": "pam",
   "version": "0.0.0",
   "private": true,
-  "description": "Experimental Amp-style capability dial for Pi, backed by Alexandria models",
+  "description": "Experimental Amp-style capability dial for Pi, backed by Alex models",
   "type": "module",
   "keywords": [
     "pi-package"

@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const PROVIDER = "alexandria";
+const PROVIDER = "alex";
 const STATE_ENTRY = "pam-mode-state";
 const DEFAULT_MODE: ModeName = "medium";
 const SETTINGS_PATH = fileURLToPath(new URL("./settings.json", import.meta.url));
@@ -466,7 +466,7 @@ export default function pam(pi: ExtensionAPI) {
 			.sort((left, right) => left.id.localeCompare(right.id));
 		if (availableModels.length === 0) {
 			ctx.ui.notify(
-				"Pi has no available Alexandria alex/* models. Run 'alex harness connect pi', then restart Pi.",
+				"Pi has no available Alex alex/* models. Run 'alex connect pi', then restart Pi.",
 				"error",
 			);
 			return;
@@ -860,7 +860,7 @@ class PamModelPicker {
 		);
 		const end = Math.min(start + maxVisible, this.filtered.length);
 		if (this.filtered.length === 0) {
-			lines.push(row(th.fg("warning", "No matching Alexandria models")));
+			lines.push(row(th.fg("warning", "No matching Alex models")));
 		} else {
 			for (let index = start; index < end; index++) {
 				const model = this.filtered[index];
@@ -1193,7 +1193,7 @@ function isModeName(value: string): value is ModeName {
 }
 
 function missingModelMessage(mode: ModeName, role: ModeRole, ids: readonly string[]): string {
-	return `Pam ${mode} ${role} could not find ${ids.join(" or ")} in Pi's '${PROVIDER}' provider. Check ${SETTINGS_PATH}, or refresh the catalog with 'alex harness connect pi', then restart Pi.`;
+	return `Pam ${mode} ${role} could not find ${ids.join(" or ")} in Pi's '${PROVIDER}' provider. Check ${SETTINGS_PATH}, or refresh the catalog with 'alex connect pi', then restart Pi.`;
 }
 
 function settingsSummary(modes: Record<ModeName, PamMode>): string {

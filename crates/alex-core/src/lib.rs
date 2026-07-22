@@ -31,6 +31,9 @@ pub enum Provider {
     Gemini,
     Xai,
     Openrouter,
+    /// A user-managed CLIProxyAPI instance exposed as an OpenAI-compatible
+    /// upstream. Kept distinct so traces preserve the integration boundary.
+    Cliproxyapi,
     Exo,
     /// Amp subscription / credits (billing + wrap harness; not a /v1 upstream route yet).
     Amp,
@@ -47,6 +50,7 @@ impl Provider {
             Provider::Gemini => "gemini",
             Provider::Xai => "xai",
             Provider::Openrouter => "openrouter",
+            Provider::Cliproxyapi => "cliproxyapi",
             Provider::Exo => "exo",
             Provider::Amp => "amp",
             Provider::Kimi => "kimi",
@@ -60,6 +64,7 @@ impl Provider {
             "gemini" | "google" => Some(Provider::Gemini),
             "xai" | "grok" => Some(Provider::Xai),
             "openrouter" | "or" => Some(Provider::Openrouter),
+            "cliproxyapi" | "cliproxy" | "cpa" => Some(Provider::Cliproxyapi),
             "exo" => Some(Provider::Exo),
             "amp" | "ampcode" => Some(Provider::Amp),
             "kimi" | "kimi-code" | "moonshot" => Some(Provider::Kimi),
@@ -104,6 +109,8 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok:", Provider::Xai),
     ("xai:", Provider::Xai),
     ("openrouter:", Provider::Openrouter),
+    ("cliproxyapi:", Provider::Cliproxyapi),
+    ("cliproxy:", Provider::Cliproxyapi),
     ("exo:", Provider::Exo),
     ("kimi:", Provider::Kimi),
     ("claude/", Provider::Anthropic),
@@ -116,14 +123,16 @@ const PREFIXES: &[(&str, Provider)] = &[
     ("grok/", Provider::Xai),
     ("xai/", Provider::Xai),
     ("openrouter/", Provider::Openrouter),
+    ("cliproxyapi/", Provider::Cliproxyapi),
+    ("cliproxy/", Provider::Cliproxyapi),
     ("exo/", Provider::Exo),
     ("kimi/", Provider::Kimi),
 ];
 
 // Claude Code gateway discovery only accepts model ids beginning with
-// `claude` or `anthropic`. Alexandria publishes `claude-alex/<model>` aliases
+// `claude` or `anthropic`. Alex publishes `claude-alex/<model>` aliases
 // to that client and removes the compatibility prefix before normal routing.
-const PASSTHROUGH: &[&str] = &["claude-alex/", "cove/", "alexandria/", "alex/"];
+const PASSTHROUGH: &[&str] = &["claude-alex/", "cove/", "alex/"];
 
 const ALIASES: &[(&str, &str)] = &[
     ("opus-4.8", "claude-opus-4-8"),
@@ -216,6 +225,7 @@ pub fn parse_limit_headers(provider: Provider, h: &Value) -> Value {
         Provider::Xai => serde_json::json!({ "windows": [] }),
         Provider::Gemini
         | Provider::Openrouter
+        | Provider::Cliproxyapi
         | Provider::Exo
         | Provider::Amp
         | Provider::Kimi => Value::Null,
@@ -419,10 +429,10 @@ pub struct TraceRecord {
     /// Provider supplied error code; falls back to the HTTP status for HTTP errors.
     #[serde(default)]
     pub error_code: Option<String>,
-    /// Alexandria's stable, coarse error taxonomy.
+    /// Alex's stable, coarse error taxonomy.
     #[serde(default)]
     pub error_class: Option<String>,
-    /// True when Alexandria retried this request through another account or model.
+    /// True when Alex retried this request through another account or model.
     #[serde(default)]
     pub substituted: bool,
     /// Model the client asked for before any configured fallback was considered.
@@ -593,10 +603,7 @@ mod tests {
         assert_eq!(route_model("o3-mini").0, Some(Provider::Openai));
         assert_eq!(
             route_model("kimi-for-coding"),
-            (
-                Some(Provider::Kimi),
-                "kimi-for-coding".to_string()
-            )
+            (Some(Provider::Kimi), "kimi-for-coding".to_string())
         );
         assert_eq!(route_model("mystery-model").0, None);
     }
@@ -616,6 +623,14 @@ mod tests {
         assert_eq!(route_model("grok/grok-4").0, Some(Provider::Xai));
         assert_eq!(route_model("xai/grok-4").0, Some(Provider::Xai));
         assert_eq!(
+            route_model("cliproxyapi/openai/gpt-4o"),
+            (Some(Provider::Cliproxyapi), "openai/gpt-4o".to_string())
+        );
+        assert_eq!(
+            route_model("cliproxy/gpt-5"),
+            (Some(Provider::Cliproxyapi), "gpt-5".to_string())
+        );
+        assert_eq!(
             route_model("exo/mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
             (
                 Some(Provider::Exo),
@@ -623,7 +638,7 @@ mod tests {
             )
         );
         assert_eq!(
-            route_model("alexandria/openrouter/anthropic/claude-3.5-sonnet"),
+            route_model("alex/openrouter/anthropic/claude-3.5-sonnet"),
             (
                 Some(Provider::Openrouter),
                 "anthropic/claude-3.5-sonnet".to_string()
@@ -656,7 +671,7 @@ mod tests {
             (Some(Provider::Xai), "grok-4.5".to_string())
         );
         assert_eq!(
-            route_model("alexandria/gpt-5.5"),
+            route_model("alex/gpt-5.5"),
             (Some(Provider::Openai), "gpt-5.5".to_string())
         );
         assert_eq!(
@@ -694,7 +709,10 @@ mod tests {
             "x-ratelimit-remaining-tokens": "5000000",
         });
         let parsed = parse_limit_headers(Provider::Xai, &headers);
-        assert!(parsed.get("requests").is_none(), "must not emit request counts");
+        assert!(
+            parsed.get("requests").is_none(),
+            "must not emit request counts"
+        );
         assert!(parsed.get("tokens").is_none(), "must not emit token counts");
         assert_eq!(
             parsed["windows"].as_array().map(Vec::len),
@@ -721,10 +739,7 @@ mod tests {
 
     #[test]
     fn routes_aliases() {
-        assert_eq!(
-            route_model("k3"),
-            (Some(Provider::Kimi), "k3".to_string())
-        );
+        assert_eq!(route_model("k3"), (Some(Provider::Kimi), "k3".to_string()));
         assert_eq!(
             route_model("opus-4.8"),
             (Some(Provider::Anthropic), "claude-opus-4-8".to_string())
@@ -750,7 +765,7 @@ mod tests {
             (Some(Provider::Anthropic), "claude-opus-4-8".to_string())
         );
         assert_eq!(
-            route_model("alexandria/sonnet-5"),
+            route_model("alex/sonnet-5"),
             (Some(Provider::Anthropic), "claude-sonnet-5".to_string())
         );
         assert_eq!(model_aliases().len(), 5);

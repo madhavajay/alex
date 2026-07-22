@@ -464,7 +464,7 @@ function LogoBox() {
 function Titles() {
   return (
     <div className="[word-break:break-word] content-stretch flex flex-col items-start leading-[normal] not-italic relative shrink-0 whitespace-nowrap" data-name="Titles">
-      <p className="font-['Inter:Semi_Bold',sans-serif] font-semibold relative shrink-0 text-[#e5e5ea] text-[14px]">Alexandria - Dario</p>
+      <p className="font-['Inter:Semi_Bold',sans-serif] font-semibold relative shrink-0 text-[#e5e5ea] text-[14px]">Alex - Dario</p>
       <p className="font-['Inter:Regular',sans-serif] font-normal relative shrink-0 text-[#636366] text-[10px]">Dario 5.1.1 - active gen-5.1.1-50932</p>
     </div>
   );
@@ -705,7 +705,7 @@ function CellName() {
   return (
     <div className="[word-break:break-word] content-stretch flex flex-col gap-[2px] items-start justify-center leading-[normal] relative shrink-0 w-[260px]" data-name="cell-name">
       <p className="font-['JetBrains_Mono:Bold',sans-serif] font-bold relative shrink-0 text-[#e5e5ea] text-[11px] w-full">claude-haiku-4-5</p>
-      <p className="font-['JetBrains_Mono:Regular',sans-serif] font-normal overflow-hidden relative shrink-0 text-[#636366] text-[9.5px] text-ellipsis w-full whitespace-nowrap">/Users/mochav/dev/.alexandria/dario-prompt-cache/claude-haiku-4-5-f73a3fface2eb.json</p>
+      <p className="font-['JetBrains_Mono:Regular',sans-serif] font-normal overflow-hidden relative shrink-0 text-[#636366] text-[9.5px] text-ellipsis w-full whitespace-nowrap">/Users/mochav/dev/.alex/dario-prompt-cache/claude-haiku-4-5-f73a3fface2eb.json</p>
     </div>
   );
 }
@@ -781,7 +781,7 @@ function CellName1() {
   return (
     <div className="[word-break:break-word] content-stretch flex flex-col gap-[2px] items-start justify-center leading-[normal] relative shrink-0 w-[260px]" data-name="cell-name">
       <p className="font-['JetBrains_Mono:Bold',sans-serif] font-bold relative shrink-0 text-[#e5e5ea] text-[11px] w-full">claude-opus-4-8</p>
-      <p className="font-['JetBrains_Mono:Regular',sans-serif] font-normal overflow-hidden relative shrink-0 text-[#636366] text-[9.5px] text-ellipsis w-full whitespace-nowrap">/Users/mochav/dev/.alexandria/dario-prompt-cache/claude-opus-4-8-efaeac877ff7.json</p>
+      <p className="font-['JetBrains_Mono:Regular',sans-serif] font-normal overflow-hidden relative shrink-0 text-[#636366] text-[9.5px] text-ellipsis w-full whitespace-nowrap">/Users/mochav/dev/.alex/dario-prompt-cache/claude-opus-4-8-efaeac877ff7.json</p>
     </div>
   );
 }

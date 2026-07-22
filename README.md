@@ -1,7 +1,7 @@
-# Alex a local LLM Proxy for all token providers, APIs and harnesses
+# Alex — a local LLM proxy for AI subscriptions and coding harnesses
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/header.jpg" alt="Alex connects terminal harnesses to LLM providers through one local proxy" width="100%">
+  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/header-v2.jpg" alt="Alex connects supported terminal harnesses to supported LLM providers through one local proxy" width="100%">
 </p>
 
 <p align="center">
@@ -26,6 +26,8 @@ Install the macOS app or Linux daemon with one command:
 curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh
 ```
 
+Windows support is coming soon and is not included in the stable release.
+
 ## Your Tokens, Your Traces, Your Choice!
 
 Most AI tools **lock together three things that should be separate**:
@@ -36,7 +38,7 @@ Most AI tools **lock together three things that should be separate**:
 
 **Alex separates them.**
 
-It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, and Grok subscriptions or OpenRouter to a single OpenAI- and Anthropic-compatible endpoint. Point your coding tools at Alex, then choose the model you want without changing harnesses, manually managing credentials, or losing visibility into what your agents are doing.
+It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, Grok, Kimi, OpenRouter, Exo, and CLIProxyAPI to one loopback service exposing OpenAI-, Anthropic-, and Gemini-compatible ingress. After connecting a provider and compatible harness, choose a supported model without manually copying upstream credentials or losing visibility into captured agent work.
 
 <table align="right">
   <tr>
@@ -52,14 +54,14 @@ It is a local LLM proxy that connects Claude, ChatGPT/Codex, Gemini, and Grok su
 
 ### At a glance
 
-- **Use any model in any harness, like Fable 5 in Codex.**
-- **Fork any session.** `alex resume SESSION pi` — every conversation Alex captures can be continued in another harness: history, tool calls, model, and working directory carry over. Pi resumes as a native session (the forked chat *is* real, scrollable history); Claude Code and Codex currently fork via transcript hand-off with native resume coming, and more harnesses are on the way. Any session from any of them can be continued in any other.
-- **See everything.** Inspect all model traffic and every turn-by-turn event.
+- **Use supported models across compatible harnesses, like Fable 5 in Codex.**
+- **Fork any session.** `alex resume SESSION pi` — captured Pi, Claude Code, and Codex conversations can be reconstructed into native sessions in any of those three harnesses. History, tool calls, model, and a verified working directory carry over when the target format supports them; unsupported or changed private formats fall back visibly to prompt hand-off.
+- **See captured work.** Inspect traffic routed or wrapped through Alex and the turn and tool events each integration exposes.
 - **Have your agents meta-analyze all your traces in an outer loop.**
 - **Tokenmax across accounts.** Bond multiple subscriptions for more aggregate capacity.
 - **Trace closed harnesses.** Capture activity from tools like Amp and Cursor.
 - **A Rust daemon that stays up.**
-- **Use Anthropic subscriptions in any tool.** Route them through [Dario](https://github.com/askalf/dario).
+- **Use Anthropic subscriptions from compatible API clients and connected harnesses.** Route eligible traffic through [Dario](https://github.com/askalf/dario).
 - **Analyze or train on your data.** Your tokens, your traces.
 - **Mix and match token sources.** Combine subscriptions and providers such as OpenAI, Anthropic, Grok, and OpenRouter.
 
@@ -73,7 +75,7 @@ switching models often means switching the tool you work in.
 
 Alex becomes the local control plane between your tools and your subscriptions.
 
-Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multiple Codex accounts. Capture Amp or Cursor runs that do not support custom endpoints. Inspect every model request and executed tool call in one trace browser.
+Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multiple Codex accounts. Capture Amp or Cursor runs that do not support custom endpoints. Inspect every captured model request and the executed-tool events exposed by each harness in one trace browser.
 
 <br clear="right">
 
@@ -81,7 +83,7 @@ Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multi
 
 ### Harness tracing support
 
-Alex records a trace for every request from any supported harness. **Session grouping** stitches a harness's
+After a harness is connected or wrapped through Alex, Alex records each captured request as a trace. **Session grouping** stitches a harness's
 requests into one conversation; **subagent tracing** additionally reconstructs the parent→child tree when a
 harness spawns subagents.
 
@@ -118,7 +120,7 @@ parallel/retried runs surface as many short sessions rather than one grouped job
 Use subscriptions, not only API keys.
 Alex imports and refreshes credentials from the official Claude, Codex, Gemini, and Grok CLIs, allowing compatible tools to use the subscriptions you already pay for.
 
-Any supported model from any compatible harness.
+Supported models across compatible harnesses.
 Alex translates between Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Gemini generateContent, including streaming responses.
 
 ## Examples
@@ -126,7 +128,7 @@ Alex translates between Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 | Terminal | Description |
 | --- | --- |
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/claude.png" alt="OpenAI GPT-5.6 running in Claude Code through Alex" width="500"> | **GPT-5.6 in Claude Code.** Mix OpenAI models into an Anthropic-native harness. |
-| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** You should be able to run Fable 5 in any harness. Your tokens your choice! |
+| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** Run Fable 5 from a compatible connected harness such as Codex. Your tokens, your choice! |
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/pi.png" alt="A custom PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **PAM in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
 
 A complete record of agent work.
@@ -134,6 +136,14 @@ Requests, responses, token usage, latency, cost, sessions, subagents, requested 
 
 Local and inspectable by default.
 The daemon listens on 127.0.0.1, stores traces in local SQLite, and keeps provider credentials on your machine.
+
+Open the shared local status, onboarding, and Trace Browser preview on macOS or Linux:
+
+```bash
+alex web
+```
+
+Use `alex web --no-open` to print the loopback URL. Native menu-bar integration remains macOS-only; see [Shared web UI](docs/web-ui.md) for the current platform support boundary.
 
 Built for real multi-agent workflows.
 Scoped run keys, session tagging, remote trace ingestion, account routing, rate-limit failover, harness integrations, and regression tests make Alex useful beyond simple API forwarding.
@@ -143,10 +153,10 @@ The CLI and macOS menu bar app show account health, authentication failures, sub
 
 alex auth import
 alex daemon --background
-alex harness connect pi
+alex connect pi
 pi --model alex/gpt-5.6-sol
 
-One proxy. Your subscriptions. Any harness. Every trace.
+One proxy. Your subscriptions. Compatible harnesses. Every captured trace.
 
 ![Alex capturing a wrapped Amp session alongside its full conversation trace](https://raw.githubusercontent.com/madhavajay/alex/main/images/amp.png)
 
@@ -154,8 +164,7 @@ One proxy. Your subscriptions. Any harness. Every trace.
 
 ### Capture traces from Amp, Cursor, and other wrapped harnesses
 
-Harnesses that don't take a custom endpoint are captured with a reverse wrap: full
-conversation traces, no config changes to the tool:
+Harnesses that don't take a custom endpoint are captured with a reverse wrap. Alex records the conversation detail each wrapper exposes without changing the tool's normal model route:
 
 ```bash
 alex wrap amp   -- -x 'refactor the auth module'      # Amp, fully traced
@@ -170,18 +179,19 @@ After running the installer, import your existing CLI logins, start Alex, and co
 alex auth import
 alex daemon --background
 alex status
+alex doctor
 
 alex connect pi
 pi --model alex/gpt-5.6-sol
 ```
 
-`alex status` shows daemon health, accounts, limits, and Dario state. For a guided setup that can install, connect, configure, and launch a supported harness, run `alex up pi`.
+`alex status` shows daemon health, accounts, limits, and Dario state. `alex doctor` checks the executable, service, local port, credential state, provider health, storage integrity, permissions, and Dario prerequisites without displaying secrets. For a guided setup that can install, connect, configure, and launch a supported harness, run `alex up pi`.
 
 ## Compatibility
 
 ### Providers & subscriptions
 
-Alex holds the credential, refreshes it, and routes traffic for each provider below. Subscription providers use your existing plan's OAuth login — no API key required.
+Alex stores credentials for the integrations below. Routable model upstreams accept traffic from the supported client APIs; wrap and billing integrations are explicitly labelled. OAuth providers use an existing subscription login, while API-key and endpoint providers use the auth shown in the table.
 
 | Provider | Plan / auth | Status |
 | --- | --- | --- |
@@ -192,7 +202,8 @@ Alex holds the credential, refreshes it, and routes traffic for each provider be
 | Moonshot (Kimi) | Kimi subscription | ✅ Supported |
 | OpenRouter | API key | ✅ Supported |
 | Exo | Local / LAN cluster (no auth) | ✅ Supported |
-| Amp | Amp CLI credentials | ✅ Supported |
+| CLIProxyAPI | URL + bearer credential | ✅ Supported in both directions |
+| Amp | Amp CLI credentials | ✅ Wrap + billing only; not a `/v1` model upstream |
 | Hugging Face | — | ⏳ Coming soon |
 | Meta (Llama) | — | ⏳ Coming soon |
 | Groq | — | ⏳ Coming soon |
@@ -203,16 +214,16 @@ Alex holds the credential, refreshes it, and routes traffic for each provider be
 
 ### API formats
 
-Alex translates requests, responses, and streaming events between the API format sent by the client and the provider selected by the model name.
+For the client/upstream pairs below, Alex translates requests, responses, and streaming events between the client API and the provider selected by the model name. Unsupported pairs return an explicit `501 Not Implemented` response.
 
 | Client API | Alex endpoint | Supported upstreams |
 | --- | --- | --- |
-| Anthropic Messages | `POST /v1/messages` | Anthropic, OpenAI, Gemini |
-| OpenAI Chat Completions | `POST /v1/chat/completions` | Anthropic, OpenAI, Gemini, xAI |
-| OpenAI Responses | `POST /v1/responses` | Anthropic, OpenAI, Gemini |
+| Anthropic Messages | `POST /v1/messages` | Anthropic, OpenAI, Gemini, xAI, OpenRouter, Exo, Kimi, CLIProxyAPI |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Anthropic, OpenAI, Gemini, xAI, OpenRouter, Exo, Kimi, CLIProxyAPI |
+| OpenAI Responses | `POST /v1/responses` | Anthropic, OpenAI, Gemini, CLIProxyAPI |
 | Gemini generateContent | `POST /v1beta/models/{model}:generateContent` | Anthropic, OpenAI, Gemini |
 
-### Harness support
+### Primary harness integration depth
 
 | Harness | Custom models | Full trace | Executed tools |
 | --- | --- | --- | --- |
@@ -393,7 +404,7 @@ server errors. The symmetric Claude/OpenAI example can be installed with
 ```
 
 Even with protection enabled, a single request can demand the exact model it
-asked for: send `x-alexandria-no-substitute: 1` to disable both account failover
+asked for: send `x-alex-no-substitute: 1` to disable both account failover
 and cross-provider substitution for that call, so the real model is used and the
 real error (if any) is returned unchanged. This is intended for **benchmark
 suites** that must run against a specific model (e.g. `claude-fable-5`) and must
@@ -403,28 +414,28 @@ never be silently rerouted.
 
 Any harness pointed at Alex can set these per request:
 
-- `x-alexandria-no-substitute: 1` — pin the model: disable failover and
+- `x-alex-no-substitute: 1` — pin the model: disable failover and
   cross-provider substitution, returning the real response or the real error
   (benchmarks).
 - `x-session-id: <id>` — group requests into one session/transcript.
-- `x-alexandria-run-id: <id>` — attach your own external run id for correlation.
-- `x-alexandria-trace-tag`, `x-alexandria-job`, `x-alexandria-task`,
-  `x-alexandria-phase` — tag traces for later filtering and analytics.
-- `x-alexandria-harness`, `x-alexandria-harness-version` — label the calling
+- `x-alex-run-id: <id>` — attach your own external run id for correlation.
+- `x-alex-trace-tag`, `x-alex-job`, `x-alex-task`,
+  `x-alex-phase` — tag traces for later filtering and analytics.
+- `x-alex-harness`, `x-alex-harness-version` — label the calling
   harness in traces.
-- `x-alexandria-simulate-error: STATUS[:kind]` — return a synthetic error with no
+- `x-alex-simulate-error: STATUS[:kind]` — return a synthetic error with no
   upstream call, for testing harness and failover behavior (local/harness-key
   gated).
 
 ## Platforms and alternative installation
 
-macOS and Linux are the supported platforms. Windows x86-64 CLI builds are published with releases, but they are experimental. First-class Windows support, including service integration, is coming soon.
+The stable release supports macOS and Ubuntu Linux x86-64 for the core CLI, user service, onboarding, routing, middleware, and Trace Browser path. The native menu-bar app and native notifications remain macOS-only; Linux uses the shared web UI. Windows support is being developed separately and is not a release target yet.
 
 Alternative installation methods:
 
 ```bash
-brew install madhavajay/alex/alex               # CLI and daemon
-brew install --cask madhavajay/alex/alexandria  # macOS menu bar app
+brew install madhavajay/alex/alex        # CLI and daemon
+brew install --cask madhavajay/alex/alex # Alex.app
 cargo install alex                              # CLI from crates.io
 ./install.sh --service                          # build this checkout and install its service
 ```

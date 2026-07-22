@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alex_auth::Vault;
@@ -214,7 +214,19 @@ async fn execute_with_progress(
     Ok(result)
 }
 
-pub(crate) struct DaemonResetHandler;
+pub(crate) struct DaemonResetHandler {
+    config: Arc<std::sync::Mutex<Config>>,
+    config_path: PathBuf,
+}
+
+impl DaemonResetHandler {
+    pub(crate) fn new(config: Arc<std::sync::Mutex<Config>>, config_path: PathBuf) -> Self {
+        Self {
+            config,
+            config_path,
+        }
+    }
+}
 
 impl alex_proxy::ResetHandler for DaemonResetHandler {
     fn reset(
@@ -222,11 +234,16 @@ impl alex_proxy::ResetHandler for DaemonResetHandler {
         state: Arc<alex_proxy::AppState>,
         request: alex_proxy::ResetRequest,
     ) -> alex_proxy::ResetFuture {
+        let shared_config = self.config.clone();
+        let config_path = self.config_path.clone();
         Box::pin(async move {
-            let (config, _) = crate::load_or_create_config()?;
+            let config = shared_config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             let result = execute_with_progress(
                 &config,
-                &crate::alexandria_home().join("config.toml"),
+                &config_path,
                 state.vault.as_ref(),
                 state.store.as_ref(),
                 request.clone().into(),
@@ -236,10 +253,15 @@ impl alex_proxy::ResetHandler for DaemonResetHandler {
             .await?;
             if !request.dry_run && request.credentials {
                 state.run_keys.write().unwrap().clear();
+                alex_proxy::reset_auth_sessions(&state).await;
             }
-            if !request.dry_run && request.settings && request.harnesses {
-                let (updated, _) = crate::load_or_create_config()?;
-                *state.local_key.write().unwrap() = updated.local_key;
+            if !request.dry_run && request.settings {
+                let updated: Config = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+                *state.local_key.write().unwrap() = updated.local_key.clone();
+                *shared_config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = updated;
+                alex_proxy::reset_notification_state(&state)?;
             }
             Ok(result)
         })
@@ -251,6 +273,7 @@ mod tests {
     use super::*;
     use alex_auth::Account;
     use alex_core::{Provider, TraceRecord};
+    use alex_store::ToolCallRecord;
     use std::path::PathBuf;
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -319,6 +342,23 @@ mod tests {
         let store = Store::open(home.clone()).unwrap();
         store.insert_trace(&trace()).unwrap();
         store.write_body("trace-1", "request", b"body").unwrap();
+        store
+            .upsert_tool_call(&ToolCallRecord {
+                id: "tool-1".into(),
+                harness: "codex".into(),
+                session_id: "session-1".into(),
+                turn_id: None,
+                tool_call_id: "call-1".into(),
+                trace_id: Some("trace-1".into()),
+                tool_name: "shell".into(),
+                ts_start_ms: 1,
+                ts_end_ms: Some(2),
+                is_error: Some(false),
+                exit_status: Some(0),
+                args_body_path: None,
+                result_body_path: None,
+            })
+            .unwrap();
         store
             .insert_heartbeat(1, "openai", None, true, Some(200), 1, "ok")
             .unwrap();
@@ -404,6 +444,7 @@ mod tests {
         );
         assert_eq!(vault.list().await.len(), 1);
         assert_eq!(counts.run_keys, 1);
+        assert!(store.session_tool_calls("session-1").unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -546,5 +587,80 @@ mod tests {
         );
         assert_eq!(store.reset_counts().unwrap().traces, 1);
         assert_eq!(vault.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_all_clears_live_state_without_reimporting_or_deleting_source_credentials() {
+        let (mut config, path, vault, store) = fixture("all-live-state").await;
+        config.notifications = vec![alex_proxy::notify::NotificationChannelConfig {
+            id: Some("telegram".into()),
+            url: "https://api.telegram.org/bot123:secret/sendMessage".into(),
+            allow_commands: true,
+            ..Default::default()
+        }];
+        save_config_at(&config, &path).unwrap();
+
+        let source_path = config.data_dir.join(".codex/auth.json");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let source_bytes = br#"{"tokens":{"access_token":"external-secret"}}"#;
+        std::fs::write(&source_path, source_bytes).unwrap();
+        let activity_path = config.data_dir.join("notification-messages.json");
+        std::fs::write(
+            &activity_path,
+            br#"[{"ts":1,"direction":"in","channel_id":"telegram","kind":"command","ok":true,"error":null,"summary":"/status"}]"#,
+        )
+        .unwrap();
+
+        let shared_config = Arc::new(std::sync::Mutex::new(config.clone()));
+        let state = alex_proxy::build_state(
+            config.local_key.clone(),
+            Arc::new(vault),
+            Arc::new(store),
+            None,
+            config.base_url(),
+            config.upstream_stream_idle_timeout(),
+        );
+        alex_proxy::set_notifications(&state, config.notification_settings());
+        let handler = DaemonResetHandler::new(shared_config.clone(), path.clone());
+        alex_proxy::ResetHandler::reset(
+            &handler,
+            state.clone(),
+            alex_proxy::ResetRequest {
+                credentials: true,
+                settings: true,
+                traces: true,
+                harnesses: true,
+                cache: true,
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(state.vault.list().await.is_empty());
+        let counts = state.store.reset_counts().unwrap();
+        assert_eq!(
+            (counts.traces, counts.heartbeats, counts.run_keys),
+            (0, 0, 0)
+        );
+        assert!(state
+            .store
+            .session_tool_calls("session-1")
+            .unwrap()
+            .is_empty());
+        assert!(!activity_path.exists());
+        assert!(shared_config.lock().unwrap().notifications.is_empty());
+        assert!(
+            alex_auth::detect_import_candidates_in(&config.data_dir, None)
+                .iter()
+                .any(|candidate| candidate.source == "codex"),
+            "external credentials remain candidates but are not auto-imported"
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        assert!(
+            state.vault.list().await.is_empty(),
+            "detection is non-mutating"
+        );
     }
 }

@@ -125,7 +125,7 @@ jobs:
           sed \
             -e "s/{{VERSION}}/${version}/g" \
             -e "s/{{SHA_DMG}}/${sha_dmg}/g" \
-            packaging/homebrew/alexandria.rb.tmpl > dist/homebrew/alexandria.rb
+            packaging/homebrew/alex-cask.rb.tmpl > dist/homebrew/alex-cask.rb
 
       - name: Push cask to Homebrew tap
         if: steps.tap_key.outputs.present == 'true'
@@ -145,13 +145,13 @@ jobs:
             git checkout -B main
           fi
           mkdir -p Casks
-          cp "$GITHUB_WORKSPACE/dist/homebrew/alexandria.rb" Casks/alexandria.rb
+          cp "$GITHUB_WORKSPACE/dist/homebrew/alex-cask.rb" Casks/alex.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/alexandria.rb
+          git add Casks/alex.rb
           if git diff --cached --quiet; then
-            echo "Casks/alexandria.rb is already up to date; skipping commit."
+            echo "Casks/alex.rb is already up to date; skipping commit."
           else
-            git commit -m "alexandria ${version}"
+            git commit -m "alex ${version}"
             git push origin HEAD:main
           fi

@@ -13,8 +13,8 @@
       "endpoint": "openai-chat-completions",
       "notes": "OpenAI-compatible harnesses usually expect a provider prefix for LiteLLM or native provider selection."
     },
-    "alexandria/gpt-5.5": {
-      "provider": "alexandria-proxy",
+    "alex/gpt-5.5": {
+      "provider": "alex-proxy",
       "proxy_route": "codex",
       "endpoint": "openai-chat-completions",
       "notes": "Alex proxy model alias for OpenAI-compatible harnesses."
@@ -30,8 +30,8 @@
       "endpoint": "openai-chat-completions-to-anthropic",
       "notes": "Use for OpenAI-compatible harnesses routed through an Anthropic-compatible bridge."
     },
-    "alexandria/opus-4.8": {
-      "provider": "alexandria-proxy",
+    "alex/opus-4.8": {
+      "provider": "alex-proxy",
       "proxy_route": "dario",
       "endpoint": "openai-chat-completions-to-anthropic",
       "notes": "Alex proxy model alias for OpenAI-compatible harnesses."
@@ -288,7 +288,7 @@
     },
     "hermes": {
       "aliases": ["hermes-agent"],
-      "default_model": "alexandria/gpt-5.5",
+      "default_model": "alex/gpt-5.5",
       "model_env": ["HERMES_MODEL"],
       "version_env": "HERMES_VERSION",
       "default_version": "main",

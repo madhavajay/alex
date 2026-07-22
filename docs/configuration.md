@@ -1,9 +1,9 @@
 # Configuration and local state
 
-The main configuration file is `~/.alexandria/config.toml`. Set
-`ALEXANDRIA_HOME` to move that root. `data_dir` then controls the SQLite,
+The main configuration file is `~/.alex/config.toml`. Set `ALEX_HOME` to move
+that root. `data_dir` then controls the SQLite,
 account, body, Dario, fixture, and wrap state root; on a fresh install it is the
-same directory as `ALEXANDRIA_HOME`.
+same directory as `ALEX_HOME`.
 
 The loader creates the directory and config on first use. On Unix it writes
 `config.toml` mode `0600`. The file contains administrative and notification
@@ -16,7 +16,7 @@ Values that are generated per installation are redacted here:
 ```toml
 host = "127.0.0.1"
 port = 4100
-data_dir = "/home/example/.alexandria"
+data_dir = "/home/example/.alex"
 local_key = "<redacted-alx-key>"
 heartbeat_minutes = 15
 reauth_check_minutes = 5
@@ -63,7 +63,7 @@ for a stable build.
 | `exo_enabled_models` | string array | `[]` | Models exposed/routed through Exo. |
 | `openrouter_exposed_models` | string array | seven-model starter list below | Bare OpenRouter IDs advertised to `/v1/models` and harnesses. Explicit `[]` exposes none. |
 | `gemini_project` | string | `""` | Optional Code Assist project override/cache. `GOOGLE_CLOUD_PROJECT` takes precedence when set. |
-| `anthropic_upstream` | string | `auto` | `auto`, `dario`, or `direct`; set through `alex dario auto|enable|disable`. |
+| `anthropic_upstream` | string | `auto` | Compatibility value set through `alex dario auto|enable|disable`; non-Claude-Code Anthropic requests always use Dario. |
 | `dario_mode_migrated` | boolean | `true` | Internal one-time legacy `direct` to `auto` migration marker. Do not use as a routing control. |
 | `dario_api_key` | string | empty, generated/saved at daemon start | Credential used only between Alex and its local Dario child. |
 | `dario_claude_bin` | path or absent | absent | Explicit real Claude Code binary for model prompt capture. An invalid explicit path does not fall through. |
@@ -149,37 +149,20 @@ that sidecar is loaded first; any provider also present in
 `config.toml`'s `account_policy` map is then replaced by the config policy. See
 [Providers and routing](providers-and-routing.md).
 
-## Substitution and protection
+## Middleware
 
-```toml
-[substitution]
-enabled = true
+Middleware settings and editable rule overrides are stored in
+`~/.alex/middleware/rules.toml`. Configure it in Settings → Middleware rather
+than editing `config.toml`.
 
-[substitution.fallbacks]
-"claude-fable-5" = ["openai/gpt-5.6-sol"]
+Alex's shipped rule recognizes Anthropic's structured Fable refusal event
+(`message_delta.delta.stop_reason = refusal`) regardless of refusal category,
+then routes the stable session to OpenAI `gpt-5.6-sol` for 24 hours.
 
-[protection]
-enabled = true
-reroute_on_auth = false
-retries = 1
-auto_return = true
-
-[protection.equivalencies.claude-fable-5]
-openai = "gpt-5.6-sol"
-```
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `substitution.enabled` | `false` | Enable ordered, explicit cross-model fallbacks. |
-| `substitution.fallbacks.<model>` | absent | Array of provider-prefixed fallback model IDs. |
-| `protection.enabled` | `false` | Enable retry/equivalency protection. |
-| `protection.reroute_on_auth` | `false` | Allow equivalency rerouting for auth-class errors. |
-| `protection.retries` | `1` | Protection retry count. |
-| `protection.auto_return` | `true` | Persisted protection behavior flag exposed by admin controls. |
-| `protection.equivalencies.<model>.<provider>` | absent | Equivalent model ID for a different provider. |
-
-`alex protection preset anthropic-openai` writes the current Fable/Sol
-equivalencies but intentionally does not turn `protection.enabled` on.
+The Middleware Wizard can optionally match the incoming effort/thinking level,
+set replacement effort, choose request or session scope, and add a templated
+harness notice. New reroute rules default to a 24-hour session route so a
+recovered conversation does not immediately return to the failing model.
 
 ## Notifications
 
@@ -220,24 +203,24 @@ launchd, and Dario-child variables are omitted.
 
 | Variable | Used by |
 | --- | --- |
-| `ALEXANDRIA_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
-| `ALEXANDRIA_URL` | Remote `alex connect`/`alex up` base URL. |
-| `ALEXANDRIA_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
-| `ALEXANDRIA_RUN_ID` | Caller-selected wrap run ID. |
-| `ALEXANDRIA_TRACE_URL` | Central daemon for wrapped trace upload. |
-| `ALEXANDRIA_TRACE_KEY` | Inline `kind=wrap` upload key. Prefer a protected file for persistence. |
-| `ALEXANDRIA_TRACE_KEY_FILE` | File containing the wrap upload key. |
-| `ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP` | Truthy value permits non-loopback plaintext trace upload. |
-| `ALEXANDRIA_NODE_BIN` | Dario Node runtime discovery override. Persist `dario_node_path` for services. |
-| `ALEXANDRIA_REAL_CLAUDE_BIN` | Real Claude executable discovery override. Persist `dario_claude_bin` for services. |
-| `ALEXANDRIA_DRAIN_TIMEOUT_SECONDS` | Graceful service-restart drain timeout. |
-| `ALEXANDRIA_GRACEFUL_RESTART` | Set to `0` to opt out of graceful restart behavior. |
+| `ALEX_HOME` | Config/state root containing `config.toml`; fresh `data_dir` defaults to it. |
+| `ALEX_URL` | Remote `alex connect`/`alex up` base URL. |
+| `ALEX_HARNESS_KEY` | Pre-minted remote harness key for `alex connect`. Requires a remote URL. |
+| `ALEX_RUN_ID` | Caller-selected wrap run ID. |
+| `ALEX_TRACE_URL` | Central daemon for wrapped trace upload. |
+| `ALEX_TRACE_KEY` | Inline `kind=wrap` upload key. Prefer a protected file for persistence. |
+| `ALEX_TRACE_KEY_FILE` | File containing the wrap upload key. |
+| `ALEX_TRACE_ALLOW_INSECURE_HTTP` | Truthy value permits non-loopback plaintext trace upload. |
+| `ALEX_NODE_BIN` | Dario Node runtime discovery override. Persist `dario_node_path` for services. |
+| `ALEX_REAL_CLAUDE_BIN` | Real Claude executable discovery override. Persist `dario_claude_bin` for services. |
+| `ALEX_DRAIN_TIMEOUT_SECONDS` | Graceful service-restart drain timeout. |
+| `ALEX_GRACEFUL_RESTART` | Set to `0` to opt out of graceful restart behavior. |
 | `GEMINI_API_KEY` | Fallback input for `alex auth gemini-key`. |
 | `OPENROUTER_API_KEY` | Fallback input for `alex auth openrouter-key`. |
 | `AMP_API_KEY` | Fallback input for `alex auth amp-key` and wrap credential resolution. |
 | `GOOGLE_CLOUD_PROJECT` | Gemini Code Assist project override before stored/discovered project. |
 | `KIMI_CODE_HOME` | Native Kimi credential root for import. |
-| `RUST_LOG` | Standard tracing filter; daemon default is `info,alexandria=debug`, other commands default to `warn`. |
+| `RUST_LOG` | Standard tracing filter; daemon default is `info,alex=debug`, other commands default to `warn`. |
 
 `alex credentials` prints the common client variables (`ANTHROPIC_BASE_URL`,
 `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, and matching key-bearing exports)
@@ -249,20 +232,20 @@ instead of hard-coding a bind wildcard as a client URL.
 Paths below are relative to `data_dir` unless stated otherwise:
 
 ```text
-~/.alexandria/config.toml         main config (always under ALEXANDRIA_HOME)
+~/.alex/config.toml               main config (always under ALEX_HOME)
 <data_dir>/accounts/*.json        active vault accounts, mode 0600 writes
 <data_dir>/accounts/removed-accounts/*.json
 <data_dir>/accounts/.routing-policies
-<data_dir>/alexandria.sqlite3     trace/pricing/key/lineage store
-<data_dir>/alexandria.sqlite3-wal
-<data_dir>/alexandria.sqlite3-shm
+<data_dir>/alex.sqlite3     trace/pricing/key/lineage store
+<data_dir>/alex.sqlite3-wal
+<data_dir>/alex.sqlite3-shm
 <data_dir>/bodies/YYYY-MM-DD/*.gz
 <data_dir>/dario/                 packages, generations, logs, update state
 <data_dir>/dario-prompt-cache/*.json
 <data_dir>/fixtures/              saved error fixtures
 <data_dir>/wrap/<harness>/        settings, flows.jsonl, WS/body sidecars, logs
-~/.alexandria/wrap-harnesses.json optional replacement wrap catalog
-~/.alexandria/daemon.log          background-daemon log
+~/.alex/wrap-harnesses.json       optional replacement wrap catalog
+~/.alex/daemon.log                background-daemon log
 ```
 
 Connected harness configuration is stored under each tool's native config

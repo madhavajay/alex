@@ -13,10 +13,10 @@ use crate::reverse::{ReverseOptions, ReverseWrap};
 use crate::{load_catalog, plan_for};
 
 const REMOTE_TRACE_ENV_VARS: &[&str] = &[
-    "ALEXANDRIA_TRACE_URL",
-    "ALEXANDRIA_TRACE_KEY",
-    "ALEXANDRIA_TRACE_KEY_FILE",
-    "ALEXANDRIA_TRACE_ALLOW_INSECURE_HTTP",
+    "ALEX_TRACE_URL",
+    "ALEX_TRACE_KEY",
+    "ALEX_TRACE_KEY_FILE",
+    "ALEX_TRACE_ALLOW_INSECURE_HTTP",
 ];
 
 fn alex_wrap_reverse_opts(harness: &WrapHarness) -> ReverseOptions {

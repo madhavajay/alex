@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "preset_id": "alex.fable-5-to-gpt-5.6-sol",
+  "shared_site_scenario": "fable-to-sol-vector.json",
+  "cases": [
+    {
+      "id": "fable-refusal-reroutes-session",
+      "failure_fixture": "anthropic-fable-refusal-200",
+      "accounts": ["anthropic", "openai"],
+      "expected": {
+        "decision": "reroute",
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "status": 200,
+        "lease": "active",
+        "ttl_seconds": 86400,
+        "explanation_contains": "Fable 5 refused the request; switching this session to GPT-5.6 Sol"
+      }
+    },
+    {
+      "id": "next-request-uses-session-route",
+      "setup": "send another request in the same stable session after the refusal fallback",
+      "accounts": ["anthropic", "openai"],
+      "expected": {
+        "decision": "active_session_route",
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "status": 200,
+        "lease": "active"
+      }
+    },
+    {
+      "id": "unavailable-fallback-account-returns-refusal",
+      "failure_fixture": "anthropic-fable-refusal-200",
+      "accounts": ["anthropic"],
+      "expected": {
+        "decision": "reroute_unavailable",
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "status": 200,
+        "lease": "none",
+        "explanation_contains": "no eligible openai account could serve gpt-5.6-sol"
+      }
+    }
+  ]
+}

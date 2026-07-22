@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SQLite trace store, pricing seed, and analytics for alex (Alexandria)"
+description = "SQLite trace store, pricing seed, and analytics for Alex"
 
 [dependencies]
+alex-lar = { workspace = true }
 alex-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -15,3 +16,4 @@ rusqlite = { workspace = true }
 flate2 = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }

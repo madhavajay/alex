@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ pub struct NotificationMessage {
 pub struct NotificationMessageLog {
     entries: Arc<Mutex<VecDeque<NotificationMessage>>>,
     path: Arc<Option<PathBuf>>,
+    disabled: Arc<AtomicBool>,
 }
 
 impl NotificationMessageLog {
@@ -49,6 +51,7 @@ impl NotificationMessageLog {
         Self {
             entries: Arc::new(Mutex::new(entries)),
             path: Arc::new(path),
+            disabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -62,10 +65,16 @@ impl NotificationMessageLog {
         error: Option<&str>,
         summary: &str,
     ) {
+        if self.disabled.load(Ordering::SeqCst) {
+            return;
+        }
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.disabled.load(Ordering::SeqCst) {
+            return;
+        }
         entries.push_back(NotificationMessage {
             ts,
             direction: direction.to_string(),
@@ -102,6 +111,27 @@ impl NotificationMessageLog {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    /// Permanently retires this log and removes its persisted activity. This
+    /// prevents already-spawned notification work from recreating activity
+    /// after Reset All has completed.
+    pub fn disable_and_clear(&self) -> Result<()> {
+        self.disabled.store(true, Ordering::SeqCst);
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        if let Some(path) = self.path.as_ref() {
+            for candidate in [path.clone(), path.with_extension("json.tmp")] {
+                match std::fs::remove_file(&candidate) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -274,7 +304,9 @@ pub trait NotificationChannel: Send + Sync {
     }
     async fn send(&self, ev: &NotificationEvent) -> Result<()>;
     async fn send_text(&self, _text: &str) -> Result<()> {
-        Err(anyhow!("notification channel does not support text replies"))
+        Err(anyhow!(
+            "notification channel does not support text replies"
+        ))
     }
 }
 
@@ -546,7 +578,11 @@ impl NotificationDispatcher {
             matches!(entry.config.format, WebhookFormat::Telegram)
                 && NotificationLevel::Warn >= entry.config.min_level
                 && (entry.config.categories.is_empty()
-                    || entry.config.categories.iter().any(|category| category == "reauth"))
+                    || entry
+                        .config
+                        .categories
+                        .iter()
+                        .any(|category| category == "reauth"))
         }) {
             let channel_id = entry.config.id.as_deref();
             if let Some(channel_id) = channel_id {
@@ -565,9 +601,11 @@ impl NotificationDispatcher {
     }
 
     fn set_channel_error(&self, channel_id: &str, error: &str) {
-        let Some(index) = self.channels.iter().position(|entry| {
-            entry.config.id.as_deref() == Some(channel_id)
-        }) else {
+        let Some(index) = self
+            .channels
+            .iter()
+            .position(|entry| entry.config.id.as_deref() == Some(channel_id))
+        else {
             return;
         };
         let mut statuses = self
@@ -642,8 +680,7 @@ impl NotificationDispatcher {
         let mut delivery = CustomDelivery::default();
         for (index, entry) in self.channels.iter().enumerate() {
             if !matches!(entry.config.format, WebhookFormat::Telegram)
-                || only_channel_id
-                    .is_some_and(|wanted| entry.config.id.as_deref() != Some(wanted))
+                || only_channel_id.is_some_and(|wanted| entry.config.id.as_deref() != Some(wanted))
                 || !accepts(&entry.config, &event)
             {
                 continue;
@@ -755,7 +792,7 @@ impl NotificationDispatcher {
             title: "Alex notification test".into(),
             body: "This is a synthetic notification test event.".into(),
             account: NotificationAccount {
-                provider: "alexandria".into(),
+                provider: "alex".into(),
                 label: None,
             },
             action_url: None,
@@ -1124,8 +1161,7 @@ mod tests {
             provider: "xai".into(),
             label: Some("work".into()),
         };
-        let first_verification_uri_complete =
-            "https://auth.example.test/device?code=first";
+        let first_verification_uri_complete = "https://auth.example.test/device?code=first";
         assert!(dispatcher.send_custom(
             "Grok needs re-authentication",
             format!("Tap {first_verification_uri_complete}"),
@@ -1210,7 +1246,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*channel.0.lock().unwrap(), ["pong"]);
-        assert!(dispatcher.send_telegram_reply("foreign", "nope").await.is_err());
+        assert!(dispatcher
+            .send_telegram_reply("foreign", "nope")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1254,7 +1293,10 @@ mod tests {
         assert_eq!(messages[0].direction, "in");
         assert_eq!(messages[2].direction, "out");
         assert_eq!(messages[2].kind, "reply");
-        assert_eq!(dispatcher.admin_view()["channels"][0]["last_error"], Value::Null);
+        assert_eq!(
+            dispatcher.admin_view()["channels"][0]["last_error"],
+            Value::Null
+        );
     }
 
     #[test]

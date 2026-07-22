@@ -75,7 +75,7 @@ fn raw_active(sessions_supported: Option<bool>, raw_mode: bool) -> bool {
 
 fn session_kind(s: &Value) -> Option<&'static str> {
     let harness = s.get("harness").and_then(|v| v.as_str()).unwrap_or("");
-    if harness.contains("alexandria-ping") {
+    if harness.contains("alex-ping") {
         return Some("ping");
     }
     match s["tags"]["kind"].as_str() {
@@ -93,7 +93,7 @@ fn session_kind(s: &Value) -> Option<&'static str> {
     }
     let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
     if sid.starts_with("tsh-")
-        || sid.starts_with("alexandria-e2e-")
+        || sid.starts_with("alex-e2e-")
         || sid.starts_with("smoke-")
         || sid.starts_with("PING-")
     {
@@ -485,7 +485,7 @@ fn draw_status(f: &mut Frame, area: Rect, snap: &Snapshot, base: &str) {
     };
     let mut spans = vec![
         Span::styled(
-            " ◆ ALEXANDRIA ",
+            " ◆ ALEX ",
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("v{version} "), Style::default().fg(PURPLE)),
@@ -1688,9 +1688,9 @@ mod tests {
 
     #[test]
     fn session_kind_classifies() {
-        let ping = serde_json::json!({"harness": "alexandria-ping", "session_id": "x"});
+        let ping = serde_json::json!({"harness": "alex-ping", "session_id": "x"});
         let test = serde_json::json!({"harness": "curl/8", "session_id": "tsh-W1-99"});
-        let e2e = serde_json::json!({"session_id": "alexandria-e2e-claude-1"});
+        let e2e = serde_json::json!({"session_id": "alex-e2e-claude-1"});
         let real = serde_json::json!({"harness": "claude-cli/2.1", "session_id": "abc"});
         assert_eq!(session_kind(&ping), Some("ping"));
         assert_eq!(session_kind(&test), Some("test"));

@@ -7,6 +7,170 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-07-22
+
+First stable release of the 0.1.29 line. It includes all changes from the
+0.1.29 betas plus the V1 activation, reliability, and supported-platform work
+below.
+
+### Added
+- **Programmable middleware with an explainable Fable-to-Sol fallback.** Typed,
+  regex-first rules can match harness, model, provider, status, response
+  headers, and body content; reroutes are session-scoped, persisted, visible in
+  traces, and manageable from the CLI, web UI, and macOS rule editor. The
+  built-in preset moves an explicit Fable refusal to high-effort GPT-5.6 Sol.
+- **LAR-backed trace storage and lazy browsing.** Crash-recoverable archives,
+  resumable migration from existing gzip bodies, bounded body reads, cursor
+  pagination, lazy transcript turns, sanitized export/replay fixtures, and a
+  reproducible 55,000-trace/9.4-GB scale gate keep large trace collections
+  usable.
+- **First-class CLIProxyAPI integration in both directions.** Alex can route
+  through an existing CLIProxyAPI instance, and CLIProxyAPI can route into
+  Alex with scoped credentials, capability negotiation, correlation headers,
+  streaming/tool-call preservation, and loop rejection. Web and macOS
+  onboarding can probe and configure the upstream path.
+- **Shared activation path.** `alex doctor`, the local web UI, Linux user
+  services, and deterministic packaged smoke tests cover onboarding, health,
+  middleware, routing, traces, restart, upgrade, and rollback.
+- **Public interactive walkthroughs.** Three static, source-checked demos cover
+  cross-harness routing, Fable-to-Sol failover, and asking a second model. The
+  site supports keyboard/mobile use, reduced motion, no-JavaScript fallbacks,
+  and privacy-safe conversion events.
+- **Cross-harness session resume.** Captured Pi, Claude, and Codex sessions can
+  be forked into another supported harness while retaining trace lineage.
+
+### Changed
+- **The product and runtime are now Alex.** User-facing copy, binaries, service
+  identifiers, configuration, installers, package metadata, and the macOS app
+  use the Alex name; fresh installs have no legacy compatibility layer.
+- **Onboarding is resumable and reversible.** Users can move between harness,
+  provider, imported credentials, existing accounts, and new-account flows
+  without stale selections or test state; detected credentials require an
+  explicit confirmation before import.
+- The default Fable fallback now intercepts any structured Anthropic SSE
+  refusal, routes to high-effort GPT-5.6 Sol, and keeps the replacement route
+  for the stable session for 24 hours.
+- Middleware Settings now shows recent real trace matches and execution results
+  instead of presenting a synthetic Test button.
+
+### Fixed
+- Release packages now exercise the installed Linux service and macOS app/CLI
+  before publication, and the stable workflow builds one complete
+  checksum-verified manifest before crates, GitHub Release, Sparkle, or
+  Homebrew promotion.
+- Reset and first-run flows safely rediscover credentials, recreate private
+  configuration paths, and return provider-less installs to onboarding.
+- Codex login and account routing preserve existing identities and clearly
+  distinguish imported, existing, and newly authenticated accounts.
+- Linux and macOS service upgrades replace the active daemon without leaving a
+  duplicate process, and packaged rollback preserves state and trace history.
+- Editing the built-in middleware rule now always updates its existing ID
+  rather than occasionally creating a second custom rule from a stale sheet
+  state.
+- Claude onboarding now shows the opt-in `--settings` launch command directly
+  after connection.
+
+## [0.1.29-beta.11] - 2026-07-20
+
+### Fixed
+- **Standalone macOS CLIs are notarized and independently verified.** The
+  release pipeline gives `alex` and `alex` stable signing identifiers,
+  submits both architectures to Apple's notary service, then downloads the
+  published archive on a separate clean macOS runner for checksum, code-signing
+  and Gatekeeper assessment before the manifest or app release can proceed.
+
+## [0.1.29-beta.10] - 2026-07-20
+
+### Changed
+- **macOS CLI signing moved to fresh staging copies.** This beta added
+  post-archive checks, but same-run code-signing caches made that check
+  insufficient on a clean Mac. Use beta.11 or newer for standalone macOS CLI
+  archives; the beta.10 app DMG itself remains notarized and valid.
+
+## [0.1.29-beta.9] - 2026-07-20
+
+### Added
+- **Declarative middleware and failover.** Alex now has a typed middleware rule
+  engine, atomic rule reload, persisted session leases, built-in account/model/
+  auth failover policies, Fable-to-Sol fallback, trace attempts and decisions,
+  and response notices that preserve the client's original protocol and model
+  identity.
+- **Middleware management surfaces.** The CLI exposes `alex middleware` status,
+  rule lifecycle, validation, dry-run and lease commands. The macOS app adds a
+  Middleware settings pane and guided rule builder while retaining the legacy
+  protection API as a compatibility adapter for one beta cycle.
+
+### Fixed
+- **OAuth onboarding uses provider identity instead of nicknames.** Claude,
+  Codex, Gemini, Grok, Kimi and Amp flows now add a new account when the
+  authenticated identity is new and replace the matching account when it is
+  the same. Existing accounts remain explicit choices alongside **Add another
+  account**.
+- **OpenRouter and Exo configure inline.** OpenRouter asks for a local display
+  name and API key inside onboarding; Exo asks for its endpoint and verifies it
+  before continuing instead of jumping to the full Settings window.
+- **Provider and harness selection stays reversible.** Going Back or choosing
+  **Change provider/harness** clears stale authentication, request and trace
+  state. Provider cards remain visible after scrolling, and selected existing
+  accounts no longer render a redundant confirmation badge.
+- **Harness smoke commands match their real CLIs.** Amp uses `alex wrap amp`
+  with its native model support boundary explained; Codex keeps the repository
+  trust bypass; Kimi requests are detectable both automatically and through
+  **Check for Request**.
+- **Stable publishing includes the middleware crate.** `alex-middleware` is
+  published before `alex-proxy`, preserving dependency order for the next
+  stable crates.io release.
+
+## [0.1.29-beta.8] - 2026-07-20
+
+### Fixed
+- **Provider OAuth no longer traps onboarding on one provider.** Every active
+  embedded auth flow now has **Change provider**, and Back navigation into or
+  out of the provider step cancels the old flow and restores a clean chooser.
+  This fixes Gemini's expanded loopback screen remaining selected across
+  Back/Next navigation.
+- **Kimi test requests unlock onboarding.** Trace matching now recognizes the
+  canonical `harness=kimi` tag even when the session field contains Kimi's
+  versioned `kimi-code-cli/*` user agent.
+
+## [0.1.29-beta.7] - 2026-07-20
+
+### Fixed
+- **Resumed onboarding no longer forces an existing provider account.** Picking
+  a provider with connected subscriptions now presents every existing account
+  alongside **Add another account**. Codex uses automatic upstream identity;
+  providers with local account names ask for a distinct nickname before OAuth.
+- **A completed harness can be changed during onboarding.** The collapsed
+  harness stage now exposes **Change harness**, which clears its plan and stale
+  test/trace state without discarding the selected provider.
+- **The Codex onboarding smoke command works outside Git repositories.** The
+  copied command includes `--skip-git-repo-check` and the selected `alex/*`
+  model, so running it from `/tmp` reaches Alex instead of failing Codex's local
+  workspace trust check.
+
+## [0.1.29-beta.6] - 2026-07-20
+
+### Fixed
+- **Anthropic requests no longer escape Dario after a reset.** Every eligible
+  non-Claude-Code Anthropic request is routed through Dario and fails closed if
+  its generation or prompt cache is unavailable; genuine Claude Code remains
+  the only direct Anthropic path.
+- **Fresh and reset installs reliably enter onboarding.** A missing daemon
+  config is bootstrapped automatically, resetting Alex reopens onboarding, and
+  a zero-provider menu now exposes **Start Onboarding** at the top.
+- **Onboarding is resumable and testable.** Connected provider accounts can be
+  selected without repeating OAuth, changing provider clears stale test state,
+  and **Check for Request** manually checks for the copied harness command.
+- **Fresh provider state is no longer misleading.** Newly authenticated
+  accounts show Active before their first health probe, while Dario/Claude stay
+  hidden until an Anthropic account exists.
+- **Old clients can be recovered without accepting unknown secrets.** Requests
+  rejected by Alex now appear in an **Alex Error** Trace Browser section. A
+  known revoked or expired client can be right-clicked and **Approve**d; unknown
+  credentials remain visible but cannot be authorized.
+- **OpenAI-compatible model discovery uses the public namespace.** `/v1/models`
+  now advertises proxy aliases as `alex/*`.
+
 ## [0.1.28] - 2026-07-19
 
 First stable release of the 0.1.28 line — everything from the 0.1.28 betas plus
@@ -237,10 +401,8 @@ the fixes below.
   installer library; ui/ mock zips (5.7MB) removed.
 
 ### In progress (building, not yet in a beta)
-- **`alexandria` → `alex` rename** — project-wide rename with a one-time,
-  no-data-loss upgrade migration (`~/.alexandria` → `~/.alex`,
-  `com.alexandria.daemon` → `com.alex.daemon`, `ALEXANDRIA_*` → `ALEX_*` with
-  legacy fallback). Built; pending live migration test.
+- **Alex naming** — the app, CLI, services, state, headers, and harness
+  artifacts consistently use the Alex name.
 - **Blue-green daemon restart** — launchd socket-activation graceful restart
   with drain + hard-restart fallback (zero dropped connections). Built on both
   platforms; pending live zero-downtime verification.
