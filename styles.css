@@ -424,6 +424,10 @@ h2 {
   width: 100%;
 }
 
+.player-panel cove-player .cb-stage {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
 /* Cove also renders trace markers above the terminal. The terminal player's
    own scrubber is the single playback timeline used on this page. */
 .player-panel .cb-timeline {
