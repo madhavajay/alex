@@ -401,11 +401,17 @@ struct MiddlewarePreferencesSection: View {
     private func activityRow(_ event: MiddlewareActivityEvent) -> some View {
         let matches = event.matchedDecisions
         let executed = matches.contains { $0.executed == true }
-        let source = event.attempts.first?.model ?? event.requestedModel ?? "unknown model"
-        let target = event.finalModel ?? event.attempts.last?.model ?? source
+        let routedByLease = matches.isEmpty && event.substituted
+        let successfulRoute = executed || routedByLease
+        let source = activityModelName(
+            event.requestedModel ?? event.attempts.first?.model ?? "unknown model")
+        let target = activityModelName(
+            event.finalModel ?? event.attempts.last?.model ?? source)
         let refusal = event.attempts.first { $0.errorKind == "upstream_refusal" }
         let outcome: String = if let match = matches.first {
             "Matched \(match.ruleName ?? match.ruleId) · \(executed ? "action executed" : "action not executed")"
+        } else if routedByLease {
+            "Active session route · matched earlier"
         } else if let refusal {
             "Refusal observed\(refusal.errorCode.map { " (\($0))" } ?? "") · no rule matched"
         } else {
@@ -413,9 +419,9 @@ struct MiddlewarePreferencesSection: View {
         }
 
         return HStack(alignment: .top, spacing: 10) {
-            Image(systemName: executed
+            Image(systemName: successfulRoute
                 ? "arrow.triangle.branch" : (matches.isEmpty ? "circle.dashed" : "exclamationmark.triangle"))
-                .foregroundStyle(executed
+                .foregroundStyle(successfulRoute
                     ? AlexTheme.Colors.success : (matches.isEmpty
                         ? AlexTheme.Colors.textTertiary : AlexTheme.Colors.warningOrange))
                 .frame(width: 20)
@@ -429,7 +435,7 @@ struct MiddlewarePreferencesSection: View {
                 }
                 Text(outcome)
                     .font(.system(size: 10, weight: matches.isEmpty ? .regular : .medium))
-                    .foregroundStyle(executed
+                    .foregroundStyle(successfulRoute
                         ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
                 HStack(spacing: 6) {
                     if let ts = event.tsMs { Text(formattedDate(ts)) }
@@ -452,6 +458,13 @@ struct MiddlewarePreferencesSection: View {
         }
         .padding(11)
         .alexCard(background: AlexTheme.Colors.overlay(0.03))
+    }
+
+    private func activityModelName(_ model: String) -> String {
+        for prefix in ["alex/", "anthropic/", "openai/"] where model.hasPrefix(prefix) {
+            return String(model.dropFirst(prefix.count))
+        }
+        return model
     }
 
     private var scriptsSection: some View {
