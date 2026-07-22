@@ -3,90 +3,246 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#111112">
   <title>Alex</title>
   <link rel="stylesheet" href="/ui/styles.css">
 </head>
 <body>
-  <header>
-    <div>
-      <p class="eyebrow">ALEX LOCAL CONTROL PLANE</p>
-      <h1>Alex</h1>
+  <section id="auth-screen" class="auth-screen" aria-live="polite">
+    <div class="auth-card">
+      <div class="auth-brand"><span class="brand-mark">A</span><div><strong>Alex</strong><span>Local control plane</span></div></div>
+      <div id="auth-loading" class="auth-state"><span class="spinner"></span><p>Finding your Alex daemon…</p></div>
+      <div id="password-login" class="auth-state" hidden>
+        <span class="eyebrow">WELCOME BACK</span>
+        <h1>Sign in to Alex</h1>
+        <p>Your dashboard password unlocks this daemon. It never leaves this machine.</p>
+        <form id="password-login-form" class="field-stack">
+          <label>Password<input name="password" type="password" required autocomplete="current-password" autofocus></label>
+          <button class="primary wide" type="submit">Sign in</button>
+        </form>
+      </div>
+      <div id="key-bootstrap" class="auth-state" hidden>
+        <span class="eyebrow">ONE-TIME SETUP</span>
+        <h1>Secure this dashboard</h1>
+        <p>No dashboard password exists yet. Enter the local admin key once, then onboarding will ask you to create one.</p>
+        <form id="remote-auth-form" class="field-stack">
+          <label>Alex admin key<input name="key" type="password" required autocomplete="off" spellcheck="false"></label>
+          <button class="primary wide" type="submit">Continue securely</button>
+        </form>
+        <p class="micro">Find it by running <code>alex credentials</code> on the daemon machine. The key stays in this page’s memory.</p>
+      </div>
+      <p id="auth-error" class="inline-message danger" hidden></p>
+      <p class="auth-foot">Trusted networks only · Built-in access uses HTTP</p>
     </div>
-    <span id="daemon-status" class="chip pending">Connecting…</span>
-  </header>
-  <nav aria-label="Primary">
-    <button data-view="status" aria-current="page">Status</button>
-    <button data-view="onboarding">Onboarding</button>
-    <button data-view="middleware">Middleware</button>
-    <button data-view="traces">Traces</button>
-  </nav>
-  <main>
-    <section id="status-view" data-panel>
-      <h2>System status</h2>
-      <p class="lede">A small, local-first view of daemon and provider health.</p>
-      <div id="status-cards" class="cards" aria-live="polite"></div>
-      <aside class="notice"><strong>Platform note.</strong> Core status, provider setup, middleware APIs, and traces are shared. The menu-bar app, Launch at Login, and native notifications remain macOS-only.</aside>
-    </section>
+  </section>
 
-    <section id="onboarding-view" data-panel hidden>
-      <h2>Connect a provider</h2>
-      <p class="lede">Use an existing account or start a secure provider flow. Credentials stay in your local Alex vault.</p>
-      <div id="accounts" class="cards" aria-live="polite"></div>
-      <div id="providers" class="provider-grid"></div>
-      <div id="login-flow" class="flow" hidden aria-live="polite"></div>
-      <details id="api-provider-details">
-        <summary>API-key and local providers</summary>
-        <form id="openrouter-form" class="stack">
-          <label>OpenRouter name <input name="display_name" required autocomplete="off"></label>
-          <label>OpenRouter key <input name="key" type="password" required autocomplete="off"></label>
-          <button type="submit">Save OpenRouter key</button>
-        </form>
-        <form id="exo-form" class="stack">
-          <label>Exo endpoint <input name="url" type="url" value="http://127.0.0.1:52415" required></label>
-          <button type="submit">Probe and save Exo</button>
-        </form>
-        <form id="cliproxyapi-form" class="stack">
-          <strong>CLIProxyAPI</strong>
-          <span class="muted">Keep your existing proxy setup. Alex probes its model catalogue before saving anything.</span>
-          <label>CLIProxyAPI endpoint <input name="url" type="url" value="http://127.0.0.1:8317/v1" required></label>
-          <label>CLIProxyAPI credential <input name="credential" type="password" required autocomplete="off"></label>
-          <button type="submit">Probe and connect CLIProxyAPI</button>
-        </form>
-        <div id="cliproxyapi-result" class="flow" hidden aria-live="polite"></div>
-      </details>
-    </section>
-
-    <section id="middleware-view" data-panel hidden>
-      <div class="section-heading">
-        <div><h2>Middleware</h2><p class="lede">Inspect active rules, change their live state, and test a rule against a saved fixture.</p></div>
-        <button id="refresh-middleware">Refresh</button>
+  <div id="app-shell" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="brand"><span class="brand-mark">A</span><div><strong>Alex</strong><small id="sidebar-version">Control plane</small></div></div>
+      <nav aria-label="Alex navigation">
+        <p class="nav-label">Overview</p>
+        <button data-view="onboarding"><span class="nav-icon">✦</span>Onboarding</button>
+        <button data-view="dashboard"><span class="nav-icon">⌂</span>Dashboard</button>
+        <button data-view="traces"><span class="nav-icon">⌁</span>Trace Browser</button>
+        <p class="nav-label">Settings</p>
+        <button data-view="general"><span class="nav-icon">⚙</span>General</button>
+        <button data-view="providers"><span class="nav-icon">◈</span>Providers</button>
+        <button data-view="harnesses"><span class="nav-icon">⌘</span>Harnesses</button>
+        <button data-view="credentials"><span class="nav-icon">⌾</span>Credentials</button>
+        <button data-view="dario"><span class="nav-icon">◉</span>Dario</button>
+        <button data-view="middleware"><span class="nav-icon">⇄</span>Middleware</button>
+        <button data-view="notifications"><span class="nav-icon">♢</span>Notifications</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="sidebar-dot" class="status-dot pending"></span>
+        <div><strong id="sidebar-status">Connecting</strong><small id="sidebar-uptime">Local daemon</small></div>
       </div>
-      <div id="middleware-summary" class="cards" aria-live="polite"></div>
-      <div id="middleware-errors" class="flow error-panel" hidden role="alert"></div>
-      <div id="middleware-rules" class="rule-list" aria-live="polite"></div>
-    </section>
+    </aside>
 
-    <section id="traces-view" data-panel hidden>
-      <div class="section-heading">
-        <div><h2>Trace summaries</h2><p class="lede">Bodies load only when you open an individual trace.</p></div>
-        <button id="refresh-traces">Refresh</button>
+    <main class="workspace">
+      <header class="topbar">
+        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open navigation">☰</button>
+        <div><h1 id="page-title">Onboarding</h1><p id="page-subtitle">Set up Alex in a few small steps</p></div>
+        <div class="topbar-actions"><span id="daemon-status" class="pill pending">Connecting…</span><button id="global-refresh" class="icon-button" title="Refresh current page" aria-label="Refresh">↻</button></div>
+      </header>
+
+      <div class="content">
+        <section id="onboarding-view" class="panel" data-panel>
+          <div class="onboarding-shell">
+            <div class="onboarding-progress" aria-label="Setup progress">
+              <button data-step-button="0"><span>1</span><small>Password</small></button><i></i>
+              <button data-step-button="1"><span>2</span><small>Provider</small></button><i></i>
+              <button data-step-button="2"><span>3</span><small>Harness</small></button><i></i>
+              <button data-step-button="3"><span>4</span><small>Ready</small></button>
+            </div>
+            <article class="onboarding-card" data-onboarding-step="0">
+              <span class="step-kicker">STEP 1 OF 4 · WEB ACCESS</span>
+              <h2>Protect your Alex dashboard</h2>
+              <p>Create a password for browsers on your LAN. Alex stores only a salted Argon2id hash, and browser sessions expire after 12 hours.</p>
+              <div id="password-configured" class="success-box" hidden><span>✓</span><div><strong>Dashboard password configured</strong><p>You can replace it at any time in General → Web access.</p></div></div>
+              <form id="password-config-form" class="field-stack compact-form">
+                <label>New dashboard password<input name="password" type="password" minlength="10" maxlength="256" required autocomplete="new-password"></label>
+                <label>Confirm password<input name="confirmation" type="password" minlength="10" maxlength="256" required autocomplete="new-password"></label>
+                <div class="password-meter"><i></i><span>Use at least 10 characters</span></div>
+                <button class="primary" type="submit">Save password</button>
+              </form>
+              <div class="wizard-actions"><span></span><button class="primary" data-next-step="1" disabled>Continue</button></div>
+            </article>
+            <article class="onboarding-card" data-onboarding-step="1" hidden>
+              <span class="step-kicker">STEP 2 OF 4 · PROVIDERS</span>
+              <h2>Connect your AI subscriptions</h2>
+              <p>Alex routes your existing subscriptions through one local endpoint. Add one now, or continue if the accounts below are already yours.</p>
+              <div id="onboarding-accounts" class="mini-list"></div>
+              <div id="onboarding-providers" class="provider-grid"></div>
+              <div id="login-flow" class="login-flow" hidden aria-live="polite"></div>
+              <div class="wizard-actions"><button data-next-step="0">Back</button><button class="primary" data-next-step="2">Continue</button></div>
+            </article>
+            <article class="onboarding-card" data-onboarding-step="2" hidden>
+              <span class="step-kicker">STEP 3 OF 4 · HARNESS</span>
+              <h2>Point your coding tools at Alex</h2>
+              <p>Alex can configure supported tools and preserve their existing settings with a reversible diff.</p>
+              <div id="onboarding-harnesses" class="mini-list"></div>
+              <button data-go="harnesses">Review all harnesses</button>
+              <div class="wizard-actions"><button data-next-step="1">Back</button><button class="primary" data-next-step="3">Continue</button></div>
+            </article>
+            <article class="onboarding-card ready-card" data-onboarding-step="3" hidden>
+              <span class="ready-mark">✓</span>
+              <span class="step-kicker">SETUP COMPLETE</span>
+              <h2>Alex is ready</h2>
+              <p>Your local control plane is online. The dashboard gathers the menu-bar status, accounts, harnesses, Dario, traces, and quick actions in one place.</p>
+              <div id="ready-summary" class="stat-grid"></div>
+              <div class="wizard-actions"><button data-next-step="2">Back</button><button id="finish-onboarding" class="primary">Open dashboard</button></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="dashboard-view" class="panel" data-panel hidden>
+          <div id="update-banner" class="update-banner" hidden></div>
+          <div class="hero-card">
+            <div><span class="eyebrow">LOCAL ROUTING CONTROL PLANE</span><h2>Everything flowing through Alex</h2><p id="dashboard-lede">Loading daemon state…</p></div>
+            <div class="hero-actions"><button id="run-ping">Run ping checks</button><button class="primary" data-go="providers">Add provider</button></div>
+          </div>
+          <div id="dashboard-stats" class="stat-grid"></div>
+          <div class="dashboard-grid">
+            <article class="dashboard-card span-2"><div class="card-heading"><div><span class="section-kicker">PROVIDERS</span><h3>Limits & availability</h3></div><div class="head-actions"><button data-refresh-card aria-label="Refresh provider limits">↻</button><button data-go="providers">Manage</button></div></div><div id="dashboard-limits" class="provider-limit-list"></div></article>
+            <article class="dashboard-card"><div class="card-heading"><div><span class="section-kicker">DARIO</span><h3>Claude subscription router</h3></div><div class="head-actions"><button data-refresh-card aria-label="Refresh Dario status">↻</button><button data-go="dario">Open</button></div></div><div id="dashboard-dario"></div></article>
+            <article class="dashboard-card span-2"><div class="card-heading"><div><span class="section-kicker">ACCOUNTS</span><h3>Connected credentials</h3></div><div class="head-actions"><button data-refresh-card aria-label="Refresh accounts">↻</button><button data-go="providers">Manage</button></div></div><div id="dashboard-accounts" class="account-list compact"></div></article>
+            <article class="dashboard-card"><div class="card-heading"><div><span class="section-kicker">HARNESS</span><h3>Coding tools</h3></div><div class="head-actions"><button data-refresh-card aria-label="Refresh harnesses">↻</button><button data-go="harnesses">Manage</button></div></div><div id="dashboard-harnesses" class="mini-list"></div></article>
+            <article class="dashboard-card span-2"><div class="card-heading"><div><span class="section-kicker">RECENT TRACES</span><h3>Latest routed work</h3></div><div class="head-actions"><button data-refresh-card aria-label="Refresh recent traces">↻</button><button data-go="traces">Trace Browser</button></div></div><div id="dashboard-traces" class="trace-mini-list"></div></article>
+            <article class="dashboard-card"><div class="card-heading"><div><span class="section-kicker">QUICK ACTIONS</span><h3>Controls</h3></div></div><div class="action-grid"><button id="quick-refresh">↻ Refresh everything</button><button data-go="credentials">⌾ Connect another app</button><button data-go="middleware">⇄ Configure failover</button><a href="https://github.com/madhavajay/alex/issues" target="_blank" rel="noopener">↗ Report a bug</a><a href="https://github.com/madhavajay/alex" target="_blank" rel="noopener">↗ Open GitHub</a></div></article>
+          </div>
+        </section>
+
+        <section id="general-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>General</h2><p>Daemon, update, browser, storage, and platform preferences</p></div></div>
+          <div class="settings-card">
+            <div class="setting-row"><div><strong>Run onboarding tutorial</strong><small>Walk through password, providers, harnesses, and readiness</small></div><button id="restart-onboarding">Run tutorial</button></div>
+            <div class="section-label">WEB DASHBOARD</div>
+            <form id="web-password-form" class="setting-form">
+              <div><strong>Dashboard password</strong><small>Replacing it signs out every other browser session</small></div>
+              <div class="inline-fields"><input name="password" type="password" minlength="10" maxlength="256" required placeholder="New password" autocomplete="new-password"><input name="confirmation" type="password" minlength="10" maxlength="256" required placeholder="Confirm" autocomplete="new-password"><button class="primary">Replace</button></div>
+            </form>
+            <div class="setting-row"><div><strong>Current browser session</strong><small>Sessions expire automatically after 12 hours</small></div><button id="logout">Sign out</button></div>
+            <div class="section-label">SYSTEM</div>
+            <div class="setting-row"><div><strong>Refresh interval</strong><small>How often dashboard data refreshes in this browser</small></div><select id="refresh-interval"><option value="30">30 seconds</option><option value="60" selected>1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></div>
+            <div class="setting-row platform-row"><div><strong>Launch at login</strong><small>Managed by the installed tray or macOS app on the daemon machine</small></div><span class="pill neutral">Platform local</span></div>
+            <div class="setting-row platform-row"><div><strong>Open commands in</strong><small>Terminal selection is managed by the native app</small></div><span class="pill neutral">Platform local</span></div>
+            <div class="section-label">UPDATES</div>
+            <form id="update-form" class="setting-form"><div><strong>Release channel</strong><small id="update-summary">Loading update state…</small></div><div class="inline-fields"><select name="channel"><option value="stable">Stable</option><option value="beta">Beta</option></select><button>Save channel</button><button id="apply-update" class="primary" type="button">Check / apply</button></div></form>
+            <div class="section-label">DAEMON & NETWORK</div>
+            <div id="daemon-settings" class="setting-details"></div>
+            <div class="setting-row"><div><strong>Network exposure</strong><small>Binding changes remain CLI/native-managed because changing them can cut off this browser</small></div><span id="network-exposure" class="pill warning">Checking</span></div>
+            <div class="section-label">STORAGE</div>
+            <div id="storage-summary" class="setting-details"></div>
+            <form id="storage-prune-form" class="setting-form"><div><strong>Prune stored bodies</strong><small>Preview or delete trace bodies older than the selected age; trace metadata remains</small></div><div class="inline-fields"><select name="older_than"><option value="7d">7 days</option><option value="30d">30 days</option><option value="90d">90 days</option></select><button name="mode" value="preview">Preview</button><button name="mode" value="apply" class="danger-button">Prune</button></div></form>
+            <div id="storage-result" class="inline-message" hidden></div>
+            <div class="section-label">RESET</div>
+            <div class="setting-row"><div><strong>Reset Alex</strong><small>Destructive reset remains available through <code>alex reset</code>, where a full counted preview and confirmation are required</small></div><span class="pill neutral">CLI guarded</span></div>
+            <div class="section-label">ABOUT</div>
+            <div class="setting-row"><div><strong>Alex</strong><small>Local-first LLM subscription router</small></div><span id="about-version" class="mono">—</span></div>
+          </div>
+        </section>
+
+        <section id="providers-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Providers</h2><p>Usage, accounts, quotas, routing, API keys, and local models</p></div><div class="head-actions"><button id="test-credentials">Run ping checks</button><button id="add-provider" class="primary">Add provider</button></div></div>
+          <div id="credential-test-result" class="inline-message" hidden></div>
+          <article class="settings-card analytics-card"><div class="card-heading"><div><span class="section-kicker">LAST 24 HOURS</span><h3>Traffic by account</h3></div><div id="analytics-total" class="mono muted"></div></div><div id="usage-share" class="usage-share"></div><div id="usage-chart" class="chart"></div></article>
+          <div id="provider-picker" class="provider-grid" hidden></div>
+          <div id="provider-login-flow" class="login-flow" hidden aria-live="polite"></div>
+          <div id="provider-accounts" class="account-list"></div>
+          <article class="settings-card">
+            <div class="section-label first">API-KEY & LOCAL PROVIDERS</div>
+            <details><summary>Gemini API key</summary><form id="gemini-key-form" class="form-grid"><label>Google AI Studio API key<input name="key" type="password" required autocomplete="off"></label><button class="primary">Save API key</button></form></details>
+            <details><summary>Import existing CLI credentials</summary><p class="setting-caption">Discovery is read-only. Alex imports only after you review and confirm a detected source.</p><div id="import-candidates" class="mini-list"></div><button id="refresh-imports" type="button">Scan for credentials</button></details>
+            <details><summary>OpenRouter</summary><form id="openrouter-form" class="form-grid"><label>Display name<input name="display_name" value="default"></label><label>API key<input name="key" type="password" required autocomplete="off"></label><label>HTTP-Referer (optional)<input name="http_referer"></label><label>X-Title (optional)<input name="x_title"></label><button class="primary">Save key</button></form><div id="openrouter-models"></div></details>
+            <details><summary>Exo local inference</summary><form id="exo-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:52415" required></label><button>Check endpoint</button></form><div id="exo-result"></div></details>
+            <details><summary>CLIProxyAPI</summary><form id="cliproxyapi-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:8317/v1" required></label><label>Credential<input name="credential" type="password" required autocomplete="off"></label><button class="primary">Probe and connect</button></form><div id="cliproxyapi-result" hidden></div></details>
+          </article>
+        </section>
+
+        <section id="harnesses-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Harnesses</h2><p>Connect coding tools, refresh model catalogs, and capture tool calls</p></div><button id="refresh-harnesses">Refresh detection</button></div>
+          <div id="harness-summary" class="stat-grid"></div>
+          <div id="harness-list" class="harness-list"></div>
+          <article class="settings-card"><div class="section-label first">REMOTE & ADVANCED</div><div class="setting-row"><div><strong>Remote harness</strong><small>Use a scoped key from Credentials and point the tool at this Alex URL</small></div><button data-go="credentials">Create connection key</button></div><div class="setting-row"><div><strong>Config overrides</strong><small>Binary and config-directory overrides are available inside each detected harness card</small></div></div></article>
+        </section>
+
+        <section id="credentials-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Credentials</h2><p>Connect other apps and control scoped access keys</p></div><button id="refresh-credentials">Refresh</button></div>
+          <article class="settings-card">
+            <div class="section-label first">CONNECT ANOTHER APP</div>
+            <p class="setting-caption">Generate a model-only key and copy a ready-to-use environment snippet. It cannot administer Alex or read traces.</p>
+            <form id="connect-key-form" class="form-grid three"><label>Client API<select name="api"><option value="anthropic">Anthropic Messages</option><option value="openai">OpenAI compatible</option></select></label><label>Label<input name="label" value="connect-helper"></label><label>Model (optional)<input name="model" placeholder="Any model"></label><button class="primary">Generate connection</button></form>
+            <div id="connect-snippet" class="secret-notice" hidden></div>
+            <div class="section-label">MINT A SCOPED KEY</div>
+            <form id="run-key-form" class="form-grid three"><label>Label<input name="label" placeholder="e.g. VS Code"></label><label>Model tag<input name="model" placeholder="Any model"></label><label>Expires<select name="ttl_seconds"><option value="3600">1 hour</option><option value="86400" selected>1 day</option><option value="604800">7 days</option></select></label><button class="primary">Mint model-only key</button></form>
+            <div id="minted-key" class="secret-notice" hidden></div>
+            <div class="section-label">ACTIVE KEYS</div>
+            <div id="run-key-list" class="key-list"></div>
+            <div class="section-label">OUTBOUND STATUS</div>
+            <div id="credential-inventory" class="credential-grid"></div>
+          </article>
+        </section>
+
+        <section id="dario-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Dario</h2><p>Claude subscription runtime, generations, and prompt caches</p></div><div class="head-actions"><button id="ping-dario">Ping runtime</button><button id="refresh-dario">Refresh</button></div></div>
+          <div id="dario-status" class="stat-grid"></div>
+          <article class="settings-card"><div class="section-label first">ROUTING</div><div id="dario-routing" class="setting-details"></div><div class="section-label">GENERATIONS</div><div class="table-wrap"><table><thead><tr><th>Generation</th><th>Version</th><th>Phase</th><th>Port</th><th>PID</th><th>Busy</th><th>Age</th></tr></thead><tbody id="dario-generations"></tbody></table></div><div class="section-label">PROMPT CACHE</div><div id="dario-caches" class="cache-list"></div><div class="section-label">RUNTIME</div><pre id="dario-runtime" class="console"></pre></article>
+        </section>
+
+        <section id="middleware-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Middleware</h2><p>Rules, failover protection, runtime safety, activity, and session leases</p></div><div class="head-actions"><button id="reload-middleware">Reload</button><button id="refresh-middleware">Refresh</button></div></div>
+          <div id="middleware-errors" class="inline-message danger" hidden role="alert"></div>
+          <article class="settings-card"><div class="section-label first">RUNTIME</div><form id="middleware-settings-form" class="form-grid four"><label class="toggle-line"><input name="enabled" type="checkbox">Enabled</label><label>Failure mode<select name="fail_mode"><option value="open">Fail open</option><option value="closed">Fail closed</option></select></label><label>Max attempts<input name="max_attempts" type="number" min="1" max="10"></label><label>Error body limit (bytes)<input name="error_body_limit_bytes" type="number" min="1024" max="1048576"></label><label>Script timeout (ms)<input name="default_script_timeout_ms" type="number" min="1" max="1000"></label><label>Script operation limit<input name="default_script_max_operations" type="number" min="100" max="10000000"></label><button class="primary">Save runtime</button></form><div class="section-label">FAILOVER PROTECTION</div><form id="protection-form" class="form-grid four"><label class="toggle-line"><input name="enabled" type="checkbox">Enable protection</label><label class="toggle-line"><input name="reroute_on_auth" type="checkbox">Reroute on auth errors</label><label>Retries<input name="retries" type="number" min="0" max="10"></label><label class="toggle-line"><input name="auto_return" type="checkbox">Auto-return</label><label class="span-all">Model equivalencies (JSON)<textarea name="equivalencies" rows="5" spellcheck="false" placeholder='{"claude-model":{"openai":"gpt-model"}}'></textarea></label><button class="primary">Save protection</button></form></article>
+          <div id="middleware-summary" class="stat-grid"></div>
+          <div id="middleware-rules" class="rule-list"></div>
+          <article class="settings-card"><div class="section-label first">RECENT ACTIVITY</div><div id="middleware-activity" class="mini-list"></div><div class="section-label">SESSION ROUTES</div><div id="middleware-leases" class="mini-list"></div></article>
+        </section>
+
+        <section id="notifications-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Notifications</h2><p>Telegram re-auth alerts and daemon messages</p></div><button id="refresh-notifications">Refresh</button></div>
+          <article class="settings-card">
+            <div class="section-label first">TELEGRAM SETUP</div>
+            <details open><summary>How to connect a Telegram bot</summary><ol class="instructions"><li>Message @BotFather → <code>/newbot</code> and copy the token.</li><li>Message the new bot once.</li><li>Paste the token, validate, then detect your chat.</li></ol></details>
+            <form id="notification-form" class="form-grid"><label>Bot token<input name="token" type="password" required autocomplete="off" placeholder="123456:ABC…"></label><label>Chat ID<input name="chat_id" required placeholder="123456789"></label><label>Display name<input name="name" placeholder="Not yet available" disabled title="The notification API does not currently persist a custom display name"></label><label>Minimum level<select name="min_level"><option value="info">Info</option><option value="warn" selected>Warn</option><option value="critical">Critical</option></select></label><label class="toggle-line"><input name="reauth_only" type="checkbox" checked>Re-auth alerts only</label><label class="toggle-line"><input name="allow_commands" type="checkbox">Allow bot commands</label><div class="form-actions"><button id="validate-telegram" type="button">Validate</button><button id="discover-telegram" type="button">Detect chats</button><button id="test-telegram" type="button">Send test</button><button class="primary">Save</button></div></form>
+            <div id="notification-action" class="inline-message" hidden></div>
+            <div class="section-label">CONFIGURED CHANNELS</div><div id="notification-channels" class="channel-list"></div>
+            <div class="section-label">RECENT MESSAGES</div><div id="notification-log" class="mini-list"></div>
+          </article>
+        </section>
+
+        <section id="traces-view" class="panel trace-panel" data-panel hidden>
+          <div class="trace-toolbar"><form id="trace-filters" class="trace-filters"><input name="model" placeholder="Model"><input name="provider" placeholder="Provider"><input name="harness" placeholder="Harness"><input name="status" inputmode="numeric" placeholder="Status"><label><input name="errors" type="checkbox"> Errors</label><button>Filter</button><button type="reset">Clear</button></form><button id="refresh-traces">Refresh</button></div>
+          <div class="trace-browser"><aside><div class="trace-column-head"><strong>Sessions & traces</strong><small>Body-free summaries</small></div><div id="trace-list" class="trace-list"></div><button id="more-traces" class="wide" hidden>Load older</button></aside><article id="trace-detail" class="trace-detail"><div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect routing, attempts, middleware, bodies, and conversation turns.</p></div></article></div>
+        </section>
       </div>
-      <form id="trace-filters" class="filter-grid">
-        <label>Model <input name="model" autocomplete="off" placeholder="gpt or claude"></label>
-        <label>Provider <input name="provider" autocomplete="off" placeholder="openai"></label>
-        <label>Harness <input name="harness" autocomplete="off" placeholder="codex"></label>
-        <label>Status <input name="status" inputmode="numeric" pattern="[0-9]*" placeholder="429"></label>
-        <label class="check-label"><input name="errors" type="checkbox"> Errors only</label>
-        <div class="filter-actions"><button type="submit">Apply filters</button><button type="reset">Clear</button></div>
-      </form>
-      <div id="trace-list" class="trace-list" aria-live="polite"></div>
-      <button id="more-traces" hidden>Load older traces</button>
-      <article id="trace-detail" hidden></article>
-    </section>
-  </main>
-  <noscript><p class="noscript">Alex is running. This first shared web preview needs JavaScript for authenticated local status and trace requests. Use <code>alex status</code> and <code>alex traces</code> without JavaScript.</p></noscript>
-  <footer>Local UI preview · no product telemetry · <a href="https://github.com/madhavajay/alex">Documentation</a></footer>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden role="status"></div>
+  <noscript><p class="noscript">Alex is running, but the control plane requires JavaScript. Use <code>alex status</code> from a terminal.</p></noscript>
   <script src="/ui/app.js" defer></script>
 </body>
 </html>

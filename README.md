@@ -180,7 +180,16 @@ Open the shared local status, onboarding, and Trace Browser preview on macOS or 
 alex web
 ```
 
-Use `alex web --no-open` to print the loopback URL. Native menu-bar integration remains macOS-only; see [Shared web UI](docs/web-ui.md) for the current platform support boundary.
+Use `alex web --no-open` to print the loopback URL. Linux can also install a
+lightweight status tray with Web UI, onboarding, trace, refresh, and daemon menu
+actions:
+
+```bash
+alex tray install
+```
+
+The full native menu-bar app remains macOS-only; see [Shared web UI](docs/web-ui.md)
+for desktop compatibility details.
 
 Built for real multi-agent workflows.
 Scoped run keys, session tagging, remote trace ingestion, account routing, rate-limit failover, harness integrations, and regression tests make Alex useful beyond simple API forwarding.
