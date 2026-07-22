@@ -5,22 +5,27 @@ import Testing
 @Suite struct OnboardingLaunchPolicyTests {
     @Test func firstRunAndResetDaemonReenterOnboarding() {
         #expect(OnboardingLaunchPolicy.shouldAutoPresent(
-            hasCompletionRecord: false,
+            completedVersion: nil,
             daemonUp: false,
             hasProviderAccounts: false,
             shownThisLaunch: false))
         #expect(OnboardingLaunchPolicy.shouldAutoPresent(
-            hasCompletionRecord: true,
+            completedVersion: "1",
+            daemonUp: true,
+            hasProviderAccounts: true,
+            shownThisLaunch: false))
+        #expect(OnboardingLaunchPolicy.shouldAutoPresent(
+            completedVersion: OnboardingLaunchPolicy.currentVersion,
             daemonUp: true,
             hasProviderAccounts: false,
             shownThisLaunch: false))
         #expect(!OnboardingLaunchPolicy.shouldAutoPresent(
-            hasCompletionRecord: true,
+            completedVersion: OnboardingLaunchPolicy.currentVersion,
             daemonUp: true,
             hasProviderAccounts: false,
             shownThisLaunch: true))
         #expect(!OnboardingLaunchPolicy.shouldAutoPresent(
-            hasCompletionRecord: true,
+            completedVersion: OnboardingLaunchPolicy.currentVersion,
             daemonUp: true,
             hasProviderAccounts: true,
             shownThisLaunch: false))

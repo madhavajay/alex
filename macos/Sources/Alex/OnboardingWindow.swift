@@ -29,7 +29,7 @@ final class OnboardingModel {
     }
 
     static let completedDefaultsKey = OnboardingLaunchPolicy.completedDefaultsKey
-    static let currentVersion = "1"
+    static let currentVersion = OnboardingLaunchPolicy.currentVersion
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
         "Credentials for compatible apps", "Never lose a login", "Keep your agents running",

@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             while store.refreshing {
                 try? await Task.sleep(for: .milliseconds(50))
             }
-            if store.config == nil, DaemonController.findBinary() != nil {
+            if !store.daemonUp, DaemonController.findBinary() != nil {
                 _ = await DaemonController.bootstrapDaemon()
                 DaemonDiscovery.invalidateCache()
                 await store.refresh()

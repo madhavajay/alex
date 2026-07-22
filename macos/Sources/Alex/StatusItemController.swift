@@ -61,8 +61,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // The completion flag lives outside ~/.alex and survives a data
         // wipe, so a live zero-account daemon must also re-enter onboarding.
         let shouldPresent = OnboardingLaunchPolicy.shouldAutoPresent(
-            hasCompletionRecord: UserDefaults.standard.object(
-                forKey: OnboardingModel.completedDefaultsKey) != nil,
+            completedVersion: UserDefaults.standard.string(
+                forKey: OnboardingModel.completedDefaultsKey),
             daemonUp: store.daemonUp,
             hasProviderAccounts: !ProviderPresentation.hasNoAccounts(store.accounts),
             shownThisLaunch: onboardingShownThisLaunch)

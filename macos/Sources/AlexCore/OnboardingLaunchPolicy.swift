@@ -5,14 +5,15 @@ import Foundation
 /// whether the existing onboarding entry point should be offered or opened.
 public enum OnboardingLaunchPolicy {
     public static let completedDefaultsKey = "onboardingCompletedVersion"
+    public static let currentVersion = "2"
 
     public static func shouldAutoPresent(
-        hasCompletionRecord: Bool,
+        completedVersion: String?,
         daemonUp: Bool,
         hasProviderAccounts: Bool,
         shownThisLaunch: Bool
     ) -> Bool {
-        if !hasCompletionRecord { return true }
+        if completedVersion != currentVersion { return true }
         return !shownThisLaunch && daemonUp && !hasProviderAccounts
     }
 
